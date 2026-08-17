@@ -2201,6 +2201,19 @@ fn session_body(
     // an `init` op, so it is useful even before a repo exists. The commit author
     // is the resolved AgentIdentity (`newt-agent` User default, overridable).
     let session_identity = newt_core::AgentIdentity::resolve().unwrap_or_default();
+    // #1709 family — operator identity for `Co-authored-by:` attribution,
+    // resolved ONCE here as an ATOMIC `(name, email)` pair (never the two
+    // halves resolved independently). A configured name is never paired with
+    // an unrelated host email: an explicitly configured `operator` +
+    // `operator_email` pair wins; a configured name with no configured email
+    // keeps the name for `Operator:` provenance and emits no email; an
+    // unconfigured operator falls to the matched host Git pair. The email is
+    // real-or-`None` — never invented — so the finalizer emits an operator
+    // `Co-authored-by:` only when one is actually known and the operator is
+    // not the primary author. Kept out of the per-turn
+    // `CommitAttribution::from_identity` ctor (which stays tool-less) and
+    // threaded in here as the caller.
+    let (session_operator_name, session_operator_email) = session_identity.operator_identity();
     // #1707/#1709: the session-scoped pending multi-contributor attribution
     // ledger. Every non-read-only tool call that succeeds records the
     // CURRENTLY resolved model here (see `ledger_note_attribution` in
@@ -2218,28 +2231,79 @@ fn session_body(
                 name: session_identity.name.clone(),
                 email: session_identity.email.clone(),
             },
-            // Auto-sign commits with the AI credit (the tool owns this so it
-            // is always present and correctly formatted — the model is told
-            // it's automatic, see runtime_context_block). Refreshed from
-            // `attribution_ledger` at the top of every loop iteration below,
-            // so it always reflects every contributor accumulated since the
-            // last successful commit, not merely whichever model was active
-            // when the session booted. `None` here (nothing accumulated yet).
-            coauthor: None,
+            // #1709 integration: commit attribution is the canonical, harness-
+            // owned [`CommitAttribution`] envelope (active model + harness build
+            // + operator/agent identity), finalized into every commit message
+            // by `CommitAttribution::finalize_message` via the tool's one
+            // shared boundary. Refreshed from the LIVE inference model + the
+            // resolved identity at the top of every loop iteration below (the
+            // latest practical point before the turn that may commit), so a
+            // `/model` switch is reflected in the next commit rather than the
+            // one frozen at session boot. `None` here (refreshed immediately
+            // below); tests opt out of signing by leaving it `None`.
+            attribution: None,
+            // #1709 family: the explicit commit-success counter — starts at
+            // zero; the `commit`/`amend`/`rebase` arms increment it on a
+            // confirmed successful `eng.*` call, and the loop drains it below
+            // to clear the ledger ONLY on a real Newt commit (not a `HEAD` diff).
+            commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
+            // #1709 family: the contributor-consumption cursor — starts at 0,
+            // reset to 0 at the top of every loop iteration (below) when the
+            // envelope is refreshed from the live model + ledger snapshot.
+            contributors_consumed: std::sync::atomic::AtomicUsize::new(0),
         })
     };
 
     loop {
-        // #1707/#1709: refresh the embedded git tool's coauthor trailer(s)
-        // from the CURRENT attribution ledger state before this turn's
-        // ChatCtx is built, so a contributor recorded on a previous turn
-        // (including one under a model/backend since switched away from) is
-        // reflected in whatever commit this turn might make. `None` (not an
-        // empty string) when nothing is pending, so `sign_message` correctly
-        // treats "no contributor yet" as "do not stamp a trailer".
+        // #1709 integration: refresh the embedded git tool's `CommitAttribution`
+        // from the LIVE inference model + the resolved identity before this
+        // turn's ChatCtx is built, so whatever commit this turn might make is
+        // attributed to the model actually driving it — a `/model` (or
+        // `/backend`/loadout) switch since the last commit shows up here, not
+        // the value captured at session boot. This is the latest practical
+        // construction point: the tool is moved into ChatCtx for the turn
+        // right after, and `GitTool::dispatch` (the commit boundary) has no
+        // model parameter to read at commit time. The typed value owns all
+        // rendering downstream; no caller formats attribution itself.
         if let Some(tool) = session_git_tool.as_mut() {
-            let rendered = attribution_ledger.borrow().render();
-            tool.coauthor = (!rendered.is_empty()).then_some(rendered);
+            let mut ca = newt_core::attribution::CommitAttribution::from_identity(
+                &inf_model,
+                &session_identity,
+            );
+            // #1709 family: thread the resolved operator identity through the
+            // typed value. `from_identity` keeps its ctor tool-less (config
+            // `operator` only); the caller (this loop) applies the host-git
+            // fallback for the NAME and supplies the real EMAIL here. The
+            // email is real-or-None — never invented — so the finalizer emits
+            // an operator `Co-authored-by:` only when one is actually known and
+            // the operator is not the primary author.
+            ca.operator_name = session_operator_name.clone();
+            ca.operator_email = session_operator_email.clone();
+            // #1707/#1709 semantic B: snapshot the pending multi-contributor
+            // ledger into the envelope here — the latest practical point
+            // before the turn that may commit. The ledger holds every model
+            // that materially contributed since the last commit (a
+            // `/model`/`/backend`/loadout switch ADDS a contributor); the
+            // active model driving THIS turn is merged in by the finalizer
+            // regardless, so this snapshot + the active-model merge credits
+            // every contributor on the one commit. The ledger is cleared on
+            // commit success below, and the next refresh re-snapshots the
+            // (now empty) ledger, so contributors never carry past the commit
+            // that consumed them.
+            ca.contributors = attribution_ledger.borrow().contributors().to_vec();
+            tool.attribution = Some(ca);
+            // #1709 family: reset the contributor-consumption cursor to 0. The
+            // envelope above is a FRESH snapshot of the ledger taken at this
+            // loop-top, so none of its contributors have been consumed yet by
+            // a commit in THIS lifecycle. The cursor advances past credited
+            // contributors at each confirmed commit boundary (inside the git
+            // tool's `commit`/`amend`/`rebase` arms), so a second commit in
+            // the same turn re-credits nobody from the first. Resetting here
+            // means a new turn starts unconsumed even if the prior turn left
+            // the cursor advanced (e.g. it committed but the end-of-turn
+            // drain ran before this refresh).
+            tool.contributors_consumed
+                .store(0, std::sync::atomic::Ordering::Relaxed);
         }
         // #1668: the ONE preference-pin persistence site. Every operator
         // posture ACTION marked since the last pass — a successful
@@ -6920,23 +6984,37 @@ fn session_body(
                     // error; preserve that transition as unattributed evidence.
                     let artifact_head_after_turn =
                         git_head_snapshot(session_git_tool.as_ref(), &turn_caveats);
-                    // #1707/#1709: HEAD moving this turn IS "a commit landed"
-                    // — the exact fact this snapshot pair already exists to
-                    // observe (`record_observed_head_transition` below), read
-                    // a second time for a different purpose. A successful
-                    // commit consumed whatever the ledger held (stamped via
-                    // `session_git_tool`'s `coauthor`, refreshed at the top of
-                    // this loop), so clear it; anything else — no commit
-                    // attempted, denied, or failed — leaves HEAD unmoved and
-                    // the pending contributors intact for the next attempt.
-                    if artifact_head_before_turn
+                    // #1709 family — attribution EPOCH boundary. The contributor
+                    // ledger is now consumed AT THE COMMIT BOUNDARY (inside the
+                    // tool round, in newt-core's `ledger_consume_at_commit_epoch`
+                    // — invoked right after a confirmed-successful
+                    // `commit`/`amend`/`rebase` git call), NOT here at the
+                    // end-of-turn drain. Clearing at the epoch boundary consumes
+                    // exactly the contributors that existed BEFORE that commit
+                    // (already credited on it via the loop-top snapshot) and
+                    // resets the ledger's dedup set, so work landing AFTER a
+                    // mid-turn commit (A edits → C1 → A edits more → turn ends →
+                    // switch B → C2) re-records fresh and survives to the next
+                    // commit — C2 credits A + B. The previous end-of-turn blanket
+                    // `clear()` erased that post-commit work, so it is REMOVED
+                    // (req 5): nothing here may clear the ledger. A failed commit
+                    // consumes nothing (the epoch clear is gated on `ok`).
+                    //
+                    // `drain_commit_success` is retained as the explicit
+                    // confirmed-commit telemetry signal (and resets the counter);
+                    // it no longer drives a ledger clear. A `HEAD` move from an
+                    // external/manual action (a user `git reset`, a fetch
+                    // advancing the branch, a checkout, …) is NOT a Newt commit
+                    // and never was a clear trigger.
+                    let new_commits = session_git_tool
                         .as_ref()
-                        .and_then(|s| s.head.as_deref())
-                        != artifact_head_after_turn
-                            .as_ref()
-                            .and_then(|s| s.head.as_deref())
-                    {
-                        attribution_ledger.borrow_mut().clear();
+                        .map_or(0, |t| t.drain_commit_success());
+                    if new_commits > 0 && verbose {
+                        print_newt(
+                            &format!("committed {new_commits} Newt commit(s) this turn"),
+                            color,
+                            verbose,
+                        );
                     }
                     if let (Some(sink), Some(turn)) =
                         (artifact_sink, active_prompt_context.as_ref())
@@ -8012,7 +8090,9 @@ mod prompt_ingress_tests {
                 name: "test".into(),
                 email: "test@example.com".into(),
             },
-            coauthor: None,
+            attribution: None,
+            commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
+            contributors_consumed: std::sync::atomic::AtomicUsize::new(0),
         };
         let mut denied = newt_core::Caveats::top();
         denied.fs_read = newt_core::Scope::none();

@@ -629,6 +629,143 @@ pub(super) fn run_command_redirect(command: &str) -> Option<&'static str> {
     DIRECT_TOOL_NAMES.iter().copied().find(|&t| t == first)
 }
 
+/// Shell separators that sequence, pipeline, or redirect sub-commands. A
+/// composed command is split on these so each sub-command is examined
+/// independently. This is a deliberately COARSE over-split (e.g. `|` inside a
+/// quoted `-m` message is split too) — the policy is fail-closed, so an
+/// over-split can only ever *block* a commit attempt, never *allow* one through.
+const SHELL_SEGMENT_SEPARATORS: &[char] = &['&', '|', ';', '>', '<', '`', '\n'];
+
+/// Git GLOBAL options that consume the following token as their value, so the
+/// real subcommand is the first non-option token AFTER skipping these. A bounded
+/// git-global-option set used only to locate the subcommand — not a general git
+/// or shell parser. The `=`-attached forms (`--git-dir=/p`) carry their value in
+/// the same token, so they are NOT here (they are bare flags that skip one).
+const GIT_GLOBAL_OPTS_TAKING_VALUE: &[&str] =
+    &["-c", "-C", "--git-dir", "--work-tree", "--namespace"];
+
+/// Whether `token` names the `git` binary — the bare name `git` OR a qualified
+/// path ending in `/git` (the model often invokes `/usr/bin/git -C <repo> …`).
+fn is_git_binary(token: &str) -> bool {
+    token == "git" || token.ends_with("/git")
+}
+
+/// Whether `token` is a shell environment-assignment prefix (`NAME=VALUE`),
+/// which may precede the git binary to forge commit identity
+/// (`GIT_AUTHOR_NAME=… git commit …`).
+fn is_env_assignment(token: &str) -> bool {
+    let Some((name, _val)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.bytes().next().is_some_and(|b| b.is_ascii_alphabetic())
+        && name.bytes().all(|b| b.is_ascii_alphabetic() || b == b'_')
+}
+
+/// Find the git SUBCOMMAND for a `git` invocation given the tokens that follow
+/// the binary: the first token that is neither a flag nor the value of a
+/// value-taking global option. `None` if no subcommand is present.
+fn git_subcommand_after_binary<'a>(tail: &'a [&'a str]) -> Option<&'a str> {
+    let mut i = 0;
+    while i < tail.len() {
+        let tok = tail[i];
+        if tok.starts_with('-') {
+            i += if GIT_GLOBAL_OPTS_TAKING_VALUE.contains(&tok) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        return Some(tok);
+    }
+    None
+}
+
+/// Shell `git` subcommands that CREATE a commit and therefore bypass
+/// harness-managed attribution when run through `run_command` (the audit
+/// set: `commit`, `merge`, `cherry-pick`, `revert`, `rebase`). Each can land
+/// an unattributed Newt commit; the routable forms (`commit`, `amend`,
+/// `rebase`) have a first-class embedded `git` tool op, and
+/// `merge`/`cherry-pick`/`revert` have NO first-class Newt route and are
+/// DENIED (the operator must run them directly, not via the agent's
+/// `run_command`). See [`run_command_creates_shell_git_commit`].
+const SHELL_GIT_COMMIT_SUBCOMMANDS: &[&str] =
+    &["commit", "merge", "cherry-pick", "revert", "rebase"];
+
+/// Flags that make a commit-producing subcommand NOT create a commit — the
+/// abort/quit forms. `git rebase --abort`, `git cherry-pick --quit`,
+/// `git revert --abort`, `git merge --abort`/`--quit` all back out of an
+/// in-progress operation WITHOUT creating a commit, so they are HARMLESS and
+/// preserved (fall through to the confined shell). `--skip` and `--continue`
+/// are deliberately NOT here: both CONTINUE the operation and DO create
+/// commits, so they stay blocked. (`--no-commit` for `merge`/`cherry-pick` is
+/// a documented possible future refinement — it genuinely creates no commit —
+/// but is rare and out of this narrow fix.)
+const SHELL_GIT_ABORT_FLAGS: &[&str] = &["--abort", "--quit"];
+
+/// Decide whether a `run_command` invocation would create a git COMMIT via the
+/// shell `git` CLI — bypassing `LocalGitTool::finalize_commit_message` and
+/// landing an unattributed commit. [`run_command_redirect`] already bounces a
+/// BARE `git commit` to the embedded tool; this catches the COMPOSED cases that
+/// fall through to the confined shell (`git add . && git commit -m x`,
+/// `echo msg | git commit -F -`, `git -c user.email=… commit`,
+/// `/usr/bin/git -C <repo> commit`, `GIT_AUTHOR_NAME=… git commit`), and now
+/// ALSO the other audit-identified commit-producing forms: `git merge`,
+/// `git cherry-pick`, `git revert`, and `git rebase` (composed or bare).
+///
+/// Scope is deliberately narrow and fail-closed:
+/// - Detects the [`SHELL_GIT_COMMIT_SUBCOMMANDS`] set. `commit`/`amend`/
+///   `rebase` have a first-class embedded route (the `git` tool's
+///   `commit`/`amend`/`rebase` ops, which the attribution finalizer owns); the
+///   model is directed there. `merge`/`cherry-pick`/`revert` have NO first-class
+///   Newt route and are DENIED (the operator must run them directly).
+/// - ABORT/QUIT forms ([`SHELL_GIT_ABORT_FLAGS`]) of `merge`/`cherry-pick`/
+///   `revert`/`rebase` create NO commit and pass through. `--skip`/`--continue`
+///   DO create commits and stay blocked.
+/// - Read-only git (`status`/`log`/`diff`/…) and git NETWORK ops
+///   ([`GIT_PASSTHROUGH_SUBCOMMANDS`]) are NOT commit creation and pass through.
+///
+/// This is a bounded lexical gate, NOT a general shell parser: it splits only
+/// on sequencing/pipeline/redirect separators and recognizes a fixed set of git
+/// global options to locate the subcommand. It over-splits on quoted
+/// metacharacters by design (fail-closed).
+pub(super) fn run_command_creates_shell_git_commit(command: &str) -> bool {
+    // Normalize command substitution `$(…)` to a separator (a real command is
+    // single-line, so `\n` cannot occur) so a sub-command inside it is examined
+    // independently — the same fail-closed over-split as the other separators.
+    let normalized = command.replace("$(", "\n");
+    for segment in normalized.split(SHELL_SEGMENT_SEPARATORS) {
+        let toks: Vec<&str> = segment.split_whitespace().collect();
+        if toks.is_empty() {
+            continue;
+        }
+        // Skip leading shell env assignments (`NAME=VALUE git …`).
+        let mut i = 0;
+        while i < toks.len() && is_env_assignment(toks[i]) {
+            i += 1;
+        }
+        if i >= toks.len() || !is_git_binary(toks[i]) {
+            continue;
+        }
+        if let Some(sub) = git_subcommand_after_binary(&toks[i + 1..]) {
+            if !SHELL_GIT_COMMIT_SUBCOMMANDS.contains(&sub) {
+                continue;
+            }
+            // The subcommand's args are the tokens after it. An abort/quit
+            // flag makes merge/cherry-pick/revert/rebase create NO commit —
+            // preserve it. (`commit` has no abort form, so this never exempts
+            // a real `git commit`; `--amend` is not an abort flag.)
+            let args = &toks[i + 2..];
+            if sub != "commit" && args.iter().any(|a| SHELL_GIT_ABORT_FLAGS.contains(a)) {
+                continue;
+            }
+            return true;
+        }
+    }
+    false
+}
+
 /// #894: the built-in tool registry — ONE self-describing entry per non-base
 /// tool (name + JSON schema builder + presence gate), replacing the parallel
 /// hand-kept lists that used to drift (the `lifecycle` tool, #891, was

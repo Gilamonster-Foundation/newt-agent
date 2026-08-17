@@ -291,6 +291,7 @@ fn crew_coauthor_trailer(model: &str, identity: &newt_core::AgentIdentity) -> St
     newt_core::attribution::Attribution::new(
         model,
         format!("{} crew", newt_core::build_info::harness_name()),
+        newt_core::build_info::PACKAGE_VERSION,
         identity.email.clone(),
     )
     .trailer()
@@ -617,7 +618,8 @@ mod tests {
         assert_eq!(
             t,
             format!(
-                "Co-authored-by: ornith:35b (newt-agent crew) <{}>",
+                "Co-authored-by: ornith:35b (newt-agent crew v{}) <{}>",
+                newt_core::build_info::PACKAGE_VERSION,
                 id.email
             )
         );
@@ -633,7 +635,10 @@ mod tests {
         };
         assert_eq!(
             crew_coauthor_trailer("m", &custom),
-            "Co-authored-by: m (newt-agent crew) <custom@example.com>"
+            format!(
+                "Co-authored-by: m (newt-agent crew v{}) <custom@example.com>",
+                newt_core::build_info::PACKAGE_VERSION
+            )
         );
     }
 

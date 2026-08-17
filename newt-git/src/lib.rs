@@ -234,6 +234,23 @@ impl GitEngine {
         Ok(HeadSnapshot { branch, head })
     }
 
+    /// Read the full commit message of the current HEAD commit (the message an
+    /// `amend` with no new message would preserve). Requires `read` like every
+    /// other repository observation. Returns the empty string for an unborn
+    /// HEAD (no commit yet) — the caller (the `amend` arm) treats that as "no
+    /// message to re-finalize" because `GitEngine::amend` itself refuses an
+    /// unborn HEAD.
+    pub fn head_message(&self, caps: &GitCaveats) -> Result<String, GitError> {
+        if !caps.permits_read() {
+            return Err(GitError::Denied("read"));
+        }
+        let Some(oid) = self.head_oid()? else {
+            return Ok(String::new());
+        };
+        let commit = parse_commit(&self.repo.odb.read(&oid)?.data)?;
+        Ok(commit.message)
+    }
+
     /// `git status` — requires the `read` capability.
     pub fn status(&self, caps: &GitCaveats) -> Result<StatusReport, GitError> {
         if !caps.permits_read() {
@@ -498,6 +515,15 @@ impl GitEngine {
         onto: &str,
         steps: &[RebaseStep],
         author: &Author,
+        // #1709 req 9: an optional commit-message finalizer applied to EVERY
+        // newly created commit's joined message (pick / reword / squash), so
+        // even an ordinary `pick` — which replays the original commit's
+        // message verbatim — receives canonical Newt attribution. The
+        // finalizer is the SAME one `commit`/`amend` use
+        // (`LocalGitTool::finalize_commit_message`), so no rebase path
+        // formats attribution itself. `None` (test scaffolds with no
+        // attribution) leaves messages untouched.
+        finalize: Option<&dyn Fn(&str) -> String>,
     ) -> Result<RebaseReport, GitError> {
         if !caps.permits_commit() {
             return Err(GitError::Denied("commit"));
@@ -551,12 +577,16 @@ impl GitEngine {
                 RebaseAction::Pick | RebaseAction::Reword => {
                     // Close any open commit first.
                     if open {
-                        tip = self.write_commit_on(
-                            cur_parent,
-                            cur_tree,
-                            &cur_msgs.join("\n\n"),
-                            author,
-                        )?;
+                        let msg = cur_msgs.join("\n\n");
+                        // #1709 req 9: finalize EVERY newly created commit's
+                        // message — including the one closed here by the next
+                        // pick/reword — so an ordinary pick receives canonical
+                        // attribution, not just reword/squash.
+                        let msg = match finalize {
+                            Some(f) => f(&msg),
+                            None => msg,
+                        };
+                        tip = self.write_commit_on(cur_parent, cur_tree, &msg, author)?;
                         tip_tree = cur_tree;
                         produced += 1;
                     }
@@ -589,7 +619,14 @@ impl GitEngine {
         }
         // Close the final open commit.
         if open {
-            tip = self.write_commit_on(cur_parent, cur_tree, &cur_msgs.join("\n\n"), author)?;
+            let msg = cur_msgs.join("\n\n");
+            // #1709 req 9: the final produced commit receives canonical
+            // attribution too (same finalizer as every other rebase commit).
+            let msg = match finalize {
+                Some(f) => f(&msg),
+                None => msg,
+            };
+            tip = self.write_commit_on(cur_parent, cur_tree, &msg, author)?;
             produced += 1;
         }
         // The single mutating step: advance the branch ref to the new tip.
@@ -950,14 +987,42 @@ fn parse_ident(s: &str) -> (String, String, i64) {
 pub struct LocalGitTool {
     pub root: std::path::PathBuf,
     pub author: Author,
-    /// A `Co-authored-by:` trailer auto-appended to every commit message — the
-    /// AI credit, e.g. `Co-authored-by: qwen3:30b (newt-agent v0.6.8)
-    /// <noreply@newt-agent.com>`. The tool owns this (deterministic, always
-    /// correct) rather than trusting the model to add it; the system prompt
-    /// tells the model it's automatic so it does not add a second copy.
-    /// `None` disables auto-signing. Skipped when the message already carries a
-    /// co-authored-by line (the model signed anyway → don't duplicate).
-    pub coauthor: Option<String>,
+    /// The canonical, harness-owned commit attribution envelope — the active
+    /// model + harness build + operator/agent identity, finalized into every
+    /// commit/amend/rebase message by
+    /// [`CommitAttribution::finalize_message`](newt_core::attribution::CommitAttribution::finalize_message).
+    /// Refreshed as late as practical before the turn that may commit (in the
+    /// session loop, from the live inference model + resolved identity) so a
+    /// `/model` switch is reflected in the next commit, not the one frozen at
+    /// session boot. `None` only in test scaffolds that opt out of signing;
+    /// the commit arms then leave the message unchanged.
+    pub attribution: Option<newt_core::attribution::CommitAttribution>,
+    /// #1709 family — the EXPLICIT commit-success signal. Incremented in the
+    /// `commit` / `amend` / `rebase` arms ONLY on a confirmed successful
+    /// `eng.*` call (the actual commit creation), never on a `HEAD` change.
+    /// The session loop drains this ([`LocalGitTool::drain_commit_success`])
+    /// after a turn and clears the contributor ledger ONLY when a real Newt
+    /// commit landed — so a `HEAD` move from an external/manual action (a
+    /// user `git reset`, a fetch advancing the branch, …) does NOT discard
+    /// pending contributors, and a commit whose `HEAD`-diff proxy was
+    /// unreliable still clears. Atomic for cross-thread visibility (the
+    /// session runs on its own thread; the drain runs on the loop thread).
+    pub commit_succeeded: std::sync::atomic::AtomicUsize,
+    /// #1709 family — the per-lifecycle contributor-consumption cursor. The
+    /// envelope's `contributors` snapshot is FROZEN for the turn (the field
+    /// is owned, and [`GitTool::dispatch`] takes `&self`, so it cannot be
+    /// mutated at the commit boundary). This cursor is the interior-mutable
+    /// view of how many of those frozen contributors a confirmed successful
+    /// commit has already consumed: [`LocalGitTool::finalize_commit_message`]
+    /// renders only `contributors[cursor..]`, and each `commit`/`amend`/
+    /// `rebase` arm advances `cursor → contributors.len()` on success. So a
+    /// SECOND commit in the SAME tool/turn lifecycle (C1 → more work → C2)
+    /// sees an empty contributor slice and re-credits nobody from C1 — the
+    /// snapshot is consumed at the actual commit boundary, not deferred to
+    /// the end-of-turn drain. Reset to 0 by the session loop when it
+    /// refreshes the envelope at the top of each iteration. Atomic for the
+    /// same cross-thread reason as `commit_succeeded`.
+    pub contributors_consumed: std::sync::atomic::AtomicUsize,
 }
 
 impl LocalGitTool {
@@ -967,57 +1032,76 @@ impl LocalGitTool {
     pub fn head_snapshot(&self, caps: &GitCaveats) -> Result<HeadSnapshot, GitError> {
         GitEngine::open(&self.root)?.head_snapshot(caps)
     }
-}
 
-/// Append the `coauthor` trailer to a commit message, unless the message
-/// already carries any `Co-authored-by:` line (case-insensitive) — the user's
-/// "skip if one already present" rule. Pure, for testing.
-///
-/// The `coauthor` value carries the stable identity line(s) built at session
-/// start (`Co-authored-by:` + `Model:`). This function stamps the volatile,
-/// commit-time fields (`Harness`, `Operator`, `Time`, `Date`) so they reflect
-/// when the commit was actually created, not when the session began.
-fn sign_message(message: &str, coauthor: Option<&str>) -> String {
-    match coauthor {
-        Some(trailer) if !message.to_lowercase().contains("co-authored-by:") => {
-            format!("{}\n\n{}", message.trim_end(), attribution_block(trailer))
+    /// The ONE first-class commit-message attribution boundary (#1709
+    /// integration). Every `commit` / `amend` / `rebase` arm routes its
+    /// model-provided subject+body through here, so no caller independently
+    /// formats attribution — the typed [`CommitAttribution`] owns it
+    /// (deterministic, idempotent, replaces stale Newt-owned trailers,
+    /// preserves legitimate third-party ones). Returns the message unchanged
+    /// when no attribution is configured (test scaffolds).
+    ///
+    /// [`CommitAttribution`]: newt_core::attribution::CommitAttribution
+    fn finalize_commit_message(&self, message: &str) -> String {
+        match &self.attribution {
+            // Semantic B: the envelope's `contributors` snapshot (the
+            // accumulated ledger, captured at the latest refresh) is merged
+            // with the active model by `finalize_message` →
+            // `finalize_message_with`, so every contributing model is
+            // credited. An empty snapshot yields the single active-model
+            // floor (semantic A).
+            //
+            // #1709 family: the snapshot is CONSUMED at the commit boundary,
+            // not the end-of-turn boundary. `contributors_consumed` is a
+            // cursor into the frozen `contributors` Vec — render only the
+            // UNCONSUMED tail `contributors[cursor..]`. A prior successful
+            // commit in this same lifecycle advanced the cursor past the
+            // contributors it already credited, so this commit re-credits
+            // none of them (C1 → more work → C2: C2's slice is empty).
+            Some(a) => {
+                let cursor = self
+                    .contributors_consumed
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let start = cursor.min(a.contributors.len());
+                a.finalize_message_with(message, &a.contributors[start..])
+            }
+            None => message.to_string(),
         }
-        _ => message.to_string(),
+    }
+
+    /// Consume the contributor snapshot at the confirmed-successful commit
+    /// boundary — advance the cursor past every contributor the just-landed
+    /// commit credited, so a subsequent commit in the SAME lifecycle re-credits
+    /// none of them. No-op when no attribution is configured (test scaffolds).
+    fn consume_contributors(&self) {
+        if let Some(a) = &self.attribution {
+            self.contributors_consumed
+                .store(a.contributors.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Drain the explicit commit-success counter — returns the number of
+    /// Newt commits that ACTUALLY landed since the last drain, and resets it
+    /// to zero. The session loop calls this after a turn and clears the
+    /// contributor ledger ONLY when it is non-zero (a confirmed successful
+    /// commit), never merely because `HEAD` moved (the historical
+    /// stale-attribution class). See [`LocalGitTool::commit_succeeded`].
+    #[must_use]
+    pub fn drain_commit_success(&self) -> usize {
+        self.commit_succeeded
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
-/// The full attribution footer: the session-built `trailer` — now
-/// potentially several `Co-authored-by:` lines, one per
-/// [`newt_core::attribution::Attribution`] contributor (#1707/#1709), no
-/// longer a single line + a redundant `Model:` line — followed by the
-/// commit-time Harness/Operator/Time/Date line. Pure given the clock +
-/// process env; reads `NEWT_BRAND_NAME` / `NEWT_OPERATOR` / `git config
-/// user.name` lazily at commit time.
-fn attribution_block(trailer: &str) -> String {
-    let harness = format!(
-        "{} v{}",
-        newt_core::build_info::harness_name(),
-        newt_core::build_info::VERSION_WITH_COMMIT
-    );
-    let operator = operator_name().unwrap_or_else(|| "unknown".to_string());
-    let now = chrono::Local::now();
-    format!(
-        "{trailer}\nHarness: {harness} | Operator: {operator} | Time: {} | Date: {}",
-        now.format("%H:%M %Z"),
-        now.format("%Y-%m-%d"),
-    )
-}
-
-/// The operator name for the footer: `NEWT_OPERATOR` override, then git's
-/// `user.name`, then `GIT_AUTHOR_NAME`, then the OS username.
-fn operator_name() -> Option<String> {
-    if let Ok(v) = std::env::var("NEWT_OPERATOR") {
-        if !v.trim().is_empty() {
-            return Some(v.trim().to_string());
-        }
-    }
-    newt_core::agent_identity::default_operator()
-}
+// #1709 integration: commit-message attribution is owned by the canonical
+// finalizer [`CommitAttribution::finalize_message`] (in `newt-core`), reached
+// through [`LocalGitTool::finalize_commit_message`]. The old per-call
+// `sign_message` + `attribution_block` + `operator_name` formatting — which
+// duplicated the finalizer and stamped a non-deterministic wall-clock
+// `Time`/`Date` footer — is removed; every commit arm now routes through the
+// one shared boundary so no caller formats attribution itself.
+//
+// [`CommitAttribution`]: newt_core::attribution::CommitAttribution
 
 impl newt_core::agentic::GitTool for LocalGitTool {
     fn dispatch(
@@ -1075,22 +1159,63 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                     .and_then(|v| v.as_str())
                     .filter(|m| !m.trim().is_empty())
                     .ok_or("commit: 'message' is required")?;
-                let signed = sign_message(msg, self.coauthor.as_deref());
+                let signed = self.finalize_commit_message(msg);
                 let c = eng.commit(caps, &signed, &self.author).map_err(s)?;
+                // #1709 family: the explicit commit-success signal — a confirmed
+                // Newt commit landed. The session loop clears the contributor
+                // ledger off THIS, not a `HEAD` diff.
+                self.commit_succeeded
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // #1709 family: consume the contributor snapshot AT the commit
+                // boundary — the contributors this commit just credited are
+                // spent, so a second commit in this same lifecycle re-credits
+                // none of them.
+                self.consume_contributors();
                 Ok(format!("committed {}: {}", c.short_id, c.summary))
             }
             "amend" => {
                 // Optional message: present → reword (signed); absent → keep
-                // HEAD's existing message (which already carries its trailer, so
-                // no re-sign needed).
+                // HEAD's existing message. #1709 req 7: even with NO new
+                // message, read HEAD's existing FULL message and run it through
+                // the canonical attribution finalizer before creating the
+                // amended commit, so attribution is REFRESHED (a `/model`
+                // switch since the original commit replaces the stale Newt
+                // model trailers + provenance; legitimate third-party trailers
+                // and the user subject/body are preserved — the finalizer is
+                // idempotent). When no attribution is configured (test
+                // scaffolds), fall back to the engine's "keep HEAD's message"
+                // path (pass `None`) so an unborn-HEAD amend still reports its
+                // own error rather than a read failure.
                 let msg = args
                     .get("message")
                     .and_then(|v| v.as_str())
                     .filter(|m| !m.trim().is_empty());
-                let signed = msg.map(|m| sign_message(m, self.coauthor.as_deref()));
+                let signed = match (&self.attribution, msg) {
+                    (Some(_), Some(m)) => Some(self.finalize_commit_message(m)),
+                    (Some(_), None) => {
+                        let head_msg = eng.head_message(caps).map_err(s)?;
+                        // Unborn HEAD → empty: let `eng.amend(None, …)` report
+                        // "nothing to amend" rather than finalizing an empty
+                        // string into a bogus message.
+                        if head_msg.is_empty() {
+                            None
+                        } else {
+                            Some(self.finalize_commit_message(&head_msg))
+                        }
+                    }
+                    (None, Some(m)) => Some(m.to_string()),
+                    (None, None) => None,
+                };
                 let c = eng
                     .amend(caps, signed.as_deref(), &self.author)
                     .map_err(s)?;
+                // #1709 family: amend creates a commit too — signal it.
+                self.commit_succeeded
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // #1709 family: amend finalized from the same frozen snapshot;
+                // consume it here too so a later commit in this lifecycle does
+                // not re-credit the contributors amend just stamped.
+                self.consume_contributors();
                 Ok(format!("amended {}: {}", c.short_id, c.summary))
             }
             "rebase" => {
@@ -1099,11 +1224,49 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                     .and_then(|v| v.as_str())
                     .filter(|o| !o.trim().is_empty())
                     .ok_or("rebase: 'onto' (the base commit/ref to replay onto) is required")?;
-                let steps = parse_rebase_plan(args, self.coauthor.as_deref())?;
+                let steps = parse_rebase_plan(args)?;
                 if steps.is_empty() {
                     return Err("rebase: 'plan' must list at least one step".to_string());
                 }
-                let r = eng.rebase(caps, onto, &steps, &self.author).map_err(s)?;
+                // #1709 req 9: every newly created rebase commit (pick/reword/
+                // squash) is finalized through the SAME canonical finalizer as
+                // `commit`/`amend` — `finalize_commit_message` reads the
+                // consumption cursor, which is stable for the whole rebase (it
+                // advances once, below, after the rebase lands), so every
+                // rebase commit shares the one frozen contributor slice. `None`
+                // when no attribution is configured (test scaffolds) → messages
+                // pass through untouched.
+                let r = {
+                    // Bind the closure to a `let` so it outlives the `&` borrow
+                    // (rustc 1.88 rejects the temporary-closure form E0716).
+                    let finalize_fn = |m: &str| self.finalize_commit_message(m);
+                    let finalize: Option<&dyn Fn(&str) -> String> = match &self.attribution {
+                        Some(_) => Some(&finalize_fn),
+                        None => None,
+                    };
+                    eng.rebase(caps, onto, &steps, &self.author, finalize)
+                        .map_err(s)?
+                };
+                // #1709 family: a rebase is an attribution EPOCH only when it
+                // actually PRODUCED commits (`r.produced > 0`). An all-drop plan
+                // (`produced == 0`) is a successful history operation — it
+                // rewrites nothing and creates no commit — so it is NOT an
+                // attribution epoch: the pending contributors are PRESERVED (a
+                // later commit in this lifecycle still credits them), and
+                // `commit_succeeded` is NOT reported (no Newt commit landed for
+                // the turn telemetry to count). Gating both the explicit
+                // commit-success signal AND the contributor-snapshot consumption
+                // on `produced > 0` keeps the two consumption paths (this
+                // per-tool cursor + the session-loop ledger clear) in agreement:
+                // a 0-produced rebase consumes nothing on either path.
+                if r.produced > 0 {
+                    self.commit_succeeded
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // The rebase's reword/squash steps finalized from the same
+                    // frozen contributor slice; consume it so a later commit in
+                    // this lifecycle does not re-credit them.
+                    self.consume_contributors();
+                }
                 Ok(format!(
                     "rebased onto {onto} → {} ({} commit(s), {} dropped)",
                     r.new_head, r.produced, r.dropped
@@ -1159,12 +1322,12 @@ impl newt_core::agentic::GitTool for LocalGitTool {
 }
 
 /// Parse the `plan` array (`[{commit, action, message?}]`) into `RebaseStep`s.
-/// `reword`/`squash` messages are signed with the co-author trailer (the tool
-/// owns signing), so rebased commits keep the AI credit too.
-fn parse_rebase_plan(
-    args: &serde_json::Value,
-    coauthor: Option<&str>,
-) -> Result<Vec<RebaseStep>, String> {
+/// Messages are passed through RAW — finalization (canonical attribution) is
+/// the engine's job now: [`GitEngine::rebase`] applies the shared finalizer to
+/// every newly created commit's joined message (pick / reword / squash), so no
+/// rebase path formats attribution itself and an ordinary `pick` receives
+/// canonical attribution too (#1709 req 9).
+fn parse_rebase_plan(args: &serde_json::Value) -> Result<Vec<RebaseStep>, String> {
     let plan = args
         .get("plan")
         .and_then(|v| v.as_array())
@@ -1188,14 +1351,12 @@ fn parse_rebase_plan(
                 ))
             }
         };
+        // Raw message — the engine finalizes at commit-creation time.
         let message = e
             .get("message")
             .and_then(|v| v.as_str())
             .filter(|m| !m.trim().is_empty())
-            .map(|m| match action {
-                RebaseAction::Reword | RebaseAction::Squash => sign_message(m, coauthor),
-                _ => m.to_string(),
-            });
+            .map(str::to_string);
         steps.push(RebaseStep {
             commit,
             action,
@@ -1611,9 +1772,16 @@ mod tests {
                 name: "newt-agent[bot]".into(),
                 email: "bot@example.com".into(),
             },
-            coauthor: Some(
-                "Co-authored-by: qwen3:30b (newt-agent v0.6.8) <noreply@newt-agent.com>".into(),
-            ),
+            // The canonical attribution the session would refresh from the live
+            // model + resolved identity. `from_runtime` is tool-less, so this
+            // is deterministic in tests (no wall clock, no subprocess).
+            attribution: Some(newt_core::attribution::CommitAttribution::from_runtime(
+                "qwen3:30b",
+                None,
+                "noreply@newt-agent.com",
+            )),
+            commit_succeeded: std::sync::atomic::AtomicUsize::new(0),
+            contributors_consumed: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1653,6 +1821,245 @@ mod tests {
             )
             .unwrap();
         assert!(c.contains("committed"), "got: {c}");
+    }
+
+    /// #1709 family (req 1): the contributor ledger must clear ONLY after an
+    /// explicitly confirmed successful commit, never merely because `HEAD`
+    /// changed. [`LocalGitTool::drain_commit_success`] is that explicit signal
+    /// — it returns the number of Newt commits that ACTUALLY landed since the
+    /// last drain (and resets it), so the session loop clears the ledger off
+    /// THIS, not a `HEAD` diff. This grounds the chat.rs clear-site change: a
+    /// successful `commit`/`amend`/`rebase` increments the counter; a failed
+    /// commit, a denied commit, or a no-op leaves it at zero. Real-resource
+    /// (tempdir + real git) because "did a commit land" is a property of the
+    /// real git engine, not a mock.
+    #[test]
+    fn drain_commit_success_signals_only_a_confirmed_landing() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = tool(dir.path());
+        t.dispatch("init", &serde_json::json!({}), &GitCaveats::top())
+            .unwrap();
+        // No commit yet → drain is zero (a bare `HEAD` move from init does NOT
+        // count as a contributor-consuming commit).
+        assert_eq!(t.drain_commit_success(), 0);
+        std::fs::write(dir.path().join("f.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["f.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        // A FAILED commit (empty message is rejected) does NOT signal.
+        let bad = t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "   "}),
+            &GitCaveats::top(),
+        );
+        assert!(bad.is_err(), "empty message must be rejected");
+        assert_eq!(
+            t.drain_commit_success(),
+            0,
+            "a failed commit does not signal"
+        );
+        // A CONFIRMED successful commit signals exactly one.
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "first"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        assert_eq!(t.drain_commit_success(), 1, "one confirmed commit");
+        // Draining resets the counter — a second drain reads zero.
+        assert_eq!(t.drain_commit_success(), 0, "drain resets the counter");
+        // Amend is also a commit creation → signals.
+        t.dispatch(
+            "amend",
+            &serde_json::json!({"message": "first (reworded)"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        assert_eq!(t.drain_commit_success(), 1, "amend signals a commit");
+    }
+
+    /// #1709 family: the contributor snapshot is CONSUMED at the actual
+    /// successful commit boundary, not deferred to the end-of-turn drain.
+    /// Within ONE tool/turn lifecycle (one frozen envelope), commit C1
+    /// credits the envelope's accumulated contributors, then "more work" →
+    /// commit C2 in the SAME lifecycle must NOT re-credit C1's contributors:
+    /// C1's success advanced the consumption cursor past them, so C2's
+    /// contributor slice is empty and it credits only the active model.
+    ///
+    /// Real git (tempdir + real commits) because "the trailer landed on C1
+    /// and NOT on C2" is a property of the real commit objects, not a mock —
+    /// this grounds the cursor logic in `finalize_commit_message` /
+    /// `consume_contributors`. The active model (`qwen3:30b`) deliberately
+    /// differs from the accumulated contributor (`model-a`) so the
+    /// distinction is visible: C1 credits BOTH, C2 credits ONLY the active
+    /// model.
+    #[test]
+    fn contributor_snapshot_consumed_at_commit_boundary_not_turn_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = tool(dir.path());
+        // Inject one accumulated contributor (model-a) into the envelope —
+        // the session loop would snapshot this from the ledger at loop-top.
+        if let Some(a) = t.attribution.as_mut() {
+            a.contributors
+                .push(newt_core::attribution::Attribution::new(
+                    "model-a",
+                    "newt-agent",
+                    newt_core::build_info::PACKAGE_VERSION,
+                    "noreply@newt-agent.com",
+                ));
+        }
+        t.dispatch("init", &serde_json::json!({}), &GitCaveats::top())
+            .unwrap();
+
+        // C1: credits model-a (contributor) + qwen3:30b (active).
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["a.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "C1"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let c1 = head_message(dir.path());
+        let version = newt_core::build_info::PACKAGE_VERSION;
+        assert!(
+            c1.contains(&format!(
+                "Co-authored-by: model-a (newt-agent v{version}) <noreply@newt-agent.com>"
+            )),
+            "C1 credits the accumulated contributor A: {c1}"
+        );
+        assert!(
+            c1.contains(&format!(
+                "Co-authored-by: qwen3:30b (newt-agent v{version}) <noreply@newt-agent.com>"
+            )),
+            "C1 credits the active model B: {c1}"
+        );
+
+        // "more work" then C2 in the SAME lifecycle (same frozen envelope;
+        // C1's success advanced the cursor past model-a).
+        std::fs::write(dir.path().join("b.txt"), "y\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["b.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "C2"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let c2 = head_message(dir.path());
+        assert!(
+            !c2.contains("model-a"),
+            "C2 must NOT re-credit A — its snapshot was consumed at C1's boundary: {c2}"
+        );
+        assert!(
+            c2.contains(&format!(
+                "Co-authored-by: qwen3:30b (newt-agent v{version}) <noreply@newt-agent.com>"
+            )),
+            "C2 still credits the active model B: {c2}"
+        );
+        // Two distinct commits landed in the one lifecycle.
+        assert_eq!(commit_count(dir.path()), 2);
+        // The cursor now sits at the (frozen) contributor count; a THIRD
+        // commit in this lifecycle would also credit only the active model.
+        std::fs::write(dir.path().join("c.txt"), "z\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "C3"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let c3 = head_message(dir.path());
+        assert!(
+            !c3.contains("model-a"),
+            "C3 still does not re-credit A: {c3}"
+        );
+        assert_eq!(commit_count(dir.path()), 3);
+    }
+
+    /// #1709 family: a FAILED commit must NOT consume the contributor
+    /// snapshot — `consume_contributors` runs only AFTER `eng.commit` succeeds
+    /// (the `?` returns early on failure), so a denied/failed commit leaves
+    /// the cursor at 0 and the contributors remain available for the next
+    /// attempt. Real git (tempdir) because "the cursor did not advance" is a
+    /// property of the real dispatch path through `eng.commit`, not a mock.
+    #[test]
+    fn failed_commit_does_not_consume_contributors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = tool(dir.path());
+        // One accumulated contributor on the frozen envelope.
+        if let Some(a) = t.attribution.as_mut() {
+            a.contributors
+                .push(newt_core::attribution::Attribution::new(
+                    "model-a",
+                    "newt-agent",
+                    newt_core::build_info::PACKAGE_VERSION,
+                    "noreply@newt-agent.com",
+                ));
+        }
+        t.dispatch("init", &serde_json::json!({}), &GitCaveats::top())
+            .unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["a.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+
+        // A commit DENIED by capability fails inside `eng.commit`; the `?`
+        // returns before `consume_contributors`, so the cursor stays 0.
+        let denied = t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "denied"}),
+            &GitCaveats::read_only(),
+        );
+        assert!(denied.is_err(), "read-only caps deny the commit");
+        let cursor = t
+            .contributors_consumed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            cursor, 0,
+            "a failed commit must NOT consume contributors (cursor still 0): {cursor}"
+        );
+        // No commit landed, so the success counter is also untouched.
+        assert_eq!(t.drain_commit_success(), 0);
+
+        // The retry, with commit authority, succeeds and DOES credit the
+        // contributor that the failed attempt left intact.
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "C1"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let c1 = head_message(dir.path());
+        let version = newt_core::build_info::PACKAGE_VERSION;
+        assert!(
+            c1.contains(&format!(
+                "Co-authored-by: model-a (newt-agent v{version}) <noreply@newt-agent.com>"
+            )),
+            "the contributor survived the failed commit and is credited on the retry: {c1}"
+        );
+        assert_eq!(commit_count(dir.path()), 1);
+        assert_eq!(t.drain_commit_success(), 1);
     }
 
     #[test]
@@ -1719,57 +2126,60 @@ mod tests {
         assert!(err.contains("branch-delete"), "{err}");
     }
 
+    /// #1709 integration: the tool's commit-message attribution now flows
+    /// through ONE boundary — [`LocalGitTool::finalize_commit_message`] →
+    /// [`CommitAttribution::finalize_message`] — not the removed
+    /// `sign_message`/`attribution_block` pair. The model may supply a bare
+    /// subject with zero attribution text; the harness owns the trailer +
+    /// provenance, deterministically (no wall clock) and idempotently.
+    ///
+    /// [`CommitAttribution`]: newt_core::attribution::CommitAttribution
     #[test]
-    fn sign_message_appends_trailer_then_dedups() {
-        let tr = "Co-authored-by: qwen3:30b (newt-agent v0.6.8) <noreply@newt-agent.com>";
-        // Plain message → attribution block appended after a blank line, and
-        // the commit-time Harness/Operator/Time/Date footer is stamped.
-        let out = sign_message("docs: tweak", Some(tr));
-        assert!(out.starts_with(&format!("docs: tweak\n\n{tr}")), "{out}");
-        assert!(out.contains("Harness: "), "{out}");
-        assert!(out.contains(" | Operator: "), "{out}");
-        assert!(out.contains(" | Time: "), "{out}");
-        assert!(out.contains(" | Date: "), "{out}");
-        // Message already carrying a co-authored-by → left untouched (no dup).
-        let already = "feat: x\n\nCo-authored-by: someone <a@b.c>";
-        assert_eq!(sign_message(already, Some(tr)), already);
-        // No trailer configured → message unchanged.
-        assert_eq!(sign_message("m", None), "m");
-    }
-
-    #[test]
-    fn attribution_block_stamps_commit_time_footer_fields() {
-        // Grounds the mocked trailer tests: the footer carries the live
-        // harness version, an operator, and a commit-time Time/Date stamp.
-        let block = attribution_block("Co-authored-by: m <a@b.c>\nModel: m");
-        assert!(block.contains("Model: m"), "{block}");
+    fn finalize_commit_message_owns_attribution_deterministically() {
+        let t = tool(Path::new(".")); // root unused by finalize_commit_message
+                                      // Bare subject, zero attribution text → canonical trailer + provenance.
+        let out = t.finalize_commit_message("fix the parser");
+        let version = newt_core::build_info::PACKAGE_VERSION;
         assert!(
-            block.contains(&format!(
-                "Harness: newt-agent v{}",
-                newt_core::build_info::VERSION_WITH_COMMIT
+            out.contains(&format!(
+                "Co-authored-by: qwen3:30b (newt-agent v{version}) <noreply@newt-agent.com>"
             )),
-            "default brand + real version: {block}"
+            "canonical model trailer rendered from the typed value: {out}"
         );
-        assert!(block.contains("Operator: "), "{block}");
-        // Time is `HH:MM <zone>` and Date is `YYYY-MM-DD`. The zone token is
-        // platform-provided: a tz abbreviation (e.g. `EDT`) where the host
-        // supplies one, else a numeric offset (`-04:00`). Assert the shape,
-        // not one platform's spelling.
-        let footer = block.lines().last().unwrap();
-        let time = footer
-            .split("Time: ")
-            .nth(1)
-            .unwrap()
-            .split(" | ")
-            .next()
-            .unwrap();
-        let mut parts = time.split_whitespace();
-        let hhmm = parts.next().unwrap_or("");
-        assert_eq!(hhmm.len(), "12:34".len(), "HH:MM: {time}");
-        assert_eq!(hhmm.chars().nth(2), Some(':'), "HH:MM colon: {time}");
-        assert!(parts.next().is_some(), "a zone token follows HH:MM: {time}");
-        let date = footer.rsplit("Date: ").next().unwrap();
-        assert_eq!(date.len(), "2026-08-12".len(), "YYYY-MM-DD: {date}");
+        assert!(
+            out.contains("Harness: newt-agent v")
+                && out.contains(" | Model: qwen3:30b | Operator: "),
+            "canonical provenance line rendered from the same value: {out}"
+        );
+        assert!(
+            !out.contains("Time:"),
+            "no wall-clock field (deterministic): {out}"
+        );
+        assert!(
+            out.starts_with("fix the parser\n\n"),
+            "subject preserved verbatim: {out}"
+        );
+        // A legitimate third-party co-author is preserved verbatim.
+        let with_third = "feat: x\n\nCo-authored-by: someone <a@b.c>";
+        let out2 = t.finalize_commit_message(with_third);
+        assert!(
+            out2.contains("Co-authored-by: someone <a@b.c>"),
+            "third-party kept: {out2}"
+        );
+        assert!(
+            out2.contains("Co-authored-by: qwen3:30b"),
+            "newt model trailer added: {out2}"
+        );
+        // Idempotent: re-finalizing the finalized message yields the same bytes.
+        assert_eq!(
+            t.finalize_commit_message(&out),
+            out,
+            "idempotent re-finalization"
+        );
+        // No attribution configured → message unchanged (test opt-out path).
+        let mut t2 = t;
+        t2.attribution = None;
+        assert_eq!(t2.finalize_commit_message("m"), "m");
     }
 
     #[test]
@@ -1797,9 +2207,311 @@ mod tests {
             .unwrap();
         let body = String::from_utf8_lossy(&log.stdout);
         assert!(body.contains("add c"), "subject present: {body}");
+        // The canonical harness-managed trailer + provenance, rendered from the
+        // typed CommitAttribution (real package version, the configured email).
+        let version = newt_core::build_info::PACKAGE_VERSION;
         assert!(
-            body.contains("Co-authored-by: qwen3:30b (newt-agent v0.6.8)"),
-            "trailer present: {body}"
+            body.contains(&format!(
+                "Co-authored-by: qwen3:30b (newt-agent v{version}) <noreply@newt-agent.com>"
+            )),
+            "canonical model trailer present: {body}"
+        );
+        assert!(
+            body.contains("Harness: newt-agent v")
+                && body.contains(" | Model: qwen3:30b | Operator: "),
+            "canonical provenance line present: {body}"
+        );
+    }
+
+    /// #1709 acceptance condition: a model may supply a bare subject —
+    /// "fix the parser" — with ZERO attribution text, and the resulting
+    /// first-class Newt commit still carries correct harness-managed
+    /// attribution (the canonical model trailer + provenance, rendered from
+    /// the typed `CommitAttribution` through the one shared finalizer
+    /// boundary). Grounds the mocked `finalize_commit_message` test against a
+    /// real commit read back via system git.
+    #[test]
+    fn bare_model_subject_still_gets_harness_managed_attribution() {
+        let dir = repo_with_commit();
+        std::fs::write(dir.path().join("p.txt"), "x\n").unwrap();
+        let t = tool(dir.path());
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["p.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        // Bare subject, no attribution text whatsoever from the model.
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "fix the parser"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let body = head_message(dir.path());
+        assert!(body.contains("fix the parser"), "subject preserved: {body}");
+        let version = newt_core::build_info::PACKAGE_VERSION;
+        assert!(
+            body.contains(&format!(
+                "Co-authored-by: qwen3:30b (newt-agent v{version}) <noreply@newt-agent.com>"
+            )),
+            "canonical model trailer added by the harness: {body}"
+        );
+        assert!(
+            body.contains(" | Model: qwen3:30b | Operator: "),
+            "canonical provenance line added by the harness: {body}"
+        );
+    }
+
+    /// #551 regression at the commit boundary: a `/model` switch between two
+    /// commits must attribute EACH commit to the model actually driving it.
+    /// The second commit carries model B — not a stale model A frozen earlier
+    /// — and the first commit is NOT retroactively rewritten. This crosses the
+    /// `/model` → `session_git_tool.attribution` → `finalize_commit_message`
+    /// boundary at the REAL commit level: the unit-tier
+    /// `fresh_construction_reflects_a_model_switch` proves the construction
+    /// half (a fresh `CommitAttribution` sees the new model); this proves the
+    /// WIRED commit half. It mirrors the per-loop-iteration refresh in
+    /// `newt-tui::chat` (`tool.attribution = from_identity(&inf_model, …)`)
+    /// by refreshing `tool.attribution` between commits, then reads each
+    /// commit back via system git. Real-resource (real git) → grounds the
+    /// mocked `finalize_commit_message` tests against actual history.
+    #[test]
+    fn model_switch_between_commits_attributes_each_to_the_live_model() {
+        let dir = repo_with_commit();
+        let p = dir.path();
+        // Session boots under model A.
+        let mut t = tool(p);
+        t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(
+            "model-a",
+            None,
+            "noreply@newt-agent.com",
+        ));
+
+        // Commit C1 under model A.
+        std::fs::write(p.join("c1.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c1.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "c1 under model A"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let body_c1 = head_message(p);
+        assert!(
+            body_c1.contains(" | Model: model-a | "),
+            "C1 → model A: {body_c1}"
+        );
+        assert!(!body_c1.contains("model-b"), "C1 has no model B: {body_c1}");
+
+        // `/model model-b`: refresh the tool's attribution, exactly as the chat
+        // loop does at the top of the next iteration before the turn's ChatCtx.
+        t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(
+            "model-b",
+            None,
+            "noreply@newt-agent.com",
+        ));
+        // Commit C2 under model B.
+        std::fs::write(p.join("c2.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c2.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "c2 under model B"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let body_c2 = head_message(p);
+        assert!(
+            body_c2.contains(" | Model: model-b | "),
+            "C2 → the LIVE model B at commit time: {body_c2}"
+        );
+        assert!(
+            !body_c2.contains("model-a"),
+            "model A does NOT survive as stale Newt attribution on C2 (#551): {body_c2}"
+        );
+
+        // The switch did not retroactively rewrite C1 — model A is still there.
+        let c1_again = Command::new("git")
+            .current_dir(p)
+            .args(["log", "--pretty=%B", "--skip=1", "-1"])
+            .output()
+            .unwrap();
+        let body_c1_still = String::from_utf8_lossy(&c1_again.stdout).to_string();
+        assert!(
+            body_c1_still.contains(" | Model: model-a | "),
+            "C1 unchanged after the switch (no backward leakage): {body_c1_still}"
+        );
+        assert!(
+            !body_c1_still.contains("model-b"),
+            "C1 not corrupted with model B: {body_c1_still}"
+        );
+
+        // `/model model-a` back to a previous model (req 7): switching back works.
+        t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(
+            "model-a",
+            None,
+            "noreply@newt-agent.com",
+        ));
+        std::fs::write(p.join("c3.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c3.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "c3 back under model A"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let body_c3 = head_message(p);
+        assert!(
+            body_c3.contains(" | Model: model-a | "),
+            "C3 → model A after switching back to a previous model: {body_c3}"
+        );
+    }
+
+    /// #551 for the amend path (req 8): amending after a `/model` switch
+    /// re-signs the commit with the LIVE model's attribution, not the stale
+    /// model that authored the original commit. The amend arm calls
+    /// `finalize_commit_message` with the current `tool.attribution`, so the
+    /// switched model is what lands. Real-resource (real git).
+    #[test]
+    fn amend_after_a_model_switch_resigns_with_the_live_model() {
+        let dir = repo_with_commit();
+        let p = dir.path();
+        let mut t = tool(p);
+        t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(
+            "model-a",
+            None,
+            "noreply@newt-agent.com",
+        ));
+        std::fs::write(p.join("c1.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c1.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "orig under model A"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        assert!(head_message(p).contains(" | Model: model-a | "));
+
+        // `/model model-b`, then amend the commit.
+        t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(
+            "model-b",
+            None,
+            "noreply@newt-agent.com",
+        ));
+        std::fs::write(p.join("c2.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c2.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "amend",
+            &serde_json::json!({"message": "reworded under model B"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let body = head_message(p);
+        assert!(
+            body.contains(" | Model: model-b | "),
+            "amended commit → the live model B: {body}"
+        );
+        assert!(
+            !body.contains("model-a"),
+            "stale model A did NOT survive the amend (#551): {body}"
+        );
+        assert!(
+            body.contains("reworded under model B"),
+            "amend subject preserved: {body}"
+        );
+    }
+
+    /// #1709 req 8: `amend` with NO new message still REFRESHES attribution.
+    /// The amend arm reads HEAD's existing full message and runs it through the
+    /// canonical finalizer before creating the amended commit, so a `/model`
+    /// switch since the original commit replaces the stale Newt model trailers
+    /// and provenance (the user subject/body and third-party trailers are
+    /// preserved).
+    ///
+    /// Real-resource (real git).
+    #[test]
+    fn amend_with_no_message_refreshes_attribution_after_a_model_switch() {
+        let dir = repo_with_commit();
+        let p = dir.path();
+        let mut t = tool(p);
+        t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(
+            "model-a",
+            None,
+            "noreply@newt-agent.com",
+        ));
+        std::fs::write(p.join("c1.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c1.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "orig under model A"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let before = head_message(p);
+        assert!(
+            before.contains(" | Model: model-a | "),
+            "C1 → model A: {before}"
+        );
+        assert!(before.contains("orig under model A"));
+
+        // `/model model-b`, stage more work, then amend with NO message.
+        t.attribution = Some(newt_core::attribution::CommitAttribution::from_runtime(
+            "model-b",
+            None,
+            "noreply@newt-agent.com",
+        ));
+        std::fs::write(p.join("c2.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c2.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch("amend", &serde_json::json!({}), &GitCaveats::top())
+            .unwrap();
+        let body = head_message(p);
+        assert!(
+            body.contains(" | Model: model-b | "),
+            "amend(no message) → the LIVE model B: {body}"
+        );
+        assert!(
+            !body.contains("model-a"),
+            "stale model A did NOT survive amend(no message): {body}"
+        );
+        // The original subject/body is preserved (not erased by re-finalization).
+        assert!(
+            body.contains("orig under model A"),
+            "amend(no message) preserved the user subject/body: {body}"
         );
     }
 
@@ -2028,6 +2740,45 @@ mod tests {
         // b.txt and c.txt still present (changes preserved).
     }
 
+    /// #1709 req 9: an ordinary `pick` (NOT reword/squash) — which replays the
+    /// original commit's message verbatim — receives canonical Newt attribution
+    /// too. Every newly created rebase commit is finalized through the same
+    /// finalizer as `commit`/`amend`. The user subject/body is preserved; the
+    /// Newt model trailer + Harness provenance are appended. Real-resource.
+    #[test]
+    fn rebase_pick_commit_receives_canonical_attribution() {
+        let (dir, oids) = repo_with_three();
+        let p = dir.path();
+        let t = tool(p);
+        // The picked commit (c3) was authored by "T <t@e.c>" with a bare
+        // subject "c3" and NO attribution. Replay it with a plain `pick`.
+        t.dispatch(
+            "rebase",
+            &serde_json::json!({
+                "onto": oids[0],
+                "plan": [
+                    {"commit": oids[1], "action": "pick"},
+                    {"commit": oids[2], "action": "pick"},
+                ]
+            }),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        // The HEAD commit (c3 replayed) now carries canonical attribution.
+        let body = head_message(p);
+        assert!(
+            body.contains(" | Model: qwen3:30b | "),
+            "pick commit received the live model provenance: {body}"
+        );
+        assert!(
+            body.contains("Co-authored-by: qwen3:30b (newt-agent v"),
+            "pick commit received the model Co-authored-by trailer: {body}"
+        );
+        // The user's original subject/body is preserved.
+        let first_line = body.lines().next().unwrap_or("");
+        assert_eq!(first_line, "c3", "pick preserved the user subject: {body}");
+    }
+
     #[test]
     fn rebase_squashes_two_commits_into_one() {
         let (dir, oids) = repo_with_three();
@@ -2091,6 +2842,82 @@ mod tests {
         assert!(
             !names.contains("c.txt"),
             "dropped commit's file gone: {names}"
+        );
+    }
+
+    /// #1709 family: a rebase that produced ZERO commits (an all-drop plan) is
+    /// a successful history operation but NOT an attribution epoch. It must
+    /// NOT signal `commit_succeeded` and must NOT consume the contributor
+    /// snapshot — pending contributors survive it and a later commit in the
+    /// same lifecycle still credits them. Real git (tempdir + real commits)
+    /// because "the contributor survived onto the next commit" is a property
+    /// of the real commit object, not a mock.
+    #[test]
+    fn rebase_all_drop_preserves_pending_contributors() {
+        let (dir, oids) = repo_with_three();
+        let mut t = tool(dir.path());
+        // Inject one accumulated contributor (model-a) into the envelope.
+        if let Some(a) = t.attribution.as_mut() {
+            a.contributors
+                .push(newt_core::attribution::Attribution::new(
+                    "model-a",
+                    "newt-agent",
+                    newt_core::build_info::PACKAGE_VERSION,
+                    "noreply@newt-agent.com",
+                ));
+        }
+        // All-drop plan: onto c1, drop c2 and c3 → produced == 0, dropped == 2.
+        let out = t
+            .dispatch(
+                "rebase",
+                &serde_json::json!({
+                    "onto": oids[0],
+                    "plan": [
+                        {"commit": oids[1], "action": "drop"},
+                        {"commit": oids[2], "action": "drop"},
+                    ]
+                }),
+                &GitCaveats::top(),
+            )
+            .unwrap();
+        assert!(
+            out.contains("0 commit(s), 2 dropped"),
+            "all-drop rebase produced 0 commits: {out}"
+        );
+        // No Newt commit landed → no commit_succeeded signal.
+        assert_eq!(
+            t.drain_commit_success(),
+            0,
+            "a 0-produced rebase must NOT report commit_succeeded"
+        );
+        // The contributor cursor was NOT advanced: a subsequent commit in the
+        // same lifecycle still credits model-a (the snapshot remains pending).
+        std::fs::write(dir.path().join("d.txt"), "z\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["d.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "after all-drop rebase"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let msg = head_message(dir.path());
+        let version = newt_core::build_info::PACKAGE_VERSION;
+        assert!(
+            msg.contains(&format!(
+                "Co-authored-by: model-a (newt-agent v{version}) <noreply@newt-agent.com>"
+            )),
+            "the pending contributor survived the 0-produced rebase and is credited on the next commit: {msg}"
+        );
+        // That next commit IS an epoch (it produced a commit) → it signals.
+        assert_eq!(
+            t.drain_commit_success(),
+            1,
+            "the commit after the all-drop rebase signals normally"
         );
     }
 

@@ -241,6 +241,23 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// RAII guard that restores an env var to its prior value on drop, so a
+    /// test can mutate the env without leaking state to siblings even if the
+    /// body panics.
+    struct EnvRestore {
+        key: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn exec_program_takes_the_basename_of_the_leading_token() {
         assert_eq!(exec_program("cargo build --release"), Some("cargo"));
@@ -333,11 +350,21 @@ mod tests {
         );
     }
 
+    /// When recording is off (capture env unset), `log_observed` must be a
+    /// no-op that never panics — it's called on every fs/net op under
+    /// `--full-access`. The ambient harness shell may set
+    /// `NEWT_FLIGHT_RECORDER` (it does under `--full-access`), so this test
+    /// isolates the env (save/unset/restore via an RAII guard) rather than
+    /// asserting the ambient env is unset. Serial-gated so the env mutation
+    /// can't race a parallel test that also reads the same var.
     #[test]
+    #[serial_test::serial(flight_recorder_env)]
     fn log_observed_is_a_no_op_when_recording_is_off() {
-        // The hook must never panic or error when the capture env is unset —
-        // it's called on every fs/net op under --full-access. (Env is unset in
-        // the unit run; this asserts the guard, staying fs-free.)
+        let _restore = EnvRestore {
+            key: CAPTURE_PATH_ENV,
+            saved: std::env::var_os(CAPTURE_PATH_ENV),
+        };
+        std::env::remove_var(CAPTURE_PATH_ENV);
         assert!(std::env::var_os(CAPTURE_PATH_ENV).is_none());
         log_observed(ShadowAxis::FsRead, "/ws/x", "read_file");
         log_observed(ShadowAxis::Net, "example.com", "https://example.com");
