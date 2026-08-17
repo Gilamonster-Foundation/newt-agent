@@ -2244,10 +2244,23 @@ fn session_body(
         // model parameter to read at commit time. The typed value owns all
         // rendering downstream; no caller formats attribution itself.
         if let Some(tool) = session_git_tool.as_mut() {
-            tool.attribution = Some(newt_core::attribution::CommitAttribution::from_identity(
+            let mut ca = newt_core::attribution::CommitAttribution::from_identity(
                 &inf_model,
                 &session_identity,
-            ));
+            );
+            // #1707/#1709 semantic B: snapshot the pending multi-contributor
+            // ledger into the envelope here — the latest practical point
+            // before the turn that may commit. The ledger holds every model
+            // that materially contributed since the last commit (a
+            // `/model`/`/backend`/loadout switch ADDS a contributor); the
+            // active model driving THIS turn is merged in by the finalizer
+            // regardless, so this snapshot + the active-model merge credits
+            // every contributor on the one commit. The ledger is cleared on
+            // commit success below, and the next refresh re-snapshots the
+            // (now empty) ledger, so contributors never carry past the commit
+            // that consumed them.
+            ca.contributors = attribution_ledger.borrow().contributors().to_vec();
+            tool.attribution = Some(ca);
         }
         // #1668: the ONE preference-pin persistence site. Every operator
         // posture ACTION marked since the last pass — a successful
@@ -6945,6 +6958,18 @@ fn session_body(
                             .and_then(|s| s.head.as_deref())
                     {
                         attribution_ledger.borrow_mut().clear();
+                        // #1707/#1709 semantic B: the envelope's `contributors`
+                        // snapshot was stamped at the top of this loop; a
+                        // successful commit consumed it, so drop it too —
+                        // otherwise a SECOND commit in the same turn (before
+                        // the next loop-top refresh) would re-credit the
+                        // already-committed contributors. The next refresh
+                        // re-snapshots the now-empty ledger.
+                        if let Some(tool) = session_git_tool.as_mut() {
+                            if let Some(ca) = tool.attribution.as_mut() {
+                                ca.contributors.clear();
+                            }
+                        }
                     }
                     if let (Some(sink), Some(turn)) =
                         (artifact_sink, active_prompt_context.as_ref())

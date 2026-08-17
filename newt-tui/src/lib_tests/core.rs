@@ -36,12 +36,19 @@ fn openai_surface_probe_skips_plain_http_multiplexers() {
 fn attribution_ledger_uses_resolved_identity_email() {
     let id = newt_core::AgentIdentity::default();
     let mut ledger = newt_core::attribution::AttributionLedger::new(id.email.clone());
-    ledger.record("nemotron-3-nano:30b", "newt-agent");
+    ledger.record(
+        "nemotron-3-nano:30b",
+        "newt-agent",
+        newt_core::build_info::PACKAGE_VERSION,
+    );
     // Model name credits the work; the email attributes to the resolved
     // harness identity (default: GitHub User https://github.com/newt-agent).
     assert_eq!(
         ledger.render(),
-        "Co-authored-by: nemotron-3-nano:30b (newt-agent) <309460085+newt-agent@users.noreply.github.com>"
+        format!(
+            "Co-authored-by: nemotron-3-nano:30b (newt-agent v{}) <309460085+newt-agent@users.noreply.github.com>",
+            newt_core::build_info::PACKAGE_VERSION
+        )
     );
     assert!(ledger.render().contains(newt_core::DEFAULT_AGENT_EMAIL));
     assert!(
@@ -59,10 +66,17 @@ fn attribution_ledger_uses_resolved_identity_email() {
         ..newt_core::AgentIdentity::default()
     };
     let mut custom_ledger = newt_core::attribution::AttributionLedger::new(custom.email.clone());
-    custom_ledger.record("ornith:35b", "newt-agent");
+    custom_ledger.record(
+        "ornith:35b",
+        "newt-agent",
+        newt_core::build_info::PACKAGE_VERSION,
+    );
     assert_eq!(
         custom_ledger.render(),
-        "Co-authored-by: ornith:35b (newt-agent) <my-agent@example.com>"
+        format!(
+            "Co-authored-by: ornith:35b (newt-agent v{}) <my-agent@example.com>",
+            newt_core::build_info::PACKAGE_VERSION
+        )
     );
 }
 

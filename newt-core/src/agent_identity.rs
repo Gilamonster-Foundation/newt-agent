@@ -548,6 +548,7 @@ impl AgentIdentity {
         crate::attribution::Attribution::new(
             self.model.as_deref().unwrap_or("<model>"),
             crate::build_info::harness_name(),
+            crate::build_info::PACKAGE_VERSION,
             self.email.clone(),
         )
         .trailer()
@@ -761,7 +762,10 @@ name = "custom[bot]"
         // last — not `name (model) <email>`.
         assert_eq!(
             id.co_author_trailer(),
-            "Co-authored-by: <model> (newt-agent) <309460085+newt-agent@users.noreply.github.com>"
+            format!(
+                "Co-authored-by: <model> (newt-agent v{}) <309460085+newt-agent@users.noreply.github.com>",
+                crate::build_info::PACKAGE_VERSION
+            )
         );
     }
 
@@ -776,7 +780,10 @@ name = "custom[bot]"
         };
         assert_eq!(
             id.co_author_trailer(),
-            "Co-authored-by: sakamakismile/Ornith-1.0-35B-NVFP4 (newt-agent) <309460085+newt-agent@users.noreply.github.com>"
+            format!(
+                "Co-authored-by: sakamakismile/Ornith-1.0-35B-NVFP4 (newt-agent v{}) <309460085+newt-agent@users.noreply.github.com>",
+                crate::build_info::PACKAGE_VERSION
+            )
         );
     }
 

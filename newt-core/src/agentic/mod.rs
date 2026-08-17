@@ -1576,9 +1576,11 @@ fn ledger_note_attribution(
     if !ok || is_read_only_call(name, args) {
         return;
     }
-    ledger
-        .borrow_mut()
-        .record(model, crate::build_info::harness_name());
+    ledger.borrow_mut().record(
+        model,
+        crate::build_info::harness_name(),
+        crate::build_info::PACKAGE_VERSION,
+    );
 }
 
 /// Drain operator steering into `messages` as genuine user turns (#952/#1669).

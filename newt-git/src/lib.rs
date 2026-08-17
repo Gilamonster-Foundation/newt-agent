@@ -951,7 +951,7 @@ pub struct LocalGitTool {
     pub root: std::path::PathBuf,
     pub author: Author,
     /// The canonical, harness-owned commit attribution envelope — the active
-    /// model + harness build + operator/agent identity — finalized into every
+    /// model + harness build + operator/agent identity, finalized into every
     /// commit/amend/rebase message by
     /// [`CommitAttribution::finalize_message`](newt_core::attribution::CommitAttribution::finalize_message).
     /// Refreshed as late as practical before the turn that may commit (in the
@@ -981,6 +981,12 @@ impl LocalGitTool {
     /// [`CommitAttribution`]: newt_core::attribution::CommitAttribution
     fn finalize_commit_message(&self, message: &str) -> String {
         match &self.attribution {
+            // Semantic B: the envelope's `contributors` snapshot (the
+            // accumulated ledger, captured at the latest refresh) is merged
+            // with the active model by `finalize_message` →
+            // `finalize_message_with`, so every contributing model is
+            // credited. An empty snapshot yields the single active-model
+            // floor (semantic A).
             Some(a) => a.finalize_message(message),
             None => message.to_string(),
         }

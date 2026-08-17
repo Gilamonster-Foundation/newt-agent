@@ -35,6 +35,14 @@ pub struct Attribution {
     /// The execution harness the model ran under (e.g. `"newt-agent"`,
     /// `"newt-agent crew"`). Never a model's self-report.
     pub harness: String,
+    /// The harness **version** the model ran under, captured at contribution
+    /// time (e.g. [`crate::build_info::PACKAGE_VERSION`]). Pairs with
+    /// [`Attribution::harness`] so a contributor is always credited under the
+    /// *actual* harness build that ran its work — the same model under
+    /// `v0.7.6` and `v0.8.0` is two distinct contributors, not one ambiguous
+    /// identity (audit Q9). Renders inside the trailer's `(<harness> v<ver>)`
+    /// qualifier, matching [`CommitAttribution::model_trailer`].
+    pub harness_version: String,
     /// The email the credit is attributed to — ordinarily the resolved
     /// [`crate::agent_identity::AgentIdentity`] email (config override, else
     /// [`crate::agent_identity::DEFAULT_AGENT_EMAIL`]).
@@ -46,22 +54,29 @@ impl Attribution {
     pub fn new(
         model: impl Into<String>,
         harness: impl Into<String>,
+        harness_version: impl Into<String>,
         email: impl Into<String>,
     ) -> Self {
         Self {
             model: model.into(),
             harness: harness.into(),
+            harness_version: harness_version.into(),
             email: email.into(),
         }
     }
 
     /// The single `Co-authored-by:` trailer line for this contributor:
-    /// `Co-authored-by: <model> (<harness>) <email>`.
+    /// `Co-authored-by: <model> (<harness> v<harness_version>) <email>` —
+    /// the SAME canonical shape [`CommitAttribution::model_trailer`] renders,
+    /// so a ledger contributor and the active-at-commit model can never
+    /// format attribution differently.
+    ///
+    /// [`CommitAttribution::model_trailer`]: CommitAttribution::model_trailer
     #[must_use]
     pub fn trailer(&self) -> String {
         format!(
-            "Co-authored-by: {} ({}) <{}>",
-            self.model, self.harness, self.email
+            "Co-authored-by: {} ({} v{}) <{}>",
+            self.model, self.harness, self.harness_version, self.email
         )
     }
 }
@@ -122,6 +137,15 @@ pub struct CommitAttribution {
     /// ([`crate::agent_identity::DEFAULT_AGENT_EMAIL`]), overridable via a
     /// resolved [`crate::agent_identity::AgentIdentity::email`].
     pub agent_email: String,
+    /// #1707/#1709 semantic B — the accumulated multi-contributor set for
+    /// this commit: every model/harness/version that materially contributed
+    /// to the committed work, NOT just the active-at-commit model. A snapshot
+    /// of the session [`AttributionLedger`] captured at the latest practical
+    /// point before the turn that may commit (see the session loop); empty
+    /// (`Vec::new()`) is the single-active-model floor (semantic A).
+    /// [`CommitAttribution::finalize_message`] merges this with the active
+    /// model and renders one `Co-authored-by:` trailer per contributor.
+    pub contributors: Vec<Attribution>,
 }
 
 impl CommitAttribution {
@@ -150,6 +174,7 @@ impl CommitAttribution {
             operator_name,
             operator_email: None,
             agent_email: agent_email.into(),
+            contributors: Vec::new(),
         }
     }
 
@@ -214,37 +239,91 @@ impl CommitAttribution {
     }
 
     /// Finalize a commit message from a model-provided subject/body plus this
-    /// typed provenance value.
+    /// typed provenance value — rendering **semantic B** (accumulated
+    /// contributors) when [`CommitAttribution::contributors`] is non-empty,
+    /// and the single-active-model floor (semantic A) when it is empty.
+    ///
+    /// Delegates to [`CommitAttribution::finalize_message_with`] with this
+    /// value's `contributors` snapshot: the active-at-commit model is always
+    /// merged in (it drove the commit), and every prior contributor in the
+    /// snapshot gets its own `Co-authored-by:` trailer — so a `/model` switch
+    /// mid-session credits BOTH models on the one commit (the contract),
+    /// while an empty snapshot yields exactly the single active-model
+    /// trailer (bit-for-bit the floor).
+    #[must_use]
+    pub fn finalize_message(&self, message: &str) -> String {
+        self.finalize_message_with(message, &self.contributors)
+    }
+
+    /// Finalize a commit message from a model-provided subject/body plus this
+    /// typed provenance value AND an accumulated contributor set — semantic B
+    /// (#1707/#1709 "accumulated contributors").
     ///
     /// The model may provide any subject + body text; the harness owns the
     /// attribution. This:
     ///
-    /// 1. Splits the message into body + a trailing trailer block (git's
-    ///    "blank line before trailers" convention, requirement 11).
-    /// 2. Partitions the existing trailers into Newt-owned vs third-party.
-    ///    Newt-owned = the model attribution trailer (a `Co-authored-by:`
-    ///    line attributed to this value's `agent_email`) and the provenance
-    ///    line (any `Harness:` line) — recognized separately from third-party
-    ///    attribution (requirement 7).
-    /// 3. Drops stale Newt-owned model attribution (requirement 8) and stale
-    ///    provenance (requirement 9), preserving legitimate third-party
-    ///    `Co-authored-by:` / `Signed-off-by:` / … trailers verbatim and in
-    ///    order (requirement 6).
-    /// 4. Appends a blank line, the preserved third-party trailers, then the
-    ///    fresh model trailer and provenance line rendered from this value.
+    /// 1. Merges `contributors` with the active-at-commit model (this value):
+    ///    the active model drove the commit, so it is always a contributor
+    ///    even if the ledger is empty (the floor). Deduplicates on the full
+    ///    `(model, harness, harness_version, email)` identity, preserving
+    ///    first-contribution order with the active model appended if new — so
+    ///    a `/model` switch mid-session ADDS a contributor and never discards
+    ///    an earlier one (the contract), while an empty ledger yields exactly
+    ///    the single active-model trailer (bit-for-bit the floor).
+    /// 2. Splits the message into body + a trailing trailer block (git's
+    ///    "blank line before trailers" convention).
+    /// 3. Partitions the existing trailers into Newt-owned vs third-party.
+    ///    Newt-owned = ANY `Co-authored-by:` line attributed to this value's
+    ///    `agent_email` (there may be several from a prior multi-contributor
+    ///    run — all are stale and replaced, not just one) and the provenance
+    ///    line (any `Harness:` line).
+    /// 4. Drops stale Newt-owned model attribution and stale provenance,
+    ///    preserving legitimate third-party `Co-authored-by:` /
+    ///    `Signed-off-by:` / … trailers verbatim and in order.
+    /// 5. Appends a blank line, the preserved third-party trailers, then ONE
+    ///    `Co-authored-by:` trailer per merged contributor (canonical
+    ///    `<model> (<harness> v<version>) <email>` shape), then the single
+    ///    provenance line rendered from this value.
     ///
-    /// Repeated finalization is idempotent (requirement 10): running it on its
-    /// own output yields the same bytes, because the freshly-rendered Newt
-    /// trailers are recognized as Newt-owned on the next pass and replaced
-    /// rather than duplicated.
+    /// The provenance line stays single (one harness build drives the commit);
+    /// the multi-contributor history lives in the per-contributor trailers,
+    /// each paired with its own harness/version — matching the contract's
+    /// "many `Co-authored-by:`, one `Harness:` provenance" shape.
     ///
-    /// Rendering is deterministic (requirement 13): given the same typed value
-    /// and the same input message, the output is byte-identical — no wall
-    /// clock, no subprocess, no model text beyond what the caller passed.
+    /// Repeated finalization is idempotent: running it on its own output
+    /// yields the same bytes, because the freshly-rendered Newt trailers are
+    /// recognized as Newt-owned on the next pass and replaced rather than
+    /// duplicated.
+    ///
+    /// Rendering is deterministic: given the same typed value, the same
+    /// contributor set, and the same input message, the output is
+    /// byte-identical — no wall clock, no subprocess, no model text beyond
+    /// what the caller passed.
     #[must_use]
-    pub fn finalize_message(&self, message: &str) -> String {
+    pub fn finalize_message_with(&self, message: &str, contributors: &[Attribution]) -> String {
         let (body, existing) = split_message(message);
         let agent_email_tag = format!("<{}>", self.agent_email);
+
+        // Merge accumulated contributors with the active-at-commit model.
+        // Dedup on the full identity; first-contribution order, active model
+        // appended only if it is not already present.
+        let mut merged: Vec<Attribution> = Vec::with_capacity(contributors.len() + 1);
+        let mut seen: HashSet<Attribution> = HashSet::with_capacity(contributors.len() + 1);
+        for c in contributors {
+            if seen.insert(c.clone()) {
+                merged.push(c.clone());
+            }
+        }
+        let active = Attribution::new(
+            &self.model,
+            &self.harness_name,
+            &self.harness_version,
+            &self.agent_email,
+        );
+        if seen.insert(active.clone()) {
+            merged.push(active);
+        }
+
         let mut third_party: Vec<String> = Vec::new();
         for trailer in existing {
             if is_newt_model_trailer(&trailer, &agent_email_tag) || is_newt_provenance(&trailer) {
@@ -254,7 +333,9 @@ impl CommitAttribution {
         }
 
         let mut trailers = third_party;
-        trailers.push(self.model_trailer());
+        for c in &merged {
+            trailers.push(c.trailer());
+        }
         trailers.push(self.provenance_line());
 
         let mut out = body;
@@ -367,12 +448,22 @@ impl AttributionLedger {
         }
     }
 
-    /// Record a material contribution from `model` running under `harness`,
-    /// attributed to this ledger's configured default email. A no-op if this
-    /// exact `(model, harness, default_email)` identity is already pending —
-    /// first-contribution order is preserved, not bumped to the end.
-    pub fn record(&mut self, model: impl Into<String>, harness: impl Into<String>) {
-        let attribution = Attribution::new(model, harness, self.default_email.clone());
+    /// Record a material contribution from `model` running under `harness` at
+    /// `harness_version`, attributed to this ledger's configured default email.
+    /// `harness_version` is captured at contribution time (ordinarily
+    /// [`crate::build_info::PACKAGE_VERSION`]) so the contributor stays paired
+    /// with the harness build that actually ran its work (audit Q9). A no-op if
+    /// this exact `(model, harness, harness_version, default_email)` identity
+    /// is already pending — first-contribution order is preserved, not bumped
+    /// to the end.
+    pub fn record(
+        &mut self,
+        model: impl Into<String>,
+        harness: impl Into<String>,
+        harness_version: impl Into<String>,
+    ) {
+        let attribution =
+            Attribution::new(model, harness, harness_version, self.default_email.clone());
         self.add(attribution);
     }
 
@@ -430,17 +521,22 @@ mod tests {
     use super::*;
 
     const DEFAULT_EMAIL: &str = crate::agent_identity::DEFAULT_AGENT_EMAIL;
+    /// Deterministic harness version for ledger tests — the version is part
+    /// of the contributor identity now (audit Q9), so tests pin it rather
+    /// than reading the live `PACKAGE_VERSION` (which would make assertions
+    /// drift on every release).
+    const TEST_VER: &str = "0.0.0-test";
 
     /// Contract test 1: one contributor produces exactly one trailer.
     #[test]
     fn one_contributor_produces_exactly_one_trailer() {
         let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
-        ledger.record("GPT-5.6 Sol", "newt-agent");
+        ledger.record("GPT-5.6 Sol", "newt-agent", TEST_VER);
         assert_eq!(ledger.contributors().len(), 1);
         assert_eq!(
             ledger.trailers(),
             vec![format!(
-                "Co-authored-by: GPT-5.6 Sol (newt-agent) <{DEFAULT_EMAIL}>"
+                "Co-authored-by: GPT-5.6 Sol (newt-agent v{TEST_VER}) <{DEFAULT_EMAIL}>"
             )]
         );
     }
@@ -450,14 +546,14 @@ mod tests {
     #[test]
     fn model_switch_with_both_contributing_produces_two_trailers() {
         let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
-        ledger.record("Model A", "newt-agent");
-        ledger.record("Model B", "newt-agent");
+        ledger.record("Model A", "newt-agent", TEST_VER);
+        ledger.record("Model B", "newt-agent", TEST_VER);
         assert_eq!(ledger.contributors().len(), 2);
         assert_eq!(
             ledger.trailers(),
             vec![
-                format!("Co-authored-by: Model A (newt-agent) <{DEFAULT_EMAIL}>"),
-                format!("Co-authored-by: Model B (newt-agent) <{DEFAULT_EMAIL}>"),
+                format!("Co-authored-by: Model A (newt-agent v{TEST_VER}) <{DEFAULT_EMAIL}>"),
+                format!("Co-authored-by: Model B (newt-agent v{TEST_VER}) <{DEFAULT_EMAIL}>"),
             ],
             "the earlier contributor must not be discarded by the later one"
         );
@@ -468,14 +564,14 @@ mod tests {
     #[test]
     fn harness_switch_with_same_model_produces_two_trailers() {
         let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
-        ledger.record("Model A", "newt-agent");
-        ledger.record("Model A", "Codex");
+        ledger.record("Model A", "newt-agent", TEST_VER);
+        ledger.record("Model A", "Codex", TEST_VER);
         assert_eq!(ledger.contributors().len(), 2);
         assert_eq!(
             ledger.trailers(),
             vec![
-                format!("Co-authored-by: Model A (newt-agent) <{DEFAULT_EMAIL}>"),
-                format!("Co-authored-by: Model A (Codex) <{DEFAULT_EMAIL}>"),
+                format!("Co-authored-by: Model A (newt-agent v{TEST_VER}) <{DEFAULT_EMAIL}>"),
+                format!("Co-authored-by: Model A (Codex v{TEST_VER}) <{DEFAULT_EMAIL}>"),
             ]
         );
     }
@@ -485,10 +581,29 @@ mod tests {
     #[test]
     fn duplicate_contribution_produces_one_trailer() {
         let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
-        ledger.record("Model A", "newt-agent");
-        ledger.record("Model A", "newt-agent");
-        ledger.record("Model A", "newt-agent");
+        ledger.record("Model A", "newt-agent", TEST_VER);
+        ledger.record("Model A", "newt-agent", TEST_VER);
+        ledger.record("Model A", "newt-agent", TEST_VER);
         assert_eq!(ledger.contributors().len(), 1);
+    }
+
+    /// Contract test 4b: the same model+harness under TWO different versions
+    /// is TWO contributors — version is part of the identity (audit Q9), so
+    /// a harness bump mid-session credits the work under the build that
+    /// actually ran it rather than silently merging it into the old one.
+    #[test]
+    fn version_switch_with_same_model_and_harness_produces_two_trailers() {
+        let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
+        ledger.record("Model A", "newt-agent", "0.7.6");
+        ledger.record("Model A", "newt-agent", "0.8.0");
+        assert_eq!(ledger.contributors().len(), 2);
+        assert_eq!(
+            ledger.trailers(),
+            vec![
+                format!("Co-authored-by: Model A (newt-agent v0.7.6) <{DEFAULT_EMAIL}>"),
+                format!("Co-authored-by: Model A (newt-agent v0.8.0) <{DEFAULT_EMAIL}>"),
+            ]
+        );
     }
 
     /// Contract test 5: many contributors (10+) — none truncated, no hidden
@@ -497,7 +612,7 @@ mod tests {
     fn many_contributors_are_not_truncated() {
         let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
         for i in 0..25 {
-            ledger.record(format!("Model-{i}"), format!("Harness-{i}"));
+            ledger.record(format!("Model-{i}"), format!("Harness-{i}"), TEST_VER);
         }
         assert_eq!(ledger.contributors().len(), 25);
         assert_eq!(ledger.trailers().len(), 25);
@@ -512,7 +627,7 @@ mod tests {
     fn default_email_is_the_newt_agent_noreply_address() {
         let mut ledger =
             AttributionLedger::new(crate::agent_identity::AgentIdentity::default().email);
-        ledger.record("Model A", "newt-agent");
+        ledger.record("Model A", "newt-agent", TEST_VER);
         assert!(ledger.trailers()[0].ends_with("<309460085+newt-agent@users.noreply.github.com>"));
     }
 
@@ -521,8 +636,8 @@ mod tests {
     #[test]
     fn configured_email_override_is_used_for_every_contributor() {
         let mut ledger = AttributionLedger::new("custom-agent@example.com");
-        ledger.record("Model A", "newt-agent");
-        ledger.record("Model B", "Codex");
+        ledger.record("Model A", "newt-agent", TEST_VER);
+        ledger.record("Model B", "Codex", TEST_VER);
         for trailer in ledger.trailers() {
             assert!(trailer.ends_with("<custom-agent@example.com>"), "{trailer}");
         }
@@ -533,7 +648,7 @@ mod tests {
     #[test]
     fn clear_empties_the_ledger_for_the_next_commit() {
         let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
-        ledger.record("Model A", "newt-agent");
+        ledger.record("Model A", "newt-agent", TEST_VER);
         assert!(!ledger.is_empty());
         ledger.clear();
         assert!(ledger.is_empty());
@@ -546,7 +661,7 @@ mod tests {
     #[test]
     fn failed_commit_leaves_pending_contributors_untouched() {
         let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
-        ledger.record("Model A", "newt-agent");
+        ledger.record("Model A", "newt-agent", TEST_VER);
         // Simulated commit failure: the caller simply never calls `clear`.
         let commit_result: Result<(), &str> = Err("commit rejected");
         if commit_result.is_ok() {
@@ -561,10 +676,11 @@ mod tests {
     #[test]
     fn full_triple_identity_distinguishes_same_model_and_harness_different_email() {
         let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
-        ledger.record("Model A", "newt-agent");
+        ledger.record("Model A", "newt-agent", TEST_VER);
         ledger.add(Attribution::new(
             "Model A",
             "newt-agent",
+            TEST_VER,
             "someone-else@example.com",
         ));
         assert_eq!(
@@ -577,8 +693,8 @@ mod tests {
     #[test]
     fn render_joins_trailers_with_newlines() {
         let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
-        ledger.record("Model A", "newt-agent");
-        ledger.record("Model B", "Codex");
+        ledger.record("Model A", "newt-agent", TEST_VER);
+        ledger.record("Model B", "Codex", TEST_VER);
         let rendered = ledger.render();
         let lines: Vec<&str> = rendered.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -713,6 +829,7 @@ mod tests {
             operator_name: Some("shawn".to_string()),
             operator_email: None,
             agent_email: DEFAULT_EMAIL.to_string(),
+            contributors: Vec::new(),
         }
     }
 
@@ -923,6 +1040,162 @@ mod tests {
         let expected = format!(
             "feat(attribution): finalizer\n\nDrives the commit.\n\n\
              Co-authored-by: Reviewer <reviewer@example.com>\n\
+             Co-authored-by: glm-5.2 (newt-agent v0.8.0) <{DEFAULT_EMAIL}>\n\
+             Harness: newt-agent v0.8.0 (ba56944bd262-dirty) | Model: glm-5.2 | Operator: shawn\n"
+        );
+        assert_eq!(after, expected);
+    }
+
+    // ---- semantic B: accumulated multi-contributor finalization ----
+    //
+    // `finalize_message_with` merges an AttributionLedger's accumulated
+    // contributors with the active-at-commit model, so a `/model` switch
+    // mid-session credits BOTH models on the one commit — the contract —
+    // rather than only the model driving the commit (semantic A, the floor).
+
+    /// Two accumulated contributors + the active model = THREE trailers, in
+    /// first-contribution order with the active model appended. The
+    /// provenance line stays single (one harness build drives the commit).
+    #[test]
+    fn finalize_with_ledger_credits_every_accumulated_contributor() {
+        let ca = sample_ca(); // active model = glm-5.2 under newt-agent v0.8.0
+        let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
+        ledger.record("Model A", "newt-agent", "0.7.6");
+        ledger.record("Model B", "Codex", "0.8.0");
+        let out = ca.finalize_message_with("fix the parser", ledger.contributors());
+        let lines: Vec<&str> = out.lines().collect();
+        // body, blank, then trailers: Model A, Model B, active glm-5.2, provenance.
+        assert_eq!(lines[0], "fix the parser");
+        assert_eq!(lines[1], "");
+        assert_eq!(
+            lines[2],
+            format!("Co-authored-by: Model A (newt-agent v0.7.6) <{DEFAULT_EMAIL}>")
+        );
+        assert_eq!(
+            lines[3],
+            format!("Co-authored-by: Model B (Codex v0.8.0) <{DEFAULT_EMAIL}>")
+        );
+        assert_eq!(
+            lines[4],
+            format!("Co-authored-by: glm-5.2 (newt-agent v0.8.0) <{DEFAULT_EMAIL}>")
+        );
+        assert!(lines[5].starts_with("Harness: "));
+        assert_eq!(lines.len(), 6);
+    }
+
+    /// The active model is merged and DEDUPED against the ledger: if it
+    /// already contributed (same model+harness+version+email), it is not
+    /// stamped twice. This is the `/model` switch back to a previous model —
+    /// credit it once.
+    #[test]
+    fn finalize_with_ledger_dedupes_active_model_already_present() {
+        let ca = sample_ca(); // active = glm-5.2 / newt-agent v0.8.0
+        let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
+        ledger.record("glm-5.2", "newt-agent", "0.8.0"); // identical to active
+        ledger.record("Model A", "newt-agent", "0.7.6");
+        let out = ca.finalize_message_with("fix the parser", ledger.contributors());
+        let coauth: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("Co-authored-by: "))
+            .collect();
+        assert_eq!(
+            coauth.len(),
+            2,
+            "active model dedupes against the ledger — no double trailer"
+        );
+        // First-contribution order: Model A was NOT in the ledger before the
+        // active identity, so the active identity (recorded first into the
+        // ledger) leads, then Model A.
+        assert!(coauth[0].contains("glm-5.2"));
+        assert!(coauth[1].contains("Model A"));
+    }
+
+    /// An empty contributor set is the floor: `finalize_message_with(&[])`
+    /// is byte-identical to `finalize_message` — the single active-model
+    /// trailer + provenance. B never regresses the A floor.
+    #[test]
+    fn finalize_with_empty_ledger_matches_the_single_model_floor() {
+        let ca = sample_ca();
+        let msg = "feat(x): y\n\nbody text\n";
+        assert_eq!(ca.finalize_message(msg), ca.finalize_message_with(msg, &[]));
+    }
+
+    /// Re-finalization is idempotent under B: running `finalize_message_with`
+    /// on its own output with the SAME contributors yields the same bytes —
+    /// the freshly-rendered Newt trailers are recognized as Newt-owned
+    /// (agent-email-tagged) on the next pass and replaced, not duplicated.
+    #[test]
+    fn finalize_with_ledger_is_idempotent() {
+        let ca = sample_ca();
+        let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
+        ledger.record("Model A", "newt-agent", "0.7.6");
+        let contributors = ledger.contributors().to_vec();
+        let once = ca.finalize_message_with("fix the parser\n\nbody", &contributors);
+        let twice = ca.finalize_message_with(&once, &contributors);
+        assert_eq!(
+            once, twice,
+            "re-finalization must not duplicate contributors"
+        );
+    }
+
+    /// Stale multi-contributor Newt trailers from a prior run are ALL
+    /// replaced, not just one: a previous B finalization may have left
+    /// several `Co-authored-by:` lines tagged with the agent email, and
+    /// re-finalizing with a fresh contributor set drops every one rather
+    /// than appending duplicates alongside them.
+    #[test]
+    fn finalize_with_ledger_replaces_every_stale_newt_model_trailer() {
+        let ca = sample_ca();
+        // A prior run left TWO stale Newt model trailers (both agent-email-
+        // tagged) plus a third-party one.
+        let stale = format!(
+            "fix the parser\n\n\
+             Co-authored-by: Old Model (newt-agent v0.1.0) <{DEFAULT_EMAIL}>\n\
+             Co-authored-by: Older Model (newt-agent v0.0.1) <{DEFAULT_EMAIL}>\n\
+             Co-authored-by: Reviewer <reviewer@example.com>\n\
+             Harness: newt-agent v0.1.0 (deadbeef) | Model: old | Operator: shawn\n"
+        );
+        let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
+        ledger.record("Model A", "newt-agent", "0.7.6");
+        let out = ca.finalize_message_with(&stale, ledger.contributors());
+        let coauth: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("Co-authored-by: "))
+            .collect();
+        // Third-party Reviewer preserved; stale Newt ones gone; fresh set =
+        // Model A + active glm-5.2 = 3 total.
+        assert_eq!(coauth.len(), 3);
+        assert!(coauth.iter().any(|l| l.contains("Reviewer")));
+        assert!(
+            !coauth
+                .iter()
+                .any(|l| l.contains("Old Model") || l.contains("Older Model")),
+            "stale Newt trailers must all be dropped"
+        );
+        // Stale provenance replaced with the fresh single line.
+        assert!(
+            out.contains("Harness: newt-agent v0.8.0 (ba56944bd262-dirty)"),
+            "stale provenance replaced"
+        );
+        assert!(!out.contains("deadbeef"));
+    }
+
+    /// Representative B before/after as a golden snapshot: a model-switch
+    /// session (Model A → Model B) committing under Model B yields TWO
+    /// `Co-authored-by:` trailers — the contract's "ADD a contributor, never
+    /// discard" — plus the single Harness provenance, with third-party
+    /// trailers preserved.
+    #[test]
+    fn finalize_with_ledger_before_after_snapshot() {
+        let ca = sample_ca(); // active at commit = glm-5.2 / newt-agent v0.8.0
+        let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
+        // Model A did earlier work; the active glm-5.2 drives the commit.
+        ledger.record("Model A", "newt-agent", "0.7.6");
+        let before = "fix the parser";
+        let after = ca.finalize_message_with(before, ledger.contributors());
+        let expected = format!(
+            "fix the parser\n\n\
+             Co-authored-by: Model A (newt-agent v0.7.6) <{DEFAULT_EMAIL}>\n\
              Co-authored-by: glm-5.2 (newt-agent v0.8.0) <{DEFAULT_EMAIL}>\n\
              Harness: newt-agent v0.8.0 (ba56944bd262-dirty) | Model: glm-5.2 | Operator: shawn\n"
         );
