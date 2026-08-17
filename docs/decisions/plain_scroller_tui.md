@@ -11,7 +11,7 @@ piped/headless path and all committed output; **amended 2026-08-11** by the
 newt-web docking work — the plain-scroller constraints are **scoped to the LEAN
 (default) surface + the headless/wyvern path**, and the feature-gated `rich-tui`
 surface may now host panes / a live dock-and-session overview (see the amendment
-right after the TL;DR); **migration notice added 2026-08-17** — the LeanTUI
+right after the TL;DR); **migration notice added 2026-08-17**: the LeanTUI
 *input surface* is scheduled to move to **wyvern-agent**, after which newt-agent
 is RichTUI-only for interactive use (see "Migration notice" below).
 **Date:** 2026-06-12 (amended 2026-06-17, refined 2026-06-20, partially
@@ -51,14 +51,14 @@ belong in the **gilamonster-agent** and **monitor-agent** repos, not here.
 The LeanTUI **input surface** (`newt-tui/src/lean_input.rs`, `LeanSurface:
 InputSurface`) is scheduled to be vendored out to **wyvern-agent**. After that
 move, newt-agent's *interactive* surface is **RichTUI only**, and lean/rich
-feature parity is explicitly **not** a requirement in the meantime — the two
+feature parity is explicitly **not** a requirement in the meantime. The two
 paths may diverge, and rich-only panel work (backend editor, `/summarizer`
 panel, rename, adopt-warm) does not need a lean twin.
 
 **What this notice does NOT do.** It does not remove or deprecate the
 plain-scroller *output* contract. Rule 2 and the committed-output rules keep
 governing **all committed output and the piped/headless path**, because that
-contract is what makes newt runnable off a TTY at all — `newt solve` when piped,
+contract is what makes newt runnable off a TTY at all. `newt solve` when piped,
 `newt-acp-worker`, the eval harness, and newt-as-a-wyvern-worker all depend on
 it. "RichTUI only" scopes to the interactive input surface, not to how output is
 committed to scrollback.
@@ -67,9 +67,9 @@ committed to scrollback.
 2026-08-17 it is five crates and ~1.7k lines with no `crossterm` / `ratatui` /
 `rustyline` dependency, no `stdin` read loop, and no `newt-*` dependency. Its own
 charter test (`crates/wyvern-wire/tests/no_vendor.rs`) frames workers as
-"newt-agent instances selected by the `agent-bridle` `Caveats` they satisfy" —
-wyvern orchestrates newt rather than hosting a chat surface. The move waits until
-wyvern grows a terminal surface to receive it.
+"newt-agent instances selected by the `agent-bridle` `Caveats` they satisfy",
+so wyvern orchestrates newt rather than hosting a chat surface. The move waits
+until wyvern grows a terminal surface to receive it.
 
 **When the move happens**, this document and
 `lean_rich_tui_morphologies.md` are both superseded in part, and the amphibious

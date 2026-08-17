@@ -1,7 +1,7 @@
 # Decision: two presentation morphologies of the plain scroller — LeanTUI and RichTUI
 
 **Status:** Accepted (decided by Shawn Hartsock, 2026-06-20); **migration notice
-2026-08-17** — the LeanTUI morphology is scheduled to move to **wyvern-agent**,
+2026-08-17**: the LeanTUI morphology is scheduled to move to **wyvern-agent**,
 after which newt-agent is RichTUI-only for interactive use. Lean/rich parity is
 explicitly no longer required in the meantime. The plain-scroller *output*
 contract is unaffected and still governs the piped/headless path; see the

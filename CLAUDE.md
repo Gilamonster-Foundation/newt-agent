@@ -94,7 +94,7 @@ explain what the existing abstraction could not be widened to cover.
   **Migration notice (2026-08-17):** the LeanTUI *input surface*
   (`newt-tui/src/lean_input.rs`) is scheduled to move to wyvern-agent, after
   which newt-agent is **RichTUI-only for interactive use**. Lean/rich feature
-  parity is therefore **not** required — rich-only panel work needs no lean
+  parity is therefore **not** required, and rich-only panel work needs no lean
   twin. This does NOT retire the plain-scroller *output* contract: committed
   output and the piped/headless path still obey it, because `newt solve` when
   piped, `newt-acp-worker`, the eval harness, and newt-as-a-wyvern-worker all
