@@ -17,15 +17,19 @@
 //! */5 * * * * newt timer fire --run --dir ~/.newt
 //! ```
 //!
-//! Without `--run`, `fire` prints each due prompt on a `PROM\t<prompt>` line
-//! for a host that wants to feed a different entry point. That shell path must
-//! use the supported `--instruction-file` interface — `newt solve` takes a
-//! file, not a positional prompt:
+//! Without `--run`, `fire` is a **non-mutating emit**: it prints each due
+//! prompt on a `PROM\t<prompt>` line for a host that wants to feed a different
+//! entry point. It does NOT consume the queue — a due timer is not removed
+//! merely for being emitted. Pair it with `newt timer dismiss <id>` after your
+//! host solve succeeds, or use `--run` for the managed lifecycle (claim →
+//! execute → acknowledge). That shell path must use the supported
+//! `--instruction-file` interface — `newt solve` takes a file, not a
+//! positional prompt:
 //!
 //! ```sh
 //! newt timer fire | while IFS=$'\t' read -r _ prompt; do
 //!   f=$(mktemp); printf '%s' "$prompt" > "$f"
-//!   newt solve --instruction-file "$f"; rm -f "$f"
+//!   newt solve --instruction-file "$f" && newt timer dismiss <id>; rm -f "$f"
 //! done
 //! ```
 //!
@@ -70,7 +74,11 @@ pub enum TimerCmd {
     Fire {
         /// Re-enter the agent with each due prompt via `newt solve` (in-process)
         /// instead of printing `PROM\t…` lines. Runs the safe, confined lane a
-        /// plain `newt solve` defaults to.
+        /// plain `newt solve` defaults to. Uses select/claim → execute →
+        /// acknowledge semantics: a due timer is claimed, driven through
+        /// solve, and only removed/advanced on success; a failed solve leaves
+        /// the timer pending/retryable and stops the beat so later due timers
+        /// are never silently lost.
         #[arg(long)]
         run: bool,
         #[arg(long, value_name = "DIR")]
@@ -121,27 +129,31 @@ pub async fn run(cmd: TimerCmd, config: Option<&Path>) -> anyhow::Result<i32> {
         TimerCmd::Fire { run, dir } => {
             let store = TimerStore::open(dir.as_deref())?;
             let clock = SystemClock;
-            let due = store.fire_due(&clock)?;
-            if due.is_empty() {
-                return Ok(0);
-            }
             if !run {
-                for t in &due {
+                // Bare emit — non-mutating. The host owns the downstream solve
+                // and must `dismiss` after it succeeds (or use `--run` for the
+                // managed lifecycle). A due timer is NOT consumed merely for
+                // being emitted.
+                for t in store.due(&clock)? {
                     println!("PROM\t{}", t.prompt);
                 }
                 return Ok(0);
             }
-            // `--run`: the supported wake-up path. Each due prompt drives a
-            // real headless solve through the same `newt solve` entry point the
-            // `Solve` command uses — the host owns the clock, the prompt
-            // re-enters the model here. Stop on the first non-zero solve exit.
-            for t in &due {
-                let code = fire_solve(&t.prompt, config).await?;
+            // `--run`: select/claim → execute → acknowledge, one timer at a
+            // time. Stop at the first failed solve so later due timers are
+            // never silently lost — they remain pending (unclaimed) for the
+            // next beat. The failed timer's claim is released and it stays
+            // pending/retryable.
+            loop {
+                let Some(timer) = store.claim_next_due(&clock)? else {
+                    return Ok(0); // nothing due/claimable
+                };
+                let code = fire_solve(&timer.prompt, config).await?;
+                store.acknowledge(&timer.id, code == 0, &clock)?;
                 if code != 0 {
                     return Ok(code);
                 }
             }
-            Ok(0)
         }
         TimerCmd::Dismiss { id, dir } => {
             let store = TimerStore::open(dir.as_deref())?;
