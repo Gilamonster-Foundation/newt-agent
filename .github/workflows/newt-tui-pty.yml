@@ -1,37 +1,39 @@
-name: newt-tui real-PTY tier (#1520)
+name: newt-tui real-PTY tier (#1520, #1677)
 
-# Real-terminal integration tier for the prompt CONTROL-key regression test
-# (`newt-tui/src/prompt_visibility_test.rs::permission_prompt_controls_are_immediate_and_distinct`).
-# It drives a real PTY child and asserts that Esc→Back and Ctrl-C/Ctrl-D→Exit
-# take effect immediately and distinctly on both the local-tty prompt and the
-# web-wait prompt — a property only an actual terminal can exhibit (no mock can
-# observe raw control bytes racing a cooked-mode reader).
+# Real-terminal integration tier for prompt CONTROL-key delivery and transcript
+# pager terminal restoration. It drives real PTY children to prove raw control
+# bytes reach modal readers and that every pager exit path restores kernel tty
+# state plus the alternate screen — properties mocks cannot observe.
 #
-# Tiering (matches the CLAUDE.md testing strategy): this test types raw control
-# BYTES that only land once the child is in raw mode, so under the parallel
-# per-PR unit run it is CPU-starvation-flaky. It is therefore `#[ignore]`d (and
-# ci.yml's `cargo test --workspace` skips ignored tests) and runs HERE in the
-# WEEKLY tier (schedule) and the RELEASE tier (on v* tags), single-threaded
-# (`--test-threads=1`), never as a push gate. It GROUNDS the mocked control-key
-# unit tests in newt-tui/src/{permissions,tty/widgets/question}.rs.
+# Tiering (matches the CLAUDE.md testing strategy): these tests use real
+# subprocesses and PTYs, and raw control bytes only land once a child is in raw
+# mode. They are therefore `#[ignore]`d (and ci.yml's workspace run skips them)
+# and run HERE in the WEEKLY tier (schedule), RELEASE tier (v* tags), and scoped
+# terminal-code PR gate, always single-threaded. They ground the mocked prompt
+# control-key tests and the transcript pager's pure row-model tests.
 #
 # HOOK PARITY EXCEPTION: like eval-live.yml / nightly-eval.yml / mesh-
 # integration.yml / output-oracle-real.yml, this workflow is intentionally
 # OUTSIDE pre-push-hook parity. A real-PTY subprocess tier is too slow/flaky for
 # a local push gate; the pre-push hook mirrors ci.yml (the per-PR unit tier)
 # only. The path-filtered pull_request trigger below is a *scoped* PR gate — it
-# fires ONLY when terminal-control / permission / PTY code actually changes, so
-# a PR that alters that byte path proves the real terminal still delivers the
-# control keys, while every other PR stays on the fast unit tier. It is not a
-# fast changed-code hook and is not mirrored into .githooks/pre-push.
+# fires ONLY when terminal-control, permission, pager lifecycle, or PTY code
+# actually changes. Such a PR proves the real terminal still delivers control
+# keys and is restored after pager exit, while every other PR stays on the fast
+# unit tier. It is not a fast changed-code hook and is not mirrored into
+# .githooks/pre-push.
+#
+# Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 10:54 EDT | Date: 2026-08-17
 
 on:
-  # Scoped PR gate: run the single-threaded real-PTY test when a PR touches the
-  # terminal-control / permission / reader byte path (Esc / Ctrl-C / Ctrl-D),
-  # since only a real terminal can prove those bytes reach the modal reader.
+  # Scoped PR gate: run the single-threaded real-PTY tests when a PR touches the
+  # terminal-control / permission / pager lifecycle path, since only a real
+  # terminal can prove byte delivery and terminal restoration.
   pull_request:
     paths:
       - "newt-tui/src/prompt_visibility_test.rs"
+      - "newt-tui/src/transcript_pager.rs"
+      - "newt-tui/src/transcript_pager_pty_test.rs"
       - "newt-tui/src/permissions.rs"
       - "newt-core/src/tty/**"
       - "newt-core/src/agentic/permissions.rs"
@@ -58,7 +60,7 @@ env:
 
 jobs:
   real-pty-tier:
-    name: prompt control-key real-PTY tier
+    name: terminal lifecycle real-PTY tier
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,4 +79,9 @@ jobs:
       - name: Run prompt control-key real-PTY tests
         run: |
           cargo test -p newt-tui prompt_visibility_test \
+            -- --ignored --test-threads=1
+
+      - name: Run transcript pager real-PTY tests
+        run: |
+          cargo test -p newt-tui --features rich-tui transcript_pager_pty_test \
             -- --ignored --test-threads=1
