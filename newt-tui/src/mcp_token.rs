@@ -2424,10 +2424,9 @@ async fn fetch_authorization_server_meta(
 }
 
 /// Discover RFC 9728 protected-resource metadata, then independently discover
-/// the selected authorization server using RFC 8414. The pre-RFC MCP fallback
-/// is retained only when the protected-resource well-known document is absent:
-/// the MCP resource origin itself is treated as the issuer. Invalid metadata
-/// never downgrades to the legacy path.
+/// the selected authorization server using RFC 8414. Missing or invalid
+/// protected-resource metadata fails closed instead of treating the MCP
+/// resource origin as an authorization issuer.
 #[cfg(test)]
 async fn discover_oauth_meta_with_policy(
     server_url: &str,
