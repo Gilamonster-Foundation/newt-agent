@@ -2,9 +2,9 @@
 
 **Status:** Accepted as target architecture (Shawn Hartsock, 2026-08-17).
 **Supersedes in part** the wyvern-agent charter ratified 2026-06-04, in the two
-places named under "What this supersedes". A companion change records the
-supersession in wyvern-agent; until that lands, treat this document and the
-charter as in conflict on those two points and nothing else.
+places named under "What this supersedes". The companion change recording that
+supersession is wyvern-agent PR #53; until it lands, treat this document and
+the charter as in conflict on those two points and nothing else.
 **Date:** 2026-08-17
 **Related:** wyvern-agent `docs/CHARTER.md`, wyvern-agent ADR-0002 (crate map),
 `docs/decisions/plain_scroller_tui.md`, `docs/decisions/ocap_confinement_model.md`,
