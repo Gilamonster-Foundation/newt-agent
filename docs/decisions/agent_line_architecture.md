@@ -1,10 +1,12 @@
 # Decision: the Gilamonster agent line
 
 **Status:** Accepted as target architecture (Shawn Hartsock, 2026-08-17).
+*Ratified* in this document means merged to `main`. This ADR is ratified when
+newt-agent PR #1753 merges; the charter amendment is ratified when wyvern-agent
+PR #53 merges. Anything gated on ratification stays blocked until then.
 **Supersedes in part** the wyvern-agent charter ratified 2026-06-04, in the two
-places named under "What this supersedes". The companion change recording that
-supersession is wyvern-agent PR #53; until it lands, treat this document and
-the charter as in conflict on those two points and nothing else.
+places named under "What this supersedes". The companion change is wyvern-agent
+PR #53, open at the time of writing.
 **Date:** 2026-08-17
 **Related:** wyvern-agent `docs/CHARTER.md`, wyvern-agent ADR-0002 (crate map),
 `docs/decisions/plain_scroller_tui.md`, `docs/decisions/ocap_confinement_model.md`,
@@ -29,12 +31,12 @@ conflating the two is what muddied earlier drafts.
 Verifiable today, as distinct from anything intended.
 
 ```
-agent-mesh-protocol 0.6.4      root of the graph; owns Caveats, Scope,
+agent-mesh-protocol "0.6"      root of the graph; owns Caveats, Scope,
         ▲                      CountBound, UserKey, AgentKey, CertChain
         │
-agent-bridle 0.8.0-rc.1        owns Gate, ToolContext, Registry, Policy,
+agent-bridle                   owns Gate, ToolContext, Registry, Policy,
         ▲                      Landlock and seccomp confinement
-        │  registry 0.7.x
+        │  registry 0.7.10-0.7.15, per crate
    newt-agent  ◄── git rev ba56944 ── gilamonster-agent
                                       (also agent-bridle-core 0.7, registry)
 
@@ -43,9 +45,9 @@ agent-bridle 0.8.0-rc.1        owns Gate, ToolContext, Registry, Policy,
 
 | | today |
 |---|---|
-| newt-agent | Working harness. `agent-mesh-protocol = "0.6"`, `agent-bridle = "0.7.15"`, `content-addressable = "0.1.0"`, all from the registry. |
+| newt-agent | Working harness. `agent-mesh-protocol = "0.6"` and `content-addressable = "0.1.0"` in `[workspace.dependencies]`. agent-bridle is **not** a workspace dependency; it is pinned per crate at three versions: `0.7.15` in newt-core, `0.7.10` in newt-mcp-server and newt-mcp-client. |
 | wyvern-agent | Five crates, about 1.7k lines, mostly seams and stubs. Depends only on `blake3`, `tokio`, `async-trait` and its own crates. |
-| gilamonster-agent | Single-package binary `gila`. Consumes newt over a **git dependency pinned to one rev**, not published crates. Ambient-first: it starts its coder with host filesystem, network and command authority, and `--ocap` opts into newt's posture. That posture is recorded in an ADR still marked *Editing / Accepted: TBD*, so it is not ratified. |
+| gilamonster-agent | Single package, shipping two binaries (`gila` and `newt-net-guard`). Consumes newt over a **git dependency pinned to one rev**, not published crates. Ambient-first: it starts its coder with host filesystem, network and command authority, and `--ocap` opts into newt's posture. That posture is recorded in an ADR still marked *Editing / Accepted: TBD*, so it is not ratified. |
 
 Three facts a reader should not have to discover the hard way:
 
@@ -59,16 +61,19 @@ Three facts a reader should not have to discover the hard way:
   a crate; it is a local package rename of `agent-mesh-protocol` used inside
   `newt-mesh` and `newt-web`.)
 
-Also drifting: the ratified crate map specifies twelve wyvern crates; five
-exist, one of those (`wyvern-dispatch`) is not in the map, and the mapped
-`airspace`, `scramble`, `scorecard`, `cli`, `context`, `supervisor`, `mailbox`,
-`attach` and `registry` do not. Consumers sit on agent-bridle 0.7.x while
-bridle's main line is 0.8.0-rc.1.
+Also drifting: ADR-0002 maps twelve wyvern crates. Five crates ship, but only
+three of them (`wire`, `flight`, `hangar`) are in the map; `wyvern-dispatch`
+and `wyvern-agent` are not. ADR-0002 also records as a consequence that "the
+Crawl scaffold creates all 12 members as stubs", which is not the case.
+Separately, the charter's reuse contract names `agent-bridle-core 0.1.0` while
+every real consumer is on 0.7.x.
 
 ## Target architecture
 
 wyvern-agent becomes a small, headless, containerized worker, deployed under
-OpenShell, that newt-agent or gilamonster-agent dispatch OCAP caveats to for
+[OpenShell](https://github.com/NVIDIA/OpenShell) (a sandboxed runtime for
+agents, governed by declarative policy), that newt-agent or gilamonster-agent
+dispatch OCAP caveats to for
 work that runs headless or on a schedule. Aspirationally it reaches that shape
 as a rewrite of newt-agent that is lighter, faster and smaller, at which point
 newt's crates are retired in favour of it.
@@ -79,7 +84,9 @@ Two graphs. They point in different directions and must not be conflated.
 
 ```
 gilamonster ──┬──► newt ──► wyvern ──► agent-bridle ──► agent-mesh-protocol
-              └──────────────►┘
+              └╌╌╌╌╌╌╌╌╌╌╌╌╌╌►┘
+                 (dashed: gilamonster's direct edge to wyvern is a working
+                  assumption, see open question 4)
 ```
 
 - Shared, stable functionality belongs in wyvern, the minimal layer.
@@ -100,9 +107,18 @@ newt or gilamonster ──dispatches caveats──► wyvern worker (OpenShell c
 |---|---|
 | Roles table: the Desk (dispatcher) is wyvern, the Pilot (worker) is a `newt worker` process. | The roles invert. wyvern is the dispatched worker; newt and gilamonster dispatch to it. |
 | "newt is a superset of wyvern by default: as newt grows it builds the wyvern airframe *into itself*." | The capability claim `newt ⊇ wyvern` stands and is restated above. The direction of absorption does not: wyvern is rewritten as the smaller base and newt is rebuilt on it, rather than newt absorbing wyvern. Note the charter's claim was always about capability, never a crate edge; no such edge exists in either direction today. |
+| Reuse contract: "**newt-agent** (dogfood): the worker is `newt worker` (ACP / stdio). Reuse `newt-eval` for scorecard plumbing and `newt-core` where it fits." | Superseded. That clause makes wyvern depend on newt, which the dependency rule above forbids. wyvern keeps the rest of the reuse contract (agent-mesh, agent-bridle, gix/git2) and drops the newt edge. |
+| Crate map entries that encode the old roles: `wyvern-hangar` "launch + supervise `newt worker` processes"; `wyvern-scramble` "the Desk's dispatch engine". | Superseded with the roles table. Both describe wyvern dispatching newt. Their replacements are for wyvern-agent to specify, not this document. |
+| "we do **not** want to slow newt down; we want a *separate*, deliberately light agent." | Partly superseded. wyvern stays deliberately light, but it is no longer *separate*: newt is rebuilt on it. |
 
 Everything else in the charter stands, including headless-only, patch-not-prose,
-no-vendor-code, `yolo ⇒ hermetic`, and the reuse contract.
+no-vendor-code, `yolo ⇒ hermetic`, and the non-newt half of the reuse contract.
+
+Two consequences an implementing agent must not get wrong. First, no wyvern
+crate may take a dependency on newt, gilamonster, or their published crates,
+whatever any surviving charter or ADR-0002 sentence says. Second, the charter's
+term "`newt pilot`" belongs to the old vocabulary in which newt was the worker;
+read it as "the richer agent's dashboard", which is not wyvern's job either way.
 
 ## The authority floor
 
@@ -184,9 +200,12 @@ greppable, headless output is what the charter already asks for.
 
 ## Open questions
 
-1. Does wyvern host any interactive surface at all? The charter says no TUI
-   ever. The plain-scroller migration assumes wyvern will host an input surface.
-   One of the two has to give.
+1. Does wyvern host any interactive surface at all? The charter says "No TUI,
+   ever", and ADR-0002 is stronger still: "No TUI dependency anywhere in the
+   workspace (no ratatui/crossterm)", which names crossterm explicitly and is
+   not superseded by anything. The plain-scroller migration assumes wyvern will
+   host a crossterm input surface. **Until this is resolved the migration is
+   blocked**, and nothing in this document unblocks it.
 2. What is "lighter, faster, smaller" measured against? An aspiration with no
    number loses to feature pressure later. A binary-size or startup budget
    recorded now is cheap.
