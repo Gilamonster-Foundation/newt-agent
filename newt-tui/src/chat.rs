@@ -2201,16 +2201,19 @@ fn session_body(
     // an `init` op, so it is useful even before a repo exists. The commit author
     // is the resolved AgentIdentity (`newt-agent` User default, overridable).
     let session_identity = newt_core::AgentIdentity::resolve().unwrap_or_default();
-    // #1709 family — operator identity for `Co-authored-by:` attribution. The
-    // operator NAME + EMAIL are resolved ONCE from the host git identity
-    // (`git config user.name` / `user.email`) via the tool-less ctor's caller-
-    // supplied fallbacks (`AgentIdentity::operator_name` / `operator_email`).
-    // The email is a REAL configured value only — never invented; `None` when
-    // no source resolves, in which case no operator trailer is emitted. Kept
-    // out of the per-turn `CommitAttribution::from_identity` ctor (which stays
-    // tool-less) and threaded in here as the caller.
-    let session_operator_name = session_identity.operator_name();
-    let session_operator_email = session_identity.operator_email();
+    // #1709 family — operator identity for `Co-authored-by:` attribution,
+    // resolved ONCE here as an ATOMIC `(name, email)` pair (never the two
+    // halves resolved independently). A configured name is never paired with
+    // an unrelated host email: an explicitly configured `operator` +
+    // `operator_email` pair wins; a configured name with no configured email
+    // keeps the name for `Operator:` provenance and emits no email; an
+    // unconfigured operator falls to the matched host Git pair. The email is
+    // real-or-`None` — never invented — so the finalizer emits an operator
+    // `Co-authored-by:` only when one is actually known and the operator is
+    // not the primary author. Kept out of the per-turn
+    // `CommitAttribution::from_identity` ctor (which stays tool-less) and
+    // threaded in here as the caller.
+    let (session_operator_name, session_operator_email) = session_identity.operator_identity();
     // #1707/#1709: the session-scoped pending multi-contributor attribution
     // ledger. Every non-read-only tool call that succeeds records the
     // CURRENTLY resolved model here (see `ledger_note_attribution` in

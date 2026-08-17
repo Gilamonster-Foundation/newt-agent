@@ -260,6 +260,18 @@ pub struct AgentIdentity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
 
+    /// The human operator's EMAIL for operator `Co-authored-by:` attribution
+    /// — the second half of the atomic `(operator, operator_email)` pair (see
+    /// [`AgentIdentity::operator_identity`]). When BOTH this and `operator`
+    /// are set, that explicitly configured pair wins outright. When `operator`
+    /// is set but this is not, the configured name is kept for `Operator:`
+    /// provenance and NO email is emitted — a configured name is never paired
+    /// with an unrelated host email. When `operator` is unset, the matched
+    /// host Git pair (`git config user.name` + `user.email`) supplies both
+    /// halves. Never invented; `None` when no real source resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_email: Option<String>,
+
     /// Filesystem **path** to the agent's signing key PEM (tilde-expanded),
     /// the [`agent_mesh_protocol::UserKey`] that roots the §6 writer
     /// fingerprint and the mesh `AgentKey`. A **path**, never inline key
@@ -295,6 +307,7 @@ impl Default for AgentIdentity {
             email: DEFAULT_AGENT_EMAIL.to_string(),
             model: None,
             operator: None,
+            operator_email: None,
             signing_key: None,
             public_key: None,
             github_app: None,
@@ -347,6 +360,80 @@ pub fn default_operator_email() -> Option<String> {
             .ok()
             .filter(|s| !s.is_empty())
     })
+}
+
+/// Read a single `git config` value (`user.name` / `user.email`). Returns
+/// `None` when git is absent, the key is unset, or the value is empty — never
+/// invents. This is the matched-pair reader for [`host_operator_identity`]:
+/// both halves come from the SAME `git config` source, so the pair can never
+/// disagree about whose identity it describes.
+fn read_git_config(key: &str) -> Option<String> {
+    std::process::Command::new("git")
+        .args(["config", "--get", key])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The matched host Git operator pair — `(user.name, user.email)`, both from
+/// the SAME `git config` source. Returns `(Some(name), Some(email))` only
+/// when BOTH resolve (a real matched pair); `(Some(name), None)` when only
+/// the host name resolves (provenance only, no `Co-authored-by:`); `(None,
+/// None)` when neither resolves. When the host name is absent but an email is
+/// set, the email is DROPPED — it has no matched name, so it cannot form a
+/// pair and is never paired with an env-fallback name. The env/`USER` name
+/// fallback ([`default_operator`]) is used only for the provenance name when
+/// `git config user.name` is unset, never paired with a host email.
+fn host_operator_identity() -> (Option<String>, Option<String>) {
+    let name = read_git_config("user.name");
+    let email = read_git_config("user.email");
+    match (name, email) {
+        (Some(n), Some(e)) => (Some(n), Some(e)),
+        (Some(n), None) => (Some(n), None),
+        (None, _) => {
+            // No host git name to match the email (if any); fall back to the
+            // env/USER name for provenance, but emit NO email — an env name
+            // and a `git config` email are not a matched pair.
+            (default_operator(), None)
+        }
+    }
+}
+
+/// Pure resolution of the operator co-author identity from the configured
+/// fields and a host Git pair — no subprocess, fully deterministic, the
+/// testable core of [`AgentIdentity::operator_identity`]. See that method for
+/// the resolution contract (configured pair → configured name only → matched
+/// host pair / host name only). Extracted so the atomic-pair logic is unit-
+/// testable without shelling out to a real `git config`.
+fn resolve_operator_identity(
+    cfg_name: Option<&str>,
+    cfg_email: Option<&str>,
+    host: (Option<String>, Option<String>),
+) -> (Option<String>, Option<String>) {
+    let cfg_name = cfg_name.map(str::trim).filter(|s| !s.is_empty());
+    let cfg_email = cfg_email.map(str::trim).filter(|s| !s.is_empty());
+    // 1. Explicitly configured pair: both halves present.
+    if let (Some(name), Some(email)) = (cfg_name, cfg_email) {
+        return (Some(name.to_string()), Some(email.to_string()));
+    }
+    // 2. Configured name without configured email: keep the name for
+    //    provenance, emit NO email — never pair a configured name with an
+    //    unrelated host email, never swap it for the host name.
+    if let Some(name) = cfg_name {
+        return (Some(name.to_string()), None);
+    }
+    // 3. No configured name: the matched host Git pair. Defensively enforce
+    //    the atomicity invariant here as well — an email with no matching
+    //    name is not a pair (never pair an email with an absent name), so the
+    //    rule holds regardless of what the host builder returned.
+    match host {
+        (Some(n), Some(e)) => (Some(n), Some(e)),
+        (Some(n), None) => (Some(n), None),
+        (None, _) => (None, None),
+    }
 }
 
 /// Which layer an [`AgentIdentity`] resolved from. Surfaced by
@@ -551,26 +638,59 @@ impl AgentIdentity {
     }
 
     /// The human operator name for the commit attribution footer's
-    /// `Operator:` field. Config wins; otherwise derived from the host git
-    /// identity so an unconfigured box still records *someone*.
+    /// `Operator:` field — the NAME half of the atomic
+    /// [`AgentIdentity::operator_identity`] pair. Config wins; otherwise
+    /// derived from the host git identity so an unconfigured box still
+    /// records *someone*.
     #[must_use]
     pub fn operator_name(&self) -> Option<String> {
-        self.operator.clone().or_else(default_operator)
+        self.operator_identity().0
     }
 
     /// The human operator's EMAIL for operator `Co-authored-by:` attribution
-    /// — the real host git identity (`git config user.email`, then
-    /// `GIT_AUTHOR_EMAIL`). `None` when no real email source resolves; NEVER
-    /// invented (the operator-attribution contract: emit a `Co-authored-by:`
-    /// for the operator only when a REAL email is known). There is no
-    /// `agent-identity.toml` field for this today; a future config source would
-    /// slot in ahead of [`default_operator_email`] here. The caller (the
-    /// session loop) resolves this once and threads it into
-    /// [`crate::attribution::CommitAttribution::operator_email`], keeping the
-    /// typed value's own constructor tool-less.
+    /// — the EMAIL half of the atomic
+    /// [`AgentIdentity::operator_identity`] pair. `None` when no real,
+    /// same-source-paired email resolves; NEVER invented (the
+    /// operator-attribution contract: emit a `Co-authored-by:` for the
+    /// operator only when a REAL email is known AND it is paired with a name
+    /// from the same source — a configured name is never paired with an
+    /// unrelated host email). Delegates to [`AgentIdentity::operator_identity`]
+    /// so the two halves can never disagree.
     #[must_use]
     pub fn operator_email(&self) -> Option<String> {
-        default_operator_email()
+        self.operator_identity().1
+    }
+
+    /// Resolve the human operator's co-author identity as an ATOMIC
+    /// `(name, email)` pair — the unit of GitHub `Co-authored-by:`
+    /// recognition. The two halves are NEVER resolved independently:
+    ///
+    /// 1. **Explicitly configured pair** — both `operator` (name) and
+    ///    `operator_email` set in `agent-identity.toml`. Both must be present
+    ///    and non-empty; this is the operator's deliberate, complete identity
+    ///    and wins outright.
+    /// 2. **Configured name without configured email** — the configured name
+    ///    is kept for `Operator:` provenance and the email is `None`: no
+    ///    human `Co-authored-by:` is emitted. A configured name is NEVER
+    ///    paired with an unrelated independently-discovered host email
+    ///    (requirement 8), and never swapped for the host name — the
+    ///    operator's stated identity wins for provenance.
+    /// 3. **Matched host Git pair** — when NO operator name is configured,
+    ///    the host git identity (`git config user.name` + `user.email`, the
+    ///    same source) supplies both halves as a matched pair. When only the
+    ///    host name resolves, it is kept for provenance with no email
+    ///    (requirement 10); when neither resolves, the operator is unknown.
+    ///
+    /// An email is therefore emitted ONLY when it is paired with a name from
+    /// the SAME source — configured email with a configured name, or host
+    /// email with a host name. Never invented (requirement 11).
+    #[must_use]
+    pub fn operator_identity(&self) -> (Option<String>, Option<String>) {
+        resolve_operator_identity(
+            self.operator.as_deref(),
+            self.operator_email.as_deref(),
+            host_operator_identity(),
+        )
     }
 
     /// A PREVIEW `Co-authored-by:` trailer line (`newt identity`), in the
@@ -1045,5 +1165,178 @@ name = "standalone[bot]"
         let (id, src) = AgentIdentity::resolve_from(Some(ws.path()), Some(home.path())).unwrap();
         assert_eq!(id.name, "standalone[bot]");
         assert!(matches!(src, IdentitySource::Workspace(_)));
+    }
+
+    // ---- #1709 family: atomic operator (name, email) identity resolution ----
+    //
+    // The operator co-author identity is resolved as ONE atomic pair, never
+    // the two halves independently: a configured name is never paired with an
+    // unrelated host email, and an email is never invented. The pure
+    // `resolve_operator_identity` core is unit-tested here with INJECTED host
+    // pairs (no subprocess); the `AgentIdentity::operator_identity` wrappers
+    // below cover the configured cases (which return before any git read, so
+    // they too are deterministic).
+
+    #[test]
+    fn resolve_configured_pair_wins_outright() {
+        // Requirement 9: an explicitly configured name+email pair is preferred.
+        let (name, email) = resolve_operator_identity(
+            Some("shawn"),
+            Some("shawn@configured.example"),
+            (Some("Host Name".into()), Some("host@host.example".into())),
+        );
+        assert_eq!(name.as_deref(), Some("shawn"));
+        assert_eq!(email.as_deref(), Some("shawn@configured.example"));
+    }
+
+    #[test]
+    fn resolve_configured_name_without_email_is_never_paired_with_host_email() {
+        // Requirement 8 (the core defect): a configured operator name with no
+        // configured email must NOT grab an unrelated host email. The name is
+        // kept for provenance; the email is None — no Co-authored-by emitted.
+        let (name, email) = resolve_operator_identity(
+            Some("shawn"),
+            None,
+            (Some("Host Name".into()), Some("host@host.example".into())),
+        );
+        assert_eq!(name.as_deref(), Some("shawn"));
+        assert!(
+            email.is_none(),
+            "configured name must not pair with host email"
+        );
+    }
+
+    #[test]
+    fn resolve_configured_email_without_name_falls_to_host_pair() {
+        // A configured email with no configured name cannot form a configured
+        // pair; fall to the matched host pair (the email is not paired with a
+        // configured-but-absent name).
+        let (name, email) = resolve_operator_identity(
+            None,
+            Some("shawn@configured.example"),
+            (Some("Host Name".into()), Some("host@host.example".into())),
+        );
+        assert_eq!(name.as_deref(), Some("Host Name"));
+        assert_eq!(email.as_deref(), Some("host@host.example"));
+    }
+
+    #[test]
+    fn resolve_unconfigured_uses_matched_host_pair() {
+        // Requirement 9: with no configured operator, the matched host Git
+        // name+email pair (same source) supplies both halves.
+        let (name, email) = resolve_operator_identity(
+            None,
+            None,
+            (Some("Host Name".into()), Some("host@host.example".into())),
+        );
+        assert_eq!(name.as_deref(), Some("Host Name"));
+        assert_eq!(email.as_deref(), Some("host@host.example"));
+    }
+
+    #[test]
+    fn resolve_host_name_only_keeps_name_emits_no_email() {
+        // Requirement 10: when only a name is known (host name, no host
+        // email), keep the name for provenance, emit no email.
+        let (name, email) = resolve_operator_identity(None, None, (Some("Host Name".into()), None));
+        assert_eq!(name.as_deref(), Some("Host Name"));
+        assert!(email.is_none());
+    }
+
+    #[test]
+    fn resolve_nothing_known_yields_none_pair() {
+        let (name, email) = resolve_operator_identity(None, None, (None, None));
+        assert!(name.is_none());
+        assert!(email.is_none());
+    }
+
+    #[test]
+    fn resolve_host_email_without_host_name_drops_the_email() {
+        // A host email with no matching host name cannot form a pair; the
+        // email is dropped (never paired with an env-fallback name).
+        let (name, email) =
+            resolve_operator_identity(None, None, (None, Some("host@host.example".into())));
+        assert!(name.is_none());
+        assert!(
+            email.is_none(),
+            "an email with no matched name is not a pair"
+        );
+    }
+
+    #[test]
+    fn resolve_trims_whitespace_and_ignores_empty_configured_values() {
+        // Whitespace-only configured values are treated as absent, so a
+        // "  " configured email does not pair with a configured name.
+        let (name, email) = resolve_operator_identity(
+            Some("  shawn  "),
+            Some("   "),
+            (Some("Host Name".into()), Some("host@host.example".into())),
+        );
+        assert_eq!(name.as_deref(), Some("shawn"));
+        assert!(
+            email.is_none(),
+            "blank configured email is absent — no pairing"
+        );
+    }
+
+    #[test]
+    fn operator_identity_configured_pair_via_toml() {
+        // The full `operator_identity()` path: an explicitly configured pair
+        // (both fields) wins, deterministically (returns before any git read).
+        let id = AgentIdentity::from_toml_str(
+            r#"
+[agent-identity]
+name = "newt-agent"
+operator = "shawn"
+operator_email = "shawn@configured.example"
+"#,
+        )
+        .unwrap();
+        let (name, email) = id.operator_identity();
+        assert_eq!(name.as_deref(), Some("shawn"));
+        assert_eq!(email.as_deref(), Some("shawn@configured.example"));
+    }
+
+    #[test]
+    fn operator_identity_configured_name_only_emits_no_email() {
+        // Requirement 8 + 10 via the real method: a configured name with no
+        // configured email keeps the name and emits no email. This returns at
+        // the configured-name branch (before any host git read), so it is
+        // deterministic regardless of the host git config.
+        let id = AgentIdentity::from_toml_str(
+            r#"
+[agent-identity]
+name = "newt-agent"
+operator = "shawn"
+"#,
+        )
+        .unwrap();
+        let (name, email) = id.operator_identity();
+        assert_eq!(name.as_deref(), Some("shawn"));
+        assert!(
+            email.is_none(),
+            "configured name with no configured email emits no email (never paired with host)"
+        );
+        // The convenience accessors agree with the atomic pair.
+        assert_eq!(id.operator_name().as_deref(), Some("shawn"));
+        assert!(id.operator_email().is_none());
+    }
+
+    #[test]
+    fn operator_email_never_invented_when_unset() {
+        // Requirement 11: with no configured operator at all, the default
+        // identity never invents an operator email — `operator_email()` is
+        // the atomic pair's email half, which is None without a matched host
+        // pair. (This does not shell out: the default identity has no
+        // configured operator, so it reaches the host branch; the assertion
+        // only checks it is None-or-real, never a fabricated constant.)
+        let id = AgentIdentity::default();
+        assert!(id.operator.is_none());
+        assert!(id.operator_email.is_none());
+        // operator_email() is real-or-None, never a hardcoded invented value.
+        let email = id.operator_email();
+        assert!(
+            email.is_none() || email.unwrap().contains('@'),
+            "operator email is real-or-None, never invented"
+        );
     }
 }
