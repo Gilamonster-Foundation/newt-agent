@@ -950,14 +950,16 @@ fn parse_ident(s: &str) -> (String, String, i64) {
 pub struct LocalGitTool {
     pub root: std::path::PathBuf,
     pub author: Author,
-    /// A `Co-authored-by:` trailer auto-appended to every commit message — the
-    /// AI credit, e.g. `Co-authored-by: qwen3:30b (newt-agent v0.6.8)
-    /// <noreply@newt-agent.com>`. The tool owns this (deterministic, always
-    /// correct) rather than trusting the model to add it; the system prompt
-    /// tells the model it's automatic so it does not add a second copy.
-    /// `None` disables auto-signing. Skipped when the message already carries a
-    /// co-authored-by line (the model signed anyway → don't duplicate).
-    pub coauthor: Option<String>,
+    /// The canonical, harness-owned commit attribution envelope — the active
+    /// model + harness build + operator/agent identity — finalized into every
+    /// commit/amend/rebase message by
+    /// [`CommitAttribution::finalize_message`](newt_core::attribution::CommitAttribution::finalize_message).
+    /// Refreshed as late as practical before the turn that may commit (in the
+    /// session loop, from the live inference model + resolved identity) so a
+    /// `/model` switch is reflected in the next commit, not the one frozen at
+    /// session boot. `None` only in test scaffolds that opt out of signing;
+    /// the commit arms then leave the message unchanged.
+    pub attribution: Option<newt_core::attribution::CommitAttribution>,
 }
 
 impl LocalGitTool {
@@ -967,57 +969,33 @@ impl LocalGitTool {
     pub fn head_snapshot(&self, caps: &GitCaveats) -> Result<HeadSnapshot, GitError> {
         GitEngine::open(&self.root)?.head_snapshot(caps)
     }
-}
 
-/// Append the `coauthor` trailer to a commit message, unless the message
-/// already carries any `Co-authored-by:` line (case-insensitive) — the user's
-/// "skip if one already present" rule. Pure, for testing.
-///
-/// The `coauthor` value carries the stable identity line(s) built at session
-/// start (`Co-authored-by:` + `Model:`). This function stamps the volatile,
-/// commit-time fields (`Harness`, `Operator`, `Time`, `Date`) so they reflect
-/// when the commit was actually created, not when the session began.
-fn sign_message(message: &str, coauthor: Option<&str>) -> String {
-    match coauthor {
-        Some(trailer) if !message.to_lowercase().contains("co-authored-by:") => {
-            format!("{}\n\n{}", message.trim_end(), attribution_block(trailer))
-        }
-        _ => message.to_string(),
-    }
-}
-
-/// The full attribution footer: the session-built `trailer` — now
-/// potentially several `Co-authored-by:` lines, one per
-/// [`newt_core::attribution::Attribution`] contributor (#1707/#1709), no
-/// longer a single line + a redundant `Model:` line — followed by the
-/// commit-time Harness/Operator/Time/Date line. Pure given the clock +
-/// process env; reads `NEWT_BRAND_NAME` / `NEWT_OPERATOR` / `git config
-/// user.name` lazily at commit time.
-fn attribution_block(trailer: &str) -> String {
-    let harness = format!(
-        "{} v{}",
-        newt_core::build_info::harness_name(),
-        newt_core::build_info::VERSION_WITH_COMMIT
-    );
-    let operator = operator_name().unwrap_or_else(|| "unknown".to_string());
-    let now = chrono::Local::now();
-    format!(
-        "{trailer}\nHarness: {harness} | Operator: {operator} | Time: {} | Date: {}",
-        now.format("%H:%M %Z"),
-        now.format("%Y-%m-%d"),
-    )
-}
-
-/// The operator name for the footer: `NEWT_OPERATOR` override, then git's
-/// `user.name`, then `GIT_AUTHOR_NAME`, then the OS username.
-fn operator_name() -> Option<String> {
-    if let Ok(v) = std::env::var("NEWT_OPERATOR") {
-        if !v.trim().is_empty() {
-            return Some(v.trim().to_string());
+    /// The ONE first-class commit-message attribution boundary (#1709
+    /// integration). Every `commit` / `amend` / `rebase` arm routes its
+    /// model-provided subject+body through here, so no caller independently
+    /// formats attribution — the typed [`CommitAttribution`] owns it
+    /// (deterministic, idempotent, replaces stale Newt-owned trailers,
+    /// preserves legitimate third-party ones). Returns the message unchanged
+    /// when no attribution is configured (test scaffolds).
+    ///
+    /// [`CommitAttribution`]: newt_core::attribution::CommitAttribution
+    fn finalize_commit_message(&self, message: &str) -> String {
+        match &self.attribution {
+            Some(a) => a.finalize_message(message),
+            None => message.to_string(),
         }
     }
-    newt_core::agent_identity::default_operator()
 }
+
+// #1709 integration: commit-message attribution is owned by the canonical
+// finalizer [`CommitAttribution::finalize_message`] (in `newt-core`), reached
+// through [`LocalGitTool::finalize_commit_message`]. The old per-call
+// `sign_message` + `attribution_block` + `operator_name` formatting — which
+// duplicated the finalizer and stamped a non-deterministic wall-clock
+// `Time`/`Date` footer — is removed; every commit arm now routes through the
+// one shared boundary so no caller formats attribution itself.
+//
+// [`CommitAttribution`]: newt_core::attribution::CommitAttribution
 
 impl newt_core::agentic::GitTool for LocalGitTool {
     fn dispatch(
@@ -1075,7 +1053,7 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                     .and_then(|v| v.as_str())
                     .filter(|m| !m.trim().is_empty())
                     .ok_or("commit: 'message' is required")?;
-                let signed = sign_message(msg, self.coauthor.as_deref());
+                let signed = self.finalize_commit_message(msg);
                 let c = eng.commit(caps, &signed, &self.author).map_err(s)?;
                 Ok(format!("committed {}: {}", c.short_id, c.summary))
             }
@@ -1087,7 +1065,7 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .filter(|m| !m.trim().is_empty());
-                let signed = msg.map(|m| sign_message(m, self.coauthor.as_deref()));
+                let signed = msg.map(|m| self.finalize_commit_message(m));
                 let c = eng
                     .amend(caps, signed.as_deref(), &self.author)
                     .map_err(s)?;
@@ -1099,7 +1077,7 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                     .and_then(|v| v.as_str())
                     .filter(|o| !o.trim().is_empty())
                     .ok_or("rebase: 'onto' (the base commit/ref to replay onto) is required")?;
-                let steps = parse_rebase_plan(args, self.coauthor.as_deref())?;
+                let steps = parse_rebase_plan(args, self.attribution.as_ref())?;
                 if steps.is_empty() {
                     return Err("rebase: 'plan' must list at least one step".to_string());
                 }
@@ -1159,11 +1137,14 @@ impl newt_core::agentic::GitTool for LocalGitTool {
 }
 
 /// Parse the `plan` array (`[{commit, action, message?}]`) into `RebaseStep`s.
-/// `reword`/`squash` messages are signed with the co-author trailer (the tool
-/// owns signing), so rebased commits keep the AI credit too.
+/// `reword`/`squash` messages are finalized through the canonical
+/// [`CommitAttribution`] finalizer (the tool owns signing), so rebased
+/// commits keep the AI credit too.
+///
+/// [`CommitAttribution`]: newt_core::attribution::CommitAttribution
 fn parse_rebase_plan(
     args: &serde_json::Value,
-    coauthor: Option<&str>,
+    attribution: Option<&newt_core::attribution::CommitAttribution>,
 ) -> Result<Vec<RebaseStep>, String> {
     let plan = args
         .get("plan")
@@ -1193,7 +1174,10 @@ fn parse_rebase_plan(
             .and_then(|v| v.as_str())
             .filter(|m| !m.trim().is_empty())
             .map(|m| match action {
-                RebaseAction::Reword | RebaseAction::Squash => sign_message(m, coauthor),
+                RebaseAction::Reword | RebaseAction::Squash => match attribution {
+                    Some(a) => a.finalize_message(m),
+                    None => m.to_string(),
+                },
                 _ => m.to_string(),
             });
         steps.push(RebaseStep {
@@ -1611,9 +1595,14 @@ mod tests {
                 name: "newt-agent[bot]".into(),
                 email: "bot@example.com".into(),
             },
-            coauthor: Some(
-                "Co-authored-by: qwen3:30b (newt-agent v0.6.8) <noreply@newt-agent.com>".into(),
-            ),
+            // The canonical attribution the session would refresh from the live
+            // model + resolved identity. `from_runtime` is tool-less, so this
+            // is deterministic in tests (no wall clock, no subprocess).
+            attribution: Some(newt_core::attribution::CommitAttribution::from_runtime(
+                "qwen3:30b",
+                None,
+                "noreply@newt-agent.com",
+            )),
         }
     }
 
@@ -1719,57 +1708,60 @@ mod tests {
         assert!(err.contains("branch-delete"), "{err}");
     }
 
+    /// #1709 integration: the tool's commit-message attribution now flows
+    /// through ONE boundary — [`LocalGitTool::finalize_commit_message`] →
+    /// [`CommitAttribution::finalize_message`] — not the removed
+    /// `sign_message`/`attribution_block` pair. The model may supply a bare
+    /// subject with zero attribution text; the harness owns the trailer +
+    /// provenance, deterministically (no wall clock) and idempotently.
+    ///
+    /// [`CommitAttribution`]: newt_core::attribution::CommitAttribution
     #[test]
-    fn sign_message_appends_trailer_then_dedups() {
-        let tr = "Co-authored-by: qwen3:30b (newt-agent v0.6.8) <noreply@newt-agent.com>";
-        // Plain message → attribution block appended after a blank line, and
-        // the commit-time Harness/Operator/Time/Date footer is stamped.
-        let out = sign_message("docs: tweak", Some(tr));
-        assert!(out.starts_with(&format!("docs: tweak\n\n{tr}")), "{out}");
-        assert!(out.contains("Harness: "), "{out}");
-        assert!(out.contains(" | Operator: "), "{out}");
-        assert!(out.contains(" | Time: "), "{out}");
-        assert!(out.contains(" | Date: "), "{out}");
-        // Message already carrying a co-authored-by → left untouched (no dup).
-        let already = "feat: x\n\nCo-authored-by: someone <a@b.c>";
-        assert_eq!(sign_message(already, Some(tr)), already);
-        // No trailer configured → message unchanged.
-        assert_eq!(sign_message("m", None), "m");
-    }
-
-    #[test]
-    fn attribution_block_stamps_commit_time_footer_fields() {
-        // Grounds the mocked trailer tests: the footer carries the live
-        // harness version, an operator, and a commit-time Time/Date stamp.
-        let block = attribution_block("Co-authored-by: m <a@b.c>\nModel: m");
-        assert!(block.contains("Model: m"), "{block}");
+    fn finalize_commit_message_owns_attribution_deterministically() {
+        let t = tool(Path::new(".")); // root unused by finalize_commit_message
+                                      // Bare subject, zero attribution text → canonical trailer + provenance.
+        let out = t.finalize_commit_message("fix the parser");
+        let version = newt_core::build_info::PACKAGE_VERSION;
         assert!(
-            block.contains(&format!(
-                "Harness: newt-agent v{}",
-                newt_core::build_info::VERSION_WITH_COMMIT
+            out.contains(&format!(
+                "Co-authored-by: qwen3:30b (newt-agent v{version}) <noreply@newt-agent.com>"
             )),
-            "default brand + real version: {block}"
+            "canonical model trailer rendered from the typed value: {out}"
         );
-        assert!(block.contains("Operator: "), "{block}");
-        // Time is `HH:MM <zone>` and Date is `YYYY-MM-DD`. The zone token is
-        // platform-provided: a tz abbreviation (e.g. `EDT`) where the host
-        // supplies one, else a numeric offset (`-04:00`). Assert the shape,
-        // not one platform's spelling.
-        let footer = block.lines().last().unwrap();
-        let time = footer
-            .split("Time: ")
-            .nth(1)
-            .unwrap()
-            .split(" | ")
-            .next()
-            .unwrap();
-        let mut parts = time.split_whitespace();
-        let hhmm = parts.next().unwrap_or("");
-        assert_eq!(hhmm.len(), "12:34".len(), "HH:MM: {time}");
-        assert_eq!(hhmm.chars().nth(2), Some(':'), "HH:MM colon: {time}");
-        assert!(parts.next().is_some(), "a zone token follows HH:MM: {time}");
-        let date = footer.rsplit("Date: ").next().unwrap();
-        assert_eq!(date.len(), "2026-08-12".len(), "YYYY-MM-DD: {date}");
+        assert!(
+            out.contains("Harness: newt-agent v")
+                && out.contains(" | Model: qwen3:30b | Operator: "),
+            "canonical provenance line rendered from the same value: {out}"
+        );
+        assert!(
+            !out.contains("Time:"),
+            "no wall-clock field (deterministic): {out}"
+        );
+        assert!(
+            out.starts_with("fix the parser\n\n"),
+            "subject preserved verbatim: {out}"
+        );
+        // A legitimate third-party co-author is preserved verbatim.
+        let with_third = "feat: x\n\nCo-authored-by: someone <a@b.c>";
+        let out2 = t.finalize_commit_message(with_third);
+        assert!(
+            out2.contains("Co-authored-by: someone <a@b.c>"),
+            "third-party kept: {out2}"
+        );
+        assert!(
+            out2.contains("Co-authored-by: qwen3:30b"),
+            "newt model trailer added: {out2}"
+        );
+        // Idempotent: re-finalizing the finalized message yields the same bytes.
+        assert_eq!(
+            t.finalize_commit_message(&out),
+            out,
+            "idempotent re-finalization"
+        );
+        // No attribution configured → message unchanged (test opt-out path).
+        let mut t2 = t;
+        t2.attribution = None;
+        assert_eq!(t2.finalize_commit_message("m"), "m");
     }
 
     #[test]
@@ -1797,9 +1789,59 @@ mod tests {
             .unwrap();
         let body = String::from_utf8_lossy(&log.stdout);
         assert!(body.contains("add c"), "subject present: {body}");
+        // The canonical harness-managed trailer + provenance, rendered from the
+        // typed CommitAttribution (real package version, the configured email).
+        let version = newt_core::build_info::PACKAGE_VERSION;
         assert!(
-            body.contains("Co-authored-by: qwen3:30b (newt-agent v0.6.8)"),
-            "trailer present: {body}"
+            body.contains(&format!(
+                "Co-authored-by: qwen3:30b (newt-agent v{version}) <noreply@newt-agent.com>"
+            )),
+            "canonical model trailer present: {body}"
+        );
+        assert!(
+            body.contains("Harness: newt-agent v")
+                && body.contains(" | Model: qwen3:30b | Operator: "),
+            "canonical provenance line present: {body}"
+        );
+    }
+
+    /// #1709 acceptance condition: a model may supply a bare subject —
+    /// "fix the parser" — with ZERO attribution text, and the resulting
+    /// first-class Newt commit still carries correct harness-managed
+    /// attribution (the canonical model trailer + provenance, rendered from
+    /// the typed `CommitAttribution` through the one shared finalizer
+    /// boundary). Grounds the mocked `finalize_commit_message` test against a
+    /// real commit read back via system git.
+    #[test]
+    fn bare_model_subject_still_gets_harness_managed_attribution() {
+        let dir = repo_with_commit();
+        std::fs::write(dir.path().join("p.txt"), "x\n").unwrap();
+        let t = tool(dir.path());
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["p.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        // Bare subject, no attribution text whatsoever from the model.
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "fix the parser"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let body = head_message(dir.path());
+        assert!(body.contains("fix the parser"), "subject preserved: {body}");
+        let version = newt_core::build_info::PACKAGE_VERSION;
+        assert!(
+            body.contains(&format!(
+                "Co-authored-by: qwen3:30b (newt-agent v{version}) <noreply@newt-agent.com>"
+            )),
+            "canonical model trailer added by the harness: {body}"
+        );
+        assert!(
+            body.contains(" | Model: qwen3:30b | Operator: "),
+            "canonical provenance line added by the harness: {body}"
         );
     }
 

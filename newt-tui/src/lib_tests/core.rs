@@ -28,9 +28,10 @@ fn openai_surface_probe_skips_plain_http_multiplexers() {
 /// #1707/#1709: the session `coauthor_trailer` single-model function this
 /// test used to exercise is gone — attribution now flows through
 /// `newt_core::attribution::AttributionLedger`, recorded per-contributor by
-/// the agent loop and rendered by `chat.rs` into `session_git_tool.coauthor`.
-/// This test exercises that same ledger directly with the identity resolved
-/// the way the session resolves it.
+/// the agent loop. (Commit attribution itself now flows through the canonical
+/// `CommitAttribution` finalizer wired into `session_git_tool.attribution` in
+/// `chat.rs`; this test exercises the ledger directly, the way the session
+/// resolves identity for it.)
 #[test]
 fn attribution_ledger_uses_resolved_identity_email() {
     let id = newt_core::AgentIdentity::default();

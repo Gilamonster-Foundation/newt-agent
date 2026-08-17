@@ -2218,28 +2218,36 @@ fn session_body(
                 name: session_identity.name.clone(),
                 email: session_identity.email.clone(),
             },
-            // Auto-sign commits with the AI credit (the tool owns this so it
-            // is always present and correctly formatted — the model is told
-            // it's automatic, see runtime_context_block). Refreshed from
-            // `attribution_ledger` at the top of every loop iteration below,
-            // so it always reflects every contributor accumulated since the
-            // last successful commit, not merely whichever model was active
-            // when the session booted. `None` here (nothing accumulated yet).
-            coauthor: None,
+            // #1709 integration: commit attribution is the canonical, harness-
+            // owned [`CommitAttribution`] envelope (active model + harness build
+            // + operator/agent identity), finalized into every commit message
+            // by `CommitAttribution::finalize_message` via the tool's one
+            // shared boundary. Refreshed from the LIVE inference model + the
+            // resolved identity at the top of every loop iteration below (the
+            // latest practical point before the turn that may commit), so a
+            // `/model` switch is reflected in the next commit rather than the
+            // one frozen at session boot. `None` here (refreshed immediately
+            // below); tests opt out of signing by leaving it `None`.
+            attribution: None,
         })
     };
 
     loop {
-        // #1707/#1709: refresh the embedded git tool's coauthor trailer(s)
-        // from the CURRENT attribution ledger state before this turn's
-        // ChatCtx is built, so a contributor recorded on a previous turn
-        // (including one under a model/backend since switched away from) is
-        // reflected in whatever commit this turn might make. `None` (not an
-        // empty string) when nothing is pending, so `sign_message` correctly
-        // treats "no contributor yet" as "do not stamp a trailer".
+        // #1709 integration: refresh the embedded git tool's `CommitAttribution`
+        // from the LIVE inference model + the resolved identity before this
+        // turn's ChatCtx is built, so whatever commit this turn might make is
+        // attributed to the model actually driving it — a `/model` (or
+        // `/backend`/loadout) switch since the last commit shows up here, not
+        // the value captured at session boot. This is the latest practical
+        // construction point: the tool is moved into ChatCtx for the turn
+        // right after, and `GitTool::dispatch` (the commit boundary) has no
+        // model parameter to read at commit time. The typed value owns all
+        // rendering downstream; no caller formats attribution itself.
         if let Some(tool) = session_git_tool.as_mut() {
-            let rendered = attribution_ledger.borrow().render();
-            tool.coauthor = (!rendered.is_empty()).then_some(rendered);
+            tool.attribution = Some(newt_core::attribution::CommitAttribution::from_identity(
+                &inf_model,
+                &session_identity,
+            ));
         }
         // #1668: the ONE preference-pin persistence site. Every operator
         // posture ACTION marked since the last pass — a successful
@@ -8012,7 +8020,7 @@ mod prompt_ingress_tests {
                 name: "test".into(),
                 email: "test@example.com".into(),
             },
-            coauthor: None,
+            attribution: None,
         };
         let mut denied = newt_core::Caveats::top();
         denied.fs_read = newt_core::Scope::none();
