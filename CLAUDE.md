@@ -12,21 +12,26 @@ review here will be done by an arbiter LLM voting against a real CI
 gate. The gates must be honest. Do not game them.
 
 **newt-agent is transitional.** See
-`docs/decisions/agent_family_inheritance.md`. The agent family descends
-**wyvern-agent, then newt-agent, then gilamonster-agent**, complexity
-increasing. wyvern is the base: the barest working harness, OCAP, and no real
-TUI, just a near-pure scroller whose lines read correctly under `journalctl`.
-gilamonster is everything and the kitchen sink, with OCAP off by default.
-Aspirationally wyvern ends up a **rewrite of newt-agent that is lighter,
-faster and smaller**, and the others inherit from it, at which point
-newt-agent's crates are retired in favour of rewrites.
+`docs/decisions/agent_line_architecture.md`, which is the single canonical
+statement of how the three agents relate. In capability terms
+**wyvern ≤ newt ≤ gilamonster**. Today the three share no crate-level
+dependency at all: newt and gilamonster sit on `agent-mesh-protocol` and
+`agent-bridle`, gilamonster consumes newt by a pinned git rev, and wyvern is
+isolated. The target is that wyvern becomes a small headless containerized
+worker that newt or gilamonster dispatch OCAP caveats to, reached as a
+rewrite of newt that is lighter, faster and smaller, after which newt's crates
+are retired in favour of it.
 
-The practical consequence for work here: **contracts survive a rewrite,
-implementations do not.** Wire types, identity, ownership/provenance chains,
-data formats and capability vocabulary are what a rewrite is written against,
-so they repay the most care. De-duplicating an implementation pays back twice
-downstream. Surface polish a descendant will rewrite is worth less. This makes
-the three Cs and the reuse discipline below *more* load-bearing, not less.
+Two rules follow, and the ADR is authoritative over this summary:
+
+- Shared functionality moves *down* into the minimal layer. A lower layer never
+  depends on a richer one.
+- **Contracts survive a rewrite, implementations do not.** Wire and schema
+  types, identity and provenance, config and capability vocabulary, observable
+  behaviour, security invariants, conformance tests and compatibility fixtures
+  are what a rewrite is written against, so they repay the most care. Surface
+  polish a descendant will rewrite is worth less. This makes the three Cs and
+  the reuse discipline below matter more, not less.
 
 ## Architectural style — the three Cs
 
