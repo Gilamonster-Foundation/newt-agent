@@ -38,6 +38,7 @@ mod solve_contract;
 pub mod stack;
 pub mod stdio_guard;
 mod summarizer_cmd;
+mod timer_cmd;
 mod tuning_cmd;
 mod web_cmd;
 
@@ -570,6 +571,13 @@ pub enum Command {
         /// Optional `/command` name to show the detail page for (omit for the
         /// full list). A leading slash is accepted and ignored.
         command: Option<String>,
+    },
+    /// Self-scheduled wake-up timers. `schedule` records a deferred prompt the
+    /// agent re-enters with later; `fire` (from a cron/launchd job) drains due
+    /// timers; `list` / `dismiss` manage the queue. The host owns the clock.
+    Timer {
+        #[command(subcommand)]
+        cmd: timer_cmd::TimerCmd,
     },
     /// Drake-swarm pilot dashboard.
     Pilot {
@@ -1583,6 +1591,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Dock { cmd } => {
             let code = dock_cmd::run(cmd, cli.config.as_deref())?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Command::Timer { cmd } => {
+            let code = timer_cmd::run(cmd)?;
             if code != 0 {
                 std::process::exit(code);
             }
