@@ -921,7 +921,11 @@ fn is_directive_prohibition(lower: &str) -> bool {
 /// ..."`: a negated form of those is rare and out of scope for this fix.
 fn needs_operator_decision(lower: &str) -> bool {
     let prohibition = is_directive_prohibition(lower);
-    (!prohibition && contains_any(lower, &["choose ", "select ", "pick "]))
+    // "Choose the smallest coherent fix" delegates the choice to the agent;
+    // "Choose SQLite or Postgres" poses one to the operator. Only the latter
+    // — a needle plus an alternative marker — is a decision (#1748).
+    let poses_alternative = contains_any(lower, &[" or ", " between ", " among ", "which", "?"]);
+    (!prohibition && poses_alternative && contains_any(lower, &["choose ", "select ", "pick "]))
         || contains_any(
             lower,
             &[
@@ -1410,6 +1414,38 @@ mod tests {
         assert_eq!(choose.disposition(), PromptDisposition::Ask);
     }
 
+    /// An imperative that delegates the choice to the agent ("choose the
+    /// smallest fix") poses no alternative for the operator to lock; it must
+    /// not block execution. Observed on PR #1747's task prompt.
+    #[test]
+    fn delegated_choice_imperatives_are_not_decisions() {
+        for prompt in [
+            "Choose the smallest coherent fix consistent with existing CLI design.",
+            "Select the first matching entry.",
+            "Pick a descriptive name for the helper.",
+        ] {
+            let intake = PromptIntake::analyze(prompt);
+            assert_eq!(
+                intake.manifest().pending_decision_count(),
+                0,
+                "{prompt:?} delegates the choice; it is not an operator decision: {:#?}",
+                intake.manifest().decisions()
+            );
+            assert_eq!(intake.disposition(), PromptDisposition::Act, "{prompt:?}");
+        }
+        for prompt in [
+            "Choose between SQLite and Postgres.",
+            "Pick which backend to use.",
+            "Select staging or production.",
+        ] {
+            assert_eq!(
+                PromptIntake::analyze(prompt).disposition(),
+                PromptDisposition::Ask,
+                "{prompt:?}"
+            );
+        }
+    }
+
     #[test]
     fn explain_and_research_receive_their_intended_bounded_tool_loops() {
         let explain = PromptIntake::analyze("Explain how prompt receipts survive compaction.");
@@ -1869,7 +1905,7 @@ mod clarification_gate_tests {
         let mut intake = PromptIntake::analyze(
             "Should we use SQLite or Postgres for the cache?\n\
              Pick either the polling or the streaming transport.\n\
-             Choose the retention window.",
+             Choose the retention window: 7 or 30 days.",
         );
         let total = intake.manifest.decisions.len();
         assert!(total >= 3, "fixture needs at least three decisions");
