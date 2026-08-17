@@ -48,11 +48,11 @@ belong in the **gilamonster-agent** and **monitor-agent** repos, not here.
 **Status: intent recorded, no code moved. Blocked on a ratified prerequisite.**
 Decided by Shawn Hartsock, 2026-08-17.
 
-This migration depends on `docs/decisions/agent_line_architecture.md` being
-ratified, and on one unresolved conflict with wyvern's charter, which says
-"Headless. No TUI, ever. A ratatui dependency is exactly the weight wyvern
-refuses." A crossterm input surface is not ratatui, but it is still an
-interactive surface. Either that clause is amended or this migration is
+This migration depends on `docs/decisions/agent_line_architecture.md`
+(added by PR #1753; not present on this branch) being merged to `main`, and on one unresolved conflict with wyvern's charter, which says
+"Headless. No TUI, ever." wyvern's ADR-0002 is stronger and names the exact
+dependency this migration would add: "No TUI dependency anywhere in the
+workspace (no ratatui/crossterm)." Either that clause is amended or this migration is
 retargeted. Until then this section records intent, not an established plan,
 and no code moves.
 
