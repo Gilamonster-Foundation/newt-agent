@@ -166,6 +166,177 @@ impl CommitAttribution {
     ) -> Self {
         Self::from_runtime(model, identity.operator.clone(), identity.email.clone())
     }
+
+    // ---- deterministic commit-message finalization (#1709 family) ----
+    //
+    // The model is allowed to provide only a commit subject + body. The
+    // harness owns attribution. [`CommitAttribution::finalize_message`] takes
+    // the model-provided message and this typed provenance value, and renders
+    // ONE canonical, idempotent commit message from them — replacing any
+    // stale Newt-owned attribution a previous run left, preserving legitimate
+    // third-party trailers, and never hard-coding a model or package version
+    // (both come from this single typed value).
+
+    /// The canonical Newt-managed model attribution trailer, rendered from
+    /// this typed value:
+    /// `Co-authored-by: <model> (<harness> v<version>) <agent-email>`.
+    ///
+    /// `model`, `harness_name`, `harness_version`, and `agent_email` are all
+    /// fields of this one [`CommitAttribution`] (requirements 1, 3, 4) — no
+    /// current-model or current-package-version constant is hard-coded.
+    #[must_use]
+    pub fn model_trailer(&self) -> String {
+        format!(
+            "Co-authored-by: {} ({} v{}) <{}>",
+            self.model, self.harness_name, self.harness_version, self.agent_email
+        )
+    }
+
+    /// The canonical provenance line, rendered from this same typed value
+    /// (requirement 2):
+    /// `Harness: <harness> v<version> (<revision>) | Model: <model> | Operator: <operator>`.
+    ///
+    /// `operator` is [`CommitAttribution::operator_name`] when known, else the
+    /// deterministic sentinel `"unknown"`. No operator *email* is ever
+    /// manufactured (requirement 12) — this line carries the operator *name*,
+    /// and [`CommitAttribution::operator_email`] is intentionally absent from
+    /// the rendered output.
+    #[must_use]
+    pub fn provenance_line(&self) -> String {
+        format!(
+            "Harness: {} v{} ({}) | Model: {} | Operator: {}",
+            self.harness_name,
+            self.harness_version,
+            self.harness_build_revision,
+            self.model,
+            self.operator_name.as_deref().unwrap_or("unknown"),
+        )
+    }
+
+    /// Finalize a commit message from a model-provided subject/body plus this
+    /// typed provenance value.
+    ///
+    /// The model may provide any subject + body text; the harness owns the
+    /// attribution. This:
+    ///
+    /// 1. Splits the message into body + a trailing trailer block (git's
+    ///    "blank line before trailers" convention, requirement 11).
+    /// 2. Partitions the existing trailers into Newt-owned vs third-party.
+    ///    Newt-owned = the model attribution trailer (a `Co-authored-by:`
+    ///    line attributed to this value's `agent_email`) and the provenance
+    ///    line (any `Harness:` line) — recognized separately from third-party
+    ///    attribution (requirement 7).
+    /// 3. Drops stale Newt-owned model attribution (requirement 8) and stale
+    ///    provenance (requirement 9), preserving legitimate third-party
+    ///    `Co-authored-by:` / `Signed-off-by:` / … trailers verbatim and in
+    ///    order (requirement 6).
+    /// 4. Appends a blank line, the preserved third-party trailers, then the
+    ///    fresh model trailer and provenance line rendered from this value.
+    ///
+    /// Repeated finalization is idempotent (requirement 10): running it on its
+    /// own output yields the same bytes, because the freshly-rendered Newt
+    /// trailers are recognized as Newt-owned on the next pass and replaced
+    /// rather than duplicated.
+    ///
+    /// Rendering is deterministic (requirement 13): given the same typed value
+    /// and the same input message, the output is byte-identical — no wall
+    /// clock, no subprocess, no model text beyond what the caller passed.
+    #[must_use]
+    pub fn finalize_message(&self, message: &str) -> String {
+        let (body, existing) = split_message(message);
+        let agent_email_tag = format!("<{}>", self.agent_email);
+        let mut third_party: Vec<String> = Vec::new();
+        for trailer in existing {
+            if is_newt_model_trailer(&trailer, &agent_email_tag) || is_newt_provenance(&trailer) {
+                continue; // stale Newt-owned — drop, re-render below
+            }
+            third_party.push(trailer);
+        }
+
+        let mut trailers = third_party;
+        trailers.push(self.model_trailer());
+        trailers.push(self.provenance_line());
+
+        let mut out = body;
+        out.push_str("\n\n");
+        out.push_str(&trailers.join("\n"));
+        out.push('\n');
+        out
+    }
+}
+
+// ---- message-splitting + Newt-owned-trailer recognition helpers ----
+//
+// Free functions (not methods): they take no `&self`, so they are pure
+// functions of their arguments and trivially unit-testable in isolation.
+
+/// A line is trailer-shaped if it is `Key: value` with an alphanumeric /
+/// `-` / `_` key — the shape git's trailer parser recognizes. Continuation
+/// lines and blank lines are NOT recognized (the canonical Newt trailers are
+/// single-line); a multi-line trailer block therefore falls back to "no
+/// trailers" and is preserved as body, which is safe (we never drop user
+/// text).
+fn looks_like_trailer(line: &str) -> bool {
+    if line.starts_with(char::is_whitespace) || line.is_empty() {
+        return false;
+    }
+    match line.find(": ") {
+        Some(idx) => {
+            let key = &line[..idx];
+            !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        }
+        None => false,
+    }
+}
+
+/// Split a commit message into `(body, trailers)` on the last blank line.
+/// The trailers are the maximal run of trailer-shaped lines after the final
+/// blank line; if that run is empty or contains a non-trailer line, the whole
+/// message is treated as body (no trailer block). Trailing blank lines are
+/// stripped from the body; internal blank lines are preserved.
+fn split_message(message: &str) -> (String, Vec<String>) {
+    let lines: Vec<&str> = message.lines().collect();
+    let last_blank = lines.iter().rposition(|l| l.trim().is_empty());
+    let tail_start = match last_blank {
+        Some(idx) => idx + 1,
+        None => return (body_of(&lines), Vec::new()),
+    };
+    let tail = &lines[tail_start..];
+    if tail.is_empty() || !tail.iter().all(|l| looks_like_trailer(l)) {
+        return (body_of(&lines), Vec::new());
+    }
+    let body = body_of(&lines[..tail_start]);
+    let trailers = tail.iter().map(|s| s.to_string()).collect();
+    (body, trailers)
+}
+
+/// Join message lines into a body string with trailing blank lines stripped
+/// (internal blank lines preserved).
+fn body_of(lines: &[&str]) -> String {
+    let mut end = lines.len();
+    while end > 0 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    lines[..end].join("\n")
+}
+
+/// A Newt-owned model attribution trailer: a `Co-authored-by:` line credited
+/// to this value's agent account email. The model and harness version in a
+/// stale trailer may differ from the current value — matching on the
+/// (stable) agent email is what lets us recognize and *replace* it rather
+/// than duplicate (requirement 8).
+fn is_newt_model_trailer(line: &str, agent_email_tag: &str) -> bool {
+    line.starts_with("Co-authored-by: ") && line.ends_with(agent_email_tag)
+}
+
+/// A Newt-owned provenance line: any `Harness:` line. Replaced wholesale on
+/// re-finalization so a stale revision/version does not linger (requirement
+/// 9).
+fn is_newt_provenance(line: &str) -> bool {
+    line.starts_with("Harness: ")
 }
 
 /// The pending multi-contributor set for one not-yet-committed unit of work.
@@ -524,5 +695,237 @@ mod tests {
         assert_eq!(ca.agent_email, "custom-agent@example.com");
         // operator_email stays explicitly None — never invented.
         assert!(ca.operator_email.is_none());
+    }
+
+    // ---- finalize_message: the deterministic commit-message finalizer ----
+
+    /// A fixed typed value the finalizer tests build against. Every field is
+    /// explicit so the assertions are independent of the real build
+    /// environment (no real git revision / package version in the test
+    /// expectations — those are *rendered from the value*, proving
+    /// requirements 1, 2, 3, 4).
+    fn sample_ca() -> CommitAttribution {
+        CommitAttribution {
+            model: "glm-5.2".to_string(),
+            harness_name: "newt-agent".to_string(),
+            harness_version: "0.8.0".to_string(),
+            harness_build_revision: "ba56944bd262-dirty".to_string(),
+            operator_name: Some("shawn".to_string()),
+            operator_email: None,
+            agent_email: DEFAULT_EMAIL.to_string(),
+        }
+    }
+
+    /// Requirement 1 + 3 + 4: the model trailer renders model + harness +
+    /// harness version all from the SAME typed value, with no hard-coded
+    /// current-model or current-package-version constant.
+    #[test]
+    fn model_trailer_renders_model_harness_version_from_the_value() {
+        let ca = sample_ca();
+        assert_eq!(
+            ca.model_trailer(),
+            format!("Co-authored-by: glm-5.2 (newt-agent v0.8.0) <{DEFAULT_EMAIL}>")
+        );
+    }
+
+    /// Requirement 2: the provenance line is rendered from the same value —
+    /// harness, version, revision, model, and operator all flow from the one
+    /// typed value. No operator email appears (requirement 12).
+    #[test]
+    fn provenance_line_renders_from_the_same_value() {
+        let ca = sample_ca();
+        assert_eq!(
+            ca.provenance_line(),
+            "Harness: newt-agent v0.8.0 (ba56944bd262-dirty) | Model: glm-5.2 | Operator: shawn"
+        );
+    }
+
+    /// Requirement 12: when no operator name is known, the provenance line
+    /// uses the deterministic `"unknown"` sentinel — and never an invented
+    /// operator email.
+    #[test]
+    fn provenance_line_uses_unknown_when_no_operator_and_never_an_email() {
+        let ca = CommitAttribution {
+            operator_name: None,
+            ..sample_ca()
+        };
+        assert_eq!(
+            ca.provenance_line(),
+            "Harness: newt-agent v0.8.0 (ba56944bd262-dirty) | Model: glm-5.2 | Operator: unknown"
+        );
+        assert!(
+            !ca.provenance_line().contains('@'),
+            "no operator email is ever manufactured"
+        );
+    }
+
+    /// Requirement 5: arbitrary user subject + body text is preserved
+    /// verbatim, and a blank line separates body from trailers (req 11).
+    #[test]
+    fn finalize_preserves_arbitrary_subject_and_body() {
+        let ca = sample_ca();
+        let input = "fix(parser): handle trailing whitespace\n\nBody para one.\n\nBody para two with `code`.\n";
+        let out = ca.finalize_message(input);
+        assert!(
+            out.starts_with("fix(parser): handle trailing whitespace\n\nBody para one.\n\nBody para two with `code`.\n\n"),
+            "subject + body must be preserved verbatim, then a blank line"
+        );
+        // The canonical trailers are appended after the body.
+        assert!(out.contains(&ca.model_trailer()));
+        assert!(out.contains(&ca.provenance_line()));
+    }
+
+    /// Requirement 6: a legitimate third-party `Co-authored-by:` trailer (a
+    /// real person, different email) is preserved through finalization.
+    #[test]
+    fn finalize_preserves_third_party_co_authored_by() {
+        let ca = sample_ca();
+        let input = "feat: thing\n\nBody.\n\nCo-authored-by: Alice <alice@example.com>\nSigned-off-by: Bob <bob@example.com>\n";
+        let out = ca.finalize_message(input);
+        assert!(
+            out.contains("Co-authored-by: Alice <alice@example.com>"),
+            "third-party Co-authored-by must be preserved"
+        );
+        assert!(
+            out.contains("Signed-off-by: Bob <bob@example.com>"),
+            "other third-party trailers must be preserved"
+        );
+    }
+
+    /// Requirement 8: a STALE Newt-owned model attribution trailer (old model
+    /// / old harness version, but same agent email) is REPLACED, not
+    /// duplicated.
+    #[test]
+    fn finalize_replaces_stale_newt_owned_model_trailer() {
+        let ca = sample_ca();
+        let input = format!(
+            "feat: thing\n\nBody.\n\nCo-authored-by: old-model (newt-agent v0.7.5) <{DEFAULT_EMAIL}>\n"
+        );
+        let out = ca.finalize_message(&input);
+        assert!(
+            !out.contains("old-model"),
+            "stale model trailer must be gone"
+        );
+        assert!(
+            !out.contains("v0.7.5"),
+            "stale harness version must be gone"
+        );
+        // Exactly one model trailer in the output — the fresh one.
+        let model_trailers: Vec<&str> = out
+            .lines()
+            .filter(|l| {
+                l.starts_with("Co-authored-by: ") && l.ends_with(&format!("<{DEFAULT_EMAIL}>"))
+            })
+            .collect();
+        assert_eq!(model_trailers.len(), 1, "no duplicate model trailer");
+        assert_eq!(model_trailers[0], ca.model_trailer());
+    }
+
+    /// Requirement 9: a STALE Newt-owned provenance line (old revision) is
+    /// replaced, not duplicated.
+    #[test]
+    fn finalize_replaces_stale_newt_owned_provenance() {
+        let ca = sample_ca();
+        let input = "feat: thing\n\nBody.\n\nHarness: newt-agent v0.7.5 (deadbeef) | Model: old | Operator: old\n";
+        let out = ca.finalize_message(input);
+        assert!(
+            !out.contains("deadbeef"),
+            "stale provenance revision must be gone"
+        );
+        let provenance: Vec<&str> = out.lines().filter(|l| l.starts_with("Harness: ")).collect();
+        assert_eq!(provenance.len(), 1, "exactly one provenance line");
+        assert_eq!(provenance[0], ca.provenance_line());
+    }
+
+    /// Requirement 10: repeated finalization is idempotent — running the
+    /// finalizer on its own output yields byte-identical bytes.
+    #[test]
+    fn finalize_is_idempotent() {
+        let ca = sample_ca();
+        let input = "feat: thing\n\nBody.\n\nCo-authored-by: Alice <alice@example.com>\n";
+        let once = ca.finalize_message(input);
+        let twice = ca.finalize_message(&once);
+        assert_eq!(once, twice, "re-finalization must be a no-op");
+        let thrice = ca.finalize_message(&twice);
+        assert_eq!(twice, thrice, "idempotent across repeated calls");
+    }
+
+    /// Requirement 10 (negative): idempotence survives a model switch
+    /// between finalizations only if the value is the same; with a DIFFERENT
+    /// value the stale trailer is replaced — proving the idempotence above is
+    /// genuine recognition, not "output already matched by luck".
+    #[test]
+    fn a_model_switch_replaces_the_stale_trailer() {
+        let before = sample_ca();
+        let msg = "feat: thing\n\nBody.\n";
+        let once = before.finalize_message(msg);
+        let after = CommitAttribution {
+            model: "glm-5.3".to_string(),
+            harness_version: "0.8.1".to_string(),
+            harness_build_revision: "cef01234-clean".to_string(),
+            ..sample_ca()
+        };
+        let twice = after.finalize_message(&once);
+        assert!(twice.contains("glm-5.3 (newt-agent v0.8.1)"));
+        assert!(twice.contains("Harness: newt-agent v0.8.1 (cef01234-clean)"));
+        assert!(
+            !twice.contains("glm-5.2 (newt-agent v0.8.0)"),
+            "old model trailer replaced"
+        );
+    }
+
+    /// Requirement 11: the blank line before the trailer block is present,
+    /// and there is exactly one (not two, not zero).
+    #[test]
+    fn finalize_emits_exactly_one_blank_line_before_trailers() {
+        let ca = sample_ca();
+        let out = ca.finalize_message("feat: thing\n\nBody.\n");
+        // The body ends, then exactly one blank line, then the trailer block.
+        let body_end = out.find("\n\nCo-authored-by: ").unwrap();
+        let _ = body_end; // present
+                          // No doubled blank line right before the trailer block.
+        assert!(
+            !out.contains("\n\n\nCo-authored-by: "),
+            "exactly one blank line before trailers"
+        );
+        // The trailer block is the last paragraph: a line after the trailers
+        // would break git's trailer parsing.
+        let mut lines = out.lines();
+        let mut seen_trailer = false;
+        for l in lines.by_ref() {
+            if l.starts_with("Co-authored-by: ") || l.starts_with("Harness: ") {
+                seen_trailer = true;
+            } else if seen_trailer {
+                panic!("non-trailer line after trailer block: {l:?}");
+            }
+        }
+    }
+
+    /// Requirement 13: rendering is deterministic — the same value + input
+    /// always produce byte-identical output.
+    #[test]
+    fn finalize_is_deterministic() {
+        let ca = sample_ca();
+        let input = "feat: thing\n\nBody.\n\nCo-authored-by: Alice <alice@example.com>\n";
+        let a = ca.finalize_message(input);
+        let b = ca.finalize_message(input);
+        assert_eq!(a, b);
+    }
+
+    /// Representative before/after, asserted as a single golden snapshot so a
+    /// future change to the format is loudly visible. This is the
+    /// "representative before/after" deliverable expressed as a test.
+    #[test]
+    fn finalize_before_after_snapshot() {
+        let ca = sample_ca();
+        let before = "feat(attribution): finalizer\n\nDrives the commit.\n\nCo-authored-by: glm-4.7 (newt-agent v0.7.6) <309460085+newt-agent@users.noreply.github.com>\nHarness: newt-agent v0.7.6 (aabbccdd) | Model: glm-4.7 | Operator: shawn\nCo-authored-by: Reviewer <reviewer@example.com>\n";
+        let after = ca.finalize_message(before);
+        let expected = format!(
+            "feat(attribution): finalizer\n\nDrives the commit.\n\n\
+             Co-authored-by: Reviewer <reviewer@example.com>\n\
+             Co-authored-by: glm-5.2 (newt-agent v0.8.0) <{DEFAULT_EMAIL}>\n\
+             Harness: newt-agent v0.8.0 (ba56944bd262-dirty) | Model: glm-5.2 | Operator: shawn\n"
+        );
+        assert_eq!(after, expected);
     }
 }
