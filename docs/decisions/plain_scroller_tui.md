@@ -11,9 +11,11 @@ piped/headless path and all committed output; **amended 2026-08-11** by the
 newt-web docking work — the plain-scroller constraints are **scoped to the LEAN
 (default) surface + the headless/wyvern path**, and the feature-gated `rich-tui`
 surface may now host panes / a live dock-and-session overview (see the amendment
-right after the TL;DR).
+right after the TL;DR); **migration notice added 2026-08-17**: the LeanTUI
+*input surface* is scheduled to move to **wyvern-agent**, after which newt-agent
+is RichTUI-only for interactive use (see "Migration notice" below).
 **Date:** 2026-06-12 (amended 2026-06-17, refined 2026-06-20, partially
-superseded 2026-07-16, amended 2026-08-11)
+superseded 2026-07-16, amended 2026-08-11, migration notice 2026-08-17)
 **Related:** newt-agent#89 ("is a rich interactive TUI in-scope for newt's
 'sharp minimal binary' identity?" — closed by the newt / gilamonster-agent
 split; this doc records the standing answer), PR #301 (the preamble always
@@ -40,6 +42,47 @@ This is not a temporary limitation. It is a load-bearing design choice:
 **newt is amphibious** — the same agent serves a human at a terminal *and*
 runs headless where wyvern-agent flies. Advanced TUI bells and whistles
 belong in the **gilamonster-agent** and **monitor-agent** repos, not here.
+
+## Migration notice (2026-08-17): LeanTUI is moving to wyvern-agent
+
+**Status: intent recorded, no code moved. Blocked on a ratified prerequisite.**
+Decided by Shawn Hartsock, 2026-08-17.
+
+This migration depends on `docs/decisions/agent_line_architecture.md`
+(added by PR #1753; not present on this branch) being merged to `main`, and on one unresolved conflict with wyvern's charter, which says
+"Headless. No TUI, ever." wyvern's ADR-0002 is stronger and names the exact
+dependency this migration would add: "No TUI dependency anywhere in the
+workspace (no ratatui/crossterm)." Either that clause is amended or this migration is
+retargeted. Until then this section records intent, not an established plan,
+and no code moves.
+
+The LeanTUI **input surface** (`newt-tui/src/lean_input.rs`, `LeanSurface:
+InputSurface`) is scheduled to be vendored out to **wyvern-agent**. After that
+move, newt-agent's *interactive* surface is **RichTUI only**, and lean/rich
+feature parity is explicitly **not** a requirement in the meantime. The two
+paths may diverge, and rich-only panel work (backend editor, `/summarizer`
+panel, rename, adopt-warm) does not need a lean twin.
+
+**What this notice does NOT do.** It does not remove or deprecate the
+plain-scroller *output* contract. Rule 2 and the committed-output rules keep
+governing **all committed output and the piped/headless path**, because that
+contract is what makes newt runnable off a TTY at all. `newt solve` when piped,
+`newt-acp-worker`, the eval harness, and newt-as-a-wyvern-worker all depend on
+it. "RichTUI only" scopes to the interactive input surface, not to how output is
+committed to scrollback.
+
+**Why the code has not moved yet.** wyvern-agent has no landing site today: as of
+2026-08-17 it is five crates and ~1.7k lines with no `crossterm` / `ratatui` /
+`rustyline` dependency, no `stdin` read loop, and no `newt-*` dependency. Its own
+charter test (`crates/wyvern-wire/tests/no_vendor.rs`) frames workers as
+"newt-agent instances selected by the `agent-bridle` `Caveats` they satisfy",
+so wyvern orchestrates newt rather than hosting a chat surface. The move waits
+until wyvern grows a terminal surface to receive it.
+
+**When the move happens**, this document and
+`lean_rich_tui_morphologies.md` are both superseded in part, and the amphibious
+claim in `CLAUDE.md` needs restating: newt stays amphibious *as a headless
+worker*, but no longer ships the lean interactive box.
 
 ## Amendment (2026-08-11): the plain-scroller rule is scoped to the LEAN surface
 
