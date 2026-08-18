@@ -379,7 +379,9 @@ fn render_json_report(o: &ProbeOutcome) -> anyhow::Result<serde_json::Value> {
         "sandbox": o.sandbox.map(|k| format!("{k:?}")),
         "net": net,
         "server_info": o.server_info.as_ref().map(|si| serde_json::json!({
-            "name": si.name, "title": si.title, "version": si.version,
+            "name": clamp_single_line(&si.name),
+            "title": si.title.as_deref().map(clamp_single_line),
+            "version": clamp_single_line(&si.version),
         })),
         "auth_required": o.auth_required,
         "toml": Config::with_mcp_server_added("", &o.entry)?,
@@ -1153,5 +1155,15 @@ mod tests {
         o.server_info = Some(info("s", Some(&hostile), "1.0\x1b[31m"));
         let text = render_text_report(&o).unwrap();
         assert!(!text.contains('\x1b'), "{text:?}");
+        let json = render_json_report(&o).unwrap();
+        let encoded = json.to_string();
+        assert!(!encoded.contains("\\u001b"), "{encoded:?}");
+        assert!(!encoded.contains("second line"), "{encoded:?}");
+        assert!(
+            json["server_info"]["title"]
+                .as_str()
+                .is_some_and(|title| title.chars().count() <= 121),
+            "{json}"
+        );
     }
 }

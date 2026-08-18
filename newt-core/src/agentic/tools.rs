@@ -1,6 +1,7 @@
 //! Built-in tool definitions and the tool executor for the agentic loop.
 //! Moved verbatim from `newt-tui` in Step 9.7 — the Caveats enforcement,
 //! shrink guard, build-check feedback, and agent-bridle routing are unchanged.
+// Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 15:15 EDT | Date: 2026-08-12
 
 use super::artifact_read::{execute_artifact_read_silent, ArtifactReadContext};
 use super::content_spill::{self, SpillStore};
@@ -2438,6 +2439,326 @@ pub(crate) fn host_of_url(url: &str) -> Option<String> {
         None
     } else {
         Some(host.to_ascii_lowercase())
+    }
+}
+
+/// MCP `_meta` extension by which an admitted connector declares the exact URL
+/// prefixes a tool can read.  The value is an array of absolute HTTP(S) URLs.
+///
+/// This is routing metadata, not model-facing JSON Schema: catalog adapters
+/// preserve it on the outer OpenAI-style definition, and
+/// [`strip_mcp_catalog_metadata`] removes it before tools go to an inference
+/// provider.
+pub const MCP_RESOURCE_URL_PREFIXES_META_KEY: &str = "newt/resourceUrlPrefixes";
+
+/// Copy Newt's recognized resource-affinity declaration from MCP tool `_meta`
+/// onto an OpenAI-style tool definition.
+///
+/// The helper is intentionally pure and narrow so both the headless and TUI
+/// catalog adapters can preserve authoritative server metadata without copying
+/// arbitrary MCP `_meta` onto an inference-provider wire. The declaration is
+/// fail-closed: every member must be valid, and an empty or malformed array
+/// adds no routing authority.
+pub fn preserve_mcp_resource_url_affinity(
+    definition: &mut serde_json::Value,
+    mcp_tool_meta: Option<&serde_json::Value>,
+) {
+    let Some(mcp_tool_meta) = mcp_tool_meta else {
+        return;
+    };
+    if validated_resource_url_prefixes(mcp_tool_meta).is_none() {
+        return;
+    }
+    let prefixes = mcp_tool_meta[MCP_RESOURCE_URL_PREFIXES_META_KEY].clone();
+    let Some(definition) = definition.as_object_mut() else {
+        return;
+    };
+    let meta = definition
+        .entry("_meta")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(meta) = meta.as_object_mut() else {
+        return;
+    };
+    meta.insert(MCP_RESOURCE_URL_PREFIXES_META_KEY.to_string(), prefixes);
+}
+
+/// Remove connector-only metadata before a tool definition crosses the model
+/// wire. Recovery reads metadata from `McpTools::tool_defs()` directly; normal
+/// tool advertisement and `tool_search` use the scrubbed merged catalog.
+pub(super) fn strip_mcp_catalog_metadata(definition: &mut serde_json::Value) {
+    if let Some(definition) = definition.as_object_mut() {
+        definition.remove("_meta");
+    }
+}
+
+fn resource_url_prefix(prefix: &str) -> Option<reqwest::Url> {
+    if prefix.trim() != prefix {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(prefix).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    Some(parsed)
+}
+
+fn validated_resource_url_prefixes(meta: &serde_json::Value) -> Option<Vec<reqwest::Url>> {
+    let prefixes = meta.get(MCP_RESOURCE_URL_PREFIXES_META_KEY)?.as_array()?;
+    if prefixes.is_empty() {
+        return None;
+    }
+    prefixes
+        .iter()
+        .map(|prefix| prefix.as_str().and_then(resource_url_prefix))
+        .collect()
+}
+
+fn resource_url_has_prefix(url: &reqwest::Url, prefix: &reqwest::Url) -> bool {
+    if url.scheme() != prefix.scheme()
+        || url.host_str() != prefix.host_str()
+        || url.port_or_known_default() != prefix.port_or_known_default()
+    {
+        return false;
+    }
+
+    let target_path = url.path();
+    let prefix_path = prefix.path();
+    if prefix_path == "/" {
+        return true;
+    }
+    let prefix_base = prefix_path.strip_suffix('/').unwrap_or(prefix_path);
+    target_path == prefix_base || target_path.starts_with(&format!("{prefix_base}/"))
+}
+
+fn tool_declares_resource_url(tool: &serde_json::Value, url: &reqwest::Url) -> bool {
+    tool.get("_meta")
+        .and_then(validated_resource_url_prefixes)
+        .is_some_and(|prefixes| {
+            prefixes
+                .iter()
+                .any(|prefix| resource_url_has_prefix(url, prefix))
+        })
+}
+
+/// Build a bounded, credential-free discovery query from a resource URL.
+///
+/// Only host/path words participate: query strings and fragments may contain
+/// credentials, so they are never copied into a model-visible recovery hint.
+/// Path words come first because they usually describe the resource better
+/// than deployment-oriented host labels. A simple plural stem lets a URL path
+/// such as `/reviews/42` find a tool described as "review" without claiming
+/// that the lexical match is authoritative.
+fn resource_url_discovery_query(url: &reqwest::Url) -> String {
+    const MAX_TERMS: usize = 8;
+    const MAX_TERM_CHARS: usize = 32;
+    const GENERIC_TERMS: &[&str] = &["com", "net", "org", "www"];
+
+    let mut terms = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let sources = std::iter::once(url.path()).chain(url.host_str());
+    for source in sources {
+        for raw in source.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+            let term = raw.to_ascii_lowercase();
+            if term.is_empty()
+                || term.chars().count() > MAX_TERM_CHARS
+                || GENERIC_TERMS.contains(&term.as_str())
+            {
+                continue;
+            }
+            for candidate in [
+                Some(term.as_str()),
+                term.strip_suffix('s').filter(|stem| stem.len() >= 3),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if seen.insert(candidate.to_string()) {
+                    terms.push(candidate.to_string());
+                    if terms.len() == MAX_TERMS {
+                        return terms.join(" ");
+                    }
+                }
+            }
+        }
+    }
+    terms.join(" ")
+}
+
+/// Return the connected MCP catalog that is actually callable in this prompt.
+/// Empty means there is no authenticated-source route to recommend, so the raw
+/// fetch failure must remain unchanged instead of promising a nonexistent tool.
+fn callable_mcp_catalog(
+    mcp: &dyn McpTools,
+    persona_tools: Option<&[String]>,
+    disposition: PromptDisposition,
+) -> serde_json::Value {
+    let defs = serde_json::Value::Array(mcp.tool_defs());
+    let defs = filter_advertised_tools(defs, persona_tools);
+    filter_tools_for_disposition(defs, disposition)
+}
+
+/// Turn an authentication/private-address raw-fetch failure into either an
+/// authoritative URL-affine MCP route or an honest connected-catalog discovery
+/// hint when this session has callable MCP tools.
+///
+/// The original error stays first and the SSRF guard stays intact. The added
+/// result steers the model through the live catalog before the two field-seen
+/// dead ends: shelling out to a second unauthenticated HTTP client, or asking
+/// the operator for unrelated local client configuration. Metadata-free
+/// discovery never asserts that a lexical candidate can access the URL.
+fn authenticated_url_recovery(
+    failure: String,
+    url: &str,
+    mcp: &dyn McpTools,
+    persona_tools: Option<&[String]>,
+    disposition: PromptDisposition,
+) -> String {
+    let Some(url) = reqwest::Url::parse(url)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .filter(|url| url.host_str().is_some())
+        .filter(|url| url.username().is_empty() && url.password().is_none())
+    else {
+        return failure;
+    };
+
+    let catalog = callable_mcp_catalog(mcp, persona_tools, disposition);
+    let matching = catalog
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|tool| {
+            tool.pointer("/function/name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| !name.is_empty())
+        })
+        .filter(|tool| tool_declares_resource_url(tool, &url))
+        .cloned()
+        .collect::<Vec<_>>();
+    if catalog.as_array().is_none_or(Vec::is_empty) {
+        return failure;
+    }
+
+    if matching.is_empty() {
+        let query = resource_url_discovery_query(&url);
+        let candidates = super::tool_search::execute_tool_search(&query, &catalog);
+        return format!(
+            "{failure}\n\nAuthenticated-source recovery (non-authoritative discovery): raw HTTP \
+             cannot access this resource and no connected MCP tool explicitly declares access to \
+             its URL. The connected catalog may still contain an imported authenticated source. \
+             Next call `tool_search` with the URL-derived query `{query}` and inspect the returned \
+             tool contracts. This is discovery only: do not assume that a candidate can read or \
+             authenticate to the URL, and do not call one unless its description and parameters \
+             fit the resource. Do not fall back to `run_command`/curl or `request_user_input` for \
+             unrelated local shell/client configuration until connected-source discovery has \
+             been tried.\n{candidates}"
+        );
+    }
+
+    let matching = serde_json::Value::Array(matching);
+    let candidates = super::tool_search::execute_tool_search("", &matching);
+    format!(
+        "{failure}\n\nAuthenticated-source recovery: raw HTTP cannot access this resource, but \
+         the connected MCP catalog explicitly declares one or more URL-affine tools. Next call \
+         `tool_search` with an exact candidate name from the authoritative list below, inspect \
+         its contract, then call the matching namespaced MCP tool for the resource. Do not fall \
+         back to `run_command`/curl or `request_user_input` for local shell/client configuration \
+         until the connected MCP routes have been tried.\n{candidates}"
+    )
+}
+
+/// Whether a bridle raw-fetch error is the private-address SSRF refusal that an
+/// authenticated connector is designed to handle. Match the stable, explicit
+/// security diagnostic rather than treating ordinary timeouts/DNS failures as
+/// evidence that a private source exists.
+fn is_private_address_fetch_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("ssrf block")
+        && (lower.contains("private/loopback address") || lower.contains("private address"))
+}
+
+/// Whether a failed raw fetch explicitly reports HTTP authentication or
+/// authorization refusal. Bridle versions may surface non-2xx responses either
+/// as structured results or errors, so both representations share the same
+/// MCP-first recovery contract.
+fn is_authentication_fetch_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    [
+        "http 401",
+        "http status 401",
+        "401 unauthorized",
+        "http 403",
+        "http status 403",
+        "403 forbidden",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// Render a successful bridle dispatch. HTTP 401/403 are transport successes
+/// but content failures: treating their login/error body as page evidence led
+/// the agent into unauthenticated shell fallbacks. Surface them as failures and,
+/// when possible, route discovery to connected MCP tools.
+fn render_web_fetch_result(
+    url: &str,
+    result: &serde_json::Value,
+    mcp: &dyn McpTools,
+    persona_tools: Option<&[String]>,
+    disposition: PromptDisposition,
+) -> String {
+    let status = result.get("status").and_then(serde_json::Value::as_u64);
+    if matches!(status, Some(401 | 403)) {
+        return authenticated_url_recovery(
+            format!(
+                "error: web_fetch returned HTTP {}",
+                status.unwrap_or_default()
+            ),
+            url,
+            mcp,
+            persona_tools,
+            disposition,
+        );
+    }
+
+    let markdown = result
+        .get("markdown")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let title = result
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let final_url = result
+        .get("final_url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(url);
+    if title.is_empty() {
+        format!("{final_url}\n\n{markdown}")
+    } else {
+        format!("# {title}\n{final_url}\n\n{markdown}")
+    }
+}
+
+/// Render a bridle dispatch error, adding the authenticated-source recovery
+/// only for the private-address SSRF case. The error itself is never weakened.
+fn render_web_fetch_error(
+    url: &str,
+    error: &str,
+    mcp: &dyn McpTools,
+    persona_tools: Option<&[String]>,
+    disposition: PromptDisposition,
+) -> String {
+    let failure = format!("error: {error}");
+    if is_private_address_fetch_error(error) || is_authentication_fetch_error(error) {
+        authenticated_url_recovery(failure, url, mcp, persona_tools, disposition)
+    } else {
+        failure
     }
 }
 
@@ -5034,29 +5355,13 @@ async fn execute_tool_inner(
                 .dispatch("web_fetch", fetch_args, effective_caveats)
                 .await
             {
-                Ok(result) => {
-                    let markdown = result
-                        .get("markdown")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    let title = result
-                        .get("title")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    let final_url = result
-                        .get("final_url")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or(url);
-                    let out = if title.is_empty() {
-                        format!("{final_url}\n\n{markdown}")
-                    } else {
-                        format!("# {title}\n{final_url}\n\n{markdown}")
-                    };
-                    out
-                }
+                Ok(result) =>
+                    render_web_fetch_result(url, &result, &*mcp, persona_tools, disposition),
                 // A `net`-axis leash denial, or a fetch error (SSRF screen,
-                // timeout, non-2xx) — surface the reason; Display is safe.
-                Err(e) => format!("error: {e}"),
+                // timeout) — surface the reason; Display is safe. Private-address
+                // denials gain an MCP-first recovery hint without weakening the
+                // refusal itself.
+                Err(e) => render_web_fetch_error(url, &e.to_string(), &*mcp, persona_tools, disposition),
             }
         }
 
@@ -5077,6 +5382,12 @@ pub(crate) fn tool_result_ok(result: &str) -> bool {
         || r.starts_with("capability denied:")
         || r.starts_with("unknown tool"))
 }
+
+// Private-source recovery is a composition invariant, not only a renderer
+// contract: replay the complete model -> built-in -> discovery -> MCP loop.
+#[cfg(test)]
+#[path = "tools_tests/private_url_mcp_bat.rs"]
+mod private_url_mcp_bat_tests;
 
 #[cfg(test)]
 mod tests {
@@ -11645,13 +11956,23 @@ mod execute_tool_branch_tests {
     struct OneRemoteTool {
         name: &'static str,
         called: bool,
+        resource_url_prefixes: &'static [&'static str],
     }
     impl OneRemoteTool {
         fn new(name: &'static str) -> Self {
             Self {
                 name,
                 called: false,
+                resource_url_prefixes: &[],
             }
+        }
+
+        fn with_resource_url_prefixes(
+            mut self,
+            resource_url_prefixes: &'static [&'static str],
+        ) -> Self {
+            self.resource_url_prefixes = resource_url_prefixes;
+            self
         }
     }
     #[async_trait::async_trait]
@@ -11660,14 +11981,38 @@ mod execute_tool_branch_tests {
             name == self.name
         }
         fn tool_defs(&self) -> Vec<serde_json::Value> {
-            vec![serde_json::json!({
+            let mut definition = serde_json::json!({
                 "type": "function",
                 "function": { "name": self.name, "description": "", "parameters": {} }
-            })]
+            });
+            preserve_mcp_resource_url_affinity(
+                &mut definition,
+                Some(&serde_json::json!({
+                    "newt/resourceUrlPrefixes": self.resource_url_prefixes
+                })),
+            );
+            vec![definition]
         }
         async fn call(&mut self, _leased: &LeasedMcpCall<'_>) -> String {
             self.called = true;
             "remote-tool-ran".to_string()
+        }
+    }
+
+    struct CatalogOnlyMcp(Vec<serde_json::Value>);
+
+    #[async_trait::async_trait]
+    impl McpTools for CatalogOnlyMcp {
+        fn handles(&self, _name: &str) -> bool {
+            false
+        }
+
+        fn tool_defs(&self) -> Vec<serde_json::Value> {
+            self.0.clone()
+        }
+
+        async fn call(&mut self, _leased: &LeasedMcpCall<'_>) -> String {
+            "catalog-only MCP must not be called".to_string()
         }
     }
 
@@ -13141,6 +13486,396 @@ mod execute_tool_branch_tests {
         .await;
         assert!(out.starts_with("error:"), "got: {out}");
         assert!(gate.asks.is_empty(), "no prompt for an unparseable URL");
+    }
+
+    /// Field-regression: a private code-review URL may be intentionally blocked
+    /// by the raw-fetch SSRF policy while an authenticated MCP source is already
+    /// connected. The result must preserve the refusal and put catalog discovery
+    /// plus the namespaced connector ahead of shell/user-configuration fallbacks.
+    #[tokio::test]
+    async fn private_address_fetch_failure_routes_to_connected_mcp_first() {
+        let mcp = OneRemoteTool::new("opaque_bridge__read_object")
+            .with_resource_url_prefixes(&["https://reviews.example.test/reviews/"]);
+        let error = "denied: SSRF block: \"reviews.example.test\" resolved to \
+                     private/loopback address 10.0.0.1 (not in the net allowlist)";
+
+        let url = "https://reviews.example.test/reviews/42";
+        let out = render_web_fetch_error(url, error, &mcp, None, PromptDisposition::Act);
+
+        assert!(out.starts_with(&format!("error: {error}")), "got: {out}");
+        let discovery = out.find("`tool_search`").expect("discovery instruction");
+        let connector = out
+            .find("opaque_bridge__read_object")
+            .expect("connected namespaced MCP tool");
+        assert!(
+            discovery < connector,
+            "tool discovery must be presented before its MCP candidate: {out}"
+        );
+        assert!(
+            out.contains("Do not fall back to `run_command`/curl or `request_user_input`"),
+            "the two field-seen dead ends must be explicitly fenced: {out}"
+        );
+
+        // Exercise the instructed route against the same live catalog: discovery
+        // returns the exact MCP name, and the dispatcher invokes that remote tool
+        // under an explicit persona grant. No shell or human-input tool enters the
+        // sequence.
+        let catalog = callable_mcp_catalog(&mcp, None, PromptDisposition::Act);
+        let discovered =
+            super::super::tool_search::execute_tool_search("opaque_bridge__read_object", &catalog);
+        assert!(
+            discovered.contains("opaque_bridge__read_object"),
+            "tool_search must discover the connector: {discovered}"
+        );
+        let allowed = vec!["opaque_bridge__read_object".to_string()];
+        let mut routed_mcp = OneRemoteTool::new("opaque_bridge__read_object")
+            .with_resource_url_prefixes(&["https://reviews.example.test/reviews/"]);
+        let result = run_remote_gated(
+            "opaque_bridge__read_object",
+            std::path::Path::new("."),
+            &Caveats::top(),
+            Some(&allowed),
+            &mut routed_mcp,
+            None,
+        )
+        .await;
+        assert_eq!(result, "remote-tool-ran");
+        assert!(routed_mcp.called, "the namespaced MCP route must dispatch");
+    }
+
+    /// HTTP authentication failures are structured successful transports in
+    /// agent-bridle. Newt must not feed their login/error body to the model as
+    /// page evidence; both statuses take the same MCP-first route.
+    #[test]
+    fn unauthorized_fetch_results_route_to_connected_mcp_not_error_body() {
+        let mcp = OneRemoteTool::new("opaque_bridge__read_object")
+            .with_resource_url_prefixes(&["https://reviews.example.test/reviews/"]);
+        for status in [401_u64, 403] {
+            let out = render_web_fetch_result(
+                "https://reviews.example.test/reviews/42",
+                &serde_json::json!({
+                    "status": status,
+                    "final_url": "https://reviews.example.test/login",
+                    "title": "Sign in",
+                    "markdown": "configure a local checkout client instead"
+                }),
+                &mcp,
+                None,
+                PromptDisposition::Act,
+            );
+
+            assert!(
+                out.starts_with(&format!("error: web_fetch returned HTTP {status}")),
+                "got: {out}"
+            );
+            assert!(out.contains("`tool_search`"), "missing discovery: {out}");
+            assert!(
+                out.contains("opaque_bridge__read_object"),
+                "missing MCP route: {out}"
+            );
+            assert!(
+                !out.contains("configure a local checkout client instead"),
+                "an auth error body must not masquerade as review evidence: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn unauthorized_fetch_errors_also_route_to_connected_mcp() {
+        let mcp = OneRemoteTool::new("opaque_bridge__read_object")
+            .with_resource_url_prefixes(&["https://reviews.example.test/reviews/"]);
+        for error in [
+            "request failed with HTTP 401 Unauthorized",
+            "request failed with HTTP status 403 Forbidden",
+        ] {
+            let out = render_web_fetch_error(
+                "https://reviews.example.test/reviews/42",
+                error,
+                &mcp,
+                None,
+                PromptDisposition::Act,
+            );
+            assert!(out.starts_with(&format!("error: {error}")), "got: {out}");
+            assert!(out.contains("`tool_search`"), "missing discovery: {out}");
+            assert!(
+                out.contains("opaque_bridge__read_object"),
+                "missing MCP route: {out}"
+            );
+        }
+    }
+
+    /// Recovery is honest: without a callable MCP tool, Newt returns the raw
+    /// SSRF failure and does not claim that an authenticated route exists.
+    #[test]
+    fn private_address_fetch_without_mcp_keeps_original_failure() {
+        let error = "denied: SSRF block: \"reviews.example.test\" resolved to \
+                     private/loopback address 10.0.0.1 (not in the net allowlist)";
+        let out = render_web_fetch_error(
+            "https://reviews.example.test/reviews/42",
+            error,
+            &NoMcp,
+            None,
+            PromptDisposition::Act,
+        );
+        assert_eq!(out, format!("error: {error}"));
+    }
+
+    #[test]
+    fn private_address_fetch_with_undeclared_mcp_offers_non_authoritative_discovery() {
+        let error = "denied: SSRF block: private address";
+        // The name deliberately looks relevant. Without explicit URL affinity
+        // it is only a connected-catalog discovery candidate, never an asserted
+        // authenticated route.
+        let mcp = OneRemoteTool::new("reviews_source__get_review");
+        let out = render_web_fetch_error(
+            "https://reviews.example.test/reviews/42",
+            error,
+            &mcp,
+            None,
+            PromptDisposition::Act,
+        );
+        assert!(out.starts_with(&format!("error: {error}")), "got: {out}");
+        assert!(out.contains("non-authoritative discovery"), "got: {out}");
+        assert!(out.contains("reviews_source__get_review"), "got: {out}");
+        assert!(out.contains("discovery only"), "got: {out}");
+        assert!(
+            out.contains("do not assume that a candidate can read or authenticate"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn discovery_query_uses_only_bounded_host_and_path_terms() {
+        let url = reqwest::Url::parse(
+            "https://review-broker.example.test/reviews/42?token=must-not-appear#fragment-secret",
+        )
+        .unwrap();
+        let query = resource_url_discovery_query(&url);
+        assert!(query.contains("reviews"), "got: {query}");
+        assert!(query.contains("review"), "got: {query}");
+        assert!(query.contains("broker"), "got: {query}");
+        assert!(!query.contains("must"), "query value leaked: {query}");
+        assert!(!query.contains("fragment"), "fragment leaked: {query}");
+        assert!(query.split_whitespace().count() <= 8, "got: {query}");
+    }
+
+    #[test]
+    fn authoritative_recovery_lists_every_matching_tool_without_choosing_first() {
+        let tools = ["review_source__get_review", "review_source__get_version"]
+            .into_iter()
+            .map(|name| {
+                let mut definition = serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": "Read an authenticated review resource.",
+                        "parameters": {"type": "object"}
+                    }
+                });
+                preserve_mcp_resource_url_affinity(
+                    &mut definition,
+                    Some(&serde_json::json!({
+                        "newt/resourceUrlPrefixes": [
+                            "https://reviews.example.test/reviews/"
+                        ]
+                    })),
+                );
+                definition
+            })
+            .collect();
+        let mcp = CatalogOnlyMcp(tools);
+        let out = authenticated_url_recovery(
+            "error: HTTP 401 Unauthorized".to_string(),
+            "https://reviews.example.test/reviews/42",
+            &mcp,
+            None,
+            PromptDisposition::Act,
+        );
+
+        assert!(out.contains("explicitly declares one or more URL-affine tools"));
+        assert!(out.contains("review_source__get_review"), "got: {out}");
+        assert!(out.contains("review_source__get_version"), "got: {out}");
+        assert!(!out.contains("the exact candidate name"), "got: {out}");
+    }
+
+    #[test]
+    fn resource_affinity_requires_exact_origin_and_path_boundary() {
+        for declared in [
+            "https://reviews.example.test/reviews",
+            "https://reviews.example.test:443/reviews/",
+        ] {
+            let prefix = resource_url_prefix(declared).unwrap();
+            for matching in [
+                "https://reviews.example.test/reviews",
+                "https://reviews.example.test/reviews/42",
+                "https://reviews.example.test/reviews/42?version=2",
+            ] {
+                let url = reqwest::Url::parse(matching).unwrap();
+                assert!(
+                    resource_url_has_prefix(&url, &prefix),
+                    "expected {declared} to match {matching}"
+                );
+            }
+            for unrelated in [
+                "http://reviews.example.test/reviews/42",
+                "https://reviews.example.test:444/reviews/42",
+                "https://reviews.example.test/reviews-extra/42",
+                "https://reviews.example.test.evil/reviews/42",
+            ] {
+                let url = reqwest::Url::parse(unrelated).unwrap();
+                assert!(
+                    !resource_url_has_prefix(&url, &prefix),
+                    "must not overmatch {declared} against {unrelated}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn affinity_adapter_preserves_valid_declaration_and_wire_scrubs_metadata() {
+        let mut definition = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "opaque_bridge__read_object",
+                "description": "Retrieve an object.",
+                "parameters": {"type": "object"}
+            }
+        });
+        preserve_mcp_resource_url_affinity(
+            &mut definition,
+            Some(&serde_json::json!({
+                "newt/resourceUrlPrefixes": [
+                    "https://reviews.example.test/reviews/"
+                ],
+                "unrelated/serverMetadata": "must not cross the provider wire"
+            })),
+        );
+        assert_eq!(
+            definition["_meta"][MCP_RESOURCE_URL_PREFIXES_META_KEY],
+            serde_json::json!(["https://reviews.example.test/reviews/"])
+        );
+        assert!(definition["_meta"]
+            .get("unrelated/serverMetadata")
+            .is_none());
+
+        strip_mcp_catalog_metadata(&mut definition);
+        assert!(definition.get("_meta").is_none());
+        assert_eq!(definition["function"]["name"], "opaque_bridge__read_object");
+    }
+
+    #[test]
+    fn affinity_declaration_is_a_strict_nonempty_array() {
+        for malformed in [
+            serde_json::json!([]),
+            serde_json::json!("https://reviews.example.test/reviews/"),
+            serde_json::json!(["https://reviews.example.test/reviews/", 7]),
+            serde_json::json!(["https://reviews.example.test/reviews/", "/reviews/42"]),
+            serde_json::json!([" https://reviews.example.test/reviews/"]),
+            serde_json::json!(["https://user:secret@reviews.example.test/reviews/"]),
+            serde_json::json!(["https://reviews.example.test/reviews/?token=secret"]),
+            serde_json::json!(["file:///tmp/reviews/"]),
+        ] {
+            let meta = serde_json::json!({
+                "newt/resourceUrlPrefixes": malformed
+            });
+            let mut definition = serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "opaque_bridge__read_object",
+                    "description": "Retrieve an object.",
+                    "parameters": {"type": "object"}
+                }
+            });
+            preserve_mcp_resource_url_affinity(&mut definition, Some(&meta));
+            assert!(
+                definition.get("_meta").is_none(),
+                "malformed declaration must add no affinity: {meta}"
+            );
+
+            let raw = serde_json::json!({
+                "type": "function",
+                "function": definition["function"].clone(),
+                "_meta": meta
+            });
+            let url = reqwest::Url::parse("https://reviews.example.test/reviews/42").unwrap();
+            assert!(
+                !tool_declares_resource_url(&raw, &url),
+                "raw malformed metadata must not bypass the adapter"
+            );
+        }
+    }
+
+    #[test]
+    fn names_and_descriptions_never_infer_resource_affinity() {
+        let decoy = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "reviews_source__get_review",
+                "description": "Read https://reviews.example.test/reviews/42",
+                "parameters": {"type": "object"}
+            }
+        });
+        let url = reqwest::Url::parse("https://reviews.example.test/reviews/42").unwrap();
+        assert!(!tool_declares_resource_url(&decoy, &url));
+    }
+
+    #[test]
+    fn merged_model_catalog_scrubs_affinity_but_recovery_catalog_retains_it() {
+        let mcp = OneRemoteTool::new("opaque_bridge__read_object")
+            .with_resource_url_prefixes(&["https://reviews.example.test/reviews/"]);
+        let recovery_catalog = callable_mcp_catalog(&mcp, None, PromptDisposition::Act);
+        assert_eq!(
+            recovery_catalog[0]["_meta"][MCP_RESOURCE_URL_PREFIXES_META_KEY],
+            serde_json::json!(["https://reviews.example.test/reviews/"])
+        );
+
+        let model_catalog = merged_tool_definitions(
+            &mcp, false, false, false, false, false, false, false, false, false, false, false,
+            false,
+        );
+        let remote = model_catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == "opaque_bridge__read_object")
+            .expect("remote tool remains advertised after metadata scrubbing");
+        assert!(remote.get("_meta").is_none());
+    }
+
+    /// Ordinary public content and unrelated transport errors keep their prior
+    /// behavior; the MCP route is specific to private-address/auth failures.
+    #[test]
+    fn ordinary_web_fetch_results_do_not_gain_mcp_recovery() {
+        let mcp = OneRemoteTool::new("review_source__get_review");
+        let ok = render_web_fetch_result(
+            "https://docs.example.test/page",
+            &serde_json::json!({
+                "status": 200,
+                "final_url": "https://docs.example.test/page",
+                "title": "Guide",
+                "markdown": "public content"
+            }),
+            &mcp,
+            None,
+            PromptDisposition::Act,
+        );
+        assert_eq!(
+            ok,
+            "# Guide\nhttps://docs.example.test/page\n\npublic content"
+        );
+        assert!(!ok.contains("tool_search"));
+
+        let timeout = render_web_fetch_error(
+            "https://docs.example.test/page",
+            "denied: request to \"docs.example.test\" timed out",
+            &mcp,
+            None,
+            PromptDisposition::Act,
+        );
+        assert_eq!(
+            timeout,
+            "error: denied: request to \"docs.example.test\" timed out"
+        );
     }
 
     // -- save_note dispatch through execute_tool (Step 19.3) ----------------

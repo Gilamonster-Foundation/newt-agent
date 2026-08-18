@@ -20,6 +20,9 @@
 #                       routed for env-scrub + timeout in a later slice.
 #   user-editor         Launches the human operator's own editor / pager on their
 #                       explicit action — not agent- or repo-controlled.
+#   user-browser        Launches the human operator's browser on an explicit OAuth
+#                       action with a fixed OS helper and one URL argv; no shell.
+#                       Browser DNS re-resolution remains outside Newt's fence.
 #   trusted-infra       Operator-invoked infrastructure (dgx ssh, doctor, web) —
 #                       not reachable from a hostile repo/model turn.
 #   operator-yolo-optout The DELIBERATE unconfined host shell, reached ONLY via an
@@ -61,7 +64,7 @@
 "newt-core/src/agent_identity.rs"          = { count = 6, class = "git-helper", note = "sets local git identity; +1 (#1654): default_operator()'s read-only `git config --get user.name` with FIXED argv (no attacker-controlled input, no shell). Deliberately NOT hardened_git — that seam nulls GIT_CONFIG_GLOBAL, and the whole point of this read is the operator's global identity; `git config` reads config files only (no index, no hooks, no fsmonitor), so the confused-deputy gadget surface hardened_git closes does not apply. Output is a display string in the commit attribution footer. +2 (#1709): default_operator_email() (`git config --get user.email`) + read_git_config() (the matched-pair reader both halves of the atomic operator (name,email) come from) — same trust class, same FIXED argv, same read-only `git config` gadget surface; the email is never invented (None when unset)." }
 "newt-tui/src/lib.rs"                      = { count = 7, class = "trusted-infra", note = "roadmap `verify` (the one attacker-influenced sh -c) MIGRATED to ConstrainedExecutor (step-4.5, CommandVerifyRunner). Remaining spawns are non-attacker-reachable: git reads (log/rev-parse/status — state into context), gh reads (pr/issue/run view — forge state), self-re-exec (run_newt_subcmd re-runs THIS newt binary with operator slash-command args; child re-applies its own OCAP), and the human `!`-bang-escape ($SHELL -c on the operator's own typed line — their authority, no model channel). Plus a fn-param + a `use CommandExt` the counter also matches." }
 "newt-tui/src/prompt.rs"                   = { count = 1, class = "user-editor", note = "opens the operator's $EDITOR on explicit action" }
-"newt-tui/src/mcp_token.rs"                = { count = 1, class = "trusted-infra", note = "operator MCP token helper" }
+"newt-tui/src/mcp_token.rs"                = { count = 1, class = "user-browser", note = "explicit MCP OAuth launches the fixed OS browser helper (open/xdg-open/rundll32); the HTTPS authorization URL is discovery-validated and passed as one argv with no shell; browser DNS re-resolution remains outside Newt's process fence" }
 "newt-tui/src/herdr/transport.rs"          = { count = 2, class = "trusted-infra", note = "HERDR_BIN_PATH CLI fallback sink (CliSink): runs the operator-configured herdr binary with a FIXED verb argv (announce/report/release-agent) built from session state, stdin/stdout/stderr all nulled, no shell, non-blocking to the agent loop via the lifecycle actor. Not reachable from a hostile repo/model turn — the binary path comes from the operator's own HERDR_BIN_PATH env. Count = the `use std::process::Command` import + the single `Command::new` spawn." }
 "newt-cli/src/dgx/ssh.rs"                  = { count = 3, class = "trusted-infra", note = "operator dgx ssh" }
 "newt-cli/src/doctor.rs"                   = { count = 1, class = "trusted-infra", note = "operator diagnostics" }

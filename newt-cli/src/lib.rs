@@ -880,9 +880,10 @@ pub enum Command {
     /// status (valid / expired / needs-login / unregistered).
     ///
     /// With a server name: opens the browser for the OAuth login flow, waits
-    /// for the redirect, exchanges the code for tokens, and saves them to
-    /// `~/.hermes/mcp-tokens/`. Both newt and hermes-agent share the same token
-    /// store, so this authenticates both.
+    /// for the redirect, exchanges the code for tokens, and saves a Newt-owned
+    /// private credential generation. Newt may adopt a complete, strictly
+    /// resource/issuer-bound legacy Hermes credential as read-only input; Newt
+    /// auth and refresh never overwrite Hermes' flat token files.
     Auth {
         /// Name of the MCP server to authenticate (e.g. `newt auth my-server`).
         /// Omit to list all servers and their current auth status.

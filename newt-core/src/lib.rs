@@ -137,6 +137,7 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 // same pipeline) + CompressCounters (read-only `/memory` snapshot).
 // Issue #263: the prompted-ocap-grant seam (PermissionGate + friends) joins
 // the surface — the TUI implements the gate; headless callers pass None.
+pub use agentic::preserve_mcp_resource_url_affinity;
 pub use agentic::wrap_untrusted;
 pub use agentic::{
     append_denial, chat_complete, chat_complete_with_prompt, compress_user_initiated,
@@ -160,6 +161,7 @@ pub use agentic::{
     StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer,
     ToolCallDialect, ToolOutputStream, TranscriptLine, TranscriptRole, TranscriptStyle, TurnDriver,
     TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, EXPERIENCE_TOP_K,
+    MCP_RESOURCE_URL_PREFIXES_META_KEY,
 };
 pub use agents::AgentsProvider;
 pub use api_surface::{resolve_surface_budget, ApiSurfaceProvider};

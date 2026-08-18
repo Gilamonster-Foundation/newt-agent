@@ -1,0 +1,108 @@
+name: MCP import real-resource tier
+
+# The MCP import CLI acceptance tests execute the compiled newt binary against
+# a real temporary filesystem. The per-PR gate is covered by pure parser,
+# sanitizer, selector, and injected transaction tests; this lane grounds those
+# mocks on a weekly schedule and when called by the release workflow,
+# single-threaded.
+
+"on":
+  schedule:
+    - cron: "0 6 * * 0"
+  workflow_dispatch: {}
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-import-real-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  real-resource-tier:
+    name: MCP import real subprocess and filesystem tier
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mcp-import-real-${{ matrix.os }}
+
+      - name: Verify Cargo nonempty-test guard
+        shell: bash
+        run: bash .github/scripts/test-cargo-test-nonempty.sh
+
+      - name: Run MCP import CLI real-resource tests
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test uat_imported_mcp_recovers_a_private_review_without_shell_or_operator_setup
+          -p newt-agent --test mcp_cli
+          -- --ignored --test-threads=1
+
+      - name: Run MCP import durable transaction tests
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          -p newt-agent mcp_cmd::tests::
+          -- --ignored --test-threads=1
+
+      - name: Run shared atomic filesystem grounding tests
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          -p newt-core atomic_fs::tests::
+          -- --ignored --test-threads=1
+
+      - name: Run private-review MCP recovery acceptance test
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test private_review_fetch_recovers_through_tool_search_and_mcp
+          -p newt-core --lib private_review_fetch_recovers_through_tool_search_and_mcp
+          -- --ignored --test-threads=1
+
+      - name: Run MCP HTTP transport acceptance suite
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          -p newt-mcp-client --test http_transport
+          -- --include-ignored --test-threads=1
+
+      - name: Run private-host MCP lifecycle acceptance test
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          --require-test exact_private_hostname_grant_pins_dns_for_full_mcp_lifecycle
+          -p newt-mcp-client --lib
+          exact_private_hostname_grant_pins_dns_for_full_mcp_lifecycle
+          -- --include-ignored --test-threads=1
+
+      - name: Run MCP OAuth token acceptance suite
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          -p newt-tui mcp_token::
+          -- --include-ignored --test-threads=1
+
+      - name: Run MCP connection acceptance suite
+        shell: bash
+        run: >-
+          bash .github/scripts/cargo-test-nonempty.sh
+          -p newt-tui mcp::
+          -- --include-ignored --test-threads=1
+
+# Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 16:43 EDT | Date: 2026-08-13
