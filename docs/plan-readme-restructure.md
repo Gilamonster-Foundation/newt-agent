@@ -64,8 +64,8 @@ via `newt solve` (headless) + the Harbor adapter, by
 <!-- BENCH-SCOREBOARD:END -->
 
 **Full results, every model, and the methodology →**
-gilamonster-bench/results/newt-agent ·
-[how the numbers were kept honest](findings/2026-07-29-dgx-spark-terminal-bench-survey.md)
+[gilamonster-bench/results/newt-agent](…) ·
+[how the numbers were kept honest](docs/findings/dgx-spark-terminal-bench-survey.md)
 ```
 
 Three rules for this block:

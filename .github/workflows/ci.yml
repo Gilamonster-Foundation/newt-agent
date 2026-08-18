@@ -64,7 +64,9 @@ jobs:
       # and nothing verified those paths; readme-check only covers README.md.
       - name: documentation references resolve (docs-check)
         if: always()
-        run: python3 scripts/docs_check.py
+        run: |
+          python3 scripts/docs_check.py --self-test
+          python3 scripts/docs_check.py
 
   test:
     name: Rust tests
