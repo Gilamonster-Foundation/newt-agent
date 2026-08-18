@@ -18,11 +18,12 @@ naive grep. Scanning comment lines separates a citation from a test string
 without needing to parse Rust.
 
 Why code spans are stripped: a document that *demonstrates* link syntax is not
-making a reference. `docs/plan-readme-restructure.md` carries a fenced template
-of the README's scoreboard block, placeholder `(…)` link and all; treating that
-as a live link makes the checker demand edits to illustrative text, and the
-"fix" for a root-relative path inside a template is wrong at the root anyway.
-A checker that bends documents to satisfy it is worse than no checker.
+making a reference. The case that established this was a now-retired planning
+document that carried a fenced template of the README's scoreboard block,
+placeholder `(…)` link and all; treating that as a live link made the checker
+demand edits to illustrative text, and the "fix" for a root-relative path
+inside a template is wrong at the root anyway. A checker that bends documents
+to satisfy it is worse than no checker.
 
 Scope: markdown is scanned wherever it lives (repository root and `docs/**`),
 because the root documents are precisely the ones that point into `docs/` and
@@ -149,9 +150,9 @@ def self_test() -> int:
     """Verify the scanner on fixtures, not on the corpus.
 
     Each case is a real failure mode this checker had: an illustrative link
-    inside a fence reported as dead (which caused a template in
-    `docs/plan-readme-restructure.md` to be edited to satisfy the checker), and
-    a reference-style definition that was never checked at all.
+    inside a fence reported as dead (which caused a template in a planning
+    document, since retired, to be edited to satisfy the checker), and a
+    reference-style definition that was never checked at all.
     """
     cases: list[tuple[str, str, list[str]]] = [
         (
