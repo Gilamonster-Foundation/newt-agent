@@ -426,4 +426,107 @@ mod tests {
         cap.resize(120, 40);
         assert_eq!(size(1), (120, 40), "a child sizing by fd 1 sees the resize");
     }
+
+    /// Acceptance (#1744): entering and leaving the cockpit repeatedly must
+    /// restore fd 1/2 EVERY time, not just on the first cycle — a session can
+    /// open the cockpit, fall back to the classic surface, and re-enter.
+    ///
+    /// Deliberately does NOT assert a descriptor count. `/proc/self/fd` is
+    /// process-global, so in a parallel suite another test opening files reads
+    /// as a cockpit leak (observed: 45 -> 138 with nothing leaked). A guard
+    /// that fails for unrelated reasons trains people to ignore it.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn repeated_enter_and_leave_cycles_restore_every_time_and_leak_nothing() {
+        let err_pty = TestPty::open();
+        let _err = RedirectFd::to(2, err_pty.slave);
+        let before_out = inode(1);
+        let before_err = inode(2);
+
+        for cycle in 0..8 {
+            {
+                let cap = PtyCapture::install(80, 24).expect("openpty");
+                assert_ne!(inode(1), before_out, "cycle {cycle}: fd 1 took the pty");
+                write_fd(1, b"tick\n");
+                let got = drain(&cap);
+                assert!(
+                    String::from_utf8_lossy(&got).contains("tick"),
+                    "cycle {cycle}: the capture still carries output"
+                );
+            }
+            assert_eq!(inode(1), before_out, "cycle {cycle}: fd 1 restored");
+            assert_eq!(inode(2), before_err, "cycle {cycle}: fd 2 restored");
+        }
+    }
+
+    /// Acceptance (#1744): an unwind while the cockpit owns the terminal must
+    /// still hand fd 1/2 back. Terminal restoration is a safety property — a
+    /// process that dies holding the real stdout leaves the operator with a
+    /// terminal that echoes nothing.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_panic_while_the_cockpit_owns_the_terminal_still_restores_it() {
+        let err_pty = TestPty::open();
+        let _err = RedirectFd::to(2, err_pty.slave);
+        let before_out = inode(1);
+        let before_err = inode(2);
+
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // keep the test log readable
+        let result = std::panic::catch_unwind(|| {
+            let _cap = PtyCapture::install(80, 24).expect("openpty");
+            assert_ne!(inode(1), before_out, "precondition: the pty is installed");
+            panic!("turn exploded while the cockpit held the terminal");
+        });
+        std::panic::set_hook(hook);
+
+        assert!(
+            result.is_err(),
+            "the panic must propagate, not be swallowed"
+        );
+        assert_eq!(inode(1), before_out, "fd 1 restored through the unwind");
+        assert_eq!(inode(2), before_err, "fd 2 restored through the unwind");
+    }
+
+    /// Acceptance (#1744): a burst larger than the pty's kernel buffer must not
+    /// deadlock the writer. This is the architecture's load-bearing assumption
+    /// — the presenter drains the master on its own thread — so the test models
+    /// exactly that: a concurrent drainer, and a write that would block without
+    /// one. Bounded by a join timeout so a regression FAILS rather than hangs.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_burst_larger_than_the_pty_buffer_does_not_deadlock_the_writer() {
+        let cap = PtyCapture::install(80, 24).expect("openpty");
+        let master = cap.master_fd();
+
+        // 512 KiB — comfortably past any pty buffer (typically 4-64 KiB).
+        const CHUNK: usize = 4096;
+        const CHUNKS: usize = 128;
+        let want = CHUNK * CHUNKS;
+
+        let reader = std::thread::spawn(move || {
+            let mut seen = 0usize;
+            let mut buf = [0u8; 8192];
+            while seen < want {
+                // SAFETY: reading into our own buffer from a descriptor we own.
+                let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+                seen += n as usize;
+            }
+            seen
+        });
+
+        let line = vec![b'x'; CHUNK];
+        for _ in 0..CHUNKS {
+            write_fd(1, &line);
+        }
+        let seen = reader.join().expect("drainer thread");
+        assert!(
+            seen >= want,
+            "the drainer saw {seen} of {want} bytes — the writer starved or the pty dropped output"
+        );
+        drop(cap);
+    }
 }
