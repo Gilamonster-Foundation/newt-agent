@@ -427,6 +427,8 @@ mod tests {
             created_at,
             repeat_secs: repeat,
             claimed_at: None,
+            claim_token: None,
+            workspace: None,
         }
     }
 
@@ -564,6 +566,8 @@ mod tests {
             created_at: 0,
             repeat_secs: Some(60),
             claimed_at: Some(100), // claimed by the beat
+            claim_token: None,
+            workspace: None,
         };
         let advanced = acknowledge_success(&rep, 250).expect("repeating stays");
         assert_eq!(advanced.fire_at, 280, "advances to first > now");
