@@ -30,7 +30,11 @@ jobs:
     name: Rust lint (fmt + clippy)
     runs-on: ${{ vars.GMF_LINUX_RUNNER || 'ubuntu-latest' }}
     steps:
+      # Full history: the retirement sweep below diffs against the PR base, and
+      # a merge base is not reachable in a depth-1 clone.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -76,10 +80,7 @@ jobs:
       # HOOK PARITY: mirrored by .githooks/pre-push via `just check`.
       - name: deleted documents are not still referenced (docs-check)
         if: always() && github.event_name == 'pull_request'
-        run: |
-          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
-          git fetch --no-tags origin "${{ github.event.pull_request.base.sha }}" || true
-          python3 scripts/docs_check.py --deleted-refs "${{ github.event.pull_request.base.sha }}"
+        run: python3 scripts/docs_check.py --deleted-refs "${{ github.event.pull_request.base.sha }}"
 
   test:
     name: Rust tests

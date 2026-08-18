@@ -349,14 +349,24 @@ def git_deleted_markdown(base: str) -> list[str]:
     Raises CalledProcessError when `base` is not a valid revision — a wrong
     base must fail loudly rather than silently checking nothing.
     """
-    out = subprocess.run(
+    proc = subprocess.run(
         ["git", "diff", "--diff-filter=D", "--name-only", f"{base}...HEAD"],
         cwd=REPO,
         capture_output=True,
         text=True,
-        check=True,
-    ).stdout
-    return [p for p in out.splitlines() if p.endswith(".md")]
+        check=False,
+    )
+    if proc.returncode != 0:
+        # The overwhelmingly common cause is a shallow clone with no reachable
+        # merge base. Say so — a raw CalledProcessError traceback sends the
+        # reader hunting through the checker instead of the checkout depth.
+        raise SystemExit(
+            f"docs-check: cannot diff against '{base}': "
+            f"{proc.stderr.strip() or 'git failed'}\n"
+            "docs-check: a merge base must be reachable — in CI, check out with "
+            "fetch-depth: 0."
+        )
+    return [p for p in proc.stdout.splitlines() if p.endswith(".md")]
 
 
 def check_retirement(base: str, quiet: bool = False) -> list[str]:
