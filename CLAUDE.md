@@ -11,6 +11,28 @@ Long-term it's also the **drake-swarm training ground** — every PR
 review here will be done by an arbiter LLM voting against a real CI
 gate. The gates must be honest. Do not game them.
 
+**newt-agent is transitional.** See
+`docs/decisions/agent_line_architecture.md`, which is the single canonical
+statement of how the three agents relate. In capability terms
+**wyvern ≤ newt ≤ gilamonster**. Today the three share no crate-level
+dependency at all: newt and gilamonster sit on `agent-mesh-protocol` and
+`agent-bridle`, gilamonster consumes newt by a pinned git rev, and wyvern is
+isolated. The target is that wyvern becomes a small headless containerized
+worker that newt or gilamonster dispatch OCAP caveats to, reached as a
+rewrite of newt that is lighter, faster and smaller, after which newt's crates
+are retired in favour of it.
+
+Two rules follow, and the ADR is authoritative over this summary:
+
+- Shared functionality moves *down* into the minimal layer. A lower layer never
+  depends on a richer one.
+- **Contracts survive a rewrite, implementations do not.** Wire and schema
+  types, identity and provenance, config and capability vocabulary, observable
+  behaviour, security invariants, conformance tests and compatibility fixtures
+  are what a rewrite is written against, so they repay the most care. Surface
+  polish a descendant will rewrite is worth less. This makes the three Cs and
+  the reuse discipline below matter more, not less.
+
 ## Architectural style — the three Cs
 
 > Canonical home: the line's craft doctrine is the **Craft Register** —
