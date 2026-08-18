@@ -16,7 +16,6 @@ both codebases. Studied trees: newt-agent @ `6b7d780`, hermes-agent
 | `report-hermes-memory.md` | Reader 2: hermes memory/curation (memory_manager, curator, memory_tool, nudges, Honcho) |
 | `report-hermes-sessions.md` | Reader 3: hermes session management (gateway sessions, FTS5 search, resume/handoff, hermes_state) |
 | `report-newt-current.md` | Reader 4: newt's current memory/conversation/context systems + limitations |
-| `synthesis-draft-plan.md` | The synthesis agent's **draft** plan — *superseded by the corrected design doc; kept for audit* |
 | `verdict-hermes-claims.md` | Verifier A: every hermes-side claim confirmed/refuted with file:line (42/50 confirmed; found 4 missed mechanisms) |
 | `verdict-newt-claims.md` | Verifier B: every newt-side claim checked (found 5 proposals that already exist in newt; corrected the 9.7 sequencing premise) |
 | `verdict-fit.md` | Verifier C: constraint/fit review (dep argument, PR sizing, phase numbering, decision-doc conflicts) |
@@ -25,3 +24,8 @@ both codebases. Studied trees: newt-agent @ `6b7d780`, hermes-agent
 errors), then the draft, then the reports for the underlying evidence. The
 design doc is the draft **with every verdict correction applied**; where the
 doc and the draft disagree, the doc is right on purpose.
+
+**Retired 2026-08-18.** `synthesis-draft-plan.md` was removed. This README
+already recorded it as superseded by the corrected design doc, and nothing
+cited it. `upstream-offers-to-hermes.md` went with it: it was advice addressed
+to a different project. Both are in git history before this commit.

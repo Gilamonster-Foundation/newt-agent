@@ -35,6 +35,9 @@ changed the verdicts (see the doc's Critique log):
 
 | Critique | Lens |
 |---|---|
-| `critique-factual.md` | every load-bearing claim re-verified against hermes source; velocity numbers recomputed |
-| `critique-fit.md` | ledger-violation + inertness + scope-creep attack on the ADOPT list; the four-part OCAP security case against script-RPC; per-item KEEP/RESHAPE/CUT verdicts |
-| `critique-completeness.md` | missed findings, overclaims-by-omission, per-item actionability, cross-reference verification |
+
+**Retired 2026-08-18.** The three `critique-*.md` review artifacts
+(factual, fit, completeness) were removed. Each reviewed a draft of the
+audit, and the audit was then revised against them, so their content is
+in the document they were reviewing. They are in git history before this
+commit if the review itself is ever the question.
