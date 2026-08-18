@@ -24,9 +24,10 @@
 //!
 //! # Spans, not scores
 //!
-//! [`check`] returns the ungrounded material as **maximal runs with character offsets
-//! into the output**, because the caller's job is to act: annotate the span, re-ask for
-//! that window, or mark it unconverted. A bare rate cannot be pointed at.
+//! [`check`] returns the ungrounded material as **maximal runs with byte offsets into
+//! the output** — byte, not character, so a span is directly `&output[start..end]`;
+//! because the caller's job is to act: annotate the span, re-ask for that window, or
+//! mark it unconverted. A bare rate cannot be pointed at.
 //!
 //! # Normalization is not cosmetic
 //!
@@ -235,13 +236,21 @@ fn tokenize(text: &str) -> Vec<Token> {
 
     while i < text.len() {
         // Quoted-printable soft break: `=` + CRLF/LF continues the current token.
-        if bytes[i] == b'=' && matches!(bytes.get(i + 1), Some(b'\n') | Some(b'\r')) {
-            i += if bytes.get(i + 1) == Some(&b'\r') {
-                3
-            } else {
-                2
+        // The width is measured, never assumed: a bare `=\r` is two bytes, and
+        // skipping three would step into the FOLLOWING character — eating an
+        // ASCII one silently (`ab=\rcd` tokenized as `abd`) and slicing a
+        // multibyte one mid-scalar, which panics `text[i..]` on the next
+        // iteration. Both are reachable from any CR-bearing capture.
+        if bytes[i] == b'=' {
+            let soft = match (bytes.get(i + 1), bytes.get(i + 2)) {
+                (Some(b'\r'), Some(b'\n')) => 3,
+                (Some(b'\r'), _) | (Some(b'\n'), _) => 2,
+                _ => 0,
             };
-            continue;
+            if soft > 0 {
+                i += soft;
+                continue;
+            }
         }
         let ch = text[i..].chars().next().expect("char boundary");
         let width = ch.len_utf8();
@@ -650,5 +659,83 @@ A statistician said an unbiased coin would produce a result that extreme \
             annotations[0].contains("not in the source document"),
             "{annotations:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod soft_break_regressions {
+    use super::*;
+
+    /// Regression (#1756): a bare `=\r` is a TWO-byte soft break. Assuming CRLF
+    /// and skipping three bytes stepped into the next character; when that
+    /// character was multibyte, the next `text[i..]` sliced mid-scalar and
+    /// panicked. A gate that runs over arbitrary captures and arbitrary model
+    /// output must not panic on either.
+    #[test]
+    fn bare_cr_soft_break_before_multibyte_does_not_panic() {
+        for s in [
+            "=\ré",
+            "=\r世",
+            "word=\récrit",
+            "a=\r\u{1F600}b",
+            "=\r",
+            "=",
+            "=\n",
+            "=\r\n",
+            "x=\r\ny",
+        ] {
+            let toks = tokenize(s);
+            // Every offset must be a usable slice of the original.
+            for t in &toks {
+                let _ = &s[t.start..t.end];
+            }
+        }
+    }
+
+    /// Regression (#1756): the over-skip also ate an ordinary ASCII character,
+    /// silently manufacturing a token (`ab=\rcd` → `abd`) that exists in
+    /// neither the output nor the source. That corrupts the comparison in both
+    /// directions — the module unwraps soft breaks precisely so a correct
+    /// conversion is not read as fabricated.
+    #[test]
+    fn soft_break_joins_the_token_without_eating_a_character() {
+        assert_eq!(text_of(tokenize("ab=\rcd")), vec!["abcd"]);
+        assert_eq!(text_of(tokenize("ab=\ncd")), vec!["abcd"]);
+        assert_eq!(text_of(tokenize("ab=\r\ncd")), vec!["abcd"]);
+        // The motivating case from the module docs.
+        assert_eq!(text_of(tokenize("Zawadow=\nski")), vec!["zawadowski"]);
+        assert_eq!(text_of(tokenize("Zawadow=\r\nski")), vec!["zawadowski"]);
+        assert_eq!(text_of(tokenize("Zawadow=\rski")), vec!["zawadowski"]);
+    }
+
+    /// A lone `=` is not a soft break and must not consume its neighbour.
+    #[test]
+    fn a_bare_equals_is_a_token_boundary_not_a_break() {
+        assert_eq!(text_of(tokenize("a=b")), vec!["a", "b"]);
+        assert_eq!(text_of(tokenize("k=1")), vec!["k", "1"]);
+        assert_eq!(text_of(tokenize("é=ü")), vec!["é", "ü"]);
+    }
+
+    /// The joined token's span still slices the ORIGINAL text, break and all.
+    #[test]
+    fn joined_token_span_slices_the_original() {
+        let s = "Zawadow=\nski wrote";
+        let toks = tokenize(s);
+        assert_eq!(toks[0].text, "zawadowski");
+        assert_eq!(&s[toks[0].start..toks[0].end], "Zawadow=\nski");
+    }
+
+    /// End-to-end: a soft-wrapped source and its correct conversion agree.
+    #[test]
+    fn a_correct_conversion_of_a_soft_wrapped_source_is_grounded() {
+        let source = "The report by Zawadow=\r\nski confirms the second quarter fig=\r\nures held.";
+        let output = "The report by Zawadowski confirms the second quarter figures held.";
+        let g = check(source, output, &GroundingConfig::default());
+        assert!(g.is_grounded(), "ungrounded: {:?}", g.annotations());
+        assert_eq!(g.grounded_ratio, 1.0);
+    }
+
+    fn text_of(toks: Vec<Token>) -> Vec<String> {
+        toks.into_iter().map(|t| t.text).collect()
     }
 }
