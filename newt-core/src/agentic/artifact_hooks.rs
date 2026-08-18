@@ -28,7 +28,7 @@ const MAX_ATOMIC_ASK_DIGESTS: usize = 64;
 const MAX_CLARIFICATION_DIGESTS: usize = 16;
 const MAX_DECISION_AGGREGATE_COUNT: u64 = 1_024;
 
-const PROMPT_COMPREHENSION_FIELDS: [&str; 9] = [
+const PROMPT_COMPREHENSION_FIELDS: [&str; 10] = [
     "schema",
     "disposition",
     "atomic_ask_count",
@@ -38,6 +38,7 @@ const PROMPT_COMPREHENSION_FIELDS: [&str; 9] = [
     "decision_source_counts",
     "atomic_ask_digests",
     "clarification_digests",
+    "authorized_assumption_digests",
 ];
 const DECISION_STATUS_FIELDS: [&str; 2] = ["pending", "locked"];
 const DECISION_SOURCE_FIELDS: [&str; 3] = ["operator", "policy", "authorized_assumption"];
@@ -96,9 +97,14 @@ fn record_prompt_comprehension_metadata(
 }
 
 fn bounded_prompt_comprehension_metadata(metadata: &Value) -> anyhow::Result<Value> {
+    // `authorized_assumption_digests` postdates the v1/v2 records already on
+    // disk, so it is ALLOWED but not REQUIRED: a stored manifest written before
+    // adjudication existed has no authorized locks, and an absent list is
+    // exactly equivalent to an empty one. Every other field stays required.
     let object = exact_object(
         metadata,
         &PROMPT_COMPREHENSION_FIELDS,
+        &["authorized_assumption_digests"],
         "prompt-comprehension metadata",
     )?;
 
@@ -172,6 +178,24 @@ fn bounded_prompt_comprehension_metadata(metadata: &Value) -> anyhow::Result<Val
     if clarification_count != u64::try_from(clarification_digests.len()).unwrap_or(u64::MAX) {
         anyhow::bail!("prompt-comprehension clarification digests do not match their count");
     }
+    // One digest per model-authorized lock. The assumption text itself never
+    // enters the ledger — the digest proves WHICH interpretation was
+    // authorized without copying prompt-derived text into durable storage.
+    let authorized_assumption_digests = match object.get("authorized_assumption_digests") {
+        None => Vec::new(),
+        present => bounded_digests(
+            present,
+            MAX_CLARIFICATION_DIGESTS,
+            "authorized-assumption digests",
+        )?,
+    };
+    if source_counts["authorized_assumption"].as_u64().unwrap_or(0)
+        != u64::try_from(authorized_assumption_digests.len()).unwrap_or(u64::MAX)
+    {
+        anyhow::bail!(
+            "prompt-comprehension authorized-assumption digests do not match their source count"
+        );
+    }
 
     Ok(json!({
         "schema": schema,
@@ -183,18 +207,24 @@ fn bounded_prompt_comprehension_metadata(metadata: &Value) -> anyhow::Result<Val
         "decision_source_counts": source_counts,
         "atomic_ask_digests": atomic_ask_digests,
         "clarification_digests": clarification_digests,
+        "authorized_assumption_digests": authorized_assumption_digests,
     }))
 }
 
 fn exact_object<'a>(
     value: &'a Value,
     fields: &[&str],
+    optional: &[&str],
     label: &str,
 ) -> anyhow::Result<&'a serde_json::Map<String, Value>> {
     let object = value
         .as_object()
         .with_context(|| format!("{label} must be a JSON object"))?;
-    if fields.iter().any(|field| !object.contains_key(*field)) {
+    if fields
+        .iter()
+        .filter(|field| !optional.contains(*field))
+        .any(|field| !object.contains_key(*field))
+    {
         anyhow::bail!("{label} is missing a required field");
     }
     if object.keys().any(|field| !fields.contains(&field.as_str())) {
@@ -223,7 +253,7 @@ fn required_count(object: &serde_json::Map<String, Value>, field: &str) -> anyho
 
 fn bounded_aggregate(value: Option<&Value>, fields: &[&str], label: &str) -> anyhow::Result<Value> {
     let value = value.with_context(|| format!("{label} is required"))?;
-    let object = exact_object(value, fields, label)?;
+    let object = exact_object(value, fields, &[], label)?;
     let mut bounded = serde_json::Map::new();
     for field in fields {
         let count = required_count(object, field)?;
@@ -245,7 +275,7 @@ fn bounded_digests(value: Option<&Value>, max: usize, label: &str) -> anyhow::Re
     digests
         .iter()
         .map(|entry| {
-            let object = exact_object(entry, &DIGEST_FIELDS, label)?;
+            let object = exact_object(entry, &DIGEST_FIELDS, &[], label)?;
             let digest = required_string(object, "digest", label)?;
             if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 anyhow::bail!("{label} contains an invalid digest");

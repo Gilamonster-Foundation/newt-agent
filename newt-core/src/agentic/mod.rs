@@ -110,6 +110,7 @@ mod markdown {
         }
     }
 }
+mod adjudicate;
 mod artifact_hooks;
 mod artifact_read;
 mod mcp;
@@ -163,6 +164,7 @@ mod trim;
 mod untrusted;
 mod warmup;
 
+pub use adjudicate::{adjudicate_decisions, AdjudicationFailure};
 pub use artifact_hooks::{
     record_manual_compaction_checkpoint, record_memory_compaction_checkpoint,
     record_observed_head_transition, record_prompt_comprehension_manifest,
@@ -207,8 +209,9 @@ pub use observability::{
 };
 pub use plan_exec::{run_plan, run_plan_with_reground, NoReground, PlanRun, Reground};
 pub use prompt_intake::{
-    AtomicAsk, ClarificationRejection, DecisionLock, DecisionSource, DecisionStatus,
-    DispositionLexicon, PromptComprehensionManifest, PromptDisposition, PromptIntake,
+    AdjudicationCandidate, AdjudicationRefusal, AdjudicationVerdict, AtomicAsk,
+    ClarificationRejection, DecisionLock, DecisionSource, DecisionStatus, DispositionLexicon,
+    PromptComprehensionManifest, PromptDisposition, PromptIntake, MAX_ADJUDICATION_BATCH,
 };
 #[cfg(test)]
 pub(crate) use prompt_read::response_repository_policy_tokens;

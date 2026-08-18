@@ -101,9 +101,38 @@ pub struct IntakeConfig {
     /// cliff, made explicit and tunable. Unknown values fall back to explain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question_mark_disposition: Option<String>,
+    /// Whether a heuristic decision candidate may be settled by one bounded,
+    /// tool-less model adjudication before the operator is asked (#1749).
+    ///
+    /// Unset resolves to [`IntakeConfig::adjudicate_decisions_enabled`]: on for
+    /// an interactive terminal, off headless. An auto-authorized assumption is
+    /// only safe because the operator SEES it and can `/undo-lock` it; where
+    /// nobody is reading, the harness asks instead of assuming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adjudicate_decisions: Option<bool>,
+    /// Optional backend override for the decision adjudication side call.
+    ///
+    /// Unset — the default — runs adjudication on the **session** backend, the
+    /// model that already holds the prompt. Adjudication reads operator intent,
+    /// which is the steering model's own job; it is deliberately NOT routed to
+    /// the summarizer, whose CPU-local default exists to keep compaction load
+    /// off the inference box and is a different kind of inference entirely.
+    ///
+    /// Set it to spread load — point adjudication at a second box while
+    /// steering stays put (#1749).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adjudicator: Option<crate::config::BackendRef>,
 }
 
 impl IntakeConfig {
+    /// Resolve [`IntakeConfig::adjudicate_decisions`] against the surface.
+    /// `interactive` is the harness's "an operator is watching this line"
+    /// signal (`LineCaps::can_own`).
+    #[must_use]
+    pub fn adjudicate_decisions_enabled(&self, interactive: bool) -> bool {
+        self.adjudicate_decisions.unwrap_or(interactive)
+    }
+
     /// Resolve this table over the built-in defaults into the lexicon
     /// [`crate::agentic::PromptIntake::analyze_with`] consumes.
     #[must_use]

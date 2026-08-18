@@ -10169,6 +10169,51 @@ fn build_session_summarizer(
     )
 }
 
+/// Build the decision adjudicator (#1749).
+///
+/// Defaults to the **session** backend: adjudication decides whether the
+/// operator delegated a choice, which is the steering model's own job and wants
+/// the model that already holds the prompt. It deliberately does NOT ride the
+/// summarizer — that one defaults to CPU-local inference precisely to keep
+/// compaction load off the inference box, which makes it the wrong host for
+/// reading intent.
+///
+/// `[intake.adjudicator]` overrides it field-by-field for an operator who wants
+/// to spread load; `BackendRef::resolve` applies the "never inherit the session
+/// key to a pinned host" rule.
+pub(crate) fn build_adjudicator(
+    cfg: &newt_core::Config,
+    inf_url: &str,
+    inf_model: &str,
+    inf_kind: newt_core::BackendKind,
+    inf_key: &Option<String>,
+    num_ctx: Option<u32>,
+    color: bool,
+) -> newt_core::Summarizer {
+    let (url, model, kind, key) = cfg
+        .intake
+        .as_ref()
+        .and_then(|intake| intake.adjudicator.as_ref())
+        .map_or_else(
+            || {
+                (
+                    inf_url.to_string(),
+                    inf_model.to_string(),
+                    inf_kind,
+                    inf_key.clone(),
+                )
+            },
+            |over| over.resolve(inf_url, inf_model, inf_kind, inf_key),
+        );
+    let opts = SummarizerOpts {
+        num_ctx,
+        color,
+        caps: newt_core::tty::LineCaps::detect(),
+        ..SummarizerOpts::default()
+    };
+    make_loop_summarizer(url, model, kind, key, None, opts)
+}
+
 /// Whether to render assistant Markdown this turn (Step 25.4, #568). The
 /// session `/markdown` override wins over `[tui].markdown`; either way the
 /// result is gated by `color` (Markdown emits ANSI, so it is off without color).
