@@ -30,15 +30,36 @@ because the root documents are precisely the ones that point into `docs/` and
 break when it is reorganized. Rust is scanned across every crate rather than an
 allowlist, so a new crate is covered the day it is added.
 
+3. **Retirement.** When a change DELETES a markdown document, nothing left in
+   the tree may still point at it — by link or by name.
+
+Why the third check reads raw text: checks 1 and 2 answer "does this reference
+resolve", and for that, blanking code spans is right (a document demonstrating
+link syntax is not making a reference). Retirement asks the opposite question —
+"does anything still NAME this file" — and the references that survive a
+deletion are overwhelmingly *prose* mentions and backtick citations, not links.
+A `docs/foo.md` written in backticks is invisible to check 1 by design. So the
+retirement sweep matches raw lines, code spans included, and is deliberately
+NOT built on `prose_lines`.
+
+Tombstones are the intended exception. A README that records "Retired
+2026-08-18: `foo.md` was removed" SHOULD keep naming the file — that is a
+manifest, not a dangling pointer. A mention is treated as acknowledged when a
+retirement marker appears in the same paragraph, which is the idiom the corpus
+already uses.
+
 Usage:
     scripts/docs_check.py            # report and exit non-zero on any failure
     scripts/docs_check.py --quiet    # only print failures
     scripts/docs_check.py --self-test  # verify the scanner itself
+    scripts/docs_check.py --deleted-refs <base>
+                                     # nothing still names a doc deleted since <base>
 """
 
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -214,6 +235,54 @@ def self_test() -> int:
             print(f"docs-check self-test FAIL: {name}: {found!r} != {expected!r}", file=sys.stderr)
             failed += 1
 
+    # --- retirement rule (--deleted-refs) ---------------------------------
+    retirement: list[tuple[str, list[str], str, list[int]]] = [
+        (
+            "a plain prose mention is dangling",
+            ["gone.md"],
+            "See gone.md for details.\n",
+            [1],
+        ),
+        (
+            "a BACKTICK citation is dangling too — the case links cannot see",
+            ["gone.md"],
+            "Cited by `gone.md` in passing.\n",
+            [1],
+        ),
+        (
+            "a tombstone paragraph may name what it retires",
+            ["gone.md"],
+            "**Retired 2026-08-18.** `gone.md` was removed.\n",
+            [],
+        ),
+        (
+            "the marker covers the whole paragraph, not just its line",
+            ["a.md", "b.md"],
+            "**Retired.** `a.md` went first.\nLater `b.md` went with it.\n",
+            [],
+        ),
+        (
+            "a marker in a DIFFERENT paragraph does not excuse a mention",
+            ["gone.md"],
+            "**Retired.** Something else was removed.\n\nSee gone.md.\n",
+            [3],
+        ),
+        (
+            "unrelated text is not a mention",
+            ["gone.md"],
+            "Nothing here names it.\n",
+            [],
+        ),
+    ]
+    for name, names, text, expected in retirement:
+        got = [lineno for lineno, _ in unacknowledged_mentions(names, text)]
+        if got != expected:
+            print(
+                f"docs-check self-test FAIL: {name}: {got!r} != {expected!r}",
+                file=sys.stderr,
+            )
+            failed += 1
+
     # The line-number case must also report the correct line.
     lines = prose_lines("```\nfenced\n```\n[x](nope.md)\n")
     if len(lines) != 4 or "nope.md" not in lines[3]:
@@ -223,14 +292,140 @@ def self_test() -> int:
     if failed:
         print(f"docs-check: {failed} self-test failure(s)", file=sys.stderr)
         return 1
-    print(f"docs-check: {len(cases) + 1} self-tests passed")
+    print(f"docs-check: {len(cases) + len(retirement) + 1} self-tests passed")
     return 0
+
+
+# A paragraph naming a deleted document is a tombstone, not a dangling pointer,
+# when it says so. These are the words the corpus already uses.
+RETIREMENT_MARKER = re.compile(r"\b(retired|removed|deleted|superseded)\b", re.I)
+
+
+def paragraphs(lines: list[str]) -> list[tuple[int, list[str]]]:
+    """Contiguous non-blank runs, each with its 1-based starting line number.
+
+    Paragraph granularity is deliberate. The corpus writes a tombstone as one
+    block — "**Retired 2026-08-18.** `a.md` was removed. ... `b.md` went with
+    it" — so the marker sits near, but not necessarily on, each mention's line.
+    """
+    out: list[tuple[int, list[str]]] = []
+    start, buf = 0, []
+    for i, line in enumerate(lines, 1):
+        if line.strip():
+            if not buf:
+                start = i
+            buf.append(line)
+        elif buf:
+            out.append((start, buf))
+            buf = []
+    if buf:
+        out.append((start, buf))
+    return out
+
+
+def unacknowledged_mentions(names: list[str], text: str) -> list[tuple[int, str]]:
+    """Which of `names` this document still mentions WITHOUT retiring them.
+
+    Pure, so the rule is testable without a filesystem or a git history. Matches
+    raw lines — code spans included — see the module docstring.
+    """
+    lines = text.splitlines()
+    found: list[tuple[int, str]] = []
+    for start, para in paragraphs(lines):
+        block = "\n".join(para)
+        if RETIREMENT_MARKER.search(block):
+            continue  # a tombstone may name what it retires
+        for offset, line in enumerate(para):
+            for name in names:
+                if name in line:
+                    found.append((start + offset, name))
+    return found
+
+
+def git_deleted_markdown(base: str) -> list[str]:
+    """Markdown paths deleted between `base` and the working tree.
+
+    # Errors
+    Raises CalledProcessError when `base` is not a valid revision — a wrong
+    base must fail loudly rather than silently checking nothing.
+    """
+    out = subprocess.run(
+        ["git", "diff", "--diff-filter=D", "--name-only", f"{base}...HEAD"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return [p for p in out.splitlines() if p.endswith(".md")]
+
+
+def check_retirement(base: str, quiet: bool = False) -> list[str]:
+    """Nothing left in the tree still names a document deleted since `base`."""
+    deleted = git_deleted_markdown(base)
+    if not deleted:
+        if not quiet:
+            print(f"docs-check: no markdown deleted since {base}")
+        return []
+
+    tracked = subprocess.run(
+        ["git", "ls-files"], cwd=REPO, capture_output=True, text=True, check=True
+    ).stdout.splitlines()
+    # Text the corpus actually cites documents from.
+    suffixes = (".md", ".rs", ".py", ".sh", ".toml", ".yml", ".yaml")
+    corpus = [
+        f for f in tracked if (f.endswith(suffixes) or Path(f).name == "justfile")
+    ]
+
+    failures = []
+    for path in deleted:
+        # Both spellings: the full path and the bare filename, since a citation
+        # is as often `foo.md` as `docs/dir/foo.md`.
+        names = [path, Path(path).name]
+        for rel in corpus:
+            fp = REPO / rel
+            if not fp.is_file():
+                continue
+            hits = unacknowledged_mentions(names, fp.read_text(encoding="utf-8", errors="replace"))
+            # `names` holds both the full path and the bare filename, so one
+            # citation matches twice. Report the line once, naming the most
+            # specific spelling that matched.
+            best: dict[int, str] = {}
+            for lineno, name in hits:
+                if len(name) > len(best.get(lineno, "")):
+                    best[lineno] = name
+            for lineno in sorted(best):
+                failures.append(
+                    f"{rel}:{lineno}: names deleted document -> {best[lineno]}"
+                )
+    if not quiet:
+        print(f"docs-check: {len(deleted)} deleted document(s) swept since {base}")
+    return failures
 
 
 def main() -> int:
     if "--self-test" in sys.argv:
         return self_test()
     quiet = "--quiet" in sys.argv
+
+    if "--deleted-refs" in sys.argv:
+        i = sys.argv.index("--deleted-refs")
+        if i + 1 >= len(sys.argv):
+            print("docs-check: --deleted-refs needs a base revision", file=sys.stderr)
+            return 2
+        failures = check_retirement(sys.argv[i + 1], quiet)
+        for failure in failures:
+            print(f"docs-check: {failure}", file=sys.stderr)
+        if failures:
+            print(
+                f"docs-check: {len(failures)} reference(s) to deleted document(s). "
+                "Remove them, or record the retirement in the same paragraph.",
+                file=sys.stderr,
+            )
+            return 1
+        if not quiet:
+            print("docs-check: no dangling reference to any deleted document")
+        return 0
+
     link_failures = check_links()
     citation_failures = check_citations()
 

@@ -69,6 +69,17 @@ jobs:
         run: |
           python3 scripts/docs_check.py --self-test
           python3 scripts/docs_check.py
+      # Retirement sweep: a deleted document must not still be NAMED anywhere.
+      # PR-only, because it is defined against the base of a change. Reads raw
+      # text (backtick citations are the case links cannot see), so it is the
+      # complement of the step above, not a duplicate of it.
+      # HOOK PARITY: mirrored by .githooks/pre-push via `just check`.
+      - name: deleted documents are not still referenced (docs-check)
+        if: always() && github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          git fetch --no-tags origin "${{ github.event.pull_request.base.sha }}" || true
+          python3 scripts/docs_check.py --deleted-refs "${{ github.event.pull_request.base.sha }}"
 
   test:
     name: Rust tests
