@@ -84,6 +84,16 @@ pub struct Timer {
     /// older ⇒ a stale claim from a dead run (re-selectable). `None` ⇒ idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_at: Option<u64>,
+    /// Unique opaque token set when claimed; the matching token is required to
+    /// acknowledge. Prevents a stale worker from consuming a newer worker's
+    /// claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<String>,
+    /// The workspace (CWD) where this timer should be executed. Makes the
+    /// timer portable and explicit — the cron process CWD does NOT infer
+    /// execution context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<PathBuf>,
 }
 
 /// Pure: which timers are due at `now` (`fire_at <= now`), in creation order.
@@ -147,6 +157,8 @@ pub fn schedule_new(
         created_at: now,
         repeat_secs,
         claimed_at: None,
+        claim_token: None,
+        workspace: None,
     }
 }
 
