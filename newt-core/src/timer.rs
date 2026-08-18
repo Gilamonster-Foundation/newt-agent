@@ -14,13 +14,31 @@
 //! flow is:
 //!
 //! 1. **claim** the next due timer ([`TimerStore::claim_next_due`]) — it is
-//!    marked in-flight (`claimed_at`) so a concurrent beat cannot re-fire it;
+//!    marked in-flight (`claimed_at`) and stamped with a unique
+//!    [`new_claim_token`], so a concurrent beat cannot re-fire it;
 //! 2. **execute** it (`newt solve`, driven by `newt timer fire --run`);
-//! 3. **acknowledge** ([`TimerStore::acknowledge`]) — on success a one-shot is
-//!    removed and a repeating timer advances; on failure the claim is released
-//!    and the timer stays pending/retryable. Execution stops at the first
-//!    failure so later due timers are never silently lost — they remain
-//!    pending (unclaimed) for the next beat.
+//! 3. **acknowledge** ([`TimerStore::acknowledge`]) — presenting the claim
+//!    token. On success a one-shot is removed and a repeating timer advances;
+//!    on failure the claim is released and the timer stays pending/retryable.
+//!    Execution stops at the first failure so later due timers are never
+//!    silently lost — they remain pending (unclaimed) for the next beat.
+//!
+//! ## Why the token, and why the lock
+//!
+//! A claim goes stale after [`CLAIM_FRESH_SECS`] so a crashed beat cannot
+//! strand a timer forever. That recovery is exactly what makes a *late* worker
+//! dangerous: its timer may already belong to the beat that re-claimed it.
+//! [`TimerStore::acknowledge`] therefore refuses any ack whose token is not the
+//! one currently on the timer ([`AckOutcome::TokenMismatch`]) — a stalled
+//! worker can no longer delete a one-shot another worker is still executing,
+//! nor advance a repeat past a firing.
+//!
+//! Ownership is only meaningful if the claim itself is atomic, so every
+//! mutation takes the queue's cross-process lock for its whole
+//! read-modify-write and commits through [`crate::atomic_fs`]. A mutating read
+//! that finds a corrupt file fails loudly instead of resolving to an empty
+//! queue: the write that followed such a read would otherwise persist the
+//! emptiness, destroying live timers and resetting the id sequence.
 //!
 //! The decision core ([`select_due`], [`select_claimable`], [`schedule_new`],
 //! [`advance_repeat`], [`acknowledge_success`], [`acknowledge_failure`]) is
@@ -29,8 +47,9 @@
 //! (same doctrine as `ocap_cmd`: the entry point is thin, the core is pure).
 //!
 //! Reuses [`crate::Config::user_config_dir`] for the root and plain JSON for
-//! the envelope — integrity is not on the table for a prompt queue, so the
-//! tamper-evident machinery of `store.rs` is deliberately not pulled in.
+//! the envelope — *tamper*-evidence is not on the table for a prompt queue, so
+//! the machinery of `store.rs` is deliberately not pulled in; durability and
+//! mutual exclusion come from [`crate::atomic_fs`], which the queue does need.
 
 use std::path::{Path, PathBuf};
 
@@ -148,6 +167,7 @@ pub fn schedule_new(
     prompt: &str,
     now: u64,
     repeat_secs: Option<u64>,
+    workspace: Option<PathBuf>,
 ) -> Timer {
     let seq = next_seq(timers);
     Timer {
@@ -158,8 +178,35 @@ pub fn schedule_new(
         repeat_secs,
         claimed_at: None,
         claim_token: None,
-        workspace: None,
+        workspace,
     }
+}
+
+/// Mint an opaque, single-use claim token. Unique per claiming process and
+/// call: `<pid>-<nanos>-<counter>`. The counter disambiguates two claims taken
+/// inside the same nanosecond tick by one process.
+#[must_use]
+pub fn new_claim_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{nanos}-{n}", std::process::id())
+}
+
+/// The outcome of [`TimerStore::acknowledge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckOutcome {
+    /// The claim matched and the timer was advanced/removed/released.
+    Applied,
+    /// No timer with that id exists.
+    NotFound,
+    /// The timer exists but is held under a *different* claim token — this
+    /// worker no longer owns it (its claim went stale and another beat took
+    /// over). The ack is refused; the current owner's claim is untouched.
+    TokenMismatch,
 }
 
 /// Pure: after a repeating timer fires at/before `now`, re-arm it to the first
@@ -192,11 +239,13 @@ pub fn advance_repeat(timer: &Timer, now: u64) -> Option<Timer> {
         None => {
             next.fire_at = u64::MAX;
             next.claimed_at = None;
+            next.claim_token = None;
             return Some(next);
         }
     };
     next.fire_at = next.fire_at.saturating_add(advance);
     next.claimed_at = None;
+    next.claim_token = None;
     Some(next)
 }
 
@@ -216,6 +265,7 @@ pub fn acknowledge_success(timer: &Timer, now: u64) -> Option<Timer> {
 pub fn acknowledge_failure(timer: &Timer) -> Timer {
     let mut t = timer.clone();
     t.claimed_at = None;
+    t.claim_token = None;
     t
 }
 
@@ -253,26 +303,59 @@ impl TimerStore {
     /// # Errors
     /// Propagates non-`NotFound` IO errors (permissions, …).
     pub fn load(&self) -> anyhow::Result<Vec<Timer>> {
+        match self.load_strict() {
+            Ok(timers) => Ok(timers),
+            Err(e) => {
+                tracing::warn!("timers.json unreadable, treating as empty: {e}");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Load for a **mutating** caller. Unlike [`Self::load`], a corrupt file is
+    /// an error, never an empty queue.
+    ///
+    /// This distinction is the queue's durability guarantee. Every mutation is
+    /// a read-modify-write; if a torn or corrupt read silently yielded an empty
+    /// vec, the write that followed would persist that emptiness and destroy
+    /// every live timer — and reset the id sequence so fresh ids collide with
+    /// timers that still exist. Reading may degrade; writing must not.
+    ///
+    /// # Errors
+    /// IO errors other than `NotFound`, and JSON parse failures.
+    fn load_strict(&self) -> anyhow::Result<Vec<Timer>> {
         match std::fs::read(&self.path) {
-            Ok(bytes) => match serde_json::from_slice::<Vec<Timer>>(&bytes) {
-                Ok(timers) => Ok(timers),
-                Err(e) => {
-                    tracing::warn!("timers.json unreadable, treating as empty: {e}");
-                    Ok(Vec::new())
-                }
-            },
+            Ok(bytes) => serde_json::from_slice::<Vec<Timer>>(&bytes).map_err(|e| {
+                anyhow::anyhow!(
+                    "{} is corrupt ({e}); refusing to overwrite it. \
+                     Move it aside to start a fresh queue.",
+                    self.path.display()
+                )
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e.into()),
         }
     }
 
+    /// Take the cross-process lock guarding the queue file. Every
+    /// read-modify-write below holds this for its whole critical section, so
+    /// two concurrent `newt timer fire` beats cannot interleave and hand the
+    /// same timer to two workers.
+    fn lock(&self) -> anyhow::Result<crate::atomic_fs::LockGuard> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        crate::atomic_fs::acquire_lock(&crate::atomic_fs::stable_lock_path_for(&self.path)?)
+    }
+
+    /// Durably replace the queue file. Atomic (stage + rename), so a concurrent
+    /// reader sees either the old queue or the new one — never a truncated file.
     fn save(&self, timers: &[Timer]) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let bytes = serde_json::to_vec_pretty(timers)?;
-        std::fs::write(&self.path, bytes)?;
-        Ok(())
+        crate::atomic_fs::atomic_write(&self.path, &bytes)
     }
 
     /// Schedule a new timer firing `after_secs` from `clock.now_secs()`.
@@ -285,6 +368,7 @@ impl TimerStore {
         prompt: &str,
         clock: &dyn Clock,
         repeat_secs: Option<u64>,
+        workspace: Option<PathBuf>,
     ) -> anyhow::Result<Timer> {
         // Config/persistence boundary: a zero repeat interval would make
         // `advance_repeat` spin forever once the job is due. Reject it here so
@@ -292,9 +376,10 @@ impl TimerStore {
         if let Some(0) = repeat_secs {
             anyhow::bail!("repeat interval must be greater than zero");
         }
+        let _guard = self.lock()?;
         let now = clock.now_secs();
-        let mut timers = self.load()?;
-        let timer = schedule_new(&timers, after_secs, prompt, now, repeat_secs);
+        let mut timers = self.load_strict()?;
+        let timer = schedule_new(&timers, after_secs, prompt, now, repeat_secs, workspace);
         timers.push(timer.clone());
         self.save(&timers)?;
         Ok(timer)
@@ -336,8 +421,9 @@ impl TimerStore {
     /// # Errors
     /// Propagates load/save IO errors.
     pub fn claim_next_due(&self, clock: &dyn Clock) -> anyhow::Result<Option<Timer>> {
+        let _guard = self.lock()?;
         let now = clock.now_secs();
-        let mut timers = self.load()?;
+        let mut timers = self.load_strict()?;
         let pick = select_claimable(&timers, now)
             .into_iter()
             .min_by_key(|t| (t.created_at, t.fire_at));
@@ -345,9 +431,11 @@ impl TimerStore {
             return Ok(None);
         };
         let target = pick.id.clone();
+        let token = new_claim_token();
         for t in &mut timers {
             if t.id == target {
                 t.claimed_at = Some(now);
+                t.claim_token = Some(token.clone());
                 break;
             }
         }
@@ -369,14 +457,32 @@ impl TimerStore {
     ///
     /// # Errors
     /// Propagates load/save IO errors.
-    pub fn acknowledge(&self, id: &str, success: bool, clock: &dyn Clock) -> anyhow::Result<bool> {
+    pub fn acknowledge(
+        &self,
+        id: &str,
+        token: &str,
+        success: bool,
+        clock: &dyn Clock,
+    ) -> anyhow::Result<AckOutcome> {
+        let _guard = self.lock()?;
         let now = clock.now_secs();
-        let timers = self.load()?;
+        let timers = self.load_strict()?;
+
+        // Ownership check BEFORE any mutation: a worker whose claim went stale
+        // (another beat re-claimed the timer under a new token) must not
+        // consume, advance, or release the claim it no longer holds.
+        let Some(current) = timers.iter().find(|t| t.id == id) else {
+            return Ok(AckOutcome::NotFound);
+        };
+        if current.claim_token.as_deref() != Some(token) {
+            return Ok(AckOutcome::TokenMismatch);
+        }
+
         let mut kept: Vec<Timer> = Vec::with_capacity(timers.len());
-        let mut found = false;
+        let mut done = false;
         for t in timers {
-            if !found && t.id == id {
-                found = true;
+            if !done && t.id == id {
+                done = true;
                 let replacement = if success {
                     acknowledge_success(&t, now)
                 } else {
@@ -391,7 +497,7 @@ impl TimerStore {
             }
         }
         self.save(&kept)?;
-        Ok(found)
+        Ok(AckOutcome::Applied)
     }
 
     /// Remove a timer by id (or an unambiguous id prefix) — cancel a watch.
@@ -400,7 +506,8 @@ impl TimerStore {
     /// # Errors
     /// Propagates load/save IO errors.
     pub fn dismiss(&self, id_or_prefix: &str) -> anyhow::Result<bool> {
-        let timers = self.load()?;
+        let _guard = self.lock()?;
+        let timers = self.load_strict()?;
         let matches: Vec<&Timer> = timers
             .iter()
             .filter(|t| t.id == id_or_prefix || t.id.starts_with(id_or_prefix))
@@ -452,14 +559,14 @@ mod tests {
     fn schedule_new_sets_fire_at_and_unique_seq() {
         let existing = vec![t("tm_1_0", "x", 0, 0, None)];
         let now = 1000;
-        let timer = schedule_new(&existing, 300, "check ci", now, None);
+        let timer = schedule_new(&existing, 300, "check ci", now, None, None);
         assert_eq!(timer.fire_at, 1300);
         assert_eq!(timer.created_at, now);
         assert_eq!(timer.id, "tm_2_1000");
         assert!(timer.prompt.contains("check ci"));
         assert!(timer.claimed_at.is_none());
         // repeat carries through
-        let rep = schedule_new(&existing, 60, "p", now, Some(300));
+        let rep = schedule_new(&existing, 60, "p", now, Some(300), None);
         assert_eq!(rep.repeat_secs, Some(300));
     }
 
@@ -478,7 +585,7 @@ mod tests {
 
     #[test]
     fn schedule_new_saturates_overflow() {
-        let timer = schedule_new(&[], u64::MAX, "p", 1, None);
+        let timer = schedule_new(&[], u64::MAX, "p", 1, None, None);
         assert_eq!(timer.fire_at, u64::MAX);
     }
 
@@ -509,7 +616,7 @@ mod tests {
         timers.retain(|x| x.id != "tm_2_0");
         // Next seq is max(1, 3) + 1 = 4 — NOT len()+1 = 3 (which collides).
         assert_eq!(next_seq(&timers), 4);
-        let new = schedule_new(&timers, 10, "d", 5, None);
+        let new = schedule_new(&timers, 10, "d", 5, None, None);
         assert_eq!(new.id, "tm_4_5");
         assert!(timers.iter().all(|x| x.id != new.id), "no id collision");
     }
@@ -686,5 +793,278 @@ mod tests {
         }
         assert_eq!(drained, 3, "all three one-shots drained on success");
         assert!(timers.is_empty(), "queue empty after successful drain");
+    }
+
+    // ---------- #1747 fix-forward regressions ----------
+    // Each of these FAILED (or asserted the opposite) against 828b846f, where
+    // `claim_token` and `workspace` were declared on `Timer` but never set,
+    // read, or enforced, and every mutation was an unlocked, non-atomic
+    // read-modify-write over a load that turned corruption into an empty queue.
+
+    struct Fixed(u64);
+    impl Clock for Fixed {
+        fn now_secs(&self) -> u64 {
+            self.0
+        }
+    }
+
+    /// Scratch dir unique per test; removed on drop even if the test panics.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!(
+                "newt-timer-{tag}-{}-{}",
+                std::process::id(),
+                new_claim_token()
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).expect("scratch");
+            Self(d)
+        }
+        fn store(&self) -> TimerStore {
+            TimerStore::open(Some(&self.0)).expect("open")
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Regression (#1747): a worker whose claim went stale must NOT be able to
+    /// acknowledge — the timer now belongs to whichever beat re-claimed it.
+    ///
+    /// Before the fix `acknowledge` took no token and checked none, so worker
+    /// A's late success deleted the one-shot that worker B was still
+    /// executing: the wake ran twice and the queue lost the timer mid-flight.
+    #[test]
+    fn stale_worker_cannot_acknowledge_a_reclaimed_timer() {
+        let s = Scratch::new("stale");
+        let store = s.store();
+        store.schedule(0, "wake", &Fixed(1000), None, None).unwrap();
+
+        let a = store.claim_next_due(&Fixed(1000)).unwrap().unwrap();
+        let a_token = a.claim_token.clone().expect("claim mints a token");
+
+        // A hangs past CLAIM_FRESH_SECS; B takes over the now-stale claim.
+        let t2 = 1000 + CLAIM_FRESH_SECS;
+        let b = store.claim_next_due(&Fixed(t2)).unwrap().unwrap();
+        let b_token = b.claim_token.clone().expect("re-claim mints a token");
+        assert_eq!(a.id, b.id, "B re-claimed the same timer");
+        assert_ne!(a_token, b_token, "each claim gets a distinct token");
+
+        // A's late ack is refused, and leaves B's claim untouched.
+        assert_eq!(
+            store
+                .acknowledge(&a.id, &a_token, true, &Fixed(t2 + 1))
+                .unwrap(),
+            AckOutcome::TokenMismatch,
+        );
+        let live = store.list().unwrap();
+        assert_eq!(live.len(), 1, "B's in-flight timer survived A's late ack");
+        assert_eq!(live[0].claim_token.as_deref(), Some(b_token.as_str()));
+
+        // B, the real owner, can still complete the lifecycle.
+        assert_eq!(
+            store
+                .acknowledge(&b.id, &b_token, true, &Fixed(t2 + 2))
+                .unwrap(),
+            AckOutcome::Applied,
+        );
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    /// Regression (#1747): acknowledging an unknown id is distinguishable from
+    /// acknowledging one this worker does not own.
+    #[test]
+    fn acknowledge_reports_not_found_separately_from_token_mismatch() {
+        let s = Scratch::new("notfound");
+        let store = s.store();
+        assert_eq!(
+            store.acknowledge("tm_9_9", "tok", true, &Fixed(1)).unwrap(),
+            AckOutcome::NotFound,
+        );
+        store.schedule(0, "p", &Fixed(1000), None, None).unwrap();
+        let t = store.claim_next_due(&Fixed(1000)).unwrap().unwrap();
+        assert_eq!(
+            store
+                .acknowledge(&t.id, "not-the-token", true, &Fixed(1001))
+                .unwrap(),
+            AckOutcome::TokenMismatch,
+        );
+        // An unclaimed timer cannot be acknowledged by anyone.
+        store
+            .acknowledge(
+                &t.id,
+                t.claim_token.as_deref().unwrap(),
+                false,
+                &Fixed(1002),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .acknowledge(&t.id, "anything", true, &Fixed(1003))
+                .unwrap(),
+            AckOutcome::TokenMismatch,
+            "a released timer is owned by nobody",
+        );
+    }
+
+    /// Regression (#1747): a failed execution releases BOTH the claim stamp and
+    /// the token, so the next beat can genuinely re-claim it.
+    #[test]
+    fn failed_ack_releases_claim_and_token() {
+        let s = Scratch::new("failed");
+        let store = s.store();
+        store.schedule(0, "p", &Fixed(1000), None, None).unwrap();
+        let a = store.claim_next_due(&Fixed(1000)).unwrap().unwrap();
+        let tok = a.claim_token.clone().unwrap();
+        assert_eq!(
+            store.acknowledge(&a.id, &tok, false, &Fixed(1001)).unwrap(),
+            AckOutcome::Applied,
+        );
+        let live = store.list().unwrap();
+        assert_eq!(live[0].fire_at, 1000, "retryable: fire_at unchanged");
+        assert!(live[0].claimed_at.is_none() && live[0].claim_token.is_none());
+        // Immediately re-claimable — not blocked for CLAIM_FRESH_SECS.
+        let b = store.claim_next_due(&Fixed(1002)).unwrap().unwrap();
+        assert_ne!(b.claim_token, Some(tok));
+    }
+
+    /// Regression (#1747): the workspace is captured at schedule time and
+    /// round-trips through persistence, so the firing host does not infer the
+    /// execution directory from the cron process CWD.
+    #[test]
+    fn schedule_captures_and_persists_the_workspace() {
+        let s = Scratch::new("ws");
+        let store = s.store();
+        let ws = PathBuf::from("/srv/project-x");
+        let t = store
+            .schedule(60, "build", &Fixed(1000), None, Some(ws.clone()))
+            .unwrap();
+        assert_eq!(t.workspace.as_ref(), Some(&ws));
+        // Survives a reload (serde round-trip), and survives a repeat advance.
+        assert_eq!(store.list().unwrap()[0].workspace.as_ref(), Some(&ws));
+        let rep = store
+            .schedule(0, "watch", &Fixed(1000), Some(60), Some(ws.clone()))
+            .unwrap();
+        let claimed = store.claim_next_due(&Fixed(2000)).unwrap().unwrap();
+        assert_eq!(claimed.id, rep.id);
+        store
+            .acknowledge(
+                &rep.id,
+                claimed.claim_token.as_deref().unwrap(),
+                true,
+                &Fixed(2000),
+            )
+            .unwrap();
+        let after = store.list().unwrap();
+        let advanced = after.iter().find(|t| t.id == rep.id).expect("re-armed");
+        assert_eq!(
+            advanced.workspace.as_ref(),
+            Some(&ws),
+            "workspace survives re-arm"
+        );
+    }
+
+    /// Regression (#1747): a corrupt queue file must NOT be silently treated as
+    /// empty by a mutating caller. Before the fix, the next `schedule` wrote
+    /// that empty view back — destroying every live timer and resetting the id
+    /// sequence so the new id collided with ids still in use.
+    #[test]
+    fn corrupt_queue_never_destroys_timers_on_write() {
+        let s = Scratch::new("corrupt");
+        let store = s.store();
+        store
+            .schedule(60, "first", &Fixed(1000), None, None)
+            .unwrap();
+        store
+            .schedule(60, "second", &Fixed(1000), None, None)
+            .unwrap();
+
+        std::fs::write(store.path(), b"{ truncated").unwrap();
+
+        let err = store
+            .schedule(60, "third", &Fixed(1000), None, None)
+            .expect_err("a mutation over a corrupt queue must fail loudly");
+        assert!(err.to_string().contains("corrupt"), "{err}");
+
+        // Every other mutating entry point refuses too — none may overwrite.
+        assert!(store.claim_next_due(&Fixed(2000)).is_err());
+        assert!(store
+            .acknowledge("tm_1_1000", "t", true, &Fixed(2000))
+            .is_err());
+        assert!(store.dismiss("tm_1").is_err());
+
+        // The bytes on disk are untouched: the queue is recoverable by hand.
+        assert_eq!(std::fs::read(store.path()).unwrap(), b"{ truncated");
+
+        // Read-only inspection still degrades gracefully rather than blocking.
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    /// Regression (#1747): ids stay unique across a full drain. `next_seq` is
+    /// derived from the max live seq, so a queue that empties and refills in
+    /// the same clock second must not re-mint a live id.
+    #[test]
+    fn ids_stay_unique_across_an_emptying_queue() {
+        let s = Scratch::new("ids");
+        let store = s.store();
+        let a = store.schedule(0, "a", &Fixed(1000), None, None).unwrap();
+        let claimed = store.claim_next_due(&Fixed(1000)).unwrap().unwrap();
+        store
+            .acknowledge(
+                &a.id,
+                claimed.claim_token.as_deref().unwrap(),
+                true,
+                &Fixed(1000),
+            )
+            .unwrap();
+        assert!(store.list().unwrap().is_empty(), "queue drained");
+
+        // Same second, empty store: a fresh id is minted. It is only safe for
+        // it to reuse seq 1 because nothing live holds it.
+        let b = store.schedule(0, "b", &Fixed(1000), None, None).unwrap();
+        let c = store.schedule(0, "c", &Fixed(1000), None, None).unwrap();
+        assert_ne!(b.id, c.id, "concurrent-second schedules never collide");
+        assert_eq!(store.list().unwrap().len(), 2);
+        // And a prefix dismiss stays unambiguous.
+        assert!(store.dismiss(&c.id).unwrap());
+    }
+
+    /// Regression (#1747): two beats racing to claim the SAME due timer must
+    /// hand it to exactly one worker. The queue mutation is lock-guarded, so
+    /// the loser sees nothing claimable rather than a duplicate wake.
+    #[test]
+    fn concurrent_beats_never_hand_one_timer_to_two_workers() {
+        let s = Scratch::new("race");
+        let dir = s.0.clone();
+        {
+            let store = s.store();
+            store
+                .schedule(0, "only-once", &Fixed(1000), None, None)
+                .unwrap();
+        }
+        let winners = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let dir = dir.clone();
+            let winners = std::sync::Arc::clone(&winners);
+            handles.push(std::thread::spawn(move || {
+                let store = TimerStore::open(Some(&dir)).unwrap();
+                if let Ok(Some(t)) = store.claim_next_due(&Fixed(1000)) {
+                    winners.lock().unwrap().push(t.claim_token.unwrap());
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let winners = winners.lock().unwrap();
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one beat may claim a due timer, got {winners:?}"
+        );
     }
 }
