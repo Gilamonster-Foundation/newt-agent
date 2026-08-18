@@ -1087,6 +1087,104 @@ struct ResolvedOrigin {
 
 const DNS_RESOLUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Maximum DNS resolutions that may be in flight across the whole process.
+///
+/// Security invariant: **DNS resolution has a bounded number of outstanding
+/// workers.** The platform resolver (`getaddrinfo`) is not cancellable, so a
+/// lookup that outlives its caller's deadline keeps its OS thread parked until
+/// the resolver finally returns. Joining that thread after the deadline would
+/// destroy the caller's deadline, so the *population* of such threads is capped
+/// instead: a caller still gives up exactly on time, but the work it walked
+/// away from stays counted, and no caller may push the process past this cap.
+/// Thirty-two is well above the handful of concurrent hops real MCP discovery
+/// needs, while keeping the worst case a small constant rather than "one thread
+/// per timed-out request, forever".
+const MAX_OUTSTANDING_DNS_WORKERS: usize = 32;
+
+/// Counts DNS resolver workers that have been started and have not yet
+/// returned — including workers whose caller already timed out and walked away.
+#[derive(Debug)]
+struct DnsWorkerPool {
+    capacity: usize,
+    outstanding: std::sync::Mutex<usize>,
+    released: std::sync::Condvar,
+}
+
+impl DnsWorkerPool {
+    const fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            outstanding: std::sync::Mutex::new(0),
+            released: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Reserve one worker slot, waiting at most `wait` for a parked worker to
+    /// finish. Returns `None` when capacity never frees up in that window; the
+    /// count never exceeds `capacity`, so a caller is never handed an
+    /// uncounted fallback worker. `wait` is drawn from the caller's own
+    /// deadline, so queueing here can never extend it.
+    fn acquire_within(
+        self: &std::sync::Arc<Self>,
+        wait: std::time::Duration,
+    ) -> Option<DnsWorkerPermit> {
+        let deadline = std::time::Instant::now() + wait;
+        let mut outstanding = self
+            .outstanding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if *outstanding < self.capacity {
+                *outstanding += 1;
+                return Some(DnsWorkerPermit {
+                    pool: std::sync::Arc::clone(self),
+                });
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let (guard, _) = self
+                .released
+                .wait_timeout(outstanding, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            outstanding = guard;
+        }
+    }
+
+    #[cfg(test)]
+    fn outstanding(&self) -> usize {
+        *self
+            .outstanding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Held by a running resolver worker and released by that worker when the
+/// platform resolver actually returns — never by a caller that timed out.
+struct DnsWorkerPermit {
+    pool: std::sync::Arc<DnsWorkerPool>,
+}
+
+impl Drop for DnsWorkerPermit {
+    fn drop(&mut self) {
+        let mut outstanding = self
+            .pool
+            .outstanding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *outstanding = outstanding.saturating_sub(1);
+        drop(outstanding);
+        self.pool.released.notify_one();
+    }
+}
+
+static DNS_WORKERS: std::sync::LazyLock<std::sync::Arc<DnsWorkerPool>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Arc::new(DnsWorkerPool::new(MAX_OUTSTANDING_DNS_WORKERS))
+    });
+
 fn system_resolver(host: &str, port: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
     resolve_with_timeout(host, port, DNS_RESOLUTION_TIMEOUT, move |host, port| {
         use std::net::ToSocketAddrs as _;
@@ -1102,15 +1200,40 @@ fn resolve_with_timeout(
     timeout: std::time::Duration,
     resolver: impl FnOnce(String, u16) -> std::io::Result<Vec<std::net::SocketAddr>> + Send + 'static,
 ) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    resolve_with_timeout_in(&DNS_WORKERS, host, port, timeout, resolver)
+}
+
+fn resolve_with_timeout_in(
+    pool: &std::sync::Arc<DnsWorkerPool>,
+    host: &str,
+    port: u16,
+    timeout: std::time::Duration,
+    resolver: impl FnOnce(String, u16) -> std::io::Result<Vec<std::net::SocketAddr>> + Send + 'static,
+) -> std::io::Result<Vec<std::net::SocketAddr>> {
     let host = host.to_string();
+    let started = std::time::Instant::now();
+    // Fail closed. When every slot is still held by a lookup that outlived its
+    // caller, refuse this resolution rather than spawning an uncounted worker:
+    // an unbounded fallback is exactly the thread-accumulation hole the cap
+    // exists to close. Waiting for a slot is charged against `timeout`, so the
+    // caller's deadline is spent, never extended.
+    let Some(permit) = pool.acquire_within(timeout) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "MCP DNS resolver capacity exhausted",
+        ));
+    };
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("newt-mcp-dns".to_string())
         .spawn(move || {
             let _ = sender.send(resolver(host, port));
+            // Released here, when the platform resolver returned — the caller's
+            // deadline below is never extended to wait for this.
+            drop(permit);
         })
         .map_err(|error| std::io::Error::other(format!("starting DNS resolver: {error}")))?;
-    match receiver.recv_timeout(timeout) {
+    match receiver.recv_timeout(timeout.saturating_sub(started.elapsed())) {
         Ok(result) => result,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -2773,6 +2896,177 @@ mod tests {
         )
         .expect_err("a stalled resolver must time out");
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// A resolver that parks until the test opens it, standing in for a
+    /// `getaddrinfo` call that outlives its caller and cannot be cancelled.
+    #[derive(Default)]
+    struct StalledResolverGate {
+        open: std::sync::Mutex<bool>,
+        opened: std::sync::Condvar,
+    }
+
+    impl StalledResolverGate {
+        fn wait(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+        }
+
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+    }
+
+    #[test]
+    fn dns_timeout_returns_on_the_caller_deadline_not_the_resolver() {
+        let pool = std::sync::Arc::new(DnsWorkerPool::new(2));
+        let gate = std::sync::Arc::new(StalledResolverGate::default());
+        let worker_gate = std::sync::Arc::clone(&gate);
+        let start = std::time::Instant::now();
+        let error = resolve_with_timeout_in(
+            &pool,
+            "stalled.example",
+            443,
+            Duration::from_millis(20),
+            move |_host, _port| {
+                worker_gate.wait();
+                Ok(Vec::new())
+            },
+        )
+        .expect_err("a resolver that never returns must not block the caller");
+        let elapsed = start.elapsed();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        // The fix must not be "join the stuck worker after the deadline".
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the caller waited {elapsed:?} on a resolver that never returned"
+        );
+        gate.open();
+    }
+
+    #[test]
+    fn dns_resolver_capacity_is_bounded_and_exhaustion_fails_closed() {
+        let pool = std::sync::Arc::new(DnsWorkerPool::new(2));
+        let gate = std::sync::Arc::new(StalledResolverGate::default());
+        let (started, worker_started) = std::sync::mpsc::channel();
+
+        for _ in 0..2 {
+            let worker_gate = std::sync::Arc::clone(&gate);
+            let started = started.clone();
+            let error = resolve_with_timeout_in(
+                &pool,
+                "stalled.example",
+                443,
+                Duration::from_millis(5),
+                move |_host, _port| {
+                    let _ = started.send(());
+                    worker_gate.wait();
+                    Ok(Vec::new())
+                },
+            )
+            .expect_err("a stalled resolver must time out");
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        }
+        for _ in 0..2 {
+            worker_started
+                .recv_timeout(Duration::from_secs(5))
+                .expect("both workers must reach the resolver");
+        }
+        assert_eq!(
+            pool.outstanding(),
+            2,
+            "both slots stay charged after timeout"
+        );
+
+        // Fail closed: no uncounted fallback worker for the third caller, and
+        // the wait for a slot is charged against that caller's own deadline.
+        let refusal_started = std::time::Instant::now();
+        let refused = resolve_with_timeout_in(
+            &pool,
+            "third.example",
+            443,
+            Duration::from_millis(50),
+            |_host, _port| -> std::io::Result<Vec<std::net::SocketAddr>> {
+                unreachable!("capacity exhaustion must not start another resolver")
+            },
+        )
+        .expect_err("resolver capacity exhaustion must fail closed");
+        let refusal_elapsed = refusal_started.elapsed();
+        assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            refusal_elapsed < Duration::from_secs(2),
+            "queueing for a slot waited {refusal_elapsed:?}, past the caller deadline"
+        );
+        assert_eq!(pool.outstanding(), 2, "a refusal must not charge a slot");
+
+        gate.open();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while pool.outstanding() > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            pool.outstanding(),
+            0,
+            "slots are released by the worker once the resolver returns"
+        );
+        let resolved = resolve_with_timeout_in(
+            &pool,
+            "recovered.example",
+            443,
+            Duration::from_secs(5),
+            |_host, _port| Ok(vec!["93.184.216.34:443".parse().unwrap()]),
+        )
+        .expect("capacity must be reusable once workers finish");
+        assert_eq!(resolved.len(), 1);
+    }
+
+    #[test]
+    fn repeated_dns_timeouts_do_not_accumulate_unbounded_workers() {
+        const CAPACITY: usize = 3;
+        const ATTEMPTS: usize = 64;
+        let pool = std::sync::Arc::new(DnsWorkerPool::new(CAPACITY));
+        let gate = std::sync::Arc::new(StalledResolverGate::default());
+        let mut timed_out = 0usize;
+        let mut refused = 0usize;
+
+        for attempt in 0..ATTEMPTS {
+            let worker_gate = std::sync::Arc::clone(&gate);
+            let error = resolve_with_timeout_in(
+                &pool,
+                "stalled.example",
+                443,
+                Duration::from_millis(2),
+                move |_host, _port| {
+                    worker_gate.wait();
+                    Ok(Vec::new())
+                },
+            )
+            .expect_err("a stalled resolver must never succeed");
+            match error.kind() {
+                std::io::ErrorKind::TimedOut => timed_out += 1,
+                std::io::ErrorKind::WouldBlock => refused += 1,
+                other => panic!("attempt {attempt} produced unexpected error kind {other:?}"),
+            }
+            assert!(
+                pool.outstanding() <= CAPACITY,
+                "attempt {attempt} left {} workers outstanding, above the {CAPACITY} cap",
+                pool.outstanding()
+            );
+        }
+
+        assert_eq!(
+            timed_out, CAPACITY,
+            "only capacity-many workers ever started"
+        );
+        assert_eq!(
+            refused,
+            ATTEMPTS - CAPACITY,
+            "every later resolution is refused instead of spawning a worker"
+        );
+        gate.open();
     }
 
     #[test]
