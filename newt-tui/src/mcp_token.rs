@@ -172,6 +172,76 @@ struct TokenResponse {
 
 const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// Ceiling on the `authorization_servers` a protected resource may advertise.
+///
+/// RFC 9728 puts no bound on that array, so a hostile or compromised protected
+/// resource could list thousands of issuers and make one authentication
+/// recovery fan out into an arbitrarily large number of outbound discovery
+/// attempts. An over-long list is **rejected**, never truncated: truncating
+/// would silently change which authorization servers the resource asked for,
+/// and quietly picking a subset of an attacker-chosen list is not a safe
+/// default. Real deployments advertise one issuer, occasionally two; four
+/// leaves failover headroom while keeping the fan-out a small constant.
+const MAX_ADVERTISED_AUTHORIZATION_SERVERS: usize = 4;
+
+/// Wall-clock allowance for one whole OAuth discovery operation.
+///
+/// Security invariant: **one authentication-recovery operation performs a
+/// bounded amount of external discovery work.** Per-request timeouts alone do
+/// not give that — N candidate issuers that each stall multiply into N times
+/// the per-request timeout. Every hop of a discovery draws from this single
+/// budget instead, so the total is bounded no matter how many candidates fail
+/// or stall, and exhaustion fails closed. Ninety seconds is many times a
+/// healthy discovery (a few sub-second requests) yet well inside the
+/// interactive patience of an operator waiting to re-authenticate.
+const OAUTH_DISCOVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The shared deadline every hop of one discovery operation draws from.
+struct DiscoveryBudget {
+    deadline: std::time::Instant,
+}
+
+impl DiscoveryBudget {
+    fn new(total: std::time::Duration) -> Self {
+        Self {
+            deadline: std::time::Instant::now() + total,
+        }
+    }
+
+    fn remaining(&self) -> std::time::Duration {
+        self.deadline
+            .saturating_duration_since(std::time::Instant::now())
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.remaining().is_zero()
+    }
+
+    /// Run one discovery hop against whatever is left of the budget. A hop that
+    /// would outlive the budget is dropped — cancelled, not awaited — so the
+    /// aggregate operation cannot be extended by a stalling candidate.
+    async fn bound<T>(
+        &self,
+        what: &str,
+        hop: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        let remaining = self.remaining();
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "OAuth discovery budget of {}s exhausted before {what}",
+                OAUTH_DISCOVERY_BUDGET.as_secs()
+            );
+        }
+        match tokio::time::timeout(remaining, hop).await {
+            Ok(result) => result,
+            Err(_) => anyhow::bail!(
+                "OAuth discovery budget of {}s exhausted during {what}",
+                OAUTH_DISCOVERY_BUDGET.as_secs()
+            ),
+        }
+    }
+}
+
 async fn bounded_response_body(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
     if response
         .content_length()
@@ -2312,6 +2382,12 @@ async fn fetch_protected_resource_meta(
         if metadata.authorization_servers.is_empty() {
             anyhow::bail!("protected resource metadata has no authorization_servers");
         }
+        if metadata.authorization_servers.len() > MAX_ADVERTISED_AUTHORIZATION_SERVERS {
+            anyhow::bail!(
+                "protected resource metadata advertises {} authorization servers, above the limit of {MAX_ADVERTISED_AUTHORIZATION_SERVERS}",
+                metadata.authorization_servers.len()
+            );
+        }
         if metadata
             .scopes_supported
             .iter()
@@ -2442,6 +2518,25 @@ async fn discover_oauth_meta_with_policy(
     .await
 }
 
+/// As [`discover_oauth_meta_with_policy`], with the aggregate discovery budget
+/// supplied by the caller so exhaustion can be exercised deterministically.
+#[cfg(test)]
+async fn discover_oauth_meta_within_budget(
+    server_url: &str,
+    allow_test_loopback_http: bool,
+    budget: &DiscoveryBudget,
+) -> anyhow::Result<DiscoveredOAuthMeta> {
+    discover_oauth_meta_within_budget_for_client(
+        server_url,
+        allow_test_loopback_http,
+        None,
+        false,
+        &OAuthHopPolicy::new(&newt_core::Scope::All),
+        budget,
+    )
+    .await
+}
+
 async fn discover_oauth_meta_for_client_with_policy(
     server_url: &str,
     allow_test_loopback_http: bool,
@@ -2449,10 +2544,33 @@ async fn discover_oauth_meta_for_client_with_policy(
     allow_re_registration: bool,
     policy: &OAuthHopPolicy,
 ) -> anyhow::Result<DiscoveredOAuthMeta> {
+    discover_oauth_meta_within_budget_for_client(
+        server_url,
+        allow_test_loopback_http,
+        client,
+        allow_re_registration,
+        policy,
+        &DiscoveryBudget::new(OAUTH_DISCOVERY_BUDGET),
+    )
+    .await
+}
+
+async fn discover_oauth_meta_within_budget_for_client(
+    server_url: &str,
+    allow_test_loopback_http: bool,
+    client: Option<&ClientFile>,
+    allow_re_registration: bool,
+    policy: &OAuthHopPolicy,
+    budget: &DiscoveryBudget,
+) -> anyhow::Result<DiscoveredOAuthMeta> {
     let resource = validate_resource_url(server_url, allow_test_loopback_http)?;
     let canonical_resource = canonical_resource_identifier(server_url, &resource);
-    let (protected, challenge_scope) =
-        fetch_protected_resource_meta(server_url, allow_test_loopback_http, policy).await?;
+    let (protected, challenge_scope) = budget
+        .bound(
+            "protected resource metadata discovery",
+            fetch_protected_resource_meta(server_url, allow_test_loopback_http, policy),
+        )
+        .await?;
     let protected = protected.ok_or_else(|| {
         anyhow::anyhow!("MCP protected resource did not publish required RFC 9728 metadata")
     })?;
@@ -2467,7 +2585,20 @@ async fn discover_oauth_meta_for_client_with_policy(
     let mut errors = Vec::new();
     let mut selected = None;
     for issuer in issuers {
-        match fetch_authorization_server_meta(&issuer, allow_test_loopback_http, policy).await {
+        if budget.is_exhausted() {
+            errors.push(format!(
+                "{issuer}: OAuth discovery budget of {}s exhausted before this candidate",
+                OAUTH_DISCOVERY_BUDGET.as_secs()
+            ));
+            break;
+        }
+        let attempt = budget
+            .bound(
+                &format!("authorization server discovery for `{issuer}`"),
+                fetch_authorization_server_meta(&issuer, allow_test_loopback_http, policy),
+            )
+            .await;
+        match attempt {
             Ok(metadata)
                 if client.is_some_and(client_is_portable_cimd)
                     && !metadata_supports_cimd(&metadata.extra)
@@ -4468,6 +4599,173 @@ mod tests {
         assert_eq!(discovered.issuer, usable_issuer);
         unusable_server.verify().await;
         usable_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn excessive_advertised_authorization_servers_are_rejected() {
+        let resource_server = MockServer::start().await;
+        let issuer_server = MockServer::start().await;
+        let resource = format!("{}/mcp", resource_server.uri());
+        let issuers: Vec<String> = (0..=MAX_ADVERTISED_AUTHORIZATION_SERVERS)
+            .map(|index| format!("{}/tenant/{index}", issuer_server.uri()))
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&resource_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/oauth-protected-resource/mcp"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "resource": resource,
+                "authorization_servers": issuers
+            })))
+            .mount(&resource_server)
+            .await;
+
+        let error = discover_oauth_meta_with_policy(&resource, true)
+            .await
+            .expect_err("an over-long authorization_servers list must be refused");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("above the limit"),
+            "unexpected error: {rendered}"
+        );
+        // Rejected, not truncated: not one candidate is contacted.
+        assert!(
+            issuer_server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .is_empty(),
+            "an over-long list must not produce any issuer discovery traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_walks_every_failing_candidate_up_to_the_limit() {
+        let resource_server = MockServer::start().await;
+        let failing_server = MockServer::start().await;
+        let usable_server = MockServer::start().await;
+        let resource = format!("{}/mcp", resource_server.uri());
+        let usable_issuer = usable_server.uri();
+        let mut issuers: Vec<String> = (0..MAX_ADVERTISED_AUTHORIZATION_SERVERS - 1)
+            .map(|index| format!("{}/tenant/{index}", failing_server.uri()))
+            .collect();
+        issuers.push(usable_issuer.clone());
+        assert_eq!(issuers.len(), MAX_ADVERTISED_AUTHORIZATION_SERVERS);
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&resource_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/oauth-protected-resource/mcp"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "resource": resource,
+                "authorization_servers": issuers
+            })))
+            .mount(&resource_server)
+            .await;
+        // `failing_server` has no matching mocks, so every metadata URL 404s.
+        Mock::given(method("GET"))
+            .and(path("/.well-known/oauth-authorization-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": usable_issuer,
+                "authorization_endpoint": format!("{}/authorize", usable_server.uri()),
+                "token_endpoint": format!("{}/token", usable_server.uri()),
+                "code_challenge_methods_supported": ["S256"]
+            })))
+            .expect(1)
+            .mount(&usable_server)
+            .await;
+
+        // A full-width advertised set is still honoured end to end: the bound
+        // rejects excess, it does not narrow legitimate failover.
+        let discovered = discover_oauth_meta_with_policy(&resource, true)
+            .await
+            .expect("the last candidate must still be reached");
+        assert_eq!(discovered.issuer, usable_issuer);
+        usable_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn stalling_issuer_candidates_cannot_outlive_the_discovery_budget() {
+        let resource_server = MockServer::start().await;
+        let first_server = MockServer::start().await;
+        let second_server = MockServer::start().await;
+        let resource = format!("{}/mcp", resource_server.uri());
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&resource_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/oauth-protected-resource/mcp"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "resource": resource,
+                "authorization_servers": [first_server.uri(), second_server.uri()]
+            })))
+            .mount(&resource_server)
+            .await;
+        for server in [&first_server, &second_server] {
+            Mock::given(method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(std::time::Duration::from_secs(60))
+                        .set_body_json(serde_json::json!({})),
+                )
+                .mount(server)
+                .await;
+        }
+
+        let budget = DiscoveryBudget::new(std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let error = discover_oauth_meta_within_budget(&resource, true, &budget)
+            .await
+            .expect_err("stalling candidates must not stall discovery forever");
+        let elapsed = started.elapsed();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("budget"), "unexpected error: {rendered}");
+        // Aggregate, not per-request: the second candidate never gets its own
+        // fresh timeout once the shared budget is gone.
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "discovery ran {elapsed:?}, far past its 300ms budget"
+        );
+        assert!(
+            second_server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .is_empty(),
+            "an exhausted budget must not fund another candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_discovery_budget_fails_closed_before_any_hop() {
+        let resource_server = MockServer::start().await;
+        let resource = format!("{}/mcp", resource_server.uri());
+        let budget = DiscoveryBudget::new(std::time::Duration::ZERO);
+        assert!(budget.is_exhausted());
+
+        let error = discover_oauth_meta_within_budget(&resource, true, &budget)
+            .await
+            .expect_err("an exhausted budget must fail closed");
+        assert!(
+            format!("{error:#}").contains("budget"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            resource_server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .is_empty(),
+            "no external work may start once the budget is gone"
+        );
     }
 
     #[tokio::test]
