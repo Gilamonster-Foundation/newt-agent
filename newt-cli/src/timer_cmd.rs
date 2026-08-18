@@ -271,13 +271,23 @@ mod tests {
             );
         }
         // A non-zero repeat parses and reaches the store layer (which fails on
-        // a non-existent dir here), proving the rejection above is zero-specific.
+        // a path where a file blocks directory creation — cross-platform; no
+        // platform-specific magic paths).
+        let blocker = std::env::temp_dir().join(format!(
+            "newt-test-block-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        ));
+        std::fs::write(&blocker, "x").unwrap();
         let cmd = TimerCmd::Schedule {
             duration: "5m".into(),
             prompt: "p".into(),
             every: Some("60".into()),
-            dir: Some(PathBuf::from("/dev/null/not-a-dir")),
+            dir: Some(blocker.join("sub")),
         };
         assert!(run(cmd, None).await.is_err());
+        let _ = std::fs::remove_file(&blocker);
     }
 }
