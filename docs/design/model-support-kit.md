@@ -78,7 +78,7 @@ itself is the kit's, not the model's.
   family — never because it exists. The sweep is the discipline that tames the
   combinatorial blow-up.
 - **Harness-layer only, additive, behind the profile** — no chat-surface change
-  ([`plain_scroller_tui.md`](decisions/plain_scroller_tui.md)); absent a profile = today's behavior.
+  ([`plain_scroller_tui.md`](../decisions/plain_scroller_tui.md)); absent a profile = today's behavior.
 
 ## Architecture (design-panel validated, 2026-06-15)
 

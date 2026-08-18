@@ -185,11 +185,22 @@ check:
     # ownership underneath them.
     cargo test -p newt-agent --no-default-features || rc=1
     cargo test -p newt-tui || rc=1
+    # Cheap (~0.1s) and catches the class readme-check cannot see: a dead link
+    # between two docs, or source citing a document that no longer exists.
+    python3 scripts/docs_check.py --self-test >/dev/null || rc=1
+    python3 scripts/docs_check.py --quiet || rc=1
     exit $rc
 
 [windows]
 check:
-    $rc = 0; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace --features newt-data/kernel; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy -p newt-agent --no-default-features --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-agent --no-default-features; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-tui; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
+    $rc = 0; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace --features newt-data/kernel; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy -p newt-agent --no-default-features --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-agent --no-default-features; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-tui; if ($LASTEXITCODE -ne 0) { $rc = 1 }; python3 scripts/docs_check.py --self-test; if ($LASTEXITCODE -ne 0) { $rc = 1 }; python3 scripts/docs_check.py --quiet; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
+
+# Documentation reference check: every relative link under docs/ resolves, and
+# every docs/....md path cited from a Rust comment exists. Runs inside `just
+# check` and in CI; this recipe is the verbose form for working on the corpus.
+docs-check:
+    python3 scripts/docs_check.py --self-test
+    python3 scripts/docs_check.py
 
 # README staleness lint (#1023): the README states invariants and links to
 # live sources of truth — it must never carry operator-local paths, cluster

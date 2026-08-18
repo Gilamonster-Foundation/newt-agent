@@ -60,6 +60,15 @@ jobs:
       - name: process-spawn inventory (no unreviewed subprocess)
         if: always()
         run: python3 scripts/spawn_inventory.py
+      # Documentation references (#1023 follow-up). Source cites docs heavily
+      # and nothing verified those paths; readme-check only covers README.md.
+      # HOOK PARITY: mirrored by .githooks/pre-push via `just check`.
+      # When editing this step, update the hook's parity block to match.
+      - name: documentation references resolve (docs-check)
+        if: always()
+        run: |
+          python3 scripts/docs_check.py --self-test
+          python3 scripts/docs_check.py
 
   test:
     name: Rust tests

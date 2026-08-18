@@ -17,6 +17,11 @@
 #     lean surface's own suite: newt-tui declares no `default` features, so
 #     testing it package-alone strips rich-tui + live-spill, which the
 #     workspace build always unifies back on.)
+#   - `just check` also runs `scripts/docs_check.py --self-test` and the
+#     check itself, matching the "documentation references resolve
+#     (docs-check)" step in the lint job: every relative markdown link (repo
+#     root + docs/**) resolves, and every `docs/....md` cited from a Rust
+#     comment exists. Cheap (~0.1s); the self-test guards the scanner itself.
 #   - `just cov-ci` matches the coverage job (cargo llvm-cov with floor)
 #   - `just audit` matches the "Security audit" job (cargo audit against the
 #     tracked ignore-list in .cargo/audit.toml; local best-effort if cargo-audit
