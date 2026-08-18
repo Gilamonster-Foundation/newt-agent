@@ -130,11 +130,14 @@ worth stating so nobody builds the old plan later:
   **Esc belongs to vi**, a deliberate change from the watcher's lone-Esc
   cancel.
 
-Found on the way and fixed at the source: the modal's raw-mode guard relied
-on crossterm's process-global "prior mode" static, which makes a second
-`enable_raw_mode` a no-op — so under any other raw-mode owner the modal ran
-canonical+echo (keys buffered until Enter, kernel echo over the editor). It
-now saves and restores the exact termios itself (`tty/modal.rs`).
+Found on the way, and **fixed separately in #1770** rather than here: the
+modal's raw-mode guard relied on crossterm's process-global "prior mode"
+static, which makes a second `enable_raw_mode` a no-op — so under any other
+raw-mode owner the modal ran canonical+echo (keys buffered until Enter, kernel
+echo over the editor). It now saves and restores the exact termios itself
+(`tty/modal.rs`). The cockpit is simply the first component in the tree that
+owns raw mode while a modal opens; the repair is `newt-core`-only and stands
+on its own, so it landed ahead of this change instead of inside it.
 
 Not in this slice: mid-turn *submission into the running turn* — a submit
 during a turn is queued for the next `ReadLine` and shown as a `queued` chip;
