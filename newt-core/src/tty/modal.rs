@@ -15,10 +15,60 @@ pub enum PromptLine {
     Eof,
 }
 
-struct RawGuard;
+/// Raw mode for the modal's read, restored to EXACTLY what it was on drop.
+///
+/// Not `crossterm::terminal::enable_raw_mode`, and the difference is the
+/// bug: crossterm keeps ONE process-global "mode prior to raw" and makes a
+/// second `enable_raw_mode` a no-op while it is set. Under the cockpit
+/// (#1669) the terminal thread already owns raw mode for the whole session,
+/// so the modal's request did nothing — and `StdinToken::acquire` had just
+/// switched the tty to canonical+echo for the line-reader path. Result: keys
+/// line-buffered until Enter, echoed by the kernel over the editor row, and a
+/// prompt that looked hung. Saving and restoring the termios here, the way
+/// `StdinToken` does for line mode, makes nested ownership simply compose.
+struct RawGuard {
+    #[cfg(unix)]
+    prev: Option<libc::termios>,
+}
+
+impl RawGuard {
+    fn enter() -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            // SAFETY: termios round-trip on stdin, restored on drop.
+            let prev = unsafe {
+                let fd = libc::STDIN_FILENO;
+                let mut prev: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(fd, &mut prev) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let mut raw = prev;
+                libc::cfmakeraw(&mut raw);
+                if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                prev
+            };
+            Ok(Self { prev: Some(prev) })
+        }
+        #[cfg(not(unix))]
+        {
+            crossterm::terminal::enable_raw_mode()?;
+            Ok(Self {})
+        }
+    }
+}
 
 impl Drop for RawGuard {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(prev) = self.prev.take() {
+            // SAFETY: restoring the termios captured in `enter`.
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &prev);
+            }
+        }
+        #[cfg(not(unix))]
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
@@ -90,13 +140,18 @@ pub trait ControlReader {
     fn poll(&mut self, timeout: Duration) -> io::Result<Option<PromptLine>>;
 }
 
-pub struct PromptControlReader<'w>(RawGuard, PhantomData<&'w PromptWindow>);
+/// Holds raw mode for as long as the reader lives — the guard is here for
+/// its `Drop`, which is the whole point of owning it.
+pub struct PromptControlReader<'w> {
+    _raw: RawGuard,
+    _window: PhantomData<&'w PromptWindow>,
+}
 
 pub fn modal_prompt_controls<'w>(window: &'w PromptWindow) -> io::Result<PromptControlReader<'w>> {
-    Ok(PromptControlReader(
-        take_modal_ownership(window)?,
-        PhantomData,
-    ))
+    Ok(PromptControlReader {
+        _raw: take_modal_ownership(window)?,
+        _window: PhantomData,
+    })
 }
 
 impl ControlReader for PromptControlReader<'_> {
@@ -143,6 +198,115 @@ fn take_modal_ownership(_window: &PromptWindow) -> io::Result<RawGuard> {
             "terminal required",
         ));
     }
-    crossterm::terminal::enable_raw_mode()?;
-    Ok(RawGuard)
+    RawGuard::enter()
+}
+
+#[cfg(all(test, unix))]
+mod raw_guard_tests {
+    use super::RawGuard;
+
+    /// stdin as a real pty for the duration of a test: `RawGuard` operates on
+    /// `STDIN_FILENO`, and only a terminal has termios. Restores fd 0 on drop.
+    struct StdinPty {
+        saved: libc::c_int,
+        master: libc::c_int,
+    }
+
+    impl StdinPty {
+        fn install() -> Self {
+            // SAFETY: openpty + dup2 on descriptors this test owns; restored
+            // in Drop.
+            unsafe {
+                let (mut master, mut slave) = (-1, -1);
+                assert_eq!(
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        std::ptr::null()
+                    ),
+                    0
+                );
+                let saved = libc::dup(0);
+                assert!(libc::dup2(slave, 0) >= 0);
+                libc::close(slave);
+                Self { saved, master }
+            }
+        }
+        fn lflag() -> libc::tcflag_t {
+            // SAFETY: tcgetattr into a zeroed termios.
+            unsafe {
+                let mut t: libc::termios = std::mem::zeroed();
+                assert_eq!(libc::tcgetattr(0, &mut t), 0);
+                t.c_lflag
+            }
+        }
+        fn set_canonical_echo(on: bool) {
+            // SAFETY: termios round-trip on fd 0 (our pty slave).
+            unsafe {
+                let mut t: libc::termios = std::mem::zeroed();
+                assert_eq!(libc::tcgetattr(0, &mut t), 0);
+                if on {
+                    t.c_lflag |= libc::ICANON | libc::ECHO;
+                } else {
+                    t.c_lflag &= !(libc::ICANON | libc::ECHO);
+                }
+                assert_eq!(libc::tcsetattr(0, libc::TCSANOW, &t), 0);
+            }
+        }
+    }
+
+    impl Drop for StdinPty {
+        fn drop(&mut self) {
+            // SAFETY: putting fd 0 back and closing what we opened.
+            unsafe {
+                libc::dup2(self.saved, 0);
+                libc::close(self.saved);
+                libc::close(self.master);
+            }
+        }
+    }
+
+    /// The bug (#1669 cockpit): with crossterm's process-global raw-mode
+    /// state already set by another owner, `enable_raw_mode` is a no-op, so a
+    /// modal opened over a canonical+echo tty stayed canonical — keys buffered
+    /// until Enter and echoed by the kernel over the editor. The guard must
+    /// take raw mode by ITSELF, whatever crossterm believes.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn the_guard_takes_raw_mode_regardless_of_crossterms_global_state() {
+        let _stdin = StdinPty::install();
+        StdinPty::set_canonical_echo(true);
+        // Simulate the cockpit: crossterm already thinks raw mode is on.
+        let _ = crossterm::terminal::enable_raw_mode();
+        // …but the tty is canonical+echo (the line-reader path just set it).
+        StdinPty::set_canonical_echo(true);
+        assert!(
+            StdinPty::lflag() & libc::ICANON != 0,
+            "precondition: canonical"
+        );
+        {
+            let _guard = RawGuard::enter().expect("raw");
+            let l = StdinPty::lflag();
+            assert_eq!(
+                l & libc::ICANON,
+                0,
+                "the modal's read must be non-canonical"
+            );
+            assert_eq!(
+                l & libc::ECHO,
+                0,
+                "the kernel must not echo over the editor"
+            );
+        }
+        // Restored to EXACTLY the prior state — canonical+echo, which the
+        // enclosing `StdinToken` then restores in turn.
+        let l = StdinPty::lflag();
+        assert!(
+            l & libc::ICANON != 0 && l & libc::ECHO != 0,
+            "prior mode restored on drop"
+        );
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
 }
