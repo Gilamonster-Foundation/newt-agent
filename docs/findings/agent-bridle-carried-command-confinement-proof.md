@@ -7,14 +7,15 @@
 implementation status added 2026-07-24
 
 > [!IMPORTANT]
-> Sections 1–12 preserve the threat model, proposed architecture, unchecked
-> acceptance list, and source notes as they were written against the
-> 2026-07-23 pre-remediation implementation. In those sections, “currently,”
-> “urgent,” “expected current result,” and unchecked `[ ]` boxes describe that
-> historical baseline. They are not claims about Agent Bridle 0.7.14 and are
-> not a current release checklist. The status immediately below records the
+> The executive decision and security theorem below were written against the
+> 2026-07-23 pre-remediation implementation and are preserved as written. Where
+> they say “currently” or describe a gap as open, they describe that historical
+> baseline — they are not claims about Agent Bridle 0.7.14 and are not a
+> current release checklist. The status immediately below records the
 > implemented and verified 0.7.14 boundary without rewriting the original proof
-> input after the fact.
+> input after the fact. The threat model, proposed architecture, unchecked
+> acceptance list, and source notes that stood in the retired sections are in
+> git history before the 2026-08-18 condensation.
 
 
 ## Agent Bridle 0.7.14 post-fix status
@@ -88,7 +89,7 @@ It does **not** prove complete Linux program-identity confinement for `exec`. Ag
 ---
 
 
-## 2. Security theorem
+## Security theorem
 
 Let:
 
@@ -116,9 +117,6 @@ This includes operations performed:
 - through path traversal, symlinks, hard links, `/proc/self/fd`, or shell redirection.
 
 The claim is valid only under the explicit assumptions in the next section.
-
----
-
 
 ---
 
