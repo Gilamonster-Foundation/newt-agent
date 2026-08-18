@@ -26,6 +26,15 @@ fn worker(home: &tempfile::TempDir) -> Command {
         .env_remove("NEWT_OPERATOR_KEY")
         .env_remove("NEWT_METRICS_PORT")
         .env_remove("NEWT_CODER")
+        // Isolate the worker from the operator's backend/provider selectors so
+        // it starts against the tempdir HOME (which has no [[backends]]
+        // defining them) rather than inheriting e.g. NEWT_PROVIDER=ollama-cloud
+        // from the shell — that leak made the worker fail with "selected
+        // backend '…' is not defined" on a developer's machine.
+        .env_remove("NEWT_PROVIDER")
+        .env_remove("NEWT_TEAM")
+        .env_remove("NEWT_CONFIG")
+        .env_remove("NEWT_BACKEND")
         .arg("worker")
         .write_stdin(INIT_LINE)
         .timeout(Duration::from_secs(30));
@@ -184,6 +193,14 @@ fn worker_metrics_server_serves_healthz_and_metrics() {
         .env("RUST_LOG", "info")
         .env("NEWT_METRICS_PORT", port.to_string())
         .env_remove("NEWT_OPERATOR_KEY")
+        // Same selector isolation as the `worker()` helper — without this the
+        // operator's NEWT_PROVIDER/NEWT_TEAM/… leaks in and the worker fails
+        // to start ("backend '…' not defined") before the metrics server binds.
+        .env_remove("NEWT_PROVIDER")
+        .env_remove("NEWT_TEAM")
+        .env_remove("NEWT_CONFIG")
+        .env_remove("NEWT_BACKEND")
+        .env_remove("NEWT_CODER")
         .args(["worker", "--operator-key-path"])
         .arg(&key)
         .stdin(std::process::Stdio::piped())

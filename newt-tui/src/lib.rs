@@ -6762,42 +6762,166 @@ fn resolve_session_start(
     }
 }
 
-/// #1671: resolve `--resume <name>` against this workspace's conversations —
-/// pure, so the matching rules are unit-testable without a store. Titles are
-/// matched case-insensitively: a unique EXACT match wins; otherwise a unique
-/// substring match; anything else is a hard error naming the candidates (an
-/// ambiguous or missing name must never silently open the wrong conversation).
-/// Ids are not this function's job — the caller tries `resolve_id` first.
-fn resolve_conversation_by_name(
-    summaries: &[newt_core::ConversationSummary],
-    name: &str,
-) -> Result<String, String> {
-    let needle = name.trim().to_lowercase();
-    let matches = |pred: &dyn Fn(&str) -> bool| -> Vec<&newt_core::ConversationSummary> {
+/// Structured title-match result — the ONE pure core behind both
+/// `resolve_conversation_by_name` (startup `--resume <name>`) and the
+/// consolidated `resolve_resume_target` (in-chat `/resume <thing>`), so the
+/// title-matching rules can never drift between the two front doors.
+///
+/// Titles are matched case-insensitively: a unique EXACT match wins; otherwise
+/// a unique substring match; several matches are `Ambiguous`; none is `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TitleMatch<'a> {
+    One(&'a newt_core::ConversationSummary),
+    Ambiguous(Vec<&'a newt_core::ConversationSummary>),
+    None,
+}
+
+fn title_match<'a>(
+    summaries: &'a [newt_core::ConversationSummary],
+    needle: &str,
+) -> TitleMatch<'a> {
+    let needle = needle.trim().to_lowercase();
+    let title_of = |s: &newt_core::ConversationSummary| s.title.trim().to_lowercase();
+    let exact: Vec<&newt_core::ConversationSummary> =
+        summaries.iter().filter(|s| title_of(s) == needle).collect();
+    let hits = if exact.is_empty() {
         summaries
             .iter()
-            .filter(|s| pred(&s.title.trim().to_lowercase()))
-            .collect()
-    };
-    let exact = matches(&|t: &str| t == needle);
-    let hits = if exact.is_empty() {
-        matches(&|t: &str| t.contains(needle.as_str()))
+            .filter(|s| title_of(s).contains(needle.as_str()))
+            .collect::<Vec<_>>()
     } else {
         exact
     };
     match hits.as_slice() {
-        [one] => Ok(one.id.clone()),
-        [] => Err(format!(
-            "no conversation titled \"{name}\" in this workspace — run newt and /resume to browse"
-        )),
-        many => Err(format!(
-            "\"{name}\" matches {} conversations — use an id: {}",
-            many.len(),
-            many.iter()
-                .map(|s| format!("{} \"{}\"", short_conversation_id(&s.id), s.title))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
+        [one] => TitleMatch::One(one),
+        [] => TitleMatch::None,
+        many => TitleMatch::Ambiguous(many.to_vec()),
+    }
+}
+
+/// The structured title-resolution error — the two failure modes of
+/// `resolve_conversation_by_name`, carried as data so the consolidated
+/// `resolve_resume_target` can branch on them (FTS fallback vs. candidate
+/// listing) instead of parsing a string. `Display` reproduces the exact
+/// human-facing messages the slash-command path always printed, so existing
+/// `unwrap_err().contains(...)` regression coverage carries over unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TitleResolveError {
+    /// No title matched the query.
+    NotFound { query: String },
+    /// Several titles matched — name the candidates so the human can pick.
+    Ambiguous {
+        query: String,
+        candidates: Vec<(String, String)>,
+    },
+}
+
+impl std::fmt::Display for TitleResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { query } => write!(
+                f,
+                "no conversation titled \"{query}\" in this workspace — run newt and /resume to browse"
+            ),
+            Self::Ambiguous { query, candidates } => write!(
+                f,
+                "\"{query}\" matches {} conversations — use an id: {}",
+                candidates.len(),
+                candidates
+                    .iter()
+                    .map(|(id, title)| format!("{} \"{title}\"", short_conversation_id(id)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TitleResolveError {}
+
+/// #1671: resolve `--resume <name>` against this workspace's conversations by
+/// TITLE — pure, so the matching rules are unit-testable without a store. A
+/// unique exact (case-insensitive) title wins, then a unique substring;
+/// ambiguity and misses are hard errors that NAME the candidates (an ambiguous
+/// or missing name must never silently open the wrong conversation). Ids are
+/// not this function's job — the consolidated `resolve_resume_target` tries
+/// id/prefix first, then delegates the title step here.
+fn resolve_conversation_by_name(
+    summaries: &[newt_core::ConversationSummary],
+    name: &str,
+) -> Result<String, TitleResolveError> {
+    match title_match(summaries, name) {
+        TitleMatch::One(one) => Ok(one.id.clone()),
+        TitleMatch::None => Err(TitleResolveError::NotFound {
+            query: name.trim().to_string(),
+        }),
+        TitleMatch::Ambiguous(many) => Err(TitleResolveError::Ambiguous {
+            query: name.trim().to_string(),
+            candidates: many
+                .iter()
+                .map(|s| (s.id.clone(), s.title.clone()))
+                .collect(),
+        }),
+    }
+}
+
+/// The consolidated resume resolver (#1030/#1671): ONE precedence chain
+/// shared by startup `--resume <name>` and in-chat `/resume <thing>`, so the
+/// two front doors never drift into different matching rules. Pure — it
+/// matches against the workspace's conversation summaries, no store needed.
+///
+/// Precedence:
+///   1. exact conversation id
+///   2. unique id prefix (byte-case-exact, like `ConversationStore::resolve_id`)
+///   3. exact (case-insensitive) title
+///   4. unique (case-insensitive) title substring
+///   5. ambiguous title match → `Ambiguous` (the caller renders a numbered
+///      listing so a follow-up `/resume <n>` selects one)
+///   6. nothing matched → `NotFound` (the caller falls back to FTS search)
+///
+/// Full-text search is deliberately NOT here: it is the listing fallback the
+/// in-chat caller renders (and a `/resume <n>` then selects from). Startup
+/// `--resume <name>` has no listing to show, so it hard-errors on
+/// `Ambiguous`/`NotFound` instead. Keeping FTS out leaves this pure and
+/// unit-testable without a store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResumeNameResolve {
+    /// A single conversation resolved — open it.
+    Resolved(String),
+    /// Several title matches — present them for numbered selection.
+    Ambiguous(Vec<(String, String)>),
+    /// Nothing matched by id or title — the caller may fall back to FTS.
+    NotFound,
+}
+
+fn resolve_resume_target(
+    summaries: &[newt_core::ConversationSummary],
+    token: &str,
+) -> ResumeNameResolve {
+    let token = token.trim();
+    // 1. exact conversation id.
+    if let Some(found) = summaries.iter().find(|s| s.id == token) {
+        return ResumeNameResolve::Resolved(found.id.clone());
+    }
+    // 2. unique id prefix (byte-case-exact; ids are validated ASCII so byte
+    //    and char positions coincide, matching `ConversationStore::resolve_id`).
+    let prefix: Vec<&newt_core::ConversationSummary> = summaries
+        .iter()
+        .filter(|s| s.id.starts_with(token))
+        .collect();
+    if let [one] = prefix.as_slice() {
+        return ResumeNameResolve::Resolved(one.id.clone());
+    }
+    // 3-5. exact title / unique substring / ambiguous — DELEGATED to the
+    //      title-only resolver so the matching rules live in ONE place and
+    //      the two front doors (startup `--resume <name>` and in-chat
+    //      `/resume <thing>`) can never drift.
+    match resolve_conversation_by_name(summaries, token) {
+        Ok(id) => ResumeNameResolve::Resolved(id),
+        Err(TitleResolveError::Ambiguous { candidates, .. }) => {
+            ResumeNameResolve::Ambiguous(candidates)
+        }
+        Err(TitleResolveError::NotFound { .. }) => ResumeNameResolve::NotFound,
     }
 }
 
@@ -7704,6 +7828,35 @@ fn resume_search_message(
             readable_snippet(&hit.snippet),
         ));
         ids.push(hit.conversation_id.clone());
+    }
+    out.push_str(RESUME_LEGEND);
+    Ok((out, ids))
+}
+
+/// Ambiguous title match — the "candidate selection when ambiguous" step of
+/// the shared resolver (#1030/#1671): render the candidates as a numbered,
+/// liveness-annotated listing so a follow-up `/resume <n>` picks one, instead
+/// of a bare error. Mirrors `resume_browse_message` / `resume_search_message`.
+fn resume_ambiguous_message(
+    store: &newt_core::ConversationStore,
+    query: &str,
+    candidates: &[(String, String)],
+    active_id: &str,
+) -> anyhow::Result<(String, Vec<String>)> {
+    let mut out = format!(
+        "\"{query}\" matches {} conversations — pick one:",
+        candidates.len()
+    );
+    let mut ids = Vec::new();
+    for (i, (id, title)) in candidates.iter().enumerate() {
+        out.push_str(&format!(
+            "\n  {:>2}. {}  {}  {}",
+            i + 1,
+            resume_liveness_marker(store, id, active_id),
+            short_conversation_id(id),
+            recall_display_title(store, id, title),
+        ));
+        ids.push(id.clone());
     }
     out.push_str(RESUME_LEGEND);
     Ok((out, ids))
@@ -12768,7 +12921,8 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /new                     - finalize this conversation and start a fresh one (stays in the session; alias: /clear)",
         "  /end  /restart           - finalize this conversation and start fresh (aliases of /new; /end no longer exits)",
         "  /start [title]           - begin a new conversation, leaving the current one open to /resume",
-        "  /rename <title>          - retitle the current conversation so it is easy to find in /resume",
+        "  /resume [name|search|n|id] - find & reopen a past conversation: bare lists recent, then match by name/title, id, or full-text search",
+        "  /name <title>            - retitle the current conversation so it is easy to find in /resume (alias: /rename)",
         "  /transcript              - review this conversation: full-screen pager (rich) / printed spine (lean)",
         "  /conversation list       - list saved conversations",
         "  /conversation show <id>  - show a saved conversation",
