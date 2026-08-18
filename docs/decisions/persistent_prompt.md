@@ -77,6 +77,30 @@ stops decoding text itself and instead forwards ground bytes to the mounted
 editor. This is the Claude Code interaction model, scoped to RichTUI per the
 plain-scroller rule.
 
+## Amendment 2026-08-16 — the silent-tool gap is NOT a phase-2 problem (#1727)
+
+Problem item 3 ("no input surface at all until the turn ends") conflated two
+failures with different fixes. During a **long, silent tool call** — a
+`run_command` waiting on the network, an MCP call, `experience_recall` — the
+row under the `⚙` header showed *nothing*: not "no editor", but **no liveness
+cue at all**, so waiting was indistinguishable from hung and operators killed
+healthy processes (#1727).
+
+That gap was never a missing writer that phase 2's block lease had to create.
+The ONE spinner already existed; it was simply scoped to the *inference* call
+and gone before the tool ran, and `LiveToolOutput::start` is bookkeeping whose
+first paint is the child's **first byte**. Closed in the tool funnel
+(`execute_tool_with_display_cancellable`) by holding a per-call spinner that
+yields the row to the live-output viewport on that first byte
+(`agentic::tools::live_output::ToolSpinner`). Zero arbiter changes; `LineCaps`
+gates it exactly as it gates the thinking spinner, so pipes stay byte-identical
+and the plain-scroller rule holds with no caveats.
+
+Phases 2–3 stand for what they actually address — the *editor* being absent
+during a turn — and are further amended by #1718: the terminal now belongs to
+a UI thread that is merely idle between surface requests, which changes what
+"always-mounted" costs. That correction is owned by the phase-3 PR, not here.
+
 ## Known seams (phase 1, documented not fixed)
 
 These are pre-existing races/ambiguities that type-ahead capture makes newly

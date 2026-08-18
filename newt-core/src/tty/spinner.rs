@@ -85,6 +85,14 @@ struct SpinnerState {
     /// Styling ONLY. Never a capability signal — see [`LineCaps`].
     color: bool,
     finished: AtomicBool,
+    /// Serializes `draw` against `finish`. Without it a tick could pass the
+    /// `finished` check, lose the CPU, and paint AFTER `finish` had erased —
+    /// a stale row that the lease's final erase would then wipe from wherever
+    /// the cursor had moved to. Harmless when the next writer is a permanent
+    /// line on a fresh row; destructive when it is a viewport that has just
+    /// taken this row (#1727's spinner → live-output hand-off). Lock order is
+    /// always gate → stdout, in both holders.
+    paint_gate: Mutex<()>,
 }
 
 impl SpinnerState {
@@ -92,6 +100,10 @@ impl SpinnerState {
     /// and never scrolls, so a line wider than the terminal would wrap and leave
     /// stale rows behind that no single-line erase can reach.
     fn draw(&self) {
+        let _gate = self
+            .paint_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.finished.load(Ordering::SeqCst) {
             return;
         }
@@ -135,6 +147,10 @@ impl SpinnerState {
     /// same operation, so teardown can never double-erase a row someone else
     /// has since taken.
     fn finish(&self) {
+        let _gate = self
+            .paint_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.finished.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -178,7 +194,34 @@ impl SpinnerState {
 }
 
 impl Ephemeral for SpinnerState {
+    /// Erase through the SAME [`SpinnerState::paint_gate`] as `draw`/`finish`.
+    ///
+    /// The suspend path is "set `suspended`, THEN erase every ephemeral"
+    /// (`Terminal::suspend_for_prompt`). Without the gate that leaves a live
+    /// window: a tick can pass `LineLease::paint`'s `suspended()` check while
+    /// the flag is still clear, lose the CPU, and flush its frame *after* the
+    /// erase — repainting the row the question is about to occupy. That is
+    /// the invisible-prompt hang the arbiter exists to end, arriving through
+    /// the one door it did not close.
+    ///
+    /// Taking the gate makes the two orderings the only two possible:
+    ///
+    /// - the tick was already inside `draw` → this erase waits for it, then
+    ///   clears what it wrote (`painted` is set, so the erase is real);
+    /// - the tick arrives after → it takes the gate next, and `paint` finds
+    ///   `suspended()` true and writes nothing.
+    ///
+    /// Lock order is `paint_gate` → stdout, matching `draw` and `finish`.
+    /// Both callers of this method — `Terminal::suspend_for_prompt` and
+    /// `Terminal::emit_line` — collect the registered ephemerals under the
+    /// arbiter mutex and **release it before erasing**, so no thread ever
+    /// holds the arbiter mutex while waiting on this gate and there is no
+    /// cycle to deadlock on.
     fn erase(&self) {
+        let _gate = self
+            .paint_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.lease.erase();
     }
     fn restore(&self) {
@@ -276,6 +319,7 @@ impl Spinner {
             frame: AtomicUsize::new(0),
             color,
             finished: AtomicBool::new(false),
+            paint_gate: Mutex::new(()),
         });
         let as_ephemeral: Arc<dyn Ephemeral> = state.clone();
         Terminal::register(
@@ -423,6 +467,83 @@ mod tests {
             Spinner::start_with_caps(LineCaps::Own, "next…", Sink::Stdout, false).is_some(),
             "the line is free again"
         );
+    }
+
+    /// **The race this PR closes.** `suspend_for_prompt` sets `suspended` and
+    /// then erases; an in-flight `draw` that already passed `paint`'s
+    /// `suspended()` check must not be able to flush its frame after that
+    /// erase, or the question is painted over and the operator is blocked on
+    /// a prompt they cannot see.
+    ///
+    /// Deterministic by construction: the test holds `paint_gate` itself,
+    /// standing in for the draw that is inside it and about to write. The
+    /// handshake means the erasing thread is provably parked *at the call*
+    /// before the observation window opens — so "it did not proceed" is a
+    /// reading about the gate, not about a thread that had not started yet.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn erase_waits_for_an_in_flight_draw_instead_of_racing_it() {
+        let sp = Spinner::start_with_caps(LineCaps::Own, "thinking…", Sink::Stdout, false)
+            .expect("spinner");
+        let state = sp.state.clone();
+        // Stand in for a `draw` that holds the gate and has not written yet.
+        let in_flight = state
+            .paint_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let at_call = Arc::new((Mutex::new(false), Condvar::new()));
+        let erased = Arc::new(AtomicBool::new(false));
+        let eraser = {
+            let (state, at_call, erased) = (state.clone(), at_call.clone(), erased.clone());
+            std::thread::spawn(move || {
+                {
+                    let (m, cv) = &*at_call;
+                    *m.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                    cv.notify_all();
+                }
+                Ephemeral::erase(&*state);
+                erased.store(true, Ordering::SeqCst);
+            })
+        };
+        {
+            let (m, cv) = &*at_call;
+            let mut at = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*at {
+                at = cv
+                    .wait(at)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !erased.load(Ordering::SeqCst),
+            "erase ran while a draw held the gate — that frame's bytes would land AFTER the erase"
+        );
+        drop(in_flight);
+        eraser.join().expect("the erasing thread");
+        assert!(
+            erased.load(Ordering::SeqCst),
+            "erase must proceed once the in-flight draw releases the gate"
+        );
+    }
+
+    /// The gate is now shared by three paths, so teardown must still compose:
+    /// a second erase is a no-op rather than a second escape, and `finish`
+    /// after an erase must not deadlock on a gate the erase already released.
+    /// (A reentrant implementation — `erase` calling `finish`, or `finish`
+    /// routing through `Ephemeral::erase` — hangs here instead of failing.)
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn erase_stays_idempotent_and_composes_with_finish() {
+        let sp = Spinner::start_with_caps(LineCaps::Own, "thinking…", Sink::Stdout, false)
+            .expect("spinner");
+        let state = sp.state.clone();
+        Ephemeral::erase(&*state);
+        Ephemeral::erase(&*state);
+        state.finish();
+        Ephemeral::erase(&*state);
+        assert!(state.finished.load(Ordering::SeqCst));
     }
 
     /// The stage label is mutable without resetting the elapsed clock — the
