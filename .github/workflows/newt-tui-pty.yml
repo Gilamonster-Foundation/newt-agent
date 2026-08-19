@@ -1,7 +1,9 @@
 name: newt-tui real-PTY tier (#1520, #1677)
 
-# Real-terminal integration tier for prompt CONTROL-key delivery and transcript
-# pager terminal restoration. It drives real PTY children to prove raw control
+# Real-terminal integration tier for prompt CONTROL-key delivery, transcript
+# pager terminal restoration, and the cockpit's ownership of fd 0/1 and the
+# terminal's modes (#1744). Runs on Linux AND macOS: the code is POSIX, and the
+# unit tier in ci.yml is Linux + Windows only. It drives real PTY children to prove raw control
 # bytes reach modal readers and that every pager exit path restores kernel tty
 # state plus the alternate screen — properties mocks cannot observe.
 #
@@ -32,6 +34,8 @@ on:
   pull_request:
     paths:
       - "newt-tui/src/prompt_visibility_test.rs"
+      - "newt-tui/src/cockpit/**"
+      - "newt-tui/src/rich_input.rs"
       - "newt-tui/src/transcript_pager.rs"
       - "newt-tui/src/transcript_pager_pty_test.rs"
       - "newt-tui/src/permissions.rs"
@@ -77,6 +81,54 @@ jobs:
       # assertion races the child's setup. The `prompt_visibility_test` filter
       # scopes the run to the ignored PTY tests (the control test + its child;
       # the child no-ops when invoked directly without its env markers).
+      - name: Run prompt control-key real-PTY tests
+        run: |
+          cargo test -p newt-tui prompt_visibility_test \
+            -- --ignored --test-threads=1
+
+      - name: Run transcript pager real-PTY tests
+        run: |
+          cargo test -p newt-tui --features rich-tui transcript_pager_pty_test \
+            -- --ignored --test-threads=1
+
+      # The cockpit owns fd 0/1 and the terminal's modes for a whole session,
+      # so its acceptance tests are real-terminal tests even though they are not
+      # `#[ignore]`d. Running them here as well as in the unit tier costs
+      # seconds and keeps this gate honest about what "terminal lifecycle"
+      # covers.
+      - name: Run cockpit terminal-ownership acceptance
+        run: |
+          cargo test -p newt-tui --features rich-tui cockpit:: \
+            -- --test-threads=1
+
+  # macOS leg. The terminal code here is POSIX, not Linux: termios restoration,
+  # openpty, TIOCSWINSZ, and crossterm's "stdin if it is a tty, else /dev/tty"
+  # resolution all have BSD-flavoured behaviour that a Linux runner cannot
+  # observe. The unit tier (ci.yml) is Linux + Windows only, so without this job
+  # nothing exercises the cockpit or the modal on a Mac.
+  macos-terminal-tier:
+    name: terminal lifecycle (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: newt-tui-pty-macos
+
+      # The termios/pty surface, in the order it is layered: the modal's raw
+      # guard, then the cockpit's capture and mode restoration on top of it.
+      - name: Run tty modal + spinner tests
+        run: |
+          cargo test -p newt-core --lib tty:: -- --test-threads=1
+
+      - name: Run cockpit terminal-ownership acceptance
+        run: |
+          cargo test -p newt-tui --features rich-tui cockpit:: \
+            -- --test-threads=1
+
       - name: Run prompt control-key real-PTY tests
         run: |
           cargo test -p newt-tui prompt_visibility_test \
