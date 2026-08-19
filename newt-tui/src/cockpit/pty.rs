@@ -54,13 +54,20 @@ impl PtyCapture {
         unsafe {
             let mut master: libc::c_int = -1;
             let mut slave: libc::c_int = -1;
-            let ws = winsize(cols, rows);
+            let mut ws = winsize(cols, rows);
+            // `termp`/`winp` are `*const` on Linux but `*mut` on BSD/macOS.
+            // `*mut` coerces to `*const`, so passing mutable pointers compiles
+            // on both; the reverse does not.
             if libc::openpty(
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &ws,
+                std::ptr::null_mut::<libc::termios>(),
+                // `addr_of_mut!`, not `&mut ws`: on Linux the parameter is
+                // `*const winsize`, so clippy's `unnecessary_mut_passed` fires
+                // on a `&mut` — but macOS needs the mutable pointer. A raw
+                // pointer satisfies both.
+                std::ptr::addr_of_mut!(ws),
             ) != 0
             {
                 return Err(io::Error::last_os_error());
@@ -284,8 +291,8 @@ mod tests {
                         &mut master,
                         &mut slave,
                         std::ptr::null_mut(),
-                        std::ptr::null(),
-                        std::ptr::null(),
+                        std::ptr::null_mut::<libc::termios>(),
+                        std::ptr::null_mut::<libc::winsize>(),
                     ),
                     0,
                     "openpty for the test's own terminal"

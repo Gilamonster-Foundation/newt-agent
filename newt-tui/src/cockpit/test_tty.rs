@@ -47,8 +47,8 @@ impl TestTty {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut::<libc::termios>(),
+                    std::ptr::null_mut::<libc::winsize>(),
                 ),
                 0,
                 "openpty for the test's terminal"
@@ -198,12 +198,44 @@ pub(crate) fn echoes(fd: RawFd) -> bool {
     termios_of(fd).c_lflag & libc::ECHO != 0
 }
 
+/// Kernel-managed transient bits in `c_lflag` — state, not configuration.
+///
+/// `PENDIN` ("input pending, retype at next read") and `FLUSHO` ("output being
+/// flushed") are set and cleared by the tty layer as a side effect of I/O and
+/// mode changes; no application sets them deliberately, and nothing is expected
+/// to restore them. macOS surfaces this where Linux happened not to: after a
+/// raw-mode round trip the observed diff was exactly
+/// `c_lflag 0x5cb -> 0x200005cb`, i.e. `PENDIN` alone. Comparing them would
+/// assert on kernel bookkeeping and call it a restoration failure.
+const TRANSIENT_LFLAGS: libc::tcflag_t = libc::PENDIN | libc::FLUSHO;
+
 /// Compare the fields that decide how a terminal behaves. `termios` is not
-/// `PartialEq`, and padding/speed fields are not the contract.
+/// `PartialEq`, padding/speed fields are not the contract, and
+/// [`TRANSIENT_LFLAGS`] are kernel state rather than configuration.
 pub(crate) fn modes_equal(a: &libc::termios, b: &libc::termios) -> bool {
-    a.c_lflag == b.c_lflag
-        && a.c_iflag == b.c_iflag
-        && a.c_oflag == b.c_oflag
-        && a.c_cflag == b.c_cflag
-        && a.c_cc == b.c_cc
+    mode_diff(a, b).is_empty()
+}
+
+/// Which mode fields differ, named — so a failure says WHAT was not restored
+/// instead of only that something was not.
+pub(crate) fn mode_diff(a: &libc::termios, b: &libc::termios) -> String {
+    let mut out = Vec::new();
+    if a.c_lflag & !TRANSIENT_LFLAGS != b.c_lflag & !TRANSIENT_LFLAGS {
+        out.push(format!("c_lflag {:#x} -> {:#x}", a.c_lflag, b.c_lflag));
+    }
+    if a.c_iflag != b.c_iflag {
+        out.push(format!("c_iflag {:#x} -> {:#x}", a.c_iflag, b.c_iflag));
+    }
+    if a.c_oflag != b.c_oflag {
+        out.push(format!("c_oflag {:#x} -> {:#x}", a.c_oflag, b.c_oflag));
+    }
+    if a.c_cflag != b.c_cflag {
+        out.push(format!("c_cflag {:#x} -> {:#x}", a.c_cflag, b.c_cflag));
+    }
+    for (i, (x, y)) in a.c_cc.iter().zip(b.c_cc.iter()).enumerate() {
+        if x != y {
+            out.push(format!("c_cc[{i}] {x} -> {y}"));
+        }
+    }
+    out.join(", ")
 }
