@@ -1127,6 +1127,13 @@ mod terminal_acceptance {
     #[test]
     fn a_panic_restores_the_real_termios_through_the_modes_guard() {
         let _tty = TestTty::install();
+        // Clear crossterm's saved-mode static FIRST. It is process-global, so
+        // an earlier test in this binary may have populated it; `enable_raw_mode`
+        // would then be a no-op-ish and `disable_raw_mode` would restore that
+        // older baseline instead of this test's. On Linux the two happen to
+        // agree; on macOS the raw-mode field set differs and the mismatch is
+        // visible. (Same global-static hazard #1770 fixed in the modal.)
+        let _ = crossterm::terminal::disable_raw_mode();
         set_canonical_echo(0);
         let before = termios_of(0);
 

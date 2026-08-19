@@ -63,7 +63,11 @@ impl PtyCapture {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut::<libc::termios>(),
-                &mut ws,
+                // `addr_of_mut!`, not `&mut ws`: on Linux the parameter is
+                // `*const winsize`, so clippy's `unnecessary_mut_passed` fires
+                // on a `&mut` — but macOS needs the mutable pointer. A raw
+                // pointer satisfies both.
+                std::ptr::addr_of_mut!(ws),
             ) != 0
             {
                 return Err(io::Error::last_os_error());
