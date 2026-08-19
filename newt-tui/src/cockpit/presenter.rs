@@ -994,7 +994,7 @@ mod tests {
 mod terminal_acceptance {
     use super::*;
     use crate::cockpit::test_tty::{
-        echoes, is_canonical, modes_equal, set_canonical_echo, termios_of, TestTty,
+        echoes, is_canonical, mode_diff, modes_equal, set_canonical_echo, termios_of, TestTty,
     };
 
     const CTRL_C: &[u8] = &[0x03];
@@ -1112,7 +1112,9 @@ mod terminal_acceptance {
         assert!(
             modes_equal(&before, &termios_of(0)),
             "every termios mode field restored exactly, not approximately — \
-             this is the assertion an emitted-escape-bytes check cannot make"
+             this is the assertion an emitted-escape-bytes check cannot make; \
+             differs: {}",
+            mode_diff(&before, &termios_of(0))
         );
     }
 
@@ -1160,7 +1162,8 @@ mod terminal_acceptance {
         assert!(echoes(0), "echo restored through the unwind");
         assert!(
             modes_equal(&before, &termios_of(0)),
-            "every termios mode field restored exactly after a panic"
+            "every termios mode field restored exactly after a panic; differs: {}",
+            mode_diff(&before, &termios_of(0))
         );
     }
 }

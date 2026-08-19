@@ -201,9 +201,29 @@ pub(crate) fn echoes(fd: RawFd) -> bool {
 /// Compare the fields that decide how a terminal behaves. `termios` is not
 /// `PartialEq`, and padding/speed fields are not the contract.
 pub(crate) fn modes_equal(a: &libc::termios, b: &libc::termios) -> bool {
-    a.c_lflag == b.c_lflag
-        && a.c_iflag == b.c_iflag
-        && a.c_oflag == b.c_oflag
-        && a.c_cflag == b.c_cflag
-        && a.c_cc == b.c_cc
+    mode_diff(a, b).is_empty()
+}
+
+/// Which mode fields differ, named — so a failure says WHAT was not restored
+/// instead of only that something was not.
+pub(crate) fn mode_diff(a: &libc::termios, b: &libc::termios) -> String {
+    let mut out = Vec::new();
+    if a.c_lflag != b.c_lflag {
+        out.push(format!("c_lflag {:#x} -> {:#x}", a.c_lflag, b.c_lflag));
+    }
+    if a.c_iflag != b.c_iflag {
+        out.push(format!("c_iflag {:#x} -> {:#x}", a.c_iflag, b.c_iflag));
+    }
+    if a.c_oflag != b.c_oflag {
+        out.push(format!("c_oflag {:#x} -> {:#x}", a.c_oflag, b.c_oflag));
+    }
+    if a.c_cflag != b.c_cflag {
+        out.push(format!("c_cflag {:#x} -> {:#x}", a.c_cflag, b.c_cflag));
+    }
+    for (i, (x, y)) in a.c_cc.iter().zip(b.c_cc.iter()).enumerate() {
+        if x != y {
+            out.push(format!("c_cc[{i}] {x} -> {y}"));
+        }
+    }
+    out.join(", ")
 }
