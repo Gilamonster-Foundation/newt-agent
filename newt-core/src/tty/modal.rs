@@ -223,8 +223,8 @@ mod raw_guard_tests {
                         &mut master,
                         &mut slave,
                         std::ptr::null_mut(),
-                        std::ptr::null(),
-                        std::ptr::null()
+                        std::ptr::null_mut::<libc::termios>(),
+                        std::ptr::null_mut::<libc::winsize>()
                     ),
                     0
                 );
