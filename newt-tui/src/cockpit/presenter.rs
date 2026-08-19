@@ -978,3 +978,182 @@ mod tests {
         assert_eq!(super::super::ansi::visible_width(&bytes), "[t] body".len());
     }
 }
+
+/// Real-terminal acceptance for the cockpit's ownership of the operator's
+/// terminal (#1744), against a pty the test owns — never the developer's.
+///
+/// **One cockpit per process.** A completed `Presenter` lifecycle leaves
+/// process-global terminal state behind (crossterm resolves and caches it), so
+/// a second `Presenter::open` in the same test binary times out waiting for its
+/// cursor report. The real session opens exactly one cockpit, so this is a
+/// property of the harness rather than of the product — but it means the
+/// behaviours have to be proven by ONE cockpit, in sequence, which is what the
+/// single test below does. The panic path is proven separately against the
+/// modes guard itself, which is the mechanism that makes the guarantee.
+#[cfg(test)]
+mod terminal_acceptance {
+    use super::*;
+    use crate::cockpit::test_tty::{
+        echoes, is_canonical, modes_equal, set_canonical_echo, termios_of, TestTty,
+    };
+
+    const CTRL_C: &[u8] = &[0x03];
+
+    /// The three properties #1744 turns on, proven on one real terminal with
+    /// one cockpit: Ctrl-C's two tiers, a modal opening underneath it, and the
+    /// terminal handed back exactly as it was found.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
+        let tty = TestTty::install();
+        newt_core::tty::set_interrupt_pending(false);
+
+        // A shell's terminal: canonical, echoing.
+        set_canonical_echo(0);
+        let before = termios_of(0);
+        assert!(
+            is_canonical(0) && echoes(0),
+            "precondition: the terminal starts as a shell hands it over"
+        );
+
+        let dir =
+            std::env::temp_dir().join(format!("newt-cockpit-acceptance-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let surface =
+            crate::rich_input::RichSurface::new(Some(dir.join("history"))).expect("rich surface");
+
+        {
+            let mut cockpit = match Presenter::open(surface) {
+                Ok(p) => p,
+                Err(e) => panic!(
+                    "cockpit failed to open: {e}; master saw {:?}",
+                    tty.painted()
+                ),
+            };
+
+            // ---- the terminal is genuinely taken ----
+            assert!(!is_canonical(0), "the cockpit runs the terminal raw");
+            assert!(!echoes(0), "and the kernel is not echoing over the editor");
+
+            // ---- Ctrl-C: first press asks, second forces ----
+            let cancel = Arc::new(AtomicBool::new(false));
+            let hard = Arc::new(AtomicBool::new(false));
+            cockpit
+                .handle_request(SurfaceRequest::TurnStarted {
+                    cancel: Arc::clone(&cancel),
+                    hard: Arc::clone(&hard),
+                })
+                .expect("a turn starts");
+
+            tty.type_bytes(CTRL_C);
+            cockpit.poll_keys().expect("first Ctrl-C");
+            assert!(
+                cancel.load(Ordering::SeqCst),
+                "first press trips the cancel the session races against"
+            );
+            assert!(
+                !hard.load(Ordering::SeqCst),
+                "first press must NOT force — that is the second press"
+            );
+            // Operator-observable: this is the flag the spinner reads to swap
+            // its stage label, so the press is acknowledged on screen.
+            assert!(
+                newt_core::tty::interrupt_pending(),
+                "first press raises the acknowledgment the operator sees"
+            );
+
+            tty.type_bytes(CTRL_C);
+            cockpit.poll_keys().expect("second Ctrl-C");
+            assert!(
+                hard.load(Ordering::SeqCst),
+                "second press forces the turn down"
+            );
+
+            cockpit
+                .handle_request(SurfaceRequest::TurnEnded)
+                .expect("the turn ends");
+            assert!(
+                !newt_core::tty::interrupt_pending(),
+                "ending the turn clears the acknowledgment, so the next turn \
+                 does not open already showing it"
+            );
+
+            // ---- a modal opens while the cockpit owns the terminal ----
+            // The integration #1770 could not prove alone: that fix made the
+            // modal take raw mode from the real termios instead of crossterm's
+            // global, and the cockpit is exactly the second raw-mode owner
+            // that broke it. Here the cockpit genuinely holds fd 0/1.
+            let window = newt_core::tty::Terminal::suspend_for_prompt();
+            {
+                let _reader = newt_core::tty::modal_prompt_controls(&window)
+                    .expect("the modal takes the terminal from under the cockpit");
+                assert!(
+                    !is_canonical(0),
+                    "the modal's read must be non-canonical, or a keypress \
+                     waits for Enter the operator does not know to press"
+                );
+                assert!(
+                    !echoes(0),
+                    "the kernel must not echo the answer over the prompt"
+                );
+            }
+            drop(window);
+            // The modal restored what it found: the cockpit still has a raw
+            // terminal to go on painting into.
+            assert!(
+                !is_canonical(0),
+                "the cockpit's raw mode survives the modal"
+            );
+        }
+
+        // ---- and the terminal comes back, exactly ----
+        assert!(is_canonical(0), "canonical mode restored on teardown");
+        assert!(echoes(0), "echo restored on teardown");
+        assert!(
+            modes_equal(&before, &termios_of(0)),
+            "every termios mode field restored exactly, not approximately — \
+             this is the assertion an emitted-escape-bytes check cannot make"
+        );
+    }
+
+    /// Acceptance (#1744): the same restoration through an ABNORMAL exit.
+    ///
+    /// Proven against the modes guard itself rather than a second cockpit: the
+    /// guard is the mechanism (`Presenter::open` binds it before the fallible
+    /// capture install precisely so a `?` or a panic cannot strand the
+    /// terminal), and one cockpit per process is a harness limit, not a reason
+    /// to leave the unwind path unproven.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_panic_restores_the_real_termios_through_the_modes_guard() {
+        let _tty = TestTty::install();
+        set_canonical_echo(0);
+        let before = termios_of(0);
+
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(|| {
+            let _modes: crate::RestoreOnDrop<fn()> = crate::RestoreOnDrop {
+                restore: restore_terminal_modes,
+            };
+            crossterm::terminal::enable_raw_mode().expect("raw");
+            assert!(!is_canonical(0), "precondition: raw mode taken");
+            panic!("turn exploded while the terminal was raw");
+        });
+        std::panic::set_hook(hook);
+
+        assert!(
+            result.is_err(),
+            "the panic must propagate, not be swallowed"
+        );
+        assert!(
+            is_canonical(0),
+            "canonical mode restored through the unwind"
+        );
+        assert!(echoes(0), "echo restored through the unwind");
+        assert!(
+            modes_equal(&before, &termios_of(0)),
+            "every termios mode field restored exactly after a panic"
+        );
+    }
+}

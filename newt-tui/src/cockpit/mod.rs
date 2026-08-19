@@ -28,6 +28,9 @@
 
 pub(crate) mod ansi;
 pub(crate) mod presenter;
+
 pub(crate) mod pty;
+#[cfg(test)]
+pub(crate) mod test_tty;
 
 pub(crate) use presenter::Presenter;
