@@ -268,29 +268,141 @@ mod probes {
 
     /// HOST role (spawned by `probe_b`): acquire a real console, host the child
     /// under a ConPTY, capture the pty output, write it to RESULT. No-ops unless
+    /// **Probe C — is a process-global console actually required?**
+    ///
+    /// Probe B's host acquires one (`FreeConsole` → `AllocConsole` → repoint
+    /// std handles), and its child's output reaches the pty. That establishes
+    /// the configuration WORKS; it does not establish the console is NECESSARY.
+    /// The two differ, and the difference decides whether a Windows cockpit has
+    /// to mutate process-global console state or can stay narrower.
+    ///
+    /// This runs the identical host path with that ONE step removed, from a
+    /// parent whose own std handles are pipes (`cargo test` stdio) — the
+    /// redirected-stdio case. Process creation is already the controlled kind
+    /// the question asks about: `bInheritHandles = FALSE`, a zeroed
+    /// `STARTUPINFOEXW` (so NO `STARTF_USESTDHANDLES` and NULL `hStd*`), and
+    /// `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` as the only handle source.
+    ///
+    /// Both outcomes are informative, so this test does not presume one. It
+    /// asserts the experiment genuinely ran, then records a machine-readable
+    /// verdict line for the ADR:
+    ///
+    /// * `traversed` — the child's stdout AND stderr came back through the pty
+    ///   with `is_terminal() == true`, and did NOT appear on the host's own
+    ///   inherited stdio. The console requirement is an artifact of the tested
+    ///   spawn configuration.
+    /// * `leaked` — the markers appeared on the host's inherited pipes, i.e.
+    ///   the child took the parent's redirected handles instead of the pty.
+    /// * `absent` — neither; the child produced nothing either way.
+    #[test]
+    fn probe_c_is_a_process_global_console_required() {
+        let result = result_path().with_extension("nocon");
+        let _ = std::fs::remove_file(&result);
+
+        // `.output()` (not `.status()`) so the host's OWN stdio is captured:
+        // that is how a leak through inherited redirected handles is seen.
+        let out = std::process::Command::new(self_exe())
+            .args([
+                "--exact",
+                "cockpit::conpty_probe::probes::conpty_host",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ROLE_ENV, "host-nocon")
+            .env(RESULT_ENV, &result)
+            .output()
+            .expect("spawn conpty host (no console)");
+
+        let host_stdio = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rendered = std::fs::read(&result).unwrap_or_default();
+        let _ = std::fs::remove_file(&result);
+        let split = rendered.iter().position(|&b| b == b'\n').unwrap_or(0);
+        let header = String::from_utf8_lossy(&rendered[..split]).into_owned();
+        let pty =
+            String::from_utf8_lossy(&rendered[(split + 1).min(rendered.len())..]).into_owned();
+
+        // The experiment must have RUN, whatever it found.
+        assert!(
+            out.status.success(),
+            "host (no console) subprocess failed: {:?}\n{host_stdio}",
+            out.status
+        );
+        assert!(
+            header.contains("allocated=false"),
+            "probe C must run WITHOUT acquiring a console; header: {header:?}"
+        );
+        assert!(
+            header.contains("created=1"),
+            "the ConPTY child must have been created for the result to mean \
+             anything; header: {header:?}"
+        );
+
+        let want_out = format!("{OUT_MARKER}[tty=true]");
+        let want_err = format!("{ERR_MARKER}[tty=true]");
+        let through_pty = pty.contains(&want_out) && pty.contains(&want_err);
+        let leaked = host_stdio.contains(OUT_MARKER) || host_stdio.contains(ERR_MARKER);
+
+        let verdict = if through_pty && !leaked {
+            "traversed"
+        } else if leaked {
+            "leaked"
+        } else {
+            "absent"
+        };
+        // Machine-readable, for the ADR to quote rather than paraphrase.
+        println!("NEWT_CONPTY_PROBE_C verdict={verdict} header={header:?}");
+        println!("NEWT_CONPTY_PROBE_C pty={pty:?}");
+        println!("NEWT_CONPTY_PROBE_C host_stdio_has_markers={leaked}");
+
+        // Teardown must be clean either way — a hung or crashing host would
+        // make the verdict meaningless.
+        assert!(
+            header.contains("child_exit=0"),
+            "the child must exit cleanly for the verdict to be trustworthy; \
+             header: {header:?}"
+        );
+    }
+
     /// invoked with `NEWT_CONPTY_ROLE=host`.
     #[ignore = "spawned by probe_b as the ConPTY host; not a standalone test"]
     #[test]
     fn conpty_host() {
-        if std::env::var(ROLE_ENV).as_deref() != Ok("host") {
-            return;
-        }
+        // `host` acquires a console first; `host-nocon` is the SAME code path
+        // with that one step removed — the discriminating variable for whether
+        // a process-global console is actually required (probe C).
+        let role = std::env::var(ROLE_ENV);
+        let acquire_console = match role.as_deref() {
+            Ok("host") => true,
+            Ok("host-nocon") => false,
+            _ => return,
+        };
         let result = std::env::var(RESULT_ENV).expect("RESULT path");
 
         // Present CONSOLE std handles to the child (see the module docs): detach
         // any existing console, take a fresh one, and repoint std handles at it.
         // SAFETY: console lifecycle on this throwaway host process.
         let allocated = unsafe {
-            FreeConsole();
-            let ok = AllocConsole() != 0;
-            if ok {
-                let conout = open_con("CONOUT$");
-                let conin = open_con("CONIN$");
-                SetStdHandle(STD_OUTPUT_HANDLE, conout);
-                SetStdHandle(STD_ERROR_HANDLE, conout);
-                SetStdHandle(STD_INPUT_HANDLE, conin);
+            if !acquire_console {
+                // Leave the host's std handles exactly as inherited — under
+                // `cargo test` they are PIPES, i.e. the redirected-stdio case.
+                false
+            } else {
+                FreeConsole();
+                let ok = AllocConsole() != 0;
+                if ok {
+                    let conout = open_con("CONOUT$");
+                    let conin = open_con("CONIN$");
+                    SetStdHandle(STD_OUTPUT_HANDLE, conout);
+                    SetStdHandle(STD_ERROR_HANDLE, conout);
+                    SetStdHandle(STD_INPUT_HANDLE, conin);
+                }
+                ok
             }
-            ok
         };
 
         let (in_read, in_write) = create_pipe();
