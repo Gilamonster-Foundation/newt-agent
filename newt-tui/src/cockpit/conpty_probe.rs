@@ -359,6 +359,22 @@ mod probes {
         println!("NEWT_CONPTY_PROBE_C pty={pty:?}");
         println!("NEWT_CONPTY_PROBE_C host_stdio_has_markers={leaked}");
 
+        // PIN the measured result. On 2026-08-19 CI this is `leaked`: without a
+        // console the child takes the parent's inherited PIPES and its output
+        // never reaches the pty — the pty carries only conhost's init bytes.
+        // That is what makes the ADR's console requirement PROVEN rather than
+        // inferred, so it is asserted, not merely printed.
+        //
+        // If this ever flips to `traversed`, the console requirement has become
+        // an artifact of an older Windows/toolchain and the ADR must be revised
+        // — which is exactly the regression this assertion exists to catch.
+        assert_eq!(
+            verdict, "leaked",
+            "probe C measured {verdict}, not the recorded `leaked`. Re-open the \
+             console question in docs/decisions/windows_cockpit_conpty.md.\n\
+             header: {header}\npty: {pty:?}"
+        );
+
         // Teardown must be clean either way — a hung or crashing host would
         // make the verdict meaningless.
         assert!(

@@ -4,9 +4,19 @@ Status: **spike / investigation** — no production behaviour change. Windows
 stays on the classic per-turn surface.
 Follows: #1669 (the cockpit), #1744 (cockpit hardening).
 
-Every claim below is tagged **PROVEN** (a probe in `cockpit::conpty_probe`
-demonstrates it on Windows + CI) or **HYPOTHESIS** (plausible, not yet
-demonstrated — do not build on it as fact).
+Every claim below carries an evidence level, and they are not
+interchangeable:
+
+- **PROVEN** — a probe in `cockpit::conpty_probe` demonstrates it directly on
+  Windows CI.
+- **INFERRED** — strongly suggested by what the probes observed, but not
+  isolated by an experiment of its own. Do not cite it as demonstrated.
+- **HYPOTHESIS** — plausible, still needs a discriminating test.
+- **OUT OF SCOPE** — deliberately not answered here.
+
+The distinction is the point of the spike. One configuration working while
+another fails does not by itself establish *why*, and an implementation built
+on a mislabelled inference inherits a constraint nobody measured.
 
 ## Context
 
@@ -43,17 +53,41 @@ what shape the work takes.
    wrongly called that success; it did not. This version requires the **child's
    own** output to arrive through the pty.)
 
-3. **The load-bearing requirement: the host must present CONSOLE std handles.**
-   ConPTY reassigns the child's std handles to the pty only when the host's std
-   handles are console handles. Under pipe stdio (cargo test, mintty, a service)
-   the child otherwise inherits the parent's **pipe** and never touches the pty —
-   this is exactly why the first attempt saw only init bytes. The probe's host
-   acquires a real console first (`FreeConsole` → `AllocConsole` → repoint
-   std handles to `CONOUT$`/`CONIN$`); because that mutates process-global
-   console state it runs in a **separate subprocess**, leaving the test process
-   untouched. A real `newt.exe` run interactively already owns a console; when
-   its stdout is redirected the cockpit does not engage anyway (`is_terminal()`
-   is false → classic path).
+3. **Under pipe stdio and no console, the child's output does NOT reach the
+   pty — it leaks to the inherited pipes (`probe_c`).** This is the
+   discriminating experiment for #2, not a restatement of it: `probe_c` runs the
+   *identical* host path with the console acquisition removed, from a parent
+   whose std handles are pipes (`cargo test` stdio). Creation is already the
+   controlled kind — `bInheritHandles = FALSE`, a zeroed `STARTUPINFOEXW` (so
+   **no `STARTF_USESTDHANDLES`** and NULL `hStd*`), and
+   `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` as the only handle source — so the
+   console is the single remaining variable. Verbatim from Windows CI:
+
+   ```
+   NEWT_CONPTY_PROBE_C verdict=leaked header="allocated=false hr=0 created=1 child_exit=0"
+   NEWT_CONPTY_PROBE_C pty="\u{1b}[?9001h\u{1b}[?1004h\u{1b}[?25l…\u{1b}[2J\u{1b}[m\u{1b}[H…"
+   NEWT_CONPTY_PROBE_C host_stdio_has_markers=true
+   ```
+
+   The pseudoconsole was created (`hr=0`) and the child ran and exited cleanly
+   (`created=1 child_exit=0`), so the negative result is about handle routing,
+   not a broken setup. The pty carried **only conhost's init bytes** — no child
+   markers — while the child's stdout AND stderr markers appeared on the host's
+   inherited pipes. Two consequences worth stating separately: the child does
+   not get the pty, **and** its output escapes to whatever the parent's handles
+   point at, which any implementation must treat as an output-containment
+   failure, not merely a missing feature.
+
+   `probe_c` asserts this verdict rather than only printing it, so a future
+   Windows or toolchain that changes the behaviour fails the spike instead of
+   silently invalidating the ADR.
+
+   The probe's host acquires its console with `FreeConsole` → `AllocConsole` →
+   repoint std handles to `CONOUT$`/`CONIN$`; because that mutates
+   process-global console state it runs in a **separate subprocess**, leaving
+   the test process untouched. A real `newt.exe` run interactively already owns
+   a console; when its stdout is redirected the cockpit does not engage anyway
+   (`is_terminal()` is false → classic path).
 
 4. **The #1744 scanner is portable, verbatim.** `cockpit::ansi` compiles on
    Windows and parses the real ConPTY byte stream; its #3 DEC private-mode
@@ -61,6 +95,31 @@ what shape the work takes.
    `?1004`, cursor `?25`). The presenter geometry (`plan_insert`,
    `render_insert`, `resize_erase_from`) is pure `u16`/byte code over
    `crossterm` (cross-platform) — portable, though not extracted here.
+
+## INFERRED (supported, not isolated — do not cite as demonstrated)
+
+- **That a console is the only way to bind a ConPTY child's std handles.**
+  What is PROVEN is narrower: *the one alternative tested* — controlled creation
+  with no explicit std handles and no console — routes the child to the
+  inherited pipes instead of the pty. Configurations **not** tested, and
+  therefore not ruled out:
+  - passing ConPTY-derived handles explicitly via `STARTF_USESTDHANDLES`
+    (`CreatePseudoConsole` does not hand back child-side handles, so this needs
+    a different construction to even attempt);
+  - a host that already owns a console but whose std handles have been
+    redirected away from it;
+  - `ClosePseudoConsole`/attach-order variations.
+
+  The console requirement is therefore stated at the strength actually
+  demonstrated: **under the tested spawn configuration a console is required**.
+  If an implementation wants to avoid process-global console ownership, the
+  above are the specific experiments left to run — not a reason to assume it is
+  impossible.
+
+- **That the leak is inherent rather than a property of `bInheritHandles`
+  semantics.** The child received the parent's pipe handles even with
+  `bInheritHandles = FALSE`, which suggests ConPTY's own handle assignment is
+  the path — but that mechanism was observed, not instrumented.
 
 ## HYPOTHESIS (not demonstrated — for the implementation to settle)
 
@@ -96,14 +155,19 @@ scoped before any build.
 
 - **In-process self-capture: ruled out** (PROVEN #1).
 - **ConPTY child-hosting: viable** — the child's stdout/stderr genuinely
-  traverse the pty and it sees a terminal (PROVEN #2/#3).
+  traverse the pty and it sees a terminal (PROVEN #2), and the host must present
+  console std handles **for the spawn configuration tested** (PROVEN #3). That
+  a console is the ONLY such configuration is INFERRED, not proven; the
+  outstanding experiments are listed there. Prefer the narrowest construction
+  that passes them — process-global console ownership is a heavy commitment to
+  adopt on an inference.
 - **Reuse:** the `ansi` scanner and presenter geometry (PROVEN #4).
 - **Before any build:** scope the **minimum viable process boundary** (above)
   and decide whether cross-process `SurfaceRequest` IPC is actually required.
   Do not commit to session-as-child until that is settled.
 - Windows stays on the classic per-turn surface. **No behaviour change.**
 
-## Out of scope for this spike
+## OUT OF SCOPE for this spike
 
 - Building the Windows cockpit (presenter/editor/scrollback over the pty).
 - The session/`SurfaceRequest` process-boundary rearchitecture.
