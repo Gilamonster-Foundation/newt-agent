@@ -464,6 +464,95 @@ def main(argv: list[str] | None = None) -> int:
 
 
 # ── self-test ───────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Roster constraints (the local-hardware rule, and the provenance rule)
+# ---------------------------------------------------------------------------
+
+
+def validate_roster(roster_path: str, results_path: str | None = None) -> list[str]:
+    """Check the roster's two standing constraints. Returns a list of problems.
+
+    **The local rule.** Every ``roster`` entry must be ``lane: "local"`` — a model
+    that runs on hardware we own. Paid/remote models belong in
+    ``special_occasions`` and are run rarely and deliberately. A roster that
+    quietly mixes the two measures something other than what it claims, and the
+    resulting table is not readable as either result.
+
+    **The provenance rule.** Every model that has ever produced a result must
+    still be *accounted for* somewhere — roster, special_occasions, or retired.
+    Results themselves are never at risk (``bench-results.jsonl`` is append-only
+    and the scoreboard is built from records first, so a model dropped from the
+    roster keeps every published row). What this rule protects is the *decision*:
+    a model leaving the rotation has to be written down with a date and a reason,
+    rather than vanishing from the file with no trace of why.
+    """
+    problems: list[str] = []
+    try:
+        doc = json.load(open(roster_path))
+    except Exception as e:  # unreadable roster is itself the failure
+        return [f"roster {roster_path}: cannot parse: {e}"]
+
+    roster = doc.get("roster", [])
+    special = doc.get("special_occasions", {}).get("models", [])
+    retired = doc.get("retired", {}).get("models", [])
+
+    for e in roster:
+        m = e.get("model")
+        if not m:
+            problems.append("roster: entry with no `model`")
+            continue
+        if not e.get("family"):
+            problems.append(f"roster: {m} has no `family`")
+        lane = e.get("lane")
+        if lane != "local":
+            problems.append(
+                f"roster: {m} has lane={lane!r}; the roster is local-hardware only. "
+                "Move a paid/remote model to `special_occasions`."
+            )
+
+    # A model must not be in two places at once — that makes its status ambiguous.
+    seen: dict[str, str] = {}
+    for section, entries in (
+        ("roster", roster),
+        ("special_occasions", special),
+        ("retired", retired),
+    ):
+        for e in entries:
+            m = e.get("model")
+            if not m:
+                continue
+            if m in seen:
+                problems.append(f"{m}: listed in both {seen[m]} and {section}")
+            seen[m] = section
+
+    for e in retired:
+        m = e.get("model", "?")
+        if not e.get("reason"):
+            problems.append(f"retired: {m} has no `reason` — record why it left")
+        if not e.get("retired_on"):
+            problems.append(f"retired: {m} has no `retired_on` date")
+
+    # Provenance: nothing with a measured result may go unaccounted for.
+    if results_path and os.path.exists(results_path):
+        measured = set()
+        with open(results_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    measured.add(json.loads(line)["model"])
+                except Exception:
+                    continue  # a malformed line is the ingest path's problem
+        for m in sorted(measured - set(seen)):
+            problems.append(
+                f"{m}: has published results but appears in no roster section. "
+                "Add it to `retired` with a reason rather than dropping it silently."
+            )
+    return problems
+
+
 def _self_test() -> int:
     # Records with no `ocap` are OCAP-off (back-compat); `ocap: "on"` is the
     # confined lane. Each (model, lane) ratchets independently.
@@ -596,6 +685,51 @@ def _self_test() -> int:
         {"model": "m", "date": "2026-07-02", "mean_reward": 0.1},
     ]
     assert champions(tie)[("m", "off")]["date"] == "2026-07-02"
+
+    # ---- roster constraints -------------------------------------------------
+    import tempfile
+
+    def _probe(doc: dict, results: str | None = None) -> list[str]:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(doc, fh)
+            path = fh.name
+        return validate_roster(path, results)
+
+    # a remote model in the roster is the failure this rule exists to catch
+    bad = _probe({"roster": [{"model": "o4-mini", "family": "openai", "lane": "remote"}]})
+    assert any("local-hardware only" in p for p in bad), bad
+    # ...and it passes once it is where it belongs
+    ok = _probe(
+        {
+            "roster": [{"model": "m", "family": "f", "lane": "local"}],
+            "special_occasions": {"models": [{"model": "o4-mini", "family": "openai"}]},
+        }
+    )
+    assert ok == [], ok
+    # a model in two sections has an ambiguous status
+    dup = _probe(
+        {
+            "roster": [{"model": "m", "family": "f", "lane": "local"}],
+            "retired": {"models": [{"model": "m", "reason": "r", "retired_on": "d"}]},
+        }
+    )
+    assert any("both roster and retired" in p for p in dup), dup
+    # retiring without saying why defeats the point of recording it
+    why = _probe({"retired": {"models": [{"model": "m"}]}})
+    assert any("no `reason`" in p for p in why), why
+    # a measured model that vanished from every section is a silent drop
+    with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as rf:
+        rf.write(json.dumps({"model": "ghost", "family": "f"}) + "\n")
+        ghost_path = rf.name
+    ghost = _probe({"roster": [{"model": "m", "family": "f", "lane": "local"}]}, ghost_path)
+    assert any("ghost" in p and "no roster section" in p for p in ghost), ghost
+
+    # and the real roster in this repo must satisfy all of it.
+    live = validate_roster(ROSTER_DEFAULT, MANIFEST_DEFAULT)
+    if live:
+        for pr in live:
+            print(f"bench_scoreboard self-test FAIL: {pr}", file=sys.stderr)
+        return 1
 
     print("bench_scoreboard self-test: OK")
     return 0

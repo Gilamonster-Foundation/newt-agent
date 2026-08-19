@@ -1,60 +1,133 @@
 {
- "roster": [
-  {
-   "model": "nemotron-3-super",
-   "family": "nemotron"
+  "_README": [
+    "The benchmark roster: which models we owe runs for.",
+    "CONSTRAINT: every entry in `roster` must be lane=local \u2014 a model that runs on our own",
+    "hardware. Remote/paid models live in `special_occasions` and are run rarely and",
+    "deliberately. Enforced by `bench_scoreboard.py --self-test`, which `just check` runs.",
+    "PROVENANCE: this file is INTENT, not record. The record is bench-results.jsonl, which is",
+    "append-only and never edited. A model removed from `roster` keeps every published row,",
+    "because the scoreboard is built from results first and the roster only adds queued rows.",
+    "Removals are still written down in `retired` with a date and a reason \u2014 an eviction with",
+    "an address, not a deletion."
+  ],
+  "hardware": {
+    "name": "NVIDIA DGX Spark",
+    "unified_memory_gb": 128,
+    "note": "Personal box; every local-lane number is measured here and should be disclosed as such. Unified memory means nothing is memory-constrained \u2014 even a 120B at Q4 fits. Bandwidth is the binding constraint, so generation speed tracks bytes streamed per token: MoE beats dense at equal total size, and a lower quant roughly halves the bytes. Plan instance budgets from measured tokens/sec, never from parameter count."
   },
-  {
-   "model": "nemotron-3-ultra",
-   "family": "nemotron"
+  "constraint": {
+    "rule": "roster[].lane must be 'local'",
+    "why": "The claim is that the harness earns its place on hardware we own. A roster that quietly mixes in frontier API models measures something else, and the mixed table is not readable as either result.",
+    "enforced_by": "scripts/eval/bench_scoreboard.py --self-test (run by `just check`)"
   },
-  {
-   "model": "nemotron-3-nano_30b",
-   "family": "nemotron"
+  "roster": [
+    {
+      "model": "ornith-1.0-35b-q8",
+      "family": "ornith",
+      "lane": "local",
+      "isolates": "the incumbent \u2014 bound scoreboard rows already exist; known conformance=no_tools"
+    },
+    {
+      "model": "devstral-small-2_24b",
+      "family": "mistral",
+      "lane": "local",
+      "isolates": "purpose-built agentic coder \u2014 the fairest test of whether the machinery adds value or compensates"
+    },
+    {
+      "model": "qwen3-coder_30b",
+      "family": "qwen",
+      "lane": "local",
+      "isolates": "competent native tool calling; the mid-point of the conformance range"
+    },
+    {
+      "model": "nemotron-3-nano_30b",
+      "family": "nemotron",
+      "lane": "local",
+      "isolates": "NVIDIA lineage at matched size; A3B MoE, so likely the FASTEST here and the right iteration model"
+    },
+    {
+      "model": "granite4.1_30b",
+      "family": "granite",
+      "lane": "local",
+      "isolates": "IBM lineage \u2014 guards against a result that is really a Qwen/Mistral/NVIDIA monoculture artifact"
+    },
+    {
+      "model": "qwen2.5-coder_14b",
+      "family": "qwen",
+      "lane": "local",
+      "isolates": "weak-model control: the harness advantage should be LARGEST here, and it is cheapest to iterate on"
+    },
+    {
+      "model": "nemotron-3-super",
+      "family": "nemotron",
+      "lane": "local",
+      "isolates": "strong-model control: does the advantage shrink as capability rises? A12B, so cheaper per token than '120B' suggests",
+      "router_id_hint": "nemotron-3-super_120b"
+    }
+  ],
+  "special_occasions": {
+    "_why": "Paid/remote models. Tokens are Shawn's, so these run rarely and on purpose \u2014 a release, a claim worth checking against a frontier reference, or a result that looks too good. They are NOT part of the regular rotation and must never enter `roster`; their numbers are a reference point, not an own-hardware result, and must be labelled as such.",
+    "models": [
+      {
+        "model": "deepseek-v4-pro",
+        "family": "deepseek",
+        "lane": "remote"
+      },
+      {
+        "model": "o4-mini",
+        "family": "openai",
+        "lane": "remote"
+      },
+      {
+        "model": "gpt-4.1-mini",
+        "family": "openai",
+        "lane": "remote"
+      },
+      {
+        "model": "gpt-oss_120b",
+        "family": "openai",
+        "lane": "remote"
+      },
+      {
+        "model": "kimi-k2.7-code",
+        "family": "kimi",
+        "lane": "remote"
+      }
+    ]
   },
-  {
-   "model": "deepseek-v4-pro",
-   "family": "deepseek"
-  },
-  {
-   "model": "kimi-k2.7-code",
-   "family": "kimi"
-  },
-  {
-   "model": "kimi-linear_48b",
-   "family": "kimi"
-  },
-  {
-   "model": "gpt-oss_120b",
-   "family": "openai"
-  },
-  {
-   "model": "o4-mini",
-   "family": "openai"
-  },
-  {
-   "model": "gpt-4.1-mini",
-   "family": "openai"
-  },
-  {
-   "model": "ornith-1.0-35b-q8",
-   "family": "ornith"
-  },
-  {
-   "model": "ornith-1.0-397b-iq1_m",
-   "family": "ornith"
-  },
-  {
-   "model": "qwen3.6_35b",
-   "family": "qwen"
-  },
-  {
-   "model": "qwen3-coder_30b",
-   "family": "qwen"
-  },
-  {
-   "model": "glm-4.7-flash",
-   "family": "glm"
+  "retired": {
+    "_why": "Removed from the active rotation. Their published results STAND \u2014 bench-results.jsonl is untouched and the scoreboard still renders them, because it is built from results first. This section exists so the decision to stop running them is itself provenanced.",
+    "models": [
+      {
+        "model": "qwen3.6_35b",
+        "family": "qwen",
+        "retired_on": "2026-08-19",
+        "reason": "superseded by qwen3-coder_30b in the focused diversity set; results stand"
+      },
+      {
+        "model": "glm-4.7-flash",
+        "family": "glm",
+        "retired_on": "2026-08-19",
+        "reason": "narrowed to one model per family for the head-to-head; results stand"
+      },
+      {
+        "model": "kimi-linear_48b",
+        "family": "kimi",
+        "retired_on": "2026-08-19",
+        "reason": "narrowed to one model per family for the head-to-head; results stand"
+      },
+      {
+        "model": "nemotron-3-ultra",
+        "family": "nemotron",
+        "retired_on": "2026-08-19",
+        "reason": "never run; two nemotron slots is enough diversity for one family"
+      },
+      {
+        "model": "ornith-1.0-397b-iq1_m",
+        "family": "ornith",
+        "retired_on": "2026-08-19",
+        "reason": "never run; IQ1_M quality is its own experiment, not a harness comparison"
+      }
+    ]
   }
- ]
 }
