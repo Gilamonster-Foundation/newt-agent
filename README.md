@@ -42,10 +42,10 @@ _Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotoni
 <!-- BENCH-SCOREBOARD:END -->
 
 **Full results** — every model including those still queued, per-run provenance,
-and the harness methodology — are published by
-[gilamonster-bench](https://github.com/Gilamonster-Foundation/gilamonster-bench),
-a separate instrument that has no dependency on newt. If the ruler shipped with
-the thing it measures, one commit could move both at once. For how these
+and the harness methodology — are produced by a **separate instrument that has no
+dependency on newt**. If the ruler shipped with the thing it measures, one commit
+could move both at once. That instrument is not currently published; the numbers
+above are the part that is. For how these
 particular numbers were kept honest — including the runs thrown out — see the
 [DGX Spark capability survey](./docs/findings/2026-07-29-dgx-spark-terminal-bench-survey.md).
 
@@ -149,7 +149,7 @@ behave inside a harness.
 | What | Where |
 |---|---|
 | Setup beyond the quick start | [`docs/guide/setup.md`](./docs/guide/setup.md) |
-| Benchmark results & methodology | [gilamonster-bench](https://github.com/Gilamonster-Foundation/gilamonster-bench) |
+| Benchmark results & methodology | the scoreboard above; the scoring instrument is maintained separately and is not currently published |
 | Forward plan | [`ROADMAP.md`](./ROADMAP.md) (issue numbers are the live state) |
 | Release history | [`CHANGELOG.md`](./CHANGELOG.md) |
 | Design docs & studies | [`docs/design/`](./docs/design/) |
