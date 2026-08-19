@@ -324,6 +324,15 @@ jobs:
         # tests on Windows too (the websocket/TLS stack must build there).
         if: always()
         run: cargo test --workspace --features newt-data/kernel
+      # The #1746 ConPTY spike's whole product is EVIDENCE, and libtest captures
+      # stdout on success — so the probes' verdict lines never reach the log in
+      # the workspace test above. Re-run just those probes with --nocapture so
+      # the ADR can quote a real CI transcript instead of a local claim. Cheap:
+      # the binaries are already built.
+      - name: ConPTY feasibility probe evidence (#1746)
+        if: always()
+        run: |
+          cargo test -p newt-tui --features rich-tui cockpit::conpty_probe -- --nocapture --test-threads=1
       - name: Windows AppContainer evidence
         if: always()
         env:

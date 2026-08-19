@@ -45,6 +45,23 @@ getrandom.workspace = true
 # feature adds only this one crate.
 tui-textarea = { version = "0.7.0", optional = true }
 
+# #1746 Windows-cockpit feasibility spike (docs/decisions/windows_cockpit_conpty.md):
+# raw Win32 bindings for the ConPTY probes (CreatePseudoConsole + a child hosted
+# under it, and the pipe-is-not-a-console counter-probe). Same crate + version
+# newt-core already uses for its Windows appcontainer path, so it costs the
+# Windows build nothing new. Only the `#[cfg(all(windows, feature = "rich-tui"))]`
+# probe module consumes it.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 [features]
 # TTY-only active-tool viewport (#1235). It has no dependency cost, but remains
 # independently severable from headless/wyvern builds.

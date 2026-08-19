@@ -99,8 +99,11 @@ mod backend_panel;
 mod vi;
 // #1669: the cockpit — the terminal owned by the UI thread for the whole
 // session, editor mounted while a turn runs, session output relayed through a
-// pty. Rich + unix: the fd capture is `dup2`/`openpty`.
-#[cfg(all(unix, feature = "rich-tui"))]
+// pty. The live presenter is unix (fd capture via `dup2`/`openpty`); the module
+// itself compiles on Windows too so the platform-agnostic scanner (`ansi`) and
+// the #1746 ConPTY feasibility probe can live beside it — see
+// `docs/decisions/windows_cockpit_conpty.md`.
+#[cfg(feature = "rich-tui")]
 mod cockpit;
 // The opt-in mouse-capture RAII guard + panic-hook release (#1303). Compiled
 // only when an interactive surface is on — the wyvern/lean build never links it.

@@ -26,11 +26,31 @@
 //! constructed under the cockpit in v1. The tool spinner (#1727) covers
 //! liveness for them.
 
+// Platform-agnostic: the byte scanner (stream model, DEC-mode allowlist, UTF-8
+// boundary carry) has no OS dependency and is reused by the Windows-cockpit
+// feasibility work (#1746). On Windows it is exercised by `conpty_probe`'s tests
+// but has no live presenter consuming it yet, so its items read as dead there.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) mod ansi;
-pub(crate) mod presenter;
 
+// The live cockpit — the fd 1/2 capture and the real-terminal presenter — is
+// unix-only: it is built on `openpty`/`dup2`/termios. Windows keeps the classic
+// per-turn surface until a ConPTY backend lands (#1746).
+#[cfg(unix)]
+pub(crate) mod presenter;
+#[cfg(unix)]
 pub(crate) mod pty;
-#[cfg(test)]
+// The cockpit's test terminal is `openpty`/termios too, so it follows `pty`
+// onto unix only. Without this the spike's relaxed module gate (below) would
+// pull it into the Windows build, where it cannot compile.
+#[cfg(all(test, unix))]
 pub(crate) mod test_tty;
 
+#[cfg(unix)]
 pub(crate) use presenter::Presenter;
+
+// #1746 feasibility spike: does ConPTY let a Windows cockpit do what the unix
+// pty capture does? Two probes, run on Windows CI. See the module and
+// `docs/decisions/windows_cockpit_conpty.md`.
+#[cfg(windows)]
+mod conpty_probe;
