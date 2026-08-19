@@ -88,6 +88,15 @@ pub(crate) enum SurfaceRequest {
     },
     SetBackgroundJobs(Vec<BackgroundJob>),
     SetTabs(Vec<crate::tab_bar::TabCell>),
+    /// #1669 cockpit: a turn is starting; these are the flags the session
+    /// races its work against, so the terminal can trip them from Ctrl-C.
+    /// A surface that does not read keys during a turn ignores this.
+    TurnStarted {
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        hard: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
+    /// The turn is over: whatever Ctrl-C meant, it means nothing now.
+    TurnEnded,
 }
 
 impl SurfaceRequest {
@@ -217,6 +226,18 @@ impl crate::chat::InputSurface for RemoteSurface {
     fn set_tabs(&mut self, tabs: Vec<crate::tab_bar::TabCell>) {
         self.notify(SurfaceRequest::SetTabs(tabs));
     }
+
+    fn turn_started(
+        &mut self,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        hard: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.notify(SurfaceRequest::TurnStarted { cancel, hard });
+    }
+
+    fn turn_ended(&mut self) {
+        self.notify(SurfaceRequest::TurnEnded);
+    }
 }
 
 /// Serve one session's surface requests on the thread that owns the terminal.
@@ -253,6 +274,8 @@ pub(crate) fn pump_surface(
             } => surface.set_runtime_context(&model, &endpoint, gauge, &session),
             SurfaceRequest::SetBackgroundJobs(jobs) => surface.set_background_jobs(jobs),
             SurfaceRequest::SetTabs(tabs) => surface.set_tabs(tabs),
+            SurfaceRequest::TurnStarted { cancel, hard } => surface.turn_started(cancel, hard),
+            SurfaceRequest::TurnEnded => surface.turn_ended(),
         }
     }
 }
@@ -534,7 +557,7 @@ mod tests {
     /// one forwarding impl and the count drops — the exact failure that
     /// shipped a silent no-op the first time.
     ///
-    /// If you add an eighth method to `InputSurface`, this test fails until
+    /// If you add a tenth method to `InputSurface`, this test fails until
     /// the proxy forwards it. That is the point; do not relax the count.
     #[test]
     fn the_proxy_forwards_every_surface_method() {
@@ -554,12 +577,15 @@ mod tests {
             surface.save_history();
             surface.reload().expect("served");
             surface.read_line("› ").expect("served");
+            let flag = || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            surface.turn_started(flag(), flag());
+            surface.turn_ended();
         }
 
         let seen = served.join().expect("terminal thread");
         assert_eq!(
             seen.observed(),
-            7,
+            9,
             "every InputSurface method must cross the proxy; missing: {:?}",
             seen.missing()
         );
@@ -575,10 +601,12 @@ mod tests {
         runtime_context: usize,
         background_jobs: usize,
         tabs: usize,
+        turn_started: usize,
+        turn_ended: usize,
     }
 
     impl CountingSurface {
-        fn each(&self) -> [(&'static str, usize); 7] {
+        fn each(&self) -> [(&'static str, usize); 9] {
             [
                 ("read_line", self.read_line),
                 ("add_history", self.add_history),
@@ -587,6 +615,8 @@ mod tests {
                 ("set_runtime_context", self.runtime_context),
                 ("set_background_jobs", self.background_jobs),
                 ("set_tabs", self.tabs),
+                ("turn_started", self.turn_started),
+                ("turn_ended", self.turn_ended),
             ]
         }
         fn observed(&self) -> usize {
@@ -624,6 +654,16 @@ mod tests {
         }
         fn set_tabs(&mut self, _tabs: Vec<crate::tab_bar::TabCell>) {
             self.tabs += 1;
+        }
+        fn turn_started(
+            &mut self,
+            _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            _hard: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) {
+            self.turn_started += 1;
+        }
+        fn turn_ended(&mut self) {
+            self.turn_ended += 1;
         }
     }
 

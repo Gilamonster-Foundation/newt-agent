@@ -984,6 +984,18 @@ pub(crate) trait InputSurface {
     /// still compiling. `session_worker::tests::the_proxy_forwards_every_
     /// surface_method` exists to make that fail loudly instead.
     fn set_tabs(&mut self, _tabs: Vec<crate::tab_bar::TabCell>) {}
+    /// #1669 cockpit: a turn is starting, and these are the flags it races
+    /// its work against. A surface that reads the keyboard WHILE a turn runs
+    /// (the cockpit) trips them from Ctrl-C; every other surface leaves the
+    /// keyboard to the session's own watcher and ignores this.
+    fn turn_started(
+        &mut self,
+        _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _hard: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+    }
+    /// The turn is over: whatever Ctrl-C meant, it means nothing now.
+    fn turn_ended(&mut self) {}
 }
 
 pub(crate) fn run_chat(
@@ -1046,18 +1058,45 @@ pub(crate) fn run_chat(
             // #1674 palette's gating test pins exactly this composition.
             if rich_surface_selected(footer_mode(), io::stdout().is_terminal()) {
                 surface_is_rich = true;
-                Box::new(rich_input::RichSurface::new(history_path)?)
+                Box::new(rich_input::RichSurface::new(history_path.clone())?)
             } else {
                 surface_is_rich = false;
-                Box::new(lean_input::LeanSurface::new(history_path)?)
+                Box::new(lean_input::LeanSurface::new(history_path.clone())?)
             }
         }
         #[cfg(not(feature = "rich-tui"))]
         {
             surface_is_rich = false;
-            Box::new(lean_input::LeanSurface::new(history_path)?)
+            Box::new(lean_input::LeanSurface::new(history_path.clone())?)
         }
     };
+    // #1669 cockpit: on the rich surface, the terminal thread takes fd 1/2
+    // onto a pty and keeps the editor mounted across turns. Opened BEFORE the
+    // session is spawned so its first byte is already captured, and before
+    // `mark_fds_cloexec` so the pty master and the saved tty are marked too.
+    // Fails closed: any error and the classic per-turn surface runs instead.
+    #[cfg(all(unix, feature = "rich-tui"))]
+    let cockpit = if surface_is_rich && crate::cockpit::presenter::supported() {
+        // `surface` is a `Box<dyn InputSurface>` built above; the cockpit
+        // needs the concrete `RichSurface`, so build a second one from the
+        // same history path — it holds no state yet at this point.
+        match rich_input::RichSurface::new(history_path.clone())
+            .map_err(|e| io::Error::other(e.to_string()))
+            .and_then(crate::cockpit::Presenter::open)
+        {
+            Ok(p) => Some(p),
+            Err(err) => {
+                eprintln!("⚠ cockpit unavailable ({err}) — using the per-turn surface");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(all(unix, feature = "rich-tui"))]
+    let terminal_owns_turn = cockpit.is_some();
+    #[cfg(not(all(unix, feature = "rich-tui")))]
+    let terminal_owns_turn = false;
     // Mark all open fds (terminal, history file, sockets) as O_CLOEXEC so
     // subprocesses spawned by run_command don't inherit them. This is the
     // primary defence against EMFILE from cargo test / rustc worker floods.
@@ -1085,6 +1124,7 @@ pub(crate) fn run_chat(
                     prewarm,
                     rt,
                     surface_is_rich,
+                    terminal_owns_turn,
                     to_ui,
                 )
             })?;
@@ -1092,6 +1132,12 @@ pub(crate) fn run_chat(
         // Service the session until it drops its end — which happens when it
         // returns, after its teardown has had its last `save_history` served.
         // The pump ending IS the session ending; there is no second handshake.
+        #[cfg(all(unix, feature = "rich-tui"))]
+        match cockpit {
+            Some(presenter) => presenter.run(&from_session)?,
+            None => crate::session_worker::pump_surface(&mut *surface, &from_session),
+        }
+        #[cfg(not(all(unix, feature = "rich-tui")))]
         crate::session_worker::pump_surface(&mut *surface, &from_session);
 
         // Propagate a session panic rather than swallowing it into a silent
@@ -1120,6 +1166,11 @@ fn session_body(
     prewarm: Option<crate::Prewarm>,
     rt: tokio::runtime::Handle,
     surface_is_rich: bool,
+    // #1669 cockpit: the terminal thread reads the keyboard during turns and
+    // relays this thread's output. When true, this thread must not enter
+    // cbreak, spawn the keyboard watcher, or construct the cursor-relative
+    // renderers (live/completed spill) — see each site.
+    terminal_owns_turn: bool,
     to_ui: std::sync::mpsc::SyncSender<crate::session_worker::SurfaceRequest>,
 ) -> anyhow::Result<()> {
     // ENTER the runtime on this thread before anything else runs.
@@ -6645,9 +6696,17 @@ fn session_body(
                     // posture preset (meet-only), so `/posture` only tightens
                     // it when a permission floor is actually configured.
                     let exec_floor = exec_floor_from(&turn_caveats.exec, preset_clamp.is_some());
-                    let turn_cancel = std::sync::atomic::AtomicBool::new(false);
+                    // Shared with the terminal thread under the cockpit, which
+                    // trips them from Ctrl-C; the session reads them exactly as
+                    // it always did.
+                    let turn_cancel =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let turn_exit = std::sync::atomic::AtomicBool::new(false);
-                    let turn_hard = std::sync::atomic::AtomicBool::new(false);
+                    let turn_hard = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    // Paired with `turn_ended` right after the blocking call
+                    // below. A `?` between them ends the session, which ends
+                    // the terminal's turn state with it, so no guard is needed.
+                    surface.turn_started(turn_cancel.clone(), turn_hard.clone());
                     // Build the gate whenever the session has a usable TTY — NOT
                     // only when authorization prompting is on. `ask_question`
                     // (request_user_input) needs a present operator; permission
@@ -6669,7 +6728,7 @@ fn session_body(
                         verbose,
                         authorization_prompts_enabled: prompt_permissions_enabled,
                         web_decision_timeout: std::time::Duration::from_secs(4 * 60),
-                        cancel: Some(&turn_cancel),
+                        cancel: Some(&*turn_cancel),
                         exit: Some(&turn_exit),
                         ask_human: prompt_permission_choice
                             as fn(
@@ -6731,7 +6790,11 @@ fn session_body(
                             .map(|_| {
                                 std::cell::RefCell::new(newt_core::verify_gate::WriteLedger::new())
                             });
-                    let interruptible = io::stdin().is_terminal() && io::stdout().is_terminal();
+                    // Under the cockpit the terminal thread owns the keyboard
+                    // for the whole session: no cbreak, no watcher here.
+                    let interruptible = io::stdin().is_terminal()
+                        && io::stdout().is_terminal()
+                        && !terminal_owns_turn;
                     // (tool_offload_on / scratchpad_on resolved at the turn head.)
                     // Prompt artifacts observe repository identity for every
                     // inference turn, independent of roadmap binding. This is
@@ -6761,20 +6824,24 @@ fn session_body(
                     let committed_view =
                         committed_spill_lines(surface_is_rich, configured_spill_lines);
                     newt_core::set_spill_lines(committed_view);
+                    // Under the cockpit the live viewport is not constructed:
+                    // it paints with cursor motion the presenter drops by design
+                    // (v1). The tool spinner (#1727) covers liveness meanwhile.
                     #[cfg(feature = "live-spill")]
-                    let live_spill = (configured_spill_lines > 0 && live_spill_capable())
-                        .then_some(())
-                        .and_then(|()| {
-                            // #1410: `stdout` now returns the `Arc` itself —
-                            // registration with the line arbiter needs
-                            // `Arc<dyn Ephemeral>`, so the constructor owns the
-                            // wrapping rather than leaving it to each caller.
-                            crate::live_spill::LiveSpillRenderer::stdout(
-                                configured_spill_lines,
-                                color,
-                                completed_spills.clone(),
-                            )
-                        });
+                    let live_spill =
+                        (configured_spill_lines > 0 && live_spill_capable() && !terminal_owns_turn)
+                            .then_some(())
+                            .and_then(|()| {
+                                // #1410: `stdout` now returns the `Arc` itself —
+                                // registration with the line arbiter needs
+                                // `Arc<dyn Ephemeral>`, so the constructor owns the
+                                // wrapping rather than leaving it to each caller.
+                                crate::live_spill::LiveSpillRenderer::stdout(
+                                    configured_spill_lines,
+                                    color,
+                                    completed_spills.clone(),
+                                )
+                            });
                     // #1640 Layer 1 + review fix (#1663): publish the
                     // committed-result mode AFTER the live renderer exists,
                     // because the collapse's whole justification is "the
@@ -7028,7 +7095,7 @@ fn session_body(
                                         write_ledger: retry_ledger.as_ref(),
                                         attribution: Some(&attribution_ledger),
                                         // Esc-to-interrupt flag, tripped by the watcher.
-                                        cancel: Some(&turn_cancel),
+                                        cancel: Some(&*turn_cancel),
                                         #[cfg(feature = "live-spill")]
                                         live_tool_output: live_spill.as_ref().map(|spill| {
                                             spill.clone()
@@ -7083,6 +7150,8 @@ fn session_body(
                             })
                         },
                     );
+                    // #1669 cockpit: nothing cancellable remains past here.
+                    surface.turn_ended();
 
                     let elapsed = t0.elapsed();
                     erase_line();

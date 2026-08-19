@@ -989,7 +989,11 @@ fn note_rows(note: &str, width: usize) -> Vec<String> {
 /// cleared on submit. Continuation lines hang-indent by the SAME gutter the
 /// input used (default 1), so a multi-line prompt reads back exactly as typed
 /// rather than being re-flowed to a different indent on submit.
-fn echo_submitted(terminal: &mut Term, body: &str, gutter: Option<u16>) -> io::Result<()> {
+fn echo_submitted(
+    sink: &mut dyn ScrollbackSink,
+    body: &str,
+    gutter: Option<u16>,
+) -> io::Result<()> {
     let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let width = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80);
     let hang_cols = resolve_gutter(gutter, width) as usize;
@@ -1010,27 +1014,21 @@ fn echo_submitted(terminal: &mut Term, body: &str, gutter: Option<u16>) -> io::R
         };
         lines.push(Line::from(vec![prefix, Span::raw(row.text)]));
     }
-    let height = lines.len() as u16;
-    terminal.insert_before(height, move |buf| {
-        Paragraph::new(lines).render(buf.area, buf);
-    })
+    sink.insert(lines)
 }
 
 /// Print a note (one or more `\n`-separated lines, e.g. `:jumps`/`:help` output)
 /// into scrollback above the input region. Each line is WRAPPED to the terminal
 /// width (via `note_rows`) so a long note — e.g. a capability-denied diagnostic —
 /// carries onto continuation rows instead of being clipped at the right edge.
-fn echo_note(terminal: &mut Term, note: &str) -> io::Result<()> {
+fn echo_note(sink: &mut dyn ScrollbackSink, note: &str) -> io::Result<()> {
     let width = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80) as usize;
     let gray = Style::default().fg(Color::Gray);
     let lines: Vec<Line> = note_rows(note, width)
         .into_iter()
         .map(|seg| Line::from(Span::styled(seg, gray)))
         .collect();
-    let height = lines.len() as u16;
-    terminal.insert_before(height, move |buf| {
-        Paragraph::new(lines).render(buf.area, buf);
-    })
+    sink.insert(lines)
 }
 
 /// The default input surface on a TTY when the `rich-tui` feature is compiled
@@ -1097,6 +1095,61 @@ impl RichSurface {
         outcome
     }
 
+    /// The chrome the header/tab bar/background row draw from — everything
+    /// the surface knows that is not the editor's own state.
+    pub(crate) fn chrome(&self) -> Chrome<'_> {
+        Chrome {
+            model: &self.model,
+            endpoint: &self.endpoint,
+            gauge: self.gauge,
+            session: &self.session,
+            background_jobs: &self.background_jobs,
+            tabs: &self.tabs,
+        }
+    }
+
+    /// The history the editor recalls on ↑/↓: on disk plus this session's
+    /// not-yet-flushed entries, oldest first.
+    pub(crate) fn history(&self) -> Vec<String> {
+        let mut history = load_history(self.history_path.as_ref());
+        history.extend(self.unsaved.iter().cloned());
+        history
+    }
+
+    /// The editor mode, for the cockpit's persistently-mounted editor. The
+    /// classic per-turn `event_loop` reads `self.edit` directly, so this
+    /// accessor exists only for the unix cockpit — hence the `cfg`, without
+    /// which it is dead code on the Windows (classic-only) build.
+    #[cfg(unix)]
+    pub(crate) fn edit(&self) -> Edit {
+        self.edit
+    }
+
+    /// The gutter setting, for the cockpit (see [`RichSurface::edit`]).
+    #[cfg(unix)]
+    pub(crate) fn gutter(&self) -> Option<u16> {
+        self.gutter
+    }
+
+    /// The `:wq` arm: the surface remembers to end-and-quit on the NEXT read.
+    pub(crate) fn arm_end_quit(&self) {
+        self.pending_end_quit.set(true);
+    }
+
+    /// Consume the armed `:wq` (see `arm_end_quit`). The cockpit's `ReadLine`
+    /// handler checks this between turns; the classic surface consumes
+    /// `pending_end_quit` inline in its own `read`, so this accessor is
+    /// cockpit-only and would be dead code on the Windows classic-only build.
+    #[cfg(unix)]
+    pub(crate) fn take_end_quit(&self) -> bool {
+        self.pending_end_quit.replace(false)
+    }
+
+    /// The classic per-turn driver: an inline viewport that lives for ONE
+    /// read and is torn down on submit. The editor state it drives is the
+    /// same [`MountedEditor`] the cockpit keeps mounted across turns — this
+    /// is the pre-cockpit path (Windows, or a cockpit that failed to open),
+    /// kept as a thin loop around it rather than a second copy of it.
     fn event_loop(&self) -> io::Result<ReadOutcome> {
         let mut cur_h = 1u16;
         // A freshly built inline terminal has a blank back-buffer, so ratatui's
@@ -1106,83 +1159,19 @@ impl RichSurface {
         // resize starts clean.
         let mut terminal = make_terminal(cur_h)?;
         terminal.clear()?;
-        let mut textarea = new_textarea(self.edit);
         // Persistent-prompt phase 1: pre-fill anything typed while the last
         // turn ran (captured as type-ahead by the keyboard watcher) so nothing
         // the user typed is lost.
         let typed_ahead = crate::type_ahead::take();
-        if !typed_ahead.is_empty() {
-            textarea = textarea_with(self.edit, typed_ahead.trim_end_matches('\n'));
-        }
-        let mut editor = Editor::new(self.edit);
-        // ↑/↓ history recall (the rustyline behavior the rich surface had
-        // dropped): the on-disk history plus this session's not-yet-flushed
-        // entries, oldest first. `hist_pos == len` means "the fresh line"; `↑`
-        // walks backward into older entries, `↓` forward, restoring the stashed
-        // in-progress line at the end.
-        let mut history = load_history(self.history_path.as_ref());
-        history.extend(self.unsaved.iter().cloned());
-        let mut hist_pos = history.len();
-        let mut stash = String::new();
-        // The slash-command palette (#1674): pure per-turn state, fed by
-        // buffer edits below and rendered above the input row by `draw`.
-        // Opens on `/` at an empty prompt; filters as you type; ↑/↓ (C-p/C-n)
-        // move; Tab/Enter complete (never submit); Esc closes.
-        let mut palette = PaletteState::from_corpus();
-        // A `/` that arrived as TYPE-AHEAD (typed while the last turn ran)
-        // must open the palette exactly as a live keypress would — run the
-        // same buffer sync over the prefill (review of #1674). A longer
-        // prefilled `/cmd…` line follows the same rule as any non-`/` edit:
-        // it does not open the palette.
-        palette.on_buffer_change("", &textarea.lines().join("\n"));
+        let mut me = MountedEditor::new(
+            self.edit,
+            self.gutter,
+            self.history(),
+            typed_ahead.trim_end_matches('\n'),
+        );
         loop {
-            // Grow/shrink the inline viewport to the input. The prompt is always
-            // inline now — on the first row, either in a wide left gutter or as
-            // an overhang prefix — so it never needs a row of its own. The
-            // overhang path soft-wraps, so the height is the WRAPPED row count
-            // (not the logical-line count); the wide-gutter widget path is one
-            // row per logical line.
-            let term_w = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80);
-            // #531: a multi-line `:`-command reserves an extra bottom row.
-            let ex_extra = u16::from(ex_bottom_line(&editor, &textarea).is_some());
-            let rows = if resolve_gutter(self.gutter, term_w) >= GUTTER_W {
-                textarea.lines().len() as u16
-            } else {
-                let empty = buffer_is_empty(&textarea);
-                let prompt = prompt_line(&editor, ex_extra == 0);
-                overhang_rows(
-                    &prompt,
-                    textarea.lines(),
-                    textarea.cursor(),
-                    resolve_gutter(self.gutter, term_w),
-                    term_w,
-                    empty.then(|| editor.mode_hint()),
-                )
-                .0
-                .len() as u16
-            };
-            // #531 ex-bottom row + #527 status header row + an optional
-            // harness-background row all contribute to the inline viewport.
-            let background_extra =
-                u16::from(self.background_jobs.iter().any(BackgroundJob::is_running));
-            // #1669 PR-B: the tab bar is the LAST row of the inline region —
-            // bottom-anchored, below the background row. 0 rows for fewer than
-            // two tabs, which is what keeps the single-conversation surface
-            // byte-identical.
-            let tab_extra = crate::tab_bar::bar_rows(&self.tabs);
-            let base =
-                (rows + ex_extra).clamp(1, MAX_INPUT_ROWS) + 1 + background_extra + tab_extra;
-            // #1674: the palette viewport gets what the terminal can spare
-            // above the input (capped inside `viewport_rows`), never squeezing
-            // the input's own rows. 0 while closed → the height math (and the
-            // whole surface) is exactly the pre-palette shape.
-            let term_h = crossterm::terminal::size().map(|(_, r)| r).unwrap_or(24);
-            let pal_rows = palette.viewport_rows(term_h.saturating_sub(base + 1) as usize);
-            palette.set_viewport(pal_rows);
-            // Never ask for more rows than the terminal has: an inline
-            // viewport taller than the screen scrolls the whole surface into
-            // scrollback on every redraw.
-            let want = (base + pal_rows as u16).min(term_h.max(1));
+            let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+            let want = me.wanted_rows(term_w, term_h, &self.chrome());
             if want != cur_h {
                 // Blank the CURRENT region before resizing. ratatui reserves
                 // space for a taller inline viewport by scrolling whatever is on
@@ -1194,136 +1183,347 @@ impl RichSurface {
                 terminal.clear()?;
                 cur_h = want;
             }
-            terminal.draw(|f| {
-                draw(
-                    f,
-                    &textarea,
-                    &editor,
-                    self.gutter,
-                    RichStatus {
-                        tabs: &self.tabs,
-                        model: &self.model,
-                        endpoint: &self.endpoint,
-                        gauge: self.gauge,
-                        session: &self.session,
-                        background_jobs: &self.background_jobs,
-                        palette: Some(&palette),
-                    },
-                );
-            })?;
+            terminal.draw(|f| me.draw(f, self.chrome()))?;
 
             // 250ms timeout drives the live clock when idle.
             if !event::poll(Duration::from_millis(250))? {
                 continue;
             }
             let evt = event::read()?;
-            // Bracketed paste: insert the whole block at the cursor — newlines
-            // become real line breaks in the buffer, and NOTHING is submitted
-            // (only an explicit Enter keypress submits). Normalize CRLF/CR so a
-            // paste from any platform lands as clean `\n` lines.
-            if let Event::Paste(text) = evt {
-                let before = textarea.lines().join("\n");
-                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                textarea.insert_str(normalized);
-                // A paste can open the palette only as a literal lone `/`;
-                // pasting anything into an open palette re-filters or (multi-
-                // line / slash gone) closes it.
-                palette.on_buffer_change(&before, &textarea.lines().join("\n"));
-                continue;
-            }
-            let Event::Key(key) = evt else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            // #1674: the palette sees every key FIRST (before history recall,
-            // so ↑/↓ move the highlight, not the history). The decision is
-            // the pure `palette_step` — the loop only acts on its verdict, so
-            // the interception contracts are unit-tested in palette.rs.
-            match palette_step(&mut palette, &key) {
-                PaletteStep::Swallowed => continue,
-                PaletteStep::CompleteTo(text) => {
-                    // A COMPLETION into the prompt — never a submit.
-                    textarea = textarea_with(self.edit, &text);
-                    continue;
-                }
-                PaletteStep::PassThrough => {}
-            }
-            // History recall on ↑/↓ — but only at a vertical edge of the buffer
-            // (top row for ↑, bottom row for ↓) so multi-line cursor movement
-            // still works, and never while a `:` ex-line or `[y/N]` confirm is
-            // open. Plain arrows only (modified arrows fall through to editing).
-            if matches!(key.code, KeyCode::Up | KeyCode::Down)
-                && key.modifiers.is_empty()
-                && editor.ex().is_none()
-                && editor.confirm_prompt().is_none()
-                && !history.is_empty()
-            {
-                let (row, _) = textarea.cursor();
-                let last_row = textarea.lines().len().saturating_sub(1);
-                let at_edge = (key.code == KeyCode::Up && row == 0)
-                    || (key.code == KeyCode::Down && row == last_row);
-                if at_edge {
-                    let up = key.code == KeyCode::Up;
-                    if let Some(next) = history_step(hist_pos, history.len(), up) {
-                        // Stash the in-progress line when first leaving it.
-                        if hist_pos == history.len() {
-                            stash = textarea.lines().join("\n");
-                        }
-                        hist_pos = next;
-                        let content = if hist_pos == history.len() {
-                            stash.clone()
-                        } else {
-                            history[hist_pos].clone()
-                        };
-                        textarea = textarea_with(self.edit, &content);
-                    }
-                    continue;
-                }
-            }
-            let before = textarea.lines().join("\n");
-            let step = editor.input(key, &mut textarea);
-            // A command (e.g. `:jumps`) may have queued a note to print above the
-            // input region, into real scrollback.
-            if let Some(note) = editor.take_msg() {
-                echo_note(&mut terminal, &note)?;
-            }
-            match step {
-                Step::Continue => {
-                    // #1674: track the edit — `/` typed at an empty prompt
-                    // opens the palette; edits re-filter it; backspacing the
-                    // leading `/` (or clearing the line) closes it.
-                    palette.on_buffer_change(&before, &textarea.lines().join("\n"));
-                }
-                Step::Submit => {
-                    let body = textarea.lines().join("\n");
-                    if body.trim().is_empty() {
-                        continue;
-                    }
-                    echo_submitted(&mut terminal, &body, self.gutter)?;
-                    return Ok(ReadOutcome::Line(body));
-                }
-                Step::SubmitQuit => {
-                    let body = textarea.lines().join("\n");
-                    // `:wq` on an empty buffer has nothing to send — treat it
-                    // as a plain `:q` (end + quit, no turn).
-                    if body.trim().is_empty() {
-                        return Ok(ReadOutcome::EndAndQuit);
-                    }
-                    echo_submitted(&mut terminal, &body, self.gutter)?;
+            match me.on_event(evt, &mut terminal)? {
+                None => {}
+                Some(EditorOutcome::Line(body)) => return Ok(ReadOutcome::Line(body)),
+                Some(EditorOutcome::LineThenQuit(body)) => {
                     // Submit this turn now; the end-and-quit fires on the NEXT
                     // read once the turn has run to completion.
-                    self.pending_end_quit.set(true);
+                    self.arm_end_quit();
                     return Ok(ReadOutcome::Line(body));
                 }
-                // #1669 16.3: a tab motion leaves the editor immediately —
-                // it is not an edit, and the session owns what happens next.
-                // The buffer is left intact so the draft survives the switch.
-                Step::Tab(action) => return Ok(ReadOutcome::Tab(action)),
-                Step::Eof => return Ok(ReadOutcome::Eof),
+                Some(EditorOutcome::EndAndQuit) => return Ok(ReadOutcome::EndAndQuit),
+                Some(EditorOutcome::Tab(action)) => return Ok(ReadOutcome::Tab(action)),
+                Some(EditorOutcome::Eof) => return Ok(ReadOutcome::Eof),
             }
         }
+    }
+}
+
+/// Everything the header, tab bar and background row draw from. Borrowed from
+/// the surface per frame; the editor never stores it.
+#[derive(Clone, Copy)]
+pub(crate) struct Chrome<'a> {
+    pub(crate) model: &'a str,
+    pub(crate) endpoint: &'a str,
+    pub(crate) gauge: Option<(u32, u32)>,
+    pub(crate) session: &'a str,
+    pub(crate) background_jobs: &'a [BackgroundJob],
+    pub(crate) tabs: &'a [crate::tab_bar::TabCell],
+}
+
+/// Where the editor's committed lines go — the scrollback above the input.
+///
+/// The classic inline viewport implements this with ratatui's `insert_before`;
+/// the cockpit implements it with its own insert, because `insert_before` is a
+/// **silent no-op** on the `Fixed` viewport the cockpit uses (ratatui returns
+/// `Ok(())` for anything but `Inline`) — a "compiles clean and does nothing"
+/// trap this seam exists to keep out of the call sites.
+pub(crate) trait ScrollbackSink {
+    fn insert(&mut self, lines: Vec<Line<'static>>) -> io::Result<()>;
+}
+
+impl ScrollbackSink for Term {
+    fn insert(&mut self, lines: Vec<Line<'static>>) -> io::Result<()> {
+        let height = lines.len() as u16;
+        self.insert_before(height, move |buf| {
+            Paragraph::new(lines).render(buf.area, buf);
+        })
+    }
+}
+
+/// What one event did, when it did something the driver must act on.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EditorOutcome {
+    /// A submitted line.
+    Line(String),
+    /// `:wq`: submit this line, and end-and-quit on the read after it.
+    LineThenQuit(String),
+    /// `:wq` on an empty buffer — nothing to send; end and quit now.
+    EndAndQuit,
+    /// A tab motion (`gt` …) — the session owns what happens next.
+    Tab(crate::tabs::TabAction),
+    /// Ctrl-D on an empty buffer, or the mode-idiomatic exit.
+    Eof,
+}
+
+/// The editor as it stands between events — what the per-turn loop used to
+/// keep as locals, lifted so it can stay MOUNTED across turns (#1669: the
+/// cockpit) as well as be driven for one read at a time.
+///
+/// Owns no terminal and no chrome. It computes the rows it needs, draws into
+/// whatever frame it is handed, and turns events into [`EditorOutcome`]s; the
+/// two drivers differ only in what they wrap around those three calls.
+pub(crate) struct MountedEditor {
+    edit: Edit,
+    gutter: Option<u16>,
+    textarea: TextArea<'static>,
+    editor: Editor,
+    /// ↑/↓ history recall (the rustyline behavior the rich surface had
+    /// dropped): oldest first. `hist_pos == len` means "the fresh line"; `↑`
+    /// walks backward into older entries, `↓` forward, restoring the stashed
+    /// in-progress line at the end.
+    history: Vec<String>,
+    hist_pos: usize,
+    stash: String,
+    /// The slash-command palette (#1674): fed by buffer edits, rendered above
+    /// the input row by `draw`. Opens on `/` at an empty prompt; filters as
+    /// you type; ↑/↓ (C-p/C-n) move; Tab/Enter complete (never submit); Esc
+    /// closes.
+    palette: PaletteState,
+}
+
+impl MountedEditor {
+    pub(crate) fn new(
+        edit: Edit,
+        gutter: Option<u16>,
+        history: Vec<String>,
+        prefill: &str,
+    ) -> Self {
+        let textarea = if prefill.is_empty() {
+            new_textarea(edit)
+        } else {
+            textarea_with(edit, prefill)
+        };
+        let hist_pos = history.len();
+        let mut palette = PaletteState::from_corpus();
+        // A `/` that arrived as a PREFILL (typed while the last turn ran) must
+        // open the palette exactly as a live keypress would — run the same
+        // buffer sync over it (review of #1674). A longer prefilled `/cmd…`
+        // line follows the same rule as any non-`/` edit: it does not open.
+        palette.on_buffer_change("", &textarea.lines().join("\n"));
+        Self {
+            edit,
+            gutter,
+            textarea,
+            editor: Editor::new(edit),
+            history,
+            hist_pos,
+            stash: String::new(),
+            palette,
+        }
+    }
+
+    /// Replace the history (a `/vi`·`/emacs` reload rebuilds the editor; the
+    /// cockpit refreshes after each `add_history`). Only the cockpit keeps an
+    /// editor mounted long enough to mutate its history in place — the classic
+    /// loop rebuilds per turn — so this is `cfg(unix)` to stay off the dead-code
+    /// list on the Windows classic-only build.
+    #[cfg(unix)]
+    pub(crate) fn set_history(&mut self, history: Vec<String>) {
+        self.hist_pos = history.len();
+        self.history = history;
+    }
+
+    /// The current draft, for a driver that must keep it across a rebuild.
+    /// Cockpit-only (the classic loop never rebuilds a live editor); see
+    /// [`MountedEditor::set_history`].
+    #[cfg(unix)]
+    pub(crate) fn draft(&self) -> String {
+        self.textarea.lines().join("\n")
+    }
+
+    /// The rows the whole inline region needs at this size: the input rows,
+    /// the ex-line row, the header, an optional background row, the tab bar
+    /// and the palette viewport — clamped to the terminal height, because an
+    /// inline region taller than the screen scrolls the whole surface into
+    /// scrollback on every redraw. Also sizes the palette viewport.
+    pub(crate) fn wanted_rows(&mut self, term_w: u16, term_h: u16, chrome: &Chrome<'_>) -> u16 {
+        // The prompt is always inline — on the first row, either in a wide
+        // left gutter or as an overhang prefix — so it never needs a row of
+        // its own. The overhang path soft-wraps, so the height is the WRAPPED
+        // row count (not the logical-line count); the wide-gutter widget path
+        // is one row per logical line.
+        // #531: a multi-line `:`-command reserves an extra bottom row.
+        let ex_extra = u16::from(ex_bottom_line(&self.editor, &self.textarea).is_some());
+        let rows = if resolve_gutter(self.gutter, term_w) >= GUTTER_W {
+            self.textarea.lines().len() as u16
+        } else {
+            let empty = buffer_is_empty(&self.textarea);
+            let prompt = prompt_line(&self.editor, ex_extra == 0);
+            overhang_rows(
+                &prompt,
+                self.textarea.lines(),
+                self.textarea.cursor(),
+                resolve_gutter(self.gutter, term_w),
+                term_w,
+                empty.then(|| self.editor.mode_hint()),
+            )
+            .0
+            .len() as u16
+        };
+        // #531 ex-bottom row + #527 status header row + an optional
+        // harness-background row all contribute to the inline viewport.
+        let background_extra =
+            u16::from(chrome.background_jobs.iter().any(BackgroundJob::is_running));
+        // #1669 PR-B: the tab bar is the LAST row of the inline region —
+        // bottom-anchored, below the background row. 0 rows for fewer than
+        // two tabs, which is what keeps the single-conversation surface
+        // byte-identical.
+        let tab_extra = crate::tab_bar::bar_rows(chrome.tabs);
+        let base = (rows + ex_extra).clamp(1, MAX_INPUT_ROWS) + 1 + background_extra + tab_extra;
+        // #1674: the palette viewport gets what the terminal can spare
+        // above the input (capped inside `viewport_rows`), never squeezing
+        // the input's own rows. 0 while closed → the height math (and the
+        // whole surface) is exactly the pre-palette shape.
+        let pal_rows = self
+            .palette
+            .viewport_rows(term_h.saturating_sub(base + 1) as usize);
+        self.palette.set_viewport(pal_rows);
+        (base + pal_rows as u16).min(term_h.max(1))
+    }
+
+    pub(crate) fn draw(&self, f: &mut Frame, chrome: Chrome<'_>) {
+        draw(
+            f,
+            &self.textarea,
+            &self.editor,
+            self.gutter,
+            RichStatus {
+                tabs: chrome.tabs,
+                model: chrome.model,
+                endpoint: chrome.endpoint,
+                gauge: chrome.gauge,
+                session: chrome.session,
+                background_jobs: chrome.background_jobs,
+                palette: Some(&self.palette),
+            },
+        );
+    }
+
+    /// Feed one terminal event. `Some` when the driver must act; `None` when
+    /// the editor absorbed it (a redraw is always due afterwards).
+    pub(crate) fn on_event(
+        &mut self,
+        evt: Event,
+        sink: &mut dyn ScrollbackSink,
+    ) -> io::Result<Option<EditorOutcome>> {
+        // Bracketed paste: insert the whole block at the cursor — newlines
+        // become real line breaks in the buffer, and NOTHING is submitted
+        // (only an explicit Enter keypress submits). Normalize CRLF/CR so a
+        // paste from any platform lands as clean `\n` lines.
+        if let Event::Paste(text) = evt {
+            let before = self.textarea.lines().join("\n");
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            self.textarea.insert_str(normalized);
+            // A paste can open the palette only as a literal lone `/`;
+            // pasting anything into an open palette re-filters or (multi-
+            // line / slash gone) closes it.
+            self.palette
+                .on_buffer_change(&before, &self.textarea.lines().join("\n"));
+            return Ok(None);
+        }
+        let Event::Key(key) = evt else {
+            return Ok(None);
+        };
+        if key.kind != KeyEventKind::Press {
+            return Ok(None);
+        }
+        // #1674: the palette sees every key FIRST (before history recall,
+        // so ↑/↓ move the highlight, not the history). The decision is
+        // the pure `palette_step` — the loop only acts on its verdict, so
+        // the interception contracts are unit-tested in palette.rs.
+        match palette_step(&mut self.palette, &key) {
+            PaletteStep::Swallowed => return Ok(None),
+            PaletteStep::CompleteTo(text) => {
+                // A COMPLETION into the prompt — never a submit.
+                self.textarea = textarea_with(self.edit, &text);
+                return Ok(None);
+            }
+            PaletteStep::PassThrough => {}
+        }
+        // History recall on ↑/↓ — but only at a vertical edge of the buffer
+        // (top row for ↑, bottom row for ↓) so multi-line cursor movement
+        // still works, and never while a `:` ex-line or `[y/N]` confirm is
+        // open. Plain arrows only (modified arrows fall through to editing).
+        if matches!(key.code, KeyCode::Up | KeyCode::Down)
+            && key.modifiers.is_empty()
+            && self.editor.ex().is_none()
+            && self.editor.confirm_prompt().is_none()
+            && !self.history.is_empty()
+        {
+            let (row, _) = self.textarea.cursor();
+            let last_row = self.textarea.lines().len().saturating_sub(1);
+            let at_edge = (key.code == KeyCode::Up && row == 0)
+                || (key.code == KeyCode::Down && row == last_row);
+            if at_edge {
+                let up = key.code == KeyCode::Up;
+                if let Some(next) = history_step(self.hist_pos, self.history.len(), up) {
+                    // Stash the in-progress line when first leaving it.
+                    if self.hist_pos == self.history.len() {
+                        self.stash = self.textarea.lines().join("\n");
+                    }
+                    self.hist_pos = next;
+                    let content = if self.hist_pos == self.history.len() {
+                        self.stash.clone()
+                    } else {
+                        self.history[self.hist_pos].clone()
+                    };
+                    self.textarea = textarea_with(self.edit, &content);
+                }
+                return Ok(None);
+            }
+        }
+        let before = self.textarea.lines().join("\n");
+        let step = self.editor.input(key, &mut self.textarea);
+        // A command (e.g. `:jumps`) may have queued a note to print above the
+        // input region, into real scrollback.
+        if let Some(note) = self.editor.take_msg() {
+            echo_note(sink, &note)?;
+        }
+        Ok(match step {
+            Step::Continue => {
+                // #1674: track the edit — `/` typed at an empty prompt
+                // opens the palette; edits re-filter it; backspacing the
+                // leading `/` (or clearing the line) closes it.
+                self.palette
+                    .on_buffer_change(&before, &self.textarea.lines().join("\n"));
+                None
+            }
+            Step::Submit => {
+                let body = self.textarea.lines().join("\n");
+                if body.trim().is_empty() {
+                    return Ok(None);
+                }
+                echo_submitted(sink, &body, self.gutter)?;
+                self.reset_after_submit();
+                Some(EditorOutcome::Line(body))
+            }
+            Step::SubmitQuit => {
+                let body = self.textarea.lines().join("\n");
+                // `:wq` on an empty buffer has nothing to send — treat it
+                // as a plain `:q` (end + quit, no turn).
+                if body.trim().is_empty() {
+                    return Ok(Some(EditorOutcome::EndAndQuit));
+                }
+                echo_submitted(sink, &body, self.gutter)?;
+                self.reset_after_submit();
+                Some(EditorOutcome::LineThenQuit(body))
+            }
+            // #1669 16.3: a tab motion leaves the editor immediately —
+            // it is not an edit, and the session owns what happens next.
+            // The buffer is left intact so the draft survives the switch.
+            Step::Tab(action) => Some(EditorOutcome::Tab(action)),
+            Step::Eof => Some(EditorOutcome::Eof),
+        })
+    }
+
+    /// A submitted line is committed to scrollback; the editor starts fresh
+    /// for the next one. The classic driver tears the whole editor down here
+    /// anyway; the cockpit keeps it mounted, so it must reset explicitly.
+    fn reset_after_submit(&mut self) {
+        self.textarea = new_textarea(self.edit);
+        self.editor = Editor::new(self.edit);
+        self.hist_pos = self.history.len();
+        self.stash.clear();
+        self.palette = PaletteState::from_corpus();
     }
 }
 

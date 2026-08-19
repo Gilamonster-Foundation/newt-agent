@@ -101,6 +101,51 @@ during a turn — and are further amended by #1718: the terminal now belongs to
 a UI thread that is merely idle between surface requests, which changes what
 "always-mounted" costs. That correction is owned by the phase-3 PR, not here.
 
+## Amendment 2026-08-16 — phase 3 lands as the cockpit; phase 2 is skipped
+
+Phases 2–3 above were written before #1718 moved the session onto its own
+thread. That changed the terrain, and the shipped design (#1669 cockpit,
+`newt-tui/src/cockpit/`) is different from what they describe in three ways
+worth stating so nobody builds the old plan later:
+
+- **The block lease is not needed.** Phase 2's "grow the line arbiter to a
+  two-row ephemeral block" solved a problem the arbiter no longer has to
+  solve: on the rich surface the terminal thread is now the ONLY writer to
+  the real terminal. It takes fd 1/2 onto a pty for the session's lifetime,
+  reads the master, and lays every finished line into scrollback above a
+  bottom block it keeps mounted. The arbiter keeps its one-row lease and its
+  writers unchanged — they simply write to the pty now — and the spinner's
+  own frames become the cockpit's status row without a second writer being
+  created. Zero arbiter changes.
+- **A pty, not a pipe.** Three checks decide behaviour, not styling, on
+  `stdout().is_terminal()`: `LineCaps` (may a spinner paint), the permission
+  gate's `interactive` (default-DENY without asking when false), and the
+  modal prompt's raw-mode path. A pipe would flip all three. A pty slave
+  keeps every answer.
+- **The turn watcher is not spawned under the cockpit.** Phase 3's "the
+  watcher forwards ground bytes to the mounted editor" is replaced by the
+  terminal thread reading the keyboard itself, under the same arbiter stdin
+  token the watcher used — which is what keeps a mid-turn `PromptWindow`
+  working unchanged. Ctrl-C interrupts (first press asks, second forces);
+  **Esc belongs to vi**, a deliberate change from the watcher's lone-Esc
+  cancel.
+
+Found on the way, and **fixed separately in #1770** rather than here: the
+modal's raw-mode guard relied on crossterm's process-global "prior mode"
+static, which makes a second `enable_raw_mode` a no-op — so under any other
+raw-mode owner the modal ran canonical+echo (keys buffered until Enter, kernel
+echo over the editor). It now saves and restores the exact termios itself
+(`tty/modal.rs`). The cockpit is simply the first component in the tree that
+owns raw mode while a modal opens; the repair is `newt-core`-only and stands
+on its own, so it landed ahead of this change instead of inside it.
+
+Not in this slice: mid-turn *submission into the running turn* — a submit
+during a turn is queued for the next `ReadLine` and shown as a `queued` chip;
+steering the live turn through `SessionSteeringInbox` is the follow-up. The
+live/completed spill viewports are not constructed under the cockpit in v1
+(they paint with cursor motion the presenter drops); the tool spinner (#1727)
+covers liveness meanwhile.
+
 ## Known seams (phase 1, documented not fixed)
 
 These are pre-existing races/ambiguities that type-ahead capture makes newly
