@@ -11,7 +11,7 @@
 //! a note carry a literal fetch URL to this host — and that one is a security
 //! control. It stays hardcoded and fail-closed, because widening it is
 //! *amplification*, and per the line's Authority Register
-//! (`steward-charter/docs/AUTHORITY.md`) amplification needs a live human act,
+//! (`AUTH-03`, `steward-charter@auth-v1.0`) amplification needs a live human act,
 //! "not a configuration file and not an environment variable, because a file
 //! can be written by anything that can write files". A prompt injection that can
 //! write config must not thereby earn an exfiltration channel.

@@ -289,7 +289,7 @@ fn scan_curl_exfil(text: &str) -> anyhow::Result<()> {
 /// **Deliberately hardcoded and deliberately not configurable.** This is the
 /// security half of the host question: widening it hands out an exfiltration
 /// channel, which is amplification, and per the line's Authority Register
-/// (`steward-charter/docs/AUTHORITY.md`) amplification needs a live human act
+/// (`AUTH-03`, `steward-charter@auth-v1.0`) amplification needs a live human act
 /// rather than a config file. The operator's "these are mine" declaration lives
 /// in [`crate::owned_hosts`] and cannot reach this list.
 pub(crate) fn is_exfil_safe_host(host: &str) -> bool {

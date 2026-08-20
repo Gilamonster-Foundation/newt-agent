@@ -3384,7 +3384,7 @@ mod tests {
     fn detected_backend_name_is_stable_and_filesystem_safe() {
         assert_eq!(
             backend_name("http://dgx1.home.arpa:8000").unwrap(),
-            "dgx1-home-lab-8000"
+            "dgx1-home-arpa-8000"
         );
         assert_eq!(
             backend_name("https://[2001:db8::1]:8080").unwrap(),
@@ -3498,7 +3498,7 @@ mod tests {
             Some(token_file),
         )
         .unwrap();
-        assert_eq!(backend.name, "dgx1-home-lab-8080");
+        assert_eq!(backend.name, "dgx1-home-arpa-8080");
         assert_eq!(backend.host.as_deref(), Some("dgx1.home.arpa"));
         assert_eq!(backend.effective_model(), Some("qwen3-coder"));
         assert_eq!(backend.serving, Some(newt_core::Serving::Multiplexer));
@@ -3535,10 +3535,10 @@ mod tests {
         let config = Config::load(&path).unwrap();
         assert_eq!(
             config.default_backend.as_deref(),
-            Some("dgx1-home-lab-8000")
+            Some("dgx1-home-arpa-8000")
         );
-        let vllm = read_dropin(&path, "dgx1-home-lab-8000");
-        let router = read_dropin(&path, "dgx1-home-lab-8080");
+        let vllm = read_dropin(&path, "dgx1-home-arpa-8000");
+        let router = read_dropin(&path, "dgx1-home-arpa-8080");
         assert_eq!(vllm.serving, Some(newt_core::Serving::Instance));
         assert_eq!(router.serving, Some(newt_core::Serving::Multiplexer));
 
@@ -3556,11 +3556,11 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         let backend_dir = dir.path().join("backends");
         std::fs::create_dir_all(&backend_dir).unwrap();
-        let occupied = backend_dir.join("dgx1-home-lab-8000.toml");
+        let occupied = backend_dir.join("dgx1-home-arpa-8000.toml");
         let hand_authored = concat!(
             "# operator-owned backend\n",
             "name = \"ignored-by-filename\"\n",
-            "endpoint = \"http://dgx1-home-lab:8000\"\n",
+            "endpoint = \"http://dgx1-home-arpa:8000\"\n",
             "model = \"hand-model\"\n",
             "tiers = [\"FAST\"]\n",
             "kind = \"openai\"\n",
@@ -3577,21 +3577,21 @@ mod tests {
         assert_eq!(written.len(), 1);
         assert_eq!(
             written[0].file_name().and_then(|name| name.to_str()),
-            Some("dgx1-home-lab-8000-2.toml")
+            Some("dgx1-home-arpa-8000-2.toml")
         );
         assert_eq!(
             Config::load(&config_path)
                 .unwrap()
                 .default_backend
                 .as_deref(),
-            Some("dgx1-home-lab-8000-2")
+            Some("dgx1-home-arpa-8000-2")
         );
 
         let first_bytes = std::fs::read(&written[0]).unwrap();
         let rerun = persist_detected_setup(&config_path, &hits, None, None).unwrap();
         assert!(rerun.is_empty(), "the collision alias should be reused");
         assert_eq!(std::fs::read(&written[0]).unwrap(), first_bytes);
-        assert!(!backend_dir.join("dgx1-home-lab-8000-3.toml").exists());
+        assert!(!backend_dir.join("dgx1-home-arpa-8000-3.toml").exists());
     }
 
     #[serial_test::serial(real_fs)]
@@ -3621,7 +3621,7 @@ mod tests {
 
         assert!(written.is_empty());
         assert_eq!(std::fs::read_to_string(&existing).unwrap(), hand_authored);
-        assert!(!backend_dir.join("dgx1-home-lab-8080.toml").exists());
+        assert!(!backend_dir.join("dgx1-home-arpa-8080.toml").exists());
         assert_eq!(
             Config::load(&config_path)
                 .unwrap()
@@ -3675,10 +3675,10 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         let backend_dir = dir.path().join("backends");
         std::fs::create_dir_all(&backend_dir).unwrap();
-        let existing = backend_dir.join("dgx1-home-lab-8080.toml");
+        let existing = backend_dir.join("dgx1-home-arpa-8080.toml");
         let hand_authored = concat!(
             "# preserve even when stale\n",
-            "name = \"dgx1-home-lab-8080\"\n",
+            "name = \"dgx1-home-arpa-8080\"\n",
             "endpoint = \"http://dgx1.home.arpa:8080\"\n",
             "model = \"retired-model\"\n",
             "tiers = [\"STANDARD\"]\n",
@@ -3696,7 +3696,7 @@ mod tests {
                 .unwrap()
                 .default_backend
                 .as_deref(),
-            Some("dgx1-home-lab-8080-2")
+            Some("dgx1-home-arpa-8080-2")
         );
     }
 
@@ -3707,9 +3707,9 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         let backend_dir = dir.path().join("backends");
         std::fs::create_dir_all(&backend_dir).unwrap();
-        let existing = backend_dir.join("dgx1-home-lab-8000.toml");
+        let existing = backend_dir.join("dgx1-home-arpa-8000.toml");
         let body = concat!(
-            "name = \"dgx1-home-lab-8000\"\n",
+            "name = \"dgx1-home-arpa-8000\"\n",
             "endpoint = \"http://dgx1.home.arpa:8000\"\n",
             "model = \"model\"\n",
             "tiers = [\"FAST\"]\n",
@@ -3726,7 +3726,7 @@ mod tests {
         assert_eq!(written.len(), 1);
         assert_eq!(
             written[0].file_name().and_then(|name| name.to_str()),
-            Some("dgx1-home-lab-8000-2.toml")
+            Some("dgx1-home-arpa-8000-2.toml")
         );
     }
 
@@ -3737,9 +3737,9 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         let backend_dir = dir.path().join("backends");
         std::fs::create_dir_all(&backend_dir).unwrap();
-        let existing = backend_dir.join("dgx1-home-lab-8000.toml");
+        let existing = backend_dir.join("dgx1-home-arpa-8000.toml");
         let body = concat!(
-            "name = \"dgx1-home-lab-8000\"\n",
+            "name = \"dgx1-home-arpa-8000\"\n",
             "endpoint = \"http://dgx1.home.arpa:8000\"\n",
             "model = \"old-model\"\n",
             "tiers = [\"FAST\"]\n",
@@ -3756,7 +3756,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(existing).unwrap(), body);
         assert_eq!(written.len(), 1);
         assert_eq!(
-            read_dropin(&config_path, "dgx1-home-lab-8000-2")
+            read_dropin(&config_path, "dgx1-home-arpa-8000-2")
                 .model
                 .as_deref(),
             Some("new-model")
