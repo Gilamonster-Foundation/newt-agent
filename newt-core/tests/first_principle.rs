@@ -38,13 +38,13 @@
 //! cannot quietly delete the marker for one instead of fixing it. Un-ignoring a
 //! law is how a fix is proved: the test must go red first with the old code.
 
-use newt_core::ConversationStore;
+use newt_core::{ConversationStore, PhantomReach, PhantomResolution};
 
 /// Number of laws in this file currently marked as violations. This may only
 /// go DOWN, and only in a change that also removes the corresponding
 /// `#[ignore]` and shows the test passing. Raising it requires filing the
 /// violation as an issue and naming it in the marker.
-const KNOWN_VIOLATIONS: usize = 2;
+const KNOWN_VIOLATIONS: usize = 3;
 
 fn store(root: &std::path::Path, workspace: &std::path::Path) -> ConversationStore {
     ConversationStore::new(root, workspace, 100).unwrap()
@@ -137,6 +137,90 @@ fn tampering_is_detectable() {
     assert!(
         store.verify_chain(&id).is_err(),
         "a tampered row must break verification — otherwise the chain is decoration"
+    );
+}
+
+/// **Law: everything in the record is covered by the chain.**
+///
+/// `tampering_is_detectable` above proves the chain works on the fields it
+/// covers. This law asks the harder question: does it cover the whole row?
+///
+/// A field stored inside a hashed record but left outside the hash is a hole
+/// with the shape of protection. The row looks tamper-evident, the chain
+/// verifies, and that one column can be rewritten by anyone with the database
+/// open. Worse, nothing about reading the record tells you which fields are
+/// covered — so a consumer that trusts "the chain verified" trusts the
+/// uncovered fields exactly as much as the covered ones.
+///
+/// This law is written to catch the NEXT field added outside the hash, not
+/// only today's. It tampers with a non-covered column and requires the chain
+/// to notice.
+///
+/// VIOLATION: `turns.phantom_reaches` is stored per row and excluded from the
+/// §6 canonical encoding (`store.rs:3227`, "NOT hashed"). The rationale
+/// recorded at `store.rs:1062` is "telemetry, not provenance", with the
+/// exclusion explicitly deferred rather than settled: "folding it into the
+/// hash would require a v2 encoding bump — a deliberate follow-up, not this
+/// additive change."
+///
+/// The deferral was reasonable; the classification is not. `PhantomReach`
+/// records that the model reached for a tool, and `PhantomResolution::Rewrite`
+/// records that newt SUBSTITUTED A DIFFERENT TOOL for the one the model named.
+/// That is the derivation edge between what was emitted and what was executed
+/// — the only record of an intervention the harness made on the model's
+/// intent. `Unknown` is the fabrication ledger: where the model invented a
+/// capability. Both are records of something that happened which someone will
+/// later rely on, which is provenance, not measurement.
+///
+/// It is also written in the SAME transaction as the turn it belongs to, so
+/// append-only was never the obstacle to hashing it. The only cost was the v2
+/// bump — a cost the provenance fix already pays.
+#[test]
+#[ignore = "FIRST-PRINCIPLE VIOLATION — turns.phantom_reaches is stored in the row but excluded from the chain"]
+fn the_whole_record_is_covered_by_the_chain() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = store(root.path(), workspace.path());
+    let id = store.create("first-principle", None).unwrap();
+
+    // A turn in which newt silently rewrote the tool the model asked for.
+    let reach = PhantomReach {
+        name_as_called: "grep_files".to_string(),
+        resolution: PhantomResolution::Rewrite("shell".to_string()),
+        active_context_features: vec!["scheduled".to_string()],
+    };
+    store
+        .append_turn_full(&id, "find the thing", "done", &[], &[reach], None, None)
+        .unwrap();
+    store.verify_chain(&id).expect("untampered chain verifies");
+
+    // Rewrite ONLY the uncovered column: make it look as though newt never
+    // substituted anything, and that the model called the right tool all along.
+    let conn = rusqlite::Connection::open(root.path().join("conversations.db")).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE turns SET phantom_reaches = '[]' WHERE conversation_id = ?1",
+            rusqlite::params![&id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "the tamper must have actually landed");
+
+    // Confirm the tamper is real and observable through the public API, so a
+    // failure here is never mistaken for the edit not having happened.
+    let rec = store.load(&id).unwrap();
+    assert!(
+        rec.turns[0].phantom_reaches.is_empty(),
+        "the tampered value must be what the store now returns"
+    );
+
+    assert!(
+        store.verify_chain(&id).is_err(),
+        "the record of newt rewriting the model's tool call was erased and the \
+         chain still verified.\n\
+         Every field stored in a chained row must be inside the canonical \
+         encoding, or 'the chain verified' means less than a reader will assume \
+         it does.\n\
+         Fix: include phantom_reaches in the v2 canonical encoding."
     );
 }
 
