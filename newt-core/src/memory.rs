@@ -1199,6 +1199,7 @@ impl Summarizing {
         let protected = protect_active_prompt_for_compression(&messages, active_task);
         let outcome = compress(
             CompressRequest {
+                rewrites_history: true,
                 messages: &protected,
                 budget: self.budget() as usize,
                 max_messages: None,

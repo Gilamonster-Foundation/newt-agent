@@ -22,6 +22,7 @@ fn ctx<'a>(
     caveats: &'a Caveats,
 ) -> ChatCtx<'a> {
     ChatCtx {
+        rewrites_history: true,
         url: server_uri,
         model: "test-model",
         kind: BackendKind::Ollama,

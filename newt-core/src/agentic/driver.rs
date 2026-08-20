@@ -543,6 +543,7 @@ async fn run_one_turn(
     // explicit `disclosure` param) value-filter against the same secret.
     let _disclosure_guard = crate::ocap::scoped_session_disclosure(session_disclosure.clone());
     let ctx = ChatCtx {
+        rewrites_history: true,
         url: &config.url,
         model: &config.model,
         kind: config.kind,

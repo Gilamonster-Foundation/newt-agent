@@ -593,6 +593,13 @@ pub(crate) struct CompressRequest<'a> {
     /// keeps today's lossy-only behavior. Used to STAMP the session scope onto the
     /// span even in the transactional (staged) mode, so the pure CID is the one the
     /// live store would resolve.
+    /// Whether the selected context manager may rewrite messages already in the
+    /// transcript. `false` selects the append-only strategy: no summarization and
+    /// no structural pruning of prior turns, so the prompt prefix is byte-identical
+    /// turn over turn and provider caching is optimal by construction. An
+    /// over-budget request is then REFUSED rather than rewritten — see
+    /// [`crate::ContextManager::rewrites_history`].
+    pub rewrites_history: bool,
     pub compaction_store: Option<&'a dyn crate::agentic::content_spill::SpillStore>,
     /// Transactional staging seam (#1528 B3, §2.6). When `Some`, an evicted span is
     /// STAGED into this candidate-local buffer PURELY — the live `compaction_store`
@@ -620,6 +627,7 @@ impl<'a> CompressRequest<'a> {
         summary_input_cap_floor_chars: usize,
     ) -> Self {
         Self {
+            rewrites_history: true,
             messages,
             budget: estimate_tokens(messages, est) / 2,
             max_messages: None,
@@ -718,6 +726,23 @@ pub(crate) async fn compress(
             tokens_before,
             tokens_after: tokens_before,
             notice: None,
+        };
+    }
+
+    // Append-only: the transcript is never rewritten, so there is nothing this
+    // pipeline may legitimately do with an over-budget request except decline it.
+    // That is the strategy's whole content — the recall/fidelity trade is taken
+    // deliberately, in exchange for a prompt prefix that never changes and a
+    // record that is never silently altered. Oversized material is capped where
+    // it is PRODUCED (tool-result caps, paginated reads, offload), not here.
+    if !req.rewrites_history {
+        return CompressOutcome {
+            messages: req.messages.to_vec(),
+            action: CompressAction::Refused,
+            fired: false,
+            tokens_before,
+            tokens_after: tokens_before,
+            notice: state.take_notice(),
         };
     }
 
@@ -2217,6 +2242,7 @@ mod tests {
     ) -> CompressOutcome {
         compress(
             CompressRequest {
+                rewrites_history: true,
                 messages,
                 budget,
                 max_messages,
@@ -2248,6 +2274,7 @@ mod tests {
     ) -> CompressOutcome {
         compress(
             CompressRequest {
+                rewrites_history: true,
                 messages,
                 budget,
                 max_messages,
@@ -2278,6 +2305,7 @@ mod tests {
     ) -> CompressOutcome {
         compress(
             CompressRequest {
+                rewrites_history: true,
                 messages,
                 budget,
                 max_messages,
@@ -2446,6 +2474,7 @@ mod tests {
         let mut state = CompressState::new();
         let out = compress(
             CompressRequest {
+                rewrites_history: true,
                 messages: &protected,
                 budget: before / 4,
                 max_messages: None,
@@ -2710,6 +2739,7 @@ mod tests {
         let mut state = CompressState::new();
         let out = compress(
             CompressRequest {
+                rewrites_history: true,
                 messages: &msgs,
                 budget: before / 3,
                 max_messages: None,
@@ -3052,6 +3082,7 @@ mod tests {
         let mut state = CompressState::new();
         let out = compress(
             CompressRequest {
+                rewrites_history: true,
                 messages: &msgs,
                 budget: usize::MAX,
                 max_messages: Some(4),
@@ -3907,6 +3938,7 @@ mod tests {
         let mut state = CompressState::new();
         let out = compress(
             CompressRequest {
+                rewrites_history: true,
                 messages: &messages,
                 budget: 128,
                 max_messages: None,
@@ -3976,6 +4008,7 @@ mod tests {
         let mut state = CompressState::new();
         let out = compress(
             CompressRequest {
+                rewrites_history: true,
                 messages: &msgs,
                 budget: 300,
                 max_messages: None,
@@ -4788,6 +4821,94 @@ mod tests {
         );
         // Everything fits → a single chunk.
         assert_eq!(chunk_strings(&parts, 1_000).len(), 1);
+    }
+
+    /// The append-only preset must actually never rewrite. Same over-budget
+    /// input, two presets: `standard` compacts it, `append-only` refuses it and
+    /// hands the messages back **byte-identical**.
+    ///
+    /// Without this the preset is a config knob that does nothing, which is worse
+    /// than not shipping it — an operator would believe their transcript was
+    /// untouched while it was being rewritten underneath them.
+    #[tokio::test]
+    async fn append_only_refuses_rather_than_rewriting() {
+        let task = "do the task";
+        let msgs = tool_heavy(task, 6, 4_000);
+        let before = estimate_tokens(&msgs, EST);
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let s = recording_summarizer(prompts.clone(), "SUMMARY");
+
+        let base = |rewrites_history: bool| CompressRequest {
+            messages: &msgs,
+            budget: before / 3,
+            max_messages: None,
+            replay_protected_tail_len: 0,
+            task,
+            hard_budget: true,
+            authoritative: true,
+            focus: None,
+            est: EST,
+            summary_input_cap_floor_chars: 8_192,
+            rewrites_history,
+            compaction_store: None,
+            compaction_stage: None,
+        };
+
+        // standard: rewrites, and the summarizer is consulted.
+        let mut st = CompressState::new();
+        let standard = compress(base(true), Some(&*s), &mut st).await;
+        assert_eq!(standard.action, CompressAction::Summarized);
+        assert!(standard.tokens_after < standard.tokens_before);
+        assert!(
+            !prompts.lock().unwrap().is_empty(),
+            "standard must summarize"
+        );
+
+        // append-only: refuses, changes nothing, and never calls the model.
+        prompts.lock().unwrap().clear();
+        let mut st2 = CompressState::new();
+        let append = compress(base(false), Some(&*s), &mut st2).await;
+        assert_eq!(append.action, CompressAction::Refused);
+        assert!(!append.fired, "an append-only pass does not fire");
+        assert_eq!(
+            append.messages, msgs,
+            "append-only must hand the transcript back byte-identical"
+        );
+        assert_eq!(append.tokens_after, append.tokens_before);
+        assert!(
+            prompts.lock().unwrap().is_empty(),
+            "append-only must not consult the summarizer at all"
+        );
+    }
+
+    /// A transcript that already fits is untouched under append-only — refusal is
+    /// for the over-budget case, not a blanket stop.
+    #[tokio::test]
+    async fn append_only_leaves_a_fitting_transcript_alone() {
+        let msgs = vec![sys("s"), user("short")];
+        let mut st = CompressState::new();
+        let out = compress(
+            CompressRequest {
+                messages: &msgs,
+                budget: 100_000,
+                max_messages: None,
+                replay_protected_tail_len: 0,
+                task: "t",
+                hard_budget: true,
+                authoritative: true,
+                focus: None,
+                est: EST,
+                summary_input_cap_floor_chars: 8_192,
+                rewrites_history: false,
+                compaction_store: None,
+                compaction_stage: None,
+            },
+            None,
+            &mut st,
+        )
+        .await;
+        assert_eq!(out.action, CompressAction::Fit);
+        assert_eq!(out.messages, msgs);
     }
 
     #[tokio::test]

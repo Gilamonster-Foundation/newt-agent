@@ -860,6 +860,17 @@ pub enum ContextManager {
     /// implemented; the selector seam for the others.
     #[default]
     Standard,
+    /// **Never rewrite history.** No summarization, no structural pruning of
+    /// prior messages — the transcript is append-only and the prompt prefix is
+    /// byte-identical turn over turn, so provider prompt caching is optimal by
+    /// construction. Oversized material is capped where it is *produced*, and a
+    /// request that will not fit is refused rather than rewritten.
+    ///
+    /// This is the strategy `mini-swe-agent` uses, and it is a real answer, not
+    /// a degenerate one: it scores >74% on SWE-bench Verified with no context
+    /// management at all. It trades recall for fidelity and cache stability —
+    /// nothing is ever silently altered, because nothing is ever altered.
+    AppendOnly,
     /// Leave a lookup marker; retrieve cards on demand (ephemeral → local DB).
     /// Owned by #546 — not yet available.
     Progressive,
@@ -873,6 +884,7 @@ impl ContextManager {
     pub fn from_keyword(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "standard" => Some(Self::Standard),
+            "append-only" | "append_only" | "appendonly" | "append" => Some(Self::AppendOnly),
             "progressive" => Some(Self::Progressive),
             "distributed" => Some(Self::Distributed),
             _ => None,
@@ -883,6 +895,7 @@ impl ContextManager {
     pub fn keyword(self) -> &'static str {
         match self {
             Self::Standard => "standard",
+            Self::AppendOnly => "append-only",
             Self::Progressive => "progressive",
             Self::Distributed => "distributed",
         }
@@ -891,7 +904,17 @@ impl ContextManager {
     /// Whether this manager is implemented. Only `standard` today; the others
     /// are owned by #546 (the selector reports "not yet available").
     pub fn available(self) -> bool {
-        matches!(self, Self::Standard)
+        matches!(self, Self::Standard | Self::AppendOnly)
+    }
+
+    /// Whether this preset may rewrite messages already in the transcript.
+    ///
+    /// `false` for [`AppendOnly`](Self::AppendOnly), which is the whole point of
+    /// it: no summarization, no structural pruning of prior turns, so the prompt
+    /// prefix is byte-identical turn over turn and provider caching is optimal by
+    /// construction. Everything else rewrites, and pays the cache cost for recall.
+    pub fn rewrites_history(self) -> bool {
+        !matches!(self, Self::AppendOnly)
     }
 
     /// The default feature bundle this preset turns on (Phase 26, #588). A

@@ -79,6 +79,7 @@ fn persona_allow() -> &'static [String] {
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        rewrites_history: true,
         url: server_uri,
         model: "claude-test",
         kind: BackendKind::Anthropic,
