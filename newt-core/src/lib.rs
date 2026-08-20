@@ -33,6 +33,7 @@ pub mod ffi_manifest;
 pub mod ffi_surface;
 pub mod flight_recorder;
 pub mod netguard;
+pub mod owned_hosts;
 // Object-bound workspace filesystem capability (step-52.1). `openat2` is
 // Linux-only, so the capability exists only there; consumers apply the
 // cross-platform fallback + fail-closed-for-untrusted policy (step-52.2/52.3).

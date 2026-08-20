@@ -461,7 +461,12 @@ mod cap_key_tests {
         // Every existing model-capabilities.json entry keeps working: the
         // multiplexer key IS the model name, byte-for-byte.
         assert_eq!(
-            cap_key(Serving::Multiplexer, "gnuc-ollama", "qwen2.5-coder:7b").as_str(),
+            cap_key(
+                Serving::Multiplexer,
+                "gpu-runner-ollama",
+                "qwen2.5-coder:7b"
+            )
+            .as_str(),
             "qwen2.5-coder:7b"
         );
     }
@@ -486,7 +491,7 @@ mod cap_key_tests {
         // …while a multiplexer keys purely by model, so two routes to the same
         // model on one gateway intentionally SHARE evidence.
         assert_eq!(
-            cap_key(Serving::Multiplexer, "gnuc-ollama", "m"),
+            cap_key(Serving::Multiplexer, "gpu-runner-ollama", "m"),
             cap_key(Serving::Multiplexer, "other-gateway", "m")
         );
     }
@@ -507,7 +512,11 @@ mod cap_key_tests {
         };
         let mut cache = CapabilityCache::default();
         cache.insert(
-            cap_key(Serving::Multiplexer, "gnuc-ollama", "qwen2.5-coder:7b"),
+            cap_key(
+                Serving::Multiplexer,
+                "gpu-runner-ollama",
+                "qwen2.5-coder:7b",
+            ),
             entry(Some(24_000), Some(26_214)),
         );
         cache.insert(
@@ -592,7 +601,7 @@ mod cap_key_tests {
 
         // MULTIPLEXER SHARING preserved: two routes to the same model on a
         // gateway intentionally share one model-keyed entry.
-        let mux = cap_key(Serving::Multiplexer, "gnuc-ollama", "m");
+        let mux = cap_key(Serving::Multiplexer, "gpu-runner-ollama", "m");
         cache.insert(mux.clone(), entry(Some(64_000), Some(64_000), None));
         assert_eq!(resolve_memory_budget(None, None, cache.get(&mux)), 64_000);
         assert_eq!(

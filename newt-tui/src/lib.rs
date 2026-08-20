@@ -12387,7 +12387,7 @@ as /backend (chooser · edit · add · remove). The text forms remain:
   /backends dgx1       repoint this session at the 'dgx1' backend
 
 Where /backend's kind toggle picks the coarse openai-vs-ollama wire protocol,
-/backends <name> picks a NAMED backend (dgx1, gnuc, openai, …) regardless of
+/backends <name> picks a NAMED backend (dgx1, gpu-runner, openai, …) regardless of
 its protocol. Your choice sticks across runs (~/.newt/settings.toml); an
 explicit NEWT_PROVIDER or a --loadout still overrides it."
         }

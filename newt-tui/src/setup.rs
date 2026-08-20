@@ -2885,16 +2885,16 @@ mod tests {
             vllm_ports: vec![8000, 8080],
         };
         assert_eq!(
-            candidate_endpoints("dgx1.home.lab", &discovery).unwrap(),
+            candidate_endpoints("dgx1.home.arpa", &discovery).unwrap(),
             vec![
-                "http://dgx1.home.lab:11434",
-                "http://dgx1.home.lab:8000",
-                "http://dgx1.home.lab:8080",
+                "http://dgx1.home.arpa:11434",
+                "http://dgx1.home.arpa:8000",
+                "http://dgx1.home.arpa:8080",
             ]
         );
         assert_eq!(
-            candidate_endpoints("http://dgx1.home.lab:8080/v1", &discovery).unwrap(),
-            vec!["http://dgx1.home.lab:8080"]
+            candidate_endpoints("http://dgx1.home.arpa:8080/v1", &discovery).unwrap(),
+            vec!["http://dgx1.home.arpa:8080"]
         );
     }
 
@@ -2906,11 +2906,11 @@ mod tests {
             vllm_ports: vec![8000, 8080, 8080],
         };
         assert_eq!(
-            candidate_endpoints("dgx1.home.lab", &discovery).unwrap(),
-            vec!["http://dgx1.home.lab:8000", "http://dgx1.home.lab:8080",]
+            candidate_endpoints("dgx1.home.arpa", &discovery).unwrap(),
+            vec!["http://dgx1.home.arpa:8000", "http://dgx1.home.arpa:8080",]
         );
         assert!(
-            candidate_endpoints("http://user:secret@dgx1.home.lab:8000", &discovery)
+            candidate_endpoints("http://user:secret@dgx1.home.arpa:8000", &discovery)
                 .unwrap_err()
                 .to_string()
                 .contains("credentials")
@@ -2919,9 +2919,9 @@ mod tests {
 
     #[test]
     fn authenticated_targets_require_an_explicit_secure_transport() {
-        assert!(validate_authenticated_target("dgx1.home.lab:8000").is_err());
-        assert!(validate_authenticated_target("http://dgx1.home.lab:8000").is_err());
-        assert!(validate_authenticated_target("https://dgx1.home.lab:8000").is_ok());
+        assert!(validate_authenticated_target("dgx1.home.arpa:8000").is_err());
+        assert!(validate_authenticated_target("http://dgx1.home.arpa:8000").is_err());
+        assert!(validate_authenticated_target("https://dgx1.home.arpa:8000").is_ok());
         assert!(validate_authenticated_target("http://127.0.0.1:8000").is_ok());
         assert!(validate_authenticated_target("http://[::1]:8000").is_ok());
     }
@@ -3383,7 +3383,7 @@ mod tests {
     #[test]
     fn detected_backend_name_is_stable_and_filesystem_safe() {
         assert_eq!(
-            backend_name("http://dgx1.home.lab:8000").unwrap(),
+            backend_name("http://dgx1.home.arpa:8000").unwrap(),
             "dgx1-home-lab-8000"
         );
         assert_eq!(
@@ -3493,13 +3493,13 @@ mod tests {
     fn detected_backend_carries_served_truth_and_secret_references_only() {
         let token_file = std::path::Path::new("~/.newt/tokens/dgx1");
         let backend = backend_from_probe(
-            &openai_hit("http://dgx1.home.lab:8080", &["qwen3-coder", "gpt-oss"]),
+            &openai_hit("http://dgx1.home.arpa:8080", &["qwen3-coder", "gpt-oss"]),
             Some("DGX_TOKEN"),
             Some(token_file),
         )
         .unwrap();
         assert_eq!(backend.name, "dgx1-home-lab-8080");
-        assert_eq!(backend.host.as_deref(), Some("dgx1.home.lab"));
+        assert_eq!(backend.host.as_deref(), Some("dgx1.home.arpa"));
         assert_eq!(backend.effective_model(), Some("qwen3-coder"));
         assert_eq!(backend.serving, Some(newt_core::Serving::Multiplexer));
         assert_eq!(backend.api_key_env.as_deref(), Some("DGX_TOKEN"));
@@ -3519,8 +3519,8 @@ mod tests {
         )
         .unwrap();
         let hits = vec![
-            openai_hit("http://dgx1.home.lab:8000", &["ornith"]),
-            openai_hit("http://dgx1.home.lab:8080", &["qwen3-coder", "gpt-oss"]),
+            openai_hit("http://dgx1.home.arpa:8000", &["ornith"]),
+            openai_hit("http://dgx1.home.arpa:8080", &["qwen3-coder", "gpt-oss"]),
         ];
 
         let written = persist_detected_setup(&path, &hits, None, None).unwrap();
@@ -3566,7 +3566,10 @@ mod tests {
             "kind = \"openai\"\n",
         );
         std::fs::write(&occupied, hand_authored).unwrap();
-        let hits = vec![openai_hit("http://dgx1.home.lab:8000", &["detected-model"])];
+        let hits = vec![openai_hit(
+            "http://dgx1.home.arpa:8000",
+            &["detected-model"],
+        )];
 
         let written = persist_detected_setup(&config_path, &hits, None, None).unwrap();
 
@@ -3602,7 +3605,7 @@ mod tests {
         let hand_authored = concat!(
             "# retain this comment and operator choices\n",
             "name = \"ignored-by-filename\"\n",
-            "endpoint = \"http://dgx1.home.lab:8080/\"\n",
+            "endpoint = \"http://dgx1.home.arpa:8080/\"\n",
             "model = \"operator-model\"\n",
             "tiers = [\"STANDARD\", \"REVIEW\"]\n",
             "kind = \"openai\"\n",
@@ -3610,7 +3613,7 @@ mod tests {
         );
         std::fs::write(&existing, hand_authored).unwrap();
         let hits = vec![openai_hit(
-            "http://dgx1.home.lab:8080",
+            "http://dgx1.home.arpa:8080",
             &["detected-model", "operator-model"],
         )];
 
@@ -3676,13 +3679,13 @@ mod tests {
         let hand_authored = concat!(
             "# preserve even when stale\n",
             "name = \"dgx1-home-lab-8080\"\n",
-            "endpoint = \"http://dgx1.home.lab:8080\"\n",
+            "endpoint = \"http://dgx1.home.arpa:8080\"\n",
             "model = \"retired-model\"\n",
             "tiers = [\"STANDARD\"]\n",
             "kind = \"openai\"\n",
         );
         std::fs::write(&existing, hand_authored).unwrap();
-        let hits = vec![openai_hit("http://dgx1.home.lab:8080", &["current-model"])];
+        let hits = vec![openai_hit("http://dgx1.home.arpa:8080", &["current-model"])];
 
         let written = persist_detected_setup(&config_path, &hits, None, None).unwrap();
 
@@ -3707,7 +3710,7 @@ mod tests {
         let existing = backend_dir.join("dgx1-home-lab-8000.toml");
         let body = concat!(
             "name = \"dgx1-home-lab-8000\"\n",
-            "endpoint = \"http://dgx1.home.lab:8000\"\n",
+            "endpoint = \"http://dgx1.home.arpa:8000\"\n",
             "model = \"model\"\n",
             "tiers = [\"FAST\"]\n",
             "kind = \"openai\"\n",
@@ -3715,7 +3718,7 @@ mod tests {
             "api_key_env = \"UNRELATED_TOKEN\"\n",
         );
         std::fs::write(&existing, body).unwrap();
-        let hits = vec![openai_hit("http://dgx1.home.lab:8000", &["model"])];
+        let hits = vec![openai_hit("http://dgx1.home.arpa:8000", &["model"])];
 
         let written = persist_detected_setup(&config_path, &hits, None, None).unwrap();
 
@@ -3737,7 +3740,7 @@ mod tests {
         let existing = backend_dir.join("dgx1-home-lab-8000.toml");
         let body = concat!(
             "name = \"dgx1-home-lab-8000\"\n",
-            "endpoint = \"http://dgx1.home.lab:8000\"\n",
+            "endpoint = \"http://dgx1.home.arpa:8000\"\n",
             "model = \"old-model\"\n",
             "tiers = [\"FAST\"]\n",
             "kind = \"openai\"\n",
@@ -3746,7 +3749,7 @@ mod tests {
             "source = \"newt setup v0.7.2 (auto-detected Openai)\"\n",
         );
         std::fs::write(&existing, body).unwrap();
-        let hits = vec![openai_hit("http://dgx1.home.lab:8000", &["new-model"])];
+        let hits = vec![openai_hit("http://dgx1.home.arpa:8000", &["new-model"])];
 
         let written = persist_detected_setup(&config_path, &hits, None, None).unwrap();
 
@@ -3770,7 +3773,7 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, "# private config\n").unwrap();
         std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let hits = vec![openai_hit("http://dgx1.home.lab:8000", &["model"])];
+        let hits = vec![openai_hit("http://dgx1.home.arpa:8000", &["model"])];
 
         persist_detected_setup(&config_path, &hits, None, None).unwrap();
 
@@ -3804,7 +3807,7 @@ mod tests {
         std::fs::write(&real_config, "# linked config\n").unwrap();
         let config_path = dir.path().join("config.toml");
         symlink(&real_config, &config_path).unwrap();
-        let hits = vec![openai_hit("http://dgx1.home.lab:8000", &["model"])];
+        let hits = vec![openai_hit("http://dgx1.home.arpa:8000", &["model"])];
 
         persist_detected_setup(&config_path, &hits, None, None).unwrap();
 
@@ -3984,9 +3987,9 @@ mod tests {
         let backend_dir = dir.path().join("backends");
         std::fs::create_dir_all(&backend_dir).unwrap();
         std::fs::write(
-            backend_dir.join("gnuc.toml"),
+            backend_dir.join("gpu-runner.toml"),
             "# operator notes for the lab box\n\
-             name = \"gnuc\"\nendpoint = \"http://gnuc:11434\" # LAN\nmodel = \"qwen3:30b\"\n\
+             name = \"gpu-runner\"\nendpoint = \"http://gpu-runner:11434\" # LAN\nmodel = \"qwen3:30b\"\n\
              tiers = [\"FAST\"]\nkind = \"anthropic\"\nserving = \"multiplexer\"\n\
              operator_hint = \"keep me\"\n",
         )
@@ -3995,9 +3998,9 @@ mod tests {
         // touched, so `kind = "anthropic"` (outside the form's ladder) must
         // survive verbatim.
         let edit = crate::backend_panel::BackendEdit {
-            name: "gnuc".into(),
+            name: "gpu-runner".into(),
             kind: Some(BackendKind::Anthropic),
-            endpoint: "http://gnuc:11434".into(),
+            endpoint: "http://gpu-runner:11434".into(),
             model: Some("llama3.1:8b".into()),
             api_key_env: None,
             api_key_file: None,
@@ -4046,7 +4049,7 @@ mod tests {
             ..edit.clone()
         };
         std::fs::write(
-            backend_dir.join("gnuc.toml"),
+            backend_dir.join("gpu-runner.toml"),
             format!("{body}api_key_env = \"OLD\"\n"),
         )
         .unwrap();
@@ -4113,7 +4116,7 @@ mod tests {
         // The #1140 wizard shape: the backends live ONLY as drop-ins.
         let original = "# hand-authored\ndefault_backend = \"dgx1\" # keep this note\n";
         std::fs::write(&config_path, original).unwrap();
-        for name in ["dgx1", "gnuc"] {
+        for name in ["dgx1", "gpu-runner"] {
             std::fs::write(
                 backend_dir.join(format!("{name}.toml")),
                 format!("endpoint = \"http://{name}:8000\"\n"),
@@ -4135,11 +4138,11 @@ mod tests {
         assert!(backend_dir.join("dgx1.toml").exists());
 
         // Accepted as ONE transaction: the pointer moves first, then the file.
-        let notes = remove_panel_backend(&config_path, "dgx1", Some("gnuc")).unwrap();
+        let notes = remove_panel_backend(&config_path, "dgx1", Some("gpu-runner")).unwrap();
         assert!(!backend_dir.join("dgx1.toml").exists());
         let config = std::fs::read_to_string(&config_path).unwrap();
         assert!(
-            config.contains("default_backend = \"gnuc\""),
+            config.contains("default_backend = \"gpu-runner\""),
             "the durable pointer followed the switch: {config}"
         );
         assert!(

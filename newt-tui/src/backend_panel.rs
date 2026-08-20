@@ -1184,7 +1184,7 @@ mod tests {
         }
     }
 
-    /// dgx1 (active, file-backed) · gnuc (file-backed) · relic (inline) + the
+    /// dgx1 (active, file-backed) · gpu-runner (file-backed) · relic (inline) + the
     /// two kind fallbacks. `default_backend` is the active one unless a test
     /// says otherwise.
     fn panel() -> PanelState {
@@ -1195,7 +1195,7 @@ mod tests {
         PanelState::new(PanelSeed {
             options: vec![
                 named("dgx1", BackendSource::UserDropIn),
-                named("gnuc", BackendSource::UserDropIn),
+                named("gpu-runner", BackendSource::UserDropIn),
                 named("relic", BackendSource::Inline),
                 BackendOption::kind_fallback("ollama"),
                 BackendOption::kind_fallback("openai"),
@@ -1239,12 +1239,12 @@ mod tests {
             "opens on the active backend: {}",
             s.pick_label()
         );
-        s.cycle(1); // → gnuc
+        s.cycle(1); // → gpu-runner
         assert!(!s.is_noop(), "a touched spinner is a pick");
-        assert!(s.pick_label().contains("gnuc") && s.pick_label().contains("(pending)"));
+        assert!(s.pick_label().contains("gpu-runner") && s.pick_label().contains("(pending)"));
         assert_eq!(
             close_outcome(true, &s).apply,
-            Some(BackendSelection::Named("gnuc".to_string()))
+            Some(BackendSelection::Named("gpu-runner".to_string()))
         );
         // Through relic and onto the kind fallbacks…
         s.cycle(1);
@@ -1282,13 +1282,13 @@ mod tests {
     #[test]
     fn edit_form_prefills_and_saves_through_injected_persist() {
         let mut s = panel();
-        s.cycle(1); // → gnuc
+        s.cycle(1); // → gpu-runner
         s.begin_edit();
         let Mode::Form(form) = &s.mode else {
             panic!("edit should open the form");
         };
-        assert_eq!(form.editing.as_deref(), Some("gnuc"));
-        assert_eq!(form.url, "http://gnuc:11434");
+        assert_eq!(form.editing.as_deref(), Some("gpu-runner"));
+        assert_eq!(form.url, "http://gpu-runner:11434");
         assert_eq!(form.model, "qwen3:30b");
         // ↓↓↓ to the model field, clear it, type a new one.
         s.form_nav(1); // kind
@@ -1302,12 +1302,12 @@ mod tests {
         let mut persist = |edit: &BackendEdit| {
             seen.push(edit.clone());
             BackendSaveResult::Saved {
-                note: "saved backend 'gnuc' → /tmp/gnuc.toml".to_string(),
+                note: "saved backend 'gpu-runner' → /tmp/gpu-runner.toml".to_string(),
             }
         };
         assert!(s.submit_form(&mut persist));
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].name, "gnuc");
+        assert_eq!(seen[0].name, "gpu-runner");
         assert_eq!(seen[0].model.as_deref(), Some("llama3.1:8b"));
         assert!(seen[0].replace, "editing replaces the existing drop-in");
         // The chooser folded the save back in and recorded the change.
@@ -1317,7 +1317,10 @@ mod tests {
             Some("llama3.1:8b"),
             "chooser reflects the edit"
         );
-        assert_eq!(s.changes, vec!["saved backend 'gnuc' → /tmp/gnuc.toml"]);
+        assert_eq!(
+            s.changes,
+            vec!["saved backend 'gpu-runner' → /tmp/gpu-runner.toml"]
+        );
     }
 
     #[test]
@@ -1516,7 +1519,7 @@ mod tests {
     #[test]
     fn edit_is_blocked_for_kind_fallbacks_and_inline_entries() {
         let mut s = panel();
-        s.cycle(1); // gnuc
+        s.cycle(1); // gpu-runner
         s.cycle(1); // relic (inline)
         s.begin_edit();
         assert!(matches!(s.mode, Mode::Choose), "inline entry: no form");
@@ -1530,9 +1533,9 @@ mod tests {
     #[test]
     fn d_key_prefills_the_typed_confirm() {
         let mut s = panel();
-        s.cycle(1); // gnuc
+        s.cycle(1); // gpu-runner
         s.begin_remove();
-        assert_eq!(s.mode, Mode::Command("d gnuc".to_string()));
+        assert_eq!(s.mode, Mode::Command("d gpu-runner".to_string()));
         // On a kind fallback there is nothing to remove.
         let mut k = panel();
         k.cycle(1);
@@ -1551,11 +1554,11 @@ mod tests {
             removed.push(name.to_string());
             Ok(format!("removed backend '{name}'"))
         };
-        s.begin_command("d gnuc");
+        s.begin_command("d gpu-runner");
         assert_eq!(s.run_command(&mut remove), None, "stays open");
-        assert_eq!(removed, vec!["gnuc"]);
-        assert!(s.named_index("gnuc").is_none(), "chooser entry gone");
-        assert_eq!(s.changes, vec!["removed backend 'gnuc'"]);
+        assert_eq!(removed, vec!["gpu-runner"]);
+        assert!(s.named_index("gpu-runner").is_none(), "chooser entry gone");
+        assert_eq!(s.changes, vec!["removed backend 'gpu-runner'"]);
         // Active marker (dgx1, index 0) survives the shift.
         assert!(s.pick_label().contains("dgx1") && s.pick_label().contains("(active)"));
     }
@@ -1563,9 +1566,9 @@ mod tests {
     #[test]
     fn removing_the_entry_under_a_dirty_cursor_resets_the_pick() {
         let mut s = panel();
-        s.cycle(1); // dial to gnuc (dirty)
+        s.cycle(1); // dial to gpu-runner (dirty)
         let mut remove = ok_remove();
-        s.begin_command("d gnuc");
+        s.begin_command("d gpu-runner");
         assert_eq!(s.run_command(&mut remove), None);
         assert!(
             s.is_noop(),
@@ -1578,9 +1581,9 @@ mod tests {
     fn remove_failure_keeps_the_option_and_shows_why() {
         let mut s = panel();
         let mut remove = |_: &str| Err("permission denied".to_string());
-        s.begin_command("d gnuc");
+        s.begin_command("d gpu-runner");
         assert_eq!(s.run_command(&mut remove), None);
-        assert!(s.named_index("gnuc").is_some(), "nothing dropped");
+        assert!(s.named_index("gpu-runner").is_some(), "nothing dropped");
         assert!(s.changes.is_empty());
         assert!(s.status.as_deref().unwrap().contains("permission denied"));
     }
@@ -1610,7 +1613,7 @@ mod tests {
     #[test]
     fn remove_active_with_a_dirty_named_selection_closes_as_one_transaction() {
         let mut s = panel();
-        s.cycle(1); // dial to gnuc (a different NAMED backend)
+        s.cycle(1); // dial to gpu-runner (a different NAMED backend)
         let mut called = false;
         let mut remove = |_: &str| {
             called = true;
@@ -1630,7 +1633,7 @@ mod tests {
         let close = close_outcome(true, &s);
         assert_eq!(
             close.apply,
-            Some(BackendSelection::Named("gnuc".to_string()))
+            Some(BackendSelection::Named("gpu-runner".to_string()))
         );
         assert_eq!(close.remove_after_apply.as_deref(), Some("dgx1"));
     }
@@ -1664,11 +1667,11 @@ mod tests {
         // applying nothing.
         let mut s = panel();
         let mut remove = ok_remove();
-        s.begin_command("d gnuc");
+        s.begin_command("d gpu-runner");
         s.run_command(&mut remove);
         let close = close_outcome(false, &s);
         assert_eq!(close.apply, None);
-        assert_eq!(close.changes, vec!["removed backend 'gnuc'"]);
+        assert_eq!(close.changes, vec!["removed backend 'gpu-runner'"]);
     }
 
     #[test]
@@ -1719,7 +1722,7 @@ mod tests {
     #[test]
     fn an_untouched_url_is_not_revalidated_but_a_typed_one_is() {
         let mut s = panel();
-        s.cycle(1); // → gnuc
+        s.cycle(1); // → gpu-runner
         s.begin_edit();
         s.form_nav(1);
         s.form_nav(1);
@@ -1753,11 +1756,11 @@ mod tests {
     /// `newt solve` / the ACP worker, which have no settings.toml mask.
     #[test]
     fn remove_refuses_the_config_default_even_when_it_is_not_active() {
-        // Active = gnuc (a NEWT_PROVIDER pin), default_backend = dgx1.
+        // Active = gpu-runner (a NEWT_PROVIDER pin), default_backend = dgx1.
         let mut s = PanelState::new(PanelSeed {
             options: vec![
                 named("dgx1", BackendSource::UserDropIn),
-                named("gnuc", BackendSource::UserDropIn),
+                named("gpu-runner", BackendSource::UserDropIn),
                 BackendOption::kind_fallback("ollama"),
             ],
             active: Some(1),
@@ -1778,16 +1781,16 @@ mod tests {
         );
         assert!(s.named_index("dgx1").is_some());
         // Dialing another NAMED backend makes it one transaction: the caller
-        // applies gnuc, repoints default_backend at it, then deletes dgx1.
+        // applies gpu-runner, repoints default_backend at it, then deletes dgx1.
         s.cycle(-1); // → dgx1
-        s.cycle(1); // → gnuc (dirty)
+        s.cycle(1); // → gpu-runner (dirty)
         s.begin_command("d dgx1");
         assert_eq!(s.run_command(&mut remove), Some(true));
         assert!(!called.get(), "the delete is deferred to the caller");
         let close = close_outcome(true, &s);
         assert_eq!(
             close.apply,
-            Some(BackendSelection::Named("gnuc".to_string()))
+            Some(BackendSelection::Named("gpu-runner".to_string()))
         );
         assert_eq!(close.remove_after_apply.as_deref(), Some("dgx1"));
     }
@@ -1801,7 +1804,7 @@ mod tests {
         let mut s = PanelState::new(PanelSeed {
             options: vec![
                 named("dgx1", BackendSource::ShadowedByProject),
-                named("gnuc", BackendSource::UserDropIn),
+                named("gpu-runner", BackendSource::UserDropIn),
             ],
             active: Some(1),
             default_backend: None,
@@ -1857,14 +1860,14 @@ mod tests {
     fn an_io_error_still_carries_the_committed_file_changes() {
         let mut s = panel();
         let mut remove = ok_remove();
-        s.begin_command("d gnuc");
+        s.begin_command("d gpu-runner");
         s.run_command(&mut remove); // the delete COMMITTED in-loop
         let err = finish(Err(io::Error::other("terminal detached")), true, &s)
             .expect_err("an io error is still an error");
         assert!(err.error.to_string().contains("terminal detached"));
         assert_eq!(
             err.close.changes,
-            vec!["removed backend 'gnuc'"],
+            vec!["removed backend 'gpu-runner'"],
             "the committed change survives for the caller to report + re-resolve"
         );
         assert_eq!(err.close.apply, None, "an aborted panel applies nothing");
@@ -1874,7 +1877,7 @@ mod tests {
         // The clean path is unchanged.
         assert_eq!(
             finish(Ok(()), false, &s).unwrap().changes,
-            vec!["removed backend 'gnuc'"]
+            vec!["removed backend 'gpu-runner'"]
         );
     }
 }

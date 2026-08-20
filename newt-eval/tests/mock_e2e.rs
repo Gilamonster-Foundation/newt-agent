@@ -135,7 +135,7 @@ async fn all_bundled_cases_pass_in_mock_mode() {
 //   -p newt-eval --test mock_e2e   (then commit newt-eval/tests/golden/*.golden)
 //
 // Unix-gated like `stdout_purity.rs`: byte-exact CLI output on Windows adds
-// CRLF/path hazards the refactor net doesn't need — gnuc/beaver (the boxes that
+// CRLF/path hazards the refactor net doesn't need — gpu-runner (the box that
 // run it) are both unix.
 #[cfg(unix)]
 mod golden {
@@ -283,7 +283,7 @@ mod golden {
     }
 
     // Boundary 3 — the piped plain chat surface: BLOCKED BY COUPLING (recorded
-    // finding for the refactor review, 2026-07-20 baseline attempt on gnuc).
+    // finding for the refactor review, 2026-07-20 baseline attempt on gpu-runner).
     //
     // A hermetic capture needs the chat backend pinned to a mock. It cannot be:
     //   * `OLLAMA_HOST` — honored by the worker (verbatim contract), NOT by the
