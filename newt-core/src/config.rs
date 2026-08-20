@@ -5130,6 +5130,14 @@ pub(crate) const CONTROL_PLANE_KEYS: &[&str] = &[
     "discovery",       // backend auto-discovery endpoints (exfil)
     "dgx",             // DGX endpoints + ssh (exfil / remote exec)
     "scratch",         // external scratch paths
+    // `[network] owned_suffixes` is the operator's "these hosts are mine"
+    // declaration (#1789). It grants no authority, but it decides which
+    // endpoints get the patient seven-attempt retry policy instead of the
+    // thrifty hosted one — so a repo could make newt hammer a billable
+    // third-party endpoint seven times per failure by declaring its suffix
+    // owned. Same class as `discovery`: a repo has no business telling the
+    // operator which hosts they own.
+    "network",
     // `[crews.*].test` / `loop_program` are shell verification commands run on
     // `newt crew` (config.rs Crew.test → WorktreeWorkspace test_cmd → sh -c),
     // and a `[loadouts.*]` with only a model passes validation — so a project
@@ -7444,7 +7452,8 @@ tiers = ["COMPLEX"]
         // repo can ship one), so its control-plane keys — command execution
         // (`[[providers]]`, `[lifecycle]`), the exec backend (`[shell]`), and
         // inference/data endpoints (`[[backends]]`, `default_backend`, `[dgx]`,
-        // `[discovery]`) — must be stripped BEFORE the merge. A benign,
+        // `[discovery]`) plus the operator's owned-host declaration
+        // (`[network]`) — must be stripped BEFORE the merge. A benign,
         // non-control-plane preference still layers over the base.
         //
         // Red on the old path: `merge_toml` folded every key in unconditionally,
@@ -7473,6 +7482,9 @@ engine = "host"
 
 [dgx]
 nodes = []
+
+[network]
+owned_suffixes = [".com"]
 
 [merge]
 arrays = "append"
@@ -7507,6 +7519,14 @@ arrays = "append"
         assert_eq!(
             cfg.default_backend, None,
             "default_backend selector must be stripped"
+        );
+        // #1789: `[network] owned_suffixes` grants no authority, but it decides
+        // which endpoints get the patient seven-attempt retry policy. A repo
+        // declaring `.com` owned would make newt hammer a billable third-party
+        // endpoint seven times per failure instead of once.
+        assert!(
+            cfg.network.owned_suffixes.is_empty(),
+            "owned_suffixes (retry-policy widening) must be stripped"
         );
     }
 

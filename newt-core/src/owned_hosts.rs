@@ -52,9 +52,21 @@ pub fn set_owned_suffixes(suffixes: Vec<String>) {
 ///   loopback, RFC-1918, and the conventional private suffixes;
 /// - it is a single-label DNS name (`dgx1`, `ollama`) — conventional LAN and
 ///   service-discovery shorthand, which carries no public suffix by design;
+/// - it is an IPv6 unique-local (`fc00::/7`) or link-local (`fe80::/10`)
+///   address — the operator's own fabric by construction;
 /// - it ends with an operator-declared `[network] owned_suffixes` entry.
 #[must_use]
 pub fn is_owned_host(host: &str) -> bool {
+    is_owned_with(host, OWNED_SUFFIXES.get().map_or(&[], Vec::as_slice))
+}
+
+/// The classification itself, with the declared suffixes passed in.
+///
+/// Separated from [`is_owned_host`] so the rule is testable without touching
+/// the process-global `OnceLock` — a first-call-wins global cannot express
+/// "these suffixes for this case" and would make the tests order-dependent.
+#[must_use]
+pub(crate) fn is_owned_with(host: &str, suffixes: &[String]) -> bool {
     let host = host.trim_matches(|c| c == '[' || c == ']').to_lowercase();
     if crate::notes_scan::is_exfil_safe_host(&host) {
         return true;
@@ -62,9 +74,17 @@ pub fn is_owned_host(host: &str) -> bool {
     if !host.contains('.') && !host.contains(':') {
         return true;
     }
-    OWNED_SUFFIXES
-        .get()
-        .is_some_and(|suffixes| suffixes.iter().any(|s| host.ends_with(s.as_str())))
+    // IPv6 unique-local and link-local. These belong HERE and deliberately not
+    // in the exfiltration guard: reaching a ULA address is a property of the
+    // operator's own network fabric, which makes it theirs, but it is not
+    // evidence that a note quoting that URL is safe.
+    if host.parse::<std::net::Ipv6Addr>().is_ok_and(|addr| {
+        let first = addr.segments()[0];
+        (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+    }) {
+        return true;
+    }
+    suffixes.iter().any(|s| host.ends_with(s.as_str()))
 }
 
 #[cfg(test)]
@@ -94,9 +114,30 @@ mod tests {
     }
 
     #[test]
-    fn declaring_a_suffix_does_not_widen_the_exfil_guard() {
-        // The guard is the security control; nothing in this module may move it.
-        // Asserted against a name no built-in suffix covers.
-        assert!(!crate::notes_scan::is_exfil_safe_host("gpu.example.com"));
+    fn ipv6_unique_local_and_link_local_are_owned() {
+        // These are the operator's own fabric. They are NOT exfil-safe, which
+        // is the point of keeping the two predicates apart.
+        assert!(is_owned_with("fd12:3456::42", &[]));
+        assert!(is_owned_with("[fd00::1]", &[]));
+        assert!(is_owned_with("fe80::1", &[]));
+        assert!(!crate::notes_scan::is_exfil_safe_host("fd12:3456::42"));
+    }
+
+    #[test]
+    fn a_declared_suffix_widens_owned_but_never_the_exfil_guard() {
+        // The separation theorem. A configured suffix moves is_owned_with and
+        // leaves is_exfil_safe_host exactly where it was — if these ever move
+        // together, the split has collapsed and config can buy an
+        // exfiltration channel.
+        let host = "gpu.example.com";
+        let declared = vec![".example.com".to_string()];
+
+        assert!(!is_owned_with(host, &[]), "not owned before declaring");
+        assert!(is_owned_with(host, &declared), "owned after declaring");
+
+        assert!(
+            !crate::notes_scan::is_exfil_safe_host(host),
+            "the exfil guard must not move when a suffix is declared"
+        );
     }
 }

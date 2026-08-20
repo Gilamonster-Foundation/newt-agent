@@ -350,15 +350,7 @@ fn inference_endpoint_is_owned(endpoint: &str) -> bool {
     else {
         return false;
     };
-    if crate::owned_hosts::is_owned_host(&host) {
-        return true;
-    }
-
-    let host = host.trim_matches(|c| c == '[' || c == ']');
-    host.parse::<std::net::Ipv6Addr>().is_ok_and(|addr| {
-        let first = addr.segments()[0];
-        (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
-    })
+    crate::owned_hosts::is_owned_host(&host)
 }
 
 fn tui_retry_policy(endpoint: &str) -> RetryPolicy {
