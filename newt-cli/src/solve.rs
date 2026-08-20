@@ -154,6 +154,7 @@ fn apply_context_config(driver: &mut TurnDriverConfig, context: Option<&newt_cor
     driver.low_budget_pct = context.low_budget_pct;
     driver.estimation = context.estimation;
     driver.summary_input_cap_floor_chars = context.summary_input_cap_floor_chars;
+    driver.context_manager = context.manager;
 }
 
 fn apply_context_window(driver: &mut TurnDriverConfig, context_window: u32) {

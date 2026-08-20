@@ -176,8 +176,8 @@ pub use artifact_read::{
 };
 pub use compress::{
     compress_user_initiated, compress_user_initiated_for_task, CompressCounters, CompressState,
-    ManualCompressOutcome, SummarizeFn, SummarizeFuture, Summarizer, CONTINUATION_PREFIX,
-    SUMMARY_END_MARKER, SUMMARY_PREFIX,
+    ManualCompressOutcome, ManualCompressPolicy, SummarizeFn, SummarizeFuture, Summarizer,
+    CONTINUATION_PREFIX, SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
 pub use content_spill::{
     SessionSpillStore, SpillCid, SpillCidError, SpillProvenance, SpillRecordV1, SpillScope,
@@ -316,7 +316,7 @@ pub use warmup::warmup_if_cold;
 use crate::retry::{with_backoff_notify, with_backoff_notify_error, RetryPolicy};
 use compress::{
     compress, compression_trigger, CompressAction, CompressRequest, CompressTrigger,
-    CompressionTriggerLimits,
+    CompressionTriggerLimits, RefusalReason,
 };
 use crossterm::{
     execute,
@@ -763,6 +763,10 @@ enum ResponsesCompaction {
     NotFired,
     /// The compressor refused: the protected head alone exceeds the budget.
     Refused,
+    /// The compressor refused because the selected context manager is
+    /// append-only — a different cause with a different remedy, kept distinct so
+    /// the rejection diagnostic cannot assert a head size it never measured.
+    AppendOnlyRefused,
     /// The rebuilt request still exceeds the budget AFTER fencing — `input` is left
     /// UNCHANGED (BHV-BUDGET-004: never dispatch an oversized request).
     OverBudgetAfterFence(responses_compaction::PostBridgeBudgetExceeded),
@@ -771,6 +775,30 @@ enum ResponsesCompaction {
     /// The staged compaction spill batch could not be committed (a poisoned store or a
     /// content-integrity violation) — fail CLOSED, committing NOTHING (BHV-SPILL-007).
     SpillCommitFailed(crate::agentic::content_spill::SpillError),
+}
+
+/// The bail message for a [`CompressAction::Refused`] outcome.
+///
+/// The two refusal causes need DIFFERENT remedies — one is a stuck pipeline, the
+/// other is the operator's own policy choice — so the message is selected by
+/// [`RefusalReason`] rather than asserting the anti-thrash cause unconditionally.
+/// Sending an append-only operator to `newt tunings reset` wastes their time and
+/// hides the one action that resolves it.
+fn refusal_bail_message(reason: Option<RefusalReason>, current: usize, model: &str) -> String {
+    match reason {
+        Some(RefusalReason::AppendOnly) => format!(
+            "context (~{current} tokens) exceeds the model's input budget and the \
+             append-only context manager never rewrites recorded turns — select \
+             `/context manager standard` to re-enable compaction, or start a new \
+             conversation / ask a more focused question"
+        ),
+        _ => format!(
+            "context (~{current} tokens) exceeds the model's input budget and \
+             auto-compression is disabled after repeated ineffective passes — \
+             start a new conversation or ask a more focused question, or run \
+             `newt tunings reset {model}` if this model's learned budget looks wrong"
+        ),
+    }
 }
 
 /// Why a proactive / reactive compaction attempt did NOT yield a dispatchable
@@ -786,6 +814,8 @@ enum CompactionRejection {
     BridgeClassification,
     /// The compressor refused: the protected head alone exceeds the budget.
     CompressorRefused,
+    /// The compressor refused because the selected context manager is append-only.
+    AppendOnlyRefused,
     /// Compaction could not reduce the request further (nothing left to reclaim).
     NoProgress,
     /// The fenced rebuild still exceeds the budget after framing (BHV-BUDGET-004).
@@ -805,6 +835,11 @@ impl std::fmt::Display for CompactionRejection {
             Self::CompressorRefused => write!(
                 f,
                 "proactive compaction refused: the protected head alone exceeds the input budget"
+            ),
+            Self::AppendOnlyRefused => write!(
+                f,
+                "proactive compaction refused: the append-only context manager never rewrites \
+                 recorded turns — select `/context manager standard` to re-enable compaction"
             ),
             Self::NoProgress => write!(
                 f,
@@ -831,6 +866,7 @@ impl ResponsesCompaction {
             Self::Compacted => None,
             Self::NotFired => Some(CompactionRejection::NoProgress),
             Self::Refused => Some(CompactionRejection::CompressorRefused),
+            Self::AppendOnlyRefused => Some(CompactionRejection::AppendOnlyRefused),
             Self::BridgeError => Some(CompactionRejection::BridgeClassification),
             Self::OverBudgetAfterFence(e) => Some(CompactionRejection::PostBridgeBudgetExceeded(e)),
             Self::SpillCommitFailed(e) => Some(CompactionRejection::SpillCommit(e)),
@@ -877,6 +913,7 @@ async fn compact_responses_input(
     estimation: crate::tokens::TokenEstimation,
     task: &str,
     summary_input_cap_floor_chars: usize,
+    rewrites_history: bool,
     compaction_store: Option<&dyn crate::agentic::content_spill::SpillStore>,
     summarizer: Option<&SummarizeFn>,
     compress_state: &mut CompressState,
@@ -918,6 +955,7 @@ async fn compact_responses_input(
             focus: None,
             est: estimation,
             summary_input_cap_floor_chars,
+            rewrites_history,
             compaction_store,
             compaction_stage: compaction_store.map(|_| &stage_buffer),
         },
@@ -927,7 +965,13 @@ async fn compact_responses_input(
     .await;
     // The notice is NOT emitted yet — only a committed compaction surfaces one.
     if outcome.action == CompressAction::Refused {
-        return ResponsesCompaction::Refused;
+        // Carry the CAUSE across, not just the fact: `CompressorRefused` names a
+        // protected-head size that the append-only guard returns before ever
+        // measuring, and this string is the diagnostic headless callers read.
+        return match outcome.refusal {
+            Some(RefusalReason::AppendOnly) => ResponsesCompaction::AppendOnlyRefused,
+            _ => ResponsesCompaction::Refused,
+        };
     }
     if !outcome.fired {
         return ResponsesCompaction::NotFired;
@@ -1502,6 +1546,11 @@ pub struct ChatCtx<'a> {
     /// ⇒ never advertised. Trait-injection seam like `git_tool` (newt-scheduler
     /// depends on newt-core, so the dep can't be direct).
     pub crew_runner: Option<&'a dyn CrewRunner>,
+    /// Whether the selected context manager may rewrite already-recorded
+    /// messages. `false` is the append-only strategy — see
+    /// [`crate::ContextManager::rewrites_history`]. Defaults to `true`
+    /// (today's `standard` preset) so every existing caller is unchanged.
+    pub rewrites_history: bool,
     /// Session-local working-style selector behind `/mode auto`. `Some` only
     /// when the human configured Auto mode, so every other session omits the
     /// model-facing selector entirely. A selection affects a future turn and
@@ -2116,6 +2165,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         estimate_ratio,
         estimation,
         summary_input_cap_floor_chars,
+        rewrites_history,
         input_ceiling_pct,
         low_budget_pct,
         exec_floor,
@@ -2573,6 +2623,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 focus: None,
                                 est: estimation,
                                 summary_input_cap_floor_chars,
+                                rewrites_history,
                                 compaction_store,
                                 compaction_stage: None,
                             },
@@ -2592,17 +2643,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     print_harness_notice(&notice, color);
                 }
                 if outcome.action == CompressAction::Refused {
-                    // Anti-thrash disabled compression and the context still
-                    // exceeds the budget: refuse the send rather than let the
-                    // backend silently truncate the task away (baseline B6).
-                    // Phase 20: name the model and the reset escape hatch —
-                    // a poisoned learned budget is a known cause of this bail.
-                    anyhow::bail!(
-                        "context (~{current} tokens) exceeds the model's input budget and \
-                         auto-compression is disabled after repeated ineffective passes — \
-                         start a new conversation or ask a more focused question, or run \
-                         `newt tunings reset {model}` if this model's learned budget looks wrong"
-                    );
+                    // Refuse the send rather than let the backend silently
+                    // truncate the task away (baseline B6). The remedy differs by
+                    // cause — a poisoned learned budget and an append-only preset
+                    // are both known reasons to land here — so the message is
+                    // built from `outcome.refusal`, never assumed.
+                    anyhow::bail!("{}", refusal_bail_message(outcome.refusal, current, model));
                 }
                 if outcome.fired {
                     // N2: a hard-budget compression whose assembled result is
@@ -2887,6 +2933,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     focus: None,
                                     est: estimation,
                                     summary_input_cap_floor_chars,
+                                    rewrites_history,
                                     compaction_store,
                                     compaction_stage: None,
                                 },
@@ -3543,6 +3590,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 focus: None,
                                 est: estimation,
                                 summary_input_cap_floor_chars,
+                                rewrites_history,
                                 compaction_store,
                                 compaction_stage: None,
                             },
@@ -3578,6 +3626,18 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 false,
                                 color,
                             );
+                        } else if !rewrites_history {
+                            // Append-only: this fallback is a structural rewrite
+                            // of prior turns, so the preset forbids it — and here
+                            // that matters MORE than under `standard`, not less.
+                            // Compress never fires under append-only, so what was
+                            // the rare branch becomes the only branch: leaving it
+                            // ungated would make the preset that promises the
+                            // transcript is never rewritten rewrite it on every
+                            // suspected overflow. The retry is then identical to
+                            // the request that just came back empty, so there is
+                            // nothing to gain by looping — let the retry budget
+                            // run out and the silent-overflow report stand.
                         } else {
                             // N1: the retry must differ from the request that
                             // just returned empty — when compress was a no-op
@@ -5993,6 +6053,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         estimate_ratio,
         estimation,
         summary_input_cap_floor_chars,
+        rewrites_history,
         input_ceiling_pct,
         low_budget_pct,
         exec_floor,
@@ -6370,6 +6431,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         focus: None,
                         est: estimation,
                         summary_input_cap_floor_chars,
+                        rewrites_history,
                         compaction_store,
                         compaction_stage: None,
                     },
@@ -6381,12 +6443,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     print_harness_notice(&notice, color);
                 }
                 if outcome.action == CompressAction::Refused {
-                    anyhow::bail!(
-                        "context (~{current} tokens) exceeds the model's input budget and \
-                         auto-compression is disabled after repeated ineffective passes — \
-                         start a new conversation or ask a more focused question, or run \
-                         `newt tunings reset {model}` if this model's learned budget looks wrong"
-                    );
+                    anyhow::bail!("{}", refusal_bail_message(outcome.refusal, current, model));
                 }
                 if outcome.fired {
                     // N2 (mirrors the Ollama path): flag a still-over-budget
@@ -6655,6 +6712,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     focus: None,
                                     est: estimation,
                                     summary_input_cap_floor_chars,
+                                    rewrites_history,
                                     compaction_store,
                                     compaction_stage: None,
                                 },
@@ -8004,6 +8062,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         estimate_ratio,
         estimation,
         summary_input_cap_floor_chars,
+        rewrites_history,
         input_ceiling_pct,
         low_budget_pct,
         exec_floor,
@@ -8384,6 +8443,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         focus: None,
                         est: estimation,
                         summary_input_cap_floor_chars,
+                        rewrites_history,
                         compaction_store,
                         compaction_stage: None,
                     },
@@ -8395,12 +8455,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     print_harness_notice(&notice, color);
                 }
                 if outcome.action == CompressAction::Refused {
-                    anyhow::bail!(
-                        "context (~{current} tokens) exceeds the model's input budget and \
-                         auto-compression is disabled after repeated ineffective passes — \
-                         start a new conversation or ask a more focused question, or run \
-                         `newt tunings reset {model}` if this model's learned budget looks wrong"
-                    );
+                    anyhow::bail!("{}", refusal_bail_message(outcome.refusal, current, model));
                 }
                 if outcome.fired {
                     let suffix = if trigger.hard_budget && outcome.tokens_after > pipeline_budget {
@@ -8597,6 +8652,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                     focus: None,
                                     est: estimation,
                                     summary_input_cap_floor_chars,
+                                    rewrites_history,
                                     compaction_store,
                                     compaction_stage: None,
                                 },
@@ -9693,6 +9749,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // #727: bound for the get_context_remaining used-token estimate.
         estimation,
         summary_input_cap_floor_chars,
+        rewrites_history,
         input_ceiling_pct,
         low_budget_pct,
         exec_floor,
@@ -9962,6 +10019,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         estimation,
                         task,
                         summary_input_cap_floor_chars,
+                        rewrites_history,
                         compaction_store,
                         summarizer,
                         compress_state,
@@ -10075,6 +10133,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                 estimation,
                                 task,
                                 summary_input_cap_floor_chars,
+                                rewrites_history,
                                 compaction_store,
                                 summarizer,
                                 compress_state,
@@ -10460,6 +10519,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 estimation,
                 task,
                 summary_input_cap_floor_chars,
+                rewrites_history,
                 compaction_store,
                 summarizer,
                 compress_state,
@@ -12119,6 +12179,7 @@ mod tool_round_cap_tests {
             estimate_ratio: None,
             estimation: crate::tokens::TokenEstimation::default(),
             summary_input_cap_floor_chars: 8_192,
+            rewrites_history: true,
             exec_floor: None,
             write_ledger: None,
             attribution: None,
@@ -12398,6 +12459,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 estimation: crate::tokens::TokenEstimation::default(),
                 summary_input_cap_floor_chars: 8_192,
+                rewrites_history: true,
                 exec_floor: None,
                 write_ledger: None,
                 attribution: None,
@@ -12858,6 +12920,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 estimation: crate::tokens::TokenEstimation::default(),
                 summary_input_cap_floor_chars: 8_192,
+                rewrites_history: true,
                 exec_floor: None,
                 write_ledger: None,
                 attribution: None,
@@ -12961,6 +13024,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 estimation: crate::tokens::TokenEstimation::default(),
                 summary_input_cap_floor_chars: 8_192,
+                rewrites_history: true,
                 exec_floor: None,
                 write_ledger: None,
                 attribution: None,
@@ -14208,6 +14272,7 @@ mod tool_round_cap_tests {
             crate::tokens::TokenEstimation::default(),
             "the task",
             8_192,
+            true,
             None,
             Some(&*summ),
             &mut state,
@@ -14259,6 +14324,7 @@ mod tool_round_cap_tests {
             crate::tokens::TokenEstimation::default(),
             "task",
             8_192,
+            true,
             None,
             None,
             &mut state,
@@ -14295,6 +14361,7 @@ mod tool_round_cap_tests {
             crate::tokens::TokenEstimation::default(),
             "task",
             8_192,
+            true,
             None,
             None,
             &mut state,
@@ -14341,6 +14408,7 @@ mod tool_round_cap_tests {
             crate::tokens::TokenEstimation::default(),
             "task",
             8_192,
+            true,
             None,
             Some(&*summ),
             &mut state,
@@ -14407,6 +14475,7 @@ mod tool_round_cap_tests {
                 crate::tokens::TokenEstimation::default(),
                 "task",
                 8_192,
+                true,
                 Some(&store),
                 Some(&*s),
                 &mut state,
@@ -14451,6 +14520,7 @@ mod tool_round_cap_tests {
                 crate::tokens::TokenEstimation::default(),
                 "task",
                 8_192,
+                true,
                 Some(&store),
                 Some(&*s),
                 &mut state,
@@ -14502,6 +14572,7 @@ mod tool_round_cap_tests {
             crate::tokens::TokenEstimation::default(),
             "task",
             8_192,
+            true,
             None, // NO real compaction store
             Some(&*summ),
             &mut state,
@@ -14543,6 +14614,7 @@ mod tool_round_cap_tests {
             crate::tokens::TokenEstimation::default(),
             "task",
             8_192,
+            true,
             Some(&store),
             Some(&*summ),
             &mut state,
@@ -15287,6 +15359,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 estimation: crate::tokens::TokenEstimation::default(),
                 summary_input_cap_floor_chars: 8_192,
+                rewrites_history: true,
                 exec_floor: None,
                 write_ledger: None,
                 attribution: None,
@@ -15403,6 +15476,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 estimation: crate::tokens::TokenEstimation::default(),
                 summary_input_cap_floor_chars: 8_192,
+                rewrites_history: true,
                 exec_floor: None,
                 write_ledger: None,
                 attribution: None,
@@ -15528,6 +15602,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 estimation: crate::tokens::TokenEstimation::default(),
                 summary_input_cap_floor_chars: 8_192,
+                rewrites_history: true,
                 exec_floor: None,
                 write_ledger: None,
                 attribution: None,
@@ -15664,6 +15739,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 estimation: crate::tokens::TokenEstimation::default(),
                 summary_input_cap_floor_chars: 8_192,
+                rewrites_history: true,
                 exec_floor: None,
                 write_ledger: None,
                 attribution: None,
@@ -15792,6 +15868,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 estimation: crate::tokens::TokenEstimation::default(),
                 summary_input_cap_floor_chars: 8_192,
+                rewrites_history: true,
                 exec_floor: None,
                 write_ledger: None,
                 attribution: None,
@@ -15962,6 +16039,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 estimation: crate::tokens::TokenEstimation::default(),
                 summary_input_cap_floor_chars: 8_192,
+                rewrites_history: true,
                 exec_floor: None,
                 write_ledger: None,
                 attribution: None,
@@ -16141,6 +16219,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 estimation: crate::tokens::TokenEstimation::default(),
                 summary_input_cap_floor_chars: 8_192,
+                rewrites_history: true,
                 exec_floor: None,
                 write_ledger: None,
                 attribution: None,
@@ -17066,6 +17145,7 @@ mod save_note_loop_tests {
             estimate_ratio: None,
             estimation: crate::tokens::TokenEstimation::default(),
             summary_input_cap_floor_chars: 8_192,
+            rewrites_history: true,
             exec_floor: None,
             write_ledger: None,
             attribution: None,
@@ -17576,6 +17656,7 @@ mod compression_loop_tests {
             estimate_ratio: None,
             estimation: crate::tokens::TokenEstimation::default(),
             summary_input_cap_floor_chars: 8_192,
+            rewrites_history: true,
             exec_floor: None,
             write_ledger: None,
             attribution: None,
@@ -18964,6 +19045,7 @@ mod observation_hook_tests {
             estimate_ratio: None,
             estimation: crate::tokens::TokenEstimation::default(),
             summary_input_cap_floor_chars: 8_192,
+            rewrites_history: true,
             // #307: test ChatCtx carries no preset exec floor (headless default).
             exec_floor: None,
             write_ledger: None,

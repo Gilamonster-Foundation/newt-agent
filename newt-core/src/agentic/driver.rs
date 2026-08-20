@@ -155,6 +155,11 @@ pub struct TurnDriverConfig {
     pub estimation: crate::tokens::TokenEstimation,
     /// Minimum summarizer input cap configured under `[context]`.
     pub summary_input_cap_floor_chars: usize,
+    /// Context-management preset configured under `[context] manager`. Headless
+    /// callers get the same preset the interactive harness resolves, so
+    /// `manager = "append-only"` in a config file governs `newt solve` too —
+    /// otherwise the setting would silently mean nothing off the TUI.
+    pub context_manager: crate::ContextManager,
     /// #1280: optional semantic retrieval for the headless turn. `Some` ⇒ the
     /// `code_search` tool is advertised and executable against the supplied
     /// index; `None` (the default) ⇒ absent, preserving today's behavior.
@@ -198,6 +203,7 @@ impl TurnDriverConfig {
             low_budget_pct: 15,
             estimation: crate::tokens::TokenEstimation::default(),
             summary_input_cap_floor_chars: 8_192,
+            context_manager: crate::ContextManager::default(),
             code_search: None,
         }
     }
@@ -543,6 +549,7 @@ async fn run_one_turn(
     // explicit `disclosure` param) value-filter against the same secret.
     let _disclosure_guard = crate::ocap::scoped_session_disclosure(session_disclosure.clone());
     let ctx = ChatCtx {
+        rewrites_history: config.context_manager.rewrites_history(),
         url: &config.url,
         model: &config.model,
         kind: config.kind,

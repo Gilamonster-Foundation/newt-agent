@@ -166,6 +166,7 @@ async fn private_review_fetch_recovers_through_tool_search_and_mcp() {
 
     let (reply, _, _, hallucinations) = chat_complete(
         ChatCtx {
+            rewrites_history: true,
             url: &model.uri(),
             model: "adaptive-private-review-model",
             kind: BackendKind::Ollama,

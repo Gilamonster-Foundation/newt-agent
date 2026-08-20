@@ -10518,7 +10518,7 @@ fn handle_context_command(
     } else if rest == "manager" {
         out.lines.push(format!(
             "context manager: {} ({mgr_src}) — \
-             use /context manager standard|progressive|distributed",
+             use /context manager standard|append-only|progressive|distributed",
             manager.keyword()
         ));
     } else if let Some(name) = rest.strip_prefix("manager ") {
@@ -10533,7 +10533,7 @@ fn handle_context_command(
                 manager.keyword()
             )),
             None => out.lines.push(format!(
-                "unknown context manager '{}' — use standard|progressive|distributed",
+                "unknown context manager '{}' — use standard|append-only|progressive|distributed",
                 name.trim()
             )),
         }
@@ -15596,6 +15596,7 @@ mod tool_round_cap_tests {
                     };
                     openai_chat_complete(
                         ChatCtx {
+                            rewrites_history: true,
                             url: &server.uri(),
                             model: "cw-test-model",
                             kind: BackendKind::Openai,

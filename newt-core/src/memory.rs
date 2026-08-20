@@ -1103,6 +1103,12 @@ pub struct Summarizing {
     /// Compaction message minted by the last compression, awaiting durable
     /// persistence via `take_compaction_record` (Step 18.5).
     pending_record: Option<String>,
+    /// Whether the selected context manager may rewrite recorded turns. `false`
+    /// (append-only) makes this provider decline to summarize rather than
+    /// replacing `history` with a rewritten form — otherwise selecting the
+    /// preset would leave the operator believing their transcript was untouched
+    /// while this provider rewrote it underneath them.
+    rewrites_history: bool,
     /// `[context.estimation]` token-estimation heuristic, and the summarizer
     /// input-cap floor (`[context] summary_input_cap_floor_chars`). Default to
     /// the universal values; the TUI sets them from config via
@@ -1124,9 +1130,20 @@ impl Summarizing {
             last_prompt_tokens: None,
             delta_since_prompt: 0,
             pending_record: None,
+            rewrites_history: true,
             est: crate::tokens::TokenEstimation::default(),
             summary_input_cap_floor_chars: 8_192,
         }
+    }
+
+    /// Builder: adopt the selected context manager's rewrite policy. `false`
+    /// (append-only) stops this provider summarizing recorded turns — the
+    /// `[context] manager` preset governs every path that rewrites history, not
+    /// only the agentic loop's compaction trigger.
+    #[must_use]
+    pub fn with_rewrites_history(mut self, rewrites_history: bool) -> Self {
+        self.rewrites_history = rewrites_history;
+        self
     }
 
     /// Builder: set the token-estimation heuristic + summarizer cap floor from
@@ -1189,6 +1206,12 @@ impl Summarizing {
         if self.history.is_empty() {
             return;
         }
+        // Append-only: this provider is one of the paths that rewrites recorded
+        // turns, so the preset has to reach it too. Declining here costs recall;
+        // summarizing anyway would cost the operator the guarantee they selected.
+        if !self.rewrites_history {
+            return;
+        }
         let messages: Vec<serde_json::Value> =
             self.history.iter().flat_map(SumTurn::to_wire).collect();
         // Carry the just-synced operator prompt as a transient protected pair.
@@ -1199,6 +1222,7 @@ impl Summarizing {
         let protected = protect_active_prompt_for_compression(&messages, active_task);
         let outcome = compress(
             CompressRequest {
+                rewrites_history: self.rewrites_history,
                 messages: &protected,
                 budget: self.budget() as usize,
                 max_messages: None,
@@ -2127,6 +2151,62 @@ mod tests {
                     && t.assistant.is_empty()),
             "the compaction message must live in history as a lone user entry"
         );
+    }
+
+    /// `[context] manager = append-only` must reach the memory provider too.
+    ///
+    /// The compaction trigger in the agentic loop is not the only path that
+    /// rewrites recorded turns — `Summarizing` replaces `history` with a
+    /// summarized form of its own accord. Left ungoverned, an operator who
+    /// selected append-only would believe their transcript was untouched while
+    /// this provider rewrote it underneath them, which is the exact harm the
+    /// preset exists to prevent.
+    ///
+    /// Same input, same budget crossing, two policies: one summarizes, the other
+    /// hands history back unchanged and never mints a compaction.
+    #[tokio::test]
+    async fn summarizing_append_only_declines_to_rewrite_history() {
+        let big = "x".repeat(200);
+        let drive = |rewrites_history: bool| async move {
+            let big = "x".repeat(200);
+            let mut s = Summarizing::new(512)
+                .with_summarizer(stub_summarizer("SUMMARY"))
+                .with_rewrites_history(rewrites_history);
+            for i in 0..5u32 {
+                s.sync_turn(&big, &big, &metrics_with_input(10 + i)).await;
+            }
+            let before = s.history.clone();
+            s.sync_turn(&big, &big, &metrics_with_input(600)).await;
+            (s, before)
+        };
+
+        let (standard, _) = drive(true).await;
+        assert!(
+            standard.compress_count >= 1,
+            "the standard preset still compacts"
+        );
+
+        let (append, before) = drive(false).await;
+        assert_eq!(
+            append.compress_count, 0,
+            "append-only must mint no compaction"
+        );
+        assert_eq!(
+            append.prev_summary, "",
+            "append-only must not start a summary chain"
+        );
+        assert!(
+            append.pending_record.is_none(),
+            "append-only must not stage a compaction record"
+        );
+        // The turns recorded before the budget crossing survive verbatim; only
+        // the newly appended turn is added.
+        assert_eq!(append.history.len(), before.len() + 1);
+        for (kept, original) in append.history.iter().zip(before.iter()) {
+            assert_eq!(kept.user, original.user);
+            assert_eq!(kept.assistant, original.assistant);
+        }
+        let _ = big;
     }
 
     /// SEMANTICS CHANGED in Step 18.1: the reported prompt sizes must

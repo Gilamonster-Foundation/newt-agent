@@ -854,12 +854,37 @@ impl MarkdownMode {
 /// `distributed` are the retrievable-card managers **owned by #546** and not
 /// yet available — selecting them reports that and stays on `standard`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+// kebab-case, NOT lowercase: serde's `lowercase` rule is a plain
+// `to_ascii_lowercase()` of the identifier, which would name `AppendOnly`
+// "appendonly" while `keyword()`, the `/context manager` selector and the docs
+// all say "append-only" — making the documented spelling a hard config-load
+// failure. `standard` / `progressive` / `distributed` are byte-identical under
+// either rule, so this is not a compatibility break for existing configs.
+#[serde(rename_all = "kebab-case")]
 pub enum ContextManager {
     /// Prune → summarize → static-marker (today's behavior). The only one
     /// implemented; the selector seam for the others.
     #[default]
     Standard,
+    /// **Never rewrite history.** No summarization, no structural pruning of
+    /// prior messages: this preset removes compaction as a source of
+    /// prompt-prefix churn, so whatever prefix the harness emits stays stable
+    /// turn over turn and provider caching can hold. Oversized material is
+    /// capped where it is *produced* (tool-result caps, paginated reads,
+    /// offload). A request that will not fit an **authoritative** ceiling is
+    /// refused rather than rewritten; softer triggers dispatch as-is, since
+    /// dispatching rewrites nothing either.
+    ///
+    /// The preset governs compaction, not every byte of the request: a caller
+    /// that regenerates a volatile system prompt each turn still invalidates the
+    /// cache on its own, and that is the caller's to fix — not something this
+    /// preset can promise away.
+    ///
+    /// This is the strategy `mini-swe-agent` uses, and it is a real answer, not
+    /// a degenerate one: it scores >74% on SWE-bench Verified with no context
+    /// management at all. It trades recall for fidelity — nothing is silently
+    /// altered, because nothing is altered.
+    AppendOnly,
     /// Leave a lookup marker; retrieve cards on demand (ephemeral → local DB).
     /// Owned by #546 — not yet available.
     Progressive,
@@ -873,16 +898,20 @@ impl ContextManager {
     pub fn from_keyword(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "standard" => Some(Self::Standard),
+            "append-only" | "append_only" | "appendonly" | "append" => Some(Self::AppendOnly),
             "progressive" => Some(Self::Progressive),
             "distributed" => Some(Self::Distributed),
             _ => None,
         }
     }
 
-    /// The canonical lowercase keyword (round-trips `from_keyword` + serde).
+    /// The canonical keyword. Round-trips through BOTH `from_keyword` and serde
+    /// — the `kebab-case` rename on the enum is what keeps the second half of
+    /// that promise once a variant's name is more than one word.
     pub fn keyword(self) -> &'static str {
         match self {
             Self::Standard => "standard",
+            Self::AppendOnly => "append-only",
             Self::Progressive => "progressive",
             Self::Distributed => "distributed",
         }
@@ -891,7 +920,17 @@ impl ContextManager {
     /// Whether this manager is implemented. Only `standard` today; the others
     /// are owned by #546 (the selector reports "not yet available").
     pub fn available(self) -> bool {
-        matches!(self, Self::Standard)
+        matches!(self, Self::Standard | Self::AppendOnly)
+    }
+
+    /// Whether this preset may rewrite messages already in the transcript.
+    ///
+    /// `false` for [`AppendOnly`](Self::AppendOnly), which is the whole point of
+    /// it: no summarization, no structural pruning of prior turns, so the prompt
+    /// prefix is byte-identical turn over turn and provider caching is optimal by
+    /// construction. Everything else rewrites, and pays the cache cost for recall.
+    pub fn rewrites_history(self) -> bool {
+        !matches!(self, Self::AppendOnly)
     }
 
     /// The default feature bundle this preset turns on (Phase 26, #588). A
@@ -5422,6 +5461,7 @@ mod tests {
     fn context_manager_keyword_roundtrip_and_availability() {
         for m in [
             ContextManager::Standard,
+            ContextManager::AppendOnly,
             ContextManager::Progressive,
             ContextManager::Distributed,
         ] {
@@ -5433,11 +5473,69 @@ mod tests {
             "case/space-insensitive"
         );
         assert_eq!(ContextManager::from_keyword("nope"), None);
-        // Only standard is implemented today; the others are pending #546.
+        // standard + append-only are implemented; the card managers are #546.
         assert!(ContextManager::Standard.available());
+        assert!(ContextManager::AppendOnly.available());
         assert!(!ContextManager::Progressive.available());
         assert!(!ContextManager::Distributed.available());
         assert_eq!(ContextManager::default(), ContextManager::Standard);
+        // The predicate the whole preset exists to express.
+        assert!(!ContextManager::AppendOnly.rewrites_history());
+        for m in [
+            ContextManager::Standard,
+            ContextManager::Progressive,
+            ContextManager::Distributed,
+        ] {
+            assert!(m.rewrites_history(), "{m:?} rewrites history");
+        }
+        // Every spelling `from_keyword` advertises must actually parse.
+        for alias in [
+            "append-only",
+            "append_only",
+            "appendonly",
+            "append",
+            "  APPEND-ONLY ",
+        ] {
+            assert_eq!(
+                ContextManager::from_keyword(alias),
+                Some(ContextManager::AppendOnly),
+                "alias {alias:?}"
+            );
+        }
+    }
+
+    /// The keyword an operator is SHOWN must be the keyword their config file
+    /// accepts. `#[serde(rename_all = "lowercase")]` would have named this
+    /// variant "appendonly" while every other surface said "append-only", so
+    /// `manager = "append-only"` — the spelling `/context manager` echoes back
+    /// and the docs use — failed the WHOLE config load, and the interactive path
+    /// swallows that into a silent fall back to defaults.
+    ///
+    /// Regression for the `lowercase` → `kebab-case` fix: this fails on the old
+    /// attribute. `keyword()` alone could never catch it — it never touches serde.
+    #[test]
+    fn context_manager_serde_name_matches_its_keyword() {
+        for m in [
+            ContextManager::Standard,
+            ContextManager::AppendOnly,
+            ContextManager::Progressive,
+            ContextManager::Distributed,
+        ] {
+            let encoded = serde_json::to_string(&m).expect("serialize");
+            assert_eq!(
+                encoded,
+                format!("\"{}\"", m.keyword()),
+                "{m:?} serializes as something other than its keyword"
+            );
+            assert_eq!(
+                serde_json::from_str::<ContextManager>(&encoded).expect("round-trip"),
+                m
+            );
+        }
+        // The documented spelling, through the real config surface.
+        let parsed: ContextConfig =
+            toml::from_str("manager = \"append-only\"").expect("append-only must load");
+        assert_eq!(parsed.manager, ContextManager::AppendOnly);
     }
 
     #[test]
