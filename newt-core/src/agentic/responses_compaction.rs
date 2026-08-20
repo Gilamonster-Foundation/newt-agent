@@ -873,6 +873,7 @@ mod tests {
                 None,
                 crate::tokens::TokenEstimation::default(),
                 8_192,
+                true,
             );
             r.budget * 2 // user_initiated stores before/2
         };
@@ -882,6 +883,7 @@ mod tests {
             None,
             crate::tokens::TokenEstimation::default(),
             8_192,
+            true,
         );
         // ~before/3, a hard budget: prune-insufficient → the middle is summarized.
         req.budget = before / 3;

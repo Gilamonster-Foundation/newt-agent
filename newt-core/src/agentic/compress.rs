@@ -208,6 +208,11 @@ pub struct CompressState {
     /// from `notified` so the over-budget-dispatch message and the
     /// compression-disabled message each surface at most once.
     failopen_notified: bool,
+    /// One-time latch for the append-only fail-open notice, kept separate from
+    /// the other two for the same reason: the preset declining to rewrite is a
+    /// different event from anti-thrash latching off or the HWM being exceeded,
+    /// and conflating them is what makes a refusal diagnostic lie.
+    append_only_notified: bool,
 }
 
 impl Default for CompressState {
@@ -225,6 +230,7 @@ impl CompressState {
             disabled: false,
             notified: false,
             failopen_notified: false,
+            append_only_notified: false,
         }
     }
 
@@ -332,6 +338,24 @@ impl CompressState {
                 "context exceeds the proven-good budget, but no authoritative window \
                  limit is known for this model — dispatching over budget and letting \
                  the backend decide; an accepted size raises the learned budget"
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// One-time notice for an append-only session whose transcript has passed a
+    /// soft or non-authoritative budget: nothing was rewritten — that is the
+    /// preset's contract, not a malfunction — and the request goes out as-is.
+    /// Names the escape hatch, because the operator chose this and can unchoose it.
+    fn take_append_only_notice(&mut self) -> Option<String> {
+        if !self.append_only_notified {
+            self.append_only_notified = true;
+            Some(
+                "context exceeds this trigger's budget, but the append-only context \
+                 manager never rewrites recorded turns — leaving the transcript \
+                 as-is; select `/context manager standard` to re-enable compaction"
                     .to_string(),
             )
         } else {
@@ -587,19 +611,21 @@ pub(crate) struct CompressRequest<'a> {
     /// summary_input_cap_floor_chars`. A tight budget would otherwise starve the
     /// summarizer of material.
     pub summary_input_cap_floor_chars: usize,
+    /// Whether the selected context manager may rewrite messages already in the
+    /// transcript. `false` selects the append-only strategy: no summarization and
+    /// no structural pruning of prior turns, so this pipeline contributes nothing
+    /// to prompt-prefix churn and the record is never silently altered. An
+    /// over-budget request against an AUTHORITATIVE hard ceiling is then refused
+    /// rather than rewritten; every softer trigger fails open, because dispatching
+    /// rewrites nothing either — see [`crate::ContextManager::rewrites_history`]
+    /// and the guard in [`compress`].
+    pub rewrites_history: bool,
     /// Session compaction store (#661 group B). When `Some`, the evicted middle
     /// span is stored (redacted) and a `compaction:<cid>` retrieval handle is
     /// named in the marker — progressive disclosure. `None` (headless / off)
     /// keeps today's lossy-only behavior. Used to STAMP the session scope onto the
     /// span even in the transactional (staged) mode, so the pure CID is the one the
     /// live store would resolve.
-    /// Whether the selected context manager may rewrite messages already in the
-    /// transcript. `false` selects the append-only strategy: no summarization and
-    /// no structural pruning of prior turns, so the prompt prefix is byte-identical
-    /// turn over turn and provider caching is optimal by construction. An
-    /// over-budget request is then REFUSED rather than rewritten — see
-    /// [`crate::ContextManager::rewrites_history`].
-    pub rewrites_history: bool,
     pub compaction_store: Option<&'a dyn crate::agentic::content_spill::SpillStore>,
     /// Transactional staging seam (#1528 B3, §2.6). When `Some`, an evicted span is
     /// STAGED into this candidate-local buffer PURELY — the live `compaction_store`
@@ -625,9 +651,10 @@ impl<'a> CompressRequest<'a> {
         focus: Option<&'a str>,
         est: TokenEstimation,
         summary_input_cap_floor_chars: usize,
+        rewrites_history: bool,
     ) -> Self {
         Self {
-            rewrites_history: true,
+            rewrites_history,
             messages,
             budget: estimate_tokens(messages, est) / 2,
             max_messages: None,
@@ -635,7 +662,10 @@ impl<'a> CompressRequest<'a> {
             task,
             hard_budget: false,
             // Moot for a soft (`hard_budget: false`) manual run — it never
-            // reaches the refuse branch — but kept truthful (Step 20.3).
+            // reaches the refuse branch — but kept truthful (Step 20.3). Every
+            // `Refused` return is gated on `hard_budget`, the append-only guard
+            // included, so this stays a structural guarantee rather than a
+            // property of the value on this line.
             authoritative: true,
             focus,
             est,
@@ -673,6 +703,24 @@ pub(crate) enum CompressAction {
     DispatchedOverBudget,
 }
 
+/// Why a [`CompressAction::Refused`] outcome refused.
+///
+/// The two causes need DIFFERENT remedies — one is a stuck pipeline, the other
+/// is the operator's own policy choice — so the diagnostic has to be selected
+/// by the reason rather than asserting whichever cause was written first. A
+/// refusal that blames anti-thrash under the append-only preset sends the
+/// operator to `newt tunings reset`, which cannot help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefusalReason {
+    /// Anti-thrash latched compression off, or the protected head alone
+    /// exceeds the budget — the context is irreducible by this pipeline.
+    Irreducible,
+    /// The selected context manager is append-only: rewriting already-recorded
+    /// messages is forbidden by policy, so an over-budget request against an
+    /// authoritative ceiling has no legitimate outcome but refusal.
+    AppendOnly,
+}
+
 impl CompressAction {
     /// Short human description for the compression notice.
     pub(crate) fn describe(self) -> &'static str {
@@ -691,6 +739,10 @@ impl CompressAction {
 pub(crate) struct CompressOutcome {
     pub messages: Vec<Value>,
     pub action: CompressAction,
+    /// Why this outcome refused, when `action` is [`CompressAction::Refused`].
+    /// `None` for every other action. Callers render the remedy from this —
+    /// see [`RefusalReason`].
+    pub refusal: Option<RefusalReason>,
     /// True when `messages` differs from the input.
     pub fired: bool,
     pub tokens_before: usize,
@@ -722,6 +774,7 @@ pub(crate) async fn compress(
         return CompressOutcome {
             messages: req.messages.to_vec(),
             action: CompressAction::Fit,
+            refusal: None,
             fired: false,
             tokens_before,
             tokens_after: tokens_before,
@@ -729,20 +782,50 @@ pub(crate) async fn compress(
         };
     }
 
-    // Append-only: the transcript is never rewritten, so there is nothing this
-    // pipeline may legitimately do with an over-budget request except decline it.
-    // That is the strategy's whole content — the recall/fidelity trade is taken
-    // deliberately, in exchange for a prompt prefix that never changes and a
-    // record that is never silently altered. Oversized material is capped where
-    // it is PRODUCED (tool-result caps, paginated reads, offload), not here.
+    // Append-only: this pipeline may not REWRITE the transcript. That is the
+    // strategy's whole content — the recall/fidelity trade is taken deliberately,
+    // in exchange for a record that is never silently altered. Oversized material
+    // is capped where it is PRODUCED (tool-result caps, paginated reads, offload),
+    // not here.
+    //
+    // But "may not rewrite" is NOT "must refuse". Refusal is correct only against
+    // an AUTHORITATIVE hard ceiling, where dispatching would let the backend
+    // truncate the task away. Every other trigger must still fail OPEN:
+    //
+    //   * a soft trigger (`hard_budget: false` — the count/VRAM guard, `/compress`)
+    //     never had the standing to refuse a send (F2), and nothing about
+    //     append-only grants it that standing;
+    //   * a budget resting on the proven-good high-water mark alone
+    //     (`authoritative: false`) is a floor of known-good, not a cap — refusing
+    //     there is the Step 20.3 death spiral, discarding the very acceptance
+    //     evidence that would raise the HWM out of the hole.
+    //
+    // Dispatching rewrites nothing, so failing open honours the append-only
+    // contract exactly. Refusing on these triggers would not: with a transcript
+    // that never shrinks, the first refusal is also every subsequent turn's, and
+    // the session is wedged until `/new`.
     if !req.rewrites_history {
+        let irreducible = req.hard_budget && req.authoritative;
         return CompressOutcome {
             messages: req.messages.to_vec(),
-            action: CompressAction::Refused,
+            action: if irreducible {
+                CompressAction::Refused
+            } else {
+                CompressAction::DispatchedOverBudget
+            },
+            refusal: irreducible.then_some(RefusalReason::AppendOnly),
             fired: false,
             tokens_before,
             tokens_after: tokens_before,
-            notice: state.take_notice(),
+            // NOT `take_notice()`: that is the anti-thrash message, and nothing
+            // here has anything to do with the latch. A refusal is explained by
+            // the caller's bail (which reads `refusal`); a fail-open dispatch
+            // gets its own one-time notice.
+            notice: if irreducible {
+                None
+            } else {
+                state.take_append_only_notice()
+            },
         };
     }
 
@@ -756,6 +839,7 @@ pub(crate) async fn compress(
         return CompressOutcome {
             messages: req.messages.to_vec(),
             action: CompressAction::Refused,
+            refusal: Some(RefusalReason::Irreducible),
             fired: false,
             tokens_before,
             tokens_after: tokens_before,
@@ -786,6 +870,7 @@ pub(crate) async fn compress(
                 return CompressOutcome {
                     messages: req.messages.to_vec(),
                     action: CompressAction::DispatchedOverBudget,
+                    refusal: None,
                     fired: false,
                     tokens_before,
                     tokens_after: tokens_before,
@@ -799,6 +884,7 @@ pub(crate) async fn compress(
             return CompressOutcome {
                 messages: req.messages.to_vec(),
                 action: CompressAction::Fit,
+                refusal: None,
                 fired: false,
                 tokens_before,
                 tokens_after: tokens_before,
@@ -822,6 +908,7 @@ pub(crate) async fn compress(
         return CompressOutcome {
             messages: pruned,
             action: CompressAction::Pruned,
+            refusal: None,
             fired: prune_changed,
             tokens_before,
             tokens_after: after_prune,
@@ -1056,6 +1143,7 @@ pub(crate) async fn compress(
         return CompressOutcome {
             messages: req.messages.to_vec(),
             action: CompressAction::Refused,
+            refusal: Some(RefusalReason::Irreducible),
             fired: false,
             tokens_before,
             tokens_after: tokens_before,
@@ -1074,6 +1162,7 @@ pub(crate) async fn compress(
     CompressOutcome {
         messages: assembled,
         action,
+        refusal: None,
         fired,
         tokens_before,
         tokens_after,
@@ -1084,6 +1173,42 @@ pub(crate) async fn compress(
 // ---------------------------------------------------------------------------
 // User-initiated compression (`/compress [focus]`, Step 18.6)
 // ---------------------------------------------------------------------------
+
+/// The `[context]` settings a user-initiated compression needs.
+///
+/// Grouped rather than passed as three positional scalars: they come from one
+/// config section, they always travel together, and a bare `bool` at the end of
+/// a long argument list is exactly the shape that gets silently transposed.
+#[derive(Debug, Clone, Copy)]
+pub struct ManualCompressPolicy {
+    /// `[context.estimation]` token-estimation heuristic.
+    pub est: crate::tokens::TokenEstimation,
+    /// `[context] summary_input_cap_floor_chars` — floor for the summarizer
+    /// input cap, so a tight budget cannot starve the summarizer of material.
+    pub est_cap_floor_chars: usize,
+    /// Whether the selected `[context] manager` may rewrite recorded turns —
+    /// see [`crate::ContextManager::rewrites_history`]. `false` (append-only)
+    /// makes `/compress` decline rather than summarize.
+    pub rewrites_history: bool,
+}
+
+impl ManualCompressPolicy {
+    /// Read the `[context]` section, taking the rewrite policy from an ALREADY
+    /// RESOLVED manager — the session's `/context manager` override wins over
+    /// `[context] manager`, and only the caller knows the override.
+    pub fn from_context(
+        ctx: Option<&crate::ContextConfig>,
+        manager: crate::ContextManager,
+    ) -> Self {
+        Self {
+            est: ctx.map(|c| c.estimation).unwrap_or_default(),
+            est_cap_floor_chars: ctx
+                .map(|c| c.summary_input_cap_floor_chars)
+                .unwrap_or(8_192),
+            rewrites_history: manager.rewrites_history(),
+        }
+    }
+}
 
 /// What a user-initiated [`compress_user_initiated`] run did — the public
 /// face of [`CompressOutcome`], with the message counts the honesty notice
@@ -1131,8 +1256,7 @@ pub async fn compress_user_initiated(
     focus: Option<&str>,
     summarizer: Option<&SummarizeFn>,
     state: &mut CompressState,
-    est: crate::tokens::TokenEstimation,
-    summary_input_cap_floor_chars: usize,
+    policy: ManualCompressPolicy,
 ) -> ManualCompressOutcome {
     let task = messages
         .iter()
@@ -1145,16 +1269,7 @@ pub async fn compress_user_initiated(
         .and_then(|m| m["content"].as_str())
         .unwrap_or_default()
         .to_string();
-    compress_user_initiated_for_task(
-        messages,
-        &task,
-        focus,
-        summarizer,
-        state,
-        est,
-        summary_input_cap_floor_chars,
-    )
-    .await
+    compress_user_initiated_for_task(messages, &task, focus, summarizer, state, policy).await
 }
 
 /// Run user-initiated compression with an explicit authoritative active task.
@@ -1169,9 +1284,13 @@ pub async fn compress_user_initiated_for_task(
     focus: Option<&str>,
     summarizer: Option<&SummarizeFn>,
     state: &mut CompressState,
-    est: crate::tokens::TokenEstimation,
-    summary_input_cap_floor_chars: usize,
+    policy: ManualCompressPolicy,
 ) -> ManualCompressOutcome {
+    let ManualCompressPolicy {
+        est,
+        est_cap_floor_chars,
+        rewrites_history,
+    } = policy;
     let tokens_before = estimate_tokens(messages, est);
     let messages_before = messages.len();
     let protected = protect_active_prompt_for_compression(messages, active_task);
@@ -1181,7 +1300,8 @@ pub async fn compress_user_initiated_for_task(
             active_task,
             focus,
             est,
-            summary_input_cap_floor_chars,
+            est_cap_floor_chars,
+            rewrites_history,
         ),
         summarizer,
         state,
@@ -1203,6 +1323,11 @@ pub async fn compress_user_initiated_for_task(
         tokens_after,
         how: if fired {
             outcome.action.describe()
+        } else if !rewrites_history {
+            // NOT "no change": the operator asked for compaction and is owed the
+            // reason it did not happen. Reporting `Fit` here would tell them the
+            // transcript was already small enough, which is a different fact.
+            "append-only — history not rewritten"
         } else {
             CompressAction::Fit.describe()
         },
@@ -2125,6 +2250,16 @@ mod tests {
     use super::*;
 
     /// Default estimation (chars_per_token = 4) for the unit tests.
+    /// The `[context]` policy a manual-compress test wants: defaults, with the
+    /// rewrite policy under test.
+    fn manual_policy(rewrites_history: bool) -> ManualCompressPolicy {
+        ManualCompressPolicy {
+            est: EST,
+            est_cap_floor_chars: 8_192,
+            rewrites_history,
+        }
+    }
+
     const EST: TokenEstimation = TokenEstimation { chars_per_token: 4 };
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4154,7 +4289,8 @@ mod tests {
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let s = recording_summarizer(prompts.clone(), "## Active Task\nMANUAL SUMMARY");
         let mut state = CompressState::new();
-        let out = compress_user_initiated(&msgs, None, Some(&*s), &mut state, EST, 8_192).await;
+        let out =
+            compress_user_initiated(&msgs, None, Some(&*s), &mut state, manual_policy(true)).await;
 
         assert!(out.fired);
         assert_eq!(out.how, CompressAction::Summarized.describe());
@@ -4209,8 +4345,7 @@ mod tests {
             None,
             Some(&*summarizer),
             &mut state,
-            EST,
-            8_192,
+            manual_policy(true),
         )
         .await;
 
@@ -4254,8 +4389,7 @@ mod tests {
             None,
             Some(&*summarizer),
             &mut state,
-            EST,
-            8_192,
+            manual_policy(true),
         )
         .await;
 
@@ -4279,8 +4413,14 @@ mod tests {
         let mut state = CompressState::new();
         let secret = "sk-aaaaaaaaaaaaaaaaaaaaaaaa1234";
         let focus = format!("the auth flow around {secret} handling");
-        let out =
-            compress_user_initiated(&msgs, Some(&focus), Some(&*s), &mut state, EST, 8_192).await;
+        let out = compress_user_initiated(
+            &msgs,
+            Some(&focus),
+            Some(&*s),
+            &mut state,
+            manual_policy(true),
+        )
+        .await;
         assert!(out.fired);
 
         let p = prompts.lock().unwrap();
@@ -4306,7 +4446,7 @@ mod tests {
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let s = recording_summarizer(prompts.clone(), "SUMMARY");
         let mut state = CompressState::new();
-        compress_user_initiated(&msgs, None, Some(&*s), &mut state, EST, 8_192).await;
+        compress_user_initiated(&msgs, None, Some(&*s), &mut state, manual_policy(true)).await;
         assert!(!prompts.lock().unwrap()[0].contains("emphasize anything about"));
     }
 
@@ -4318,7 +4458,8 @@ mod tests {
         let msgs = vec![sys("you are newt"), user("task"), user("note")];
         let mut state = CompressState::new();
         for _ in 0..3 {
-            let out = compress_user_initiated(&msgs, None, None, &mut state, EST, 8_192).await;
+            let out =
+                compress_user_initiated(&msgs, None, None, &mut state, manual_policy(true)).await;
             assert!(!out.fired, "nothing to reclaim — must not fire");
             assert_eq!(out.messages, msgs);
             assert_eq!(out.tokens_before, out.tokens_after);
@@ -4339,7 +4480,7 @@ mod tests {
         let msgs = chat_history(10, 400);
         let mut state = CompressState::new();
         state.latch_disabled_for_tests();
-        let out = compress_user_initiated(&msgs, None, None, &mut state, EST, 8_192).await;
+        let out = compress_user_initiated(&msgs, None, None, &mut state, manual_policy(true)).await;
         assert!(out.fired, "an explicit ask must bypass the latch");
         assert_eq!(out.how, CompressAction::StaticFallback.describe());
         assert!(state.is_disabled(), "the latch itself stays set");
@@ -4881,8 +5022,120 @@ mod tests {
         );
     }
 
+    /// Append-only must not turn a SOFT trigger into a fatal turn. The count /
+    /// VRAM guard (`hard_budget: false`) never had standing to refuse a send
+    /// (F2), and a budget resting on the proven-good high-water mark alone
+    /// (`authoritative: false`) is the Step 20.3 fail-open case — refusing there
+    /// discards the acceptance evidence that raises the HWM.
+    ///
+    /// This matters more under append-only than under `standard`, not less: the
+    /// transcript never shrinks, so the first refusal is also every later turn's
+    /// and the session is wedged until `/new`. Dispatching rewrites nothing, so
+    /// failing open honours the preset exactly.
+    ///
+    /// Regression: with the guard ungated on `hard_budget && authoritative` both
+    /// cases return `Refused` and the callers bail the turn.
+    #[tokio::test]
+    async fn append_only_fails_open_on_soft_and_non_authoritative_triggers() {
+        let task = "do the task";
+        let msgs = tool_heavy(task, 6, 4_000);
+        let before = estimate_tokens(&msgs, EST);
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let s = recording_summarizer(prompts.clone(), "SUMMARY");
+
+        let req = |hard_budget: bool, authoritative: bool| CompressRequest {
+            messages: &msgs,
+            budget: before / 3,
+            max_messages: None,
+            replay_protected_tail_len: 0,
+            task,
+            hard_budget,
+            authoritative,
+            focus: None,
+            est: EST,
+            summary_input_cap_floor_chars: 8_192,
+            rewrites_history: false,
+            compaction_store: None,
+            compaction_stage: None,
+        };
+
+        for (hard_budget, authoritative, label) in [
+            (false, false, "count-only trigger"),
+            (false, true, "soft trigger, authoritative budget"),
+            (true, false, "hard trigger, high-water-mark budget"),
+        ] {
+            let mut st = CompressState::new();
+            let out = compress(req(hard_budget, authoritative), Some(&*s), &mut st).await;
+            assert_eq!(
+                out.action,
+                CompressAction::DispatchedOverBudget,
+                "{label} must fail open, not refuse"
+            );
+            assert_eq!(out.refusal, None, "{label} is not a refusal");
+            assert_eq!(out.messages, msgs, "{label} must not rewrite");
+            assert!(!out.fired, "{label} does not fire");
+        }
+        assert!(
+            prompts.lock().unwrap().is_empty(),
+            "no fail-open path may consult the summarizer"
+        );
+
+        // Only the authoritative hard ceiling refuses — and it says WHY, so the
+        // caller cannot report it as anti-thrash.
+        let mut st = CompressState::new();
+        let out = compress(req(true, true), Some(&*s), &mut st).await;
+        assert_eq!(out.action, CompressAction::Refused);
+        assert_eq!(out.refusal, Some(RefusalReason::AppendOnly));
+        assert_eq!(out.messages, msgs);
+    }
+
+    /// The append-only fail-open explains itself once, and never borrows the
+    /// anti-thrash notice — which would tell the operator compression had been
+    /// "ineffective twice in a row" when the latch was never even consulted.
+    #[tokio::test]
+    async fn append_only_notice_is_its_own_and_fires_once() {
+        let task = "do the task";
+        let msgs = tool_heavy(task, 6, 4_000);
+        let before = estimate_tokens(&msgs, EST);
+        let req = || CompressRequest {
+            messages: &msgs,
+            budget: before / 3,
+            max_messages: None,
+            replay_protected_tail_len: 0,
+            task,
+            hard_budget: false,
+            authoritative: false,
+            focus: None,
+            est: EST,
+            summary_input_cap_floor_chars: 8_192,
+            rewrites_history: false,
+            compaction_store: None,
+            compaction_stage: None,
+        };
+        let mut st = CompressState::new();
+        let first = compress(req(), None, &mut st).await;
+        let notice = first.notice.expect("the first fail-open explains itself");
+        assert!(
+            notice.contains("append-only"),
+            "notice must name the cause: {notice}"
+        );
+        assert!(
+            !notice.contains("ineffective"),
+            "must not borrow the anti-thrash message: {notice}"
+        );
+        assert!(
+            compress(req(), None, &mut st).await.notice.is_none(),
+            "the notice is one-time"
+        );
+    }
+
     /// A transcript that already fits is untouched under append-only — refusal is
     /// for the over-budget case, not a blanket stop.
+    ///
+    /// Note this one deliberately exits at the `Fit` guard ABOVE the append-only
+    /// branch: what it pins is that ordering, not the branch itself. The branch
+    /// is covered by the two tests above and by
+    /// `append_only_refuses_rather_than_rewriting`.
     #[tokio::test]
     async fn append_only_leaves_a_fitting_transcript_alone() {
         let msgs = vec![sys("s"), user("short")];

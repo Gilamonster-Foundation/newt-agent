@@ -1436,8 +1436,11 @@ async fn manual_compress_shrinks_session_and_notice_is_truthful() {
         None,
         Some(&*summarizer),
         &mut state,
-        newt_core::TokenEstimation::default(),
-        8_192,
+        newt_core::ManualCompressPolicy {
+            est: Default::default(),
+            est_cap_floor_chars: 8_192,
+            rewrites_history: true,
+        },
     )
     .await;
 
@@ -1494,8 +1497,11 @@ async fn manual_compress_noop_reports_no_compression_possible() {
         None,
         None,
         &mut state,
-        newt_core::TokenEstimation::default(),
-        8_192,
+        newt_core::ManualCompressPolicy {
+            est: Default::default(),
+            est_cap_floor_chars: 8_192,
+            rewrites_history: true,
+        },
     )
     .await;
 
@@ -1552,8 +1558,11 @@ async fn compress_focus_secret_never_reaches_summarizer() {
         Some(&focus),
         Some(&*summarizer),
         &mut state,
-        newt_core::TokenEstimation::default(),
-        8_192,
+        newt_core::ManualCompressPolicy {
+            est: Default::default(),
+            est_cap_floor_chars: 8_192,
+            rewrites_history: true,
+        },
     )
     .await;
     assert!(outcome.fired, "the summarizer path must have run");

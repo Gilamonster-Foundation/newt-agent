@@ -2565,6 +2565,7 @@ mod composed_private_mcp_uat {
 
         let (reply, _, _, hallucinations) = newt_core::chat_complete(
             ChatCtx {
+                rewrites_history: true,
                 url: &model.uri(),
                 model: "composed-private-review-model",
                 kind: BackendKind::Ollama,

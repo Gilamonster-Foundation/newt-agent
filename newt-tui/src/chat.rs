@@ -3234,14 +3234,10 @@ fn session_body(
                                 focus.as_deref(),
                                 Some(&*summarizer),
                                 &mut compress_state,
-                                cfg.context
-                                    .as_ref()
-                                    .map(|c| c.estimation)
-                                    .unwrap_or_default(),
-                                cfg.context
-                                    .as_ref()
-                                    .map(|c| c.summary_input_cap_floor_chars)
-                                    .unwrap_or(8_192),
+                                newt_core::ManualCompressPolicy::from_context(
+                                    cfg.context.as_ref(),
+                                    context_manager(&cfg, context_manager_override),
+                                ),
                             ))
                         });
                         if outcome.fired {
@@ -6299,12 +6295,14 @@ fn session_body(
                     // Step 26.3/26.4: resolve the per-turn feature set once (used
                     // for the <state> injection here and the ChatCtx fields below).
                     let turn_disposition = prompt_intake.disposition();
-                    let turn_features = context_features(
-                        &cfg,
-                        context_manager(&cfg, context_manager_override),
-                        &context_features_override,
-                        inf_kind,
-                    );
+                    let turn_manager = context_manager(&cfg, context_manager_override);
+                    let turn_features =
+                        context_features(&cfg, turn_manager, &context_features_override, inf_kind);
+                    // Step 24.8 (#559): the selected preset's rewrite policy. This
+                    // is what makes `/context manager append-only` mean something —
+                    // without it the selector would confirm a setting the loop
+                    // never reads.
+                    let turn_rewrites_history = turn_manager.rewrites_history();
                     let tool_offload_on = turn_features.tool_offload;
                     let scratchpad_on = turn_features.scratchpad;
                     let semantic_on = turn_features.semantic;
@@ -6935,6 +6933,7 @@ fn session_body(
                             tokio::task::block_in_place(|| {
                                 rt.block_on(chat_complete_with_prompt_and_artifacts(
                                     ChatCtx {
+                                        rewrites_history: turn_rewrites_history,
                                         url: &inf_url,
                                         model: &inf_model,
                                         kind: inf_kind,
