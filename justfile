@@ -432,14 +432,18 @@ eval *ARGS:
     cargo build --release --bin newt-eval
     ./target/release/newt-eval run --mode live {{ARGS}}
 
-# Run the live BAT/UAT eval against the gnuc home box's Ollama + a test LLM —
-# the hand-run equivalent of the `eval-live.yml` weekly CI job. Override the
-# model/host, and filter to BAT (L1) or UAT (L2,L3):
+# Run the live BAT/UAT eval by hand against any OpenAI/Ollama-compatible host.
 #
-#   just eval-live                                  # default test model @ gnuc
-#   just eval-live qwen2.5-coder:7b                 # pick a model
-#   just eval-live llama3.1:8b http://REDACTED-HOST:11434 --difficulty L2,L3
-eval-live MODEL="qwen2.5-coder:7b" HOST="http://gnuc:11434" *ARGS:
+# The scheduled CI tiers that used to drive this (`eval-live.yml` weekly,
+# `nightly-eval.yml` nightly) were retired: they ran on a self-hosted runner
+# that is being decommissioned, and had not passed in months. The eval
+# machinery under `scripts/eval/` is deliberately kept — this recipe and
+# `sweep.sh` still work when pointed at a host that serves the model.
+#
+#   just eval-live                                        # default model, localhost
+#   just eval-live qwen2.5-coder:7b                       # pick a model
+#   just eval-live llama3.1:8b http://gpu-host:11434 --difficulty L2,L3
+eval-live MODEL="qwen2.5-coder:7b" HOST="http://localhost:11434" *ARGS:
     cargo build --release --bin newt
     cargo build --release --bin newt-eval
     OLLAMA_HOST="{{HOST}}" NEWT_DEFAULT_MODEL="{{MODEL}}" \

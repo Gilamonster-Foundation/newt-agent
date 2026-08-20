@@ -1,0 +1,138 @@
+name: Live eval (BAT/UAT vs a hosted model)
+
+# Real-model acceptance tier — the EXPENSIVE end of newt's test pyramid
+# (CLAUDE.md "Testing strategy"). The per-PR gate runs the SAME eval cases in
+# MOCK mode (`cargo test -p newt-eval --test mock_e2e`, wired in ci.yml); this
+# workflow replays them in LIVE mode against a real model, so we catch
+# regressions in real-world model behavior that a golden mock cannot.
+#
+#   * BAT (Basic Acceptance) = the L1 cases — does the wired-up system accept
+#     the basic single-edit flows end to end against a real model.
+#   * UAT (User Acceptance)   = the L2/L3 cases — multi-step / cross-domain
+#     scenarios phrased the way a user would actually exercise them.
+#
+# WHY THIS REPLACED THE SELF-HOSTED TIER
+#
+# The previous `eval-live.yml` / `nightly-eval.yml` pair ran on a self-hosted
+# runner beside a local Ollama. That runner is being decommissioned, and the
+# nightly had not passed in months — a red heartbeat that graded nothing. This
+# runs on a GitHub-hosted runner against an OpenAI-compatible endpoint instead,
+# so the tier survives without any owned hardware.
+#
+# SECURITY INVARIANT (RATCHET.md, preserved): no hosts, keys, or GPUs appear in
+# this file. The model is NAMED only; the endpoint comes from a repo variable
+# and the bearer token from a secret. Nothing here names a host.
+#
+# UNCONFIGURED IS A SKIP, NOT A FAILURE. A fork, or this repo before the secret
+# exists, has no endpoint to call. The preflight job below reports that and the
+# eval job is skipped — deliberately, because the failure mode we are replacing
+# was a scheduled job going red every night for a reason nobody could act on.
+#
+# HOOK PARITY EXCEPTION: like the `windows` job in ci.yml and mesh-integration,
+# this is intentionally OUTSIDE pre-push parity — it needs a real model and is
+# far too slow for a push gate. The hand-run equivalent is `just eval-live`.
+
+on:
+  schedule:
+    # Weekly, Mondays 07:17 UTC (off the top of the hour).
+    - cron: "17 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model to run (blank = the EVAL_MODEL repo variable)"
+        required: false
+        default: ""
+      difficulty:
+        description: "Filter by difficulty (L1=BAT, L2/L3=UAT, blank=all)"
+        required: false
+        default: ""
+  push:
+    branches: ["release/**"]
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preflight:
+    name: is the hosted tier configured
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - name: Check for an endpoint and a token
+        id: check
+        env:
+          HAVE_KEY: ${{ secrets.EVAL_API_KEY != '' }}
+        run: |
+          BASE="${{ vars.EVAL_BASE_URL }}"
+          if [ "$HAVE_KEY" = "true" ] && [ -n "$BASE" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Hosted eval tier not configured — set the EVAL_BASE_URL repo variable and the EVAL_API_KEY secret to enable it. Skipping."
+          fi
+
+  eval-hosted:
+    name: live eval (hosted)
+    needs: preflight
+    if: needs.preflight.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: eval-hosted
+
+      - name: Build worker + eval driver
+        run: |
+          cargo build --release --bin newt
+          cargo build --release --bin newt-eval
+
+      - name: Resolve target model
+        id: model
+        run: |
+          M="${{ github.event.inputs.model }}"
+          if [ -z "$M" ]; then M="${{ vars.EVAL_MODEL }}"; fi
+          if [ -z "$M" ]; then
+            echo "::error::No model resolved — pass the workflow_dispatch 'model' input or set the EVAL_MODEL repo variable."
+            exit 1
+          fi
+          echo "name=$M" >> "$GITHUB_OUTPUT"
+          echo "Running hosted eval against: $M"
+
+      # The worker resolves its backend from ~/.newt, which does not exist on a
+      # hosted runner. Write the one backend this run needs. The token is NOT
+      # written here — `api_key_env` keeps it in the process environment, so it
+      # never lands on disk and never reaches a config the eval could print.
+      - name: Write the eval backend config
+        run: |
+          mkdir -p "$HOME/.newt"
+          cat > "$HOME/.newt/config.toml" <<EOF
+          [[backends]]
+          name = "eval"
+          endpoint = "${{ vars.EVAL_BASE_URL }}"
+          model = "${{ steps.model.outputs.name }}"
+          kind = "openai"
+          api_key_env = "EVAL_API_KEY"
+          EOF
+
+      # The eval driver runs cases SERIALLY and spawns the `newt` worker, which
+      # talks to the configured endpoint. Real fs / real model / real subprocess
+      # — the expensive tier, which is WHY it is here and not in the per-PR gate.
+      # A `runner` FAIL exits non-zero so the job goes red.
+      - name: Run BAT/UAT cases (live)
+        env:
+          EVAL_API_KEY: ${{ secrets.EVAL_API_KEY }}
+          NEWT_BACKEND: openai
+          NEWT_DEFAULT_MODEL: ${{ steps.model.outputs.name }}
+          # Live cases touch a real model; give the worker headroom.
+          NEWT_EVAL_WORKER_TIMEOUT_MS: "180000"
+        run: |
+          DIFF="${{ github.event.inputs.difficulty }}"
+          ARGS="run --mode live --model ${{ steps.model.outputs.name }}"
+          if [ -n "$DIFF" ]; then ARGS="$ARGS --difficulty $DIFF"; fi
+          ./target/release/newt-eval $ARGS
