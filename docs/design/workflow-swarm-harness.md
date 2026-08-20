@@ -374,7 +374,8 @@ risks now.
   `attenuate(parent_key, child_caveats)` (= `parent.delegate(...)`), producing a
   signed child `AgentKey` whose authority is provably `⊑` the parent's.
   `delegate` refuses amplification structurally; `enforced_caveats` verifies the
-  chain before the child runs. A child given `fs_write = Only(["src/foo.rs"])`,
+  chain before the child runs (*attenuate, never amplify*,
+  `steward-charter/docs/AUTHORITY.md`). A child given `fs_write = Only(["src/foo.rs"])`,
   `exec = none`, `net = Only([backend_host])`, `max_calls = AtMost(k)` cannot
   escalate to anything wider — the same property `WorkerIdentity` already relies
   on.

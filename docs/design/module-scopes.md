@@ -189,7 +189,8 @@ commits — a different concern; it is never cited as principal identity.) Conse
 - **Identity is cryptographic; the name is a label.** A module has a `display_name` for humans and
   logs, and a principal key for everything that matters (Grant binding, provenance, mesh addressing).
   There is no UUID-vs-name question: the key *is* the identity; UUIDs, if any, are local handles.
-- **The Grant is bound to the principal.** `attenuate` refuses to mint a child key that
+- **The Grant is bound to the principal** (*attenuate, never amplify*,
+  `steward-charter/docs/AUTHORITY.md`). `attenuate` refuses to mint a child key that
   amplifies; `CertChain::verify` re-checks attenuation at every link. A module holding its own key but
   not the root `UserKey` can only narrow.
 - **The `UserKey` never enters a module.** The root module runs under the *operating key*

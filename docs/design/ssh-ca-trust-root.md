@@ -62,8 +62,8 @@ transport — without touching the iroh path that already works on LAN.
   - `extensions` — where the member's `Caveats` (and `GitCaveats` / `SshCaveats`)
     are encoded or referenced.
   A member cert's authority is `⊑` the CA's; `meet` composes along the chain. This
-  is the same attenuation-only algebra as `Caveats` — amplification is impossible by
-  construction.
+  is the same attenuation-only algebra as `Caveats`: *attenuate, never amplify*
+  (`steward-charter/docs/AUTHORITY.md`), here in certificate form.
 - **External anchoring proves the human, not the PKI.** `github.com/<user>.keys`
   (or GitLab / LDAP / SSO key registration) publishes the human's public keys, which
   lets any peer verify "this CA key belongs to `hartsock`." GitHub does **not** host

@@ -230,7 +230,8 @@ So the rule is:
 | `Session` / `Source` / `Sink` / `View` / `Transform` | `required.bridle` for fs/net/exec effects **and** `required.domain: DomainCaveats` for the interface's own axes (e.g. `SpeechCaveats { mic, speaker }`, `PaneCaveats { subscribe: Scope, publish: Scope }`) | the host that mints the export's capability handles: `granted.meet(required)` on each lattice, computed once at mint time | the handles for declared `consumes`/`provides` — a handle is minted only for a declared import, and only within the meet |
 
 This is **one authority algebra** — lattice element, `top`, `leq`, `meet`, attenuation-only — with
-two carriers, not a second vocabulary. A `DomainCaveats` type must (a) implement the same laws —
+two carriers, not a second vocabulary; *one authority vocabulary* and *attenuate,
+never amplify* (`steward-charter/docs/AUTHORITY.md`). A `DomainCaveats` type must (a) implement the same laws —
 pinned by a **shared lattice-law test** that #1737 introduces (a `macro_rules!` / `proptest`
 strategy over `top` / `leq` / `meet`: reflexivity, antisymmetry, `meet ⊑` both operands, `top` is
 the identity) and applies first to `GitCaveats`, whose lattice tests today are example-based

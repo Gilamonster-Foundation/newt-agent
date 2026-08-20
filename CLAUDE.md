@@ -96,6 +96,17 @@ explain what the existing abstraction could not be widened to cover.
 
 ## Where the rules live
 
+> Canonical home for authority doctrine: the line's **Authority Register** —
+> `steward-charter/docs/AUTHORITY.md`. Fail-closed, attenuate-never-amplify,
+> amplification-needs-the-human-root, permissive-is-a-posture, one authority
+> vocabulary, unsafe-state-unrepresentable, content-addressed identity,
+> chain-plus-one-ref history, environmental-and-in-process confinement, and
+> observable authority decisions are stated there once. A document in this repo
+> **cites the law it relies on and does not re-argue it**; where this repo
+> deviates, state the deviation against the named law (the live register is
+> `docs/security/ocap-deviations.md`). When the register and a document here
+> disagree, the register wins and the document is the thing to fix.
+
 - **Acceptance contract for every PR:** `docs/ROADMAP.md` (top
   section). Every PR must clear all of: `cargo build --workspace`,
   `cargo test --workspace`, `cargo clippy --workspace --all-targets
