@@ -2149,11 +2149,45 @@ fn render_message_with(m: &Value, hygiene: bool) -> String {
         }
         if !content.is_empty() {
             line.push(' ');
-            line.push_str(&excerpt(&redact_secrets(content), SUMMARY_INPUT_MSG_CAP));
+            // #1780: a prior compaction summary keeps its tail, because that is
+            // where its recovery handle and re-read breadcrumb live. Every other
+            // message truncates head-first as before.
+            let redacted = redact_secrets(content);
+            if is_compaction_text(content) {
+                line.push_str(&excerpt_keeping_tail(&redacted, SUMMARY_INPUT_MSG_CAP));
+            } else {
+                line.push_str(&excerpt(&redacted, SUMMARY_INPUT_MSG_CAP));
+            }
         }
     }
     line.push('\n');
     line
+}
+
+/// Excerpt that keeps the END as well as the beginning, for content whose trailing
+/// bytes are load-bearing.
+///
+/// A compaction summary appends its recovery affordances LAST — the `#319` re-read
+/// breadcrumb and the `memory_fetch("compaction:<cid>")` handle. Head-first
+/// truncation therefore removes exactly the two things that exist so the model can
+/// recover what the summary dropped, and it removes them silently: what survives is
+/// lossy prose with no pointer and no sign that a pointer ever existed. An addressed
+/// elision degrades into an unmarked gap, and the model cannot know to ask (#1780).
+///
+/// Splits the budget head-heavy — the summary's opening sections (`## Active Task`
+/// first of all) carry the task, and the tail is small and bounded by construction.
+fn excerpt_keeping_tail(s: &str, max_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+    // The affordances are short; a fifth of the budget covers both with room over.
+    let tail_budget = (max_chars / 5).max(1);
+    let head_budget = max_chars.saturating_sub(tail_budget);
+    let head: String = s.chars().take(head_budget).collect();
+    let tail: String = s.chars().skip(total.saturating_sub(tail_budget)).collect();
+    let elided = total - head_budget - tail_budget;
+    format!("{head}\n…[{elided} chars elided]…\n{tail}")
 }
 
 /// First `max_chars` chars, newlines preserved, `…`-terminated if cut.
@@ -4971,6 +5005,63 @@ mod tests {
     /// Without this the preset is a config knob that does nothing, which is worse
     /// than not shipping it — an operator would believe their transcript was
     /// untouched while it was being rewritten underneath them.
+    /// #1780: an over-cap prior summary must re-enter the summarizer with its
+    /// recovery handle and re-read breadcrumb INTACT.
+    ///
+    /// These are appended LAST to a summary body, so head-first truncation removed
+    /// exactly the two affordances that exist for recovering what the summary
+    /// dropped — turning an addressed elision into an unmarked gap the model has no
+    /// way to notice. This test fails on the pre-fix code.
+    #[test]
+    fn an_over_cap_summary_keeps_its_recovery_handle() {
+        let handle = "bafyr4ideadbeefcafe";
+        let body = format!(
+            "{SUMMARY_PREFIX}\n## Active Task\nfix the parser\n{}\n\n\
+             [the full verbatim text of this compacted span is retrievable with \
+             memory_fetch(\"compaction:{handle}\")]\n{SUMMARY_END_MARKER}",
+            "padding that pushes this summary well past the input cap. ".repeat(120),
+        );
+        assert!(
+            body.chars().count() > SUMMARY_INPUT_MSG_CAP,
+            "fixture must exceed the cap or it proves nothing"
+        );
+
+        let rendered = render_message(&json!({ "role": "user", "content": body }));
+
+        assert!(
+            rendered.contains(handle),
+            "the compaction handle was truncated out of the summarizer input"
+        );
+        assert!(
+            rendered.contains("memory_fetch"),
+            "the recovery directive was truncated out"
+        );
+        assert!(
+            rendered.contains("## Active Task"),
+            "the head must survive too — the task lives there"
+        );
+        assert!(
+            rendered.contains("elided"),
+            "the cut must be marked, not silent"
+        );
+    }
+
+    /// The tail-preserving path is for compaction summaries only; everything else
+    /// keeps the cheaper head-first behaviour.
+    #[test]
+    fn ordinary_messages_still_truncate_head_first() {
+        let body = format!(
+            "ORDINARY {}TAILMARKER",
+            "x".repeat(SUMMARY_INPUT_MSG_CAP * 2)
+        );
+        let rendered = render_message(&json!({ "role": "user", "content": body }));
+        assert!(rendered.contains("ORDINARY"));
+        assert!(
+            !rendered.contains("TAILMARKER"),
+            "a non-summary message should not have gained tail preservation"
+        );
+    }
+
     #[tokio::test]
     async fn append_only_refuses_rather_than_rewriting() {
         let task = "do the task";
