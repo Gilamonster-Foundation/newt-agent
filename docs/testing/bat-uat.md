@@ -58,9 +58,23 @@ OpenAI-compatible endpoint:
   model is the `EVAL_MODEL` repo variable (or the dispatch input), and the
   bearer token is the `EVAL_API_KEY` secret. Per RATCHET.md no host or key
   appears in the workflow file; the model is named only.
-- **Unconfigured is a skip, not a failure.** A preflight job checks for the
-  variable and the secret and skips the eval when either is missing, so a fork
-  — or this repo before the secret exists — does not get a red schedule.
+- **The configuration contract differs per trigger, on purpose.** A preflight
+  job checks for the variable and the secret. On the weekly schedule and on
+  manual dispatch, missing configuration is a **skip** — the failure mode being
+  replaced was a scheduled job going red nightly for a reason nobody could act
+  on, and a fork has no endpoint to call. On a push to `release/**` it
+  **fails closed**: a release gate that silently skips is not a gate.
+- **No expression-to-shell interpolation.** `${{ }}` is never written into a
+  `run:` script; values cross into the script through `env:` and are used
+  quoted, with arguments assembled as a bash array. GitHub substitutes
+  expressions before bash parses the script, so a dispatch input containing
+  shell metacharacters would otherwise become code running beside the API key.
+  The generated backend TOML is serialized with real string escaping rather
+  than shell interpolation for the same reason.
+- **Least privilege:** `permissions: contents: read`, checkout with
+  `persist-credentials: false` (the agent under test runs against this
+  checkout), a 60-minute job timeout, and concurrency that supersedes an older
+  run — except on `release/**`, where a follow-up push must not cancel a gate.
 - **Serial by design:** the eval driver runs cases one at a time and the worker
   talks to a real model, satisfying the "real-resource tests run
   single-threaded" rule.

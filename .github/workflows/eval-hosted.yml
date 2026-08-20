@@ -23,14 +23,21 @@ name: Live eval (BAT/UAT vs a hosted model)
 # this file. The model is NAMED only; the endpoint comes from a repo variable
 # and the bearer token from a secret. Nothing here names a host.
 #
-# UNCONFIGURED IS A SKIP, NOT A FAILURE. A fork, or this repo before the secret
-# exists, has no endpoint to call. The preflight job below reports that and the
-# eval job is skipped — deliberately, because the failure mode we are replacing
-# was a scheduled job going red every night for a reason nobody could act on.
+# NO EXPRESSION-TO-SHELL INTERPOLATION. `${{ }}` is never written directly into
+# a `run:` script. GitHub substitutes expressions into the temporary shell
+# script BEFORE bash parses it, so an input containing shell metacharacters
+# becomes executable code running beside EVAL_API_KEY. Every value crosses into
+# the script through `env:` and is used quoted, and arguments are assembled as a
+# bash array rather than a concatenated string.
+#   https://docs.github.com/en/actions/concepts/security/script-injections
 #
-# HOOK PARITY EXCEPTION: like the `windows` job in ci.yml and mesh-integration,
-# this is intentionally OUTSIDE pre-push parity — it needs a real model and is
-# far too slow for a push gate. The hand-run equivalent is `just eval-live`.
+# CONFIGURATION CONTRACT — deliberately different per trigger:
+#   * schedule / workflow_dispatch → unconfigured is a SKIP. The failure mode
+#     being replaced was a scheduled job going red nightly for a reason nobody
+#     could act on, and a fork has no endpoint to call.
+#   * push to release/**          → unconfigured FAILS CLOSED. A release gate
+#     that silently skips is not a gate. If we cannot prove the release against
+#     a real model, that is a red release, not a quiet pass.
 
 on:
   schedule:
@@ -49,6 +56,19 @@ on:
   push:
     branches: ["release/**"]
 
+# The eval asks an external model to drive an agent inside a checked-out repo.
+# Give that environment nothing writable it does not need.
+permissions:
+  contents: read
+
+# A newer commit supersedes an older eval run: these are slow and billable, and
+# several `release/**` pushes in a row must not run several at once. Release
+# runs are NOT cancelled — a gate that a follow-up push can silently cancel is
+# not a gate.
+concurrency:
+  group: eval-hosted-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/heads/release/') }}
+
 env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
@@ -57,6 +77,7 @@ jobs:
   preflight:
     name: is the hosted tier configured
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       configured: ${{ steps.check.outputs.configured }}
     steps:
@@ -64,22 +85,33 @@ jobs:
         id: check
         env:
           HAVE_KEY: ${{ secrets.EVAL_API_KEY != '' }}
+          BASE_URL: ${{ vars.EVAL_BASE_URL }}
+          IS_RELEASE: ${{ startsWith(github.ref, 'refs/heads/release/') }}
         run: |
-          BASE="${{ vars.EVAL_BASE_URL }}"
-          if [ "$HAVE_KEY" = "true" ] && [ -n "$BASE" ]; then
+          set -euo pipefail
+          if [[ "$HAVE_KEY" == "true" && -n "$BASE_URL" ]]; then
             echo "configured=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Hosted eval tier not configured — set the EVAL_BASE_URL repo variable and the EVAL_API_KEY secret to enable it. Skipping."
+            exit 0
           fi
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+          if [[ "$IS_RELEASE" == "true" ]]; then
+            echo "::error::Release gate cannot run: set the EVAL_BASE_URL repo variable and the EVAL_API_KEY secret. A release is not proven against a real model without them."
+            exit 1
+          fi
+          echo "::notice::Hosted eval tier not configured — set the EVAL_BASE_URL repo variable and the EVAL_API_KEY secret to enable it. Skipping."
 
   eval-hosted:
     name: live eval (hosted)
     needs: preflight
     if: needs.preflight.outputs.configured == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The agent under test runs against this checkout; do not leave a
+          # push-capable token sitting in .git/config beside it.
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -89,36 +121,58 @@ jobs:
 
       - name: Build worker + eval driver
         run: |
+          set -euo pipefail
           cargo build --release --bin newt
           cargo build --release --bin newt-eval
 
       - name: Resolve target model
         id: model
+        env:
+          INPUT_MODEL: ${{ github.event.inputs.model }}
+          VAR_MODEL: ${{ vars.EVAL_MODEL }}
         run: |
-          M="${{ github.event.inputs.model }}"
-          if [ -z "$M" ]; then M="${{ vars.EVAL_MODEL }}"; fi
-          if [ -z "$M" ]; then
+          set -euo pipefail
+          model="${INPUT_MODEL:-}"
+          if [[ -z "$model" ]]; then model="${VAR_MODEL:-}"; fi
+          if [[ -z "$model" ]]; then
             echo "::error::No model resolved — pass the workflow_dispatch 'model' input or set the EVAL_MODEL repo variable."
             exit 1
           fi
-          echo "name=$M" >> "$GITHUB_OUTPUT"
-          echo "Running hosted eval against: $M"
+          # A model name is an opaque identifier; reject anything that is not
+          # one rather than carrying it further into a config file.
+          if [[ ! "$model" =~ ^[A-Za-z0-9._:/-]+$ ]]; then
+            echo "::error::Model name contains unexpected characters; refusing."
+            exit 1
+          fi
+          printf 'name=%s\n' "$model" >> "$GITHUB_OUTPUT"
+          printf 'Running hosted eval against: %s\n' "$model"
 
       # The worker resolves its backend from ~/.newt, which does not exist on a
       # hosted runner. Write the one backend this run needs. The token is NOT
       # written here — `api_key_env` keeps it in the process environment, so it
       # never lands on disk and never reaches a config the eval could print.
+      #
+      # The TOML is produced by python's toml-string escaping rather than by
+      # shell interpolation, so a value can never terminate its own string and
+      # inject a second key.
       - name: Write the eval backend config
+        env:
+          BASE_URL: ${{ vars.EVAL_BASE_URL }}
+          MODEL: ${{ steps.model.outputs.name }}
         run: |
+          set -euo pipefail
           mkdir -p "$HOME/.newt"
-          cat > "$HOME/.newt/config.toml" <<EOF
-          [[backends]]
-          name = "eval"
-          endpoint = "${{ vars.EVAL_BASE_URL }}"
-          model = "${{ steps.model.outputs.name }}"
-          kind = "openai"
-          api_key_env = "EVAL_API_KEY"
-          EOF
+          python3 - <<'PY' > "$HOME/.newt/config.toml"
+          import json, os
+          def s(v):  # TOML basic strings share JSON's escaping rules.
+              return json.dumps(v)
+          print("[[backends]]")
+          print(f"name = {s('eval')}")
+          print(f"endpoint = {s(os.environ['BASE_URL'])}")
+          print(f"model = {s(os.environ['MODEL'])}")
+          print(f"kind = {s('openai')}")
+          print(f"api_key_env = {s('EVAL_API_KEY')}")
+          PY
 
       # The eval driver runs cases SERIALLY and spawns the `newt` worker, which
       # talks to the configured endpoint. Real fs / real model / real subprocess
@@ -128,11 +182,15 @@ jobs:
         env:
           EVAL_API_KEY: ${{ secrets.EVAL_API_KEY }}
           NEWT_BACKEND: openai
+          MODEL: ${{ steps.model.outputs.name }}
           NEWT_DEFAULT_MODEL: ${{ steps.model.outputs.name }}
+          DIFFICULTY: ${{ github.event.inputs.difficulty }}
           # Live cases touch a real model; give the worker headroom.
           NEWT_EVAL_WORKER_TIMEOUT_MS: "180000"
         run: |
-          DIFF="${{ github.event.inputs.difficulty }}"
-          ARGS="run --mode live --model ${{ steps.model.outputs.name }}"
-          if [ -n "$DIFF" ]; then ARGS="$ARGS --difficulty $DIFF"; fi
-          ./target/release/newt-eval $ARGS
+          set -euo pipefail
+          args=(run --mode live --model "$MODEL")
+          if [[ -n "${DIFFICULTY:-}" ]]; then
+            args+=(--difficulty "$DIFFICULTY")
+          fi
+          ./target/release/newt-eval "${args[@]}"
