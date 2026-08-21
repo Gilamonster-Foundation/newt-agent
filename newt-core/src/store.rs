@@ -1089,10 +1089,11 @@ impl ConversationStore {
         // precisely what makes it a witness rather than a cache: two values
         // written at different moments that must agree.
         //
-        // Checking it costs one indexed row read (the turns PRIMARY KEY serves
-        // it directly) and catches an altered tip at the moment we would
-        // otherwise chain a new turn on top of the damage, instead of at the
-        // next restore.
+        // This deliberately O(1) witness check compares only the recorded
+        // writer's final row with the stored tip. It catches an altered or
+        // deleted tip at the moment we would otherwise extend it. An edit to
+        // an earlier turn that leaves the final row and witness intact passes
+        // here and is discovered by load_verified / verify_chain on restore.
         //
         // Writer-agnostic, matching `verify_chain`: the stored tip belongs to
         // the conversation row's RECORDED writer, not whoever is appending, so
@@ -1136,8 +1137,8 @@ impl ConversationStore {
                 // refuses hashing on an intact record) — the wrapper must
                 // stay accurate for both.
                 anyhow::anyhow!(
-                    "refusing the append — the record's integrity could not be \
-                     confirmed, and new work must not chain on top of it: {e:#}"
+                    "refusing the append -- the recorded chain tip could not be \
+                     confirmed, so new work must not extend that tip: {e:#}"
                 )
             })?;
         }
@@ -1210,11 +1211,18 @@ impl ConversationStore {
     ///
     /// ## Coverage boundary — what "verified" does and does not cover
     ///
-    /// The §6 chain covers TURN CONTENT (the canonical encoding hashes every
-    /// turn field). Three things inside or beside the returned record are
-    /// outside it, stated here so "verified" is never read as more than it
-    /// is:
+    /// The §6 chain covers the canonical turn encoding, except for
+    /// `phantom_reaches`; it does not authenticate the surrounding
+    /// `conversations` row. The following data inside or beside the returned
+    /// record is outside it, stated here so "verified" is never read as more
+    /// than it is:
     ///
+    /// * **`phantom_reaches`.** This per-turn telemetry is deliberately not a
+    ///   canonical-encoding input, so an SQL-level edit passes this gate.
+    /// * **Conversation-row metadata.** `title`, workspace metadata,
+    ///   `persona`, roadmap/node IDs, and the created/updated time claims are
+    ///   materialized from `conversations`, but are not chain inputs. An
+    ///   SQL-level edit passes this gate; restore applies the returned persona.
     /// * **`scratchpad` and `plan`** ride the conversations row unhashed
     ///   ("working memory, not provenance" — the schema comments). They are
     ///   rehydrated into the restored session, so an SQL-level edit to them
@@ -2618,10 +2626,10 @@ impl ConversationStore {
     /// (`None` = that writer has no turns, so the witness must equal its
     /// genesis hash).
     ///
-    /// An empty `recorded_tip` or `tip_writer` is the schema-diff backfill —
-    /// absence of evidence — and passes; see
-    /// [`Self::verify_conversation_chain`] for why refusing on absence would
-    /// be both harmful and dishonest.
+    /// An empty `recorded_tip` is the schema-diff backfill — absence of
+    /// evidence — and passes. A nonempty tip with an empty `tip_writer`
+    /// refuses because no write path or migration produces it; see
+    /// [`Self::verify_conversation_chain`] for the policy.
     ///
     /// LIMITATION, stated rather than papered over: this policy means an
     /// attacker who can write SQL can erase the witness — blanking the ONE

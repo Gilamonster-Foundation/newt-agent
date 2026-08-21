@@ -329,8 +329,63 @@ fn the_scanner_finds_callers_that_do_exist() {
     );
 }
 
+/// The production-caller scanner must not let a test-only hit satisfy a
+/// wiring law. This fixture covers the two places source layout can hide test
+/// status from a line scanner: an out-of-line child reached through a
+/// parent-side `#[cfg(test)] #[path = ...]`, and an inline cfg attribute whose
+/// item opens its brace on the attribute line. It also pins that
+/// `#[cfg(not(test))]` remains visible as production code.
+#[test]
+fn scanner_does_not_count_test_only_callers() {
+    let root = tempfile::tempdir().unwrap();
+    let src = root.path().join("src");
+    std::fs::create_dir_all(src.join("lib_tests")).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        r#"
+#[cfg(test)]
+#[path = "lib_tests/core.rs"]
+mod tests;
+
+#[cfg(test)] fn inline_test_only() {
+    if true { helper(); }
+    load_verified();
+}
+
+#[cfg(not(test))]
+fn production_only() { load_verified(); }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("lib_tests/core.rs"),
+        "fn parent_gated_test_only() { load_verified(); }\n",
+    )
+    .unwrap();
+
+    let callers = production_callers_of_in(root.path(), &["load_verified"]);
+    assert_eq!(
+        callers.len(),
+        1,
+        "only the production-only caller may be counted: {callers:?}"
+    );
+    assert!(
+        callers[0].contains("production_only"),
+        "the production-only caller must remain visible: {callers:?}"
+    );
+}
+
+#[test]
+fn cfg_test_only_matcher_is_conservative() {
+    assert!(cfg_is_test_only("#[cfg(test)]"));
+    assert!(cfg_is_test_only("#[cfg(all(test, unix))]"));
+    assert!(!cfg_is_test_only("#[cfg(not(test))]"));
+    assert!(!cfg_is_test_only("#[cfg(any(test, unix))]"));
+}
+
 /// Scan every crate's `src/` for a call to any of `names`, ignoring the
-/// definition sites, doc comments, and `#[cfg(test)]` modules.
+/// definition sites, doc comments, and source items that cannot compile in a
+/// production build.
 ///
 /// A source scan is an unusual shape for a test and is used deliberately: the
 /// property under test is "this code is reachable in production", which is a
@@ -340,9 +395,12 @@ fn production_callers_of(names: &[&str]) -> Vec<String> {
         .parent()
         .expect("newt-core has a parent workspace directory")
         .to_path_buf();
+    production_callers_of_in(&workspace_root, names)
+}
 
+fn production_callers_of_in(workspace_root: &std::path::Path, names: &[&str]) -> Vec<String> {
     let mut found = Vec::new();
-    let mut stack = vec![workspace_root.clone()];
+    let mut stack = vec![workspace_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -361,6 +419,12 @@ fn production_callers_of(names: &[&str]) -> Vec<String> {
                 continue;
             }
             if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            // newt-tui's out-of-line lib_tests files are each reached by a
+            // parent-side #[cfg(test)] #[path = ...] declaration. The child
+            // itself has no local cfg for this line scanner to see.
+            if is_test_only_source_path(&path) {
                 continue;
             }
             // agentic/artifact_read.rs defines a PRIVATE fn of the same name —
@@ -382,14 +446,12 @@ fn production_callers_of(names: &[&str]) -> Vec<String> {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            // Skip `#[cfg(test)]` items by brace depth: from the attribute,
-            // ignore lines until the braces opened after it close again. A
-            // simple latch ("saw #[cfg(test)], skip the rest of the file") is
-            // NOT good enough — a large file with an early test seam would
-            // hide every later production line, making this scanner blind in
-            // exactly the way it exists to detect. That bug shipped in this
-            // scanner's first version: it missed a real production caller in
-            // a 7000-line file with a `#[cfg(test)]` seam near the top.
+            // Skip cfg items that cannot compile in production by brace depth:
+            // from the attribute, ignore lines until the braces opened after
+            // it close again. A simple latch ("saw #[cfg(test)], skip the rest
+            // of the file") is NOT good enough — a large file with an early
+            // test seam would hide every later production line, making this
+            // scanner blind in exactly the way it exists to detect.
             let mut test_depth: i32 = 0;
             let mut pending_test_attr = false;
             for line in text.lines() {
@@ -406,6 +468,12 @@ fn production_callers_of(names: &[&str]) -> Vec<String> {
                 // and this is a structural ratchet, not a parser.)
                 let code = strip_string_literals(line);
                 let ctrim = code.trim_start();
+                if test_depth == 0 && !pending_test_attr && cfg_is_test_only(ctrim) {
+                    // Do not continue yet: an inline attribute item such as
+                    // #[cfg(test)] fn f() { must contribute its opening brace
+                    // before the test-only body is skipped.
+                    pending_test_attr = true;
+                }
                 if test_depth > 0 || pending_test_attr {
                     let opens = code.matches('{').count() as i32;
                     let closes = code.matches('}').count() as i32;
@@ -425,14 +493,6 @@ fn production_callers_of(names: &[&str]) -> Vec<String> {
                     test_depth = (test_depth + opens - closes).max(0);
                     continue;
                 }
-                // Any cfg attribute whose predicate names `test` as a word:
-                // `#[cfg(test)]`, `#[cfg(all(test, unix))]`, … — the exact-
-                // prefix match missed the `all(…)` forms, so a test-gated
-                // caller inside one satisfied a production-caller law.
-                if ctrim.starts_with("#[cfg(") && has_word_test(ctrim) {
-                    pending_test_attr = true;
-                    continue;
-                }
                 for n in names {
                     // A call, not the definition — matched on the stripped
                     // line, so the name inside a string literal (an error
@@ -447,14 +507,92 @@ fn production_callers_of(names: &[&str]) -> Vec<String> {
     found
 }
 
+/// Whether `path` is an out-of-line test module below a crate's `src/`.
+/// These modules are parent-gated, so scanning the child file alone cannot
+/// recover its cfg context.
+fn is_test_only_source_path(path: &std::path::Path) -> bool {
+    let mut below_src = false;
+    for component in path.components() {
+        if component.as_os_str() == "src" {
+            below_src = true;
+        } else if below_src && component.as_os_str() == "lib_tests" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Return true only for cfg predicates that require the `test` atom. This is
+/// deliberately conservative: `#[cfg(not(test))]` and
+/// `#[cfg(any(test, unix))]` can compile in production and must stay visible.
+fn cfg_is_test_only(code: &str) -> bool {
+    let Some(rest) = code.strip_prefix("#[cfg(") else {
+        return false;
+    };
+    let mut depth = 1_i32;
+    for (index, ch) in rest.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            return cfg_all_requires_test(&rest[..index]);
+        }
+    }
+    false
+}
+
+/// An `all(...)` predicate requires tests when any of its factors does.
+fn cfg_all_requires_test(predicate: &str) -> bool {
+    let predicate = predicate.trim();
+    if predicate == "test" {
+        return true;
+    }
+    let Some(open) = predicate.find('(') else {
+        return false;
+    };
+    if predicate[..open].trim() != "all" || !predicate.ends_with(')') {
+        return false;
+    }
+    split_cfg_args(&predicate[open + 1..predicate.len() - 1])
+        .into_iter()
+        .any(cfg_all_requires_test)
+}
+
+/// Split cfg-function arguments while preserving nested cfg expressions.
+fn split_cfg_args(args: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_i32;
+    for (index, ch) in args.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                let part = args[start..index].trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    let part = args[start..].trim();
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    parts
+}
+
 /// Regression for #1785, write path: an append onto a conversation whose
-/// recorded tip witness disagrees with the chain must refuse — otherwise new
-/// work is chained on top of the damage and the altered record gains a valid
-/// continuation.
+/// recorded tip witness disagrees with the recorded final turn must refuse.
+/// This is deliberately an O(1) witness check, not a full-chain walk.
 ///
 /// Also pins the failure contract: refusing must not change what is stored.
 #[test]
-fn append_refuses_to_extend_a_tampered_chain() {
+fn append_refuses_to_extend_a_tampered_tip_witness() {
     let root = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let store = store(root.path(), workspace.path());
@@ -486,6 +624,44 @@ fn append_refuses_to_extend_a_tampered_chain() {
     assert_eq!(
         rec.turns[1].assistant, "rewritten",
         "the tampered row must be left exactly as found — evidence, not debris"
+    );
+}
+
+/// The append guard validates the recorded tip witness only. An interior
+/// mutation that leaves the recorded final row and witness intact is detected
+/// by the full restore verification, not by the O(1) append path.
+#[test]
+fn append_tip_witness_only_checks_the_tip() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = store(root.path(), workspace.path());
+    let id = store.create("first-principle", None).unwrap();
+    store.append_turn(&id, "u1", "a1").unwrap();
+    store.append_turn(&id, "u2", "a2").unwrap();
+    store.append_turn(&id, "u3", "a3").unwrap();
+
+    let conn = rusqlite::Connection::open(root.path().join("conversations.db")).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE turns SET assistant = 'rewritten history' WHERE conversation_id = ?1
+               AND seq = (SELECT MIN(seq) + 1 FROM turns WHERE conversation_id = ?1)",
+            rusqlite::params![&id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "the middle-turn tamper must have landed");
+
+    store
+        .append_turn(&id, "u4", "a4")
+        .expect("the O(1) tip witness checks only the recorded final turn");
+    assert_eq!(store.load(&id).unwrap().turns.len(), 4);
+
+    let err = store
+        .load_verified(&id)
+        .expect_err("restore verification must catch the broken interior link");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("chain violation") && msg.contains("does not link"),
+        "the full verifier must name the broken link: {msg}"
     );
 }
 
@@ -735,31 +911,6 @@ fn strip_string_literals(line: &str) -> String {
         }
     }
     out
-}
-
-/// Does the line contain `test` as a standalone word (not `test_util`,
-/// `latest`, `attest`)? Used on STRIPPED lines only, so `"test-util"` inside
-/// a feature string never reaches it.
-fn has_word_test(code: &str) -> bool {
-    let bytes = code.as_bytes();
-    let mut from = 0;
-    while let Some(pos) = code[from..].find("test") {
-        let start = from + pos;
-        let end = start + 4;
-        let before_ok = start == 0 || {
-            let b = bytes[start - 1];
-            !(b.is_ascii_alphanumeric() || b == b'_')
-        };
-        let after_ok = end >= bytes.len() || {
-            let b = bytes[end];
-            !(b.is_ascii_alphanumeric() || b == b'_')
-        };
-        if before_ok && after_ok {
-            return true;
-        }
-        from = end;
-    }
-    false
 }
 
 // =========================================================================
