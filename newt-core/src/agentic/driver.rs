@@ -788,14 +788,25 @@ mod tests {
 
     /// Pump the driver to completion the way a crossterm loop would: poll on an
     /// interval until the turn resolves, never blocking the "frame".
+    ///
+    /// The budget is a WALL-CLOCK deadline, not a poll count. It used to be 600
+    /// polls at 10 ms, which reads like six seconds but is really "600 polls
+    /// plus however long 600 `poll()` calls take" — and under `cargo llvm-cov`
+    /// instrumentation the turns that do a real mock-server round trip, take a
+    /// 400, compact, and retry ran past it. That made the test fail by machine
+    /// speed rather than by behaviour.
+    ///
+    /// A deadline says what is meant: no turn here should take 30 s, and one
+    /// that does is hung, which is what this guard exists to catch.
     async fn pump_to_done(driver: &mut TurnDriver) -> TurnStatus {
-        for _ in 0..600 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
             match driver.poll() {
                 TurnStatus::Running => tokio::time::sleep(Duration::from_millis(10)).await,
                 other => return other,
             }
         }
-        panic!("turn did not complete within the pump budget");
+        panic!("turn did not complete within the 30s pump budget");
     }
 
     /// THE acceptance test: a consumer drives one turn through the driver and

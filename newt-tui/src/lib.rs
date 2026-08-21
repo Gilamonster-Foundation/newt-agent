@@ -15737,6 +15737,13 @@ mod fd_exhaustion_tests {
     use super::*;
 
     /// mark_fds_cloexec must never touch stdin/stdout/stderr.
+    ///
+    /// Serialized on `tty_arbiter`: the cockpit pty tests `dup2` the pty slave
+    /// onto fd 1 (and a terminal fd 2) and restore them in `Drop`. Reading the
+    /// process fd table during that window sees fd 1 mid-swap and reports it
+    /// closed. Rust runs a crate's tests in ONE process, so this is a real
+    /// shared resource, not an isolated one.
+    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn mark_fds_cloexec_preserves_stdio() {
         mark_fds_cloexec();
@@ -15756,6 +15763,10 @@ mod fd_exhaustion_tests {
     }
 
     /// A freshly-opened fd that lacks CLOEXEC gets the flag set by mark_fds_cloexec.
+    ///
+    /// Same `tty_arbiter` key: this walks the whole fd table, so it must not run
+    /// while another test is opening and closing pty descriptors.
+    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn mark_fds_cloexec_sets_flag_on_new_fd() {
         let f = std::fs::File::open("/dev/null").expect("open /dev/null");
@@ -15810,6 +15821,9 @@ mod fd_exhaustion_tests {
     }
 
     /// mark_fds_cloexec is idempotent — calling it twice changes nothing.
+    ///
+    /// Same `tty_arbiter` key, for the same fd-table reason.
+    #[serial_test::serial(tty_arbiter)]
     #[test]
     fn mark_fds_cloexec_is_idempotent() {
         let f = std::fs::File::open("/dev/null").expect("open /dev/null");
