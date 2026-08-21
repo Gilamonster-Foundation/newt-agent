@@ -116,7 +116,7 @@ no alt-screen, no region. Format (one marker line + indented body):
     edit src/foo.rs (+12 −3)   edit src/bar.rs (+4 −0)
 ▸ verify · just check
     ✗ 1 failing: foo::tests::off_by_one
-▸ triage · gnuc▸qwen2.5-coder:3b
+▸ triage · gpu-runner▸qwen2.5-coder:3b
     "loop bound uses < where it should be <="
 ▸ plan · dgx▸qwen3-coder:30b · attempt 2/3
     edit src/foo.rs (+1 −1)
@@ -146,7 +146,7 @@ The rich surface already renders a status row (clock + edit-mode). Extend it,
 **while a crew is running**, to a workflow line:
 
 ```
-[20:51:24] crew · PLAN 2/3 · dgx▸planner gnuc▸triage · ⏱ 14s
+[20:51:24] crew · PLAN 2/3 · dgx▸planner gpu-runner▸triage · ⏱ 14s
 ```
 
 Schema: `[clock] crew · <STEP> <attempt>/<max> · <role▸backend placements> · <elapsed>`.

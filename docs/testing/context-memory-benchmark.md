@@ -119,7 +119,7 @@ sessions (reset-on-use working), zero scan bypasses.
 
 ## Environment
 
-Live runs on **gnuc** use gnuc's own Ollama (`https://REDACTED-HOST`),
+Live runs on **gpu-runner** use gpu-runner's own Ollama (`https://REDACTED-HOST`),
 not the DGX or the LB — pinned models: `llama3.1:8b` (weak-model floor),
 `qwen3-coder:30b` (workhorse), one mid model (`qwen2.5-coder:14b`). Record
 per kyln's citability checklist: model + quant, ollama version, `num_ctx`,

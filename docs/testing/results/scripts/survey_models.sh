@@ -5,7 +5,7 @@
 #
 # Usage:
 #   NEWT_BIN=<release/newt> NEWT_EVAL_BIN=<release/newt-eval> \
-#   survey_models.sh --endpoint URL --hardware "gnuc 4060 Ti" \
+#   survey_models.sh --endpoint URL --hardware "gpu-runner 4060 Ti" \
 #       --corpus DIR --surface JSON --out DIR \
 #       --models "m1 m2 ..."|auto [--require-tools] [--repeats K] [--timeout 1200]
 #

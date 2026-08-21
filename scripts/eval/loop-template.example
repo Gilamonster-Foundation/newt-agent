@@ -36,7 +36,7 @@ prompt = false                     # non-interactive: MUST auto-grant, not block
 # model. Endpoint lives here only. (Does NOT fix cap-exit summaries — those
 # always use the session client, mod.rs:2377-2378; that is a separate lever.)
 kind = "ollama"
-endpoint = "http://<your-gnuc-host>:11434"
+endpoint = "http://<your-gpu-runner-host>:11434"
 model = "gemma3:12b"
 timeout_secs = 150
 fallback_model = "qwen2.5-coder:7b"

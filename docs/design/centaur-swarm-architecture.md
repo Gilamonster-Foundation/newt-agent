@@ -39,7 +39,7 @@ each voice, over the same channel that carries the work.
  division of labor    decorrelated diversity
   │                     │                                    (data plane)
   ▼                     ▼   dispatch by model-pin, with failover
-   🌐 agent-mesh BackendPool — DGX + gnuc + intermittent Windows, *breathing*
+   🌐 agent-mesh BackendPool — DGX + gpu-runner + intermittent Windows, *breathing*
   │                     │                                    (authority plane)
   ▼                     ▼   each voice runs attenuated + contained
    🔒 captured-shell OCAP per voice — the Confused-Deputy defense
@@ -77,7 +77,7 @@ function.** The register and the mechanism live in
 
 ## The critical path (three gates, mostly parallel)
 
-1. **Data plane moves now.** The crew MVP (#85) — the boring two-pass machine on gnuc+DGX
+1. **Data plane moves now.** The crew MVP (#85) — the boring two-pass machine on gpu-runner+DGX
    — proves dispatch + failover across the pool. Its mesh substrate is built; the net-new
    is the `newt-scheduler` `BackendPool` layer.
 2. **Control plane is the Phone gate.** #62 multi-attach (epic #314) + the pairing flow in

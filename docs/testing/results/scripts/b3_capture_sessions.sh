@@ -27,7 +27,7 @@ This workspace exists for the newt context/memory baseline (issue #245).
 ## Things the agent might be asked about
 - The conversation store rewrites the whole JSON record per turn.
 - The token estimator is chars/4 over serialized messages, no tool schemas.
-- gnuc runs an RTX 4060 Ti with 16GB of VRAM.
+- gpu-runner runs an RTX 4060 Ti with 16GB of VRAM.
 
 ## Filler
 The measurements compare estimated tokens against the backend's reported

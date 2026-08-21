@@ -100,7 +100,7 @@ count, tokens in/out, and a cap-hit inference (`events ≥ max_tool_rounds`, sin
 
 | label | device | memory |
 |---|---|---|
-| `gnuc 4060 Ti` | NVIDIA GeForce RTX 4060 Ti | 16 GB |
+| `gpu-runner 4060 Ti` | NVIDIA GeForce RTX 4060 Ti | 16 GB |
 | `DGX Spark` | NVIDIA DGX Spark (GB10) | 128 GB unified |
 
 Inference is served by Ollama (`REDACTED-HOST`, `REDACTED-HOST`).
@@ -120,9 +120,9 @@ docs/testing/results/scripts/pack_pyo3_corpus.sh --repo . --out /tmp/corpus8 --c
 NEWT_BIN=~/.cache/newt-target/release/newt \
 NEWT_EVAL_BIN=~/.cache/newt-target/release/newt-eval \
 docs/testing/results/scripts/survey_models.sh \
-  --endpoint https://REDACTED-HOST --hardware "gnuc 4060 Ti" \
+  --endpoint https://REDACTED-HOST --hardware "gpu-runner 4060 Ti" \
   --corpus /tmp/corpus8/corpus --surface /tmp/corpus8/python_surface.json \
-  --out /tmp/survey-gnuc --models auto --require-tools --repeats 5 --timeout 900
+  --out /tmp/survey-gpu-runner --models auto --require-tools --repeats 5 --timeout 900
 ```
 
 `--repeats K` runs each model K times and reports a **pass-rate** (pass/K)

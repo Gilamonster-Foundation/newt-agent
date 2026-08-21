@@ -181,7 +181,7 @@ only lets it thrash longer" (ROADMAP.md:1326). Pair with T0.2.
 
 **T0.2 — get the summarizer off the session backend (two paths).**
 *Immediate — already done:* `summarizer.toml` has been renamed back
-into place (gnuc `gemma3:12b`, 150s timeout, fallback
+into place (gpu-runner `gemma3:12b`, 150s timeout, fallback
 `qwen2.5-coder:7b`); the next session's mid-loop compaction runs off-
 box again. Verify it actually loads (`RUST_LOG=info` shows summarizer
 resolution; a manual `/compress` should not report "prune + static
@@ -203,7 +203,7 @@ model_path = "/Users/shawnhartsock/.newt/models/qwen2.5-1.5b/qwen2.5-1.5b-instru
 
 *Buys:* zero-contention, zero-external-dependency compaction — the
 #639 design goal.
-*Failure modes:* a half-setup is worse than gnuc — `kind = "embedded"`
+*Failure modes:* a half-setup is worse than gpu-runner — `kind = "embedded"`
 with a feature-off build or missing GGUF yields a permanently failing
 summarizer → static marker on every compaction (`lib.rs:4290-4297`,
 `compress.rs:1390-1398`), never a fallback to HTTP. Disk check first:
@@ -224,7 +224,7 @@ doc comment (`config.rs:1438-1442`) advises exactly this: open-ended
 work should reach for `newt crew "<task>"` (bounded `--max-attempts`,
 honest `NeedsHumanReview` exit) rather than an unbounded chat cap.
 The `~/.newt/crews/home.toml` drop-in already routes planner=dgx1,
-navigator/triage=gnuc.
+navigator/triage=gpu-runner.
 *Failure mode:* crew quality on this hardware is its own project
 (see [`improving-crew-results.md`](improving-crew-results.md)).
 
