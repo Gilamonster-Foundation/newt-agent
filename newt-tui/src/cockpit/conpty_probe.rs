@@ -490,6 +490,19 @@ mod probes {
                 GetExitCodeProcess(pi.hProcess, &mut child_exit);
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
+                // The child having EXITED does not mean its bytes have reached
+                // us. The pseudoconsole renders child output into the pipe
+                // asynchronously, and `ClosePseudoConsole` tears that session
+                // down — anything still buffered is discarded, the reader sees
+                // EOF early, and the tail of the transcript vanishes. That lost
+                // exactly one marker on a loaded runner: stdout arrived and
+                // stderr, written last, did not.
+                //
+                // A short grace period lets the renderer flush what the child
+                // already wrote. It bounds the wait rather than guessing: the
+                // probe writes a few dozen bytes, so this is slack, not a race
+                // the delay merely usually wins.
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
             ClosePseudoConsole(hpc);
         }
