@@ -43,7 +43,7 @@ saves OpenAI spend.
 | **Task** | `T0` basic → `T5` decomposition-heavy (a ladder of small, behaviorally-checkable cases) | a `newt-eval/cases/T*` dir |
 | **Mode** (the ratchet rung) | `single` → `plan` → `plan+crew` | which real CLI the driver runs |
 | **Mechanism variant** (the eventual primary axis) | `baseline` → `+worker-grounding` → `+behavioral-leaf-gate` → `+planner-grounding` | a newt feature flag / config (downstream; the levers must be built first) |
-| **Model** (a CONTROL, per E) | mostly gnuc small; a frontier spot-check | a **named** backend / `[crews.<name>]` in local `~/.newt` |
+| **Model** (a CONTROL, per E) | mostly gpu-runner small; a frontier spot-check | a **named** backend / `[crews.<name>]` in local `~/.newt` |
 
 **Readout — the staircase:** per (mode, mechanism), the highest task rung that still
 behaviorally passes — the mechanism's **competence boundary**. The headline tables:
@@ -62,7 +62,7 @@ does NOT move the boundary (re-validating E so we can stay on cheap models).
   worktree-bounded). The per-leaf crew uses a **single-model** `[crews.<name>]` roster
   (planner == navigator == triage == one model).
 - **`plan+crew`** — identical command, but the active `[crews.<name>]` is a **mixed** roster
-  (e.g. planner on a resident dgx coder model, navigator/triage on gnuc) — the `[crews.home]`
+  (e.g. planner on a resident dgx coder model, navigator/triage on gpu-runner) — the `[crews.home]`
   shape #672 used. Plan vs crew differ **only** by the roster.
 
 ## Grading — two layers, behavioral is the headline
@@ -96,7 +96,7 @@ wall-clock`, over **n ≥ 3–5 trials** (past #672's n=1 caveat), plus the nois
 - `[crews.<name>]` — the per-role roster (model **names** only; hosts resolve via the named
   backends).
 
-`ratchet.sh` takes **names** (`--backend gnuc-7b`, `--crew mixed`), never endpoints, and may
+`ratchet.sh` takes **names** (`--backend gpu-runner-7b`, `--crew mixed`), never endpoints, and may
 generate an **ephemeral** `$NEWT_CONFIG` at runtime (a temp file, not committed) by composing
 the operator's local pieces. Placeholder templates (no real hosts) live in
 `RATCHET.local.example`.
@@ -181,8 +181,8 @@ without them and never rebuilds mid-sweep.
 
 ## Status & build order
 
-- **v1 — the instrument + the baseline boundary (gnuc, cheap).** `single` vs `plan` vs
-  `plan+crew` across T0→T5 on cheap gnuc small models (model held as a control), mixed crew
+- **v1 — the instrument + the baseline boundary (gpu-runner, cheap).** `single` vs `plan` vs
+  `plan+crew` across T0→T5 on cheap gpu-runner small models (model held as a control), mixed crew
   planner on a resident dgx coder model. **The v1 deliverable is a single-vs-crew competence
   staircase**: where does the autonomous mechanism stop implementing, and does crew underperform
   single (testing E's prediction at smaller scale). No OpenAI needed for v1.

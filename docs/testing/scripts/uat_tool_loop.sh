@@ -19,7 +19,7 @@
 # Kill background helpers by tracked PID, clear ports with `fuser -k <port>/tcp`.
 #
 # Usage: uat_tool_loop.sh [HOST] [MODEL]
-#   HOST  default http://REDACTED-HOST:11434  (dgx1 is reliable; gnuc-ollama
+#   HOST  default http://REDACTED-HOST:11434  (dgx1 is reliable; gpu-runner-ollama
 #         flakes under multi-turn/large-ctx load — connection drops → timeouts)
 #   MODEL default qwen3-coder:30b
 # Env:  NEWT_BIN (default: $CARGO_TARGET_DIR/release/newt or target/release/newt)

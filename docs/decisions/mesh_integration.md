@@ -72,7 +72,7 @@ newt-mesh (requires `../agent-mesh/` sibling checkout):
 ```sh
 just check-mesh                                                # fmt + clippy + test
 cargo build --release --manifest-path newt-mesh/Cargo.toml     # build the binary
-./newt-mesh/target/release/newt-mesh announce --role gnuc      # responder
+./newt-mesh/target/release/newt-mesh announce --role gpu-runner      # responder
 ./newt-mesh/target/release/newt-mesh ask <fp> "what is this?"  # client
 ```
 
@@ -115,7 +115,7 @@ dials by fingerprint.
 
    ```sh
    # responder
-   newt mesh announce --role gnuc-worker
+   newt mesh announce --role gpu-runner-worker
 
    # asker (on the same LAN, same UserKey)
    newt mesh ask <agent_fp> "what does this regex do?"
@@ -143,10 +143,10 @@ dials by fingerprint.
 The honest answer: a real cross-host latency benchmark would require
 two machines on a stable LAN with controlled Ollama load, and we
 don't have that bench rigged in this session. What we *can* measure
-is the in-process roundtrip on `gnuc`, which sets the floor for
+is the in-process roundtrip on `gpu-runner`, which sets the floor for
 "plumbing overhead the wire path adds":
 
-**In-process MockBackend round-trip (release build, gnuc):**
+**In-process MockBackend round-trip (release build, gpu-runner):**
 
 ```sh
 $ cargo test -p newt-mesh --release --test inference_roundtrip

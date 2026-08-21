@@ -118,7 +118,7 @@ never widen.**
 CrewTask  { goal, caveats, workspace_ref }  →  CrewResult { diff, status, ledger }
 ```
 
-carried over the SSH-CA / iroh dual transport — iroh/QUIC for a gnuc-resident on the
+carried over the SSH-CA / iroh dual transport — iroh/QUIC for a gpu-runner-resident on the
 LAN, OpenSSH-cert SSH for a cloud-resident long-haul.
 
 ## Design invariants

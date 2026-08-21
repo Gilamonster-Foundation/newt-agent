@@ -59,7 +59,7 @@ run through `newt code` in an isolated sandbox `HOME`, with a **dual assertion**
 ### Environment notes & gotchas (load-bearing)
 
 - **Endpoint reliability:** prefer **dgx1** (`REDACTED-HOST:11434`) — it is
-  reliable under load. **gnuc-ollama flakes** on multi-turn / large-`num_ctx`
+  reliable under load. **gpu-runner-ollama flakes** on multi-turn / large-`num_ctx`
   sessions (connection drops → timeouts), which silently aborts longer probes.
 - **`run_command` is the dead stub** on the crates.io-publishable build
   ("temporarily unavailable in this build") **yet still advertised** — so any

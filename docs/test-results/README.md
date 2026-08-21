@@ -12,7 +12,7 @@ starting with the **nemotron family** (the 0.6.9 target — see below).
 
 | version | experiment | summary |
 |---|---|---|
-| [0.6.8](0.6.8-pyo3-examples.md) | PyO3-examples under context overflow (8-crate corpus) | baseline across all gnuc (4060 Ti) + DGX Spark models |
+| [0.6.8](0.6.8-pyo3-examples.md) | PyO3-examples under context overflow (8-crate corpus) | baseline across all gpu-runner (4060 Ti) + DGX Spark models |
 
 ## Outcomes
 

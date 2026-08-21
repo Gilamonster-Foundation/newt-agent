@@ -149,7 +149,7 @@ A model actually driving the fence, observed from outside.
 - **Driver:** `newt plan --goal "…" --one-shot` (or `newt worker` over ACP, the
   newt-eval runner pattern), with a restricted permission posture — **not**
   `--yolo` / `--full-access`, which bypass the bridle.
-- **Backend:** the configured gnuc loadout if reachable (watch the WireGuard
+- **Backend:** the configured gpu-runner loadout if reachable (watch the WireGuard
   on-demand WiFi gotcha), else the configured OpenAI backend.
 - **Scenario:** the agent (a) creates a file inside the workspace — succeeds
   through the Seatbelt-wrapped subset engine; (b) tries to write outside the

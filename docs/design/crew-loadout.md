@@ -18,7 +18,7 @@ models are workers, admitted, given bounded context, allowed one role, then pree
 
 ```toml
 [loadouts.planner]
-provider = "dgx"            # or gnuc — both have qwen3-coder:30b
+provider = "dgx"            # or gpu-runner — both have qwen3-coder:30b
 model    = "qwen3-coder:30b"
 kit      = "coder"          # plan / patch / review techniques
 role     = "planner-editor"
@@ -31,7 +31,7 @@ kit      = "navigator"      # read-only repo-search tools
 role     = "repo-navigator"
 
 [loadouts.triage]
-provider = "gnuc"          # small, local, always-resident
+provider = "gpu-runner"          # small, local, always-resident
 model    = "qwen2.5-coder:3b"
 kit      = "triage"
 role     = "test-triage"
@@ -66,15 +66,15 @@ harness is the scheduler; the models are processes.
 That exposes the real problems (latency, swap cost, failover) on real hardware before the
 scheduler crate exists.
 
-## 3. The heterogeneous pool (gnuc + DGX today; intermittent peers later)
+## 3. The heterogeneous pool (gpu-runner + DGX today; intermittent peers later)
 
 The measured pool:
 
 | Role | Model | Where | Note |
 |---|---|---|---|
-| planner | `qwen3-coder:30b` | DGX **or** gnuc | failover-able |
-| navigator | `devstral-small-2:24b` | **DGX-only** | pin to DGX (or pull to gnuc as backup) |
-| triage | `qwen2.5-coder:3b` | gnuc | always-resident, never swaps |
+| planner | `qwen3-coder:30b` | DGX **or** gpu-runner | failover-able |
+| navigator | `devstral-small-2:24b` | **DGX-only** | pin to DGX (or pull to gpu-runner as backup) |
+| triage | `qwen2.5-coder:3b` | gpu-runner | always-resident, never swaps |
 
 With **two machines**, the primary mechanism is **placement** (put roles on different
 backends), not **model-swapping** on one GPU. Happy-path placement → **zero swaps**.
@@ -86,7 +86,7 @@ backend can take it — exactly the case the scheduler is for.
 *tight* GPU also needs **model-residency scheduling** — *which weights are loaded*.
 Principle: **treat model-load as the serialized expensive resource.** Batch by model to
 minimize swaps; keep the small triage model co-resident; time-share the big-model slot.
-With the gnuc+DGX pool this mostly dissolves into placement; it re-appears only when a
+With the gpu-runner+DGX pool this mostly dissolves into placement; it re-appears only when a
 single backend must serve two big models. The `Engine` trait abstracts the mechanism
 (Ollama `keep_alive` pin/evict vs vLLM server lifecycle). **The DGX is itself
 intermittently busy** (70b models hog VRAM) — "busy" is not "dead"; the pool must
@@ -117,7 +117,7 @@ exactly what agent-mesh / newt-mesh provide:
   *enforceable*, not hopeful.
 - Transport security (per-envelope ed25519 sig, sequence+nonce replay defense, ALPN-pinned
   QUIC, same-`user_fp` auto-team handshake); `EndpointKind {Ollama, OllamaLb, InCluster,
-  Vllm}` already describes gnuc + DGX; `Plan`/`Subtask` + per-subtask default-deny
+  Vllm}` already describes gpu-runner + DGX; `Plan`/`Subtask` + per-subtask default-deny
   `CaveatPolicy`.
 
 ### Net-new — a focused `newt-scheduler` layer (NOT a mesh rebuild)
@@ -125,7 +125,7 @@ exactly what agent-mesh / newt-mesh provide:
    (`LocalOllama | DgxNode | MeshPeer`) each with tier support + health + reachability.
    Answers *"given Tier + optional model pin, which LIVE backend?"* and reports `len()` to
    pick strategy (`0`→refuse, `1`→time-slice, `N`→fan out). **The core net-new artifact.**
-2. **Pluggable `PoolSource`** trait: `StaticSource` (gnuc+DGX from config, today) +
+2. **Pluggable `PoolSource`** trait: `StaticSource` (gpu-runner+DGX from config, today) +
    `MeshSource` (drains `PeerResolver`/`Browser` events, filters `capability ==
    "newt-inference"`, reads model+tier from the signed TXT). **The pool must not know
    whether an entry came from config or from mDNS** — that's what makes intermittent peers
@@ -140,7 +140,7 @@ exactly what agent-mesh / newt-mesh provide:
    genuinely can't serve it.
 
 ### MVP recommendation
-Wire gnuc + DGX as **direct backends** today (no mesh needed for two stable machines) —
+Wire gpu-runner + DGX as **direct backends** today (no mesh needed for two stable machines) —
 but behind the `BackendPool` + `PoolSource` abstraction, so adding the Windows peers later
 is "they announce" (a `MeshSource`), **not a rewrite**. Even with two backends you need the
 health + failover path, because the DGX is intermittently busy.
