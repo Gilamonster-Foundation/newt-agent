@@ -3,7 +3,7 @@
 newt's tests run in tiers (see `CLAUDE.md` → "Testing strategy"). This doc
 covers the two acceptance tiers between the fully-mocked unit tier and pure
 release gates: **BAT** (Basic Acceptance) and **UAT** (User Acceptance), and how
-they're wired into CI/CD — including the live run against the **gnuc** home box
+they're wired into CI/CD — including the live run against a **hosted model**
 with real test LLMs.
 
 ## The two acceptance tiers
@@ -44,48 +44,69 @@ network, fs, subprocess, or wall-clock. The browser BAT/UAT is the deliberate
 grounding add-on: it is still deterministic and uses no external network, but
 runs serially against real loopback processes, a temporary store, and Chromium.
 
-### 2. Live (real LLMs on gnuc) — weekly + release, in `eval-live.yml`
+### 2. Live (a real hosted model) — weekly + release, in `eval-hosted.yml`
 
-The expensive end of the pyramid. `.github/workflows/eval-live.yml` replays the
-*same* eval cases in **live mode** against real models served by Ollama on the
-`gnuc` home box:
+The expensive end of the pyramid. `.github/workflows/eval-hosted.yml` replays
+the *same* eval cases in **live mode** against a real model served over an
+OpenAI-compatible endpoint:
 
 - **Triggers:** weekly cron (Mondays 07:17 UTC), `workflow_dispatch` (with an
-  optional single-model / difficulty override), and pushes to `release/**` (a
-  release gate). Never per-PR — too slow/flaky for a push gate.
-- **Runner:** a self-hosted GitHub Actions runner labelled `gnuc`. The matrix
-  models must be pulled there (`ollama pull <model>`).
-- **Gating vs informational (capability tracker):** each matrix leg carries an
-  `informational` flag. **Coder** models (`informational: false`, e.g.
-  `qwen2.5-coder:7b`) **gate** the run. **General-purpose** models
-  (`informational: true`, e.g. `llama3.1:8b`) are **tracked-only** via
-  `continue-on-error` — their scores are recorded but a miss does NOT fail the
-  weekly run. So "red" means a coder model **regressed**, not that a general
-  model flubbed a hard case (no 7B/8B general model aces every case). Add a model
-  as a `matrix.include` entry with its flag.
-- **Serial by design:** the eval driver runs cases one at a time (no parallel
-  flag) and the worker talks to a real model — satisfying the
-  "real-resource tests run single-threaded" rule.
+  optional model / difficulty override), and pushes to `release/**` (a release
+  gate). Never per-PR — too slow and too costly for a push gate.
+- **Runner:** a GitHub-hosted `ubuntu-latest`. No owned hardware.
+- **Configuration:** the endpoint is the `EVAL_BASE_URL` repo variable, the
+  model is the `EVAL_MODEL` repo variable (or the dispatch input), and the
+  bearer token is the `EVAL_API_KEY` secret. Per RATCHET.md no host or key
+  appears in the workflow file; the model is named only.
+- **The configuration contract differs per trigger, on purpose.** A preflight
+  job checks for the variable and the secret. On the weekly schedule and on
+  manual dispatch, missing configuration is a **skip** — the failure mode being
+  replaced was a scheduled job going red nightly for a reason nobody could act
+  on, and a fork has no endpoint to call. On a push to `release/**` it
+  **fails closed**: a release gate that silently skips is not a gate.
+- **No expression-to-shell interpolation.** `${{ }}` is never written into a
+  `run:` script; values cross into the script through `env:` and are used
+  quoted, with arguments assembled as a bash array. GitHub substitutes
+  expressions before bash parses the script, so a dispatch input containing
+  shell metacharacters would otherwise become code running beside the API key.
+  The generated backend TOML is serialized with real string escaping rather
+  than shell interpolation for the same reason.
+- **Least privilege:** `permissions: contents: read`, checkout with
+  `persist-credentials: false` (the agent under test runs against this
+  checkout), a 60-minute job timeout, and concurrency that supersedes an older
+  run — except on `release/**`, where a follow-up push must not cancel a gate.
+- **Serial by design:** the eval driver runs cases one at a time and the worker
+  talks to a real model, satisfying the "real-resource tests run
+  single-threaded" rule.
 - **HOOK PARITY EXCEPTION:** like the `windows` job and `mesh-integration`, this
-  is CI-only (it needs real models); the local equivalent is `just eval-live`.
+  is CI-only; the local equivalent is `just eval-live`.
 
-#### Setting up the gnuc runner (one-time)
+#### What this replaced
 
-1. On gnuc, register a self-hosted runner with the label `gnuc`
-   (GitHub → repo Settings → Actions → Runners → New self-hosted runner).
-2. Ensure Ollama is serving and the matrix models are pulled:
-   `ollama pull qwen2.5-coder:7b && ollama pull llama3.1:8b`.
-3. (Optional) set a repo variable `GNUC_OLLAMA_HOST` if Ollama isn't on the
-   runner's `http://127.0.0.1:11434` (e.g. point it at `REDACTED-HOST:11434`).
-4. Edit the `matrix.model` list in `eval-live.yml` to track your rig.
+Until 2026-08-20 this tier ran as `eval-live.yml` (weekly) and
+`nightly-eval.yml` (nightly) on a **self-hosted runner** beside a local Ollama,
+which is being decommissioned. The nightly had not passed in its last 40 runs,
+so it graded nothing while still reporting red every morning. The eval machinery
+under `scripts/eval/` is unchanged and still runs by hand.
+
+Two behavioral differences worth knowing:
+
+- **No `--coder` flag.** It existed because small local coder models cannot
+  reliably fabricate valid diff hunk headers, so prompts were routed through the
+  newt-coder whole-file plugin. A hosted frontier model does not need it, and
+  leaving it on would grade a different code path than users exercise.
+- **No informational matrix leg.** The old weekly tracked a general-purpose
+  local model non-gating alongside a gating coder model. With one hosted model
+  the run is simply gating. Add a matrix with per-leg `continue-on-error` if a
+  tracked-only model becomes useful again.
 
 ## Running it by hand
 
 ```bash
 just eval                                   # mock-mode cases, local Ollama
-just eval-live                              # live, default test model @ gnuc
+just eval-live                              # live, default model @ localhost
 just eval-live qwen2.5-coder:7b             # pick a model
-just eval-live llama3.1:8b http://REDACTED-HOST:11434 --difficulty L2,L3   # UAT only
+just eval-live llama3.1:8b http://gpu-host:11434 --difficulty L2,L3   # UAT only
 ```
 
 `--difficulty L1` selects the BAT (smoke) cases; `L2,L3` selects UAT.
@@ -93,6 +114,6 @@ just eval-live llama3.1:8b http://REDACTED-HOST:11434 --difficulty L2,L3   # UAT
 ## When you change CI
 
 Per `CLAUDE.md` "Push Hook Governance": the per-PR jobs in `ci.yml` are mirrored
-by `.githooks/pre-push` (`just check` + `just cov-ci`). `eval-live.yml` is a
+by `.githooks/pre-push` (`just check` + `just cov-ci`). `eval-hosted.yml` is a
 documented parity *exception* (the live tier can't run in a push gate). When you
 edit either CI file, re-check the hook/pipeline cross-reference comments.
