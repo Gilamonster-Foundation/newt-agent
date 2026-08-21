@@ -94,6 +94,11 @@ tests-pty.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The #1785/#1792 tamper-and-restore regression's raw-SQLite hatch: the test
+# must alter a stored turn OUTSIDE the store's append path (the store itself
+# has no mutation API — that absence is the point) and then prove the restore
+# seam refuses. Mirrors the `raw()` inspect hatch newt-core/tests/store.rs uses.
+rusqlite.workspace = true
 # Chain-rooting unit tests for the TUI's subprocess-spawn envelope
 # chokepoint (issue #93): we decode the base64-JSON envelope back into
 # a CertChain so we can walk it to the operator UserKey.

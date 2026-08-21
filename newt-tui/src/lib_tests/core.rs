@@ -1468,3 +1468,104 @@ fn slash_dgx_no_subcmd_returns_true() {
 }
 
 // Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 13:18 EDT | Date: 2026-08-12
+
+/// #1785/#1792 behavioural gate at the REAL restore seam: a conversation
+/// tampered outside the append path must fail `prepare_conversation_restore`
+/// — the single choke point both the `/conversation restore` command and the
+/// tab-switch/adoption path route through — and the refusal must leave the
+/// stored rows untouched.
+///
+/// "No tampered transcript reaches model-visible state THROUGH THE RESTORE
+/// SEAM" is enforced by the seam's own contract: `PreparedConversationRestore`
+/// is the ONLY input `commit_conversation_restore` accepts, and a refusal
+/// means no such value ever exists for this conversation. Nothing downstream
+/// can restore what prepare never produced. (The restore seam is not the only
+/// model-visible read of stored turns — `resume_context` recall reads via the
+/// unverified `load`, documented as a #1792 residual at its call site — so
+/// this test claims the seam, not the universe.)
+///
+/// This is the behavioural half of the conformance suite's static
+/// `evidence_unread_is_evidence_absent` law (newt-core/tests/first_principle.rs):
+/// the scan proves the verified-load call is present; this proves it refuses.
+#[test]
+fn restore_seam_refuses_a_tampered_transcript_and_modifies_nothing() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = newt_core::ConversationStore::new(state.path(), workspace.path(), 100).unwrap();
+    let personas = PersonaStore::new(state.path().join("personas"));
+
+    let id = store.create("tamper target", None).unwrap();
+    store.append_turn(&id, "u1", "a1").unwrap();
+    store.append_turn(&id, "u2", "a2").unwrap();
+    store.append_turn(&id, "u3", "a3").unwrap();
+
+    // A clean restore prepares — the refusal below is about the tamper,
+    // not about some unrelated precondition this test failed to meet.
+    assert!(
+        prepare_conversation_restore(&store, &personas, &id).is_ok(),
+        "the untampered conversation must prepare"
+    );
+
+    // Tamper a middle turn outside the append path, as an attacker or a
+    // careless migration would.
+    let conn = rusqlite::Connection::open(state.path().join("conversations.db")).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE turns SET assistant = 'forged' WHERE conversation_id = ?1
+               AND seq = (SELECT MIN(seq) + 1 FROM turns WHERE conversation_id = ?1)",
+            rusqlite::params![&id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "the tamper must have actually landed");
+
+    let err = match prepare_conversation_restore(&store, &personas, &id) {
+        Ok(_) => panic!("the tampered conversation must refuse to prepare"),
+        Err(e) => e,
+    };
+    // Display (`{err}`): the tab-switch preflight renders this error with
+    // `{e}`, so the integrity diagnosis must survive plain Display — an
+    // outer-context-only error would show the user a refusal with no reason.
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("chain violation") && msg.contains(&id),
+        "the refusal must be an integrity diagnosis naming the conversation: {msg}"
+    );
+
+    // Refusal must not mutate evidence: same rows, tamper intact, and the
+    // conversation still readable for examination/export.
+    let rec = store.load(&id).unwrap();
+    assert_eq!(rec.turns.len(), 3, "refusal must not add or drop rows");
+    assert_eq!(
+        rec.turns[1].assistant, "forged",
+        "refusal must not repair or re-chain the tampered row"
+    );
+
+    // The final-turn position too: repair the middle (restore the original
+    // bytes) and tamper the tail, which only the tip witness can see.
+    conn.execute(
+        "UPDATE turns SET assistant = 'a2' WHERE conversation_id = ?1
+           AND seq = (SELECT MIN(seq) + 1 FROM turns WHERE conversation_id = ?1)",
+        rusqlite::params![&id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE turns SET assistant = 'forged tail' WHERE conversation_id = ?1
+           AND seq = (SELECT MAX(seq) FROM turns WHERE conversation_id = ?1)",
+        rusqlite::params![&id],
+    )
+    .unwrap();
+    let err = match prepare_conversation_restore(&store, &personas, &id) {
+        Ok(_) => panic!("a tampered final turn must also refuse to prepare"),
+        Err(e) => e,
+    };
+    // Pin the MECHANISM, not just the refusal: a final-turn tamper is
+    // invisible to the per-turn walk (nothing chains onto the last row), so
+    // only the tip witness can catch it. Asserting the generic phrase alone
+    // would let this leg pass via a leftover per-turn break — a refusal for
+    // the wrong reason proving nothing about the witness.
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("chain violation") && msg.contains("tip witness"),
+        "final-turn tamper must be caught BY THE WITNESS: {msg}"
+    );
+}

@@ -4542,6 +4542,7 @@ dependencies = [
  "newt-tools",
  "ratatui",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "serial_test",

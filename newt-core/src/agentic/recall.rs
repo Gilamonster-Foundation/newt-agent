@@ -102,10 +102,17 @@ impl RecallSource for StoreRecallSource<'_> {
 
     fn this_conversation_recent(&self, limit: usize) -> anyhow::Result<Vec<SearchHit>> {
         // The OPPOSITE of `search`'s filter (#714): load THIS conversation's own
-        // record (the same path `/conversation restore` uses) and hand back its
-        // last `limit` turns. On resume these are the pre-interrupt turns
-        // compaction cut from the live window — durable in the store, refused by
-        // `recall` by design, reachable only here.
+        // record and hand back its last `limit` turns. On resume these are the
+        // pre-interrupt turns compaction cut from the live window — durable in
+        // the store, refused by `recall` by design, reachable only here.
+        //
+        // UNVERIFIED READ, on purpose and on record (#1792 residual): restore
+        // moved to `load_verified` (one snapshot, chain-checked); this recall
+        // surface still reads via plain `load`, so what it hands the model is
+        // not integrity-checked. It is a recall excerpt, not the session's
+        // restored history — but it IS model-visible, and pretending the
+        // restore gate covers it would be the vacuous-green pattern. Verified
+        // recall rides the #1786 provenance work.
         if limit == 0 {
             return Ok(Vec::new());
         }
