@@ -44,7 +44,7 @@ use newt_core::{ConversationStore, PhantomReach, PhantomResolution};
 /// go DOWN, and only in a change that also removes the corresponding
 /// `#[ignore]` and shows the test passing. Raising it requires filing the
 /// violation as an issue and naming it in the marker.
-const KNOWN_VIOLATIONS: usize = 3;
+const KNOWN_VIOLATIONS: usize = 2;
 
 fn store(root: &std::path::Path, workspace: &std::path::Path) -> ConversationStore {
     ConversationStore::new(root, workspace, 100).unwrap()
@@ -247,11 +247,13 @@ fn the_whole_record_is_covered_by_the_chain() {
 /// conversation store — the record that survives restarts and is the one an
 /// audit would actually care about — does not. That asymmetry is the drift.
 ///
-/// VIOLATION: `ConversationStore::verify_chain` is called only from
-/// `newt-core/tests/`, `newt-core/tests/workspace_key.rs`, and a benchmark
-/// script. It has no caller under any crate's `src/`.
+/// FIXED (#1785): the chain now has two production readers — the write path
+/// checks the recorded tip witness before every append (`append_turn_full`),
+/// and the restore path runs a full `verify_chain` before a conversation's
+/// history becomes the model's context (`prepare_conversation_restore`).
+/// This law holding is what keeps it that way: if both call sites are ever
+/// refactored away, this goes red again.
 #[test]
-#[ignore = "FIRST-PRINCIPLE VIOLATION — conversation chain is written every turn and never verified in production"]
 fn evidence_unread_is_evidence_absent() {
     let callers = production_callers_of(&["verify_chain", "verify_prompt_artifact_chain"]);
     assert!(
@@ -284,6 +286,19 @@ fn the_scanner_finds_callers_that_do_exist() {
         "the source scanner found no caller of verify_integrity, which IS \
          called in production — the scanner is broken, so every result it \
          produces (including the violation above) is uninformative"
+    );
+
+    // The specific blindness that actually shipped in this scanner's first
+    // version: a caller AFTER a `#[cfg(test)]` item in the same file. The
+    // restore-path verify_chain call sits thousands of lines past a test seam
+    // in newt-tui/src/lib.rs; a scanner that latches on the first test marker
+    // reports it absent — a violation verdict whether or not one exists. Pin
+    // that the fix stays fixed.
+    let callers = production_callers_of(&["verify_chain"]);
+    assert!(
+        callers.iter().any(|c| c.contains("newt-tui")),
+        "the scanner must see the restore-path caller that sits AFTER a \
+         #[cfg(test)] item in the same file; found only: {callers:?}"
     );
 }
 
@@ -321,6 +336,17 @@ fn production_callers_of(names: &[&str]) -> Vec<String> {
             if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                 continue;
             }
+            // agentic/artifact_read.rs defines a PRIVATE fn of the same name —
+            // the session-local artifact ledger's verifier (the one that was
+            // already wired correctly). Counting its `self.verify_chain(..)`
+            // calls as callers of the STORE's chain verifier would make this
+            // law pass with the store still unverified — a name collision a
+            // textual scanner cannot resolve by types, so it is excluded by
+            // file. Discovered red-first: reverting the #1785 fix left the law
+            // green until this exclusion was added.
+            if path.ends_with("agentic/artifact_read.rs") {
+                continue;
+            }
             // Only production sources: a call from tests/ or benches/ is
             // exactly the situation this law is trying to detect.
             if !path.components().any(|c| c.as_os_str() == "src") {
@@ -329,17 +355,33 @@ fn production_callers_of(names: &[&str]) -> Vec<String> {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let mut in_test_mod = false;
+            // Skip `#[cfg(test)]` items by brace depth: from the attribute,
+            // ignore lines until the braces opened after it close again. A
+            // simple latch ("saw #[cfg(test)], skip the rest of the file") is
+            // NOT good enough — a large file with an early test seam would
+            // hide every later production line, making this scanner blind in
+            // exactly the way it exists to detect. That bug shipped in this
+            // scanner's first version: it missed a real production caller in
+            // a 7000-line file with a `#[cfg(test)]` seam near the top.
+            let mut test_depth: i32 = 0;
+            let mut pending_test_attr = false;
             for line in text.lines() {
                 let trimmed = line.trim_start();
-                if trimmed.starts_with("#[cfg(test)]") {
-                    in_test_mod = true;
-                }
-                if in_test_mod {
-                    continue;
-                }
                 // Doc comments describe the guarantee; they do not invoke it.
                 if trimmed.starts_with("//") {
+                    continue;
+                }
+                if test_depth > 0 || pending_test_attr {
+                    let opens = line.matches('{').count() as i32;
+                    let closes = line.matches('}').count() as i32;
+                    if pending_test_attr && opens > 0 {
+                        pending_test_attr = false;
+                    }
+                    test_depth = (test_depth + opens - closes).max(0);
+                    continue;
+                }
+                if trimmed.starts_with("#[cfg(test)]") {
+                    pending_test_attr = true;
                     continue;
                 }
                 for n in names {
@@ -353,6 +395,78 @@ fn production_callers_of(names: &[&str]) -> Vec<String> {
         }
     }
     found
+}
+
+/// Regression for #1785, write path: an append onto a conversation whose
+/// recorded tip witness disagrees with the chain must refuse — otherwise new
+/// work is chained on top of the damage and the altered record gains a valid
+/// continuation.
+///
+/// Also pins the failure contract: refusing must not change what is stored.
+#[test]
+fn append_refuses_to_extend_a_tampered_chain() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = store(root.path(), workspace.path());
+    let id = store.create("first-principle", None).unwrap();
+    store.append_turn(&id, "user one", "assistant one").unwrap();
+    store.append_turn(&id, "user two", "assistant two").unwrap();
+
+    // Alter a recorded turn behind the store's back.
+    let conn = rusqlite::Connection::open(root.path().join("conversations.db")).unwrap();
+    conn.execute(
+        "UPDATE turns SET assistant = 'rewritten' WHERE conversation_id = ?1
+           AND seq = (SELECT MAX(seq) FROM turns WHERE conversation_id = ?1)",
+        rusqlite::params![&id],
+    )
+    .unwrap();
+
+    let err = store
+        .append_turn(&id, "user three", "assistant three")
+        .expect_err("appending onto a tampered chain must refuse");
+    assert!(
+        err.to_string().contains("chain violation"),
+        "the refusal must say why: {err}"
+    );
+
+    // The failure contract: terminal for the write, harmless to the record.
+    // Nothing repaired, nothing deleted, nothing appended.
+    let rec = store.load(&id).unwrap();
+    assert_eq!(rec.turns.len(), 2, "the refused turn must not have landed");
+    assert_eq!(
+        rec.turns[1].assistant, "rewritten",
+        "the tampered row must be left exactly as found — evidence, not debris"
+    );
+}
+
+/// Regression for #1785, migration path: a conversation whose tip witness is
+/// the schema-diff backfill (`''` — the column did not exist when the rows
+/// were written) must still accept appends. An empty tip is absence of
+/// evidence, not evidence of tampering, and the first post-migration append
+/// is what establishes the witness. Refusing would lock writes out of exactly
+/// the oldest histories.
+#[test]
+fn append_accepts_a_conversation_with_no_tip_witness() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = store(root.path(), workspace.path());
+    let id = store.create("first-principle", None).unwrap();
+    store.append_turn(&id, "user one", "assistant one").unwrap();
+
+    // Model the pre-column state the schema-diff backfill produces.
+    let conn = rusqlite::Connection::open(root.path().join("conversations.db")).unwrap();
+    conn.execute(
+        "UPDATE conversations SET tip_hash = '' WHERE id = ?1",
+        rusqlite::params![&id],
+    )
+    .unwrap();
+
+    store
+        .append_turn(&id, "post-migration", "ok")
+        .expect("an absent witness must not refuse the append that repairs it");
+    store
+        .verify_chain(&id)
+        .expect("the repairing append must leave a verifiable chain");
 }
 
 // =========================================================================

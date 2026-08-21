@@ -7378,6 +7378,18 @@ pub(crate) fn prepare_conversation_restore(
     persona_store: &PersonaStore,
     id: &str,
 ) -> anyhow::Result<PreparedConversationRestore> {
+    // Integrity gate (#1785): the §6 chain is verified HERE, before anything
+    // moves, for the same reason the prompt receipts are resolved here — a
+    // tampered transcript must fail the restore while the session is still
+    // entirely on the outgoing conversation. This is the read-path counterpart
+    // of the write-path tip witness in `append_turn_full`: restore is the
+    // moment history is about to become the model's context, which is exactly
+    // when silently trusting an altered record would do its damage.
+    //
+    // A failure REFUSES the restore and nothing else: no repair, no re-chain,
+    // no deletion — the rows stay readable and the error names the first bad
+    // turn so the damage can be examined rather than papered over.
+    store.verify_chain(id)?;
     let record = store.load(id)?;
     // Test seam modelling the exact P0 hazard: the ROW loads, and a LATER
     // validation fails. Placed after `load` on purpose — a seam before it would

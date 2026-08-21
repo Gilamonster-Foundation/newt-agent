@@ -1083,6 +1083,47 @@ impl ConversationStore {
         let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         let tick = next_tick(&tx, &self.writer_fingerprint)?;
 
+        // §6 tip witness (#1785). `tip_hash` is a SECOND, independently written
+        // record of where this conversation's chain ends. Nothing chains on it —
+        // `prev_hash` is always re-derived from the row itself — and that is
+        // precisely what makes it a witness rather than a cache: two values
+        // written at different moments that must agree.
+        //
+        // Checking it costs one indexed row read (the turns PRIMARY KEY serves
+        // it directly) and catches an altered tip at the moment we would
+        // otherwise chain a new turn on top of the damage, instead of at the
+        // next restore.
+        //
+        // Writer-agnostic, matching `verify_chain`: the stored tip belongs to
+        // the conversation row's RECORDED writer, not whoever is appending, so
+        // a second writer joining a conversation does not spuriously fail.
+        //
+        // An EMPTY tip is absence of evidence, NOT evidence of tampering. A
+        // database predating the column gains it as `''` from the schema-diff
+        // backfill, and the first post-migration append is what repairs it —
+        // refusing here would lock writes out of exactly the oldest histories,
+        // and would state a conclusion nothing recorded supports.
+        let (recorded_tip, tip_writer): (String, String) = tx.query_row(
+            "SELECT tip_hash, writer_fingerprint FROM conversations WHERE id = ?1",
+            [&id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if !recorded_tip.is_empty() && !tip_writer.is_empty() {
+            let expected_tip = match last_turn(&tx, &id, &tip_writer)? {
+                Some(row) => row.content_hash()?,
+                None => genesis_hash(&id, &tip_writer),
+            };
+            if recorded_tip != expected_tip {
+                anyhow::bail!(
+                    "chain violation in `{id}`: the recorded chain tip does not match \
+                     writer {tip_writer}'s last turn. The stored record was altered \
+                     outside newt, and appending would chain new work on top of the \
+                     damage. Nothing has been changed or lost — every existing turn is \
+                     still readable; `verify_chain` locates the first bad turn."
+                );
+            }
+        }
+
         // The §6 content chain: hash the canonical encoding of this writer's
         // previous turn (re-derived from the row itself, so a drifted
         // `tip_hash` column can never poison the chain).
