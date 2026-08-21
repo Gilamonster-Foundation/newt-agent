@@ -267,7 +267,7 @@ fn scan_injection_patterns(text: &str) -> anyhow::Result<()> {
 fn scan_curl_exfil(text: &str) -> anyhow::Result<()> {
     for caps in curl_regex().captures_iter(text) {
         let host = caps.get(1).map_or("", |m| m.as_str());
-        if !is_local_host(host) {
+        if !is_exfil_safe_host(host) {
             anyhow::bail!(
                 "note rejected — NOT saved: matched injection pattern \
                  \"curl-wget-exfil\" on {:?} — a fetch command targeting the \
@@ -285,7 +285,14 @@ fn scan_curl_exfil(text: &str) -> anyhow::Result<()> {
 /// Loopback / private-network hosts that a note may legitimately reference
 /// (local model endpoints like `http://localhost:11434` are exactly what a
 /// local-first agent's notes describe).
-pub(crate) fn is_local_host(host: &str) -> bool {
+///
+/// **Deliberately hardcoded and deliberately not configurable.** This is the
+/// security half of the host question: widening it hands out an exfiltration
+/// channel, which is amplification, and per the line's Authority Register
+/// (`AUTH-03`, `steward-charter@auth-v1.0`) amplification needs a live human act
+/// rather than a config file. The operator's "these are mine" declaration lives
+/// in [`crate::owned_hosts`] and cannot reach this list.
+pub(crate) fn is_exfil_safe_host(host: &str) -> bool {
     let host = host.trim_matches(|c| c == '[' || c == ']').to_lowercase();
     if host == "localhost" || host == "0.0.0.0" {
         return true;

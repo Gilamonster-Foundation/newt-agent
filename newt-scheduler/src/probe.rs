@@ -179,21 +179,24 @@ mod tests {
         let mut pool = BackendPool::from_source(&StaticSource {
             backends: vec![
                 backend("dgx", "http://dgx").with_health(Health::Up),
-                backend("gnuc", "http://gnuc").with_health(Health::Up),
+                backend("gpu-runner", "http://gpu-runner").with_health(Health::Up),
             ],
         });
         let mock = MockProber(HashMap::from([
-            ("dgx".to_string(), Health::Up),    // unchanged
-            ("gnuc".to_string(), Health::Down), // changed Up→Down
+            ("dgx".to_string(), Health::Up),          // unchanged
+            ("gpu-runner".to_string(), Health::Down), // changed Up→Down
         ]));
-        assert_eq!(pool.refresh_health(&mock), 1, "only gnuc changed");
-        // gnuc dropped out of candidate selection; dgx still live.
+        assert_eq!(pool.refresh_health(&mock), 1, "only gpu-runner changed");
+        // gpu-runner dropped out of candidate selection; dgx still live.
         let names: Vec<_> = pool
             .backends()
             .iter()
             .map(|b| (b.name.as_str(), b.health))
             .collect();
-        assert_eq!(names, vec![("dgx", Health::Up), ("gnuc", Health::Down)]);
+        assert_eq!(
+            names,
+            vec![("dgx", Health::Up), ("gpu-runner", Health::Down)]
+        );
         // Idempotent: a second identical probe changes nothing.
         assert_eq!(pool.refresh_health(&mock), 0);
     }

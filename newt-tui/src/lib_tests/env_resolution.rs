@@ -497,8 +497,8 @@ fn active_backend_name_prefers_provider_pin_then_endpoint_match() {
                 newt_core::BackendKind::Ollama,
             ),
             backend(
-                "gnuc",
-                "http://gnuc:11434",
+                "gpu-runner",
+                "http://gpu-runner:11434",
                 "qwen2.5-coder:14b",
                 newt_core::BackendKind::Ollama,
             ),
@@ -507,9 +507,9 @@ fn active_backend_name_prefers_provider_pin_then_endpoint_match() {
     };
     // An explicit NEWT_PROVIDER pin wins.
     with_env_vars(
-        &[("NEWT_PROVIDER", "gnuc")],
+        &[("NEWT_PROVIDER", "gpu-runner")],
         &["NEWT_DGX_MODEL", "NEWT_BACKEND"],
-        || assert_eq!(active_backend_name(&cfg).as_deref(), Some("gnuc")),
+        || assert_eq!(active_backend_name(&cfg).as_deref(), Some("gpu-runner")),
     );
     // No pin → match the resolved endpoint back to a configured backend.
     with_env_vars(

@@ -12,7 +12,7 @@
 //!
 //! Grounded in the crew-MVP empirical findings
 //! (`experiments/crew-mvp/FINDINGS.md`):
-//! - **Model-pin is load-bearing.** gnuc's 16GB GPU cannot host a 30B planner, so a
+//! - **Model-pin is load-bearing.** gpu-runner's 16GB GPU cannot host a 30B planner, so a
 //!   pin must route to a backend that genuinely *has* the model — never "any backend".
 //! - **Busy is not Down.** The DGX is intermittently busy (70b models hog VRAM); a
 //!   busy backend can still take queued work, so it stays a candidate but is
@@ -349,9 +349,9 @@ mod tests {
                 "qwen2.5-coder:3b",
             ])
     }
-    fn gnuc() -> PoolBackend {
-        // gnuc's 16GB cannot host a 30B — it serves the small models only.
-        PoolBackend::new("gnuc", "http://localhost:11434", BackendKind::Ollama)
+    fn gpu_runner() -> PoolBackend {
+        // gpu-runner's 16GB cannot host a 30B — it serves the small models only.
+        PoolBackend::new("gpu-runner", "http://localhost:11434", BackendKind::Ollama)
             .with_models(["qwen2.5-coder:3b", "qwen2.5-coder:7b"])
     }
 
@@ -362,24 +362,24 @@ mod tests {
         assert!(b.serves(Tier::Complex, Some("qwen3-coder:30b")));
         assert!(!b.serves(Tier::Complex, Some("not-here:1b")));
         // empty tiers ⇒ any tier; pin still enforced
-        let g = gnuc();
+        let g = gpu_runner();
         assert!(g.serves(Tier::Fast, Some("qwen2.5-coder:3b")));
         assert!(
             !g.serves(Tier::Fast, Some("qwen3-coder:30b")),
-            "gnuc cannot host the 30B"
+            "gpu-runner cannot host the 30B"
         );
     }
 
     #[test]
     fn model_pin_routes_around_a_backend_that_lacks_the_model() {
         // The crew reality: planner pins qwen3-coder:30b → must land on the DGX,
-        // never gnuc (which doesn't have it).
+        // never gpu-runner (which doesn't have it).
         let pool = BackendPool::from_source(&StaticSource {
-            backends: vec![dgx(), gnuc()],
+            backends: vec![dgx(), gpu_runner()],
         });
         let pick = pool.select(Tier::Complex, Some("qwen3-coder:30b")).unwrap();
         assert_eq!(pick.name, "dgx");
-        // triage pins the small model → gnuc is a candidate (and preferred Up).
+        // triage pins the small model → gpu-runner is a candidate (and preferred Up).
         assert_eq!(
             pool.candidates(Tier::Fast, Some("qwen2.5-coder:3b")).len(),
             2
@@ -391,18 +391,18 @@ mod tests {
         let mut pool = BackendPool::from_source(&StaticSource {
             backends: vec![
                 dgx().with_health(Health::Busy),
-                gnuc().with_health(Health::Up),
+                gpu_runner().with_health(Health::Up),
             ],
         });
-        // both serve the small model; the idle gnuc wins over the busy dgx.
+        // both serve the small model; the idle gpu-runner wins over the busy dgx.
         assert_eq!(
             pool.select(Tier::Fast, Some("qwen2.5-coder:3b"))
                 .unwrap()
                 .name,
-            "gnuc"
+            "gpu-runner"
         );
-        // mark gnuc down → falls back to the busy dgx (still live).
-        assert!(pool.mark("gnuc", Health::Down));
+        // mark gpu-runner down → falls back to the busy dgx (still live).
+        assert!(pool.mark("gpu-runner", Health::Down));
         assert_eq!(
             pool.select(Tier::Fast, Some("qwen2.5-coder:3b"))
                 .unwrap()
@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn strategy_is_count_adaptive() {
         let pool = BackendPool::from_source(&StaticSource {
-            backends: vec![dgx(), gnuc()],
+            backends: vec![dgx(), gpu_runner()],
         });
         // 0 live candidates for an unknown model → refuse.
         assert_eq!(
@@ -439,10 +439,10 @@ mod tests {
     #[test]
     fn mark_unknown_backend_is_false() {
         let mut pool = BackendPool::from_source(&StaticSource {
-            backends: vec![gnuc()],
+            backends: vec![gpu_runner()],
         });
         assert!(!pool.mark("nope", Health::Down));
-        assert!(pool.mark("gnuc", Health::Busy));
+        assert!(pool.mark("gpu-runner", Health::Busy));
     }
 
     #[test]
@@ -487,9 +487,9 @@ mod tests {
 
     #[test]
     fn dispatch_with_failover_skips_failed_then_succeeds() {
-        // dgx (Up) is tried first, fails; gnuc (Up) succeeds — both serve the small model.
+        // dgx (Up) is tried first, fails; gpu-runner (Up) succeeds — both serve the small model.
         let pool = BackendPool::from_source(&StaticSource {
-            backends: vec![dgx(), gnuc()],
+            backends: vec![dgx(), gpu_runner()],
         });
         let out = pool
             .dispatch_with_failover(Tier::Fast, Some("qwen2.5-coder:3b"), |b| {
@@ -500,8 +500,8 @@ mod tests {
                 }
             })
             .unwrap();
-        assert_eq!(out.chosen, "gnuc");
-        assert_eq!(out.result, "served by gnuc");
+        assert_eq!(out.chosen, "gpu-runner");
+        assert_eq!(out.result, "served by gpu-runner");
         assert_eq!(
             out.failed,
             vec!["dgx".to_string()],
@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn dispatch_with_failover_none_when_all_fail_or_none_serve() {
         let pool = BackendPool::from_source(&StaticSource {
-            backends: vec![dgx(), gnuc()],
+            backends: vec![dgx(), gpu_runner()],
         });
         // every attempt errors → None, and the caller could mark all tried.
         let all_fail: Option<Failover<()>> =
@@ -537,13 +537,13 @@ mod tests {
         let pool = BackendPool::from_source(&StaticSource {
             backends: vec![
                 dgx().with_health(Health::Busy),
-                gnuc().with_health(Health::Up),
+                gpu_runner().with_health(Health::Up),
             ],
         });
         let ranked = pool.ranked_candidates(Tier::Fast, Some("qwen2.5-coder:3b"));
         assert_eq!(
             ranked.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
-            vec!["gnuc", "dgx"]
+            vec!["gpu-runner", "dgx"]
         );
     }
 

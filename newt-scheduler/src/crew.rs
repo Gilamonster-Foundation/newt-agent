@@ -85,7 +85,7 @@ pub trait Workspace: Send {
 }
 
 /// Which model each role is pinned to (the [`BackendPool`] routes by these).
-/// Mirrors the gnuc+DGX crew loadout: a strong planner, a mid navigator, a small
+/// Mirrors the gpu-runner+DGX crew loadout: a strong planner, a mid navigator, a small
 /// fast triage.
 #[derive(Debug, Clone)]
 pub struct CrewConfig {

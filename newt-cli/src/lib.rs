@@ -2448,7 +2448,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "newt",
             "setup",
-            "https://dgx1.home.lab:8000",
+            "https://dgx1.home.arpa:8000",
             "--token-env",
             "DGX_TOKEN",
             "--yes",
@@ -2463,7 +2463,7 @@ mod tests {
                 model,
                 yes,
             }) => {
-                assert_eq!(target.as_deref(), Some("https://dgx1.home.lab:8000"));
+                assert_eq!(target.as_deref(), Some("https://dgx1.home.arpa:8000"));
                 assert_eq!(token_env.as_deref(), Some("DGX_TOKEN"));
                 assert_eq!(token_file, None);
                 assert_eq!(model, None);
@@ -2478,7 +2478,7 @@ mod tests {
         let env_cli = Cli::try_parse_from([
             "newt",
             "setup",
-            "https://dgx1.home.lab:8000",
+            "https://dgx1.home.arpa:8000",
             "--api-key-env",
             "DGX_TOKEN",
         ])
@@ -2494,7 +2494,7 @@ mod tests {
         let file_cli = Cli::try_parse_from([
             "newt",
             "setup",
-            "https://dgx1.home.lab:8080",
+            "https://dgx1.home.arpa:8080",
             "--api-key-file",
             "/tmp/dgx-token",
         ])
@@ -2513,7 +2513,7 @@ mod tests {
         let err = Cli::try_parse_from([
             "newt",
             "setup",
-            "dgx1.home.lab",
+            "dgx1.home.arpa",
             "--token-env",
             "DGX_TOKEN",
             "--token-file",

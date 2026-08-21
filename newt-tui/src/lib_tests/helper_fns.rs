@@ -641,8 +641,8 @@ fn resolver_default_backend_beats_the_openai_heuristic() {
     // pointer wins; without it, the historical prefer-openai heuristic
     // applies; a sole backend is always chosen.
     let ollama = newt_core::BackendConfig {
-        name: "gnuc".into(),
-        endpoint: "http://gnuc:11434".into(),
+        name: "gpu-runner".into(),
+        endpoint: "http://gpu-runner:11434".into(),
         model: Some("m1".into()),
         kind: Some(newt_core::BackendKind::Ollama),
         ..Default::default()
@@ -666,16 +666,16 @@ fn resolver_default_backend_beats_the_openai_heuristic() {
     assert_eq!(c.model, "", "unset model stays empty until adopted");
     assert_eq!(c.serving, Some(newt_core::Serving::Instance));
     // default_backend pointer beats the heuristic.
-    cfg.default_backend = Some("gnuc".into());
+    cfg.default_backend = Some("gpu-runner".into());
     let c = resolve_backend_choice(&cfg);
-    assert_eq!(c.name, "gnuc");
+    assert_eq!(c.name, "gpu-runner");
     assert_eq!(c.model, "m1");
     // Sole backend is the obvious choice.
     let solo = newt_core::Config {
         backends: vec![ollama],
         ..Default::default()
     };
-    assert_eq!(resolve_backend_choice(&solo).name, "gnuc");
+    assert_eq!(resolve_backend_choice(&solo).name, "gpu-runner");
 }
 
 #[test]

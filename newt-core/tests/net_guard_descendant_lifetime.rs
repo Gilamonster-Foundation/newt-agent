@@ -30,7 +30,7 @@ fn a_setsid_escaped_descendant_is_killed_by_the_cgroup() {
     // killpg, which cannot reach a setsid session (the documented b1 residual), so
     // there is nothing to assert here. Skip rather than fail, like the Landlock
     // tests skip where Landlock is absent. On a host with delegation (bare-metal
-    // gnuc) this runs for real.
+    // gpu-runner) this runs for real.
     if !newt_core::confined_exec::cgroup_subtree_kill_available() {
         return;
     }

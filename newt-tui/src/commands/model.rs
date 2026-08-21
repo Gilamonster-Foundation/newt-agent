@@ -342,7 +342,7 @@ pub(crate) fn dispatch(
                 // List every configured [[backends]] entry by name, flagging the
                 // one the session currently resolves to. `/backend` toggles the
                 // coarse openai-vs-ollama *kind*; `/backends` picks a *named*
-                // endpoint (dgx1, gnuc, openai, …) regardless of wire protocol.
+                // endpoint (dgx1, gpu-runner, openai, …) regardless of wire protocol.
                 let active = active_backend_name(&cfg);
                 print_newt("configured backends:", color, verbose);
                 if cfg.backends.is_empty() {

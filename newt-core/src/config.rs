@@ -91,6 +91,12 @@ pub struct Config {
     #[serde(default)]
     pub discovery: Discovery,
 
+    /// `[network]` — the operator's "these hosts are mine" declaration
+    /// (#1789). Colloquial trust: it shapes retry patience, never authority.
+    /// It cannot widen the note exfiltration guard; see [`crate::owned_hosts`].
+    #[serde(default)]
+    pub network: NetworkConfig,
+
     /// External provider-plugin definitions.
     pub providers: Vec<ProviderConfig>,
 
@@ -2880,6 +2886,22 @@ pub struct Discovery {
     pub vllm_ports: Vec<u16>,
 }
 
+/// `[network]` — which DNS suffixes the operator calls theirs.
+///
+/// Pure data, Configuration over hardcoded knowledge: the built-in private
+/// suffixes stay compiled in as the floor, and this only ever *adds*. Declaring
+/// `owned_suffixes = [".corp"]` makes `infer.corp` eligible for the patient
+/// local-inference retry policy. It grants no authority and does not touch the
+/// hardcoded exfiltration guard.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkConfig {
+    /// DNS suffixes the operator owns (`.corp`, `.home.arpa`). A leading dot is
+    /// optional; matching is case-insensitive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owned_suffixes: Vec<String>,
+}
+
 impl Default for Discovery {
     fn default() -> Self {
         Self {
@@ -3677,6 +3699,7 @@ impl Default for Config {
             backend_fallback: true,
             default_backend: None,
             discovery: Discovery::default(),
+            network: NetworkConfig::default(),
             providers: Vec::new(),
             scratch: None,
             default_tier_order: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
@@ -3926,6 +3949,11 @@ impl Config {
         // session plans honor it. `NEWT_SCRATCH_DIR` still overrides.
         if let Some(dir) = self.scratch.as_ref().and_then(|s| s.dir.as_deref()) {
             crate::scratch::set_scratch_dir(dir);
+        }
+        // #1789: publish `[network] owned_suffixes` so retry policy can treat
+        // operator-owned inference hosts as patiently as loopback ones.
+        if !self.network.owned_suffixes.is_empty() {
+            crate::owned_hosts::set_owned_suffixes(self.network.owned_suffixes.clone());
         }
     }
 
@@ -5102,6 +5130,14 @@ pub(crate) const CONTROL_PLANE_KEYS: &[&str] = &[
     "discovery",       // backend auto-discovery endpoints (exfil)
     "dgx",             // DGX endpoints + ssh (exfil / remote exec)
     "scratch",         // external scratch paths
+    // `[network] owned_suffixes` is the operator's "these hosts are mine"
+    // declaration (#1789). It grants no authority, but it decides which
+    // endpoints get the patient seven-attempt retry policy instead of the
+    // thrifty hosted one — so a repo could make newt hammer a billable
+    // third-party endpoint seven times per failure by declaring its suffix
+    // owned. Same class as `discovery`: a repo has no business telling the
+    // operator which hosts they own.
+    "network",
     // `[crews.*].test` / `loop_program` are shell verification commands run on
     // `newt crew` (config.rs Crew.test → WorktreeWorkspace test_cmd → sh -c),
     // and a `[loadouts.*]` with only a model passes validation — so a project
@@ -6154,7 +6190,7 @@ mod tests {
             model = "qwen3-coder:30b"
             tiers = []
             [[backends]]
-            name = "gnuc"
+            name = "gpu-runner"
             endpoint = "http://localhost:11434"
             model = "qwen2.5-coder:3b"
             tiers = []
@@ -6164,7 +6200,7 @@ mod tests {
             [loadouts.navigator]
             provider = "dgx"
             [loadouts.triage]
-            provider = "gnuc"
+            provider = "gpu-runner"
 
             [crews.coder]
             planner = "planner"
@@ -6476,8 +6512,8 @@ mod tests {
                     ..Default::default()
                 },
                 BackendConfig {
-                    name: "gnuc".into(),
-                    endpoint: "http://gnuc:11434".into(),
+                    name: "gpu-runner".into(),
+                    endpoint: "http://gpu-runner:11434".into(),
                     model: Some("qwen2.5-coder:14b".into()),
                     model_path: None,
                     tiers: vec![],
@@ -6492,13 +6528,16 @@ mod tests {
         };
         cfg.merge_backends_from_dir(dir.path());
 
-        // The drop-in replaced the inline dgx1 in place (no duplicate), gnuc kept.
+        // The drop-in replaced the inline dgx1 in place (no duplicate), gpu-runner kept.
         assert_eq!(cfg.backends.len(), 2, "only the valid .toml loads, no dup");
         let dgx1 = cfg.backends.iter().find(|b| b.name == "dgx1").unwrap();
         assert_eq!(dgx1.endpoint, "http://REDACTED-HOST:11434", "disk wins");
         assert_eq!(dgx1.effective_model(), Some("qwen3:30b"));
         assert_eq!(dgx1.kind, None, "absent kind means probe-at-connect");
-        assert!(cfg.backends.iter().any(|b| b.name == "gnuc"), "gnuc kept");
+        assert!(
+            cfg.backends.iter().any(|b| b.name == "gpu-runner"),
+            "gpu-runner kept"
+        );
     }
 
     #[test]
@@ -7413,7 +7452,8 @@ tiers = ["COMPLEX"]
         // repo can ship one), so its control-plane keys — command execution
         // (`[[providers]]`, `[lifecycle]`), the exec backend (`[shell]`), and
         // inference/data endpoints (`[[backends]]`, `default_backend`, `[dgx]`,
-        // `[discovery]`) — must be stripped BEFORE the merge. A benign,
+        // `[discovery]`) plus the operator's owned-host declaration
+        // (`[network]`) — must be stripped BEFORE the merge. A benign,
         // non-control-plane preference still layers over the base.
         //
         // Red on the old path: `merge_toml` folded every key in unconditionally,
@@ -7442,6 +7482,9 @@ engine = "host"
 
 [dgx]
 nodes = []
+
+[network]
+owned_suffixes = [".com"]
 
 [merge]
 arrays = "append"
@@ -7476,6 +7519,14 @@ arrays = "append"
         assert_eq!(
             cfg.default_backend, None,
             "default_backend selector must be stripped"
+        );
+        // #1789: `[network] owned_suffixes` grants no authority, but it decides
+        // which endpoints get the patient seven-attempt retry policy. A repo
+        // declaring `.com` owned would make newt hammer a billable third-party
+        // endpoint seven times per failure instead of once.
+        assert!(
+            cfg.network.owned_suffixes.is_empty(),
+            "owned_suffixes (retry-policy widening) must be stripped"
         );
     }
 
@@ -8379,7 +8430,7 @@ command = \"drop-mcp\"
 default_backend = \"old\" # keep this selection note
 
 [discovery]
-hosts = [\"localhost\", \"dgx1.home.lab\"]
+hosts = [\"localhost\", \"dgx1.home.arpa\"]
 
 [custom]
 operator_note = \"leave me alone\" # custom inline comment
@@ -8401,7 +8452,7 @@ operator_note = \"leave me alone\" # custom inline comment
             "target inline comment lost: {out}"
         );
         assert!(
-            out.contains("dgx1.home.lab"),
+            out.contains("dgx1.home.arpa"),
             "discovery table changed: {out}"
         );
         assert!(
@@ -8422,7 +8473,7 @@ operator_note = \"leave me alone\" # custom inline comment
     fn with_dropin_edits_touches_only_named_keys_and_keeps_comments_and_unknowns() {
         let original = "\
 # hand-authored drop-in for the lab box
-endpoint = \"http://gnuc:11434\" # the LAN address
+endpoint = \"http://gpu-runner:11434\" # the LAN address
 kind = \"anthropic\"
 model = \"qwen3:30b\"
 api_key_env = \"OLD_KEY\"

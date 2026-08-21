@@ -343,31 +343,18 @@ use trim::{
 /// loads or sheds pressure. Hosted requests get one retry: each failed attempt
 /// may already have consumed the full inference deadline and may be billable.
 /// All thresholds remain overridable through the standard `NEWT_HTTP_*` vars.
-fn inference_endpoint_is_local(endpoint: &str) -> bool {
+fn inference_endpoint_is_owned(endpoint: &str) -> bool {
     let Some(host) = reqwest::Url::parse(endpoint)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
     else {
         return false;
     };
-    if crate::notes_scan::is_local_host(&host) {
-        return true;
-    }
-
-    let host = host.trim_matches(|c| c == '[' || c == ']');
-    if !host.contains('.') && !host.contains(':') {
-        // Single-label DNS names are conventional LAN/service-discovery names
-        // (`dgx1`, `gnuc`, `ollama`) even without a private suffix.
-        return true;
-    }
-    host.parse::<std::net::Ipv6Addr>().is_ok_and(|addr| {
-        let first = addr.segments()[0];
-        (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
-    })
+    crate::owned_hosts::is_owned_host(&host)
 }
 
 fn tui_retry_policy(endpoint: &str) -> RetryPolicy {
-    if inference_endpoint_is_local(endpoint) {
+    if inference_endpoint_is_owned(endpoint) {
         RetryPolicy::for_local_inference()
     } else {
         RetryPolicy::for_hosted_inference()
