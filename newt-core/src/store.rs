@@ -1029,7 +1029,7 @@ impl ConversationStore {
     /// serializes to `'[]'` and absent tokens to NULL — byte-identical to
     /// the pre-17.6 row shape, so existing callers are unchanged.
     pub fn append_turn(&self, id: &str, user: &str, assistant: &str) -> anyhow::Result<()> {
-        self.append_turn_full(id, user, assistant, &[], &[], None, None)
+        self.append_turn_full(id, user, assistant, &[], &[], &[], None, None)
     }
 
     /// Append one turn with its recorded tool events and backend-reported
@@ -1058,12 +1058,20 @@ impl ConversationStore {
     /// `tool_args_digest` from the events JSON at index time — recording
     /// events here lights recall up with no schema work.
     ///
-    /// **Phantom reaches (#717):** the per-turn alias-seam telemetry persists
-    /// alongside `events` in its own `phantom_reaches` column. It is deliberately
-    /// NOT part of the §6 canonical encoding (telemetry, not provenance), so an
-    /// older db gains the column on open and existing content chains verify
-    /// byte-for-byte unchanged. Folding it into the hash would require a v2
-    /// encoding bump — a deliberate follow-up, not this additive change.
+    /// **Phantom reaches (#717 → #1786):** the per-turn alias-seam record
+    /// persists alongside `events` in its own `phantom_reaches` column. As of
+    /// the v2 encoding it is INSIDE the canonical hash: `Rewrite` records
+    /// that newt substituted a different tool for the one the model named —
+    /// the derivation edge between emitted and executed — and `Unknown` is
+    /// the fabrication ledger. Both are provenance someone will rely on, not
+    /// telemetry. Pre-bump v1 rows keep their reaches outside the hash
+    /// forever (their arm cannot change); see the spec's §3.2 residue.
+    ///
+    /// **Sources (#1786):** content ids of the turns a DERIVED row (a
+    /// compaction summary) was derived from; empty for witnessed turns.
+    /// Validated (64 lowercase hex each) and canonicalized (sorted, deduped,
+    /// compact JSON) here, so this write path cannot produce the
+    /// non-canonical bytes verification refuses.
     #[allow(clippy::too_many_arguments)]
     pub fn append_turn_full(
         &self,
@@ -1072,6 +1080,7 @@ impl ConversationStore {
         assistant: &str,
         events: &[crate::ToolEvent],
         phantom_reaches: &[crate::PhantomReach],
+        sources: &[String],
         tokens_in: Option<u32>,
         tokens_out: Option<u32>,
     ) -> anyhow::Result<()> {
@@ -1079,6 +1088,7 @@ impl ConversationStore {
         let now = (self.claim_clock)();
         let events_json = serde_json::to_string(events)?;
         let phantom_reaches_json = serde_json::to_string(phantom_reaches)?;
+        let sources_json = canonical_sources_json(sources)?;
         let conn = self.lock_conn();
         let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         let tick = next_tick(&tx, &self.writer_fingerprint)?;
@@ -1159,12 +1169,14 @@ impl ConversationStore {
             user: user.to_string(),
             assistant: assistant.to_string(),
             events: events_json,
+            phantom_reaches: phantom_reaches_json,
+            sources: sources_json,
             tokens_in: tokens_in.map(i64::from),
             tokens_out: tokens_out.map(i64::from),
             ts_claim: now,
             encoding_version: TURN_ENCODING_VERSION_CURRENT,
         };
-        insert_turn_row(&tx, &row, &phantom_reaches_json)?;
+        insert_turn_row(&tx, &row)?;
         // Activity tick + chain tip move together; updated_at_claim is a
         // display claim only (§6) — nothing orders by it.
         tx.execute(
@@ -2555,7 +2567,8 @@ impl ConversationStore {
 
         let mut stmt = conn.prepare(
             "SELECT conversation_id, writer_fingerprint, seq, prev_hash, user, assistant,
-                    events, tokens_in, tokens_out, ts_claim, encoding_version
+                    events, tokens_in, tokens_out, ts_claim, encoding_version,
+                    phantom_reaches, sources
                FROM turns
               WHERE conversation_id = ?1
               ORDER BY writer_fingerprint ASC, seq ASC",
@@ -2602,6 +2615,59 @@ impl ConversationStore {
                 }
             }
             prev = Some(row);
+        }
+
+        // #1786 provenance checks, v2 rows ONLY (§3.2: a v1 row's sources
+        // bytes are never interpreted — its arm predates the concept and an
+        // out-of-band edit to them surfaces as a loud content-id orphan on
+        // rows that cite it, never as a silent retarget).
+        //
+        // Order matters: the per-turn walk above already proved every row's
+        // stored bytes are the appended bytes, so the checks below reason
+        // about VERIFIED bytes, not attacker-writable ones.
+        let content_ids: std::collections::HashSet<String> =
+            rows.iter().map(|r| r.content_id()).collect();
+        for row in &rows {
+            if row.encoding_version < 2 {
+                continue;
+            }
+            let cited = parse_canonical_sources(&row.sources).map_err(|e| {
+                anyhow::anyhow!(
+                    "chain violation in `{id}`: writer {} turn seq {} carries a \
+                     sources column that is not in canonical form ({e}) — \
+                     well-formed evidence or none",
+                    row.writer_fingerprint,
+                    row.seq
+                )
+            })?;
+            if !cited.is_empty() {
+                // Derived-row shape invariant (#1786 §3): a derived row is
+                // harness-minted — a row claiming BOTH derivation and tool
+                // activity would break the witnessed/derived classification
+                // provenance consumers depend on.
+                if row.events != "[]" || row.phantom_reaches != "[]" {
+                    anyhow::bail!(
+                        "chain violation in `{id}`: writer {} turn seq {} claims \
+                         derivation (non-empty sources) AND tool activity — a \
+                         derived row is harness-minted and carries neither events \
+                         nor phantom reaches",
+                        row.writer_fingerprint,
+                        row.seq
+                    );
+                }
+                for source in &cited {
+                    if !content_ids.contains(source) {
+                        anyhow::bail!(
+                            "chain violation in `{id}`: writer {} turn seq {} cites \
+                             source `{source}`, which matches no turn in this \
+                             conversation — an orphan citation is an unattributable \
+                             assertion. Rows are left exactly as found.",
+                            row.writer_fingerprint,
+                            row.seq
+                        );
+                    }
+                }
+            }
         }
 
         // The stored tip belongs to the conversation row's RECORDED last
@@ -3517,7 +3583,8 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              tokens_out         INTEGER,
              ts_claim           INTEGER NOT NULL,         -- DISPLAY ONLY (wall-clock claim, unix nanos)
              encoding_version   INTEGER NOT NULL DEFAULT 1, -- canonical-encoding dispatch (N1 on #261)
-             phantom_reaches    TEXT NOT NULL DEFAULT '[]', -- JSON phantom-reach telemetry (#717); NOT hashed (§6 chain unchanged)
+             phantom_reaches    TEXT NOT NULL DEFAULT '[]', -- JSON phantom reaches (#717); hashed by v2 rows, outside v1 hashes forever (#1786 §3.2)
+             sources            TEXT NOT NULL DEFAULT '[]', -- #1786: content ids a derived row cites; canonical bytes, hashed by v2 rows
              PRIMARY KEY (conversation_id, writer_fingerprint, seq)
          );
          -- Immutable prompt receipts are written before inference/tool work.
@@ -3761,10 +3828,16 @@ const EXPECTED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             // N1 on #261: rows written before this column exist only as v1,
             // so DEFAULT 1 is the historically-true backfill.
             ("encoding_version", "INTEGER NOT NULL DEFAULT 1"),
-            // #717: phantom-reach telemetry. Additive — an older db gains it on
-            // open with the historically-true empty backfill. NOT part of the §6
-            // canonical encoding, so existing chains verify byte-for-byte.
+            // #717: phantom reaches. Additive — an older db gains it on open
+            // with the historically-true empty backfill. Outside the v1
+            // canonical encoding (existing chains verify byte-for-byte);
+            // INSIDE v2 hashes (#1786).
             ("phantom_reaches", "TEXT NOT NULL DEFAULT '[]'"),
+            // #1786: provenance sources. Additive; the `'[]'` backfill is the
+            // historically-true "witnessed, derived from nothing". On v1 rows
+            // these bytes are never interpreted (§3.2) though they are
+            // content-id inputs, so out-of-band edits orphan loudly.
+            ("sources", "TEXT NOT NULL DEFAULT '[]'"),
         ],
     ),
     (
@@ -3789,6 +3862,78 @@ const EXPECTED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
 /// Compare `PRAGMA table_info` against [`EXPECTED_COLUMNS`] and `ALTER TABLE
 /// ... ADD COLUMN` any additive drift. Removed/renamed columns are NOT
 /// handled here — destructive migrations get their own explicit step.
+/// Parse a stored `sources` column, REFUSING anything but the canonical
+/// byte form `canonical_sources_json` produces: compact JSON array of
+/// 64-lowercase-hex ids, sorted, deduplicated. The column is hashed, so its
+/// bytes have exactly one legitimate rendering — any other shape reached the
+/// database without going through the write path.
+fn parse_canonical_sources(stored: &str) -> anyhow::Result<Vec<String>> {
+    if stored == "[]" {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<String> = serde_json::from_str(stored)
+        .map_err(|e| anyhow::anyhow!("not a JSON string array: {e}"))?;
+    for id in &ids {
+        let ok = id.len() == 64
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !ok {
+            anyhow::bail!("`{id}` is not a 64-lowercase-hex content id");
+        }
+    }
+    for pair in ids.windows(2) {
+        if pair[0] >= pair[1] {
+            anyhow::bail!("ids are not strictly sorted (duplicates included)");
+        }
+    }
+    let canonical = canonical_sources_json(&ids)?;
+    if canonical != stored {
+        anyhow::bail!("bytes differ from the canonical rendering");
+    }
+    Ok(ids)
+}
+
+/// Validate and canonicalize a sources list into the ONE stored byte form
+/// (#1786 spec §3): a compact JSON array of 64-lowercase-hex content ids,
+/// sorted lexicographically, duplicates removed. The column is hashed, so
+/// its bytes need exactly one producer-deterministic rendering — and because
+/// this write path canonicalizes, only out-of-band SQL can ever produce the
+/// non-canonical bytes verification refuses.
+fn canonical_sources_json(sources: &[String]) -> anyhow::Result<String> {
+    if sources.is_empty() {
+        return Ok("[]".to_string());
+    }
+    for id in sources {
+        let ok = id.len() == 64
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !ok {
+            anyhow::bail!(
+                "refusing the append — source reference `{id}` is not a content id \
+                 (64 lowercase hex); a citation that cannot resolve must not be recorded"
+            );
+        }
+    }
+    let mut ids: Vec<&str> = sources.iter().map(String::as_str).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    // Compact by construction: fixed-alphabet strings need no escaping.
+    let mut out = String::with_capacity(2 + ids.len() * 67);
+    out.push('[');
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(id);
+        out.push('"');
+    }
+    out.push(']');
+    Ok(out)
+}
+
 fn reconcile_schema(conn: &Connection) -> anyhow::Result<()> {
     for (table, expected) in EXPECTED_COLUMNS {
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -4068,14 +4213,23 @@ fn import_one_record(
             events: "[]".to_string(),
             tokens_in: None,
             tokens_out: None,
+            // #717 / #1786: the legacy JSON backend predates phantom reaches
+            // and sources alike — empty, exactly as `events: "[]"`.
+            phantom_reaches: "[]".to_string(),
+            sources: "[]".to_string(),
             // The legacy format recorded no per-turn time; the record-level
             // updated_at is the only available claim (display only, §6).
             ts_claim: updated_claim,
-            encoding_version: TURN_ENCODING_VERSION_CURRENT,
+            // PINNED at v1, deliberately NOT `TURN_ENCODING_VERSION_CURRENT`
+            // (#1786 spec §9.1): legacy records carry no sources or reaches,
+            // so v2 buys them nothing — and a v1-pinned import keeps a
+            // post-import rollback able to verify the imported history. The
+            // import retires its source tree and cannot re-run, so a
+            // rolled-back binary otherwise faces a store it can neither
+            // verify nor re-import.
+            encoding_version: 1,
         };
-        // #717: the legacy JSON backend recorded no phantom reaches (it predates
-        // the column), exactly as it recorded no tool events (`events: "[]"`).
-        insert_turn_row(&tx, &row, "[]")?;
+        insert_turn_row(&tx, &row)?;
         prev_hash = row.content_hash()?;
         last_tick = seq;
     }

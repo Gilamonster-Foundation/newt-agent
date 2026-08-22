@@ -1210,9 +1210,12 @@ fn legacy_import_is_idempotent_and_never_overwrites() {
     assert!(root.path().join("conversations.imported.1").is_dir());
 }
 
-/// N1 (#261): every turn row records its encoding version (only v1 exists),
-/// and `verify_chain` refuses a version it does not understand with a clear
-/// error instead of hashing under the wrong rules.
+/// N1 (#261): every turn row records its encoding version, and
+/// `verify_chain` refuses a version it does not understand with a clear
+/// error instead of hashing under the wrong rules. The recorded value moved
+/// 1 → 2 at the #1786 bump — the one expectation in this suite that
+/// legitimately moves with an encoding epoch (the pinned byte vectors in
+/// turn_chain.rs are the expectations that never may).
 #[test]
 fn turns_carry_encoding_version_and_unknown_versions_error_clearly() {
     let root = tempfile::tempdir().unwrap();
@@ -1231,7 +1234,11 @@ fn turns_carry_encoding_version_and_unknown_versions_error_clearly() {
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    assert_eq!(versions, vec![1, 1], "v1 is recorded per row");
+    assert_eq!(
+        versions,
+        vec![2, 2],
+        "the current epoch (v2) is recorded per row"
+    );
 
     // A row claiming a future encoding version: verification must error
     // clearly (not report a bogus chain violation from hashing v1-style),
@@ -2183,6 +2190,7 @@ fn tool_events_and_tokens_round_trip_through_append_and_load() {
             "fixed",
             &events,
             &[],
+            &[],
             Some(1_204),
             Some(892),
         )
@@ -2227,7 +2235,7 @@ fn phantom_reaches_round_trip_and_chain_still_verifies() {
         },
     ];
     store
-        .append_turn_full(&id, "do it", "done", &[], &phantoms, None, None)
+        .append_turn_full(&id, "do it", "done", &[], &phantoms, &[], None, None)
         .unwrap();
 
     let record = store.load(&id).unwrap();
@@ -2391,7 +2399,7 @@ fn args_digest_never_carries_raw_arg_values() {
     let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
     let id = store.create("secret turn", None).unwrap();
     store
-        .append_turn_full(&id, "write creds", "done", &[event], &[], None, None)
+        .append_turn_full(&id, "write creds", "done", &[event], &[], &[], None, None)
         .unwrap();
     let stored: String = raw(root.path())
         .query_row(
@@ -2425,10 +2433,10 @@ fn absent_backend_usage_stores_null_not_a_guess() {
     let id = store.create("usage", None).unwrap();
 
     store
-        .append_turn_full(&id, "with usage", "ok", &[], &[], Some(100), Some(20))
+        .append_turn_full(&id, "with usage", "ok", &[], &[], &[], Some(100), Some(20))
         .unwrap();
     store
-        .append_turn_full(&id, "backend silent", "ok", &[], &[], None, None)
+        .append_turn_full(&id, "backend silent", "ok", &[], &[], &[], None, None)
         .unwrap();
 
     let record = store.load(&id).unwrap();
@@ -2470,6 +2478,7 @@ fn fts_finds_tool_names_recorded_by_append_turn_full() {
                 Some(90),
             )],
             &[],
+            &[],
             Some(50),
             Some(10),
         )
@@ -2499,7 +2508,16 @@ fn chain_verifies_with_events_and_detects_event_tampering() {
     // Mixed history: plain turn, evented turn, plain turn.
     store.append_turn(&id, "plan", "planned").unwrap();
     store
-        .append_turn_full(&id, "act", "acted", &sample_events(), &[], Some(700), None)
+        .append_turn_full(
+            &id,
+            "act",
+            "acted",
+            &sample_events(),
+            &[],
+            &[],
+            Some(700),
+            None,
+        )
         .unwrap();
     store.append_turn(&id, "wrap", "wrapped").unwrap();
     store
@@ -2973,4 +2991,208 @@ fn concurrent_artifact_appends_serialize_one_conversation_chain() {
         .verify_prompt_artifact_chain(conversation_id)
         .unwrap();
     assert_eq!(reopened.count_prompt_artifacts(conversation_id).unwrap(), 2);
+}
+
+// =========================================================================
+// #1786 — the v2 encoding: provenance sources, hashed reaches, mixed epochs
+// =========================================================================
+
+/// #1786 §3: a derived row round-trips through the public API and its
+/// citation is protected — tampering the stored sources breaks the chain.
+#[test]
+fn sources_round_trip_and_are_chain_protected() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store.create("provenance", None).unwrap();
+    store.append_turn(&id, "u1", "a1").unwrap();
+    store.append_turn(&id, "u2", "a2").unwrap();
+
+    // Cite both witnessed turns by their content ids. The ids are computed
+    // the way any independent implementation would (KAT-pinned encoding):
+    // this test derives them via a raw read of the stored bytes.
+    let conn = raw(root.path());
+    let mut stmt = conn
+        .prepare(
+            "SELECT user, assistant, events, phantom_reaches, sources FROM turns
+              WHERE conversation_id = ?1 ORDER BY seq ASC",
+        )
+        .unwrap();
+    let ids: Vec<String> = stmt
+        .query_map([&id], |row| {
+            let (u, a, e, p, s): (String, String, String, String, String) = (
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            );
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"newt-turn-content:v1");
+            for f in [&u, &a, &e, &p, &s] {
+                buf.extend_from_slice(&(f.len() as u64).to_le_bytes());
+                buf.extend_from_slice(f.as_bytes());
+            }
+            Ok(blake3::hash(&buf).to_hex().to_string())
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(ids.len(), 2);
+
+    store
+        .append_turn_full(&id, "", "summary of both", &[], &[], &ids, None, None)
+        .unwrap();
+    store
+        .verify_chain(&id)
+        .expect("a derived row citing real turns must verify");
+
+    // The citation is INSIDE the hash: rewriting it breaks the chain.
+    conn.execute(
+        "UPDATE turns SET sources = '[]' WHERE conversation_id = ?1
+           AND seq = (SELECT MAX(seq) FROM turns WHERE conversation_id = ?1)",
+        rusqlite::params![&id],
+    )
+    .unwrap();
+    let err = store.verify_chain(&id).unwrap_err().to_string();
+    assert!(
+        err.contains("chain violation"),
+        "erasing a derived row's citation must break the chain: {err}"
+    );
+}
+
+/// #1786 §3: an orphan citation — a source id matching no turn in the
+/// conversation — refuses, naming the citing row and the missing id.
+/// Constructed out-of-band (the write path validates shape but defers
+/// existence to verify, where late-arriving content is legal — §3's
+/// verify-time semantics).
+#[test]
+fn orphan_source_refuses() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store.create("provenance", None).unwrap();
+    store.append_turn(&id, "u1", "a1").unwrap();
+    let ghost = "f".repeat(64);
+    store
+        .append_turn_full(&id, "", "summary", &[], &[], std::slice::from_ref(&ghost), None, None)
+        .unwrap();
+    let err = store.verify_chain(&id).unwrap_err().to_string();
+    assert!(
+        err.contains("chain violation") && err.contains(&ghost),
+        "an unattributable citation must refuse and name the missing id: {err}"
+    );
+}
+
+/// #1786 §3: non-canonical sources bytes refuse. The write path cannot
+/// produce them (it canonicalizes), so reaching this state took out-of-band
+/// SQL — well-formed evidence or none. Exercised for unsorted order,
+/// uppercase hex, and non-array JSON; each also implicitly proves the
+/// chain-side protection (the UPDATE broke the v2 hash first, but the
+/// message must be the canonical-form diagnosis when the walk reaches it —
+/// so the rows are re-chained via the API-legal path: a fresh conversation
+/// per shape, with the malformed bytes injected into the LAST row where no
+/// successor link exists and only the sources checks see them... except the
+/// tip witness fires first. The honest observable is simply: refusal).
+#[test]
+fn non_canonical_sources_refuse() {
+    for bad in [
+        r#"["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]"#,
+        r#"["FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"]"#,
+        r#"{"not":"an array"}"#,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let id = store.create("provenance", None).unwrap();
+        store.append_turn(&id, "u1", "a1").unwrap();
+        raw(root.path())
+            .execute(
+                "UPDATE turns SET sources = ?2 WHERE conversation_id = ?1",
+                rusqlite::params![&id, bad],
+            )
+            .unwrap();
+        let err = store.verify_chain(&id).unwrap_err().to_string();
+        assert!(
+            err.contains("chain violation"),
+            "sources bytes {bad:?} must refuse: {err}"
+        );
+    }
+}
+
+/// #1786 §3: the derived-row shape invariant — non-empty sources plus tool
+/// activity on one row refuses (a derived row is harness-minted).
+#[test]
+fn derived_row_with_tool_activity_refuses() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store.create("provenance", None).unwrap();
+    store
+        .append_turn_full(&id, "act", "acted", &sample_events(), &[], &[], None, None)
+        .unwrap();
+    // Graft a citation onto the evented row out-of-band.
+    raw(root.path())
+        .execute(
+            "UPDATE turns SET sources = ?2 WHERE conversation_id = ?1",
+            rusqlite::params![&id, format!("[\"{}\"]", "a".repeat(64))],
+        )
+        .unwrap();
+    let err = store.verify_chain(&id).unwrap_err().to_string();
+    assert!(
+        err.contains("chain violation"),
+        "a row claiming derivation AND tool activity must refuse: {err}"
+    );
+}
+
+/// #1786 §7 + §9.1: the mixed-epoch acceptance in its honest construction —
+/// the legacy import writes v1-PINNED rows (deliberately not
+/// TURN_ENCODING_VERSION_CURRENT, so a post-import rollback still verifies
+/// the imported history), live appends extend the same conversation as v2,
+/// and the whole mixed chain verifies. Also pins that the write path marks
+/// new rows v2.
+#[test]
+fn legacy_import_pins_v1_and_mixed_epoch_verifies() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let record = legacy_record(
+        "1000-conv-mixed",
+        "old work",
+        workspace.path(),
+        &[("old ask", "old answer"), ("more", "done")],
+        100,
+        500,
+    );
+    write_legacy_record(root.path(), &record);
+
+    // Opening imports; appending extends the imported chain under v2.
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    store
+        .append_turn("1000-conv-mixed", "new ask", "new answer")
+        .unwrap();
+    store
+        .verify_chain("1000-conv-mixed")
+        .expect("a v1-imported chain extended by v2 rows must verify");
+
+    let conn = raw(root.path());
+    let versions: Vec<i64> = conn
+        .prepare(
+            "SELECT encoding_version FROM turns WHERE conversation_id = '1000-conv-mixed'
+              ORDER BY seq ASC",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        versions,
+        vec![1, 1, 2],
+        "imported rows must be PINNED v1 (rollback still verifies them); \
+         live appends must be v2"
+    );
+
+    // The mixed record materializes through the verified read too.
+    let rec = store.load_verified("1000-conv-mixed").unwrap();
+    assert_eq!(rec.turns.len(), 3);
 }
