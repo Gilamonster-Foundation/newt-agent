@@ -3789,3 +3789,264 @@ fn corrupt_stale_writer_witness_is_not_laundered_during_handoff() {
         "the tampered witness must not be advanced"
     );
 }
+
+// =========================================================================
+// #1786 Phase C — context-window manifests (spec §5b)
+// =========================================================================
+
+/// Content ids as an INDEPENDENT implementation would compute them: from the
+/// raw stored bytes, not through the crate's own function, so encoding drift
+/// between test and crate is a failure rather than a silent agreement.
+fn content_ids_in_order(root: &std::path::Path, conversation: &str) -> Vec<String> {
+    let conn = raw(root);
+    let mut stmt = conn
+        .prepare(
+            "SELECT user, assistant, events, phantom_reaches, sources FROM turns
+              WHERE conversation_id = ?1 ORDER BY seq ASC",
+        )
+        .unwrap();
+    stmt.query_map([conversation], |row| {
+        let f: [String; 5] = [
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        ];
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"newt-turn-content:v1");
+        for x in &f {
+            buf.extend_from_slice(&(x.len() as u64).to_le_bytes());
+            buf.extend_from_slice(x.as_bytes());
+        }
+        Ok(blake3::hash(&buf).to_hex().to_string())
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// #1786 §5b: a seal round-trips, and — the point of the whole design —
+/// **the replaced window's membership is recoverable from the record**.
+/// That is reversibility at the reference level, as an executable claim
+/// rather than a promise: carried ∪ elided is exactly what was there, and
+/// every elided turn is still readable in the store.
+#[test]
+fn a_seal_records_a_recoverable_partition() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store.create("windows", None).unwrap();
+    for i in 0..4 {
+        store
+            .append_turn(&id, &format!("u{i}"), &format!("a{i}"))
+            .unwrap();
+    }
+    let members = content_ids_in_order(root.path(), &id);
+    assert_eq!(members.len(), 4);
+    let (elided, carried) = members.split_at(2);
+
+    let window_id = store
+        .append_summary_and_seal(&id, "[CONTEXT COMPACTION] u0..u1", carried, elided)
+        .unwrap();
+    store
+        .verify_chain(&id)
+        .expect("a well-formed seal must verify");
+
+    // Recoverability: the manifest names the whole replaced window, and the
+    // elided turns are STILL READABLE — compaction removed them from the
+    // window, not from the record.
+    let conn = raw(root.path());
+    let (c_json, e_json): (String, String) = conn
+        .query_row(
+            "SELECT carried, elided FROM context_windows WHERE window_id = ?1",
+            rusqlite::params![&window_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let recorded: std::collections::HashSet<String> = serde_json::from_str::<Vec<String>>(&c_json)
+        .unwrap()
+        .into_iter()
+        .chain(serde_json::from_str::<Vec<String>>(&e_json).unwrap())
+        .collect();
+    let original: std::collections::HashSet<String> = members.iter().cloned().collect();
+    assert_eq!(
+        recorded, original,
+        "the seal must account for exactly the window it replaced"
+    );
+    let rec = store.load(&id).unwrap();
+    assert_eq!(
+        rec.turns.len(),
+        5,
+        "elided turns stay in the record; only the window changed"
+    );
+}
+
+/// #1786 §5b: the summary turn and its manifest are two independently hashed
+/// records of one derivation. Editing either alone must refuse.
+#[test]
+fn manifest_and_summary_must_agree_about_what_was_elided() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store.create("windows", None).unwrap();
+    for i in 0..3 {
+        store
+            .append_turn(&id, &format!("u{i}"), &format!("a{i}"))
+            .unwrap();
+    }
+    let m = content_ids_in_order(root.path(), &id);
+    store
+        .append_summary_and_seal(&id, "[CONTEXT COMPACTION] early", &m[2..], &m[..2])
+        .unwrap();
+    store.verify_chain(&id).unwrap();
+
+    // Shrink the manifest's elided list to one id. The manifest now
+    // disagrees with the summary turn's sources — and, because window_id is
+    // self-certifying, it also no longer matches its own name.
+    let conn = raw(root.path());
+    conn.execute(
+        "UPDATE context_windows SET elided = ?2 WHERE conversation_id = ?1",
+        rusqlite::params![&id, format!("[\"{}\"]", m[0])],
+    )
+    .unwrap();
+    let err = store.verify_chain(&id).unwrap_err().to_string();
+    assert!(
+        err.contains("chain violation") && err.contains("does not match its own contents"),
+        "an edited manifest must fail its own id first: {err}"
+    );
+}
+
+/// #1786 §5b CONSERVATION: a seal may not silently drop a member its parent
+/// held. Every turn in the previous window must be carried forward or
+/// explicitly elided — that is what makes "what became of this turn?"
+/// answerable, and it is the invariant reversibility rests on.
+#[test]
+fn a_seal_may_not_drop_what_its_parent_held() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store.create("windows", None).unwrap();
+    for i in 0..4 {
+        store
+            .append_turn(&id, &format!("u{i}"), &format!("a{i}"))
+            .unwrap();
+    }
+    let m = content_ids_in_order(root.path(), &id);
+    // Seal 1: elide the first two, carry the last two.
+    store
+        .append_summary_and_seal(&id, "[CONTEXT COMPACTION] first", &m[2..], &m[..2])
+        .unwrap();
+    let after_first = content_ids_in_order(root.path(), &id);
+    let summary_1 = after_first.last().unwrap().clone();
+
+    // Seal 2 accounts for everything seal 1 left: its two carried members
+    // plus its summary.
+    let mut all = m[2..].to_vec();
+    all.push(summary_1.clone());
+    store
+        .append_summary_and_seal(&id, "[CONTEXT COMPACTION] second", &[], &all)
+        .unwrap();
+    store
+        .verify_chain(&id)
+        .expect("a conserving second seal must verify");
+
+    // Now forge a seal that forgets one of the parent's members.
+    let id2 = store.create("windows-bad", None).unwrap();
+    for i in 0..4 {
+        store
+            .append_turn(&id2, &format!("u{i}"), &format!("a{i}"))
+            .unwrap();
+    }
+    let n = content_ids_in_order(root.path(), &id2);
+    store
+        .append_summary_and_seal(&id2, "[CONTEXT COMPACTION] first", &n[2..], &n[..2])
+        .unwrap();
+    let after = content_ids_in_order(root.path(), &id2);
+    let s1 = after.last().unwrap().clone();
+    // Second seal drops n[3] entirely — neither carried nor elided.
+    let dropped = n[3].clone();
+    let err = store
+        .append_summary_and_seal(&id2, "[CONTEXT COMPACTION] lossy", &[], &[n[2].clone(), s1])
+        .map(|w| w)
+        .and_then(|_| store.verify_chain(&id2).map(|_| String::new()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("chain violation") && err.contains(&dropped),
+        "a seal that forgets a parent member must refuse, naming it: {err}"
+    );
+}
+
+/// #1786 §5b: a member cannot be both carried and elided — the write path
+/// refuses the contradiction rather than letting a caller commit a state
+/// verification would reject forever (the read path repairs nothing).
+#[test]
+fn a_member_cannot_be_both_carried_and_elided() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store.create("windows", None).unwrap();
+    store.append_turn(&id, "u0", "a0").unwrap();
+    let m = content_ids_in_order(root.path(), &id);
+    let err = store
+        .append_summary_and_seal(&id, "[CONTEXT COMPACTION] x", &m, &m)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("BOTH carried and elided"),
+        "the contradiction must be refused at the write path: {err}"
+    );
+}
+
+/// #1786 §5b: a manifest naming a turn that is not in this conversation is an
+/// orphan seal — a window that cannot show what it claims to hold.
+#[test]
+fn a_manifest_naming_an_unknown_member_refuses() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store.create("windows", None).unwrap();
+    store.append_turn(&id, "u0", "a0").unwrap();
+    let m = content_ids_in_order(root.path(), &id);
+    let window_id = store
+        .append_summary_and_seal(&id, "[CONTEXT COMPACTION] x", &[], &m)
+        .unwrap();
+    // Swap a real member for a ghost, and repair the manifest's own id so the
+    // self-certification check passes and the MEMBER check is what fires.
+    let ghost = "c".repeat(64);
+    let conn = raw(root.path());
+    let (parent, summary, seq): (Option<String>, String, i64) = conn
+        .query_row(
+            "SELECT parent_id, summary_turn_id, sealed_at_seq FROM context_windows
+              WHERE window_id = ?1",
+            rusqlite::params![&window_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let elided = format!("[\"{ghost}\"]");
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"newt-window:v1");
+    for f in [
+        id.as_str(),
+        parent.as_deref().unwrap_or(""),
+        summary.as_str(),
+        "[]",
+        elided.as_str(),
+    ] {
+        buf.extend_from_slice(&(f.len() as u64).to_le_bytes());
+        buf.extend_from_slice(f.as_bytes());
+    }
+    buf.extend_from_slice(&seq.to_le_bytes());
+    let reforged = blake3::hash(&buf).to_hex().to_string();
+    conn.execute(
+        "UPDATE context_windows SET elided = ?2, window_id = ?3 WHERE window_id = ?1",
+        rusqlite::params![&window_id, elided, reforged],
+    )
+    .unwrap();
+    let err = store.verify_chain(&id).unwrap_err().to_string();
+    assert!(
+        err.contains("chain violation") && err.contains(&ghost),
+        "a manifest must not name what it cannot show: {err}"
+    );
+}

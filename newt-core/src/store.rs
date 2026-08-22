@@ -179,8 +179,8 @@ pub use fts::sanitize_fts5_query;
 
 mod turn_chain;
 use turn_chain::{
-    genesis_hash, insert_turn_row, last_turn, next_tick, turn_at_seq, turn_row_from_sql, TurnRow,
-    TURN_ENCODING_VERSION_CURRENT,
+    genesis_hash, insert_turn_row, last_turn, next_tick, turn_at_seq, turn_row_from_sql,
+    window_manifest_id, TurnRow, TURN_ENCODING_VERSION_CURRENT,
 };
 
 use crate::artifact::{
@@ -1084,7 +1084,74 @@ impl ConversationStore {
         tokens_in: Option<u32>,
         tokens_out: Option<u32>,
     ) -> anyhow::Result<()> {
-        let id = self.resolve_id(id)?;
+        self.append_turn_returning_id(
+            id,
+            user,
+            assistant,
+            events,
+            phantom_reaches,
+            sources,
+            tokens_in,
+            tokens_out,
+        )
+        .map(|_| ())
+    }
+
+    /// [`Self::append_turn_full`], returning the new row's CONTENT ID
+    /// (#1786 §2) — the identity a later derived row cites, and the identity
+    /// a context-window manifest records as a member (§5b).
+    ///
+    /// Every append needs to be able to hand this back: provenance flows
+    /// FORWARD from the store, so a caller that cannot learn what it just
+    /// wrote could only reconstruct the reference by matching content, which
+    /// the design forbids.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_turn_returning_id(
+        &self,
+        id: &str,
+        user: &str,
+        assistant: &str,
+        events: &[crate::ToolEvent],
+        phantom_reaches: &[crate::PhantomReach],
+        sources: &[String],
+        tokens_in: Option<u32>,
+        tokens_out: Option<u32>,
+    ) -> anyhow::Result<String> {
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let content_id = self.append_turn_in_tx(
+            &tx,
+            id,
+            user,
+            assistant,
+            events,
+            phantom_reaches,
+            sources,
+            tokens_in,
+            tokens_out,
+        )?;
+        tx.commit()?;
+        Ok(content_id)
+    }
+
+    /// The append body, on the CALLER's transaction — so a summary turn and
+    /// the context-window manifest that seals it commit together or not at
+    /// all (#1786 §8 producer failure semantics: a persisted summary without
+    /// its seal must not be constructible).
+    #[allow(clippy::too_many_arguments)]
+    fn append_turn_in_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        id: &str,
+        user: &str,
+        assistant: &str,
+        events: &[crate::ToolEvent],
+        phantom_reaches: &[crate::PhantomReach],
+        sources: &[String],
+        tokens_in: Option<u32>,
+        tokens_out: Option<u32>,
+    ) -> anyhow::Result<String> {
+        let id = self.resolve_id_on(tx, id)?;
         let now = (self.claim_clock)();
         let events_json = serde_json::to_string(events)?;
         let phantom_reaches_json = serde_json::to_string(phantom_reaches)?;
@@ -1103,9 +1170,7 @@ impl ConversationStore {
             );
         }
         let sources_json = canonical_sources_json(sources)?;
-        let conn = self.lock_conn();
-        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-        let tick = next_tick(&tx, &self.writer_fingerprint)?;
+        let tick = next_tick(tx, &self.writer_fingerprint)?;
 
         // §6 tip witness (#1785). `tip_hash` is a SECOND, independently written
         // record of where this conversation's chain ends. Nothing chains on it —
@@ -1163,7 +1228,7 @@ impl ConversationStore {
             // bad turn" to locate — the message says what it can prove.)
             // Flattened (not `.context()`) for the same Display-visibility
             // reason as `load_verified`: callers render these with `{e}`.
-            let tip_writer_final = last_turn(&tx, &id, &tip_writer)?;
+            let tip_writer_final = last_turn(tx, &id, &tip_writer)?;
             Self::check_tip_witness(&id, &recorded_tip, &tip_writer, tip_writer_final.as_ref())
                 .map_err(|e| {
                     // "could not be confirmed", not "disagrees": the inner error
@@ -1224,7 +1289,7 @@ impl ConversationStore {
                             let row_at: Option<&TurnRow> = if final_row.seq == existing_seq {
                                 Some(final_row)
                             } else {
-                                fetched = turn_at_seq(&tx, &id, &tip_writer, existing_seq)?;
+                                fetched = turn_at_seq(tx, &id, &tip_writer, existing_seq)?;
                                 fetched.as_ref()
                             };
                             Self::check_writer_tip_witness(
@@ -1271,7 +1336,7 @@ impl ConversationStore {
         // table); a LOWER tip_seq is a stale-but-honest witness (a rolled-back
         // binary appended without maintaining writer_tips) verified against
         // the row it actually pins and repaired by the upsert below.
-        let own_last = last_turn(&tx, &id, &self.writer_fingerprint)?;
+        let own_last = last_turn(tx, &id, &self.writer_fingerprint)?;
         let own_witness: Option<(String, i64)> = tx
             .query_row(
                 "SELECT tip_hash, tip_seq FROM writer_tips
@@ -1287,7 +1352,7 @@ impl ConversationStore {
                 if own_last.as_ref().is_some_and(|r| r.seq == tip_seq) {
                     own_last.as_ref()
                 } else {
-                    fetched = turn_at_seq(&tx, &id, &self.writer_fingerprint, tip_seq)?;
+                    fetched = turn_at_seq(tx, &id, &self.writer_fingerprint, tip_seq)?;
                     fetched.as_ref()
                 };
             Self::check_writer_tip_witness(
@@ -1329,13 +1394,14 @@ impl ConversationStore {
             ts_claim: now,
             encoding_version: TURN_ENCODING_VERSION_CURRENT,
         };
-        insert_turn_row(&tx, &row)?;
+        insert_turn_row(tx, &row)?;
         // Activity tick + chain tip + per-writer witness move together;
         // updated_at_claim is a display claim only (§6) — nothing orders by
         // it. The two witnesses are written in ONE transaction, which is why
         // read-path divergence between them (at the same seq) has no
         // legitimate producer.
         let row_hash = row.content_hash()?;
+        let content_id = row.content_id();
         tx.execute(
             "INSERT INTO writer_tips (conversation_id, writer_fingerprint, tip_hash, tip_seq)
              VALUES (?1, ?2, ?3, ?4)
@@ -1350,8 +1416,107 @@ impl ConversationStore {
               WHERE id = ?1",
             rusqlite::params![id, self.writer_fingerprint, tick, row_hash, now],
         )?;
+        Ok(content_id)
+    }
+
+    /// Persist a compaction's summary AND seal the window it replaced, in
+    /// ONE transaction (#1786 §5b). Returns the new manifest's `window_id`.
+    ///
+    /// A seal records a PARTITION of the window being replaced: `carried`
+    /// (members that stay on the wire) and `elided` (members the summary now
+    /// stands in for). Together with the summary itself they account for
+    /// everything that was in the parent window — which is what makes a
+    /// compaction auditable, and the checkable form of reversibility at the
+    /// reference level: the replaced window's membership is recoverable from
+    /// the record, and the elided turns themselves are still in the store
+    /// (turn rows are insert-only; nothing deletes a turn short of deleting
+    /// its conversation).
+    ///
+    /// One transaction is load-bearing, not tidiness: appending the summary
+    /// and writing its manifest separately makes a persisted summary with no
+    /// seal constructible — a derived row whose provenance says nothing,
+    /// which is the exact state this work exists to prevent.
+    pub fn append_summary_and_seal(
+        &self,
+        id: &str,
+        summary_text: &str,
+        carried: &[String],
+        elided: &[String],
+    ) -> anyhow::Result<String> {
+        let carried_json = canonical_sources_json(carried)?;
+        let elided_json = canonical_sources_json(elided)?;
+        // Disjointness is a WRITE-path refusal too, not only a verify-time
+        // one: a member both carried and elided is a contradiction about
+        // what happened to it, and admitting it here would let a caller
+        // brick the conversation (the read path repairs nothing by design).
+        let carried_set: std::collections::HashSet<&String> = carried.iter().collect();
+        if let Some(dup) = elided.iter().find(|e| carried_set.contains(e)) {
+            anyhow::bail!(
+                "refusing the seal -- `{dup}` is recorded as BOTH carried and elided; \
+                 a member cannot be kept and replaced at once"
+            );
+        }
+
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let resolved = self.resolve_id_on(&tx, id)?;
+
+        // The summary is a DERIVED row: its sources are exactly the elided
+        // half, so the manifest and the turn are two independently hashed
+        // records of one fact, cross-checked at verification.
+        let summary_turn_id = self.append_turn_in_tx(
+            &tx,
+            &resolved,
+            summary_text,
+            "",
+            &[],
+            &[],
+            elided,
+            None,
+            None,
+        )?;
+        let sealed_at_seq: i64 = tx.query_row(
+            "SELECT MAX(seq) FROM turns WHERE conversation_id = ?1",
+            [&resolved],
+            |row| row.get(0),
+        )?;
+
+        // The parent is the conversation's most recent seal; NULL only at the
+        // first one. Read inside this transaction so two racing seals cannot
+        // both claim the same parent.
+        let parent_id: Option<String> = tx
+            .query_row(
+                "SELECT window_id FROM context_windows WHERE conversation_id = ?1
+                  ORDER BY sealed_at_seq DESC LIMIT 1",
+                [&resolved],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let window_id = window_manifest_id(
+            &resolved,
+            parent_id.as_deref().unwrap_or(""),
+            &summary_turn_id,
+            &carried_json,
+            &elided_json,
+            sealed_at_seq,
+        );
+        tx.execute(
+            "INSERT INTO context_windows
+               (conversation_id, window_id, parent_id, summary_turn_id,
+                carried, elided, sealed_at_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                resolved,
+                window_id,
+                parent_id,
+                summary_turn_id,
+                carried_json,
+                elided_json,
+                sealed_at_seq
+            ],
+        )?;
         tx.commit()?;
-        Ok(())
+        Ok(window_id)
     }
 
     /// Load a full record (turns in causal `(writer, seq)` order). `id` may
@@ -2623,8 +2788,21 @@ impl ConversationStore {
 
     /// Resolve an exact id or unique prefix within this workspace.
     pub fn resolve_id(&self, id_or_prefix: &str) -> anyhow::Result<String> {
-        validate_record_id(id_or_prefix)?;
         let conn = self.lock_conn();
+        self.resolve_id_on(&conn, id_or_prefix)
+    }
+
+    /// [`Self::resolve_id`] on the caller's connection — so a resolve inside
+    /// a transaction reads the SAME snapshot as the work that follows it
+    /// (the verify-then-load hazard #1792 closed, applied to the write path:
+    /// resolving on one lock acquisition and appending on another leaves a
+    /// window where the conversation can vanish between them).
+    fn resolve_id_on(
+        &self,
+        conn: &rusqlite::Connection,
+        id_or_prefix: &str,
+    ) -> anyhow::Result<String> {
+        validate_record_id(id_or_prefix)?;
         let exact = conn
             .query_row(
                 "SELECT id FROM conversations WHERE id = ?1 AND workspace_key = ?2",
@@ -2858,6 +3036,163 @@ impl ConversationStore {
             &tip_writer,
             rows.iter().rfind(|r| r.writer_fingerprint == tip_writer),
         )?;
+
+        // #1786 §5b — context-window manifests. Order matters: the per-turn
+        // walk above already proved every row's stored bytes are the appended
+        // bytes, so these checks reason about VERIFIED content ids.
+        let mut window_stmt = conn.prepare(
+            "SELECT window_id, parent_id, summary_turn_id, carried, elided, sealed_at_seq
+               FROM context_windows WHERE conversation_id = ?1
+              ORDER BY sealed_at_seq ASC",
+        )?;
+        let windows = window_stmt
+            .query_map([&id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !windows.is_empty() {
+            let known_ids: std::collections::HashSet<String> =
+                rows.iter().map(|r| r.content_id()).collect();
+            let by_id: std::collections::HashMap<&str, usize> = windows
+                .iter()
+                .enumerate()
+                .map(|(i, w)| (w.0.as_str(), i))
+                .collect();
+            let mut roots = 0usize;
+            for (i, (window_id, parent_id, summary_id, carried, elided, sealed_at_seq)) in
+                windows.iter().enumerate()
+            {
+                // Self-certifying: the recorded id must recompute from the
+                // manifest's own fields, so a manifest cannot be edited (or
+                // moved to another conversation — the conversation id is in
+                // the preimage) without breaking its own name.
+                let expected = window_manifest_id(
+                    id,
+                    parent_id.as_deref().unwrap_or(""),
+                    summary_id,
+                    carried,
+                    elided,
+                    *sealed_at_seq,
+                );
+                if &expected != window_id {
+                    anyhow::bail!(
+                        "chain violation in `{id}`: context window `{window_id}` does not \
+                         match its own contents — the manifest was altered. Rows are left \
+                         exactly as found."
+                    );
+                }
+                let carried_ids = parse_canonical_sources(carried).map_err(|e| {
+                    anyhow::anyhow!(
+                        "chain violation in `{id}`: context window `{window_id}` carried \
+                         list is not in canonical form ({e})"
+                    )
+                })?;
+                let elided_ids = parse_canonical_sources(elided).map_err(|e| {
+                    anyhow::anyhow!(
+                        "chain violation in `{id}`: context window `{window_id}` elided \
+                         list is not in canonical form ({e})"
+                    )
+                })?;
+                // Every member, and the summary, must be a turn in THIS
+                // conversation — a manifest may not cite what it cannot show.
+                for member in carried_ids.iter().chain(elided_ids.iter()) {
+                    if !known_ids.contains(member) {
+                        anyhow::bail!(
+                            "chain violation in `{id}`: context window `{window_id}` names \
+                             member `{member}`, which matches no turn in this conversation"
+                        );
+                    }
+                }
+                if !known_ids.contains(summary_id) {
+                    anyhow::bail!(
+                        "chain violation in `{id}`: context window `{window_id}` names \
+                         summary turn `{summary_id}`, which matches no turn in this \
+                         conversation"
+                    );
+                }
+                // Carried and elided must be disjoint: a member cannot be both
+                // kept and replaced.
+                let carried_set: std::collections::HashSet<&String> = carried_ids.iter().collect();
+                if let Some(dup) = elided_ids.iter().find(|e| carried_set.contains(e)) {
+                    anyhow::bail!(
+                        "chain violation in `{id}`: context window `{window_id}` records \
+                         `{dup}` as BOTH carried and elided"
+                    );
+                }
+                // Producer-consistency assertion, NOT a tamper defence — and
+                // labelled as such because the difference matters. Both sides
+                // are independently hashed (the turn's `sources` by the v2
+                // chain, the manifest by its self-certifying id), so tampering
+                // with either fires an earlier check and this one is
+                // UNREACHABLE by tampering: a red-first drill gutting it
+                // changed no test result, which is how it was caught. It stays
+                // as a cheap guard against a FUTURE producer computing the two
+                // values separately and drifting — the write path passes one
+                // value to both today — and is deliberately not counted among
+                // the integrity guarantees.
+                let summary_row = rows.iter().find(|r| &r.content_id() == summary_id);
+                if let Some(row) = summary_row {
+                    if &row.sources != elided {
+                        anyhow::bail!(
+                            "chain violation in `{id}`: context window `{window_id}` and its \
+                             summary turn disagree about what was elided — two records of \
+                             one derivation, one of them altered"
+                        );
+                    }
+                }
+                match parent_id {
+                    None => {
+                        roots += 1;
+                        if roots > 1 || i != 0 {
+                            anyhow::bail!(
+                                "chain violation in `{id}`: context window `{window_id}` \
+                                 claims to be a first seal, but the conversation already \
+                                 has one — a window chain has exactly one root"
+                            );
+                        }
+                    }
+                    Some(parent) => {
+                        let Some(&pi) = by_id.get(parent.as_str()) else {
+                            anyhow::bail!(
+                                "chain violation in `{id}`: context window `{window_id}` \
+                                 descends from `{parent}`, which is not a window of this \
+                                 conversation — an orphan seal"
+                            );
+                        };
+                        // CONSERVATION (§5b.4): everything the parent window
+                        // held must be accounted for here — carried forward or
+                        // explicitly elided. This is the half that makes a
+                        // compaction auditable; the converse (no EXTRA members)
+                        // is deliberately not checked, because turns appended
+                        // between the two seals are legitimately new members
+                        // and the store cannot distinguish them from
+                        // fabrications without the live window's membership.
+                        let (_, _, parent_summary, parent_carried, _, _) = &windows[pi];
+                        let parent_members =
+                            parse_canonical_sources(parent_carried).unwrap_or_default();
+                        let here: std::collections::HashSet<&String> =
+                            carried_ids.iter().chain(elided_ids.iter()).collect();
+                        for member in parent_members.iter().chain(std::iter::once(parent_summary)) {
+                            if !here.contains(member) {
+                                anyhow::bail!(
+                                    "chain violation in `{id}`: context window `{window_id}` \
+                                     drops `{member}`, which its parent `{parent}` held — a \
+                                     seal must account for every member of the window it \
+                                     replaces, by carrying it forward or eliding it"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // #1786 §5 — per-writer witnesses, both directions. (Agreement
         // between the conversations-row tip and writer_tips needs no third
@@ -3912,6 +4247,34 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              tip_seq            INTEGER NOT NULL,
              PRIMARY KEY (conversation_id, writer_fingerprint)
          );
+         -- #1786 §5b: context-window manifests. A SEAL is the moment a
+         -- compaction replaces one window with another, and the manifest
+         -- records a PARTITION of the window it replaced: `carried` (members
+         -- kept on the wire) and `elided` (members the summary now stands in
+         -- for) together account for every member of the parent window, and
+         -- never overlap. That invariant is what makes a compaction auditable
+         -- (without it, the question of what became of a given turn has no
+         -- answer) and it is
+         -- the checkable form of reversibility at the reference level: the
+         -- replaced window's membership is fully recoverable.
+         --
+         -- Minted once per seal, never mutated: between seals, membership is
+         -- derivable (the last seal's carried + its summary + every turn
+         -- appended since, by seq), so there is no grow-the-window write path.
+         --
+         -- `window_id` is the manifest's own content id — self-certifying.
+         CREATE TABLE IF NOT EXISTS context_windows (
+             conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+             window_id       TEXT NOT NULL,
+             parent_id       TEXT,               -- NULL only at a conversation's first seal
+             summary_turn_id TEXT NOT NULL,      -- content id of the summary standing in for `elided`
+             carried         TEXT NOT NULL,      -- canonical JSON array of turn content ids
+             elided          TEXT NOT NULL,      -- canonical JSON array of turn content ids
+             sealed_at_seq   INTEGER NOT NULL,
+             PRIMARY KEY (conversation_id, window_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_context_windows_seq
+             ON context_windows (conversation_id, sealed_at_seq);
          CREATE INDEX IF NOT EXISTS idx_conversations_ws_tick
              ON conversations (workspace_key, activity_tick);
          CREATE INDEX IF NOT EXISTS idx_prompt_receipts_conversation_order

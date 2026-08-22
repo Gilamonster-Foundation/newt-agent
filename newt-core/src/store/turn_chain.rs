@@ -47,6 +47,11 @@ pub(super) const TURN_CONTENT_ID_PREFIX: &[u8] = b"newt-turn-content:v1";
 /// escape, which is exactly why the lockout above is stated here.
 pub(super) const TURN_ENCODING_VERSION_CURRENT: i64 = 2;
 
+/// Domain-separation prefix for a CONTEXT WINDOW manifest id (#1786 §5b) —
+/// a third domain, distinct from both chain encodings and the turn content
+/// id, so a window id can never be mistaken for (or collide with) a turn's.
+pub(super) const WINDOW_ID_PREFIX: &[u8] = b"newt-window:v1";
+
 /// Domain-separation prefix for the per-(conversation, writer) genesis hash.
 pub(super) const GENESIS_PREFIX: &[u8] = b"newt-turn-chain-genesis:v1";
 
@@ -327,6 +332,44 @@ pub(super) fn last_turn(
             turn_row_from_sql,
         )
         .optional()?)
+}
+
+/// The self-certifying id of a context-window manifest (#1786 §5b): BLAKE3
+/// over the manifest's own fields, so a stored manifest can be checked
+/// against its recorded id without trusting anything else.
+///
+/// `conversation_id` is IN the preimage even though it is also the table's
+/// key: without it a manifest could be moved between conversations and still
+/// recompute — the same reason the turn chain hashes its conversation id.
+/// `parent_id` is the empty string at a conversation's first seal.
+pub(super) fn window_manifest_id(
+    conversation_id: &str,
+    parent_id: &str,
+    summary_turn_id: &str,
+    carried: &str,
+    elided: &str,
+    sealed_at_seq: i64,
+) -> String {
+    let mut buf = Vec::with_capacity(
+        64 + conversation_id.len()
+            + parent_id.len()
+            + summary_turn_id.len()
+            + carried.len()
+            + elided.len(),
+    );
+    buf.extend_from_slice(WINDOW_ID_PREFIX);
+    for field in [
+        conversation_id.as_bytes(),
+        parent_id.as_bytes(),
+        summary_turn_id.as_bytes(),
+        carried.as_bytes(),
+        elided.as_bytes(),
+    ] {
+        buf.extend_from_slice(&(field.len() as u64).to_le_bytes());
+        buf.extend_from_slice(field);
+    }
+    buf.extend_from_slice(&sealed_at_seq.to_le_bytes());
+    blake3::hash(&buf).to_hex().to_string()
 }
 
 /// One writer's turn at an exact seq — the row a per-writer witness pins
