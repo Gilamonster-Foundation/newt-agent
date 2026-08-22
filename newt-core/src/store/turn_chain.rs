@@ -30,11 +30,21 @@ pub(super) const TURN_CONTENT_ID_PREFIX: &[u8] = b"newt-turn-content:v1";
 /// dispatches on the stored value; v1 and v2 exist, and a row carrying an
 /// unknown version errors clearly instead of hashing garbage.
 ///
+/// **Downgrade is one-directional from the first v2 append** (#1786 spec
+/// §9.1). Once any row in a conversation is v2, an older binary refuses to
+/// `verify_chain` or append it ("carries encoding_version 2 … upgrade newt")
+/// — and since #1785 the production read path verifies, so that refusal is
+/// not cosmetic. Plain `load` still reads. Fail-closed lockout, stated and
+/// accepted: binaries sharing a store upgrade together, or the older one
+/// goes verified-read-only on every conversation the newer one touched.
+///
 /// The ONE-TIME legacy JSON import deliberately pins v1 instead of this
 /// constant — see `import_one_record` (#1786 spec §9.1): legacy records
 /// carry no sources or phantom reaches, so v2 buys them nothing, and a
 /// v1-pinned import keeps a post-import rollback able to verify the
 /// imported history (the import retires its source tree and cannot re-run).
+/// That lever covers imported history only; live appends have no such
+/// escape, which is exactly why the lockout above is stated here.
 pub(super) const TURN_ENCODING_VERSION_CURRENT: i64 = 2;
 
 /// Domain-separation prefix for the per-(conversation, writer) genesis hash.

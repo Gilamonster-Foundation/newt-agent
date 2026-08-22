@@ -3075,7 +3075,16 @@ fn orphan_source_refuses() {
     store.append_turn(&id, "u1", "a1").unwrap();
     let ghost = "f".repeat(64);
     store
-        .append_turn_full(&id, "", "summary", &[], &[], std::slice::from_ref(&ghost), None, None)
+        .append_turn_full(
+            &id,
+            "",
+            "summary",
+            &[],
+            &[],
+            std::slice::from_ref(&ghost),
+            None,
+            None,
+        )
         .unwrap();
     let err = store.verify_chain(&id).unwrap_err().to_string();
     assert!(
@@ -3087,13 +3096,16 @@ fn orphan_source_refuses() {
 /// #1786 §3: non-canonical sources bytes refuse. The write path cannot
 /// produce them (it canonicalizes), so reaching this state took out-of-band
 /// SQL — well-formed evidence or none. Exercised for unsorted order,
-/// uppercase hex, and non-array JSON; each also implicitly proves the
-/// chain-side protection (the UPDATE broke the v2 hash first, but the
-/// message must be the canonical-form diagnosis when the walk reaches it —
-/// so the rows are re-chained via the API-legal path: a fresh conversation
-/// per shape, with the malformed bytes injected into the LAST row where no
-/// successor link exists and only the sources checks see them... except the
-/// tip witness fires first. The honest observable is simply: refusal).
+/// uppercase hex, and non-array JSON.
+///
+/// Each conversation holds ONE turn, so the tampered row is also the last:
+/// the per-turn walk has no successor to check its link against, and
+/// `verify_chain` runs the sources checks BEFORE the tip witness. The
+/// canonical-form refusal is therefore the check that actually fires, and
+/// the assertion pins that specific diagnosis rather than the bare "chain
+/// violation" prefix every failure class shares — otherwise reordering the
+/// provenance block below the tip witness would leave this test green while
+/// testing something else entirely.
 #[test]
 fn non_canonical_sources_refuse() {
     for bad in [
@@ -3114,8 +3126,8 @@ fn non_canonical_sources_refuse() {
             .unwrap();
         let err = store.verify_chain(&id).unwrap_err().to_string();
         assert!(
-            err.contains("chain violation"),
-            "sources bytes {bad:?} must refuse: {err}"
+            err.contains("chain violation") && err.contains("not in canonical form"),
+            "sources bytes {bad:?} must refuse AS a canonical-form violation: {err}"
         );
     }
 }
@@ -3140,8 +3152,9 @@ fn derived_row_with_tool_activity_refuses() {
         .unwrap();
     let err = store.verify_chain(&id).unwrap_err().to_string();
     assert!(
-        err.contains("chain violation"),
-        "a row claiming derivation AND tool activity must refuse: {err}"
+        err.contains("chain violation") && err.contains("AND tool activity"),
+        "a row claiming derivation AND tool activity must refuse AS a shape \
+         violation, not merely as some chain failure: {err}"
     );
 }
 
