@@ -1083,6 +1083,66 @@ impl ConversationStore {
         let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         let tick = next_tick(&tx, &self.writer_fingerprint)?;
 
+        // §6 tip witness (#1785). `tip_hash` is a SECOND, independently written
+        // record of where this conversation's chain ends. Nothing chains on it —
+        // `prev_hash` is always re-derived from the row itself — and that is
+        // precisely what makes it a witness rather than a cache: two values
+        // written at different moments that must agree.
+        //
+        // This deliberately O(1) witness check compares only the recorded
+        // writer's final row with the stored tip. It catches an altered or
+        // deleted tip at the moment we would otherwise extend it. An edit to
+        // an earlier turn that leaves the final row and witness intact passes
+        // here and is discovered by load_verified / verify_chain on restore.
+        //
+        // Writer-agnostic, matching `verify_chain`: the stored tip belongs to
+        // the conversation row's RECORDED writer, not whoever is appending, so
+        // a second writer joining a conversation does not spuriously fail.
+        //
+        // An EMPTY tip is absence of evidence, NOT evidence of tampering. A
+        // database predating the column gains it as `''` from the schema-diff
+        // backfill, and the first post-migration append is what repairs it —
+        // refusing here would lock writes out of exactly the oldest histories,
+        // and would state a conclusion nothing recorded supports.
+        // `.optional()` for the same resolve-then-read gap as
+        // `verify_conversation_chain`: a conversation deleted between
+        // `resolve_id` and this transaction is a deletion, not corruption.
+        let (recorded_tip, tip_writer): (String, String) = tx
+            .query_row(
+                "SELECT tip_hash, writer_fingerprint FROM conversations WHERE id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("conversation `{id}` not found"))?;
+        if !recorded_tip.is_empty() {
+            // Shared policy + diagnostics: `check_tip_witness` owns both, so
+            // the write path and the read path cannot drift apart. The added
+            // context names what is being refused and why: an append onto a
+            // witness mismatch would chain new work on top of the damage.
+            // (`verify_chain` gives the per-turn diagnosis when a specific
+            // turn's link is broken; a witness-only mismatch has no "first
+            // bad turn" to locate — the message says what it can prove.)
+            // Flattened (not `.context()`) for the same Display-visibility
+            // reason as `load_verified`: callers render these with `{e}`.
+            Self::check_tip_witness(
+                &id,
+                &recorded_tip,
+                &tip_writer,
+                last_turn(&tx, &id, &tip_writer)?.as_ref(),
+            )
+            .map_err(|e| {
+                // "could not be confirmed", not "disagrees": the inner error
+                // may also be a cannot-compute (an unknown encoding_version
+                // refuses hashing on an intact record) — the wrapper must
+                // stay accurate for both.
+                anyhow::anyhow!(
+                    "refusing the append -- the recorded chain tip could not be \
+                     confirmed, so new work must not extend that tip: {e:#}"
+                )
+            })?;
+        }
+
         // The §6 content chain: hash the canonical encoding of this writer's
         // previous turn (re-derived from the row itself, so a drifted
         // `tip_hash` column can never poison the chain).
@@ -1120,17 +1180,108 @@ impl ConversationStore {
 
     /// Load a full record (turns in causal `(writer, seq)` order). `id` may
     /// be a unique prefix.
+    ///
+    /// This is the UNVERIFIED read: it materializes whatever the rows say,
+    /// including a tampered chain — which is deliberate, because it is also
+    /// the examine-the-evidence path a refused restore points at. The path
+    /// that hands history to the model is [`Self::load_verified`].
     pub fn load(&self, id: &str) -> anyhow::Result<ConversationRecord> {
         let id = self.resolve_id(id)?;
         let conn = self.lock_conn();
+        Self::load_record_on(&conn, &self.workspace_id, &id)
+    }
+
+    /// Verify and materialize `id` from ONE SQLite read snapshot — the only
+    /// load the restore/resume path may use.
+    ///
+    /// The invariant this method exists to hold: **the record returned is
+    /// exactly the snapshot whose integrity was verified.** `verify_chain`
+    /// followed by `load` as two calls cannot hold it — each call reads its
+    /// own database state, so a legitimate concurrent append between them
+    /// reads as corruption, and a corruption landing between them reads as
+    /// clean. Here the chain walk, the tip-witness comparison, and the
+    /// materialization of the returned [`ConversationRecord`] all run inside
+    /// a single read transaction (WAL snapshot isolation), so both hazards
+    /// are structurally absent rather than merely unlikely.
+    ///
+    /// Fail-closed: a violation refuses with the integrity diagnosis and
+    /// changes nothing — no repair, no re-chain, no witness rebuild. The rows
+    /// stay exactly as found, readable through [`Self::load`] for
+    /// examination.
+    ///
+    /// ## Coverage boundary — what "verified" does and does not cover
+    ///
+    /// The §6 chain covers the canonical turn encoding, except for
+    /// `phantom_reaches`; it does not authenticate the surrounding
+    /// `conversations` row. The following data inside or beside the returned
+    /// record is outside it, stated here so "verified" is never read as more
+    /// than it is:
+    ///
+    /// * **`phantom_reaches`.** This per-turn telemetry is deliberately not a
+    ///   canonical-encoding input, so an SQL-level edit passes this gate.
+    /// * **Conversation-row metadata.** `title`, workspace metadata,
+    ///   `persona`, roadmap/node IDs, and the created/updated time claims are
+    ///   materialized from `conversations`, but are not chain inputs. An
+    ///   SQL-level edit passes this gate; restore applies the returned persona.
+    /// * **`scratchpad` and `plan`** ride the conversations row unhashed
+    ///   ("working memory, not provenance" — the schema comments). They are
+    ///   rehydrated into the restored session, so an SQL-level edit to them
+    ///   passes this gate. Same family as the `phantom_reaches` gap; the
+    ///   coverage decision belongs to #1786's encoding bump.
+    /// * **Non-tip writers' final turns.** Each writer's chain pins every
+    ///   turn except its last (nothing chains onto a final turn), and the
+    ///   single recorded witness pins only the RECORDED tip writer's last
+    ///   turn. In a multi-writer history (a writer handoff, a fingerprint
+    ///   upgrade), the other writers' final turns are pinned by nothing —
+    ///   binding them needs a per-writer witness, which is schema work, not
+    ///   a read-path fix.
+    /// * **The witness columns themselves** (see the erasure bound
+    ///   documented on `check_tip_witness`).
+    ///
+    /// Operational note: under the documented journal_mode=DELETE fallback
+    /// (NFS homes where WAL is refused), this read transaction holds SHARED
+    /// for the whole verify+materialize, so a very large conversation can
+    /// hold off a concurrent writer's COMMIT past its busy_timeout. That is
+    /// the price of single-snapshot verification without WAL; accepted, and
+    /// bounded by conversation size.
+    pub fn load_verified(&self, id: &str) -> anyhow::Result<ConversationRecord> {
+        let id = self.resolve_id(id)?;
+        let conn = self.lock_conn();
+        // A DEFERRED read transaction: under WAL this pins one snapshot at
+        // the first read, which is what makes verify-and-materialize atomic
+        // against writers on OTHER connections (same-store writers are
+        // already serialized by the connection mutex).
+        let tx = conn.unchecked_transaction()?;
+        // Flattened (not `.context()`) ON PURPOSE: the TUI surfaces restore
+        // errors with Display (`{e}`, tab_switch preflight), which shows only
+        // the outermost anyhow layer — a context wrapper would bury the
+        // diagnosis it wraps. One flat message keeps the whole diagnosis
+        // Display-visible; the conformance tests pin this.
+        Self::verify_conversation_chain(&tx, &id)
+            .map_err(|e| anyhow::anyhow!("refusing the restore — nothing has moved: {e:#}"))?;
+        let record = Self::load_record_on(&tx, &self.workspace_id, &id)?;
+        tx.commit()?;
+        Ok(record)
+    }
+
+    /// Materialize a [`ConversationRecord`] on the caller's connection — the
+    /// shared body of [`ConversationStore::load`] and
+    /// [`ConversationStore::load_verified`]. Taking `&Connection` is what lets
+    /// `load_verified` run this inside the SAME read transaction as the chain
+    /// verification: one snapshot, verified and returned.
+    fn load_record_on(
+        conn: &Connection,
+        workspace_id: &str,
+        id: &str,
+    ) -> anyhow::Result<ConversationRecord> {
         let (mut record, scratchpad_json, plan_json) = conn
             .query_row(
                 "SELECT id, title, workspace_path, workspace_key, persona,
-                        started_at_claim, updated_at_claim, scratchpad, plan,
-                        roadmap_id, node_id
-                   FROM conversations
-                  WHERE id = ?1 AND workspace_key = ?2",
-                rusqlite::params![id, self.workspace_id],
+                    started_at_claim, updated_at_claim, scratchpad, plan,
+                    roadmap_id, node_id
+               FROM conversations
+              WHERE id = ?1 AND workspace_key = ?2",
+                rusqlite::params![id, workspace_id],
                 |row| {
                     Ok((
                         ConversationRecord {
@@ -2336,17 +2487,71 @@ impl ConversationStore {
 
     /// Verify the §6 content chain for a conversation: every writer's turns
     /// must link `prev_hash` → BLAKE3(prior turn's canonical encoding) from
-    /// the genesis hash, and the stored chain tip must match this writer's
-    /// last turn. A tampered row (content OR claims — claims are inside the
-    /// canonical encoding, so they are tamper-evident too) breaks the chain.
+    /// the genesis hash, and the stored tip witness must match the recorded
+    /// last writer's final turn (an EMPTY witness — the schema-diff backfill —
+    /// is absence of evidence and skips only the tip comparison). A tampered
+    /// row (content OR claims — claims are inside the canonical encoding, so
+    /// they are tamper-evident too) breaks the chain.
     pub fn verify_chain(&self, id: &str) -> anyhow::Result<()> {
         let id = self.resolve_id(id)?;
         let conn = self.lock_conn();
-        let (tip, tip_writer): (String, String) = conn.query_row(
-            "SELECT tip_hash, writer_fingerprint FROM conversations WHERE id = ?1",
-            [&id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        // Same single-snapshot discipline as `load_verified`: the chain walk
+        // and the tip-witness comparison read the database twice, and a
+        // writer on another connection between those reads would fabricate a
+        // corruption verdict. One DEFERRED read transaction pins one
+        // snapshot for both.
+        let tx = conn.unchecked_transaction()?;
+        Self::verify_conversation_chain(&tx, &id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The §6 verification body, on the caller's connection — the shared
+    /// kernel of [`Self::verify_chain`] and [`Self::load_verified`]. Taking
+    /// `&Connection` is what lets `load_verified` verify and materialize
+    /// inside the SAME read transaction: the record it returns is the
+    /// snapshot this function checked, not a later one.
+    ///
+    /// Callers MUST hold a read transaction when other connections may write
+    /// concurrently; this function performs multiple reads and does not open
+    /// one itself.
+    ///
+    /// What a failure means, precisely:
+    ///
+    /// * A per-turn diagnosis (`does not link`, `genesis`, `seq order`) names
+    ///   the first turn whose link is broken — that turn or its predecessor
+    ///   was altered.
+    /// * A tip-witness diagnosis means the per-turn links all held. The final
+    ///   turn has no successor linking to it, so its content is pinned ONLY
+    ///   by the witness — and a witness mismatch therefore cannot say which
+    ///   side was altered: the final turn or the witness itself. The message
+    ///   says exactly that and no more.
+    /// * An EMPTY `tip_hash` (`''`, the schema-diff backfill for databases
+    ///   predating the column — `writer_fingerprint` may still hold a real
+    ///   value from an earlier schema epoch) is absence of evidence, not
+    ///   evidence of tampering: the per-turn links are still fully verified,
+    ///   the tip comparison is skipped, and the next append records a real
+    ///   witness. Refusing on absence would lock restores out of exactly the
+    ///   oldest histories while asserting a conclusion nothing recorded
+    ///   supports — the same policy the append path applies. A PRESENT
+    ///   `tip_hash` with a blank writer is the reverse mix, which nothing
+    ///   produces, and refuses.
+    fn verify_conversation_chain(conn: &Connection, id: &str) -> anyhow::Result<()> {
+        // `.optional()` + a named not-found: `resolve_id` ran on an earlier
+        // lock acquisition, so a conversation deleted in the gap (another
+        // session's `/conversation delete`, retention pruning) reaches this
+        // read as an absent row. That is a plain deletion, not corruption —
+        // surfacing rusqlite's raw QueryReturnedNoRows here would dress a
+        // legitimate concurrent delete as an integrity-shaped refusal and
+        // send the operator hunting for tampering that never happened.
+        let (tip, tip_writer): (String, String) = conn
+            .query_row(
+                "SELECT tip_hash, writer_fingerprint FROM conversations WHERE id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("conversation `{id}` not found"))?;
 
         let mut stmt = conn.prepare(
             "SELECT conversation_id, writer_fingerprint, seq, prev_hash, user, assistant,
@@ -2364,23 +2569,29 @@ impl ConversationStore {
             let same_writer = prev.is_some_and(|p| p.writer_fingerprint == row.writer_fingerprint);
             if same_writer {
                 let p = prev.expect("same_writer implies prev");
+                // Seqs are PER-WRITER Lamport ticks: without the writer they
+                // do not even identify a row in a multi-writer history, so
+                // the diagnosis names the writer it already holds.
                 if row.seq <= p.seq {
                     anyhow::bail!(
-                        "chain violation in `{id}`: seq {} not strictly after {}",
+                        "chain violation in `{id}`: writer {} seq {} not strictly \
+                         after {}",
+                        row.writer_fingerprint,
                         row.seq,
                         p.seq
                     );
                 }
                 if row.prev_hash != p.content_hash()? {
                     anyhow::bail!(
-                        "chain violation in `{id}`: turn seq {} does not link to seq {} \
-                         (row tampered or out of order)",
+                        "chain violation in `{id}`: writer {} turn seq {} does not \
+                         link to seq {} (row tampered or out of order)",
+                        row.writer_fingerprint,
                         row.seq,
                         p.seq
                     );
                 }
             } else {
-                let genesis = genesis_hash(&id, &row.writer_fingerprint);
+                let genesis = genesis_hash(id, &row.writer_fingerprint);
                 if row.prev_hash != genesis {
                     anyhow::bail!(
                         "chain violation in `{id}`: first turn of writer {} (seq {}) does \
@@ -2393,18 +2604,100 @@ impl ConversationStore {
             prev = Some(row);
         }
 
-        // The stored tip must match the chain of the conversation row's
-        // RECORDED last writer (set at create, updated on every append in
-        // the same txn) — not whoever happens to be verifying. This keeps
-        // verify_chain writer-agnostic: a store that authored no turns in a
+        // The stored tip belongs to the conversation row's RECORDED last
+        // writer (set at create, updated on every append in the same txn) —
+        // not whoever happens to be verifying. This keeps verification
+        // writer-agnostic: a store that authored no turns in a
         // migrated/foreign conversation still verifies it correctly
-        // (adversarial-review finding N2 on #261).
-        let expected_tip = match rows.iter().rfind(|r| r.writer_fingerprint == tip_writer) {
-            Some(row) => row.content_hash()?,
-            None => genesis_hash(&id, &tip_writer),
-        };
-        if tip != expected_tip {
-            anyhow::bail!("chain violation in `{id}`: stored tip_hash does not match the chain");
+        // (adversarial-review finding N2 on #261). The final row comes from
+        // the SAME `rows` read as the walk above — one snapshot, one verdict.
+        Self::check_tip_witness(
+            id,
+            &tip,
+            &tip_writer,
+            rows.iter().rfind(|r| r.writer_fingerprint == tip_writer),
+        )
+    }
+
+    /// The §6 tip-witness comparison — the ONE owner of the witness policy
+    /// and its diagnostics, shared by [`Self::verify_conversation_chain`]
+    /// (read path) and [`Self::append_turn_full`] (write path). `final_row`
+    /// is the tip writer's last recorded turn under the caller's snapshot
+    /// (`None` = that writer has no turns, so the witness must equal its
+    /// genesis hash).
+    ///
+    /// An empty `recorded_tip` is the schema-diff backfill — absence of
+    /// evidence — and passes. A nonempty tip with an empty `tip_writer`
+    /// refuses because no write path or migration produces it; see
+    /// [`Self::verify_conversation_chain`] for the policy.
+    ///
+    /// LIMITATION, stated rather than papered over: this policy means an
+    /// attacker who can write SQL can erase the witness — blanking the ONE
+    /// `tip_hash` column — along with tampering the final turn, and the
+    /// erasure is indistinguishable from a legitimately migrated database
+    /// (whose fixture state is exactly writer-set/tip-blank) — so the tamper
+    /// passes. That is not a defect of the policy but the boundary of
+    /// the mechanism: a hash chain with no secret and no out-of-store anchor
+    /// can never bind an adversary who can rewrite the store itself (they
+    /// could equally recompute the entire chain). What the chain + witness DO
+    /// hold against is accidental mutation, careless migration, and tampering
+    /// that does not think to cover its tracks. Binding a stronger adversary
+    /// requires an anchor outside the database — #1786's provenance work is
+    /// where that boundary moves.
+    fn check_tip_witness(
+        id: &str,
+        recorded_tip: &str,
+        tip_writer: &str,
+        final_row: Option<&TurnRow>,
+    ) -> anyhow::Result<()> {
+        // A blank TIP is legitimate absence: the schema-diff backfill blanks
+        // `tip_hash` on databases predating the column while an earlier-epoch
+        // `writer_fingerprint` may hold a real value — the drifted-schema
+        // fixture in tests/store.rs hand-writes exactly that state, and the
+        // first post-migration append repairs it.
+        if recorded_tip.is_empty() {
+            return Ok(());
+        }
+        // The REVERSE has no producer: every write of `tip_hash` (create,
+        // append) writes `writer_fingerprint` in the same statement, and no
+        // migration blanks the writer while keeping the tip. A witness hash
+        // that names no writer is evidence someone altered the witness
+        // columns themselves.
+        if tip_writer.is_empty() {
+            anyhow::bail!(
+                "chain violation in `{id}`: the conversation records a tip witness \
+                 but no writer to attribute it to — a state no newt write path or \
+                 migration produces. The witness columns themselves appear \
+                 altered; rows are left exactly as found."
+            );
+        }
+        match final_row {
+            Some(row) => {
+                if recorded_tip != row.content_hash()? {
+                    anyhow::bail!(
+                        "chain violation in `{id}`: the tip witness disagrees with \
+                         writer `{tip_writer}` at its final turn (seq {}). The \
+                         per-turn links do not cover the final turn — nothing \
+                         chains onto it — so this check cannot localize the \
+                         alteration further: an altered final turn, an altered \
+                         witness, and deleted trailing turns all produce exactly \
+                         this disagreement. Rows are left exactly as found.",
+                        row.seq
+                    );
+                }
+            }
+            None => {
+                if recorded_tip != genesis_hash(id, tip_writer) {
+                    anyhow::bail!(
+                        "chain violation in `{id}`: the tip witness names writer \
+                         `{tip_writer}`, which has no recorded turns, yet does not \
+                         equal that writer's genesis hash. An altered witness, \
+                         altered writer attribution, and deletion of that \
+                         writer's turns all produce exactly this state; rows are \
+                         left exactly as found."
+                    );
+                }
+            }
         }
         Ok(())
     }

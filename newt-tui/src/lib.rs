@@ -7378,7 +7378,22 @@ pub(crate) fn prepare_conversation_restore(
     persona_store: &PersonaStore,
     id: &str,
 ) -> anyhow::Result<PreparedConversationRestore> {
-    let record = store.load(id)?;
+    // Integrity gate (#1785): the record that becomes the model's context is
+    // verified and materialized by ONE store operation, from one SQLite read
+    // snapshot — `load_verified`, never verify-then-load. Two separate calls
+    // would verify one database state and hand back another: a legitimate
+    // concurrent append between them reads as corruption, and a real
+    // corruption between them reads as clean. Restore is the moment history
+    // is about to become the model's context, which is exactly when silently
+    // trusting an unverified record would do its damage; it fails the restore
+    // while the session is still entirely on the outgoing conversation, the
+    // same contract the prompt receipts already follow below.
+    //
+    // A failure REFUSES the restore and nothing else: no repair, no re-chain,
+    // no deletion — the rows stay readable and the error carries the
+    // per-turn or tip-witness diagnosis so the damage can be examined rather
+    // than papered over.
+    let record = store.load_verified(id)?;
     // Test seam modelling the exact P0 hazard: the ROW loads, and a LATER
     // validation fails. Placed after `load` on purpose — a seam before it would
     // only re-prove what a load-only preflight already caught.
