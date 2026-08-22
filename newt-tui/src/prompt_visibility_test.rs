@@ -10,7 +10,7 @@ use crate::permissions::{
     permission_question, prompt_permission_choice, PermissionPromptState, PromptPermissionGate,
 };
 use newt_core::caveats::{Caveats, CountBound, Scope};
-use newt_core::tty::{LineCaps, Sink, Spinner};
+use newt_core::tty::{LineCaps, Sink, Spinner, MODAL_INPUT_GLYPH};
 use newt_core::{DenialKind, PermissionGate as _, PermissionRequest};
 
 const CHILD_TEST: &str = "prompt_visibility_test::prompt_scenario_child";
@@ -321,8 +321,11 @@ fn a_permission_prompt_is_visible_and_survives_a_live_spinner() {
     );
 
     let visible_tail = window.trim_end_matches(|c: char| c.is_whitespace());
+    // The input line ends with the modal chevron the user types behind. Assert
+    // against the production glyph itself (not a hardcoded `>`) so this
+    // visibility check tracks `MODAL_INPUT_GLYPH` and can't drift from it.
     assert!(
-        visible_tail.ends_with('>'),
+        visible_tail.ends_with(MODAL_INPUT_GLYPH.trim_end()),
         "menu missing before input\nscreen={screen:?}"
     );
 }
