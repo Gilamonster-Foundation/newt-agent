@@ -220,7 +220,59 @@ stays unwitnessed; if anyone else appends, step 3 rescues the recorded tip
 writer only. Keyless witnesses beside the data; the boundary moves with
 out-of-store anchors (agent-frame), not here.
 
-## 5b. Compaction seals — reversibility, at a grain the record can express
+## 5b. Compaction reversibility — SUPERSEDED, see 5b.0
+
+### 5b.0 STOP: most of this already exists
+
+r5 was reviewed (32 findings) and one of them is worth more than all the
+rest: **a content-addressed store of the verbatim elided span already
+ships**, and this spec spent three design rounds rebuilding it badly.
+
+`SpillStore` + `SpillProvenance::CompactionSpan` (`agentic/content_spill.rs`,
+`agentic/compress.rs:1033`) already:
+
+* stores the **verbatim elided span**, content-addressed — the CID is a pure
+  function of the content;
+* redacts on store (the same closed table `spill:` uses);
+* dedups idempotently and **fails closed** on a CID present with different
+  bytes (`SpillError::IntegrityViolation`);
+* advertises the handle inside the summary body, so it lands in the turn's
+  `user` field — which is **inside the canonical encoding**, making the
+  citation tamper-evident already;
+* resolves through `memory_fetch("compaction:<cid>")`.
+
+Its own comment states this spec's goal outright: *"The summary is demoted
+from sole replacement to a catalog card over a retrievable span."*
+
+**This is strictly stronger than anything §5b designed.** Seals recovered
+turn REFERENCES; the span recovers the BYTES. And it dissolves the problem
+that killed r4 and shaped r5: a mid-turn cut is fine, because a verbatim
+span expresses any cut. The turn-alignment rule (§5b.1) exists only because
+turn ids cannot express a mid-turn cut — with the span, it is unnecessary.
+
+**Two gaps remain, and they are the whole job:**
+
+1. `SessionSpillStore` is *"in-memory, session-scoped, discarded at session
+   end"* — so reversibility does not survive a restart. A **durable,
+   content-addressed home for compaction spans** is the actual missing
+   piece.
+2. The Summarizing provider — the ONLY path that persists a summary — passes
+   `compaction_store: None` (`memory.rs:1238`), so on that path no span is
+   created at all.
+
+**On storing a rendering.** §5b.7 argued that storing wire messages makes a
+rendering authoritative, which is backwards. That objection does not apply
+here: the span is not a competing record of the conversation, it is a
+**receipt for a lossy transformation** — evidence of what was consumed. The
+turn rows remain the authority. A receipt records what was rendered; it does
+not claim to be the thing rendered.
+
+Everything below is retained as the record of what was tried and why it
+failed. It is NOT the plan.
+
+---
+
+## 5b (superseded). Compaction seals — reversibility, at a grain the record can express
 
 **The insight this section is built on:** a conversation window is derived
 from a previous window, and if that derivation is recorded, compaction
