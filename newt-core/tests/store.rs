@@ -3254,6 +3254,8 @@ fn append_refuses_a_derived_row_that_also_claims_tool_activity() {
     store
         .verify_chain(&id)
         .expect("a refused append must not have written a bricking row");
+}
+
 // =========================================================================
 // #1786 Phase B — per-writer tip witnesses (spec §5)
 // =========================================================================
