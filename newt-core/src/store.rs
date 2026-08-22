@@ -179,7 +179,7 @@ pub use fts::sanitize_fts5_query;
 
 mod turn_chain;
 use turn_chain::{
-    genesis_hash, insert_turn_row, last_turn, next_tick, turn_row_from_sql, TurnRow,
+    genesis_hash, insert_turn_row, last_turn, next_tick, turn_at_seq, turn_row_from_sql, TurnRow,
     TURN_ENCODING_VERSION_CURRENT,
 };
 
@@ -1149,20 +1149,81 @@ impl ConversationStore {
             // bad turn" to locate — the message says what it can prove.)
             // Flattened (not `.context()`) for the same Display-visibility
             // reason as `load_verified`: callers render these with `{e}`.
-            Self::check_tip_witness(
+            let tip_writer_final = last_turn(&tx, &id, &tip_writer)?;
+            Self::check_tip_witness(&id, &recorded_tip, &tip_writer, tip_writer_final.as_ref())
+                .map_err(|e| {
+                    // "could not be confirmed", not "disagrees": the inner error
+                    // may also be a cannot-compute (an unknown encoding_version
+                    // refuses hashing on an intact record) — the wrapper must
+                    // stay accurate for both.
+                    anyhow::anyhow!(
+                        "refusing the append -- the recorded chain tip could not be \
+                         confirmed, so new work must not extend that tip: {e:#}"
+                    )
+                })?;
+
+            // #1786 §5 step 3 — witness RELOCATION on handoff: when a
+            // different writer is about to take the conversations-row tip
+            // and the outgoing writer has no per-writer witness yet, the
+            // just-verified witness is copied down BEFORE the update below
+            // overwrites it. Without this, the first post-migration handoff
+            // append destroys the only witness pinning the outgoing writer's
+            // final turn — one statement after proving it correct. This is
+            // relocation of CHECKED evidence, not backfill-from-rows (a
+            // witness computed from the rows it witnesses agrees by
+            // construction — the vacuous-green pattern, which stays banned).
+            if tip_writer != self.writer_fingerprint {
+                if let Some(final_row) = tip_writer_final.as_ref() {
+                    tx.execute(
+                        "INSERT INTO writer_tips
+                           (conversation_id, writer_fingerprint, tip_hash, tip_seq)
+                         VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT (conversation_id, writer_fingerprint) DO NOTHING",
+                        rusqlite::params![id, tip_writer, recorded_tip, final_row.seq],
+                    )?;
+                }
+            }
+        }
+
+        // #1786 §5 step 1 — the appending writer's OWN witness, seq-aware,
+        // checked BEFORE its last row is trusted as the chain tip. Without
+        // this, a tamper of a non-tip writer's final turn is laundered — and
+        // its only evidence overwritten by the upsert below — the moment that
+        // writer appends again. Absence is skip (the writer predates the
+        // table); a LOWER tip_seq is a stale-but-honest witness (a rolled-back
+        // binary appended without maintaining writer_tips) verified against
+        // the row it actually pins and repaired by the upsert below.
+        let own_last = last_turn(&tx, &id, &self.writer_fingerprint)?;
+        let own_witness: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT tip_hash, tip_seq FROM writer_tips
+                  WHERE conversation_id = ?1 AND writer_fingerprint = ?2",
+                rusqlite::params![id, self.writer_fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((tip_hash, tip_seq)) = own_witness {
+            let final_seq = own_last.as_ref().map(|r| r.seq).unwrap_or(0);
+            let fetched;
+            let row_at_seq: Option<&TurnRow> =
+                if own_last.as_ref().is_some_and(|r| r.seq == tip_seq) {
+                    own_last.as_ref()
+                } else {
+                    fetched = turn_at_seq(&tx, &id, &self.writer_fingerprint, tip_seq)?;
+                    fetched.as_ref()
+                };
+            Self::check_writer_tip_witness(
                 &id,
-                &recorded_tip,
-                &tip_writer,
-                last_turn(&tx, &id, &tip_writer)?.as_ref(),
+                &self.writer_fingerprint,
+                &tip_hash,
+                tip_seq,
+                final_seq,
+                row_at_seq,
             )
             .map_err(|e| {
-                // "could not be confirmed", not "disagrees": the inner error
-                // may also be a cannot-compute (an unknown encoding_version
-                // refuses hashing on an intact record) — the wrapper must
-                // stay accurate for both.
                 anyhow::anyhow!(
-                    "refusing the append -- the recorded chain tip could not be \
-                     confirmed, so new work must not extend that tip: {e:#}"
+                    "refusing the append -- this writer's own recorded witness could \
+                     not be confirmed, so new work must not chain past it: {e:#}"
                 )
             })?;
         }
@@ -1170,8 +1231,8 @@ impl ConversationStore {
         // The §6 content chain: hash the canonical encoding of this writer's
         // previous turn (re-derived from the row itself, so a drifted
         // `tip_hash` column can never poison the chain).
-        let prev_hash = match last_turn(&tx, &id, &self.writer_fingerprint)? {
-            Some(prev) => prev.content_hash()?,
+        let prev_hash = match own_last {
+            Some(ref prev) => prev.content_hash()?,
             None => genesis_hash(&id, &self.writer_fingerprint),
         };
 
@@ -1191,14 +1252,25 @@ impl ConversationStore {
             encoding_version: TURN_ENCODING_VERSION_CURRENT,
         };
         insert_turn_row(&tx, &row)?;
-        // Activity tick + chain tip move together; updated_at_claim is a
-        // display claim only (§6) — nothing orders by it.
+        // Activity tick + chain tip + per-writer witness move together;
+        // updated_at_claim is a display claim only (§6) — nothing orders by
+        // it. The two witnesses are written in ONE transaction, which is why
+        // read-path divergence between them (at the same seq) has no
+        // legitimate producer.
+        let row_hash = row.content_hash()?;
+        tx.execute(
+            "INSERT INTO writer_tips (conversation_id, writer_fingerprint, tip_hash, tip_seq)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (conversation_id, writer_fingerprint)
+             DO UPDATE SET tip_hash = excluded.tip_hash, tip_seq = excluded.tip_seq",
+            rusqlite::params![id, self.writer_fingerprint, row_hash, tick],
+        )?;
         tx.execute(
             "UPDATE conversations
                 SET writer_fingerprint = ?2, activity_tick = ?3, tip_hash = ?4,
                     updated_at_claim = ?5
               WHERE id = ?1",
-            rusqlite::params![id, self.writer_fingerprint, tick, row.content_hash()?, now],
+            rusqlite::params![id, self.writer_fingerprint, tick, row_hash, now],
         )?;
         tx.commit()?;
         Ok(())
@@ -2707,7 +2779,110 @@ impl ConversationStore {
             &tip,
             &tip_writer,
             rows.iter().rfind(|r| r.writer_fingerprint == tip_writer),
-        )
+        )?;
+
+        // #1786 §5 — per-writer witnesses, both directions. (Agreement
+        // between the conversations-row tip and writer_tips needs no third
+        // check: at equal seq, each is independently compared against the
+        // same row's hash, so divergence between them cannot survive both.)
+        let mut witness_stmt = conn.prepare(
+            "SELECT writer_fingerprint, tip_hash, tip_seq FROM writer_tips
+              WHERE conversation_id = ?1",
+        )?;
+        let witnesses = witness_stmt
+            .query_map([&id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (writer, tip_hash, tip_seq) in &witnesses {
+            let final_seq = rows
+                .iter()
+                .rfind(|r| &r.writer_fingerprint == writer)
+                .map(|r| r.seq);
+            match final_seq {
+                Some(final_seq) => {
+                    let row_at = rows
+                        .iter()
+                        .find(|r| &r.writer_fingerprint == writer && r.seq == *tip_seq);
+                    Self::check_writer_tip_witness(
+                        id, writer, tip_hash, *tip_seq, final_seq, row_at,
+                    )?;
+                }
+                None => {
+                    // A witness for a writer with no turns: legitimate ONLY
+                    // as a genesis witness (a zero-turn create/import shape).
+                    // Anything else means either the writer's turns were all
+                    // deleted or the witness was planted.
+                    if tip_hash != &genesis_hash(id, writer) || *tip_seq != 0 {
+                        anyhow::bail!(
+                            "chain violation in `{id}`: a witness exists for writer \
+                             {writer}, which has no recorded turns, and it is not \
+                             that writer's genesis witness — either the writer's \
+                             turns were deleted or the witness was planted. Rows \
+                             are left exactly as found."
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The #1786 §5 per-writer witness verdict — the ONE owner of the
+    /// seq-aware semantics, shared by the append path (a writer checking its
+    /// OWN witness before chaining) and the read path (verification checking
+    /// every writer's witness). `row_at_tip_seq` is the writer's turn at the
+    /// seq the witness names, under the caller's snapshot.
+    ///
+    /// Three verdicts (`tip_seq` vs the writer's final seq):
+    /// * equal — the witness pins the final turn; hash must match.
+    /// * LOWER — stale but honest: a rolled-back binary appended without
+    ///   maintaining `writer_tips`. The witness still pins the interior turn
+    ///   it names, so it is verified against THAT row — evidence is spent,
+    ///   not discarded — and the writer's next append under a current binary
+    ///   repairs it. Not a violation: without the seq column, stale would be
+    ///   indistinguishable from tampered and re-upgrading after a rollback
+    ///   would refuse legitimate history.
+    /// * HIGHER — rows were deleted out from under the witness: violation.
+    fn check_writer_tip_witness(
+        id: &str,
+        writer: &str,
+        tip_hash: &str,
+        tip_seq: i64,
+        final_seq: i64,
+        row_at_tip_seq: Option<&TurnRow>,
+    ) -> anyhow::Result<()> {
+        if tip_seq > final_seq {
+            anyhow::bail!(
+                "chain violation in `{id}`: writer {writer}'s witness pins seq \
+                 {tip_seq}, past its last recorded turn (seq {final_seq}) — turns \
+                 were deleted out from under the witness. Rows are left exactly \
+                 as found."
+            );
+        }
+        match row_at_tip_seq {
+            Some(row) => {
+                if tip_hash != row.content_hash()? {
+                    anyhow::bail!(
+                        "chain violation in `{id}`: writer {writer}'s witness \
+                         disagrees with its turn at seq {tip_seq}. The per-turn \
+                         links do not cover a writer's final turn, so this check \
+                         cannot localize the alteration further. Rows are left \
+                         exactly as found."
+                    );
+                }
+            }
+            None => anyhow::bail!(
+                "chain violation in `{id}`: writer {writer}'s witness pins seq \
+                 {tip_seq}, but no such turn exists. Rows are left exactly as \
+                 found."
+            ),
+        }
+        Ok(())
     }
 
     /// The §6 tip-witness comparison — the ONE owner of the witness policy
@@ -3641,6 +3816,24 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              writer_fingerprint TEXT PRIMARY KEY,
              last_tick          INTEGER NOT NULL
          );
+         -- #1786 §5: per-writer tip witnesses. Each writer's chain pins every
+         -- turn EXCEPT its last (nothing chains onto a final turn), and the
+         -- conversations-row witness pins only the recorded tip writer — so in
+         -- a multi-writer history the other writers' final turns were pinned by
+         -- nothing (#1794 residual 2). tip_seq names the turn the witness pins:
+         -- an equal-seq hash mismatch is a violation, a LOWER tip_seq is a
+         -- stale-but-honest witness (a rolled-back binary appended without
+         -- maintaining this table) verified at its own seq and repaired by the
+         -- writer's next append, a HIGHER tip_seq means rows were deleted.
+         -- A missing row is absence of evidence (the writer predates the
+         -- table) — never backfilled from the turns it would witness.
+         CREATE TABLE IF NOT EXISTS writer_tips (
+             conversation_id    TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+             writer_fingerprint TEXT NOT NULL,
+             tip_hash           TEXT NOT NULL,
+             tip_seq            INTEGER NOT NULL,
+             PRIMARY KEY (conversation_id, writer_fingerprint)
+         );
          CREATE INDEX IF NOT EXISTS idx_conversations_ws_tick
              ON conversations (workspace_key, activity_tick);
          CREATE INDEX IF NOT EXISTS idx_prompt_receipts_conversation_order
@@ -4268,6 +4461,19 @@ fn import_one_record(
         tx.execute(
             "UPDATE conversations SET activity_tick = ?2, tip_hash = ?3 WHERE id = ?1",
             rusqlite::params![record.id, last_tick, prev_hash],
+        )?;
+        // #1786 §5: the import writes the per-writer witness too — it is a
+        // fresh producer writing rows in a transaction that already computed
+        // every hash, so "the writer predates the table" is false here, and
+        // absence would silently reopen the multi-writer hole for every
+        // imported conversation the moment the operator's fingerprint later
+        // changes (the exact writer-handoff motivation of #1794 residual 2).
+        tx.execute(
+            "INSERT INTO writer_tips (conversation_id, writer_fingerprint, tip_hash, tip_seq)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (conversation_id, writer_fingerprint)
+             DO UPDATE SET tip_hash = excluded.tip_hash, tip_seq = excluded.tip_seq",
+            rusqlite::params![record.id, writer_fingerprint, prev_hash, last_tick],
         )?;
     }
     tx.commit()?;
