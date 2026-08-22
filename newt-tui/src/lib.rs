@@ -7129,7 +7129,9 @@ where
     // rebuilds `[summary] + [turns from the trigger on]` — the same working
     // set the live session kept.
     if let Some(summary) = compaction {
-        store.append_turn_full(conversation_id, &summary, "", &[], &[], None, None)?;
+        // Sources stay empty until the producer plumbing lands (#1786 spec
+        // §8, Phase C): ids flow from the store post-save, one cycle late.
+        store.append_turn_full(conversation_id, &summary, "", &[], &[], &[], None, None)?;
     }
     // 17.6: persist the turn's tool events and the backend-reported token
     // actuals. `usage` is what `chat_complete` returned — input = largest
@@ -7142,6 +7144,8 @@ where
         reply,
         events,
         phantom_reaches,
+        // A model turn is witnessed, never derived: empty sources always.
+        &[],
         usage.map(|u| u.input_tokens),
         usage.map(|u| u.output_tokens),
     )?;

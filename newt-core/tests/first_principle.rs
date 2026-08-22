@@ -48,10 +48,13 @@ use newt_core::{ConversationStore, PhantomReach, PhantomResolution};
 /// Trajectory, reconciled with the staged plan (#1785 → #1786 → #1787):
 /// the suite landed at 3 (issue #1785's original acceptance text predates the
 /// third law and said "lower to 1" — superseded by this note). #1785 took
-/// 3 → 2. #1786 retires BOTH remaining laws in one v2-encoding bump
-/// (provenance sources + hashing `phantom_reaches`), taking 2 → 0. #1787 is
-/// downstream diagnostics built on those fixes, not a law in this file.
-const KNOWN_VIOLATIONS: usize = 2;
+/// 3 → 2. #1786 Phase A (the v2 encoding) hashed `phantom_reaches` and
+/// landed `sources`, taking 2 → 1; Phase C (the producer plumbing) retires
+/// the last law — `derived_records_name_their_sources`, strengthened per the
+/// spec's §10.1 to drive the REAL compaction producer, never the Debug-grep
+/// this file originally carried — taking 1 → 0. #1787 is downstream
+/// diagnostics built on those fixes, not a law in this file.
+const KNOWN_VIOLATIONS: usize = 1;
 
 fn store(root: &std::path::Path, workspace: &std::path::Path) -> ConversationStore {
     ConversationStore::new(root, workspace, 100).unwrap()
@@ -163,27 +166,21 @@ fn tampering_is_detectable() {
 /// only today's. It tampers with a non-covered column and requires the chain
 /// to notice.
 ///
-/// VIOLATION: `turns.phantom_reaches` is stored per row and excluded from the
-/// §6 canonical encoding (`store.rs:3227`, "NOT hashed"). The rationale
-/// recorded at `store.rs:1062` is "telemetry, not provenance", with the
-/// exclusion explicitly deferred rather than settled: "folding it into the
-/// hash would require a v2 encoding bump — a deliberate follow-up, not this
-/// additive change."
+/// FIXED (#1786 Phase A): the v2 canonical encoding hashes
+/// `phantom_reaches` (and `sources`), so erasing the record of newt
+/// substituting a tool for the one the model named now breaks the chain.
+/// The original violation: the column was stored per row and excluded from
+/// the v1 encoding as "telemetry, not provenance" — but
+/// `PhantomResolution::Rewrite` is the derivation edge between what was
+/// emitted and what was executed, and `Unknown` is the fabrication ledger;
+/// both are provenance someone will rely on.
 ///
-/// The deferral was reasonable; the classification is not. `PhantomReach`
-/// records that the model reached for a tool, and `PhantomResolution::Rewrite`
-/// records that newt SUBSTITUTED A DIFFERENT TOOL for the one the model named.
-/// That is the derivation edge between what was emitted and what was executed
-/// — the only record of an intervention the harness made on the model's
-/// intent. `Unknown` is the fabrication ledger: where the model invented a
-/// capability. Both are records of something that happened which someone will
-/// later rely on, which is provenance, not measurement.
-///
-/// It is also written in the SAME transaction as the turn it belongs to, so
-/// append-only was never the obstacle to hashing it. The only cost was the v2
-/// bump — a cost the provenance fix already pays.
+/// HONEST RESIDUE (spec §3.2), so this green is never read as retroactive:
+/// pre-bump v1 rows keep their reaches outside the hash FOREVER — their
+/// encoding arm cannot change without rewriting history. This law covers
+/// rows the current write path produces (v2); the v1 residue is permanent
+/// and documented, not fixed.
 #[test]
-#[ignore = "FIRST-PRINCIPLE VIOLATION — turns.phantom_reaches is stored in the row but excluded from the chain"]
 fn the_whole_record_is_covered_by_the_chain() {
     let root = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
@@ -197,7 +194,16 @@ fn the_whole_record_is_covered_by_the_chain() {
         active_context_features: vec!["scheduled".to_string()],
     };
     store
-        .append_turn_full(&id, "find the thing", "done", &[], &[reach], None, None)
+        .append_turn_full(
+            &id,
+            "find the thing",
+            "done",
+            &[],
+            &[reach],
+            &[],
+            None,
+            None,
+        )
         .unwrap();
     store.verify_chain(&id).expect("untampered chain verifies");
 
