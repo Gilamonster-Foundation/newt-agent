@@ -3209,3 +3209,49 @@ fn legacy_import_pins_v1_and_mixed_epoch_verifies() {
     let rec = store.load_verified("1000-conv-mixed").unwrap();
     assert_eq!(rec.turns.len(), 3);
 }
+
+/// #1786 §3: the derived-row shape invariant must fail closed on the WRITE
+/// path too, not only at verification.
+///
+/// `verify_chain` refuses a row carrying both derivation (non-empty sources)
+/// and tool activity, and `append_turn_full` validates the *shape of the ids*
+/// — but it did not enforce the invariant itself. A caller passing both
+/// therefore wrote a row that chained, witnessed, and committed, after which
+/// `verify_chain` refuses that conversation forever and the stated policy is
+/// "rows are left exactly as found" — no repair path. Phase C introduces
+/// exactly the producer that could pass both.
+///
+/// A write path that admits what verification rejects manufactures
+/// permanently unverifiable history, so the refusal belongs at the append.
+#[test]
+fn append_refuses_a_derived_row_that_also_claims_tool_activity() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store.create("shape", None).unwrap();
+    store.append_turn(&id, "u1", "a1").unwrap();
+
+    let source = "a".repeat(64);
+    let err = store
+        .append_turn_full(
+            &id,
+            "",
+            "summary",
+            &sample_events(),
+            &[],
+            std::slice::from_ref(&source),
+            None,
+            None,
+        )
+        .expect_err("a row claiming derivation AND tool activity must be refused at append")
+        .to_string();
+    assert!(
+        err.contains("derivation") && err.contains("tool activity"),
+        "the refusal must name the shape violation: {err}"
+    );
+
+    // And the refusal left nothing behind: the conversation still verifies.
+    store
+        .verify_chain(&id)
+        .expect("a refused append must not have written a bricking row");
+}

@@ -1088,6 +1088,20 @@ impl ConversationStore {
         let now = (self.claim_clock)();
         let events_json = serde_json::to_string(events)?;
         let phantom_reaches_json = serde_json::to_string(phantom_reaches)?;
+        // #1786 §3 — the derived-row shape invariant, enforced HERE and not
+        // only at verification. `verify_chain` refuses a row carrying both
+        // derivation and tool activity; without the same refusal at the
+        // append, a caller could commit one and brick the conversation
+        // permanently (the read path repairs nothing by design). A write
+        // path must never admit what verification rejects.
+        if !sources.is_empty() && !(events.is_empty() && phantom_reaches.is_empty()) {
+            anyhow::bail!(
+                "refusing the append -- this turn claims derivation (non-empty \
+                 sources) AND tool activity; a derived row is harness-minted and \
+                 carries neither events nor phantom reaches, and a row with both \
+                 could never be verified again"
+            );
+        }
         let sources_json = canonical_sources_json(sources)?;
         let conn = self.lock_conn();
         let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
