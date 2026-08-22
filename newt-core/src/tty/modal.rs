@@ -7,6 +7,12 @@ use super::PromptWindow;
 
 pub const MODAL_CONTROL_HINT: &str = "Esc=back · Ctrl-C/Ctrl-D=exit";
 
+/// The input glyph a modal draws its answer line behind. Shares the chevron
+/// morphology of the chat prompt (`newt_tui::prompt`) so a modal reads as the
+/// same input surface the user already types at, rather than a second style of
+/// prompt stacked under it.
+pub const MODAL_INPUT_GLYPH: &str = "❯ ";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptLine {
     Line(String),

@@ -10,7 +10,7 @@ use crate::mint_operating_key;
 use newt_core::agentic::{newt_line, print_newt};
 use newt_core::tty::{
     modal_prompt_controls, read_prompt_window_line, ControlReader, PromptLine as ModalLine,
-    PromptWindow, Terminal, MODAL_CONTROL_HINT,
+    PromptWindow, Terminal, MODAL_CONTROL_HINT, MODAL_INPUT_GLYPH,
 };
 pub(crate) use newt_core::PermissionAction as PromptChoice;
 use newt_core::{Action, HumanQuestionOutcome, Question};
@@ -188,7 +188,7 @@ pub(crate) fn prompt_permission_choice(
     w: &PromptWindow,
     question: &Question<PromptChoice>,
 ) -> PromptChoice {
-    let prompt = format!("{}\n> ", question.terminal_text());
+    let prompt = format!("{}\n{MODAL_INPUT_GLYPH}", question.terminal_text());
     match read_prompt_window_line(w, &prompt) {
         Ok(ModalLine::Line(answer)) => question.parse(&answer).unwrap_or(PromptChoice::Deny),
         Ok(ModalLine::Back) => PromptChoice::Back,
@@ -223,7 +223,8 @@ pub(crate) fn prompt_user_input(w: &PromptWindow, question: &str) -> io::Result<
         actions: Vec::new(),
         note: Some(MODAL_CONTROL_HINT.into()),
     };
-    let result = read_prompt_window_line(w, &format!("{}\n> ", form.terminal_text()))?;
+    let result =
+        read_prompt_window_line(w, &format!("{}\n{MODAL_INPUT_GLYPH}", form.terminal_text()))?;
     let ModalLine::Line(line) = &result else {
         return Ok(result);
     };
