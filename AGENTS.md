@@ -105,11 +105,13 @@ An `agent-identity.toml` email overrides the newt row only. That file is
 newt's identity, and it cannot reassign another harness's address.
 
 Example — a newt session that moved through four distinct model/harness
-pairs before landing one commit, each credited to the harness that ran it:
+pairs before landing one commit, each credited to the harness that ran it,
+under the operator who ran the session:
 
 ```
 Harness: newt-agent v0.8.0 (a3f9c21b4d5e) | Model: GPT-5.6 Sol | Operator: Shawn Hartsock
 
+Co-authored-by: Shawn Hartsock <33919+hartsock@users.noreply.github.com>
 Co-authored-by: GPT-5.6 Sol (v0.8.0 a3f9c21b4d5e) <309460085+newt-agent@users.noreply.github.com>
 Co-authored-by: Claude Opus 4.8 (Claude Code v2.1.239) <noreply@anthropic.com>
 Co-authored-by: GPT-5.3-Codex (Codex CLI v0.47.0) <codex@openai.com>
@@ -122,6 +124,26 @@ name is omitted when the email already names it.** `<…+newt-agent@…>` identi
 `newt-agent` in the qualifier is noise; what remains is only what the address
 does not already tell you, which for `newt-agent crew` is `crew`. A foreign
 harness keeps its full name, because its address does not spell it out.
+
+**The human operator gets a by-line too, read from git.** The models are
+co-authors, not the only ones — the person who ran the session is credited
+under their OWN name and email, never the agent account. That pair comes from
+the host git identity, `user.name` + `user.email`, via
+`agent_identity::host_operator_identity`, with an explicitly configured
+`operator` / `operator_email` in `agent-identity.toml` winning when both are
+set. `CommitAttribution::operator_trailer` renders it:
+
+```
+Co-authored-by: Shawn Hartsock <33919+hartsock@users.noreply.github.com>
+```
+
+Two rules hold it honest. **Name and email move as a matched pair** — a
+configured name is never welded onto a host email it has nothing to do with.
+And **an operator email is never invented**: when no real one is known the
+by-line is omitted entirely rather than manufactured, so a missing operator
+credit means "unknown", not "nobody". Operator attribution is independent of
+model attribution; neither substitutes for the other, and a commit carries
+both.
 
 Rules:
 
