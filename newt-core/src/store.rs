@@ -2625,6 +2625,17 @@ impl ConversationStore {
         // Order matters: the per-turn walk above already proved every row's
         // stored bytes are the appended bytes, so the checks below reason
         // about VERIFIED bytes, not attacker-writable ones.
+        //
+        // NO ORDERING RULE, deliberately (spec §5, r1 finding): membership is
+        // the whole test — a cited id may belong to a turn appearing LATER in
+        // the conversation. Cross-writer seqs are per-writer Lamport ticks,
+        // not a causal order, so an r1 seq-ordering check produced only false
+        // positives and permanently bricked legitimate conversations. Dropped.
+        // Temporal soundness of a citation is an explicit NON-CLAIM: the
+        // record proves what was reachable, not when the producer knew it.
+        // What IS unconstructible is self/mutual citation — sources ride in
+        // the content-id preimage, so either would need a BLAKE3 fixed point
+        // (see `TurnRow::content_id`).
         let content_ids: std::collections::HashSet<String> =
             rows.iter().map(|r| r.content_id()).collect();
         for row in &rows {
@@ -3862,6 +3873,20 @@ const EXPECTED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
 /// Compare `PRAGMA table_info` against [`EXPECTED_COLUMNS`] and `ALTER TABLE
 /// ... ADD COLUMN` any additive drift. Removed/renamed columns are NOT
 /// handled here — destructive migrations get their own explicit step.
+/// Is `s` a content id — exactly 64 lowercase hex characters (#1786 spec §2)?
+///
+/// ONE definition, deliberately shared by both sides of the sources contract:
+/// [`canonical_sources_json`] (the write path, which refuses a bad reference
+/// at append) and [`parse_canonical_sources`] (verification, which refuses
+/// bad stored bytes). Two copies of this predicate could drift apart, and a
+/// write path that admits what verification rejects writes rows that can
+/// never verify again — so the shape has a single owner.
+fn is_content_id(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Parse a stored `sources` column, REFUSING anything but the canonical
 /// byte form `canonical_sources_json` produces: compact JSON array of
 /// 64-lowercase-hex ids, sorted, deduplicated. The column is hashed, so its
@@ -3874,11 +3899,7 @@ fn parse_canonical_sources(stored: &str) -> anyhow::Result<Vec<String>> {
     let ids: Vec<String> = serde_json::from_str(stored)
         .map_err(|e| anyhow::anyhow!("not a JSON string array: {e}"))?;
     for id in &ids {
-        let ok = id.len() == 64
-            && id
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        if !ok {
+        if !is_content_id(id) {
             anyhow::bail!("`{id}` is not a 64-lowercase-hex content id");
         }
     }
@@ -3905,11 +3926,7 @@ fn canonical_sources_json(sources: &[String]) -> anyhow::Result<String> {
         return Ok("[]".to_string());
     }
     for id in sources {
-        let ok = id.len() == 64
-            && id
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        if !ok {
+        if !is_content_id(id) {
             anyhow::bail!(
                 "refusing the append — source reference `{id}` is not a content id \
                  (64 lowercase hex); a citation that cannot resolve must not be recorded"
