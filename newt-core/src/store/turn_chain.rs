@@ -329,6 +329,27 @@ pub(super) fn last_turn(
         .optional()?)
 }
 
+/// One writer's turn at an exact seq — the row a per-writer witness pins
+/// (#1786 §5). `None` when no such turn exists.
+pub(super) fn turn_at_seq(
+    conn: &Connection,
+    conversation_id: &str,
+    writer_fingerprint: &str,
+    seq: i64,
+) -> anyhow::Result<Option<TurnRow>> {
+    Ok(conn
+        .query_row(
+            "SELECT conversation_id, writer_fingerprint, seq, prev_hash, user, assistant,
+                    events, tokens_in, tokens_out, ts_claim, encoding_version,
+                    phantom_reaches, sources
+               FROM turns
+              WHERE conversation_id = ?1 AND writer_fingerprint = ?2 AND seq = ?3",
+            rusqlite::params![conversation_id, writer_fingerprint, seq],
+            turn_row_from_sql,
+        )
+        .optional()?)
+}
+
 /// Allocate the next per-writer Lamport tick (strictly monotonic — §6 floor).
 ///
 /// Must run inside the caller's `BEGIN IMMEDIATE` transaction so the
