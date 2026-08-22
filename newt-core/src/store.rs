@@ -1139,6 +1139,20 @@ impl ConversationStore {
             )
             .optional()?
             .ok_or_else(|| anyhow::anyhow!("conversation `{id}` not found"))?;
+        // PHYSICAL ORDER vs SPEC ORDER. Spec §5 lists the write path as
+        // (1) the appending writer's own witness, (2) the conversations-row
+        // tip, (3) relocation, (4) insert + upserts. The code below runs
+        // 2 -> 3 -> 1 -> 4, because relocation needs `tip_writer_final`,
+        // which the tip check already computed.
+        //
+        // The orders are equivalent where it matters: all four steps share
+        // ONE `Immediate` transaction, and every check bails with `?`, so a
+        // failure at any step rolls the whole append back and nothing partial
+        // is ever observable. The accept/reject set is therefore identical —
+        // both orders refuse if EITHER witness fails, because both run before
+        // the commit. The only difference is which diagnostic surfaces first
+        // when more than one witness is simultaneously bad, and each message
+        // names the witness it is about.
         if !recorded_tip.is_empty() {
             // Shared policy + diagnostics: `check_tip_witness` owns both, so
             // the write path and the read path cannot drift apart. The added
