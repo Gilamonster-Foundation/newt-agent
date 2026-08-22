@@ -3870,9 +3870,6 @@ const EXPECTED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
-/// Compare `PRAGMA table_info` against [`EXPECTED_COLUMNS`] and `ALTER TABLE
-/// ... ADD COLUMN` any additive drift. Removed/renamed columns are NOT
-/// handled here — destructive migrations get their own explicit step.
 /// Is `s` a content id — exactly 64 lowercase hex characters (#1786 spec §2)?
 ///
 /// ONE definition, deliberately shared by both sides of the sources contract:
@@ -3951,6 +3948,9 @@ fn canonical_sources_json(sources: &[String]) -> anyhow::Result<String> {
     Ok(out)
 }
 
+/// Compare `PRAGMA table_info` against [`EXPECTED_COLUMNS`] and `ALTER TABLE
+/// ... ADD COLUMN` any additive drift. Removed/renamed columns are NOT
+/// handled here — destructive migrations get their own explicit step.
 fn reconcile_schema(conn: &Connection) -> anyhow::Result<()> {
     for (table, expected) in EXPECTED_COLUMNS {
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
