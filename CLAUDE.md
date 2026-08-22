@@ -94,6 +94,43 @@ broken call does not compile.
 If a second implementation really is warranted, say so in the PR and
 explain what the existing abstraction could not be widened to cover.
 
+## Content-addressable data structures — the concrete instance of reuse discipline
+
+The rule above says "do not add a second implementation of something that
+already exists." Here is the binding, named, so it cannot be missed:
+
+**Every data structure that is persisted, transmitted, chained, or identified
+takes its identity from `content-addressable` (v0.1.1). Hand-rolling a hash,
+digest, id, or canonical encoding is a defect.**
+
+| Use | Type |
+|---|---|
+| canonical **structured value** (record, event, manifest) | `ContentId` — CIDv1 / dag-cbor / BLAKE3 |
+| opaque **byte string** (file, payload, tool result, cache key) | `RawContentId` — CIDv1 / raw / BLAKE3 |
+| node with **causal parents** (chain or DAG link) | `MerkleNode<T>` — id over payload AND parents |
+| **storing** addressed nodes | `NodeStore` |
+| carrying a **foreign** CID without minting one | `ClassifiedCid` |
+
+`ContentId` and `RawContentId` are different identities even with identical
+digest bytes — the profile is semantic. One required method:
+`canonical_form()` deferring to `to_canonical_dagcbor` on a `Serialize` type.
+
+**Step zero for any new record type:** inventory what the crate mints and what
+this repo already has (`grep -rn "blake3::hash(\|content_addressable\|SpillStore"`),
+then invoke the `provenance-audit` skill, then design only the gap.
+
+**This rule is enforced, not just stated.** Existing hand-rolled sites are
+enumerated in a conformance ratchet whose count may only go DOWN. Prose was
+not enough: on 2026-08-22 this rule existed in four places — the reuse
+discipline above, the Authority Register's *content-addressed identity*, the
+workspace AGENTS.md, and the `provenance-audit` skill — and three design rounds
+(~70 review findings) still went into rebuilding a span store, a dag-cbor
+scheme, and a Merkle DAG that already shipped in the dependency tree.
+
+**Migration posture:** unadvertised project, no backwards compatibility owed.
+Smash the bespoke format — one importer, then one encoding — rather than carry
+a compatibility arm. Fix the mess by ratchet, never by rewrite.
+
 ## Where the rules live
 
 > Canonical home for authority doctrine: the line's **Authority Register** —
