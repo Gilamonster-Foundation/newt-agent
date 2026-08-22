@@ -173,23 +173,72 @@ Newt mechanically maintains a **multi-contributor attribution ledger**
 materially contributed to a commit gets its OWN trailer:
 
 ```
-Co-authored-by: <MODEL> (<HARNESS>) <EMAIL>
+Co-authored-by: <MODEL> (<HARNESS> v<HARNESS-VERSION>) <HARNESS-EMAIL>
 ```
 
-Example — a session that moved through four distinct model/harness pairs
-before landing one commit:
+**The harness version is part of the identity, not decoration.** The same
+model under `v0.7.6` and under `v0.8.0` is two distinct contributors, because
+what ran the work differs. `Attribution::harness_version` is captured at
+contribution time and rendered inside the `(<harness> v<version>)` qualifier
+by `Attribution::trailer` / `CommitAttribution::model_trailer`.
+
+**For newt-agent the version carries the commit it was built from.** A
+package version alone does not identify a build — every dev build between two
+releases claims the same `0.8.0`. So newt's version is
+`build_info::VERSION_WITH_COMMIT`: the semver plus the 12-character git
+commit, e.g. `0.8.0 (a3f9c21b4d5e)`. In a trailer that renders flat, without
+nesting a second set of parentheses:
 
 ```
-Co-authored-by: GPT-5.6 Sol (newt-agent) <309460085+newt-agent@users.noreply.github.com>
-Co-authored-by: Claude Opus 4.8 (Claude Code) <309460085+newt-agent@users.noreply.github.com>
-Co-authored-by: GPT-5.3-Codex (Codex CLI) <309460085+newt-agent@users.noreply.github.com>
-Co-authored-by: Nemotron (newt-agent crew) <309460085+newt-agent@users.noreply.github.com>
+Co-authored-by: <MODEL> (v0.8.0 a3f9c21b4d5e) <309460085+newt-agent@users.noreply.github.com>
 ```
+
+A build from a modified worktree is `-dirty`-suffixed, per
+`build_info::SOURCE_ID` — an honest signal that the harness that ran the work
+is not any committed revision. A foreign harness uses whatever version it
+publishes (`Claude Code v2.1.239`) and appends no commit unless it reports
+one; it never borrows newt's.
+
+**The email identifies the harness, not the model.** It is a real account
+that receives the credit, so a harness stamps its OWN address and never
+another's. Newt's address belongs to newt's own machinery; a Claude Code or
+Codex session working in this repo is a guest and signs as itself.
+
+| Harness | Attribution email |
+|---|---|
+| `newt-agent`, `newt-agent crew` — this repo's embedded `git` tool | `309460085+newt-agent@users.noreply.github.com` (`agent_identity::DEFAULT_AGENT_EMAIL`) |
+| `Claude Code` | `noreply@anthropic.com` |
+| `Codex CLI` | `codex@openai.com` |
+| anything else | that harness's own documented trailer — if it documents none, ask rather than invent one |
+
+An `agent-identity.toml` email overrides the newt row only. That file is
+newt's identity, and it cannot reassign another harness's address.
+
+Example — a newt session that moved through four distinct model/harness
+pairs before landing one commit, each credited to the harness that ran it:
+
+```
+Harness: newt-agent v0.8.0 (a3f9c21b4d5e) | Model: GPT-5.6 Sol | Operator: Shawn Hartsock
+
+Co-authored-by: GPT-5.6 Sol (v0.8.0 a3f9c21b4d5e) <309460085+newt-agent@users.noreply.github.com>
+Co-authored-by: Claude Opus 4.8 (Claude Code v2.1.239) <noreply@anthropic.com>
+Co-authored-by: GPT-5.3-Codex (Codex CLI v0.47.0) <codex@openai.com>
+Co-authored-by: Nemotron (crew v0.8.0 a3f9c21b4d5e) <309460085+newt-agent@users.noreply.github.com>
+```
+
+The first and last lines say `(v0.8.0 a3f9c21b4d5e)` and
+`(crew v0.8.0 a3f9c21b4d5e)`, not `(newt-agent v0.8.0 …)` — **the harness
+name is omitted when the email already names it.** `<…+newt-agent@…>` identifies the harness, so repeating
+`newt-agent` in the qualifier is noise; what remains is only what the address
+does not already tell you, which for `newt-agent crew` is `crew`. A foreign
+harness keeps its full name, because its address does not spell it out.
 
 Rules:
 
-- **Identify model AND harness**, e.g. `GPT-5.6 Sol (newt-agent)`, not just
-  the model name. Never a generic "AI Assistant".
+- **Identify model AND harness**, e.g. `GPT-5.3-Codex (Codex CLI v0.47.0)`,
+  not just the model name. Never a generic "AI Assistant". Under newt's own
+  address the harness half collapses to the version, per the omission rule
+  above.
 - **One trailer per contributing model/harness pair, unlimited count.** A
   `/model`, `/backend`, loadout, crew, or delegation switch mid-session ADDS
   a contributor; it never discards one already accumulated for the pending
@@ -198,19 +247,31 @@ Rules:
 - **Deduplicate identical `(model, harness, email)` identities**, preserving
   first-contribution order — do not list the same contributor three times
   because it made three writes.
-- **Default attribution email:**
-  `309460085+newt-agent@users.noreply.github.com` (the dedicated
-  `github.com/newt-agent` account's noreply address). An explicitly
-  configured `agent-identity.toml` email overrides this. Provider-specific
-  emails (`codex@openai.com`, `noreply@anthropic.com`) are NOT required or
-  used for automatic attribution — every trailer on one commit shares the
-  same configured/default email; only the model and harness vary.
+- **The email travels with the harness, not with the ledger.** Trailers on
+  one commit do NOT all share one address.
+  `AttributionLedger::record` stamps the ledger's default email and is for
+  newt's own contributions; a contributor that ran under a *foreign* harness
+  goes in via `AttributionLedger::add` with an `Attribution` carrying that
+  harness's address — `Attribution::email` is per-contributor for exactly
+  this reason.
+- **The code does not render this shape yet.** `Attribution::trailer` and
+  `CommitAttribution::model_trailer` always emit `(<harness> v<version>)` and
+  are fed `PACKAGE_VERSION`, so today newt's own trailers read
+  `(newt-agent v0.8.0)` — harness name repeated against a `+newt-agent@`
+  address, and no build commit. This section states the intended shape; the
+  renderers and their `harness_version` source are the thing to fix, not
+  this doc.
 - **This is mechanical, not a model instruction.** The embedded `git` tool
   stamps the ledger's accumulated trailers itself; do not hand-write
   `Co-authored-by` lines yourself when using it — see the per-turn "Git
   commit identity" guidance the harness already gives you. If you must shell
   out to `git` directly (bypassing the embedded tool), you get no automatic
   multi-contributor credit at all — prefer the embedded tool.
+- **If you are not the newt harness, this section is not yours to imitate.**
+  It documents what newt stamps about itself. A Claude Code, Codex, or other
+  foreign session commits with the trailer ITS OWN harness prescribes and the
+  matching address from the table above. Reading these rules and hand-writing
+  a newt-style trailer signs newt's account for work newt did not do.
 
 ### Expunge Claude sessions
 
