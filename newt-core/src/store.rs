@@ -1174,13 +1174,77 @@ impl ConversationStore {
             // construction — the vacuous-green pattern, which stays banned).
             if tip_writer != self.writer_fingerprint {
                 if let Some(final_row) = tip_writer_final.as_ref() {
-                    tx.execute(
-                        "INSERT INTO writer_tips
-                           (conversation_id, writer_fingerprint, tip_hash, tip_seq)
-                         VALUES (?1, ?2, ?3, ?4)
-                         ON CONFLICT (conversation_id, writer_fingerprint) DO NOTHING",
-                        rusqlite::params![id, tip_writer, recorded_tip, final_row.seq],
-                    )?;
+                    // The outgoing writer's existing per-writer witness, if
+                    // any, is CHECKED before anything overwrites it. A blind
+                    // `DO NOTHING` here left a stale witness in place while
+                    // the conversations-row tip moved to the incoming writer
+                    // — and because the outgoing writer never appends again,
+                    // "repaired by the next append" never arrives, so its
+                    // final turn ended up pinned by nothing (#1794 residual
+                    // 2, reopened through the rollback path).
+                    let existing: Option<(String, i64)> = tx
+                        .query_row(
+                            "SELECT tip_hash, tip_seq FROM writer_tips
+                              WHERE conversation_id = ?1 AND writer_fingerprint = ?2",
+                            rusqlite::params![id, tip_writer],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?;
+                    match existing {
+                        // No per-writer row (the migration shape): relocate
+                        // the just-verified conversations-row witness down.
+                        None => {
+                            tx.execute(
+                                "INSERT INTO writer_tips
+                                   (conversation_id, writer_fingerprint, tip_hash, tip_seq)
+                                 VALUES (?1, ?2, ?3, ?4)",
+                                rusqlite::params![id, tip_writer, recorded_tip, final_row.seq],
+                            )?;
+                        }
+                        // A witness already exists. Verify it on its own
+                        // terms FIRST — a bad one must fail the append and be
+                        // left exactly as found, never overwritten by the
+                        // advance below (that would launder the evidence).
+                        Some((existing_hash, existing_seq)) => {
+                            let fetched;
+                            let row_at: Option<&TurnRow> = if final_row.seq == existing_seq {
+                                Some(final_row)
+                            } else {
+                                fetched = turn_at_seq(&tx, &id, &tip_writer, existing_seq)?;
+                                fetched.as_ref()
+                            };
+                            Self::check_writer_tip_witness(
+                                &id,
+                                &tip_writer,
+                                &existing_hash,
+                                existing_seq,
+                                final_row.seq,
+                                row_at,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "refusing the append -- the outgoing writer's own \
+                                     recorded witness could not be confirmed, so the \
+                                     handoff must not overwrite it: {e:#}"
+                                )
+                            })?;
+                            // Valid but STALE: advance it to the tip this
+                            // very append already verified against the
+                            // outgoing writer's final row. This relocates
+                            // CHECKED evidence — `recorded_tip` comes from
+                            // the conversations row and was confirmed by
+                            // `check_tip_witness` above — rather than
+                            // recomputing a hash from the rows the witness
+                            // exists to protect (vacuous backfill, banned).
+                            if existing_seq < final_row.seq {
+                                tx.execute(
+                                    "UPDATE writer_tips SET tip_hash = ?3, tip_seq = ?4
+                                      WHERE conversation_id = ?1 AND writer_fingerprint = ?2",
+                                    rusqlite::params![id, tip_writer, recorded_tip, final_row.seq],
+                                )?;
+                            }
+                        }
+                    }
                 }
             }
         }

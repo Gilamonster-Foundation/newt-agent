@@ -3621,3 +3621,169 @@ fn witness_for_a_writer_with_no_turns_refuses_unless_genesis() {
         "a planted witness must refuse naming the writer: {err}"
     );
 }
+
+/// #1786 §5 steps 1+3 in COMPOSITION (r3 blocker): a stale-but-honest
+/// witness meeting a writer handoff.
+///
+/// Each mechanism is sound alone and each has its own test, but they cover
+/// disjoint states: `handoff_relocates_the_outgoing_writers_witness` deletes
+/// `writer_tips` entirely (the migration shape, so the INSERT has no
+/// conflict), and `stale_witness_is_accepted_and_repaired_by_the_next_append`
+/// never hands off (so the SAME writer's next append repairs it). Compose
+/// them and the outgoing writer never appends again, so "repaired by the
+/// next append" never arrives:
+///
+/// ```text
+/// A5 by current binary        writer_tips[A] = (hash(A5), 5)
+/// A6 by rolled-back binary    conversations.tip = hash(A6); writer_tips[A] untouched
+/// B  hands off                relocation INSERT hits ON CONFLICT -> DO NOTHING
+///                             conversations.tip -> B, writer_tips[A] still seq 5
+/// ```
+///
+/// A6 is A's final turn: no successor links to it, the conversations-row
+/// witness has moved to B, and A's own witness pins seq 5. It is pinned by
+/// nothing — precisely the #1794 residual 2 this phase exists to close.
+///
+/// The handoff already VERIFIED the conversation-level witness against A6,
+/// so advancing A's witness here is relocation of checked evidence, not
+/// backfill from the rows it is meant to protect.
+#[test]
+fn stale_writer_witness_is_advanced_during_handoff() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store_a = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store_a.create("handoff-stale", None).unwrap();
+    store_a.append_turn(&id, "a one", "1").unwrap();
+    let writer_a = store_a.writer_fingerprint().to_string();
+
+    let conn = raw(root.path());
+    let (h1, s1): (String, i64) = conn
+        .query_row(
+            "SELECT tip_hash, tip_seq FROM writer_tips
+              WHERE conversation_id = ?1 AND writer_fingerprint = ?2",
+            rusqlite::params![&id, &writer_a],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    // A's real final turn, then the rolled-back binary's residue: the turn
+    // and the conversations-row tip advanced, `writer_tips` did not.
+    store_a.append_turn(&id, "a two", "2").unwrap();
+    conn.execute(
+        "UPDATE writer_tips SET tip_hash = ?3, tip_seq = ?4
+          WHERE conversation_id = ?1 AND writer_fingerprint = ?2",
+        rusqlite::params![&id, &writer_a, &h1, s1],
+    )
+    .unwrap();
+    drop(store_a);
+
+    // Handoff under a current binary.
+    let store_b = reopen_as_new_writer(root.path(), workspace.path());
+    store_b.append_turn(&id, "b one", "1").unwrap();
+
+    let a_final_seq: i64 = conn
+        .query_row(
+            "SELECT MAX(seq) FROM turns WHERE conversation_id = ?1
+               AND writer_fingerprint = ?2",
+            rusqlite::params![&id, &writer_a],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let (_, witness_seq): (String, i64) = conn
+        .query_row(
+            "SELECT tip_hash, tip_seq FROM writer_tips
+              WHERE conversation_id = ?1 AND writer_fingerprint = ?2",
+            rusqlite::params![&id, &writer_a],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        witness_seq, a_final_seq,
+        "the handoff verified the conversation witness against A's final turn, \
+         so it must advance A's stale witness to that already-checked tip — \
+         otherwise A's final turn is pinned by nothing after the tip moves to B"
+    );
+
+    // The advanced witness must have teeth: mutate A's final turn.
+    conn.execute(
+        "UPDATE turns SET assistant = 'forged' WHERE conversation_id = ?1
+           AND writer_fingerprint = ?2 AND seq = ?3",
+        rusqlite::params![&id, &writer_a, a_final_seq],
+    )
+    .unwrap();
+    let err = store_b.load_verified(&id).unwrap_err().to_string();
+    assert!(
+        err.contains("chain violation"),
+        "a mutation of A's final turn must be caught after handoff: {err}"
+    );
+}
+
+/// #1786 §5 step 3 (r3 blocker, second half): the handoff must CHECK the
+/// outgoing writer's existing witness before it advances it, and a bad one
+/// must fail the append closed with the evidence left exactly as found.
+///
+/// The advance added for `stale_writer_witness_is_advanced_during_handoff`
+/// is the hazard this pins: an unconditional "advance the stale witness to
+/// the verified tip" would overwrite a TAMPERED witness with a good-looking
+/// one, destroying the only record that anything was wrong — laundering, and
+/// the exact failure the own-witness check exists to prevent on the
+/// appending side. Relocation is for CHECKED evidence only.
+#[test]
+fn corrupt_stale_writer_witness_is_not_laundered_during_handoff() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store_a = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store_a.create("handoff-corrupt", None).unwrap();
+    store_a.append_turn(&id, "a one", "1").unwrap();
+    let writer_a = store_a.writer_fingerprint().to_string();
+
+    let conn = raw(root.path());
+    let stale_seq: i64 = conn
+        .query_row(
+            "SELECT tip_seq FROM writer_tips
+              WHERE conversation_id = ?1 AND writer_fingerprint = ?2",
+            rusqlite::params![&id, &writer_a],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    // A's real final turn, then a CORRUPT witness frozen at the stale seq:
+    // the shape a rolled-back binary leaves, with the hash tampered.
+    store_a.append_turn(&id, "a two", "2").unwrap();
+    let forged = "0".repeat(64);
+    conn.execute(
+        "UPDATE writer_tips SET tip_hash = ?3, tip_seq = ?4
+          WHERE conversation_id = ?1 AND writer_fingerprint = ?2",
+        rusqlite::params![&id, &writer_a, &forged, stale_seq],
+    )
+    .unwrap();
+    drop(store_a);
+
+    let store_b = reopen_as_new_writer(root.path(), workspace.path());
+    let err = store_b
+        .append_turn(&id, "b one", "1")
+        .expect_err("a handoff must not chain past an unconfirmable outgoing witness")
+        .to_string();
+    assert!(
+        err.contains("outgoing writer's own recorded witness could not be confirmed"),
+        "the refusal must name the outgoing witness as the reason: {err}"
+    );
+
+    // The bad evidence is left exactly as found — not advanced, not repaired.
+    let (hash_now, seq_now): (String, i64) = conn
+        .query_row(
+            "SELECT tip_hash, tip_seq FROM writer_tips
+              WHERE conversation_id = ?1 AND writer_fingerprint = ?2",
+            rusqlite::params![&id, &writer_a],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        hash_now, forged,
+        "the tampered witness must not be laundered"
+    );
+    assert_eq!(
+        seq_now, stale_seq,
+        "the tampered witness must not be advanced"
+    );
+}
