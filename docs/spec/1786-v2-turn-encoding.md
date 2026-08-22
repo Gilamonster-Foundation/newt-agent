@@ -1,8 +1,12 @@
 # Spec: the v2 canonical turn encoding (#1786)
 
-**Status:** DRAFT r3 — r1 reviewed (33 findings, 29 confirmed), r2 reviewed
-(19 findings, 16 confirmed); every confirmed finding is addressed below or
-carried as a stated bound. Ready for decision.
+**Status:** DRAFT r5. Review history: r1 (33 findings, 29 confirmed), r2
+(19/16), then the derivation edge moved from the turn to the **compaction
+seal** — which dissolves D5 rather than answering it — and r4's encoding of
+that move was killed by a third review aimed at the new mechanism (39
+findings, five independent fatal flaws). r5 keeps the insight and replaces
+the encoding; §5b states what failed at each rule. Phases A (#1799) and B
+(#1801) are merged and unaffected.
 **Depends on:** PR #1792 (`load_verified` — the chain must be *read* in
 production before hashing anything new into it is meaningful).
 **Retires:** both remaining conformance-suite violations, `KNOWN_VIOLATIONS`
@@ -117,12 +121,12 @@ proves what was reachable, not why or when the producer knew it.
 `events` and empty `phantom_reaches` (derived rows are harness-minted, not
 model turns). Token counts permitted. Violation ⇒ chain violation.
 
-**Sources are a LOWER BOUND** (r2 finding): the array lists the citable
-inputs, not necessarily everything the summarizer consumed. Window entries
-with no persisted row — a turn whose save failed, wire-fabricated
-`/compress` windows — are not citable and are omitted rather than guessed.
-§10.1 asserts equality on the happy path; the residue is this stated bound,
-never an orphan-producing fabrication.
+**Sources are EXACT, not a lower bound** (superseding r2's framing): §5b
+makes a summary's sources the `elided` half of a recorded partition, so the
+producer no longer guesses which entries it consumed — the set is computed,
+recorded, and cross-checked against the window manifest at verify time. What
+r2 called "the residue" was an artifact of asking the producer to remember;
+the window grain asks the record instead.
 
 ### 3.1 What sources do NOT claim
 
@@ -216,6 +220,214 @@ stays unwitnessed; if anyone else appends, step 3 rescues the recorded tip
 writer only. Keyless witnesses beside the data; the boundary moves with
 out-of-store anchors (agent-frame), not here.
 
+## 5b. Compaction seals — reversibility, at a grain the record can express
+
+**The insight this section is built on:** a conversation window is derived
+from a previous window, and if that derivation is recorded, compaction
+becomes **reversible** — you can say what was removed and get it back.
+
+r4 tried to record this as a *partition of window membership over content
+ids* and a review killed it (39 findings). This revision keeps the insight
+and replaces the encoding. What changed, and why, is stated at each rule —
+the failures are more instructive than the design.
+
+### 5b.1 The alignment rule: only cut where the record can express the cut
+
+> **A compaction may cut only at a turn boundary.**
+
+r4 assumed the cut was turn-aligned. It is not: `compute_boundary` walks
+WIRE MESSAGES with `TAIL_MIN_MESSAGES = 3` over a pair-shaped history, so on
+the normal path the boundary lands mid-turn.
+
+The reflex is to call this a fidelity trade — record turns, lose the exact
+window. It is the opposite. **A mid-turn cut is already irreversible**: the
+store holds no half-turns, so a window split inside one can never be
+reconstructed from the record, by anything. Aligning the cut to turns does
+not cost fidelity; it is the only way to have any.
+
+This is also not a new mechanism. `compute_boundary` already performs three
+alignment passes, including:
+
+```rust
+// never start the tail inside a result group — pull the cut back to the
+// assistant carrying the tool_calls so call/result pairs stay together
+while tail_start > head && messages[tail_start]["role"] == Some("tool") { … }
+```
+
+It already refuses to cut where the result would be *incoherent*. This adds
+one more pass refusing to cut where the result would be *unrecordable*.
+
+**The rule, concretely.** In the provider's wire view a turn boundary is
+identifiable: `SumTurn::to_wire` emits at most `[user, assistant]` per turn
+and skips empty sides, and its own doc states that `system`/`tool` roles
+never occur there. So a turn starts at every `user` message. The pass is:
+
+```rust
+// A cut inside a turn produces a window the record cannot express —
+// pull back to the turn's own start. Exact parallel to the tool-group
+// pass above, for a stronger reason: incoherent vs unrecordable.
+while tail_start > head && messages[tail_start]["role"] != Some("user") {
+    tail_start -= 1;
+}
+```
+
+**Cost: at most ONE MESSAGE**, not one turn — the pair is `[user,
+assistant]`, so a cut landing on the assistant moves back exactly one. The
+earlier "bounded by one turn" was pessimistic. Every tail rule today
+(`TAIL_MIN_MESSAGES`, the token-budgeted walk, the last-user anchor) is a
+MINIMUM of protection, so growing the tail never violates their intent.
+
+**This pass is OPT-IN, not global.** The agentic loop calls `compress` at
+several sites over windows that are not provider history — system cards,
+tool results, working-set cards, no pair shape — and those windows are never
+sealed. Forcing alignment there would be meaningless at best. `CompressRequest`
+therefore carries the alignment as a flag, set by the sealing producer only.
+A summary entry is itself a lone `user` (compaction text, empty assistant),
+so it reads as its own boundary and the pass lands on it correctly.
+
+Aligning BEFORE summarizing also makes the summarizer's input exactly the
+elided set, so the record describes what actually happened rather than
+approximating it.
+
+### 5b.2 The seal record
+
+```sql
+CREATE TABLE IF NOT EXISTS context_seals (
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  ordinal         INTEGER NOT NULL,   -- 1, 2, 3 … per conversation
+  summary_writer  TEXT NOT NULL,      -- the summary turn, by its PRIMARY KEY
+  summary_seq     INTEGER NOT NULL,
+  elided          TEXT NOT NULL,      -- canonical JSON: [[writer, seq], …]
+  seal_hash       TEXT NOT NULL,      -- chained; see 5b.4
+  prev_seal_hash  TEXT NOT NULL,      -- genesis for ordinal 1
+  PRIMARY KEY (conversation_id, ordinal)
+);
+```
+
+Three deliberate departures from r4:
+
+**Members are keyed by `(writer, seq)`, not content id.** Content ids
+collide by design — Phase A's own doc says identical witnessed rows share
+one, "harmless: they have no outgoing edges", which is true for CITATION and
+false for MEMBERSHIP. A deduplicated set of content ids cannot express "turn
+7 and turn 22 are both here", so a conversation with two identical turns
+became unpartitionable and would have refused forever: fail-closed data loss
+on untampered data. `(writer, seq)` is the `turns` PRIMARY KEY — unique by
+construction.
+
+**Seals are ordered by an `ordinal`, not by seq.** r4 defined membership
+with a `sealed_at_seq` range, contradicting §3 of this same spec, which
+rules that cross-writer seqs are not a causal order. A per-conversation
+ordinal needs no cross-writer comparison.
+
+**`carried` is gone.** It was derivable (everything before, minus everything
+elided, plus prior summaries) and it was the source of r4's worst flaw: with
+`elided = parent − carried`, the partition invariant held IDENTICALLY for
+any `carried` whatsoever — no failure mode reachable by an honest producer,
+which is the vacuous-green pattern in the check meant to be the centrepiece.
+Recording only what was removed leaves claims that can actually be false.
+
+### 5b.3 What is checkable, and what is not
+
+**Checkable, with reachable failure modes:**
+
+* Every `(writer, seq)` in `elided` resolves to a turn in this conversation.
+* **Disjointness across seals**: no turn is elided by two seals. A turn
+  removed twice was double-counted by the record.
+* No seal elides its own summary turn, or any turn at or after it.
+* Ordinals are dense from 1 — a missing ordinal is a deleted seal.
+* The summary turn's `sources` (content ids, chain-protected since Phase A)
+  are exactly the content ids of the turns `elided` names. Two independent
+  descriptions of one set: one positional, one by content.
+
+**NOT checkable, stated rather than faked:** that no turn was *silently
+dropped* — left out of every seal and out of the window. Detecting a gap
+needs the live window's membership, which is provider state, not store
+state. r4 pretended otherwise by deriving membership from a seq range; that
+derivation was the flaw, not the check. What the record does guarantee is
+narrower and true: **anything a seal removed, it named.**
+
+### 5b.4 Anchoring: seals are chained and witnessed
+
+r4's `window_id` was an unkeyed BLAKE3 over the manifest's own public
+fields. Edit the row, recompute the id, done — the whole graph could be
+rewritten self-consistently without touching a turn. "Self-certifying" was
+true against corruption and false against tampering.
+
+Seals therefore carry the same machinery the turn chain already proved:
+
+```
+seal_hash = BLAKE3("newt-seal:v1"
+                    ∥ len-prefixed: conversation_id, prev_seal_hash,
+                                    summary_writer, elided
+                    ∥ ordinal, summary_seq)
+```
+
+* Each seal chains to the previous (`prev_seal_hash`), genesis-anchored at
+  ordinal 1 — so a seal cannot be altered without breaking every seal after.
+* The conversation row carries a `seal_tip` witness, written in the same
+  transaction as the seal — the §5 pattern, which already survived review,
+  applied to the last seal (which nothing chains onto).
+* The summary turn's `sources` remain chain-protected independently.
+
+### 5b.5 Ordering with the trigger turn
+
+r4 could not record the window it sealed: the summary is appended BEFORE the
+triggering turn (`lib.rs:7134` then `7141`), so at seal time the turn that
+is *in* the window has no row, no seq, and no id.
+
+**The obvious fix is wrong.** Reordering to turn-then-summary breaks restore:
+`Summarizing::restore_turns` finds the cut with
+`rposition(|t| is_compaction_text(&t.user) && t.assistant.is_empty())` and
+keeps `turns[k+1..]` — so a summary written LAST makes the restored working
+set empty, silently discarding the trigger turn and everything after it. The
+existing order is load-bearing, and `restore_turns`'s own docstring says so:
+*"the record itself was appended just before the turn that triggered the
+compression, so the turns after it are exactly the ones the live boundary's
+last-user anchor guaranteed survived."* (Caught here rather than in review —
+recorded because the near-miss is the point: a fix aimed at one invariant
+walked straight into another one nothing was checking.)
+
+**The actual fix: leave the turn order alone and move the SEAL.** Append the
+summary, append the trigger turn, then write the seal — all in ONE
+transaction. The seal goes last, when every row it names exists; the rows
+keep the order restore depends on. r4's mistake was writing the seal at
+summary-append time, not the order of the turns.
+
+One transaction is load-bearing rather than tidy: a summary persisted
+without its seal is a derived row whose provenance says nothing, and today
+the two appends are separate transactions (`store.rs` opens and commits its
+own per call), so that state is currently constructible.
+
+### 5b.6 `/compress` seals through the same path
+
+`/compress` today replaces the live window with `wire_messages_to_turns(...)`
+— synthetic turns carrying no store identity — and persists nothing. That is
+why it is the highest-probability route to an unsourced later compaction: the
+next automatic seal draws its middle from material that can no longer be
+named.
+
+Under r5 it does not need a special case, because the divergence IS the bug:
+`/compress` is a compaction, so it takes the same turn-aligned cut, splices
+its surviving history by index (preserving ids rather than rebuilding from
+wire), persists its summary, and writes its seal. One sealing path, two
+triggers — automatic and operator-invoked.
+
+### 5b.7 What reversibility means, precisely
+
+From the record you can recover, for any seal: **which turns it removed**,
+and **their content** (turn rows are insert-only; nothing deletes a turn
+short of deleting its conversation). Re-render from those turns to
+reconstruct the window.
+
+You do NOT recover the exact byte stream: the rendering depends on the
+system prompt and tool schemas in force at the time, which change with the
+model. That is the same rule already settled for backend switching —
+re-render, never re-summarize — and it is why the record keeps turns rather
+than wire messages. Storing the wire would make a *rendering* authoritative,
+which is backwards under the first principle, and would churn on every
+backend switch.
+
 ## 6. `scratchpad` / `plan` (D3 — recommend A)
 
 Mutable by design; cannot live in an append-only chain. **A: classify as
@@ -231,54 +443,78 @@ v1 and v2 rows coexist; `prev_hash` of a v2 row is its predecessor's hash
 under the predecessor's own version; a v2 summary cites v1 turns by content
 id (computable from v1 rows). No re-encoding of old rows, ever.
 
-## 8. The producer: ids flow from the store, one cycle late
+## 8. The producer: the record answers, not the producer's memory
 
 The only summary persisted as a turn row is the Summarizing provider's
-sync-time record; the mid-turn CONTINUATION compaction never persists.
+sync-time record; the mid-turn CONTINUATION compaction never persists
+(confirmed by r2 review).
 
-r2's "tag at sync time" was **unimplementable in the real order** (r2
-findings): the summary is minted *during* sync, the rows are appended
-*after*, and ids exist only once `append_turn_full` runs. The corrected
-mechanism — **post-save tagging, one cycle late**:
+r3 specified a post-save tagging seam so the provider could remember which
+history entries the summarizer ate. §5b removes the question. A seal records
+a **partition of the previous window**, and both halves are answerable from
+durable state:
 
-1. `append_turn_full` returns the new row's content id. The save path
-   returns the cycle's appended ids (turn row; summary row when present)
-   to the chat loop.
-2. After a successful save, the loop calls one new provider seam —
-   `attach_row_ids(turn_id, summary_id)` — and the provider tags the
-   history entry it synced this cycle and (when a compaction fired) the
-   compaction entry it minted this cycle. Deterministic: the provider tags
-   the entries it just created, by position in its own history, no content
-   matching anywhere.
+1. `append_turn_full` returns the new row's content id (needed regardless —
+   the summary turn's id goes in the manifest).
+2. At a seal, the producer reports the **cut**: which of the previous
+   window's members survive. Everything else in that window is `elided`.
+   The previous window's membership is not remembered — it is *read*: the
+   last seal's `carried` plus its summary, plus every turn appended since,
+   by seq.
 3. `ConversationRecord` turns carry their content id (computed by
-   `load_record_on` from stored bytes), so a store-fed `restore_turns`
-   re-tags a rehydrated window — including prior summary entries, which
-   are persisted rows like any other. The `/compress` path's
-   wire-fabricated windows carry no identity and stay untagged (§3's
-   lower bound).
-4. Compression consumes only prior-cycle entries as its middle (the anchor
-   rule keeps the trigger turn out), so by the time a summary is minted,
-   every *citable* middle entry is already tagged. Untagged entries
-   (failed saves, wire windows, pre-bump history never re-restored) are
-   omitted per §3.
-5. `take_compaction_record` returns `(record, Vec<ContentId>)`; the
-   persist site passes them as the summary's sources.
+   `load_record_on` from stored bytes), so a restored window's members are
+   known ids from the moment they are materialized.
 
-**Producer failure semantics** (r2 finding): a failed save leaves that
-cycle's entries untagged — omitted from later sources, never guessed. A
-summary whose sources came out *empty* because nothing in its middle was
-citable persists as a derived-shaped row with empty sources — which the
-shape invariant reads as witnessed; to keep the biconditional honest, such
-a record is persisted with sources = the sentinel it cites: nothing. This
-is the one case where derived and witnessed are indistinguishable on the
-wire, bounded to windows with no citable input, stated here rather than
-hidden. (Review may prefer refusing to persist such summaries; that
-trades a provenance gap for losing the recovery handle — decision D5.)
+**The migration case, which drove D5, was never the problem** (evidence pass,
+2026-08-22): the provider's history is process-local, so pre-upgrade material
+cannot be in a new binary's provider except by RESTORE — and a restore
+materializes from the store, where every member's content id is known. The
+first seal in an old conversation is therefore fully sourced. What remains
+true: `parent_id` is NULL at a conversation's first seal, which is exactly
+right, and the store enumerates the pre-seal membership directly.
 
-**Producer correctness is an acceptance obligation** (§10.1): a
-wrong-but-existing source set passes every verifier check and is then
-chain-protected permanently. The verifier cannot catch a plausible lie
-about derivation; the test suite pins the producer.
+### 8.1 Three producer defects this must fix, not work around
+
+The same evidence pass found the routes by which identity is actually lost.
+All three are producer bugs, and the window grain fixes them rather than
+tolerating them:
+
+**P1 — tags are destroyed at every compaction.** `compress_via_pipeline` ends
+with `self.history = wire_to_history(&messages, ...)`, rebuilding history
+from wire messages that carry only `{role, content}`. Any id attached to a
+history entry is discarded, recurring, every compaction from the second on.
+FIX: the surviving tail is a CONTIGUOUS SUFFIX of the pre-compaction history,
+so it is spliced by INDEX — `[summary] + old_history[cut..]` — instead of
+reconstructed from wire. This is strictly more faithful than the current
+rebuild (which is a lossy heuristic: 1–2 messages per turn, empty-assistant
+skip), and it carries ids across for free. No content matching anywhere.
+
+**P2 — `compress` does not tell its caller where it cut.** `Boundary` is
+private and `CompressOutcome` carries no cut. Without it the provider cannot
+know which entries formed the middle, and §8's rule forbids guessing by
+content. FIX: `CompressOutcome` carries the cut (survivor count in history
+terms). This is the one seam this work adds to the pipeline, and P1's splice
+depends on it.
+
+**P3 — `/compress` wipes store identity from the entire history.** It calls
+`restore_turns(wire_messages_to_turns(&outcome.messages))` — wire-fabricated
+turns with no store identity — and never persists a summary. The manual
+command is therefore the highest-probability real route to an unsourced
+later compaction: the NEXT provider-minted summary summarizes a middle whose
+entries have no ids. FIX: `/compress` is a compaction, so it SEALS like one —
+it persists its summary and records a manifest. That closes the hole at its
+source instead of adding a "sometimes we can't say" branch downstream.
+
+With P1–P3 fixed, an entry that corresponds to a persisted turn always
+carries that turn's id, so **zero-citable is unreachable rather than
+merely unlikely** — which is the standard §5b sets and D5 could not meet.
+
+**Producer failure semantics.** The summary row and the trigger turn are
+currently appended by two independent `append_turn_full` calls, each opening
+and committing its own transaction — so a summary can commit while its turn
+fails. FIX: one transaction for the cycle's rows and the manifest, so a
+persisted summary without its seal cannot exist. A dropped cycle then
+narrows what is carried; it can never fabricate an elided set.
 
 ## 9. Failure semantics
 
@@ -288,6 +524,20 @@ sources; derived-shape violation; per-writer witness mismatch (writer +
 seq); witness-over-deleted-rows (`tip_seq > final`); witness divergence.
 Stale witness (`tip_seq < final`) is **not** a failure class — it is the
 rollback residue, verified at its own seq and repaired by the next append.
+
+**Seal classes (§5b):** broken seal chain (`prev_seal_hash` mismatch); seal
+tip witness disagreement; unresolvable elided member; a turn elided by two
+seals; a seal eliding its own summary or a later turn; a gap in the ordinal
+sequence; `sources` and `elided` describing different sets.
+
+**If an unsourced derivation is ever produced anyway** (a defect, not a
+design state): the row is persisted with the reserved sentinel
+`["0"*64]` in `sources` rather than an empty array. The sentinel keeps the
+biconditional (non-empty ⇔ derived), is already inside both digests so it is
+tamper-evident with no encoding change, and is excluded from the orphan
+check by construction — it resolves to no turn ON PURPOSE, which is the
+honest statement "derived, inputs not citable". It is a bug report in the
+record, not a supported path: §10 asserts no production path emits it.
 
 ### 9.1 Version skew and downgrade
 
@@ -310,9 +560,9 @@ primitive test re-pins its future vector at **3** (the bump consumes 2).
 * `derived_records_name_their_sources`: r1's Debug-grep flips green the
   moment the field exists. Strengthened: drive the REAL producer
   (Summarizing provider, compression fired, record persisted) and assert
-  the persisted summary carries non-empty sources equal to the content ids
-  of the turns actually summarized. Red today; red after the schema change
-  alone; green only when §8 is wired.
+  the persisted summary carries non-empty sources equal to the `elided`
+  half of the seal's recorded partition. Red today; red after the schema
+  change alone; green only when §5b/§8 are wired.
 * `the_whole_record_is_covered_by_the_chain`: constructs a v2 row, tampers
   `phantom_reaches`, chain must break; docstring states the §3.2 residue.
 
@@ -331,7 +581,15 @@ epoch verifies; v1-only verifies byte-for-byte (vectors); per-writer
 witness catches a non-tip final-turn tamper at read AND at that writer's
 own next append; stale witness accepted and verified at its own seq;
 witness-over-deleted-rows refused; genesis witness on a zero-turn
-conversation accepted; handoff relocation preserves the outgoing writer's
+conversation accepted; **the cut is turn-aligned (a compaction over a
+pair-shaped history never splits a turn — asserted against the real
+boundary function, since this is the rule everything else rests on); an
+edited seal breaks the seal chain; an edited last seal breaks the seal tip
+witness; a turn elided by two seals refuses; a seal eliding its own summary
+refuses; a missing ordinal refuses; `sources` and `elided` describing
+different sets refuses; and REVERSIBILITY AS A TEST — after two real
+compactions, every elided turn is recovered from the record and its content
+matches what was summarized;** handoff relocation preserves the outgoing writer's
 witness (tamper X's final turn *after* a W handoff → caught);
 import-then-verify with witnesses; fingerprint change after import stays
 closed; downgrade proxy (version-3 vector); seam test extended to a
@@ -340,7 +598,13 @@ multi-writer tamper.
 ## 11. Deliberately not claimed
 
 * Faithfulness of summaries (§3.1); temporal soundness of citations (§3).
-* Completeness of sources (§3's lower bound; D5's empty-sources case).
+* Byte-exact reversal of a compaction. §5b.6 recovers the elided TURNS; the
+  rendering is re-derived, and a different model or tool schema renders the
+  same turns differently.
+* Detection of a turn silently dropped from every seal AND the window
+  (§5b.3) — that needs the live window's membership, which is provider
+  state. The record guarantees the narrower, true thing: anything a seal
+  removed, it named.
 * Working-memory integrity (§6); v1 rows' new-column bytes (§3.2).
 * Witness erasure bounds (§5), including the migration window.
 * Cross-conversation citation — representable later (content ids are
@@ -354,4 +618,5 @@ multi-writer tamper.
 | D2 | Per-writer witnesses this epoch | Yes — seq-aware, own-check on append, handoff relocation, import coverage |
 | D3 | scratchpad/plan | Classify unprotected now; append-only redesign later |
 | D4 | Mixed epochs | Allowed; never re-encode; downgrade lockout stated; legacy import pinned v1 |
-| D5 | Summary with zero citable inputs | Persist with empty sources (stated gap) — or refuse and lose the recovery handle? **Needs a call.** |
+| D5 | Summary with zero citable inputs | **DISSOLVED by §5b** — a seal always succeeds a seal, so the edge is always exactly one. No call needed. |
+| D6 | Cut alignment | **Turn-aligned, pulled back** (§5b.1) — a mid-turn cut is already irreversible, so this costs no fidelity; the pipeline already aligns cuts for coherence, this adds one pass for auditability. |
