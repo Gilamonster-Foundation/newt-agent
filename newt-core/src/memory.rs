@@ -1479,7 +1479,10 @@ is ground truth.\n\
 \n\
 **Sign every commit.** Credit yourself on every commit you author with a \
 `Co-authored-by:` trailer naming the model and harness, e.g. \
-`Co-authored-by: <model> (newt-agent v<version>) <309460085+newt-agent@users.noreply.github.com>`. \
+`Co-authored-by: <model> (v<version> <build>) <309460085+newt-agent@users.noreply.github.com>`. \
+The account name is not repeated in the parenthetical — the address already \
+carries it, so the qualifier holds only the harness version and the build it \
+was compiled from. \
 The harness identity is the newt-agent GitHub App — link it: \
 <https://github.com/apps/newt-agent>. This is the house default, not an \
 occasional courtesy — include it on every commit, including commits made \

@@ -2895,6 +2895,31 @@ fn session_body(
                         println!();
                         continue;
                     }
+                    // `/byline` — show the operator (and the model) the exact
+                    // `Co-authored-by:` block the next commit would carry.
+                    // Read-only. Rendered by the SAME finalizer the commit
+                    // path runs, over the live envelope this loop refreshes,
+                    // so it cannot show a shape a commit would not produce —
+                    // and so a model can check its credit instead of guessing
+                    // one and hand-writing it.
+                    if slash_body == "byline" {
+                        print_newt("the next commit would be signed:", color, verbose);
+                        match session_git_tool
+                            .as_ref()
+                            .and_then(|t| t.attribution.as_ref())
+                        {
+                            Some(ca) => {
+                                for line in ca.byline(&ca.contributors) {
+                                    println!("  {line}");
+                                }
+                            }
+                            // No envelope means no commit path is armed yet;
+                            // say so rather than rendering a plausible guess.
+                            None => println!("  (no commit identity resolved yet)"),
+                        }
+                        println!();
+                        continue;
+                    }
                     if slash_body == "docs" {
                         print_newt("docs and help:", color, verbose);
                         println!("  https://github.com/Gilamonster-Foundation/newt-agent");

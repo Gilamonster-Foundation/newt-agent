@@ -294,6 +294,7 @@ fn crew_coauthor_trailer(model: &str, identity: &newt_core::AgentIdentity) -> St
         newt_core::build_info::PACKAGE_VERSION,
         identity.email.clone(),
     )
+    .with_build(newt_core::build_info::SOURCE_ID)
     .trailer()
 }
 
@@ -613,13 +614,18 @@ mod tests {
         // distinct execution context from the main session), and the
         // resolved harness EMAIL makes GitHub attribute the commit to the
         // configured account.
+        // Under newt's OWN address the account name is not repeated, so the
+        // qualifier keeps only what the address does not say: `crew`, the
+        // version, and the build. The crew marker — the whole reason this
+        // harness string exists — survives.
         let id = newt_core::AgentIdentity::default();
         let t = crew_coauthor_trailer("ornith:35b", &id);
         assert_eq!(
             t,
             format!(
-                "Co-authored-by: ornith:35b (newt-agent crew v{}) <{}>",
+                "Co-authored-by: ornith:35b (crew v{} {}) <{}>",
                 newt_core::build_info::PACKAGE_VERSION,
+                newt_core::build_info::SOURCE_ID,
                 id.email
             )
         );
@@ -633,11 +639,16 @@ mod tests {
             email: "custom@example.com".into(),
             ..newt_core::AgentIdentity::default()
         };
+        // A configured address that does NOT name an account carries no
+        // harness identity of its own, so the full `newt-agent crew` stays
+        // spelled out — the omission is licensed by the address, never
+        // assumed.
         assert_eq!(
             crew_coauthor_trailer("m", &custom),
             format!(
-                "Co-authored-by: m (newt-agent crew v{}) <custom@example.com>",
-                newt_core::build_info::PACKAGE_VERSION
+                "Co-authored-by: m (newt-agent crew v{} {}) <custom@example.com>",
+                newt_core::build_info::PACKAGE_VERSION,
+                newt_core::build_info::SOURCE_ID
             )
         );
     }
