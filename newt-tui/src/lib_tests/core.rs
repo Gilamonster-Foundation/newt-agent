@@ -46,8 +46,9 @@ fn attribution_ledger_uses_resolved_identity_email() {
     assert_eq!(
         ledger.render(),
         format!(
-            "Co-authored-by: nemotron-3-nano:30b (newt-agent v{}) <309460085+newt-agent@users.noreply.github.com>",
-            newt_core::build_info::PACKAGE_VERSION
+            "Co-authored-by: nemotron-3-nano:30b (v{} {}) <309460085+newt-agent@users.noreply.github.com>",
+            newt_core::build_info::PACKAGE_VERSION,
+            newt_core::build_info::SOURCE_ID
         )
     );
     assert!(ledger.render().contains(newt_core::DEFAULT_AGENT_EMAIL));
@@ -74,8 +75,9 @@ fn attribution_ledger_uses_resolved_identity_email() {
     assert_eq!(
         custom_ledger.render(),
         format!(
-            "Co-authored-by: ornith:35b (newt-agent v{}) <my-agent@example.com>",
-            newt_core::build_info::PACKAGE_VERSION
+            "Co-authored-by: ornith:35b (newt-agent v{} {}) <my-agent@example.com>",
+            newt_core::build_info::PACKAGE_VERSION,
+            newt_core::build_info::SOURCE_ID
         )
     );
 }

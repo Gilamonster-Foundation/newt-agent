@@ -1092,7 +1092,7 @@ fn runtime_context_block(
          {runtime_authority}\
          # Git commit identity\n\
          Prefer the `git` tool: it commits as `{author_name} <{author_email}>` and \
-         auto-signs `Co-authored-by: {model} ({harness}) <{author_email}>` for \
+         auto-signs `Co-authored-by: {model} ({harness} v<version> <build>) <{author_email}>` for \
          every model/harness that materially contributed since the last commit \
          (not just this one) — do NOT add that trailer yourself, just write the \
          plain message; for the last commit use op=amend (don't claim to amend \
@@ -12689,6 +12689,32 @@ Shows the same status surface as /status, plus the version, active model
 identity, and resolved backend details that drive this prompt.
         "
         }
+        "byline" => {
+            "\
+/byline — show the Co-authored-by block the next commit would carry
+
+  Read-only. Prints the exact trailer block, in commit order:
+
+    every model that has contributed since the last commit (a /model,
+    /backend, loadout, or crew switch ADDS one — it never replaces one),
+    then the model driving this turn, then the human operator when a real
+    email is known, then the Harness: provenance line.
+
+  The email in a trailer identifies the HARNESS, not the model, so a
+  harness signs its own address and never another's. Under newt's own
+  address the account name is not repeated: the qualifier carries only
+  what the address does not already say — `(v<version> <build>)`, or
+  `(crew v<version> <build>)` for a crew leaf. A foreign harness keeps its
+  full name, e.g. `(Claude Code v2.1.239)`.
+
+  The operator by-line comes from your git identity (user.name +
+  user.email). If no real email is known it is OMITTED, never invented —
+  so a missing operator line means \"unknown\", not \"nobody\".
+
+  This is rendered by the same finalizer the commit path runs, so it
+  cannot show a shape a commit would not produce. Do not hand-write these
+  trailers: the `git` tool stamps them itself."
+        }
         "docs" => {
             "\
 /docs — open the right docs quickly
@@ -13078,6 +13104,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /status                  - show session and environment summary",
         "  /info                    - show detailed session info (backend, permissions, version)",
         "  /workspace               - show current workspace path",
+        "  /byline                  - the Co-authored-by block the next commit would carry",
         "  /docs                    - quick pointers to newt docs and issue tracker",
         "  /dock [status|disable|enable] - remote-HTMX docking kill-switch (req 7): disable forcibly undocks THIS box from every hub; status lists approved peers",
         "  /allow                   - alias for /permissions",

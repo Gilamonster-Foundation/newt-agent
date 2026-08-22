@@ -1903,13 +1903,17 @@ mod tests {
         // Inject one accumulated contributor (model-a) into the envelope —
         // the session loop would snapshot this from the ledger at loop-top.
         if let Some(a) = t.attribution.as_mut() {
-            a.contributors
-                .push(newt_core::attribution::Attribution::new(
+            a.contributors.push(
+                newt_core::attribution::Attribution::new(
                     "model-a",
                     "newt-agent",
                     newt_core::build_info::PACKAGE_VERSION,
                     "noreply@newt-agent.com",
-                ));
+                )
+                // Mirrors production: the session ledger stamps this build on
+                // every contribution it records.
+                .with_build(newt_core::build_info::SOURCE_ID),
+            );
         }
         t.dispatch("init", &serde_json::json!({}), &GitCaveats::top())
             .unwrap();
@@ -1930,15 +1934,18 @@ mod tests {
         .unwrap();
         let c1 = head_message(dir.path());
         let version = newt_core::build_info::PACKAGE_VERSION;
+        // The build revision is part of the contributor identity, so it
+        // renders in the qualifier alongside the version.
+        let build = newt_core::build_info::SOURCE_ID;
         assert!(
             c1.contains(&format!(
-                "Co-authored-by: model-a (newt-agent v{version}) <noreply@newt-agent.com>"
+                "Co-authored-by: model-a (newt-agent v{version} {build}) <noreply@newt-agent.com>"
             )),
             "C1 credits the accumulated contributor A: {c1}"
         );
         assert!(
             c1.contains(&format!(
-                "Co-authored-by: qwen3:30b (newt-agent v{version}) <noreply@newt-agent.com>"
+                "Co-authored-by: qwen3:30b (newt-agent v{version} {build}) <noreply@newt-agent.com>"
             )),
             "C1 credits the active model B: {c1}"
         );
@@ -1965,7 +1972,7 @@ mod tests {
         );
         assert!(
             c2.contains(&format!(
-                "Co-authored-by: qwen3:30b (newt-agent v{version}) <noreply@newt-agent.com>"
+                "Co-authored-by: qwen3:30b (newt-agent v{version} {build}) <noreply@newt-agent.com>"
             )),
             "C2 still credits the active model B: {c2}"
         );
@@ -2006,13 +2013,17 @@ mod tests {
         let mut t = tool(dir.path());
         // One accumulated contributor on the frozen envelope.
         if let Some(a) = t.attribution.as_mut() {
-            a.contributors
-                .push(newt_core::attribution::Attribution::new(
+            a.contributors.push(
+                newt_core::attribution::Attribution::new(
                     "model-a",
                     "newt-agent",
                     newt_core::build_info::PACKAGE_VERSION,
                     "noreply@newt-agent.com",
-                ));
+                )
+                // Mirrors production: the session ledger stamps this build on
+                // every contribution it records.
+                .with_build(newt_core::build_info::SOURCE_ID),
+            );
         }
         t.dispatch("init", &serde_json::json!({}), &GitCaveats::top())
             .unwrap();
@@ -2052,9 +2063,12 @@ mod tests {
         .unwrap();
         let c1 = head_message(dir.path());
         let version = newt_core::build_info::PACKAGE_VERSION;
+        // The build revision is part of the contributor identity, so it
+        // renders in the qualifier alongside the version.
+        let build = newt_core::build_info::SOURCE_ID;
         assert!(
             c1.contains(&format!(
-                "Co-authored-by: model-a (newt-agent v{version}) <noreply@newt-agent.com>"
+                "Co-authored-by: model-a (newt-agent v{version} {build}) <noreply@newt-agent.com>"
             )),
             "the contributor survived the failed commit and is credited on the retry: {c1}"
         );
@@ -2140,9 +2154,12 @@ mod tests {
                                       // Bare subject, zero attribution text → canonical trailer + provenance.
         let out = t.finalize_commit_message("fix the parser");
         let version = newt_core::build_info::PACKAGE_VERSION;
+        // The build revision is part of the contributor identity, so it
+        // renders in the qualifier alongside the version.
+        let build = newt_core::build_info::SOURCE_ID;
         assert!(
             out.contains(&format!(
-                "Co-authored-by: qwen3:30b (newt-agent v{version}) <noreply@newt-agent.com>"
+                "Co-authored-by: qwen3:30b (newt-agent v{version} {build}) <noreply@newt-agent.com>"
             )),
             "canonical model trailer rendered from the typed value: {out}"
         );
@@ -2210,9 +2227,12 @@ mod tests {
         // The canonical harness-managed trailer + provenance, rendered from the
         // typed CommitAttribution (real package version, the configured email).
         let version = newt_core::build_info::PACKAGE_VERSION;
+        // The build revision is part of the contributor identity, so it
+        // renders in the qualifier alongside the version.
+        let build = newt_core::build_info::SOURCE_ID;
         assert!(
             body.contains(&format!(
-                "Co-authored-by: qwen3:30b (newt-agent v{version}) <noreply@newt-agent.com>"
+                "Co-authored-by: qwen3:30b (newt-agent v{version} {build}) <noreply@newt-agent.com>"
             )),
             "canonical model trailer present: {body}"
         );
@@ -2251,9 +2271,12 @@ mod tests {
         let body = head_message(dir.path());
         assert!(body.contains("fix the parser"), "subject preserved: {body}");
         let version = newt_core::build_info::PACKAGE_VERSION;
+        // The build revision is part of the contributor identity, so it
+        // renders in the qualifier alongside the version.
+        let build = newt_core::build_info::SOURCE_ID;
         assert!(
             body.contains(&format!(
-                "Co-authored-by: qwen3:30b (newt-agent v{version}) <noreply@newt-agent.com>"
+                "Co-authored-by: qwen3:30b (newt-agent v{version} {build}) <noreply@newt-agent.com>"
             )),
             "canonical model trailer added by the harness: {body}"
         );
@@ -2858,13 +2881,17 @@ mod tests {
         let mut t = tool(dir.path());
         // Inject one accumulated contributor (model-a) into the envelope.
         if let Some(a) = t.attribution.as_mut() {
-            a.contributors
-                .push(newt_core::attribution::Attribution::new(
+            a.contributors.push(
+                newt_core::attribution::Attribution::new(
                     "model-a",
                     "newt-agent",
                     newt_core::build_info::PACKAGE_VERSION,
                     "noreply@newt-agent.com",
-                ));
+                )
+                // Mirrors production: the session ledger stamps this build on
+                // every contribution it records.
+                .with_build(newt_core::build_info::SOURCE_ID),
+            );
         }
         // All-drop plan: onto c1, drop c2 and c3 → produced == 0, dropped == 2.
         let out = t
@@ -2907,9 +2934,12 @@ mod tests {
         .unwrap();
         let msg = head_message(dir.path());
         let version = newt_core::build_info::PACKAGE_VERSION;
+        // The build revision is part of the contributor identity, so it
+        // renders in the qualifier alongside the version.
+        let build = newt_core::build_info::SOURCE_ID;
         assert!(
             msg.contains(&format!(
-                "Co-authored-by: model-a (newt-agent v{version}) <noreply@newt-agent.com>"
+                "Co-authored-by: model-a (newt-agent v{version} {build}) <noreply@newt-agent.com>"
             )),
             "the pending contributor survived the 0-produced rebase and is credited on the next commit: {msg}"
         );

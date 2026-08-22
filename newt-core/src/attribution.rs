@@ -43,10 +43,78 @@ pub struct Attribution {
     /// identity (audit Q9). Renders inside the trailer's `(<harness> v<ver>)`
     /// qualifier, matching [`CommitAttribution::model_trailer`].
     pub harness_version: String,
-    /// The email the credit is attributed to — ordinarily the resolved
-    /// [`crate::agent_identity::AgentIdentity`] email (config override, else
-    /// [`crate::agent_identity::DEFAULT_AGENT_EMAIL`]).
+    /// The email the credit is attributed to. It names the **harness**, not
+    /// the model: a co-author line credits a real account, so a harness signs
+    /// its own address and never another's. Newt's own contributions carry
+    /// [`crate::agent_identity::DEFAULT_AGENT_EMAIL`] (or the configured
+    /// override); a contributor that ran under a foreign harness carries that
+    /// harness's address — which is why this is a per-contributor field and
+    /// not one value hung off the ledger.
     pub email: String,
+    /// The harness **build** the model ran under — for newt,
+    /// [`crate::build_info::SOURCE_ID`]: the git commit it was compiled from,
+    /// `-dirty`-suffixed when the worktree was modified. `None` for a harness
+    /// that reports no build revision.
+    ///
+    /// A package version alone does not identify a build; every dev build
+    /// between two releases claims the same semver. Part of the identity for
+    /// the same reason [`Attribution::harness_version`] is: a different build
+    /// is a different thing that ran the work.
+    pub harness_build: Option<String>,
+}
+
+/// The GitHub noreply account a `<id>+<login>@users.noreply.github.com`
+/// address names, e.g. `newt-agent`. `None` for any other address shape — a
+/// generic mailbox like `codex@openai.com` names a provider, not an account,
+/// and must not be treated as naming a harness.
+fn noreply_login(email: &str) -> Option<&str> {
+    let local = email.strip_suffix("@users.noreply.github.com")?;
+    let (_id, login) = local.split_once('+')?;
+    (!login.is_empty()).then_some(login)
+}
+
+/// The parenthesized qualifier in a co-author trailer: what ran the work,
+/// beyond what the address already says.
+///
+/// The ONE place the qualifier is rendered — [`Attribution::trailer`] and
+/// [`CommitAttribution::model_trailer`] both call it, so the two can never
+/// drift into different shapes.
+///
+/// The harness NAME is dropped when the email already carries it: against
+/// `<…+newt-agent@…>` the harness `newt-agent` is pure repetition, and
+/// `newt-agent crew` reduces to the part the address does not tell you,
+/// `crew`. A foreign harness keeps its full name, because its address does
+/// not spell it out — which is what keeps `Model A (newt-agent)` and
+/// `Model A (Codex CLI)` two visibly distinct contributors on one commit.
+fn qualifier(harness: &str, version: &str, build: Option<&str>) -> String {
+    let mut out = String::new();
+    if !harness.is_empty() {
+        out.push_str(harness);
+        out.push(' ');
+    }
+    out.push('v');
+    out.push_str(version);
+    if let Some(build) = build.filter(|b| !b.is_empty()) {
+        out.push(' ');
+        out.push_str(build);
+    }
+    out
+}
+
+/// The harness name as it should appear in a qualifier next to `email` —
+/// emptied when the address already names it. See [`qualifier`].
+fn harness_beyond_email(harness: &str, email: &str) -> String {
+    let Some(login) = noreply_login(email) else {
+        return harness.to_string();
+    };
+    match harness.strip_prefix(login) {
+        // Exactly the account name: the address says it all.
+        Some("") => String::new(),
+        // `newt-agent crew` -> `crew`. The space guard keeps a harness that
+        // merely *starts with* the login (`newt-agentic`) fully spelled out.
+        Some(rest) => rest.strip_prefix(' ').unwrap_or(harness).to_string(),
+        None => harness.to_string(),
+    }
 }
 
 impl Attribution {
@@ -62,7 +130,16 @@ impl Attribution {
             harness: harness.into(),
             harness_version: harness_version.into(),
             email: email.into(),
+            harness_build: None,
         }
+    }
+
+    /// Pin the harness build revision this contribution ran under (for newt,
+    /// [`crate::build_info::SOURCE_ID`]). Chainable on [`Attribution::new`].
+    #[must_use]
+    pub fn with_build(mut self, build: impl Into<String>) -> Self {
+        self.harness_build = Some(build.into());
+        self
     }
 
     /// The single `Co-authored-by:` trailer line for this contributor:
@@ -75,8 +152,14 @@ impl Attribution {
     #[must_use]
     pub fn trailer(&self) -> String {
         format!(
-            "Co-authored-by: {} ({} v{}) <{}>",
-            self.model, self.harness, self.harness_version, self.email
+            "Co-authored-by: {} ({}) <{}>",
+            self.model,
+            qualifier(
+                &harness_beyond_email(&self.harness, &self.email),
+                &self.harness_version,
+                self.harness_build.as_deref(),
+            ),
+            self.email
         )
     }
 }
@@ -211,10 +294,23 @@ impl CommitAttribution {
     /// current-model or current-package-version constant is hard-coded.
     #[must_use]
     pub fn model_trailer(&self) -> String {
-        format!(
-            "Co-authored-by: {} ({} v{}) <{}>",
-            self.model, self.harness_name, self.harness_version, self.agent_email
+        self.active_attribution().trailer()
+    }
+
+    /// The active-at-commit model as a contributor identity — the same typed
+    /// value the ledger holds, so the active model and an accumulated
+    /// contributor can never render differently. Used by
+    /// [`CommitAttribution::model_trailer`] and by the merge in
+    /// [`CommitAttribution::finalize_message_with`].
+    #[must_use]
+    pub fn active_attribution(&self) -> Attribution {
+        Attribution::new(
+            &self.model,
+            &self.harness_name,
+            &self.harness_version,
+            &self.agent_email,
         )
+        .with_build(&self.harness_build_revision)
     }
 
     /// The canonical operator co-author trailer, rendered from this value's
@@ -234,6 +330,24 @@ impl CommitAttribution {
                 email
             )
         })
+    }
+
+    /// The trailer block a commit finalized RIGHT NOW would carry: every
+    /// accumulated contributor, the active-at-commit model, the operator
+    /// by-line when a real operator email is known, and the provenance line —
+    /// in the order a commit gets them.
+    ///
+    /// This is what `/byline` shows the operator (and the model). It runs the
+    /// REAL finalizer over an empty message rather than re-rendering the
+    /// pieces itself, so a preview can never show something the commit would
+    /// not actually receive — the failure mode a hand-rolled preview invites.
+    #[must_use]
+    pub fn byline(&self, contributors: &[Attribution]) -> Vec<String> {
+        self.finalize_message_with("", contributors)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
     /// The canonical provenance line, rendered from this same typed value
@@ -342,12 +456,7 @@ impl CommitAttribution {
                 merged.push(c.clone());
             }
         }
-        let active = Attribution::new(
-            &self.model,
-            &self.harness_name,
-            &self.harness_version,
-            &self.agent_email,
-        );
+        let active = self.active_attribution();
         if seen.insert(active.clone()) {
             merged.push(active);
         }
@@ -499,6 +608,7 @@ fn is_newt_provenance(line: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct AttributionLedger {
     default_email: String,
+    default_build: Option<String>,
     contributors: Vec<Attribution>,
     seen: HashSet<Attribution>,
 }
@@ -513,9 +623,31 @@ impl AttributionLedger {
     pub fn new(default_email: impl Into<String>) -> Self {
         Self {
             default_email: default_email.into(),
+            // THIS build, not `None`. `record` credits the harness that owns
+            // the ledger, and that harness is this one — the same source
+            // [`CommitAttribution::from_runtime`] reads. Defaulting to `None`
+            // made a forgotten `with_build` silently double-credit the active
+            // model at commit time (its build set, the ledger's not, so the
+            // dedup in `finalize_message_with` saw two identities). Correct by
+            // construction instead: a caller must go out of its way to be
+            // inconsistent.
+            default_build: Some(crate::build_info::SOURCE_ID.to_string()),
             contributors: Vec::new(),
             seen: HashSet::new(),
         }
+    }
+
+    /// Pin the harness build revision [`AttributionLedger::record`] stamps on
+    /// its entries (for newt, [`crate::build_info::SOURCE_ID`]).
+    ///
+    /// `record` is for the harness that OWNS this ledger, so one default
+    /// build is right for it — exactly as one default email is. A contributor
+    /// that ran under a foreign harness carries its own build and its own
+    /// address, and goes in through [`AttributionLedger::add`].
+    #[must_use]
+    pub fn with_build(mut self, build: impl Into<String>) -> Self {
+        self.default_build = Some(build.into());
+        self
     }
 
     /// Record a material contribution from `model` running under `harness` at
@@ -532,8 +664,9 @@ impl AttributionLedger {
         harness: impl Into<String>,
         harness_version: impl Into<String>,
     ) {
-        let attribution =
+        let mut attribution =
             Attribution::new(model, harness, harness_version, self.default_email.clone());
+        attribution.harness_build = self.default_build.clone();
         self.add(attribution);
     }
 
@@ -596,6 +729,14 @@ mod tests {
     /// than reading the live `PACKAGE_VERSION` (which would make assertions
     /// drift on every release).
     const TEST_VER: &str = "0.0.0-test";
+    /// The build revision `AttributionLedger::record` stamps by default —
+    /// this harness's own, the same source `CommitAttribution::from_runtime`
+    /// reads. Referenced rather than hard-coded so the assertions stay true
+    /// on every build.
+    const SOURCE_ID: &str = crate::build_info::SOURCE_ID;
+    /// A foreign harness's own address — the Claude Code row of the harness
+    /// table. Never newt's.
+    const ANTHROPIC: &str = "noreply@anthropic.com";
 
     /// Contract test 1: one contributor produces exactly one trailer.
     #[test]
@@ -606,7 +747,7 @@ mod tests {
         assert_eq!(
             ledger.trailers(),
             vec![format!(
-                "Co-authored-by: GPT-5.6 Sol (newt-agent v{TEST_VER}) <{DEFAULT_EMAIL}>"
+                "Co-authored-by: GPT-5.6 Sol (v{TEST_VER} {SOURCE_ID}) <{DEFAULT_EMAIL}>"
             )]
         );
     }
@@ -622,8 +763,8 @@ mod tests {
         assert_eq!(
             ledger.trailers(),
             vec![
-                format!("Co-authored-by: Model A (newt-agent v{TEST_VER}) <{DEFAULT_EMAIL}>"),
-                format!("Co-authored-by: Model B (newt-agent v{TEST_VER}) <{DEFAULT_EMAIL}>"),
+                format!("Co-authored-by: Model A (v{TEST_VER} {SOURCE_ID}) <{DEFAULT_EMAIL}>"),
+                format!("Co-authored-by: Model B (v{TEST_VER} {SOURCE_ID}) <{DEFAULT_EMAIL}>"),
             ],
             "the earlier contributor must not be discarded by the later one"
         );
@@ -640,8 +781,10 @@ mod tests {
         assert_eq!(
             ledger.trailers(),
             vec![
-                format!("Co-authored-by: Model A (newt-agent v{TEST_VER}) <{DEFAULT_EMAIL}>"),
-                format!("Co-authored-by: Model A (Codex v{TEST_VER}) <{DEFAULT_EMAIL}>"),
+                format!("Co-authored-by: Model A (v{TEST_VER} {SOURCE_ID}) <{DEFAULT_EMAIL}>"),
+                format!(
+                    "Co-authored-by: Model A (Codex v{TEST_VER} {SOURCE_ID}) <{DEFAULT_EMAIL}>"
+                ),
             ]
         );
     }
@@ -670,10 +813,219 @@ mod tests {
         assert_eq!(
             ledger.trailers(),
             vec![
-                format!("Co-authored-by: Model A (newt-agent v0.7.6) <{DEFAULT_EMAIL}>"),
-                format!("Co-authored-by: Model A (newt-agent v0.8.0) <{DEFAULT_EMAIL}>"),
+                format!("Co-authored-by: Model A (v0.7.6 {SOURCE_ID}) <{DEFAULT_EMAIL}>"),
+                format!("Co-authored-by: Model A (v0.8.0 {SOURCE_ID}) <{DEFAULT_EMAIL}>"),
             ]
         );
+    }
+
+    // ---- the qualifier: what the address does not already say ----
+
+    /// The harness name is REDUNDANT against an address that already names
+    /// it, so it is dropped: `<…+newt-agent@…>` says `newt-agent` once, and
+    /// the qualifier carries only the build that address cannot tell you.
+    #[test]
+    fn newt_harness_name_is_not_repeated_against_its_own_address() {
+        let a = Attribution::new("m", "newt-agent", "0.8.0", DEFAULT_EMAIL).with_build("abc123");
+        assert_eq!(
+            a.trailer(),
+            format!("Co-authored-by: m (v0.8.0 abc123) <{DEFAULT_EMAIL}>")
+        );
+        assert!(
+            !a.trailer().contains("(newt-agent"),
+            "the account name appears once, in the address: {}",
+            a.trailer()
+        );
+    }
+
+    /// Only the part the address does NOT carry survives: `newt-agent crew`
+    /// reduces to `crew`, so a crew-landed commit stays distinguishable from
+    /// a session one — the crew marker is the whole reason that harness
+    /// string exists (newt-cli's `crew_coauthor_trailer`).
+    #[test]
+    fn crew_keeps_the_half_of_the_harness_the_address_omits() {
+        let a =
+            Attribution::new("m", "newt-agent crew", "0.8.0", DEFAULT_EMAIL).with_build("abc123");
+        assert_eq!(
+            a.trailer(),
+            format!("Co-authored-by: m (crew v0.8.0 abc123) <{DEFAULT_EMAIL}>")
+        );
+    }
+
+    /// A FOREIGN harness keeps its full name, because its address does not
+    /// spell it out. This is what stops the omission from collapsing two
+    /// genuinely different contributors into one identical line — the
+    /// `Model A (newt-agent)` vs `Model A (Codex)` contract.
+    #[test]
+    fn a_foreign_harness_keeps_its_name_so_contributors_stay_distinct() {
+        let newt = Attribution::new("Model A", "newt-agent", "0.8.0", DEFAULT_EMAIL);
+        let codex = Attribution::new("Model A", "Codex CLI", "0.8.0", "codex@openai.com");
+        assert_eq!(
+            codex.trailer(),
+            "Co-authored-by: Model A (Codex CLI v0.8.0) <codex@openai.com>"
+        );
+        assert_ne!(
+            newt.trailer(),
+            codex.trailer(),
+            "same model, two harnesses — two visibly distinct trailers"
+        );
+    }
+
+    /// A generic provider mailbox names a PROVIDER, not an account, so it
+    /// never licenses dropping the harness name. `codex@openai.com` must not
+    /// strip `Codex` off `Codex CLI`.
+    #[test]
+    fn a_non_account_address_never_strips_the_harness_name() {
+        let a = Attribution::new("m", "Codex CLI", "1.0", "codex@openai.com");
+        assert!(a.trailer().contains("(Codex CLI v1.0)"), "{}", a.trailer());
+        let anthropic = Attribution::new("Claude Opus 5", "Claude Code", "2.1.239", ANTHROPIC);
+        assert_eq!(
+            anthropic.trailer(),
+            format!("Co-authored-by: Claude Opus 5 (Claude Code v2.1.239) <{ANTHROPIC}>")
+        );
+    }
+
+    /// A harness that merely STARTS WITH the account name is not the account:
+    /// `newt-agentic` keeps its full name, because the space guard means only
+    /// `newt-agent` itself and `newt-agent <suffix>` are treated as the
+    /// account speaking.
+    #[test]
+    fn a_lookalike_harness_name_is_not_treated_as_the_account() {
+        let a = Attribution::new("m", "newt-agentic", "0.8.0", DEFAULT_EMAIL);
+        assert!(
+            a.trailer().contains("(newt-agentic v0.8.0)"),
+            "{}",
+            a.trailer()
+        );
+    }
+
+    /// The build revision is part of the IDENTITY, not just the rendering:
+    /// the same model+harness+version from two different builds is two
+    /// contributors, because what ran the work differs.
+    #[test]
+    fn a_build_switch_with_everything_else_equal_produces_two_trailers() {
+        let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
+        ledger.add(
+            Attribution::new("Model A", "newt-agent", "0.8.0", DEFAULT_EMAIL)
+                .with_build("aaaa1111"),
+        );
+        ledger.add(
+            Attribution::new("Model A", "newt-agent", "0.8.0", DEFAULT_EMAIL)
+                .with_build("bbbb2222"),
+        );
+        assert_eq!(ledger.contributors().len(), 2);
+        assert_eq!(
+            ledger.trailers(),
+            vec![
+                format!("Co-authored-by: Model A (v0.8.0 aaaa1111) <{DEFAULT_EMAIL}>"),
+                format!("Co-authored-by: Model A (v0.8.0 bbbb2222) <{DEFAULT_EMAIL}>"),
+            ]
+        );
+    }
+
+    /// A dirty build is credited as dirty — an honest signal that the harness
+    /// that ran the work is not any committed revision.
+    #[test]
+    fn a_dirty_build_says_so_in_the_trailer() {
+        let a = Attribution::new("m", "newt-agent", "0.8.0", DEFAULT_EMAIL)
+            .with_build("ba56944bd262-dirty");
+        assert!(a.trailer().ends_with(&format!("<{DEFAULT_EMAIL}>")));
+        assert!(
+            a.trailer().contains("(v0.8.0 ba56944bd262-dirty)"),
+            "{}",
+            a.trailer()
+        );
+    }
+
+    /// `record` credits the harness that OWNS the ledger, so it stamps THIS
+    /// build by default — the same source `CommitAttribution::from_runtime`
+    /// reads. Without that default a caller who forgot `with_build` would
+    /// silently double-credit the active model at commit time.
+    #[test]
+    fn record_stamps_this_build_so_the_active_model_dedupes() {
+        let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
+        ledger.record("m", "newt-agent", "0.8.0");
+        assert_eq!(
+            ledger.contributors()[0].harness_build.as_deref(),
+            Some(crate::build_info::SOURCE_ID)
+        );
+    }
+
+    /// The active-at-commit model and a ledger contributor render through the
+    /// SAME code path, so the two can never drift into different shapes.
+    #[test]
+    fn the_active_model_renders_exactly_like_a_ledger_contributor() {
+        let ca = sample_ca();
+        let same = Attribution::new(
+            &ca.model,
+            &ca.harness_name,
+            &ca.harness_version,
+            &ca.agent_email,
+        )
+        .with_build(&ca.harness_build_revision);
+        assert_eq!(ca.model_trailer(), same.trailer());
+    }
+
+    // ---- `/byline`: the preview cannot lie about the commit ----
+
+    /// The preview is EXACTLY the trailer block the commit gets — same lines,
+    /// same order — because it runs the same finalizer. Pinned against a real
+    /// finalized message rather than against a hand-written expectation, so
+    /// the two cannot drift.
+    #[test]
+    fn byline_is_exactly_what_the_commit_would_receive() {
+        let ca = CommitAttribution {
+            operator_email: Some("shawn@example.com".to_string()),
+            ..sample_ca()
+        };
+        let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
+        ledger.record("Model A", "newt-agent", "0.7.6");
+        let preview = ca.byline(ledger.contributors());
+        let committed: Vec<String> = ca
+            .finalize_message_with("fix the parser", ledger.contributors())
+            .lines()
+            .filter(|l| !l.trim().is_empty() && *l != "fix the parser")
+            .map(str::to_string)
+            .collect();
+        assert_eq!(preview, committed);
+    }
+
+    /// The preview credits the human operator and every accumulated model,
+    /// not just the active one — the whole point of asking before committing.
+    #[test]
+    fn byline_shows_operator_contributors_and_provenance() {
+        let ca = CommitAttribution {
+            operator_email: Some("shawn@example.com".to_string()),
+            ..sample_ca()
+        };
+        let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
+        ledger.record("Model A", "newt-agent", "0.7.6");
+        let out = ca.byline(ledger.contributors());
+        assert_eq!(
+            out,
+            vec![
+                format!("Co-authored-by: Model A (v0.7.6 {SOURCE_ID}) <{DEFAULT_EMAIL}>"),
+                format!(
+                    "Co-authored-by: glm-5.2 (v0.8.0 ba56944bd262-dirty) <{DEFAULT_EMAIL}>"
+                ),
+                "Co-authored-by: shawn <shawn@example.com>".to_string(),
+                "Harness: newt-agent v0.8.0 (ba56944bd262-dirty) | Model: glm-5.2 | Operator: shawn"
+                    .to_string(),
+            ]
+        );
+    }
+
+    /// With no operator email known, the preview omits the operator by-line
+    /// rather than inventing an address — the same never-invent rule the
+    /// commit path obeys.
+    #[test]
+    fn byline_omits_the_operator_when_no_real_email_is_known() {
+        let out = sample_ca().byline(&[]);
+        assert!(
+            !out.iter().any(|l| l.contains("shawn@")),
+            "no operator email is manufactured: {out:?}"
+        );
+        assert_eq!(out.len(), 2, "active model + provenance only: {out:?}");
     }
 
     /// Contract test 5: many contributors (10+) — none truncated, no hidden
@@ -911,7 +1263,7 @@ mod tests {
         let ca = sample_ca();
         assert_eq!(
             ca.model_trailer(),
-            format!("Co-authored-by: glm-5.2 (newt-agent v0.8.0) <{DEFAULT_EMAIL}>")
+            format!("Co-authored-by: glm-5.2 (v0.8.0 ba56944bd262-dirty) <{DEFAULT_EMAIL}>")
         );
     }
 
@@ -1053,10 +1405,10 @@ mod tests {
             ..sample_ca()
         };
         let twice = after.finalize_message(&once);
-        assert!(twice.contains("glm-5.3 (newt-agent v0.8.1)"));
+        assert!(twice.contains("glm-5.3 (v0.8.1 cef01234-clean)"));
         assert!(twice.contains("Harness: newt-agent v0.8.1 (cef01234-clean)"));
         assert!(
-            !twice.contains("glm-5.2 (newt-agent v0.8.0)"),
+            !twice.contains("glm-5.2 (v0.8.0 ba56944bd262-dirty)"),
             "old model trailer replaced"
         );
     }
@@ -1105,12 +1457,12 @@ mod tests {
     #[test]
     fn finalize_before_after_snapshot() {
         let ca = sample_ca();
-        let before = "feat(attribution): finalizer\n\nDrives the commit.\n\nCo-authored-by: glm-4.7 (newt-agent v0.7.6) <309460085+newt-agent@users.noreply.github.com>\nHarness: newt-agent v0.7.6 (aabbccdd) | Model: glm-4.7 | Operator: shawn\nCo-authored-by: Reviewer <reviewer@example.com>\n";
+        let before = "feat(attribution): finalizer\n\nDrives the commit.\n\nCo-authored-by: glm-4.7 (v0.7.6 aabbccdd) <309460085+newt-agent@users.noreply.github.com>\nHarness: newt-agent v0.7.6 (aabbccdd) | Model: glm-4.7 | Operator: shawn\nCo-authored-by: Reviewer <reviewer@example.com>\n";
         let after = ca.finalize_message(before);
         let expected = format!(
             "feat(attribution): finalizer\n\nDrives the commit.\n\n\
              Co-authored-by: Reviewer <reviewer@example.com>\n\
-             Co-authored-by: glm-5.2 (newt-agent v0.8.0) <{DEFAULT_EMAIL}>\n\
+             Co-authored-by: glm-5.2 (v0.8.0 ba56944bd262-dirty) <{DEFAULT_EMAIL}>\n\
              Harness: newt-agent v0.8.0 (ba56944bd262-dirty) | Model: glm-5.2 | Operator: shawn\n"
         );
         assert_eq!(after, expected);
@@ -1139,15 +1491,15 @@ mod tests {
         assert_eq!(lines[1], "");
         assert_eq!(
             lines[2],
-            format!("Co-authored-by: Model A (newt-agent v0.7.6) <{DEFAULT_EMAIL}>")
+            format!("Co-authored-by: Model A (v0.7.6 {SOURCE_ID}) <{DEFAULT_EMAIL}>")
         );
         assert_eq!(
             lines[3],
-            format!("Co-authored-by: Model B (Codex v0.8.0) <{DEFAULT_EMAIL}>")
+            format!("Co-authored-by: Model B (Codex v0.8.0 {SOURCE_ID}) <{DEFAULT_EMAIL}>")
         );
         assert_eq!(
             lines[4],
-            format!("Co-authored-by: glm-5.2 (newt-agent v0.8.0) <{DEFAULT_EMAIL}>")
+            format!("Co-authored-by: glm-5.2 (v0.8.0 ba56944bd262-dirty) <{DEFAULT_EMAIL}>")
         );
         assert!(lines[5].starts_with("Harness: "));
         assert_eq!(lines.len(), 6);
@@ -1159,7 +1511,16 @@ mod tests {
     /// credit it once.
     #[test]
     fn finalize_with_ledger_dedupes_active_model_already_present() {
-        let ca = sample_ca(); // active = glm-5.2 / newt-agent v0.8.0
+        // The build revision is part of the identity, so the active model and
+        // the ledger entry must agree on it to be ONE contributor. They do in
+        // production — `AttributionLedger::new` and
+        // `CommitAttribution::from_runtime` both read `build_info::SOURCE_ID`
+        // — so the fixture reads it too rather than pinning a literal that
+        // would make this dedupe pass for the wrong reason.
+        let ca = CommitAttribution {
+            harness_build_revision: SOURCE_ID.to_string(),
+            ..sample_ca()
+        };
         let mut ledger = AttributionLedger::new(DEFAULT_EMAIL);
         ledger.record("glm-5.2", "newt-agent", "0.8.0"); // identical to active
         ledger.record("Model A", "newt-agent", "0.7.6");
@@ -1265,8 +1626,8 @@ mod tests {
         let after = ca.finalize_message_with(before, ledger.contributors());
         let expected = format!(
             "fix the parser\n\n\
-             Co-authored-by: Model A (newt-agent v0.7.6) <{DEFAULT_EMAIL}>\n\
-             Co-authored-by: glm-5.2 (newt-agent v0.8.0) <{DEFAULT_EMAIL}>\n\
+             Co-authored-by: Model A (v0.7.6 {SOURCE_ID}) <{DEFAULT_EMAIL}>\n\
+             Co-authored-by: glm-5.2 (v0.8.0 ba56944bd262-dirty) <{DEFAULT_EMAIL}>\n\
              Harness: newt-agent v0.8.0 (ba56944bd262-dirty) | Model: glm-5.2 | Operator: shawn\n"
         );
         assert_eq!(after, expected);
