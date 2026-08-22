@@ -276,13 +276,13 @@ Rules:
   goes in via `AttributionLedger::add` with an `Attribution` carrying that
   harness's address — `Attribution::email` is per-contributor for exactly
   this reason.
-- **The code does not render this shape yet.** `Attribution::trailer` and
-  `CommitAttribution::model_trailer` always emit `(<harness> v<version>)` and
-  are fed `PACKAGE_VERSION`, so today newt's own trailers read
-  `(newt-agent v0.8.0)` — harness name repeated against a `+newt-agent@`
-  address, and no build commit. This section states the intended shape; the
-  renderers and their `harness_version` source are the thing to fix, not
-  this doc.
+- **Ask rather than reconstruct it: `/byline`.** It prints the exact block
+  the next commit would carry — every accumulated contributor, the active
+  model, the operator by-line, the provenance line — rendered by the same
+  finalizer the commit path runs, so it cannot show a shape a commit would
+  not produce. `newt identity` prints the same preview for the configured
+  identity. Read it off one of those instead of assembling a trailer from
+  this section by hand.
 - **This is mechanical, not a model instruction.** The embedded `git` tool
   stamps the ledger's accumulated trailers itself; do not hand-write
   `Co-authored-by` lines yourself when using it — see the per-turn "Git
