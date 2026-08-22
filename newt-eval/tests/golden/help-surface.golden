@@ -60,6 +60,7 @@
   /status                  - show session and environment summary
   /info                    - show detailed session info (backend, permissions, version)
   /workspace               - show current workspace path
+  /byline                  - the Co-authored-by block the next commit would carry
   /docs                    - quick pointers to newt docs and issue tracker
   /dock [status|disable|enable] - remote-HTMX docking kill-switch (req 7): disable forcibly undocks THIS box from every hub; status lists approved peers
   /allow                   - alias for /permissions
