@@ -2569,6 +2569,7 @@ mod composed_private_mcp_uat {
                 url: &model.uri(),
                 model: "composed-private-review-model",
                 kind: BackendKind::Ollama,
+                emits_leading_reasoning: false,
                 api_key: None,
                 messages: &messages,
                 task: &task,

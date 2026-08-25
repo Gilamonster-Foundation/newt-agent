@@ -7035,6 +7035,7 @@ fn session_body(
                                         chat_completions_capability: choice
                                             .chat_completions_capability,
                                         reasoning_replay_scope: choice.reasoning_replay_scope,
+                                        emits_leading_reasoning: choice.emits_leading_reasoning,
                                         max_tool_rounds: eff_max_tool_rounds,
                                         narration_nudge_cap: eff_narration_nudge_cap,
                                         // #1162: the /nudge dial — env set by the

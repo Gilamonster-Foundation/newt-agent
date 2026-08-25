@@ -1284,6 +1284,17 @@ pub struct ChatCtx<'a> {
     /// Unknown endpoints default to `Never`; local reasoning backends opt in via
     /// their explicit capability profile.
     pub reasoning_replay_scope: crate::model_card::ReasoningReplayScope,
+    /// Whether this model streams a lone leading `</think>` closer, so the
+    /// filter must start inside the reasoning block (#528).
+    ///
+    /// Resolved by the caller from an INLINE BACKEND CAPABILITY declaration
+    /// (`[backends.<name>.capability]`) — never from the model name. A named
+    /// `card =` pointer is not consulted by any capability accessor today.
+    ///
+    /// Undeclared resolves to `false` (do not suppress): filtering wrongly
+    /// drops real answer text silently, while not filtering wrongly shows
+    /// reasoning the operator can see.
+    pub emits_leading_reasoning: bool,
     /// Maximum tool-call rounds before forcing a final tools-disabled
     /// completion (from `[tui].max_tool_rounds`, default 40).
     pub max_tool_rounds: usize,
@@ -2166,6 +2177,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         operating_mode_control,
         plan_mode_control,
         steering,
+        emits_leading_reasoning,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
     // bookkeeping: on EVERY exit (return, `?`, cancel, panic) the guard
@@ -3417,7 +3429,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // #528: models that stream a lone-leading `</think>` (Nemotron et al.)
             // need the filter to start inside the reasoning block so the closer
             // and the reasoning it follows don't leak into the reply.
-            let leading_reasoning = crate::reasoning::emits_leading_reasoning(model);
+            let leading_reasoning = emits_leading_reasoning;
             // Step 25.4 (#568): `markdown` is now resolved by the caller
             // (`[tui].markdown` ∧ `/markdown` override ∧ color) and read off the
             // ctx above — no longer hardcoded to `color`.
@@ -6054,6 +6066,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         plan_mode_control,
         steering,
         completed_spill_renderer,
+        // This loop does not call `stream_response`, the only consumer of the
+        // flag (the leading-`</think>` filter is Ollama-wire only today).
+        // Bound and ignored rather than dropped from the pattern: a future
+        // field added to ChatCtx then fails HERE, forcing a decision about
+        // what it means for this wire instead of silently defaulting.
+        emits_leading_reasoning: _,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
     // bookkeeping: on EVERY exit (return, `?`, cancel, panic) the guard
@@ -8063,6 +8081,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         plan_mode_control,
         steering,
         completed_spill_renderer,
+        // Anthropic streams reasoning in its own wire fields, not as a lone
+        // leading `</think>` closer, so this loop never starts the filter
+        // inside a reasoning block. Bound and ignored rather than dropped
+        // from the pattern, so adding a field to ChatCtx keeps failing here
+        // until someone decides what it means for this wire.
+        emits_leading_reasoning: _,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
     // bookkeeping: on EVERY exit (return, `?`, cancel, panic) the guard
@@ -9750,6 +9774,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         plan_mode_control,
         steering,
         completed_spill_renderer,
+        // This loop does not call `stream_response`, the only consumer of the
+        // flag (the leading-`</think>` filter is Ollama-wire only today).
+        // Bound and ignored rather than dropped from the pattern: a future
+        // field added to ChatCtx then fails HERE, forcing a decision about
+        // what it means for this wire instead of silently defaulting.
+        emits_leading_reasoning: _,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
     // bookkeeping: on EVERY exit (return, `?`, cancel, panic) the guard
@@ -12130,6 +12160,7 @@ mod tool_round_cap_tests {
             cognition: None,
             chat_completions_capability: Default::default(),
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
+            emits_leading_reasoning: false,
             max_tool_rounds: 1,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -12410,6 +12441,7 @@ mod tool_round_cap_tests {
                 cognition: None,
                 chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
+                emits_leading_reasoning: false,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -12871,6 +12903,7 @@ mod tool_round_cap_tests {
                 cognition: None,
                 chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
+                emits_leading_reasoning: false,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -12975,6 +13008,7 @@ mod tool_round_cap_tests {
                 cognition: None,
                 chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
+                emits_leading_reasoning: false,
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -15310,6 +15344,7 @@ mod tool_round_cap_tests {
                 cognition: None,
                 chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
+                emits_leading_reasoning: false,
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -15427,6 +15462,7 @@ mod tool_round_cap_tests {
                 cognition: None,
                 chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
+                emits_leading_reasoning: false,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -15553,6 +15589,7 @@ mod tool_round_cap_tests {
                 cognition: None,
                 chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
+                emits_leading_reasoning: false,
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -15690,6 +15727,7 @@ mod tool_round_cap_tests {
                 cognition: None,
                 chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
+                emits_leading_reasoning: false,
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -15819,6 +15857,7 @@ mod tool_round_cap_tests {
                 cognition: None,
                 chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
+                emits_leading_reasoning: false,
                 max_tool_rounds: 2,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -15990,6 +16029,7 @@ mod tool_round_cap_tests {
                 cognition: None,
                 chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
+                emits_leading_reasoning: false,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -16170,6 +16210,7 @@ mod tool_round_cap_tests {
                 cognition: None,
                 chat_completions_capability: Default::default(),
                 reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
+                emits_leading_reasoning: false,
                 max_tool_rounds: 10,
                 narration_nudge_cap: 1,
                 action_nudges: true,
@@ -17096,6 +17137,7 @@ mod save_note_loop_tests {
             cognition: None,
             chat_completions_capability: Default::default(),
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
+            emits_leading_reasoning: false,
             max_tool_rounds: 6,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -17605,6 +17647,7 @@ mod compression_loop_tests {
             cognition: None,
             chat_completions_capability: Default::default(),
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
+            emits_leading_reasoning: false,
             max_tool_rounds: 12,
             narration_nudge_cap: 1,
             action_nudges: true,
@@ -18996,6 +19039,7 @@ mod observation_hook_tests {
             cognition: None,
             chat_completions_capability: Default::default(),
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
+            emits_leading_reasoning: false,
             max_tool_rounds: 8,
             narration_nudge_cap: 1,
             action_nudges: true,

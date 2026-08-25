@@ -3086,6 +3086,35 @@ impl BackendConfig {
             .unwrap_or_default()
     }
 
+    /// Whether this model streams its chain-of-thought as a lone leading
+    /// closer (`reasoning</think>answer`, no opening tag) and therefore needs
+    /// the stream filter to start INSIDE the reasoning block.
+    ///
+    /// Reads THIS backend's inline [`Capability`] — never the model name.
+    /// Display names are labels: an operator may serve any artifact under any
+    /// alias, so `contains("qwen3")` is wrong in both directions (it
+    /// suppresses output from things that are not Qwen, and prints raw
+    /// reasoning from things that are). Replaces the #384 name-list stopgap.
+    ///
+    /// **Scope, stated precisely:** like its two siblings above, this reads
+    /// the inline `capability` field only. A named `card =` pointer is copied
+    /// between configs but never resolved into a capability, so a card's
+    /// `[capability]` block does not reach here. Fixing that is one step for
+    /// all three accessors — doing it for one would leave siblings behaving
+    /// differently, which is worse than a uniform gap.
+    ///
+    /// **Unknown defaults to `false` — do not suppress.** The two failure
+    /// modes are not symmetric: filtering when we should not DROPS real answer
+    /// text silently, while not filtering when we should shows reasoning the
+    /// operator can see and correct. Fail toward the visible one.
+    #[must_use]
+    pub fn emits_leading_reasoning(&self) -> bool {
+        self.capability
+            .as_ref()
+            .and_then(|capability| capability.emits_leading_reasoning)
+            .unwrap_or(false)
+    }
+
     /// Resolve the backend's reasoning replay contract. Unknown or legacy
     /// endpoints remain conservative and never receive replayed reasoning.
     #[must_use]

@@ -200,21 +200,29 @@ impl ThinkFilter {
     }
 }
 
-/// Whether a model streams its chain-of-thought as a **lone leading closer**
-/// (`reasoning</think>answer`, with no opening `<think>`) — the shape Nemotron
-/// (`detailed thinking on`), DeepSeek-R1, and Qwen3 emit. Such models need
-/// [`ThinkFilter::with_leading_reasoning`] so the streamed reasoning (and the
-/// bare `</think>`) is suppressed rather than printed into the reply.
-///
-/// Name-based stopgap until a per-model capability card carries this flag
-/// (#384); matched case-insensitively against the known families.
-#[must_use]
-pub fn emits_leading_reasoning(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    ["nemotron", "deepseek-r1", "qwen3"]
-        .iter()
-        .any(|fam| m.contains(fam))
-}
+// The #384 name-list stopgap that used to live here is GONE.
+//
+// It asked `model.contains("nemotron" | "deepseek-r1" | "qwen3")` and used the
+// answer to decide whether streamed text was suppressed as reasoning or
+// printed into the reply — authoritative execution behavior selected from a
+// display label. That is wrong in both directions: an operator may serve any
+// artifact under any alias, so an unrelated model named `my-qwen3-finetune`
+// had its output filtered, while a genuine Qwen3 served as `ornith-1.0` had
+// its raw reasoning printed into the answer.
+//
+// The flag now comes from an INLINE BACKEND CAPABILITY DECLARATION
+// (`[backends.<name>.capability] emits_leading_reasoning = true` →
+// `BackendConfig::emits_leading_reasoning` → `ChatCtx`/`TurnDriverConfig`),
+// which is the direction #384 asked for.
+//
+// Note the precise source: a named `card = "…"` pointer is NOT consulted —
+// `card` is copied between configs but never resolved into a capability by
+// any of the three accessors. Saying "capability card" here would describe a
+// path that does not run.
+//
+// With nothing declared, no policy applies and the filter stays off:
+// filtering wrongly drops real answer text silently, while not filtering
+// wrongly only shows reasoning the operator can see and correct.
 
 /// The length of `buf` that is safe to commit (emit *or* discard) without splitting
 /// a possible `tag` — i.e. `buf` minus its longest suffix that is a proper prefix of
@@ -397,16 +405,5 @@ mod tests {
         // into the (discarded) reasoning and the answer stays clean.
         let (clean, _r) = stream_leading(&["<think>r</think>", "answer"]);
         assert_eq!(clean, "answer");
-    }
-
-    #[test]
-    fn emits_leading_reasoning_matches_known_families() {
-        assert!(emits_leading_reasoning("nemotron-3-nano:30b"));
-        assert!(emits_leading_reasoning("nemotron3:33b"));
-        assert!(emits_leading_reasoning("deepseek-r1:7b"));
-        assert!(emits_leading_reasoning("qwen3:8b"));
-        assert!(!emits_leading_reasoning("llama3:8b"));
-        assert!(!emits_leading_reasoning("qwen2.5-coder:7b"));
-        assert!(!emits_leading_reasoning("gpt-4o"));
     }
 }
