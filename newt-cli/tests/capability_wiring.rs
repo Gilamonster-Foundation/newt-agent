@@ -44,8 +44,9 @@ const BANNED: &[&str] = &[
     // A binding re-derived from the (possibly overridden) backend instead
     // of the receipt.
     "CardBindingSeed::from_backend(",
-    // Model-name substring family inference.
-    "attribute_active_family(",
+    // (the `attribute_active_family(` ban retired with #1820: the symbol no
+    // longer exists, and newt-core/tests/tenacity_exact_family_ratchet.rs now
+    // owns the no-name-inference guarantee at the source.)
 ];
 
 fn solve_source() -> String {

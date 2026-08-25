@@ -198,28 +198,6 @@ impl TenacityConfig {
             .or(self.default)
             .unwrap_or_default()
     }
-
-    /// Attribute a family to a model for per-family resolution, without requiring
-    /// a model card per model. The card's `family` wins when it names a configured
-    /// family; otherwise infer it by matching a configured family KEY as a
-    /// case-insensitive substring of the model NAME — so `"qwen3-coder_30b"` picks
-    /// up a `[tenacity.families] qwen3` default, and the whole matrix (gemma,
-    /// nemotron, deepseek, kimi, glm…) works from config alone. The match set is
-    /// the operator's own `families` keys (data, not a hardcoded list). `None`
-    /// when nothing matches ⇒ [`resolve`](Self::resolve) uses the default.
-    pub fn family_for(&self, model: &str, card_family: Option<&str>) -> Option<String> {
-        if let Some(fam) = card_family {
-            let fam = fam.trim();
-            if self.families.keys().any(|k| k.eq_ignore_ascii_case(fam)) {
-                return Some(fam.to_string());
-            }
-        }
-        let lname = model.to_ascii_lowercase();
-        self.families
-            .keys()
-            .find(|k| lname.contains(&k.to_ascii_lowercase()))
-            .cloned()
-    }
 }
 
 /// Full resolution order, most-specific first: an explicit operator choice
@@ -326,8 +304,15 @@ pub fn set_tenacity_config(config: TenacityConfig) {
     }
 }
 
-/// Install the active model's family (from its model card) so per-family config
-/// defaults apply. Called at model selection. `None` clears it.
+/// Install the active model's family so per-family config defaults apply;
+/// `None` clears it. This is the ONLY attribution path (#1820): callers derive
+/// the family from typed resolved-card metadata
+/// (`ResolvedCapabilities::family_for_route`) at every point a session settles
+/// on a model — chat AND solve (#1139). Deliberately, nothing infers a family
+/// from the model NAME anymore: a cardless model whose name merely contains a
+/// configured `[tenacity.families]` key gets NO family and falls to the
+/// configured default (names are labels, never evidence — #1818/#1819). Opt
+/// back in by writing a drop-in model card that names the family.
 pub fn set_active_model_family(family: Option<String>) {
     if let Ok(mut slot) = ACTIVE_FAMILY.lock() {
         *slot = family;
@@ -389,20 +374,6 @@ pub fn base_tenacity() -> Tenacity {
     let config = TENACITY_CONFIG.lock().ok().and_then(|s| s.clone());
     let family = ACTIVE_FAMILY.lock().ok().and_then(|s| s.clone());
     resolve_tenacity(None, None, config.as_ref(), family.as_deref())
-}
-
-/// Attribute the active model's family for per-family `[tenacity]` resolution and
-/// install it (`ACTIVE_FAMILY`). The card's `family` wins when a built-in card
-/// names one; else the family is inferred from the model NAME against the
-/// configured `[tenacity.families]` keys. Call at every point a session settles on
-/// a model — solve AND chat (#1139: chat previously never did this, so per-family
-/// defaults silently did not apply there). `config == None` ⇒ only a card family.
-pub fn attribute_active_family(config: Option<&TenacityConfig>, model: &str) {
-    let card_family = crate::model_card::builtin_card(model).and_then(|c| c.family);
-    let family = config
-        .and_then(|t| t.family_for(model, card_family.as_deref()))
-        .or(card_family);
-    set_active_model_family(family);
 }
 
 /// A complete snapshot of **every** mutable global that feeds
@@ -599,42 +570,36 @@ mod tests {
         assert_eq!(cfg(None, &[]).resolve(None), Tenacity::Standard);
     }
 
+    /// Companion to the exact-family migration (#1820). The red/green
+    /// regression for the removal itself is
+    /// `tests/tenacity_exact_family_ratchet.rs` (red on the pre-migration
+    /// source); THESE assertions pin the surviving semantics: family reaches
+    /// tenacity only through the typed seam, the label match is equality, and
+    /// a session with no typed evidence gets the configured default — where
+    /// before, a cardless model named like `my-nemotron-alias` picked up the
+    /// `nemotron` level by name containment. The end-to-end solve negative
+    /// lives in newt-cli/tests/solve_cli.rs
+    /// (`a_cardless_nemotron_looking_alias_gets_no_family_tenacity`).
     #[test]
-    fn attribute_active_family_installs_card_then_substring_then_clears() {
+    fn family_arrives_only_through_the_typed_seam() {
         use crate::test_guard::GlobalSettingsGuard;
         let _g = GlobalSettingsGuard::acquire();
 
-        // Card path: with no config at all (`config == None` ⇒ only a card family),
-        // a built-in card that names a family installs it. ornith-1.0-35b → qwen3.
-        set_active_model_family(None);
-        attribute_active_family(None, "ornith-1.0-35b");
-        assert_eq!(
-            active_model_family().as_deref(),
-            Some("qwen3"),
-            "the built-in card's declared family is installed"
-        );
+        set_tenacity_config(cfg(None, &[("nemotron", Tenacity::Relentless)]));
 
-        // Substring path: no card for this name, but the model NAME contains a
-        // configured `[tenacity.families]` key → that family is inferred + installed.
-        // This is the #1139 chat fix — chat now attributes family exactly as solve does.
-        let c = cfg(None, &[("qwen3", Tenacity::Relentless)]);
-        set_active_model_family(None);
-        attribute_active_family(Some(&c), "Qwen3-Coder-30B");
-        assert_eq!(
-            active_model_family().as_deref(),
-            Some("qwen3"),
-            "a family is inferred from the model name against the config families"
-        );
+        // Typed evidence — a resolved card's family — installs and resolves.
+        set_active_model_family(Some("nemotron".to_string()));
+        assert_eq!(effective_tenacity(), Tenacity::Relentless);
 
-        // No card + no matching family → ACTIVE_FAMILY is CLEARED (not left stale),
-        // so effective_tenacity falls back to the config default / Standard.
-        set_active_model_family(Some("stale".to_string()));
-        attribute_active_family(Some(&c), "mystery-model-7b");
-        assert_eq!(
-            active_model_family(),
-            None,
-            "an unrecognized model clears the family rather than leaving a stale one"
-        );
+        // The label match is equality (case-insensitive), never containment:
+        // a family label that merely CONTAINS a configured key is not it.
+        set_active_model_family(Some("nemotron-super".to_string()));
+        assert_eq!(effective_tenacity(), Tenacity::Standard);
+
+        // No typed evidence => no family. Tenacity never sees a model name,
+        // so there is nothing to infer from — the deliberate behavior loss.
+        set_active_model_family(None);
+        assert_eq!(effective_tenacity(), Tenacity::Standard);
     }
 
     #[test]
@@ -682,41 +647,6 @@ mod tests {
             resolve_tenacity(Some(Tenacity::Insistent), None, None, None),
             Tenacity::Insistent
         );
-    }
-
-    #[test]
-    fn family_for_prefers_card_then_infers_from_the_model_name() {
-        let c = cfg(
-            None,
-            &[
-                ("qwen3", Tenacity::Standard),
-                ("nemotron", Tenacity::Relentless),
-            ],
-        );
-        // Card family that names a configured family wins.
-        assert_eq!(
-            c.family_for("whatever", Some("qwen3")).as_deref(),
-            Some("qwen3")
-        );
-        // No card → infer from the model name (the matrix case).
-        assert_eq!(
-            c.family_for("qwen3-coder_30b", None).as_deref(),
-            Some("qwen3")
-        );
-        assert_eq!(
-            c.family_for("NVIDIA-Nemotron-3-Nano", None).as_deref(),
-            Some("nemotron")
-        );
-        // No configured family matches the name → None (→ default level).
-        assert_eq!(c.family_for("gemma-2-9b", None), None);
-        // A card family NOT in the map falls through to name inference.
-        assert_eq!(
-            c.family_for("qwen3-coder_30b", Some("unlisted")).as_deref(),
-            Some("qwen3")
-        );
-        // Resolving that inferred family gives the per-family level.
-        let fam = c.family_for("qwen3-coder_30b", None);
-        assert_eq!(c.resolve(fam.as_deref()), Tenacity::Standard);
     }
 
     #[test]
