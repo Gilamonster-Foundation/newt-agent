@@ -720,3 +720,85 @@ fn card_pointer_near_collisions_never_silently_bind() {
         .for_route(&home(), ServingPrincipal::Instance)
         .emits_leading_reasoning());
 }
+
+// =========================================================================
+// Typed family identity (anti-substring seam)
+// =========================================================================
+
+/// A capability-less card with an ARBITRARY family (no
+/// `cards/families/<name>.toml` defaults profile) resolves through the
+/// exact catalog and carries its family — identity is decoupled from
+/// serving-default availability — and `family_for_route` gates it through
+/// the exact concrete destination + principal association, never the model
+/// name.
+#[test]
+fn an_arbitrary_family_card_carries_typed_identity_without_defaults() {
+    let (_dir, config) = catalog_with(&[(
+        "nano-team",
+        "name = \"nano-team\"\nbackend = \"vllm\"\nfamily = \"nemotron\"\n\n[vllm]\nserved_name = \"nano-team\"\n",
+    )]);
+    let b = backend(Some("bound-model"), Some("nano-team"), None);
+    let caps = resolve(&b, Some(&config)).unwrap();
+    // A family-only card mints the SAME binding a capability card does —
+    // its transitions are exactly as visible (finding-5 unification): the
+    // associated route is typed Active (capability layer stays inline-only)…
+    assert_eq!(caps.card(), Some("nano-team"));
+    let d = caps.for_route(&home(), ServingPrincipal::Instance);
+    assert!(matches!(
+        d.applicability(),
+        CardApplicability::Active { card } if card == "nano-team"
+    ));
+    assert!(
+        !d.emits_leading_reasoning(),
+        "no [capability] ⇒ no capability layer engages"
+    );
+    // …a retargeted model is a typed InactiveModel, a moved destination a
+    // typed InactiveDestination, an unestablished principal Undecided — the
+    // display owner can render every family-policy transition.
+    assert!(matches!(
+        caps.for_route(&home(), ServingPrincipal::MultiplexerModel("warm-pick"))
+            .applicability(),
+        CardApplicability::InactiveModel { .. }
+    ));
+    let moved = BackendDestination::new(Some("http://elsewhere:9".to_string()), None);
+    assert!(matches!(
+        caps.for_route(&moved, ServingPrincipal::Instance)
+            .applicability(),
+        CardApplicability::InactiveDestination { .. }
+    ));
+    assert!(matches!(
+        caps.for_route(&home(), ServingPrincipal::Unknown)
+            .applicability(),
+        CardApplicability::Undecided { .. }
+    ));
+    assert_eq!(
+        caps.family_for_route(&home(), ServingPrincipal::Instance),
+        Some("nemotron"),
+        "identity needs no serving-defaults profile"
+    );
+    assert_eq!(
+        caps.family_for_route(&home(), ServingPrincipal::MultiplexerModel("bound-model")),
+        Some("nemotron"),
+        "exact bound-model association carries the family"
+    );
+    // The gates: a different model, a hollow model, a moved destination —
+    // no association, no family, no name inference.
+    assert_eq!(
+        caps.family_for_route(&home(), ServingPrincipal::MultiplexerModel("warm-pick")),
+        None
+    );
+    assert_eq!(
+        caps.family_for_route(&home(), ServingPrincipal::MultiplexerModel("")),
+        None
+    );
+    let elsewhere = BackendDestination::new(Some("http://elsewhere:9".to_string()), None);
+    assert_eq!(
+        caps.family_for_route(&elsewhere, ServingPrincipal::Instance),
+        None,
+        "a moved destination never carries the family"
+    );
+    assert_eq!(
+        caps.family_for_route(&BackendDestination::default(), ServingPrincipal::Unknown),
+        None
+    );
+}

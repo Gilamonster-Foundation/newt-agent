@@ -11,14 +11,30 @@ use newt_core::agentic::{print_newt, warmup_if_cold, NEWT_ORANGE_CT};
 use crate::probe;
 use crate::{
     active_backend_name, backends_list_items, fetch_models_for, is_ephemeral_session,
-    keep_alive_str, resolve_backend_choice, run_newt_subcmd, today_date, with_interrupt_watch,
-    BackendChoice,
+    keep_alive_str, run_newt_subcmd, today_date, with_interrupt_watch, BackendChoice,
 };
 
 /// Handle the model/backend command family. `dispatch_slash` routes exactly the
 /// command names listed in this module's doc here; any other `cmd` is a router
 /// bug. Mirrors `dispatch_slash`'s "handled ⇒ `Ok(true)`" contract (none of
 /// these commands end the session).
+/// The session's current backend choice for a slash command — or print the
+/// typed selection refusal (unknown/unroutable/provider explicit selector)
+/// and yield `None`: a command surface never silently runs another backend.
+fn choice_or_print(
+    resolved: &newt_core::ResolvedConfig,
+    color: bool,
+    verbose: bool,
+) -> Option<BackendChoice> {
+    match crate::resolve_backend_choice(resolved) {
+        Ok(choice) => Some(choice),
+        Err(refusal) => {
+            print_newt(&refusal, color, verbose);
+            None
+        }
+    }
+}
+
 pub(crate) fn dispatch(
     cmd: &str,
     arg1: &str,
@@ -28,10 +44,12 @@ pub(crate) fn dispatch(
 ) -> anyhow::Result<bool> {
     match cmd {
         "models" => {
-            let cfg = newt_core::Config::resolve().unwrap_or_default();
-            let choice = resolve_backend_choice(&cfg);
+            let cfg = crate::resolve_runtime_or_default();
+            let Some(choice) = choice_or_print(&cfg, color, verbose) else {
+                return Ok(true);
+            };
             let url = choice.url;
-            let current = choice.model;
+            let current = choice.active_model.clone().unwrap_or_default();
 
             if arg1 == "capabilities" {
                 // Full tool-conformance matrix from the capability cache.
@@ -101,8 +119,10 @@ pub(crate) fn dispatch(
 
         "probe" => {
             // Test tool conformance for one model, or every model (`all`).
-            let cfg = newt_core::Config::resolve().unwrap_or_default();
-            let choice = resolve_backend_choice(&cfg);
+            let cfg = crate::resolve_runtime_or_default();
+            let Some(choice) = choice_or_print(&cfg, color, verbose) else {
+                return Ok(true);
+            };
 
             if arg1 == "reset" {
                 // Wipe learned conformance, context windows, and calibration so
@@ -145,7 +165,7 @@ pub(crate) fn dispatch(
                         }
                     }
                 } else if model_arg.is_empty() {
-                    vec![choice.model.clone()]
+                    vec![choice.active_model.clone().unwrap_or_default()]
                 } else {
                     vec![model_arg.to_string()]
                 };
@@ -286,10 +306,15 @@ pub(crate) fn dispatch(
 
         "model" => {
             if arg1.is_empty() {
-                let cfg = newt_core::Config::resolve().unwrap_or_default();
-                let current = resolve_backend_choice(&cfg).model;
+                let cfg = crate::resolve_runtime_or_default();
+                let Some(choice) = choice_or_print(&cfg, color, verbose) else {
+                    return Ok(true);
+                };
                 print_newt(
-                    &format!("active model: {current}  (use /model <name> to switch)"),
+                    &format!(
+                        "active model: {}  (use /model <name> to switch)",
+                        choice.display_model()
+                    ),
                     color,
                     verbose,
                 );
@@ -299,19 +324,21 @@ pub(crate) fn dispatch(
         }
 
         "backend" => {
-            let cfg = newt_core::Config::resolve().unwrap_or_default();
+            let cfg = crate::resolve_runtime_or_default();
             let has_openai = cfg
                 .backends
                 .iter()
                 .any(|b| b.kind == Some(newt_core::BackendKind::Openai));
             let kind_name = |c: &BackendChoice| c.kind.label();
             if arg1.is_empty() {
-                let choice = resolve_backend_choice(&cfg);
+                let Some(choice) = choice_or_print(&cfg, color, verbose) else {
+                    return Ok(true);
+                };
                 print_newt(
                     &format!(
                         "active backend: {} · {} @ {}",
                         kind_name(&choice),
-                        choice.model,
+                        choice.display_model(),
                         choice.url
                     ),
                     color,
@@ -337,7 +364,7 @@ pub(crate) fn dispatch(
         }
 
         "backends" => {
-            let cfg = newt_core::Config::resolve().unwrap_or_default();
+            let cfg = crate::resolve_runtime_or_default();
             if arg1.is_empty() {
                 // List every configured [[backends]] entry by name, flagging the
                 // one the session currently resolves to. `/backend` toggles the
@@ -417,17 +444,19 @@ pub(crate) fn apply_backend_kind(kind: &str, model: &str, color: bool, verbose: 
         // action. The coarse wire kind is deliberately not a pin axis.
         newt_core::runtime::mark_model_pick(model);
     }
-    let choice = resolve_backend_choice(&newt_core::Config::resolve().unwrap_or_default());
-    print_newt(
-        &format!(
-            "switched to {} · {} @ {} — next message.",
-            choice.kind.label(),
-            choice.model,
-            choice.url
+    match crate::resolve_backend_choice(&crate::resolve_runtime_or_default()) {
+        Ok(choice) => print_newt(
+            &format!(
+                "switched to {} · {} @ {} — next message.",
+                choice.kind.label(),
+                choice.display_model(),
+                choice.url
+            ),
+            color,
+            verbose,
         ),
-        color,
-        verbose,
-    );
+        Err(refusal) => print_newt(&refusal, color, verbose),
+    }
 }
 
 /// Switch the session to the NAMED backend `name` — the single application path
@@ -446,8 +475,24 @@ pub(crate) fn apply_backend_kind(kind: &str, model: &str, color: bool, verbose: 
 ///   wins). Skipped in an ephemeral session, which must leave no trace; the
 ///   live switch still applies. Best-effort — a write never blocks it.
 pub(crate) fn apply_backend_choice(name: &str, color: bool, verbose: bool) -> bool {
-    let cfg = newt_core::Config::resolve().unwrap_or_default();
-    if cfg.backends.iter().any(|b| b.name == name) {
+    let cfg = crate::resolve_runtime_or_default();
+    if let Some(target) = cfg.backends.iter().find(|b| b.name == name) {
+        // TRANSACTIONAL: validate the named target as HTTP-drivable BEFORE
+        // any env/settings mutation — refusing after `set_var` would poison
+        // the session selector and the saved preference while the live
+        // route stayed on the old backend. Judged on the FLATTENED,
+        // core-normalized view, exactly like the choice seam.
+        if target.endpoint.is_empty() || target.kind == Some(newt_core::BackendKind::Embedded) {
+            print_newt(
+                &format!(
+                    "backend '{name}' is an embedded (model_path) backend — chat drives \
+                     HTTP backends only; nothing was switched or saved"
+                ),
+                color,
+                verbose,
+            );
+            return false;
+        }
         unsafe {
             std::env::set_var("NEWT_PROVIDER", name);
             std::env::remove_var("NEWT_DGX_MODEL");
@@ -458,15 +503,19 @@ pub(crate) fn apply_backend_choice(name: &str, color: bool, verbose: bool) -> bo
         if newt_core::settings::should_persist(is_ephemeral_session()) {
             newt_core::settings::record_provider(name);
         }
-        let choice = resolve_backend_choice(&newt_core::Config::resolve().unwrap_or_default());
-        print_newt(
-            &format!(
-                "switched to backend '{}' · {} @ {} — next message.",
-                name, choice.model, choice.url
+        match crate::resolve_backend_choice(&crate::resolve_runtime_or_default()) {
+            Ok(choice) => print_newt(
+                &format!(
+                    "switched to backend '{}' · {} @ {} — next message.",
+                    name,
+                    choice.display_model(),
+                    choice.url
+                ),
+                color,
+                verbose,
             ),
-            color,
-            verbose,
-        );
+            Err(refusal) => print_newt(&refusal, color, verbose),
+        }
         true
     } else {
         let names: Vec<&str> = cfg.backends.iter().map(|b| b.name.as_str()).collect();
@@ -511,8 +560,10 @@ pub(crate) fn apply_backend_choice(name: &str, color: bool, verbose: bool) -> bo
 /// - Warm-up only applies to Ollama: vLLM and OpenAI-compatible endpoints
 ///   keep their served model resident at all times.
 pub(crate) fn apply_model_choice(name: &str, color: bool, verbose: bool) {
-    let gate_cfg = newt_core::Config::resolve().unwrap_or_default();
-    let gate_choice = resolve_backend_choice(&gate_cfg);
+    let gate_cfg = crate::resolve_runtime_or_default();
+    let Some(gate_choice) = choice_or_print(&gate_cfg, color, verbose) else {
+        return;
+    };
     let served: Option<Vec<String>> = fetch_models_for(
         &gate_choice.url,
         gate_choice.kind,
@@ -551,12 +602,14 @@ pub(crate) fn apply_model_choice(name: &str, color: bool, verbose: bool) {
     if newt_core::settings::should_persist(is_ephemeral_session()) {
         newt_core::settings::record_model(name);
     }
-    let cfg = newt_core::Config::resolve().unwrap_or_default();
-    let choice = resolve_backend_choice(&cfg);
+    let cfg = crate::resolve_runtime_or_default();
+    let Some(choice) = choice_or_print(&cfg, color, verbose) else {
+        return;
+    };
     if choice.kind == newt_core::BackendKind::Ollama {
         warmup_if_cold(
             &choice.url,
-            &choice.model,
+            &choice.active_model.clone().unwrap_or_default(),
             &keep_alive_str(&cfg),
             choice.api_key.as_deref(),
             color,
@@ -566,7 +619,7 @@ pub(crate) fn apply_model_choice(name: &str, color: bool, verbose: bool) {
         print_newt(
             &format!(
                 "Switched to {} — takes effect on next message.",
-                choice.model
+                choice.display_model()
             ),
             color,
             verbose,

@@ -654,28 +654,38 @@ fn resolver_default_backend_beats_the_openai_heuristic() {
         serving: Some(newt_core::Serving::Instance),
         ..Default::default()
     };
-    let mut cfg = newt_core::Config {
+    let resolved = |cfg: newt_core::Config| newt_core::ResolvedConfig::unrequested(cfg);
+    let cfg = newt_core::Config {
         backends: vec![ollama.clone(), vllm.clone()],
         ..Default::default()
     };
     // No default → prefer-openai heuristic picks the vllm entry; its
     // model is EMPTY (server dictates; adopt() fills it), and name/serving
     // ride along for the adopt wiring.
-    let c = resolve_backend_choice(&cfg);
+    let c = resolve_backend_choice(&resolved(cfg.clone())).expect("resolves");
     assert_eq!(c.name, "dgx1-8000");
-    assert_eq!(c.model, "", "unset model stays empty until adopted");
-    assert_eq!(c.serving, Some(newt_core::Serving::Instance));
+    assert_eq!(
+        c.active_model, None,
+        "unset model stays empty until adopted"
+    );
+    assert_eq!(c.route_serving(), Some(newt_core::Serving::Instance));
     // default_backend pointer beats the heuristic.
-    cfg.default_backend = Some("gpu-runner".into());
-    let c = resolve_backend_choice(&cfg);
+    let mut with_default = cfg;
+    with_default.default_backend = Some("gpu-runner".into());
+    let c = resolve_backend_choice(&resolved(with_default)).expect("resolves");
     assert_eq!(c.name, "gpu-runner");
-    assert_eq!(c.model, "m1");
+    assert_eq!(c.active_model.as_deref(), Some("m1"));
     // Sole backend is the obvious choice.
     let solo = newt_core::Config {
         backends: vec![ollama],
         ..Default::default()
     };
-    assert_eq!(resolve_backend_choice(&solo).name, "gpu-runner");
+    assert_eq!(
+        resolve_backend_choice(&resolved(solo))
+            .expect("resolves")
+            .name,
+        "gpu-runner"
+    );
 }
 
 #[test]
@@ -888,14 +898,15 @@ fn resolve_backend_choice_prefers_openai_backend() {
         }],
         ..Default::default()
     };
+    let cfg = newt_core::ResolvedConfig::unrequested(cfg);
     let choice = crate::env_resolution_tests::with_env_vars(
         &[],
         &["NEWT_DGX_MODEL", "NEWT_BACKEND", "NEWT_PROVIDER"],
-        || resolve_backend_choice(&cfg),
+        || resolve_backend_choice(&cfg).expect("resolves"),
     );
     assert_eq!(choice.kind, newt_core::BackendKind::Openai);
     assert_eq!(choice.url, "http://vllm.example:8000");
-    assert_eq!(choice.model, "qwen3:32b");
+    assert_eq!(choice.active_model.as_deref(), Some("qwen3:32b"));
     assert!(choice.api_key.is_none(), "no key configured → None");
 }
 
@@ -911,6 +922,7 @@ fn resolve_backend_choice_marks_absent_kind_for_probe() {
         }],
         ..Default::default()
     };
+    let cfg = newt_core::ResolvedConfig::unrequested(cfg);
     let choice = crate::env_resolution_tests::with_env_vars(
         &[],
         &[
@@ -920,7 +932,7 @@ fn resolve_backend_choice_marks_absent_kind_for_probe() {
             "NEWT_DGX_OLLAMA_URL",
             "NEWT_DGX_HOST",
         ],
-        || resolve_backend_choice(&cfg),
+        || resolve_backend_choice(&cfg).expect("resolves"),
     );
     assert!(choice.kind_needs_probe, "absent kind must probe at adopt");
     assert_eq!(choice.name, "dgx1-llama");
@@ -929,7 +941,7 @@ fn resolve_backend_choice_marks_absent_kind_for_probe() {
 
 #[test]
 fn resolve_backend_choice_explicit_kind_skips_probe_flag() {
-    let cfg = newt_core::Config {
+    let cfg = newt_core::ResolvedConfig::unrequested(newt_core::Config {
         backends: vec![newt_core::BackendConfig {
             name: "local".into(),
             endpoint: "http://127.0.0.1:11434".into(),
@@ -937,7 +949,7 @@ fn resolve_backend_choice_explicit_kind_skips_probe_flag() {
             ..Default::default()
         }],
         ..Default::default()
-    };
+    });
     let choice = crate::env_resolution_tests::with_env_vars(
         &[],
         &[
@@ -947,7 +959,7 @@ fn resolve_backend_choice_explicit_kind_skips_probe_flag() {
             "NEWT_DGX_OLLAMA_URL",
             "NEWT_DGX_HOST",
         ],
-        || resolve_backend_choice(&cfg),
+        || resolve_backend_choice(&cfg).expect("resolves"),
     );
     assert!(!choice.kind_needs_probe);
     assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
@@ -997,23 +1009,19 @@ async fn adopt_detects_openai_when_kind_absent() {
         .await;
 
     let mut choice = BackendChoice {
-        name: "dgx1-llama".into(),
-        serving: None,
-        url: server.uri(),
-        model: String::new(),
-        kind: newt_core::BackendKind::Ollama, // placeholder
         kind_needs_probe: true,
         api_key: None,
-        capabilities: newt_core::model_card::ResolvedCapabilities::none(),
-        card_suppressed_notice: None,
-        api: newt_core::OpenAiApi::default(),
-        api_needs_probe: false,
-        context_window: None,
+        ..BackendChoice::synthesized(
+            "dgx1-llama",
+            server.uri(),
+            newt_core::BackendKind::Ollama, // placeholder
+            None,
+        )
     };
     let lines = adopt_backend_choice(&mut choice, None);
     assert_eq!(choice.kind, newt_core::BackendKind::Openai);
     assert!(!choice.kind_needs_probe);
-    assert_eq!(choice.model, "nemotron");
+    assert_eq!(choice.active_model.as_deref(), Some("nemotron"));
     assert!(
         lines.iter().any(|l| l.contains("detected openai")),
         "status lines={lines:?}"
@@ -1037,22 +1045,18 @@ async fn adopt_detects_ollama_when_kind_absent() {
         .await;
 
     let mut choice = BackendChoice {
-        name: "local".into(),
-        serving: None,
-        url: server.uri(),
-        model: String::new(),
-        kind: newt_core::BackendKind::Openai, // wrong placeholder — probe must win
         kind_needs_probe: true,
         api_key: None,
-        capabilities: newt_core::model_card::ResolvedCapabilities::none(),
-        card_suppressed_notice: None,
-        api: newt_core::OpenAiApi::default(),
-        api_needs_probe: false,
-        context_window: None,
+        ..BackendChoice::synthesized(
+            "local",
+            server.uri(),
+            newt_core::BackendKind::Openai, // wrong placeholder — probe must win
+            None,
+        )
     };
     let _ = adopt_backend_choice(&mut choice, None);
     assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
-    assert_eq!(choice.model, "llama3.1:8b");
+    assert_eq!(choice.active_model.as_deref(), Some("llama3.1:8b"));
 }
 
 #[serial_test::serial(real_fs)]
@@ -1073,23 +1077,21 @@ async fn adopt_respects_explicit_kind_without_detect() {
         .await;
 
     let mut choice = BackendChoice {
-        name: "pinned-ollama".into(),
-        serving: None,
-        url: server.uri(),
-        model: "configured".into(),
-        kind: newt_core::BackendKind::Ollama,
         kind_needs_probe: false,
         api_key: None,
-        capabilities: newt_core::model_card::ResolvedCapabilities::none(),
-        card_suppressed_notice: None,
-        api: newt_core::OpenAiApi::default(),
-        api_needs_probe: false,
-        context_window: None,
+        declared_model: Some("configured".into()),
+        ..BackendChoice::synthesized(
+            "pinned-ollama",
+            server.uri(),
+            newt_core::BackendKind::Ollama,
+            Some("configured".into()),
+        )
     };
     let lines = adopt_backend_choice(&mut choice, None);
     assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
     assert_eq!(
-        choice.model, "configured",
+        choice.active_model.as_deref(),
+        Some("configured"),
         "keep file hint when ollama probe fails"
     );
     assert!(
@@ -1116,22 +1118,13 @@ async fn adopt_detects_authenticated_openai_with_bearer() {
         .await;
 
     let mut choice = BackendChoice {
-        name: "gated".into(),
-        serving: None,
-        url: server.uri(),
-        model: String::new(),
-        kind: newt_core::BackendKind::Ollama,
         kind_needs_probe: true,
         api_key: Some("secret-token".into()),
-        capabilities: newt_core::model_card::ResolvedCapabilities::none(),
-        card_suppressed_notice: None,
-        api: newt_core::OpenAiApi::default(),
-        api_needs_probe: false,
-        context_window: None,
+        ..BackendChoice::synthesized("gated", server.uri(), newt_core::BackendKind::Ollama, None)
     };
     let _ = adopt_backend_choice(&mut choice, None);
     assert_eq!(choice.kind, newt_core::BackendKind::Openai);
-    assert_eq!(choice.model, "gated-model");
+    assert_eq!(choice.active_model.as_deref(), Some("gated-model"));
 }
 
 #[test]

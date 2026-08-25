@@ -1842,7 +1842,8 @@ fn persist_verified_setup(
         if let Some(found) = existing
             .iter()
             .filter(|item| {
-                item.endpoint.as_deref() == Some(normalized.as_str())
+                !item.probe_owned
+                    && item.endpoint.as_deref() == Some(normalized.as_str())
                     && item.matches_token_reference(token_env, token_file_ref)
                     && item.matches_probe(verified)
             })
@@ -1929,6 +1930,12 @@ struct ExistingSetupBackend {
     serving: Option<newt_core::Serving>,
     model: Option<String>,
     generated_by_setup: bool,
+    /// The file is a machine-owned probe overlay (`record = "probe_v1"` or
+    /// the unambiguous legacy cache) — it RESERVES its filename but is
+    /// never REUSABLE as a setup backend definition: adopting a probe cache
+    /// as the definition is how the real backend silently vanished (#1819
+    /// ownership taxonomy).
+    probe_owned: bool,
 }
 
 impl ExistingSetupBackend {
@@ -2018,9 +2025,14 @@ fn read_existing_setup_backends(dir: &Path) -> anyhow::Result<Vec<ExistingSetupB
         else {
             continue;
         };
-        let parsed = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|body| toml::from_str::<BackendConfig>(&body).ok());
+        let body = std::fs::read_to_string(&path).ok();
+        let probe_owned = body.as_deref().is_some_and(|text| {
+            matches!(
+                newt_core::classify_backend_dropin(text),
+                Ok(newt_core::DropinOwnership::Probe)
+            )
+        });
+        let parsed = body.and_then(|body| toml::from_str::<BackendConfig>(&body).ok());
         backends.push(ExistingSetupBackend {
             name,
             endpoint: parsed
@@ -2043,6 +2055,7 @@ fn read_existing_setup_backends(dir: &Path) -> anyhow::Result<Vec<ExistingSetupB
                     .and_then(|provenance| provenance.source.as_deref())
                     .is_some_and(|source| source.starts_with("newt setup v"))
             }),
+            probe_owned,
             path,
         });
     }
@@ -3420,6 +3433,7 @@ mod tests {
             serving: Some(probe.serving),
             model: Some("model".into()),
             generated_by_setup: false,
+            probe_owned: false,
         };
 
         assert!(existing.matches_probe(&VerifiedTargetHit {
@@ -3631,12 +3645,17 @@ mod tests {
         );
     }
 
-    /// Real-resource grounding for setup idempotency after the runtime records
-    /// its definitive OpenAI wire surface in a generated backend drop-in.
+    /// Real-resource grounding for setup × runtime-probe ownership: a
+    /// runtime `probe_v1` overlay at the setup slot's filename is
+    /// MACHINE-owned cache — it reserves the filename but is never REUSED
+    /// as the backend definition (pre-#1819 the reuse silently adopted the
+    /// probe cache as the definition, and the real declaration vanished).
+    /// A setup re-run writes a real definition under the next name and
+    /// leaves the probe cache's bytes untouched.
     #[ignore = "real-resource: weekly/release tier; touches the filesystem"]
     #[serial_test::serial(real_fs)]
     #[test]
-    fn detected_setup_reuses_a_runtime_api_writeback_without_suffixing() {
+    fn detected_setup_never_reuses_a_runtime_probe_overlay_as_a_definition() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
@@ -3649,23 +3668,36 @@ mod tests {
         let backend_dir = dir.path().join("backends");
         let name = backend_name("https://inference.example.test").unwrap();
         let backend_path = backend_dir.join(format!("{name}.toml"));
-        newt_core::writeback_probed_backend(&BackendConfig {
+        // The setup definition exists; replace it with a runtime probe
+        // overlay at the same path (delete first: the typed writeback
+        // rightly refuses to overwrite an operator-owned file).
+        std::fs::remove_file(&backend_path).unwrap();
+        let outcome = newt_core::persist_probe_observation(&newt_core::ProbeObservation {
             name,
             endpoint: "https://inference.example.test".into(),
-            model: Some("model".into()),
             kind: Some(BackendKind::Openai),
             api: Some(OpenAiApi::Responses),
-            serving: Some(verified[0].probe.serving),
-            ..Default::default()
+            serving: newt_core::ProbedServing::Instance {
+                model: Some("model".into()),
+            },
         })
         .unwrap();
+        assert!(matches!(outcome, newt_core::ProbeWriteback::Written(_)));
         let runtime_bytes = std::fs::read(&backend_path).unwrap();
 
         let written = persist_verified_setup(&config_path, &verified, None, None).unwrap();
 
-        assert!(written.is_empty(), "runtime writeback should be reused");
-        assert_eq!(std::fs::read_dir(&backend_dir).unwrap().count(), 1);
-        assert_eq!(std::fs::read(&backend_path).unwrap(), runtime_bytes);
+        assert_eq!(
+            written.len(),
+            1,
+            "a probe overlay is not a definition — setup writes a real one"
+        );
+        assert_eq!(
+            std::fs::read(&backend_path).unwrap(),
+            runtime_bytes,
+            "the machine-owned cache's bytes stay untouched"
+        );
+        assert_eq!(std::fs::read_dir(&backend_dir).unwrap().count(), 2);
     }
 
     #[serial_test::serial(real_fs)]

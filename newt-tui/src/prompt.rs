@@ -181,9 +181,10 @@ pub(crate) fn current_prompt_and_preview(workspace: &str) -> (String, String) {
                 .and_then(|t| t.prompt)
         })
         .unwrap_or_else(|| DEFAULT_RICH_PROMPT.to_string());
-    let model = newt_core::Config::resolve()
+    let model = newt_core::Config::resolve_runtime()
         .ok()
-        .map(|c| super::resolve_backend_choice(&c).model)
+        .and_then(|c| super::resolve_backend_choice(&c).ok())
+        .map(|choice| choice.display_model().to_string())
         .unwrap_or_default();
     let is_vi = resolve_edit_mode() == newt_core::EditMode::Vi;
     let preview = expand_prompt_tokens(&template, workspace, &model, is_vi);

@@ -742,11 +742,11 @@ pub(crate) fn probe_timeout_secs(url: &str) -> u64 {
 /// about to change everything) and a tokio runtime is available.
 fn spawn_backend_prewarm() -> Option<Prewarm> {
     let runtime = tokio::runtime::Handle::try_current().ok()?;
-    let cfg = newt_core::Config::resolve().ok()?;
+    let cfg = newt_core::Config::resolve_runtime_unpublished().ok()?;
     if cfg.is_unconfigured() {
         return None;
     }
-    let choice = resolve_backend_choice(&cfg);
+    let choice = resolve_backend_choice(&cfg).ok()?;
     let url = choice.url.clone();
     let api_key = choice.api_key.clone();
     let needs_probe = choice.kind_needs_probe;
@@ -3458,6 +3458,7 @@ async fn retry_revert(
 /// adoption established since). Adoption evidence survives refreshes via
 /// [`merge_refresh`], and overlays never destroy the declaration they
 /// overlaid.
+#[derive(Debug)]
 pub(crate) struct BackendChoice {
     /// The configured backend's name ("" for env-synthesized/legacy choices) —
     /// feeds cap_key (instance keying) and honest status lines.
@@ -3470,8 +3471,13 @@ pub(crate) struct BackendChoice {
     /// kept apart from the declaration so adoption can fall back to the
     /// declared model when the request is unavailable.
     pub(crate) requested_model: Option<String>,
-    /// Declared serving axis when the backend file pins one.
-    pub(crate) configured_serving: Option<newt_core::Serving>,
+    /// The DECLARED serving axis (declaration layer + the core's
+    /// destination normalization: a model_path route is Instance even when
+    /// the declaration omitted the axis).
+    pub(crate) declared_serving: Option<newt_core::Serving>,
+    /// The explicit `--backend-serving` REQUEST for this invocation, if
+    /// any — operator intent, outranking every cached observation.
+    pub(crate) requested_serving: Option<newt_core::Serving>,
     /// The config-declared wire protocol (`None` = probe at connect).
     pub(crate) configured_kind: Option<newt_core::BackendKind>,
     /// The config-declared OpenAI surface (`None` = probe at connect).
@@ -3479,11 +3485,22 @@ pub(crate) struct BackendChoice {
     /// Managed mode — lets adoption prefer a warm model on a Shared box.
     pub(crate) managed: Option<newt_core::ManagedMode>,
     pub(crate) api_key: Option<String>,
+    /// The embedded artifact path, when this backend routes to a local
+    /// model file instead of an endpoint — the other destination axis.
+    pub(crate) model_path: Option<String>,
     // ── mutable route ────────────────────────────────────────────────
     /// The model the session is actually driving: request > declaration at
-    /// resolve time; adoption replaces it with served reality.
-    pub(crate) active_model: String,
-    /// The serving axis adoption/probing established this session.
+    /// resolve time; adoption replaces it with served reality — INCLUDING
+    /// clearing it when a live multiplexer establishes no pick (`None` is
+    /// truthful; display falls back through [`Self::display_model`]).
+    pub(crate) active_model: Option<String>,
+    /// The serving axis a CACHED probe observation attests (the receipt's
+    /// observation layer) — provenance kept separate from live adoption,
+    /// so a fresh resolution's cache always lands and the two can never
+    /// overwrite each other.
+    pub(crate) observed_serving: Option<newt_core::Serving>,
+    /// The serving axis LIVE adoption/probing established THIS session —
+    /// written only by the adopt path, the strongest route evidence.
     pub(crate) adopted_serving: Option<newt_core::Serving>,
     pub(crate) kind: newt_core::BackendKind,
     /// True when the config omitted `kind` — adopt must run `detect_endpoint`
@@ -3521,19 +3538,22 @@ impl BackendChoice {
         name: &str,
         url: String,
         kind: newt_core::BackendKind,
-        active_model: String,
+        active_model: Option<String>,
     ) -> Self {
         Self {
             name: name.to_string(),
             url,
             declared_model: None,
             requested_model: None,
-            configured_serving: None,
+            declared_serving: None,
+            requested_serving: None,
+            observed_serving: None,
             configured_kind: None,
             configured_api: None,
             managed: None,
             api_key: None,
-            active_model,
+            model_path: None,
+            active_model: active_model.filter(|m| !m.trim().is_empty()),
             adopted_serving: None,
             kind,
             kind_needs_probe: false,
@@ -3546,10 +3566,30 @@ impl BackendChoice {
         }
     }
 
-    /// The serving axis the session currently operates under: adopted
-    /// (established) beats configured (declared).
+    /// The serving axis the session currently operates under, by
+    /// PROVENANCE strength: live adoption > explicit request > cached
+    /// observation > declaration (destination-normalized).
     pub(crate) fn route_serving(&self) -> Option<newt_core::Serving> {
-        self.adopted_serving.or(self.configured_serving)
+        self.adopted_serving
+            .or(self.requested_serving)
+            .or(self.observed_serving)
+            .or(self.declared_serving)
+    }
+
+    /// The route's typed destination — where the session's bytes go: the
+    /// endpoint, or the embedded artifact path. Feeds the destination-first
+    /// capability decision ([`newt_core::model_card::ResolvedCapabilities::for_route`]).
+    pub(crate) fn route_destination(&self) -> newt_core::BackendDestination {
+        newt_core::BackendDestination::new(Some(self.url.clone()), self.model_path.clone())
+    }
+
+    /// The label for status lines: the live route model, else the declared
+    /// intent, else "(server decides)". DISPLAY ONLY — never an identity.
+    pub(crate) fn display_model(&self) -> &str {
+        self.active_model
+            .as_deref()
+            .or(self.declared_model.as_deref())
+            .unwrap_or("(server decides)")
     }
 
     /// The serving principal this choice currently represents, for the
@@ -3567,15 +3607,32 @@ impl BackendChoice {
         use newt_core::model_card::ServingPrincipal as P;
         match self.route_serving() {
             Some(newt_core::Serving::Instance) => P::Instance,
-            Some(newt_core::Serving::Multiplexer) if !self.active_model.is_empty() => {
-                P::MultiplexerModel(&self.active_model)
+            Some(newt_core::Serving::Multiplexer) => {
+                match self
+                    .active_model
+                    .as_deref()
+                    .filter(|m| !m.trim().is_empty())
+                {
+                    Some(m) => P::MultiplexerModel(m),
+                    // A live multiplexer with no established pick: Unknown —
+                    // a stale declared/requested label must not become the
+                    // principal a card activates against.
+                    None => P::Unknown,
+                }
             }
-            Some(newt_core::Serving::Multiplexer) => P::Unknown,
-            None if self.configured_kind == Some(newt_core::BackendKind::Embedded) => P::Instance,
+            // An embedded route (a model_path destination) serves ONE
+            // artifact — derived from the TYPED destination, never from a
+            // possibly-stale declared kind beside an endpoint.
+            None if self.url.is_empty()
+                && self.model_path.as_deref().is_some_and(|p| !p.is_empty()) =>
+            {
+                P::Instance
+            }
             None => match self
                 .requested_model
                 .as_deref()
                 .or(self.declared_model.as_deref())
+                .filter(|m| !m.trim().is_empty())
             {
                 Some(m) => P::SelectedModel(m),
                 None => P::Unknown,
@@ -3588,7 +3645,8 @@ impl BackendChoice {
     /// refreshed choice cannot re-enable a card the current model does not
     /// match.
     pub(crate) fn capability_decision(&self) -> newt_core::model_card::CapabilityDecision {
-        self.capabilities.for_principal(self.principal())
+        self.capabilities
+            .for_route(&self.route_destination(), self.principal())
     }
 
     /// Observe + render card-layer state at a printing seam — THE display
@@ -3630,16 +3688,59 @@ fn notice_transition(
         if prev.last_error.as_deref() != Some(e) {
             lines.push(e.to_string());
         }
+    } else if prev.last_error.is_some() {
+        // Error RECOVERY is a transition too: a fixed card must not just
+        // silently start applying after sessions of error lines.
+        lines.push("card resolution recovered — the configured card resolves again".to_string());
     }
+    // Applicability transitions render EXHAUSTIVELY over typed identity —
+    // any change in which card (or whether one) governs card-derived
+    // behavior is visible: replacement, removal, activation, deactivation,
+    // and every inactive shape. Only two states stay deliberately quiet:
+    // an unchanged identity (dedupe), and the very first observation when
+    // the card simply applies (startup Active needs no banner).
     if prev.last_applicability.as_ref() != Some(now) {
-        if let Some(line) = now.describe() {
-            lines.push(line);
-        } else if let (A::Active { card }, Some(A::Inactive { .. } | A::Undecided { .. })) =
-            (now, prev.last_applicability.as_ref())
-        {
-            lines.push(format!(
-                "card `{card}` applies again — the session is serving its bound model"
-            ));
+        match (prev.last_applicability.as_ref(), now) {
+            // Card replaced: A → B, both applying.
+            (Some(A::Active { card: before }), A::Active { card: after }) if before != after => {
+                lines.push(format!(
+                    "card switched: `{before}` → `{after}` — card-derived behavior now \
+                     follows `{after}`"
+                ));
+            }
+            // Re-activation after any non-applying shape.
+            (
+                Some(A::InactiveModel { .. } | A::InactiveDestination { .. } | A::Undecided { .. }),
+                A::Active { card },
+            ) => {
+                lines.push(format!(
+                    "card `{card}` applies again — the session is serving its bound model"
+                ));
+            }
+            // Activation from an explicitly card-less state (mid-session:
+            // a card was configured/bound where none governed before).
+            (Some(A::None), A::Active { card }) => {
+                lines.push(format!(
+                    "card `{card}` now applies — card-derived behavior follows it"
+                ));
+            }
+            // First observation: a card that simply applies at startup
+            // stays quiet; anything else renders its prose below.
+            (None, A::Active { .. }) => {}
+            // Card removed / binding gone: card-derived behavior is off.
+            (Some(prev_state), A::None) if !matches!(prev_state, A::None) => {
+                lines.push(
+                    "card removed — no card governs this backend; card-derived behavior \
+                     is off (inline backend settings kept)"
+                        .to_string(),
+                );
+            }
+            // Every non-applying shape has prose of its own.
+            _ => {
+                if let Some(line) = applicability_prose(now) {
+                    lines.push(line);
+                }
+            }
         }
     }
     (
@@ -3651,6 +3752,181 @@ fn notice_transition(
     )
 }
 
+/// The operator-facing prose for a non-applying card state; `None` for the
+/// quiet states. THE one prose owner — core keeps every outcome typed
+/// (renderer-neutrality, #1803), and every display seam renders through
+/// here, never its own copy. Public: headless `solve` (newt-cli) renders
+/// its stderr line through this same owner.
+pub fn applicability_prose(a: &newt_core::model_card::CardApplicability) -> Option<String> {
+    use newt_core::model_card::CardApplicability as A;
+    match a {
+        A::None | A::Active { .. } => None,
+        A::InactiveModel {
+            card,
+            bound_model,
+            active_model,
+        } => Some(format!(
+            "card `{card}` is bound to {} — the session is serving {active_model}, so \
+             card-derived behavior (capabilities and family policy) is off (inline \
+             backend settings kept); rebind the card or switch back",
+            bound_model.as_deref().unwrap_or("(no declared model)"),
+        )),
+        A::InactiveDestination {
+            card,
+            bound_destination,
+            active_destination,
+        } => Some(format!(
+            "card `{card}` is bound at {} — the session is routed to {}, so \
+             card-derived behavior (capabilities and family policy) is off (inline \
+             backend settings kept)",
+            describe_destination(bound_destination),
+            describe_destination(active_destination),
+        )),
+        A::Undecided { card } => Some(format!(
+            "card `{card}` is configured but the serving principal is not established — \
+             card-derived behavior (capabilities and family policy) stays off until \
+             adoption decides"
+        )),
+        // Core's applicability enum is non-exhaustive-shaped by policy: an
+        // unrecognized future state renders conservatively rather than
+        // silently.
+        #[allow(unreachable_patterns)]
+        other => Some(format!("card state changed: {other:?}")),
+    }
+}
+
+/// One destination, for prose: the endpoint or the artifact path.
+fn describe_destination(d: &newt_core::BackendDestination) -> String {
+    d.endpoint
+        .clone()
+        .or_else(|| d.model_path.clone())
+        .unwrap_or_else(|| "(no destination)".into())
+}
+
+#[cfg(test)]
+mod notice_transition_tests {
+    use super::*;
+    use newt_core::model_card::CardApplicability as A;
+    use newt_core::BackendDestination;
+
+    fn active(card: &str) -> A {
+        A::Active {
+            card: card.to_string(),
+        }
+    }
+    fn inactive_model(card: &str) -> A {
+        A::InactiveModel {
+            card: card.to_string(),
+            bound_model: Some("bound".into()),
+            active_model: "other".into(),
+        }
+    }
+    fn inactive_destination(card: &str) -> A {
+        A::InactiveDestination {
+            card: card.to_string(),
+            bound_destination: BackendDestination::new(Some("http://a:1".into()), None),
+            active_destination: BackendDestination::new(Some("http://b:2".into()), None),
+        }
+    }
+    /// Drive a sequence of (error, state) observations through the owner,
+    /// returning the lines each observation printed.
+    fn drive(seq: &[(Option<&str>, A)]) -> Vec<Vec<String>> {
+        let mut notices = CardNotices::default();
+        seq.iter()
+            .map(|(error, state)| {
+                let (next, lines) = notice_transition(&notices, *error, state);
+                notices = next;
+                lines
+            })
+            .collect()
+    }
+
+    /// The exhaustive typed transitions: replacement, removal, activation,
+    /// deactivation, re-activation — every change in WHICH card governs is
+    /// visible; unchanged identity is quiet (dedupe); startup Active is
+    /// deliberately quiet.
+    #[test]
+    fn every_governance_change_is_visible_and_dedupe_holds() {
+        let out = drive(&[
+            (None, active("a")),                       // startup Active: quiet
+            (None, active("a")),                       // unchanged: dedupe, quiet
+            (None, active("b")),                       // replacement a → b
+            (None, A::None),                           // removal
+            (None, A::None),                           // dedupe
+            (None, active("a")),                       // activation from None
+            (None, inactive_model("a")),               // deactivation: typed prose
+            (None, inactive_model("a")),               // dedupe
+            (None, active("a")),                       // re-activation
+            (None, inactive_destination("a")),         // destination retarget prose
+            (None, A::Undecided { card: "a".into() }), // undecided prose
+        ]);
+        assert!(
+            out[0].is_empty(),
+            "startup Active stays quiet: {:?}",
+            out[0]
+        );
+        assert!(out[1].is_empty(), "dedupe: {:?}", out[1]);
+        assert!(
+            out[2][0].contains("`a`") && out[2][0].contains("`b`"),
+            "replacement names both: {:?}",
+            out[2]
+        );
+        assert!(out[3][0].contains("card removed"), "{:?}", out[3]);
+        assert!(out[4].is_empty(), "dedupe after removal: {:?}", out[4]);
+        assert!(out[5][0].contains("now applies"), "{:?}", out[5]);
+        assert!(
+            out[6][0].contains("card-derived behavior"),
+            "family-neutral wording: {:?}",
+            out[6]
+        );
+        assert!(out[7].is_empty(), "dedupe inactive: {:?}", out[7]);
+        assert!(out[8][0].contains("applies again"), "{:?}", out[8]);
+        assert!(out[9][0].contains("routed to"), "{:?}", out[9]);
+        assert!(out[10][0].contains("not established"), "{:?}", out[10]);
+    }
+
+    /// A resolution error prints once per distinct message, and RECOVERY is
+    /// itself a visible transition — a fixed card never just silently
+    /// starts applying.
+    #[test]
+    fn error_lines_dedupe_and_recovery_is_visible() {
+        let out = drive(&[
+            (Some("card `x` — no such card"), A::None),
+            (Some("card `x` — no such card"), A::None), // same error: quiet
+            (None, active("x")),                        // fixed: recovery + activation
+        ]);
+        assert!(out[0][0].contains("no such card"), "{:?}", out[0]);
+        assert!(out[1].is_empty(), "same error dedupes: {:?}", out[1]);
+        assert!(
+            out[2].iter().any(|l| l.contains("recovered")),
+            "recovery visible: {:?}",
+            out[2]
+        );
+        assert!(
+            out[2].iter().any(|l| l.contains("now applies")),
+            "activation visible: {:?}",
+            out[2]
+        );
+    }
+
+    /// The family-only inactive→active round trip renders through the SAME
+    /// owner — a capability-less family card's transitions are exactly as
+    /// visible (J): its states are the same typed identities.
+    #[test]
+    fn family_only_cards_share_the_same_visible_transitions() {
+        let out = drive(&[
+            (None, inactive_model("nano-team")),
+            (None, active("nano-team")),
+        ]);
+        assert!(
+            out[0][0].contains("family policy"),
+            "the prose names the family contribution: {:?}",
+            out[0]
+        );
+        assert!(out[1][0].contains("applies again"), "{:?}", out[1]);
+    }
+}
+
 /// The complete INTENT key: two resolutions with equal intent describe the
 /// same operator ask, so the established route may carry across a refresh.
 fn same_intent(a: &BackendChoice, b: &BackendChoice) -> bool {
@@ -3658,7 +3934,8 @@ fn same_intent(a: &BackendChoice, b: &BackendChoice) -> bool {
         && a.url == b.url
         && a.declared_model == b.declared_model
         && a.requested_model == b.requested_model
-        && a.configured_serving == b.configured_serving
+        && a.declared_serving == b.declared_serving
+        && a.requested_serving == b.requested_serving
         && a.configured_kind == b.configured_kind
         && a.configured_api == b.configured_api
         && a.managed == b.managed
@@ -3679,6 +3956,9 @@ fn merge_refresh(prev: &BackendChoice, next: &mut BackendChoice) -> bool {
     next.kind_needs_probe = prev.kind_needs_probe;
     next.api = prev.api;
     next.api_needs_probe = prev.api_needs_probe;
+    // ONLY the live-adopted evidence carries; the fresh resolution's CACHED
+    // observation (observed_serving) always stands — a prior offline
+    // session's None must never erase a newly written probe cache.
     next.adopted_serving = prev.adopted_serving;
     next.active_model = prev.active_model.clone();
     next.context_window = prev.context_window;
@@ -3698,7 +3978,10 @@ fn adoption_inputs(choice: &BackendChoice) -> (newt_core::BackendConfig, Option<
             endpoint: choice.url.clone(),
             model: choice.declared_model.clone(),
             kind: Some(choice.kind),
-            serving: choice.configured_serving,
+            serving: choice
+                .requested_serving
+                .or(choice.observed_serving)
+                .or(choice.declared_serving),
             managed: choice.managed,
             ..Default::default()
         },
@@ -3710,9 +3993,10 @@ fn adoption_inputs(choice: &BackendChoice) -> (newt_core::BackendConfig, Option<
 /// active model. Intent fields are never written.
 fn apply_adoption(choice: &mut BackendChoice, adoption: &newt_core::backend_probe::Adoption) {
     choice.adopted_serving = Some(adoption.serving);
-    if let Some(m) = &adoption.model {
-        choice.active_model = m.clone();
-    }
+    // Unconditional: a multiplexer that established NO pick clears the
+    // route model — a stale declared/requested label must not survive as
+    // the principal a card could activate against.
+    choice.active_model = adoption.model.clone().filter(|m| !m.trim().is_empty());
 }
 
 /// The session-start ready preamble. Includes the backend wire protocol
@@ -3800,17 +4084,18 @@ fn resolve_embeddings_target(
 /// `/backends <name>` sets); otherwise matches the resolved endpoint+kind back to
 /// a configured `[[backends]]` entry. `None` when nothing matches (e.g. the
 /// historical DGX fallback that isn't itself a named backend).
-pub(crate) fn active_backend_name(cfg: &newt_core::Config) -> Option<String> {
+pub(crate) fn active_backend_name(resolved: &newt_core::ResolvedConfig) -> Option<String> {
     if let Some(name) = std::env::var("NEWT_PROVIDER")
         .ok()
         .filter(|s| !s.is_empty())
     {
-        if cfg.backends.iter().any(|b| b.name == name) {
+        if resolved.backends.iter().any(|b| b.name == name) {
             return Some(name);
         }
     }
-    let choice = resolve_backend_choice(cfg);
-    cfg.backends
+    let choice = resolve_backend_choice(resolved).ok()?;
+    resolved
+        .backends
         .iter()
         .find(|b| b.endpoint == choice.url && (b.kind.is_none() || b.kind == Some(choice.kind)))
         .map(|b| b.name.clone())
@@ -3847,8 +4132,8 @@ fn adopt_backend_choice(choice: &mut BackendChoice, prewarm: Option<Prewarm>) ->
         let detected = if choice.kind_needs_probe {
             choice.kind = probe.kind;
             choice.kind_needs_probe = false;
-            if choice.serving.is_none() {
-                choice.serving = Some(probe.serving);
+            if choice.route_serving().is_none() {
+                choice.adopted_serving = Some(probe.serving);
             }
             Some(probe.kind)
         } else {
@@ -3878,8 +4163,8 @@ fn adopt_backend_choice(choice: &mut BackendChoice, prewarm: Option<Prewarm>) ->
                     Ok(probe) => {
                         choice.kind = probe.kind;
                         choice.kind_needs_probe = false;
-                        if choice.serving.is_none() {
-                            choice.serving = Some(probe.serving);
+                        if choice.route_serving().is_none() {
+                            choice.adopted_serving = Some(probe.serving);
                         }
                         Ok((probe.models, probe.warm, Some(probe.kind)))
                     }
@@ -3942,68 +4227,52 @@ fn finish_adoption(
                     models.len()
                 ));
             }
-            // Synthesize the backend view adopt() reasons over: the choice
-            // already carries name/kind/serving and the file-hint model.
-            let synth = newt_core::BackendConfig {
-                name: choice.name.clone(),
-                endpoint: choice.url.clone(),
-                model: (!choice.model.is_empty()).then(|| choice.model.clone()),
-                kind: Some(choice.kind),
-                serving: choice.serving,
-                ..Default::default()
-            };
-            let requested = std::env::var("NEWT_DGX_MODEL")
-                .ok()
-                .filter(|s| !s.is_empty());
+            // Adoption inputs from the choice's IMMUTABLE intent: the
+            // declared model rides in the synthesized view, the operator's
+            // per-session request rides separately — `adopt()` owns the
+            // fallback policy (an unavailable request falls back to the
+            // declaration; Managed Shared may prefer a warm model).
+            let (synth, requested) = adoption_inputs(choice);
             let adoption =
                 backend_probe::adopt(&synth, &Served { models, warm }, requested.as_deref());
-            choice.serving = Some(adoption.serving);
             if adoption.requested_unavailable {
                 // #1122 fail-soft: a restored/typo'd model must not brick the
                 // session — say what happened and what we used instead.
                 lines.push(format!(
-                    "requested model isn't on {} — falling back (was it a typo, or                      removed from the endpoint?); /models to list",
+                    "requested model isn't on {} — falling back (was it a typo, or \
+                     removed from the endpoint?); /models to list",
                     choice.url
                 ));
             }
-            match adoption.model {
-                Some(m) => {
-                    if adoption.requested_ignored {
-                        lines.push(format!(
-                            "model is fixed by this {} instance: {m} — restart the server                              with another model, or /backends to switch endpoints",
-                            choice.kind.label()
-                        ));
-                    }
-                    choice.model = m;
-                    // Card binding, evaluated AFTER the final serving/model
-                    // is set, through the typed principal decision: Instance
-                    // preserves the binding (one artifact; the served label
-                    // is its alias, requested_ignored included); a
-                    // Multiplexer whose final model is not the exact bound
-                    // model — warm pick, fallback, override — reports the
-                    // binding inactive. Surfacing it HERE makes the adoption
-                    // transition visible; the decision itself is recomputed
-                    // at every use, so nothing here mutates state.
-                    if let Some(notice) = choice.capability_decision().retarget_notice {
-                        lines.push(notice);
-                    }
-                }
-                None => lines.push(format!(
-                    "{} listed no models — pull one (or start the server with a model),                      then /models",
+            if adoption.model.is_none() {
+                lines.push(format!(
+                    "{} listed no models — pull one (or start the server with a model), \
+                     then /models",
                     choice.url
-                )),
+                ));
+            } else if adoption.requested_ignored {
+                lines.push(format!(
+                    "model is fixed by this {} instance: {} — restart the server \
+                     with another model, or /backends to switch endpoints",
+                    choice.kind.label(),
+                    adoption.model.as_deref().unwrap_or_default()
+                ));
             }
+            // Adoption mutates ONLY the route — including CLEARING the
+            // active model when a live multiplexer established no pick.
+            apply_adoption(choice, &adoption);
             // #1199: auto-detect the context window from the SERVER, fresh —
             // vLLM's max_model_len / Ollama's /api/show. Held on the choice and
             // fed to the budget; never read from the persisted cache (which
             // could pin a stale None and starve a 256k model).
+            let window_model = choice.active_model.clone().unwrap_or_default();
             choice.context_window = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     backend_probe::api_for(choice.kind)
                         .context_window(
                             &client,
                             &choice.url,
-                            &choice.model,
+                            &window_model,
                             choice.api_key.as_deref(),
                         )
                         .await
@@ -4018,16 +4287,16 @@ fn finish_adoption(
             if should_probe_openai_surface(
                 choice.kind,
                 choice.api_needs_probe,
-                &choice.model,
+                &window_model,
                 &choice.url,
-                choice.serving,
+                choice.route_serving(),
             ) {
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         backend_probe::detect_openai_api(
                             &client,
                             &choice.url,
-                            &choice.model,
+                            &window_model,
                             choice.api_key.as_deref(),
                         )
                         .await
@@ -4040,7 +4309,7 @@ fn finish_adoption(
                         lines.push(format!(
                             "detected api={} for {} @ {}",
                             api.label(),
-                            choice.model,
+                            choice.display_model(),
                             choice.url
                         ));
                     }
@@ -4049,36 +4318,46 @@ fn finish_adoption(
                     )),
                 }
             }
-            // Persist probed fields to ~/.newt/backends/<name>.toml only — never
-            // the main config.toml. Reset = delete that drop-in file.
+            // Persist what the probe OBSERVED through the typed machine
+            // channel — probe_v1 files only; an operator-owned same-name
+            // drop-in is skipped byte-for-byte and the skip is VISIBLE.
             if !choice.name.is_empty() && (detected_kind.is_some() || api_was_probed) {
-                let patch = newt_core::BackendConfig {
+                let serving = match choice.route_serving() {
+                    // Only an Instance's model is backend truth; a
+                    // multiplexer's pick is per-session and has no field to
+                    // persist through.
+                    Some(newt_core::Serving::Instance) => newt_core::ProbedServing::Instance {
+                        model: choice.active_model.clone(),
+                    },
+                    Some(newt_core::Serving::Multiplexer) => newt_core::ProbedServing::Multiplexer,
+                    None => newt_core::ProbedServing::Unknown,
+                };
+                let observation = newt_core::ProbeObservation {
                     name: choice.name.clone(),
                     endpoint: choice.url.clone(),
                     kind: Some(choice.kind),
                     api: (choice.kind == newt_core::BackendKind::Openai).then_some(choice.api),
-                    // A MULTIPLEXER's adopted model is a per-session pick
-                    // (warm state, fallbacks), not backend truth — persisting
-                    // it would freeze today's pick as tomorrow's declared
-                    // model and, under a card binding, resolve card-A
-                    // capability for a model the card was never bound to
-                    // before any live decision runs. An INSTANCE's model IS
-                    // backend truth (one artifact) and persists.
-                    model: (choice.serving != Some(newt_core::Serving::Multiplexer)
-                        && !choice.model.is_empty())
-                    .then(|| choice.model.clone()),
-                    serving: choice.serving,
-                    ..Default::default()
+                    serving,
                 };
-                match newt_core::writeback_probed_backend(&patch) {
-                    Ok(Some(path)) => lines.push(format!(
+                match newt_core::persist_probe_observation(&observation) {
+                    Ok(newt_core::ProbeWriteback::Written(path)) => lines.push(format!(
                         "wrote probed backend → {} (delete to reset)",
                         path.display()
                     )),
-                    Ok(None) => {}
+                    Ok(newt_core::ProbeWriteback::SkippedOperatorOwned(path)) => {
+                        lines.push(format!(
+                            "probe results not persisted — {} is operator-owned \
+                             (delete it, or claim/edit it, to let probes write)",
+                            path.display()
+                        ));
+                    }
+                    Ok(newt_core::ProbeWriteback::NotWritten) => {}
                     Err(e) => lines.push(format!("could not write backend drop-in: {e}")),
                 }
             }
+            // Card-layer transitions surface HERE — the adoption seam —
+            // through the ONE display owner, deduped by typed identity.
+            lines.extend(choice.card_notice_lines());
         }
     }
     lines
@@ -4091,16 +4370,16 @@ fn offline_adoption(
     mut lines: Vec<String>,
     e: anyhow::Error,
 ) -> Vec<String> {
-    if choice.model.is_empty() {
-        lines.push(format!(
-            "{} is unreachable ({e:#}) and no model is configured — check the                      endpoint, then /backends",
+    match choice.active_model.as_deref() {
+        None => lines.push(format!(
+            "{} is unreachable ({e:#}) and no model is configured — check the \
+             endpoint, then /backends",
             choice.url
-        ));
-    } else {
-        lines.push(format!(
-            "{} is unreachable ({e:#}) — using configured model {} until it answers",
-            choice.url, choice.model
-        ));
+        )),
+        Some(model) => lines.push(format!(
+            "{} is unreachable ({e:#}) — using configured model {model} until it answers",
+            choice.url
+        )),
     }
     lines
 }
@@ -4245,22 +4524,14 @@ fn codex_env_backend(
     let url = base_url.unwrap_or("https://api.openai.com");
     let url = url.trim_end_matches('/');
     let url = url.strip_suffix("/v1").unwrap_or(url).to_string();
+    let requested = model.map(str::to_string).or(session_model);
     Some(BackendChoice {
-        name: "openai-env".into(),
-        serving: None,
-        url,
-        model: model
-            .map(str::to_string)
-            .or(session_model)
-            .unwrap_or_default(),
-        kind: newt_core::BackendKind::Openai,
-        kind_needs_probe: false,
         api_key: api_key.map(str::to_string),
-        capabilities: newt_core::model_card::ResolvedCapabilities::none(),
-        card_suppressed_notice: None,
-        api: newt_core::OpenAiApi::default(),
         api_needs_probe: true,
-        context_window: None,
+        // The env-supplied model is an operator REQUEST (an explicitly
+        // selected identity), and the initial route until adoption decides.
+        requested_model: requested.clone(),
+        ..BackendChoice::synthesized("openai-env", url, newt_core::BackendKind::Openai, requested)
     })
 }
 
@@ -4279,7 +4550,12 @@ mod codex_env_tests {
         )
         .expect("explicit base url is a deliberate redirect");
         assert_eq!(c.url, "https://api.openai.com");
-        assert_eq!(c.model, "gpt-4.1");
+        assert_eq!(c.active_model.as_deref(), Some("gpt-4.1"));
+        assert_eq!(
+            c.requested_model.as_deref(),
+            Some("gpt-4.1"),
+            "the env model is an operator REQUEST"
+        );
         assert_eq!(c.api_key.as_deref(), Some("sk-x"));
         assert_eq!(c.kind, newt_core::BackendKind::Openai);
     }
@@ -4294,7 +4570,7 @@ mod codex_env_tests {
             .expect("zero-config onboarding");
         assert_eq!(c.url, "https://api.openai.com");
         assert!(
-            c.model.is_empty(),
+            c.active_model.is_none(),
             "adopt() fills the model at session start"
         );
     }
@@ -4323,70 +4599,158 @@ mod codex_env_tests {
     }
 }
 
-pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
+pub(crate) fn resolve_backend_choice(
+    resolved: &newt_core::ResolvedConfig,
+) -> Result<BackendChoice, String> {
     let session_model = || {
         std::env::var("NEWT_DGX_MODEL")
             .ok()
             .filter(|s| !s.is_empty())
     };
-    let from_backend = |b: &newt_core::BackendConfig| {
-        // ONE sidecar construction per choice: the immutable card+inline
-        // capability layers. An unknown named card is a real config error but
-        // choice resolution is infallible by contract (a broken backend list
-        // must not crash the TUI) — so the error becomes a VISIBLE notice at
-        // the next printing seam and the capabilities fall to the
-        // conservative inline-only floor. Fail closed, fail loud, keep going.
-        let (caps, card_error) = match newt_core::model_card::ResolvedCapabilities::resolve(
-            b,
-            newt_core::Config::pinned_config_path().as_deref(),
-        ) {
-            Ok(caps) => (caps, None),
-            Err(e) => (
-                newt_core::model_card::ResolvedCapabilities::resolve(
-                    &newt_core::BackendConfig {
-                        card: None,
-                        ..b.clone()
-                    },
-                    None,
-                )
-                .expect("card-less resolution is infallible"),
-                Some(e),
-            ),
-        };
-        let choice = BackendChoice {
+    let from_backend = |rb: newt_core::ResolvedBackend<'_>| -> Result<BackendChoice, String> {
+        let b = rb.backend;
+        let receipt = rb.receipt;
+        // The chat driver is HTTP-only: an embedded (model_path) backend —
+        // judged on the FLATTENED, core-normalized view, never a stale
+        // declared kind — is a typed refusal, exactly as in solve. No
+        // silent fallback to another backend, no empty-URL HTTP session.
+        if b.endpoint.is_empty() || b.kind == Some(newt_core::BackendKind::Embedded) {
+            return Err(format!(
+                "backend `{}` is an embedded (model_path) backend — chat drives HTTP \
+                 backends only; select an HTTP backend (/backends), or serve the \
+                 artifact behind an HTTP endpoint",
+                b.name
+            ));
+        }
+        // ONE sidecar construction per choice, from the receipt's BINDING
+        // evidence (pre-overlay: a CLI/session model override retargets the
+        // session, never the card). An unknown named card is a real config
+        // error but choice resolution is infallible by contract (a broken
+        // backend list must not crash the TUI) — so the error becomes a
+        // VISIBLE notice at the next printing seam and the capabilities
+        // fall to the conservative inline-only floor.
+        let seed = receipt.binding.clone();
+        let pinned = newt_core::Config::pinned_config_path();
+        let (caps, card_error) =
+            match newt_core::model_card::ResolvedCapabilities::resolve(b, &seed, pinned.as_deref())
+            {
+                Ok(caps) => (caps, None),
+                Err(e) => (
+                    newt_core::model_card::ResolvedCapabilities::resolve(
+                        b,
+                        &newt_core::model_card::CardBindingSeed {
+                            card: None,
+                            ..seed.clone()
+                        },
+                        None,
+                    )
+                    .expect("card-less resolution is infallible"),
+                    Some(e),
+                ),
+            };
+        // The probe-cached route, straight from the receipt's typed
+        // observation — never re-derived from the flattened backend.
+        let (observed_serving, _observed_model) = receipt
+            .observation
+            .as_ref()
+            .map(|o| o.serving_axis())
+            .unwrap_or((None, None));
+        let request = receipt.request.as_ref();
+        // The DECLARED axis carries the core's destination normalization: a
+        // model_path route IS Instance even when the declaration omitted
+        // the axis.
+        let declared_serving = receipt.declaration.serving.or_else(|| {
+            receipt
+                .declaration
+                .destination
+                .model_path
+                .as_deref()
+                .is_some_and(|p| !p.is_empty())
+                .then_some(newt_core::Serving::Instance)
+        });
+        Ok(BackendChoice {
             name: b.name.clone(),
-            serving: b.serving,
             url: b.endpoint.clone(),
-            // Session override > declared model > empty-until-adopted (#1126: the
-            // server dictates; adopt() fills an empty model at session start).
-            model: session_model()
-                .or_else(|| b.effective_model().map(str::to_string))
-                .unwrap_or_default(),
+            // Immutable intent, from the receipt's DECLARATION layer.
+            declared_model: receipt.declaration.model.clone(),
+            // The session override (env) is the most-specific request; the
+            // CLI --backend-model rides in the receipt's request layer.
+            requested_model: session_model()
+                .or_else(|| receipt.request.as_ref().and_then(|r| r.model.clone())),
+            declared_serving,
+            requested_serving: request.and_then(|r| r.serving),
+            configured_kind: request.and_then(|r| r.kind).or(receipt.declaration.kind),
+            configured_api: request.and_then(|r| r.api).or(receipt.declaration.api),
+            managed: receipt.declaration.managed,
+            api_key: b.resolve_api_key(),
+            model_path: b.model_path.clone(),
+            // The route starts at the EFFECTIVE view (session override >
+            // flattened model, which already carries the probe-cached
+            // Instance model and any CLI request); adoption replaces it
+            // with served reality.
+            active_model: session_model().or_else(|| b.effective_model().map(str::to_string)),
+            // The cached observation keeps its own PROVENANCE slot — the
+            // precedence (live > request > cache > declaration) lives in
+            // route_serving, not in field blending.
+            observed_serving,
+            adopted_serving: None,
             kind: b.kind.unwrap_or(newt_core::BackendKind::Ollama),
             kind_needs_probe: b.needs_kind_probe(),
-            api_key: b.resolve_api_key(),
-            capabilities: caps,
             api: b.api.unwrap_or_default(),
             api_needs_probe: b.api.is_none(),
             context_window: None,
-            card_suppressed_notice: card_error,
-        };
-        // No override-event logic here, on purpose: the principal decision
-        // (`capability_decision`) is computed at USE time from the current
-        // serving + model, so a session override, a warm adoption, or a
-        // refresh all get the correct answer from the same pure function —
-        // and its retarget notice is surfaced at the printing seams.
-        choice
+            capabilities: caps,
+            card_resolution_error: card_error,
+            notices: CardNotices::default(),
+        })
     };
-    // 1. A pinned provider (loadout `provider` axis → NEWT_PROVIDER) selects a
-    //    named backend, regardless of wire protocol. Unknown name falls through
-    //    (the loadout path validates before setting the env var).
-    if let Some(name) = std::env::var("NEWT_PROVIDER")
+    // 1. Explicit selection ($NEWT_PROVIDER / default_backend) through the
+    //    SHARED typed contract: unknown, unroutable, and provider outcomes
+    //    are HARD errors — never a silent fallback to some other backend
+    //    (the pre-#1819 fall-through was exactly the failure mode the typed
+    //    selection exists to kill).
+    let explicit_selector = std::env::var("NEWT_PROVIDER")
         .ok()
         .filter(|s| !s.is_empty())
-    {
-        if let Some(b) = cfg.backends.iter().find(|b| b.name == name) {
-            return from_backend(b);
+        .is_some()
+        || resolved
+            .default_backend
+            .as_deref()
+            .is_some_and(|n| !n.is_empty());
+    if explicit_selector {
+        use newt_core::config::{SelectedBackend, SelectionOutcome};
+        match resolved.select_backend() {
+            SelectionOutcome::Selected(SelectedBackend::Configured(_)) => {
+                let rb = resolved
+                    .selected_backend()
+                    .expect("the shared index selector just picked a configured backend");
+                return from_backend(rb);
+            }
+            SelectionOutcome::Selected(SelectedBackend::Provider(p)) => {
+                return Err(format!(
+                    "the backend selection resolves to provider `{}` — chat drives \
+                     [[backends]] only; point $NEWT_PROVIDER/default_backend at a \
+                     backend (or unset them)",
+                    p.name
+                ));
+            }
+            SelectionOutcome::UnknownNamed(name) => {
+                return Err(format!(
+                    "$NEWT_PROVIDER/default_backend names `{name}`, which matches \
+                     nothing configured — fix the selector (chat will not silently \
+                     run another backend)"
+                ));
+            }
+            SelectionOutcome::UnroutableNamed(name) => {
+                return Err(format!(
+                    "$NEWT_PROVIDER/default_backend names `{name}`, which has neither \
+                     an endpoint nor a model_path — give it a destination (chat will \
+                     not silently run another backend)"
+                ));
+            }
+            // No explicit selector fired inside the contract (e.g. the env
+            // var empty) — fall through to the env shims + preference.
+            SelectionOutcome::Unset => {}
         }
     }
     // 1.5 Codex-compatible environment (bug/steering-regressions #9): honor
@@ -4406,7 +4770,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             key.as_deref(),
             model.as_deref(),
             session_model(),
-            !cfg.backends.is_empty(),
+            !resolved.backends.is_empty(),
         ) {
             let detected = [
                 base.as_ref().map(|_| "OPENAI_BASE_URL"),
@@ -4418,7 +4782,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             .collect::<Vec<_>>()
             .join(", ");
             if codex_env_allowed(&detected) {
-                return choice;
+                return Ok(choice);
             }
         }
     }
@@ -4432,45 +4796,72 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         })
     });
     if let Some(url) = env_url {
-        return BackendChoice {
-            name: String::new(),
-            serving: None,
-            url,
-            model: session_model().unwrap_or_else(|| "llama3.1:8b".into()),
-            kind: newt_core::BackendKind::Ollama,
-            kind_needs_probe: false,
-            api_key: None,
-            capabilities: newt_core::model_card::ResolvedCapabilities::none(),
-            card_suppressed_notice: None,
-            api: newt_core::OpenAiApi::default(),
-            api_needs_probe: false,
-            context_window: None,
-        };
+        let requested = session_model();
+        return Ok(BackendChoice {
+            requested_model: requested.clone(),
+            ..BackendChoice::synthesized(
+                "",
+                url,
+                newt_core::BackendKind::Ollama,
+                requested.or_else(|| Some("llama3.1:8b".into())),
+            )
+        });
     }
-    // 3. The configured default (#1130): a named pointer beats every heuristic.
-    if let Some(name) = cfg.default_backend.as_deref() {
-        if let Some(b) = cfg.backends.iter().find(|b| b.name == name) {
-            return from_backend(b);
-        }
-    }
-    // 4. NEWT_BACKEND forces the wire kind (`/backend openai|ollama`).
+    // 3. NEWT_BACKEND forces the wire kind (`/backend openai|ollama`).
     if let Some(force) = std::env::var("NEWT_BACKEND").ok().filter(|s| !s.is_empty()) {
         let want = if force.eq_ignore_ascii_case("openai") {
             newt_core::BackendKind::Openai
         } else {
             newt_core::BackendKind::Ollama
         };
-        if let Some(b) = cfg.backends.iter().find(|b| b.kind == Some(want)) {
-            return from_backend(b);
+        if let Some(rb) = resolved.backends().find(|rb| rb.backend.kind == Some(want)) {
+            return from_backend(rb);
         }
     }
-    // 5. A sole backend is the obvious choice.
-    if cfg.backends.len() == 1 {
-        return from_backend(&cfg.backends[0]);
+    // 4. Everything configured — sole / prefer-OpenAI / first ROUTABLE /
+    //    provider — delegates to the SHARED typed selection contract, so
+    //    chat's fallback can never diverge from solve/worker: a
+    //    destination-less first entry is skipped for a later routable one
+    //    (the core preference filters by routability), and a provider-only
+    //    config is a TYPED refusal, never a silent localhost.
+    {
+        use newt_core::config::{SelectedBackend, SelectionOutcome};
+        match resolved.select_backend() {
+            SelectionOutcome::Selected(SelectedBackend::Configured(_)) => {
+                let rb = resolved
+                    .selected_backend()
+                    .expect("the shared index selector just picked a configured backend");
+                return from_backend(rb);
+            }
+            SelectionOutcome::Selected(SelectedBackend::Provider(p)) => {
+                return Err(format!(
+                    "the backend selection resolves to provider `{}` — chat drives \
+                     [[backends]] only; configure a backend (or run the worker)",
+                    p.name
+                ));
+            }
+            // Explicit-selector errors were handled in rung 1; if the env
+            // changed between the two reads, surface the same typed refusal
+            // rather than falling through.
+            SelectionOutcome::UnknownNamed(name) => {
+                return Err(format!(
+                    "$NEWT_PROVIDER/default_backend names `{name}`, which matches \
+                     nothing configured — fix the selector"
+                ));
+            }
+            SelectionOutcome::UnroutableNamed(name) => {
+                return Err(format!(
+                    "$NEWT_PROVIDER/default_backend names `{name}`, which has neither \
+                     an endpoint nor a model_path — give it a destination"
+                ));
+            }
+            // Nothing configured qualifies: the chat-only legacy shims below.
+            SelectionOutcome::Unset => {}
+        }
     }
-    // 6. Legacy [dgx] node (one-release shim): configs written by the old
+    // 5. Legacy [dgx] node (one-release shim): configs written by the old
     //    wizard resolve their dgx endpoint + active_model as before.
-    if let Some((url, model)) = cfg.dgx.as_ref().and_then(|d| {
+    if let Some((url, model)) = resolved.dgx.as_ref().and_then(|d| {
         d.nodes.first().and_then(|n| n.ollama.clone()).map(|url| {
             let model = session_model()
                 .or_else(|| d.active_model.clone())
@@ -4478,47 +4869,38 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             (url, model)
         })
     }) {
-        return BackendChoice {
-            name: String::new(),
-            serving: None,
-            url,
-            model,
-            kind: newt_core::BackendKind::Ollama,
-            kind_needs_probe: false,
-            api_key: None,
-            capabilities: newt_core::model_card::ResolvedCapabilities::none(),
-            card_suppressed_notice: None,
-            api: newt_core::OpenAiApi::default(),
-            api_needs_probe: false,
-            context_window: None,
-        };
+        let requested = session_model();
+        return Ok(BackendChoice {
+            requested_model: requested,
+            ..BackendChoice::synthesized("", url, newt_core::BackendKind::Ollama, Some(model))
+        });
     }
-    // 7. Multiple backends, nothing pinned: prefer an OpenAI-compatible entry
-    //    (today's heuristic), else the first.
-    if let Some(b) = cfg
-        .backends
-        .iter()
-        .find(|b| b.kind == Some(newt_core::BackendKind::Openai))
-        .or_else(|| cfg.backends.first())
-    {
-        return from_backend(b);
-    }
-    // 8. Bare fallback: localhost ollama (Config::resolve normally restores
+    // 6. Bare fallback: localhost ollama (Config::resolve normally restores
     //    this backend already; this is the belt-and-braces path).
-    BackendChoice {
-        name: String::new(),
-        serving: None,
-        url: "http://localhost:11434".into(),
-        model: session_model().unwrap_or_else(|| "llama3.1:8b".into()),
-        kind: newt_core::BackendKind::Ollama,
-        kind_needs_probe: false,
-        api_key: None,
-        capabilities: newt_core::model_card::ResolvedCapabilities::none(),
-        card_suppressed_notice: None,
-        api: newt_core::OpenAiApi::default(),
-        api_needs_probe: false,
-        context_window: None,
-    }
+    let requested = session_model();
+    Ok(BackendChoice {
+        requested_model: requested.clone(),
+        ..BackendChoice::synthesized(
+            "",
+            "http://localhost:11434".into(),
+            newt_core::BackendKind::Ollama,
+            requested.or_else(|| Some("llama3.1:8b".into())),
+        )
+    })
+}
+
+/// The TUI's config resolution, receipts kept and NOTHING published:
+/// process-global settings land only at an accepted-session boundary
+/// (startup after the typed backend choice validates; a refresh after it
+/// accepts) — a refused session must not publish globals from a route it
+/// never accepted. A resolution failure is warned (typed, not silent) and
+/// falls back to the AS-IS default config so command surfaces still
+/// render; the chat startup path prints its own visible line.
+pub(crate) fn resolve_runtime_or_default() -> newt_core::ResolvedConfig {
+    newt_core::Config::resolve_runtime_unpublished().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "config resolution failed — running on built-in defaults");
+        newt_core::ResolvedConfig::unrequested(newt_core::Config::default())
+    })
 }
 
 /// Surface the resolved OpenAI API surface to the agent loop via
@@ -4549,7 +4931,7 @@ pub fn apply_openai_api_env(api: newt_core::OpenAiApi) {
 /// caller re-probes DGX telemetry only when it matters.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn refresh_backend(
-    cfg: &newt_core::Config,
+    resolved: &newt_core::ResolvedConfig,
     choice: &mut BackendChoice,
     inf_url: &mut String,
     inf_model: &mut String,
@@ -4560,39 +4942,63 @@ pub(crate) fn refresh_backend(
     verbose: bool,
 ) -> bool {
     let prev_url = inf_url.clone();
-    *choice = resolve_backend_choice(cfg);
-    // Adopt served reality only when the endpoint or model actually changed (a
-    // plain slash command must not re-probe every time).
-    if choice.url != prev_url || choice.model != *inf_model {
+    // The typed selection contract can REFUSE (unknown/unroutable/provider
+    // explicit selector): print the refusal and keep the current choice — a
+    // live session never silently reroutes, and never crashes mid-flight.
+    let mut next = match resolve_backend_choice(resolved) {
+        Ok(next) => next,
+        Err(refusal) => {
+            // Typed refusal: keep the current choice AND the current
+            // process-globals — a refused route publishes nothing.
+            print_newt(&refusal, color, verbose);
+            return false;
+        }
+    };
+    // The route validated — THIS is the accepted-session boundary where the
+    // re-resolved configuration's process-global settings publish.
+    resolved.publish_runtime_settings();
+    // Fold the fresh resolution over the previous choice: on a same-intent
+    // no-op the established route/probe results carry; fresh capabilities
+    // and resolution errors always stand; display history always survives.
+    let _intent_changed = merge_refresh(choice, &mut next);
+    *choice = next;
+    // Adopt served reality only when the ROUTE actually moved (endpoint or
+    // model) — the historical trigger: a plain slash command must not
+    // re-probe every time, and two same-endpoint backends can swap without
+    // a network round-trip (the pin/tab tiers depend on that). A
+    // same-intent refresh carried the established route above, so it
+    // compares equal here and stays quiet.
+    if choice.url != prev_url || choice.active_model.clone().unwrap_or_default() != *inf_model {
         for line in adopt_backend_choice(choice, None) {
             print_newt(&line, color, verbose);
         }
     }
     // Card-layer notices surface HERE — the seam every mid-session
-    // backend/model change flows through. Resolution errors (an unknown
-    // named card) are taken once; the retarget notice is recomputed by the
-    // pure decision and printed only when the model actually changed, so a
-    // steady-state refresh stays quiet while every transition is visible.
-    if let Some(error) = choice.card_suppressed_notice.take() {
-        print_newt(&error, color, verbose);
-    }
-    if choice.model != *inf_model {
-        if let Some(notice) = choice.capability_decision().retarget_notice {
-            print_newt(&notice, color, verbose);
-        }
+    // backend/model change flows through — via the ONE display owner,
+    // deduped by typed identity (an unchanged state stays quiet, every
+    // transition is visible, nothing is destructively taken).
+    for line in choice.card_notice_lines() {
+        print_newt(&line, color, verbose);
     }
     *inf_url = choice.url.clone();
-    *inf_model = choice.model.clone();
+    *inf_model = choice.active_model.clone().unwrap_or_default();
     *inf_kind = choice.kind;
     *inf_key = choice.api_key.clone();
     *inf_context_window = choice.context_window;
     apply_openai_api_env(choice.api);
     // #1139: this is the ONE seam every mid-session model change flows through —
     // `/backends`, `/model`, and persona routing (`apply_persona_backend`) all land
-    // here — so re-attribute the model's family in one place. Per-family `[tenacity]`
-    // defaults then track a live backend/persona switch, instead of going stale on
-    // the model the session happened to start with.
-    newt_core::tenacity::attribute_active_family(cfg.tenacity.as_ref(), inf_model.as_str());
+    // here — so attribute the model's FAMILY in one place. TYPED: the family is
+    // the resolved card's declared metadata, under the same association gates as
+    // the capability decision — never inferred from the model name (the
+    // anti-substring law). No associated card family ⇒ no family (the
+    // per-family default simply does not engage).
+    newt_core::tenacity::set_active_model_family(
+        choice
+            .capabilities
+            .family_for_route(&choice.route_destination(), choice.principal())
+            .map(str::to_string),
+    );
     *inf_url != prev_url
 }
 
@@ -4647,7 +5053,7 @@ pub(crate) fn apply_persona_backend(
     persona: Option<&Persona>,
     base_provider: &Option<String>,
     base_model: &Option<String>,
-    cfg: &newt_core::Config,
+    cfg: &newt_core::ResolvedConfig,
     choice: &mut BackendChoice,
     inf_url: &mut String,
     inf_model: &mut String,
@@ -4783,7 +5189,7 @@ pub(crate) struct ConversationPreferenceSwitch<'a> {
     /// pin: adopting a pin here is what let it propagate (review finding 2).
     pub base_provider: &'a mut Option<String>,
     pub base_model: &'a mut Option<String>,
-    pub cfg: &'a newt_core::Config,
+    pub cfg: &'a newt_core::ResolvedConfig,
     pub choice: &'a mut BackendChoice,
     pub inf_url: &'a mut String,
     pub inf_model: &'a mut String,
@@ -5224,8 +5630,8 @@ mod resumed_preference_tests {
     /// network-free. (Two named backends on one endpoint is a real
     /// configuration: `sol` and `openai` both live on api.openai.com.) The
     /// route is still observable: `NEWT_PROVIDER` and `choice.name` change.
-    fn cfg_with(names: &[&str]) -> newt_core::Config {
-        newt_core::Config {
+    fn cfg_with(names: &[&str]) -> newt_core::ResolvedConfig {
+        newt_core::ResolvedConfig::unrequested(newt_core::Config {
             default_backend: names.first().map(|n| (*n).to_string()),
             backends: names
                 .iter()
@@ -5238,7 +5644,7 @@ mod resumed_preference_tests {
                 })
                 .collect(),
             ..Default::default()
-        }
+        })
     }
 
     fn store_in(root: &std::path::Path, ws: &std::path::Path) -> newt_core::ConversationStore {
@@ -5270,14 +5676,14 @@ mod resumed_preference_tests {
     impl Session {
         /// Seeded to the CURRENT resolution so a same-target route never fires
         /// the served-adoption probe — the unit tier stays network-free.
-        fn new(cfg: &newt_core::Config) -> Self {
-            let choice = resolve_backend_choice(cfg);
+        fn new(cfg: &newt_core::ResolvedConfig) -> Self {
+            let choice = resolve_backend_choice(cfg).expect("test configs resolve");
             Self {
                 base_provider: std::env::var("NEWT_PROVIDER").ok(),
                 base_model: std::env::var("NEWT_DGX_MODEL").ok(),
                 pending: PreferenceActions::default(),
                 inf_url: choice.url.clone(),
-                inf_model: choice.model.clone(),
+                inf_model: choice.active_model.clone().unwrap_or_default(),
                 inf_kind: choice.kind,
                 inf_key: choice.api_key.clone(),
                 inf_context_window: choice.context_window,
@@ -5291,7 +5697,7 @@ mod resumed_preference_tests {
             store: Option<&newt_core::ConversationStore>,
             id: &str,
             baseline: &PreferenceBaseline,
-            cfg: &newt_core::Config,
+            cfg: &newt_core::ResolvedConfig,
         ) -> bool {
             self.switch_with_persona(store, id, baseline, cfg, None)
         }
@@ -5305,7 +5711,7 @@ mod resumed_preference_tests {
             store: Option<&newt_core::ConversationStore>,
             id: &str,
             baseline: &PreferenceBaseline,
-            cfg: &newt_core::Config,
+            cfg: &newt_core::ResolvedConfig,
         ) -> bool {
             apply_startup_preference_pin(outcome, self.switch_args(store, id, baseline, cfg, None))
         }
@@ -5319,7 +5725,7 @@ mod resumed_preference_tests {
             store: Option<&newt_core::ConversationStore>,
             id: &str,
             baseline: &PreferenceBaseline,
-            cfg: &newt_core::Config,
+            cfg: &newt_core::ResolvedConfig,
             persona: Option<&Persona>,
         ) -> bool {
             restore_preference_pin(self.switch_args(store, id, baseline, cfg, persona)).url_changed
@@ -5330,7 +5736,7 @@ mod resumed_preference_tests {
             store: Option<&'a newt_core::ConversationStore>,
             id: &'a str,
             baseline: &'a PreferenceBaseline,
-            cfg: &'a newt_core::Config,
+            cfg: &'a newt_core::ResolvedConfig,
             persona: Option<&'a Persona>,
         ) -> ConversationPreferenceSwitch<'a> {
             ConversationPreferenceSwitch {

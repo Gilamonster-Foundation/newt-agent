@@ -4,23 +4,48 @@
 //! differently from the TUI: first a missing `emits_leading_reasoning`
 //! hand-off, then raw inline-only `BackendConfig` accessors after the
 //! sidecar landed. Divergence between lanes is silent precisely where nobody
-//! watches a stream, so the shape is asserted: `solve.rs` builds
-//! `ResolvedCapabilities`, decides `for_principal`, and takes every
-//! capability from the DECISION — never from raw accessors.
+//! watches a stream, so the shape is asserted: `solve.rs` pairs the selected
+//! backend with ITS OWN provenance receipt, seeds `ResolvedCapabilities`
+//! from the receipt's binding (never a re-derived one), decides
+//! `for_route` against the typed route destination, renders prose through
+//! the ONE display owner, and takes every capability from the DECISION —
+//! never from raw accessors, never from the pre-pivot principal-only API.
 
 const REQUIRED: &[&str] = &[
+    // The receipt-seeded sidecar: binding evidence comes from the slot's
+    // own receipt, paired by the shared index selector.
+    "&picked.receipt.binding,",
     "ResolvedCapabilities::resolve(",
-    ".for_principal(",
+    // The destination-first typed decision.
+    "BackendDestination::of(backend)",
+    ".for_route(&destination, principal)",
+    // The one prose owner (shared with the TUI's display seam).
+    "newt_tui::applicability_prose(decision.applicability())",
+    // Typed family attribution — the anti-substring seam.
+    ".family_for_route(&destination, principal)",
+    // Every capability read comes from the decision.
     "decision.chat_completions()",
     "decision.reasoning_replay_scope()",
     "decision.emits_leading_reasoning()",
 ];
 
-/// Raw accessor reads that must NOT appear in solve (the decision owns them).
+/// Shapes that must NOT appear in solve: raw inline-only accessors (the
+/// decision owns them) and the pre-pivot capability/attribution APIs (a
+/// re-derived binding or a principal-only decision reintroduces the exact
+/// silent-rebind / lane-divergence classes the pivot closed).
 const BANNED: &[&str] = &[
     "backend.chat_completions_capability()",
     "backend.reasoning_replay_scope()",
     "backend.emits_leading_reasoning()",
+    // Pre-pivot decision API (no destination gate).
+    ".for_principal(",
+    // Pre-pivot prose channel.
+    "retarget_notice",
+    // A binding re-derived from the (possibly overridden) backend instead
+    // of the receipt.
+    "CardBindingSeed::from_backend(",
+    // Model-name substring family inference.
+    "attribute_active_family(",
 ];
 
 fn solve_source() -> String {

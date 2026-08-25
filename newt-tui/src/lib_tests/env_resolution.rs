@@ -169,9 +169,12 @@ fn resolve_backend_config_env_url_wins() {
         ],
         DGX_VARS,
         || {
-            let choice = resolve_backend_choice(&newt_core::Config::default());
+            let choice = resolve_backend_choice(&newt_core::ResolvedConfig::unrequested(
+                newt_core::Config::default(),
+            ))
+            .expect("resolves");
             assert_eq!(choice.url, "http://envhost:1234");
-            assert_eq!(choice.model, "env-model:7b");
+            assert_eq!(choice.active_model.as_deref(), Some("env-model:7b"));
             assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
         },
     );
@@ -196,7 +199,10 @@ fn resolve_backend_config_synthesizes_from_host_scheme_port() {
         ],
         DGX_VARS,
         || {
-            let choice = resolve_backend_choice(&newt_core::Config::default());
+            let choice = resolve_backend_choice(&newt_core::ResolvedConfig::unrequested(
+                newt_core::Config::default(),
+            ))
+            .expect("resolves");
             if !host_still("dgx1.lab") {
                 return; // raced with the wizard env test
             }
@@ -205,7 +211,10 @@ fn resolve_backend_config_synthesizes_from_host_scheme_port() {
     );
     // Host alone uses http + 11434 defaults.
     with_env_vars(&[("NEWT_DGX_HOST", "dgx2")], DGX_VARS, || {
-        let choice = resolve_backend_choice(&newt_core::Config::default());
+        let choice = resolve_backend_choice(&newt_core::ResolvedConfig::unrequested(
+            newt_core::Config::default(),
+        ))
+        .expect("resolves");
         if !host_still("dgx2") {
             return; // raced with the wizard env test
         }
@@ -241,18 +250,20 @@ fn resolve_backend_config_falls_back_to_dgx_config_then_localhost() {
             backends: vec![],
             ..cfg.clone()
         };
-        let choice = resolve_backend_choice(&bare);
+        let choice = resolve_backend_choice(&newt_core::ResolvedConfig::unrequested(bare))
+            .expect("resolves");
         assert_eq!(choice.url, "http://cfg-node:11434");
-        assert_eq!(choice.model, "cfg-model:8b");
+        assert_eq!(choice.active_model.as_deref(), Some("cfg-model:8b"));
         // No env, no config → documented localhost defaults.
         let bare2 = newt_core::Config {
             backends: vec![],
             dgx: None,
             ..Default::default()
         };
-        let choice = resolve_backend_choice(&bare2);
+        let choice = resolve_backend_choice(&newt_core::ResolvedConfig::unrequested(bare2))
+            .expect("resolves");
         assert_eq!(choice.url, "http://localhost:11434");
-        assert_eq!(choice.model, "llama3.1:8b");
+        assert_eq!(choice.active_model.as_deref(), Some("llama3.1:8b"));
         assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
         assert!(choice.api_key.is_none());
     });
@@ -301,7 +312,7 @@ fn backend_choice_resolves_a_named_card_and_decides_per_principal() {
     std::fs::create_dir_all(dir.path().join("models")).unwrap();
     std::fs::write(
         dir.path().join("models/team-reasoner.toml"),
-        "name = \"team-reasoner\"\n\n[capability]\nemits_leading_reasoning = true\n",
+        "name = \"team-reasoner\"\nbackend = \"vllm\"\n\n[vllm]\nserved_name = \"team-reasoner\"\n\n[capability]\nemits_leading_reasoning = true\n",
     )
     .unwrap();
 
@@ -313,10 +324,10 @@ fn backend_choice_resolves_a_named_card_and_decides_per_principal() {
     );
     configured.card = Some("team-reasoner".to_string());
     configured.serving = Some(newt_core::Serving::Instance);
-    let cfg = newt_core::Config {
+    let cfg = newt_core::ResolvedConfig::unrequested(newt_core::Config {
         backends: vec![configured.clone()],
         ..Default::default()
-    };
+    });
     let config_str = config.display().to_string();
 
     // Instance: the binding holds, whatever the label.
@@ -324,12 +335,16 @@ fn backend_choice_resolves_a_named_card_and_decides_per_principal() {
         &[("NEWT_CONFIG", config_str.as_str())],
         &["NEWT_PROVIDER", "NEWT_DGX_MODEL", "NEWT_BACKEND"],
         || {
-            let choice = resolve_backend_choice(&cfg);
+            let choice = resolve_backend_choice(&cfg).expect("resolves");
+            let d = choice.capability_decision();
             assert!(
-                choice.capability_decision().emits_leading_reasoning(),
+                d.emits_leading_reasoning(),
                 "an Instance holds the card binding through the real seam"
             );
-            assert!(choice.capability_decision().retarget_notice.is_none());
+            assert!(matches!(
+                d.applicability(),
+                newt_core::model_card::CardApplicability::Active { .. }
+            ));
         },
     );
 
@@ -337,10 +352,10 @@ fn backend_choice_resolves_a_named_card_and_decides_per_principal() {
     // off, visibly, and switching back needs no state reset (pure decision).
     let mut mux = configured;
     mux.serving = Some(newt_core::Serving::Multiplexer);
-    let cfg = newt_core::Config {
+    let cfg = newt_core::ResolvedConfig::unrequested(newt_core::Config {
         backends: vec![mux],
         ..Default::default()
-    };
+    });
     with_env_vars(
         &[
             ("NEWT_CONFIG", config_str.as_str()),
@@ -348,15 +363,24 @@ fn backend_choice_resolves_a_named_card_and_decides_per_principal() {
         ],
         &["NEWT_PROVIDER", "NEWT_BACKEND"],
         || {
-            let choice = resolve_backend_choice(&cfg);
+            let choice = resolve_backend_choice(&cfg).expect("resolves");
             let d = choice.capability_decision();
             assert!(
                 !d.emits_leading_reasoning(),
                 "a multiplexer serving a model the card was not bound to must \
                  not carry card behavior"
             );
-            let notice = d.retarget_notice.expect("the retarget is visible");
-            assert!(notice.contains("team-reasoner") && notice.contains("warm-pick"));
+            let newt_core::model_card::CardApplicability::InactiveModel {
+                card, active_model, ..
+            } = d.applicability()
+            else {
+                panic!(
+                    "the retarget is typed InactiveModel: {:?}",
+                    d.applicability()
+                );
+            };
+            assert_eq!(card, "team-reasoner");
+            assert_eq!(active_model, "warm-pick");
         },
     );
     with_env_vars(
@@ -366,7 +390,7 @@ fn backend_choice_resolves_a_named_card_and_decides_per_principal() {
         ],
         &["NEWT_PROVIDER", "NEWT_BACKEND"],
         || {
-            let choice = resolve_backend_choice(&cfg);
+            let choice = resolve_backend_choice(&cfg).expect("resolves");
             assert!(
                 choice.capability_decision().emits_leading_reasoning(),
                 "the exact bound model on a multiplexer re-applies the card — \
@@ -390,15 +414,15 @@ fn backend_choice_carries_declared_leading_reasoning() {
         emits_leading_reasoning: Some(true),
         ..Default::default()
     });
-    let cfg = newt_core::Config {
+    let cfg = newt_core::ResolvedConfig::unrequested(newt_core::Config {
         backends: vec![configured],
         ..Default::default()
-    };
+    });
     with_env_vars(
         &[],
         &["NEWT_PROVIDER", "NEWT_DGX_MODEL", "NEWT_BACKEND"],
         || {
-            let choice = resolve_backend_choice(&cfg);
+            let choice = resolve_backend_choice(&cfg).expect("resolves");
             assert!(
                 choice.capability_decision().emits_leading_reasoning(),
                 "an inline declaration must reach BackendChoice through resolution"
@@ -418,15 +442,15 @@ fn backend_choice_ignores_a_lineage_alias_without_a_declaration() {
             alias,
             newt_core::BackendKind::Openai,
         );
-        let cfg = newt_core::Config {
+        let cfg = newt_core::ResolvedConfig::unrequested(newt_core::Config {
             backends: vec![configured],
             ..Default::default()
-        };
+        });
         with_env_vars(
             &[],
             &["NEWT_PROVIDER", "NEWT_DGX_MODEL", "NEWT_BACKEND"],
             || {
-                let choice = resolve_backend_choice(&cfg);
+                let choice = resolve_backend_choice(&cfg).expect("resolves");
                 assert!(
                     !choice.capability_decision().emits_leading_reasoning(),
                     "`{alias}` is a label — with nothing declared, no policy applies"
@@ -454,16 +478,16 @@ fn backend_choice_carries_chat_generation_capabilities() {
         }),
         ..Default::default()
     });
-    let cfg = newt_core::Config {
+    let cfg = newt_core::ResolvedConfig::unrequested(newt_core::Config {
         backends: vec![configured],
         ..Default::default()
-    };
+    });
 
     with_env_vars(
         &[],
         &["NEWT_PROVIDER", "NEWT_DGX_MODEL", "NEWT_BACKEND"],
         || {
-            let choice = resolve_backend_choice(&cfg);
+            let choice = resolve_backend_choice(&cfg).expect("resolves");
             assert_eq!(
                 choice.capability_decision().reasoning_replay_scope(),
                 newt_core::model_card::ReasoningReplayScope::CurrentUserTurn
@@ -485,7 +509,7 @@ fn backend_choice_carries_chat_generation_capabilities() {
 
 #[test]
 fn resolve_backend_choice_honors_named_provider() {
-    let cfg = newt_core::Config {
+    let cfg = newt_core::ResolvedConfig::unrequested(newt_core::Config {
         backends: vec![
             // An OpenAI backend that the historical default would pick first…
             backend(
@@ -503,14 +527,14 @@ fn resolve_backend_choice_honors_named_provider() {
             ),
         ],
         ..Default::default()
-    };
+    });
     with_env_vars(
         &[("NEWT_PROVIDER", "local-box")],
         &["NEWT_DGX_MODEL", "NEWT_BACKEND"],
         || {
-            let choice = resolve_backend_choice(&cfg);
+            let choice = resolve_backend_choice(&cfg).expect("resolves");
             assert_eq!(choice.url, "http://local-box:11434");
-            assert_eq!(choice.model, "nemotron-3:33b");
+            assert_eq!(choice.active_model.as_deref(), Some("nemotron-3:33b"));
             assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
         },
     );
@@ -518,7 +542,7 @@ fn resolve_backend_choice_honors_named_provider() {
 
 #[test]
 fn resolve_backend_choice_named_provider_model_override() {
-    let cfg = newt_core::Config {
+    let cfg = newt_core::ResolvedConfig::unrequested(newt_core::Config {
         backends: vec![backend(
             "dgx-prod",
             "http://dgx:11434",
@@ -526,7 +550,7 @@ fn resolve_backend_choice_named_provider_model_override() {
             newt_core::BackendKind::Ollama,
         )],
         ..Default::default()
-    };
+    });
     // The loadout's `model` (→ NEWT_DGX_MODEL) overrides the backend default.
     with_env_vars(
         &[
@@ -535,10 +559,11 @@ fn resolve_backend_choice_named_provider_model_override() {
         ],
         &["NEWT_BACKEND"],
         || {
-            let choice = resolve_backend_choice(&cfg);
+            let choice = resolve_backend_choice(&cfg).expect("resolves");
             assert_eq!(choice.url, "http://dgx:11434");
             assert_eq!(
-                choice.model, "nemotron-3:4b",
+                choice.active_model.as_deref(),
+                Some("nemotron-3:4b"),
                 "loadout model overrides backend default"
             );
         },
@@ -551,7 +576,7 @@ fn model_override_applies_on_every_backend_path() {
     // (NEWT_DGX_MODEL) must win on the pinned-provider path AND the OpenAI
     // default path — previously only the pinned path honored it, so `/model`
     // silently did nothing when a named/OpenAI backend was active.
-    let cfg = newt_core::Config {
+    let cfg = newt_core::ResolvedConfig::unrequested(newt_core::Config {
         backends: vec![
             backend(
                 "dgx1",
@@ -567,7 +592,7 @@ fn model_override_applies_on_every_backend_path() {
             ),
         ],
         ..Default::default()
-    };
+    });
     // Pinned named backend + override → override wins over the static model.
     with_env_vars(
         &[
@@ -575,23 +600,31 @@ fn model_override_applies_on_every_backend_path() {
             ("NEWT_DGX_MODEL", "nemotron:30b"),
         ],
         &["NEWT_BACKEND"],
-        || assert_eq!(resolve_backend_choice(&cfg).model, "nemotron:30b"),
+        || {
+            assert_eq!(
+                resolve_backend_choice(&cfg)
+                    .expect("resolves")
+                    .active_model
+                    .as_deref(),
+                Some("nemotron:30b")
+            );
+        },
     );
     // OpenAI default (no provider pin) + override → override wins too.
     with_env_vars(
         &[("NEWT_DGX_MODEL", "gpt-4.1-mini")],
         &["NEWT_PROVIDER", "NEWT_BACKEND"],
         || {
-            let c = resolve_backend_choice(&cfg);
+            let c = resolve_backend_choice(&cfg).expect("resolves");
             assert_eq!(c.kind, newt_core::BackendKind::Openai);
-            assert_eq!(c.model, "gpt-4.1-mini");
+            assert_eq!(c.active_model.as_deref(), Some("gpt-4.1-mini"));
         },
     );
 }
 
 #[test]
-fn resolve_backend_choice_unknown_provider_falls_through() {
-    let cfg = newt_core::Config {
+fn resolve_backend_choice_unknown_provider_is_a_typed_refusal() {
+    let cfg = newt_core::ResolvedConfig::unrequested(newt_core::Config {
         backends: vec![backend(
             "remote",
             "http://remote:8000",
@@ -599,16 +632,16 @@ fn resolve_backend_choice_unknown_provider_falls_through() {
             newt_core::BackendKind::Openai,
         )],
         ..Default::default()
-    };
-    // A directly-set provider that names no backend is not a hard error here
-    // (the loadout path validates upstream) — it falls through to prefer-openai.
+    });
+    // A NEWT_PROVIDER that names no backend used to silently fall through to
+    // prefer-openai — running a backend the operator did not select. It is
+    // now the shared typed refusal: the caller surfaces it, nothing reroutes.
     with_env_vars(
         &[("NEWT_PROVIDER", "ghost")],
         &["NEWT_DGX_MODEL", "NEWT_BACKEND"],
         || {
-            let choice = resolve_backend_choice(&cfg);
-            assert_eq!(choice.url, "http://remote:8000");
-            assert_eq!(choice.kind, newt_core::BackendKind::Openai);
+            let refusal = resolve_backend_choice(&cfg).expect_err("no silent fallback to `remote`");
+            assert!(refusal.contains("ghost"), "{refusal}");
         },
     );
 }
@@ -666,6 +699,7 @@ fn active_backend_name_prefers_provider_pin_then_endpoint_match() {
         ],
         ..Default::default()
     };
+    let cfg = newt_core::ResolvedConfig::unrequested(cfg);
     // An explicit NEWT_PROVIDER pin wins.
     with_env_vars(
         &[("NEWT_PROVIDER", "gpu-runner")],
@@ -1049,4 +1083,276 @@ fn prompt_str_expands_newt_prompt_template() {
         let em = prompt_str("/tmp/proj", false, "gpt-4.1", false);
         assert_eq!(em, format!("proj emacs {VERSION}> "));
     });
+}
+
+// =========================================================================
+// Embedded (model_path) backends: typed chat refusal, no fallback
+// =========================================================================
+
+fn embedded_backend(name: &str) -> newt_core::BackendConfig {
+    newt_core::BackendConfig {
+        name: name.into(),
+        model_path: Some("/models/x.gguf".into()),
+        kind: Some(newt_core::BackendKind::Embedded),
+        ..Default::default()
+    }
+}
+
+/// The chat driver is HTTP-only: an embedded backend is a TYPED refusal on
+/// every selection arm — sole, default-named, env-named, and the heuristic
+/// first-pick — never a silent fallback to another backend, never an
+/// empty-URL HTTP session.
+#[test]
+fn embedded_backends_are_typed_chat_refusals_on_every_arm() {
+    // Sole.
+    let cfg = newt_core::ResolvedConfig::unrequested(newt_core::Config {
+        backends: vec![embedded_backend("emb")],
+        ..Default::default()
+    });
+    with_env_vars(
+        &[],
+        &[
+            "NEWT_PROVIDER",
+            "NEWT_DGX_MODEL",
+            "NEWT_BACKEND",
+            "NEWT_DGX_OLLAMA_URL",
+            "NEWT_DGX_HOST",
+        ],
+        || {
+            let refusal = resolve_backend_choice(&cfg).expect_err("sole embedded refuses");
+            assert!(
+                refusal.contains("emb") && refusal.contains("HTTP"),
+                "{refusal}"
+            );
+        },
+    );
+    // default_backend names it — with a perfectly good HTTP backend beside
+    // it that must NOT be silently run instead.
+    let cfg = newt_core::ResolvedConfig::unrequested(newt_core::Config {
+        backends: vec![
+            backend("http", "http://h:1", "m", newt_core::BackendKind::Openai),
+            embedded_backend("emb"),
+        ],
+        default_backend: Some("emb".into()),
+        ..Default::default()
+    });
+    with_env_vars(
+        &[],
+        &["NEWT_PROVIDER", "NEWT_DGX_MODEL", "NEWT_BACKEND"],
+        || {
+            let refusal = resolve_backend_choice(&cfg).expect_err("no fallback to `http`");
+            assert!(refusal.contains("emb"), "{refusal}");
+        },
+    );
+    // $NEWT_PROVIDER names it.
+    with_env_vars(
+        &[("NEWT_PROVIDER", "emb")],
+        &["NEWT_DGX_MODEL", "NEWT_BACKEND"],
+        || {
+            let refusal = resolve_backend_choice(&cfg).expect_err("env-named embedded refuses");
+            assert!(refusal.contains("emb"), "{refusal}");
+        },
+    );
+    // Heuristic arm: embedded-only config, nothing explicit — the first
+    // pick lands on it and refuses rather than entering HTTP.
+    let cfg = newt_core::ResolvedConfig::unrequested(newt_core::Config {
+        backends: vec![embedded_backend("only-emb")],
+        default_backend: None,
+        ..Default::default()
+    });
+    with_env_vars(
+        &[],
+        &[
+            "NEWT_PROVIDER",
+            "NEWT_DGX_MODEL",
+            "NEWT_BACKEND",
+            "NEWT_DGX_OLLAMA_URL",
+            "NEWT_DGX_HOST",
+        ],
+        || {
+            assert!(resolve_backend_choice(&cfg).is_err());
+        },
+    );
+}
+
+/// `/backends <name>` is TRANSACTIONAL: an embedded target is refused
+/// BEFORE any env/settings mutation — the session selector and the saved
+/// preference stay untouched, and the switch reports not-applied.
+#[serial_test::serial(real_fs)]
+#[test]
+fn apply_backend_choice_refuses_embedded_before_any_mutation() {
+    let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "[[backends]]\nname = \"http\"\nendpoint = \"http://h:1\"\nkind = \"openai\"\n\n\
+         [[backends]]\nname = \"emb\"\nmodel_path = \"/models/x.gguf\"\nkind = \"embedded\"\n",
+    )
+    .unwrap();
+    let prev_config = std::env::var_os("NEWT_CONFIG");
+    let prev_dir = std::env::var_os(newt_core::config::NEWT_CONFIG_DIR_ENV);
+    // SAFETY: guarded + serial lane; restored below.
+    unsafe {
+        std::env::remove_var("NEWT_CONFIG");
+        std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
+        std::env::remove_var("NEWT_PROVIDER");
+        std::env::remove_var("NEWT_DGX_MODEL");
+    }
+    let applied = crate::commands::model::apply_backend_choice("emb", false, false);
+    let provider_after = std::env::var("NEWT_PROVIDER").ok();
+    let settings_file = dir.path().join("settings.toml");
+    let settings_after = std::fs::read_to_string(&settings_file).ok();
+    // SAFETY: restore before asserting (panic-safety handled by the guard
+    // for NEWT_PROVIDER; config vars restored manually here).
+    unsafe {
+        match prev_config {
+            Some(v) => std::env::set_var("NEWT_CONFIG", v),
+            None => std::env::remove_var("NEWT_CONFIG"),
+        }
+        match prev_dir {
+            Some(v) => std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, v),
+            None => std::env::remove_var(newt_core::config::NEWT_CONFIG_DIR_ENV),
+        }
+    }
+    assert!(!applied, "the switch reports not-applied");
+    assert_eq!(
+        provider_after, None,
+        "session selector untouched on refusal"
+    );
+    assert!(
+        settings_after.is_none_or(|s| !s.contains("emb")),
+        "saved preference untouched on refusal"
+    );
+}
+
+/// L: chat's configured fallback delegates to the SHARED selection
+/// contract — a destination-less first/OpenAI entry is skipped for a later
+/// ROUTABLE one (never picked-and-refused, never a hollow session), and a
+/// provider-only config is a typed provider refusal, never a silent
+/// localhost fallback.
+#[test]
+fn configured_fallback_delegates_to_the_shared_contract() {
+    // Destination-less OpenAI first + routable Ollama later: the routable
+    // one is selected.
+    let cfg = newt_core::ResolvedConfig::unrequested(newt_core::Config {
+        backends: vec![
+            newt_core::BackendConfig {
+                name: "hollow-openai".into(),
+                kind: Some(newt_core::BackendKind::Openai),
+                ..Default::default()
+            },
+            backend(
+                "routable",
+                "http://r:1",
+                "m",
+                newt_core::BackendKind::Ollama,
+            ),
+        ],
+        ..Default::default()
+    });
+    with_env_vars(
+        &[],
+        &[
+            "NEWT_PROVIDER",
+            "NEWT_DGX_MODEL",
+            "NEWT_BACKEND",
+            "NEWT_DGX_OLLAMA_URL",
+            "NEWT_DGX_HOST",
+        ],
+        || {
+            let choice = resolve_backend_choice(&cfg).expect("the routable entry serves");
+            assert_eq!(choice.name, "routable");
+        },
+    );
+    // Provider-only: a typed refusal naming the provider — not localhost.
+    let cfg = newt_core::ResolvedConfig::unrequested(newt_core::Config {
+        backends: vec![],
+        providers: vec![newt_core::config::ProviderConfig {
+            name: "acme".into(),
+            command: "newt-provider-openai".into(),
+            model: None,
+            env_pass: vec![],
+            tiers: vec![],
+        }],
+        ..Default::default()
+    });
+    with_env_vars(
+        &[],
+        &[
+            "NEWT_PROVIDER",
+            "NEWT_DGX_MODEL",
+            "NEWT_BACKEND",
+            "NEWT_DGX_OLLAMA_URL",
+            "NEWT_DGX_HOST",
+        ],
+        || {
+            let refusal = resolve_backend_choice(&cfg).expect_err("providers are typed refusals");
+            assert!(refusal.contains("acme"), "{refusal}");
+        },
+    );
+}
+
+/// B/G: serving-route provenance — an explicit `--backend-serving` request
+/// outranks a cached probe observation, live adoption outranks both, and a
+/// fresh resolution's cache survives a same-intent refresh from a session
+/// that adopted nothing (offline) — while live-adopted evidence beats an
+/// older cache.
+#[test]
+fn serving_route_provenance_is_ordered_and_cache_survives_refresh() {
+    use newt_core::config::BackendOverride;
+    use newt_core::Serving;
+    let base = newt_core::Config {
+        backends: vec![backend(
+            "dgx1",
+            "http://dgx:8000",
+            "m",
+            newt_core::BackendKind::Openai,
+        )],
+        ..Default::default()
+    };
+    // A cached probe observation says Instance…
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("dgx1.toml"),
+        "record = \"probe_v1\"\nendpoint = \"http://dgx:8000\"\nserving = \"instance\"\n",
+    )
+    .unwrap();
+    let _unused: Option<BackendOverride> = None;
+    // Without a request: the cache seeds the route.
+    let rc = newt_core::ResolvedConfig::assemble_for_test(base.clone(), &[dir.path()], None)
+        .expect("assembles");
+    with_env_vars(
+        &[],
+        &["NEWT_PROVIDER", "NEWT_DGX_MODEL", "NEWT_BACKEND"],
+        || {
+            let choice = resolve_backend_choice(&rc).expect("resolves");
+            assert_eq!(
+                choice.observed_serving,
+                Some(Serving::Instance),
+                "cache slot"
+            );
+            assert_eq!(choice.adopted_serving, None, "no LIVE evidence yet");
+            assert_eq!(choice.route_serving(), Some(Serving::Instance));
+            // An explicit serving REQUEST outranks the cache…
+            let mut requested = choice;
+            requested.requested_serving = Some(Serving::Multiplexer);
+            assert_eq!(requested.route_serving(), Some(Serving::Multiplexer));
+            // …and LIVE adoption outranks both.
+            requested.adopted_serving = Some(Serving::Instance);
+            assert_eq!(requested.route_serving(), Some(Serving::Instance));
+            // A same-intent refresh from an OFFLINE prior session (nothing
+            // live-adopted) must NOT erase the fresh cache: only the live
+            // axis carries.
+            let mut fresh = resolve_backend_choice(&rc).expect("resolves");
+            let offline_prev = resolve_backend_choice(&rc).expect("resolves");
+            let changed = crate::merge_refresh(&offline_prev, &mut fresh);
+            assert!(!changed, "same intent");
+            assert_eq!(
+                fresh.observed_serving,
+                Some(Serving::Instance),
+                "the freshly resolved cache stands"
+            );
+            assert_eq!(fresh.adopted_serving, None, "no live evidence to carry");
+        },
+    );
 }

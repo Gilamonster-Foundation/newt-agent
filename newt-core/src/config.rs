@@ -1970,43 +1970,47 @@ impl Config {
     /// The profile name `bundle` yields for `model`: the longest-prefix `families`
     /// match, else `default_profile`. `None` ⇒ the bundle applies no profile here.
     #[must_use]
-    pub fn bundle_profile_for_model<'a>(
+    pub fn bundle_profile_for_family<'a>(
         &self,
         bundle: &'a BundleConfig,
-        model: &str,
+        family: Option<&str>,
     ) -> Option<&'a str> {
-        bundle
-            .families
-            .iter()
-            .filter(|(prefix, _)| model.starts_with(prefix.as_str()))
-            .max_by_key(|(prefix, _)| prefix.len()) // longest-prefix-wins
-            .map(|(_, p)| p.as_str())
+        family
+            .and_then(|fam| {
+                bundle
+                    .families
+                    .iter()
+                    .find(|(key, _)| key.as_str() == fam)
+                    .map(|(_, p)| p.as_str())
+            })
             .or(bundle.default_profile.as_deref())
     }
 
-    /// Infer the bundle for `model` from `applies_to` (longest-prefix-wins). Only
-    /// bundles with a non-empty `applies_to` participate — a use-case bundle (empty
-    /// `applies_to`) is never auto-inferred, only chosen explicitly via `--bundle`.
+    /// Infer the bundle for the TYPED model family (the resolved card's
+    /// declared metadata under the route-association gates — never a
+    /// model-name prefix): a bundle applies when its `applies_to` names the
+    /// family EXACTLY. No family ⇒ no automatic bundle — a qwen-LOOKING
+    /// alias with no exact card gets no family behavior (the anti-substring
+    /// law: names are labels, never evidence). Only bundles with a
+    /// non-empty `applies_to` participate — a use-case bundle (empty
+    /// `applies_to`) is never auto-inferred, only chosen explicitly via
+    /// `--bundle`.
     #[must_use]
-    pub fn infer_bundle(&self, model: &str) -> Option<(&str, &BundleConfig)> {
+    pub fn infer_bundle_for_family(&self, family: Option<&str>) -> Option<(&str, &BundleConfig)> {
+        let fam = family?;
         self.bundles
             .iter()
-            .filter_map(|(name, b)| {
-                b.applies_to
-                    .iter()
-                    .filter(|p| model.starts_with(p.as_str()))
-                    .map(String::len)
-                    .max()
-                    .map(|best| (best, name.as_str(), b))
-            })
-            .max_by_key(|(best, _, _)| *best)
-            .map(|(_, name, b)| (name, b))
+            .find(|(_, b)| b.applies_to.iter().any(|a| a == fam))
+            .map(|(name, b)| (name.as_str(), b))
     }
 
-    /// Resolve the active profile from the selectors + the active `model`:
-    /// `--profile` (explicit) > `--bundle` (its profile for this model) > an
-    /// inferred bundle (`applies_to`) > `None` (today's no-profile behavior).
-    /// Returns the profile NAME + how it was chosen (for the banner).
+    /// Resolve the active profile from the selectors + the TYPED model
+    /// family: `--profile` (explicit) > `--bundle` (its profile for this
+    /// family) > a bundle inferred from the exact family (`applies_to`) >
+    /// `None`. Automatic selection keys on the resolved card's declared
+    /// family under the route-association gates — NEVER on model-name
+    /// prefixes. Returns the profile NAME + how it was chosen (for the
+    /// banner).
     ///
     /// # Errors
     /// An unknown explicit `--bundle` is a hard error. An unknown explicit
@@ -2016,7 +2020,7 @@ impl Config {
         &self,
         profile_flag: Option<&str>,
         bundle_flag: Option<&str>,
-        model: &str,
+        family: Option<&str>,
     ) -> std::result::Result<Option<ProfilePick>, String> {
         if let Some(p) = profile_flag.filter(|s| !s.is_empty()) {
             return Ok(Some(ProfilePick {
@@ -2027,15 +2031,15 @@ impl Config {
         if let Some(b) = bundle_flag.filter(|s| !s.is_empty()) {
             let bundle = self.resolve_bundle(b)?;
             return Ok(self
-                .bundle_profile_for_model(bundle, model)
+                .bundle_profile_for_family(bundle, family)
                 .map(|p| ProfilePick {
                     name: p.to_string(),
                     via: PickVia::Bundle(b.to_string()),
                 }));
         }
-        if let Some((name, bundle)) = self.infer_bundle(model) {
+        if let Some((name, bundle)) = self.infer_bundle_for_family(family) {
             return Ok(self
-                .bundle_profile_for_model(bundle, model)
+                .bundle_profile_for_family(bundle, family)
                 .map(|p| ProfilePick {
                     name: p.to_string(),
                     via: PickVia::InferredBundle(name.to_string()),
@@ -2052,9 +2056,9 @@ impl Config {
 /// ```toml
 /// [bundles.nemotron]
 /// about = "Support bundle for the nemotron family"
-/// applies_to = ["nemotron"]                 # longest-prefix-wins; "nemotron3:33b" matches
+/// applies_to = ["nemotron"]                 # EXACT typed family names (card metadata)
 /// default_profile = "nemotron"
-/// families = { "nemotron" = "nemotron", "qwen" = "qwen-coder" }
+/// families = { "nemotron" = "nemotron", "qwen3" = "qwen-coder" }
 /// ```
 ///
 /// A bundle carries **no authority** — there is deliberately no caveats/preset
@@ -4406,6 +4410,52 @@ impl ResolvedConfig {
     #[must_use]
     pub fn into_config(self) -> Config {
         self.config
+    }
+
+    /// A resolution of `config` AS-IS: pure declarations — no disk merge,
+    /// no CLI request, receipts minted 1:1 from each backend's own
+    /// declaration. The INFALLIBLE last-resort constructor for surfaces
+    /// that must render something even when resolution proper failed (the
+    /// TUI's `unwrap_or_default` lane); it validates nothing, exactly like
+    /// the bare `Config` it wraps.
+    #[must_use]
+    pub fn unrequested(config: Config) -> Self {
+        let receipts = config
+            .backends
+            .iter()
+            .map(|b| BackendResolutionReceipt {
+                declaration: DeclaredBackend::of(b),
+                request: None,
+                observation: None,
+                binding: crate::model_card::CardBindingSeed::from_backend(b),
+            })
+            .collect();
+        Self { config, receipts }
+    }
+
+    /// Test-support (doc-hidden, the `test_guard` precedent): run the
+    /// backend assembly over `config` + explicit drop-in `dirs` + an
+    /// explicit request, exactly as `resolve_runtime_unpublished` does but
+    /// without candidate-path/env IO — so dependent crates' tests can
+    /// build receipt-bearing resolutions deterministically.
+    ///
+    /// # Errors
+    /// The assembly's identity/destination/request errors.
+    #[doc(hidden)]
+    pub fn assemble_for_test(
+        mut config: Config,
+        dirs: &[&Path],
+        over: Option<BackendOverride>,
+    ) -> std::result::Result<Self, String> {
+        let mut assembly = BackendAssembly::new(std::mem::take(&mut config.backends))?;
+        for dir in dirs {
+            assembly.merge_dir(dir)?;
+        }
+        let default_backend = config.default_backend.clone();
+        let _slot = assembly.apply_request(over, default_backend.as_deref())?;
+        let (backends, receipts) = assembly.finish();
+        config.backends = backends;
+        Ok(Self { config, receipts })
     }
 
     /// Publish this resolution's process-global settings —
@@ -7991,69 +8041,79 @@ mod tests {
     }
 
     #[test]
-    fn bundle_profile_for_model_longest_prefix_then_default() {
+    fn bundle_profile_for_family_exact_then_default() {
         let cfg = bundle_cfg();
         let b = cfg.resolve_bundle("nemotron").unwrap();
-        // family-prefix match
+        // EXACT typed-family match — never a model-name prefix.
         assert_eq!(
-            cfg.bundle_profile_for_model(b, "nemotron3:33b"),
+            cfg.bundle_profile_for_family(b, Some("nemotron")),
             Some("nemotron")
         );
         assert_eq!(
-            cfg.bundle_profile_for_model(b, "qwen2.5-coder"),
+            cfg.bundle_profile_for_family(b, Some("qwen")),
             Some("qwen-coder")
         );
-        // no family match → default_profile
+        // An unmapped family — or no family at all — falls to the bundle's
+        // default profile (the bundle was chosen; its default applies).
         assert_eq!(
-            cfg.bundle_profile_for_model(b, "llama3.1:8b"),
+            cfg.bundle_profile_for_family(b, Some("llama")),
             Some("nemotron")
         );
+        assert_eq!(cfg.bundle_profile_for_family(b, None), Some("nemotron"));
     }
 
     #[test]
-    fn infer_bundle_only_from_applies_to() {
+    fn infer_bundle_only_from_exact_family() {
         let cfg = bundle_cfg();
-        // nemotron model → the nemotron bundle (applies_to match)
+        // The exact typed family → the nemotron bundle.
         assert_eq!(
-            cfg.infer_bundle("nemotron3:33b").map(|(n, _)| n),
+            cfg.infer_bundle_for_family(Some("nemotron"))
+                .map(|(n, _)| n),
             Some("nemotron")
         );
-        // a model no applies_to matches → no inference (the use-case bundle is never inferred)
-        assert!(cfg.infer_bundle("gpt-4.1").is_none());
+        // A family nothing names — and NO family (the qwen-LOOKING alias
+        // with no exact card: labels are never evidence) → no inference.
+        assert!(cfg.infer_bundle_for_family(Some("gpt")).is_none());
+        assert!(cfg.infer_bundle_for_family(None).is_none());
+        // A model-name-shaped string is NOT a family key: exact equality
+        // only, no prefix matching.
+        assert!(cfg.infer_bundle_for_family(Some("nemotron3:33b")).is_none());
     }
 
     #[test]
     fn pick_active_profile_precedence() {
         let cfg = bundle_cfg();
-        // 1. explicit --profile wins over everything
+        // 1. explicit --profile wins over everything.
         let p = cfg
-            .pick_active_profile(Some("qwen-coder"), Some("nemotron"), "nemotron3:33b")
+            .pick_active_profile(Some("qwen-coder"), Some("nemotron"), Some("nemotron"))
             .unwrap()
             .unwrap();
         assert_eq!(p.name, "qwen-coder");
         assert_eq!(p.via, PickVia::Profile);
-        // 2. --bundle resolves to its profile for the model
+        // 2. --bundle resolves to its profile for the TYPED family.
         let p = cfg
-            .pick_active_profile(None, Some("nemotron"), "nemotron3:33b")
+            .pick_active_profile(None, Some("nemotron"), Some("nemotron"))
             .unwrap()
             .unwrap();
         assert_eq!(
             (p.name.as_str(), p.via),
             ("nemotron", PickVia::Bundle("nemotron".into()))
         );
-        // 3. inferred from the model when neither flag is set
+        // 3. inferred from the exact family when neither flag is set —
+        //    and family A → profile A, family gone → None (the refresh
+        //    funnel re-derives per route transition).
         let p = cfg
-            .pick_active_profile(None, None, "nemotron3:33b")
+            .pick_active_profile(None, None, Some("nemotron"))
             .unwrap()
             .unwrap();
         assert_eq!(p.via, PickVia::InferredBundle("nemotron".into()));
-        // 4. nothing matches → None (today's behavior)
+        assert!(cfg.pick_active_profile(None, None, None).unwrap().is_none());
+        // 4. a card-less qwen-looking ALIAS has no family → no profile.
+        assert!(cfg.pick_active_profile(None, None, None).unwrap().is_none());
+        // an unknown explicit bundle is a hard error.
         assert!(cfg
-            .pick_active_profile(None, None, "gpt-4.1")
-            .unwrap()
-            .is_none());
-        // an unknown explicit bundle is a hard error
-        assert!(cfg.pick_active_profile(None, Some("ghost"), "x").is_err());
+            .pick_active_profile(None, Some("ghost"), Some("x"))
+            .is_err());
     }
 
     // ── loadouts (the top-level composition; inert until Slice 1) ───────

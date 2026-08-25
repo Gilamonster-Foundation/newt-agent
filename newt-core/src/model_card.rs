@@ -354,11 +354,19 @@ impl ModelCard {
         if self.name.trim().is_empty() {
             return Err("model card: `name` is empty".to_string());
         }
+        // Family is an IDENTITY, decoupled from serving defaults: any
+        // nonempty explicit family validates — when no
+        // `cards/families/<name>.toml` profile exists the card simply gets
+        // no serving defaults ([`apply_family_defaults`] is a no-op). Only
+        // the empty/whitespace non-identity is rejected. (The old rule
+        // required a defaults profile per family, which made the typed
+        // family seam unable to carry `nemotron`/`gemma`/… without an
+        // unrelated serving profile.)
         if let Some(family) = self.family.as_deref() {
-            if family_defaults(family).is_none() {
+            if family.trim().is_empty() {
                 return Err(format!(
-                    "model card `{}`: family `{family}` has no known defaults \
-                     (check for a typo, or add cards/families/{family}.toml)",
+                    "model card `{}`: `family` is empty — declare a real family \
+                     identity or remove the key",
                     self.name
                 ));
             }
@@ -533,6 +541,15 @@ pub fn builtin_card_entries() -> Vec<(String, ModelCard)> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedCapabilities {
     inline: Option<Capability>,
+    /// ONE association per resolved card: capability AND family ride the
+    /// same binding (both optional), so the typed applicability the display
+    /// owner renders and the family policy the tenacity seam consumes can
+    /// never diverge — a family-only card's transitions are exactly as
+    /// VISIBLE as a capability card's. A card carrying NEITHER contributes
+    /// nothing and mints no binding (serving/tuning-only cards stay
+    /// silent). Family identity is DECOUPLED from serving-default
+    /// availability (a `family` with no `cards/families/<name>.toml`
+    /// profile is still an identity).
     binding: Option<CardBinding>,
 }
 
@@ -575,7 +592,10 @@ impl CardBindingSeed {
 #[derive(Debug, Clone, PartialEq)]
 struct CardBinding {
     name: String,
-    capability: Capability,
+    /// The card's `[capability]` layer, when it declares one.
+    capability: Option<Capability>,
+    /// The card's declared family identity, when it names one.
+    family: Option<String>,
     /// From [`CardBindingSeed::bound_model`] — `None` when the backend
     /// declared no model.
     bound_model: Option<String>,
@@ -693,6 +713,22 @@ impl CapabilityDecision {
     }
 }
 
+/// Does this principal EXACTLY associate with the bound model? Instance
+/// associates by artifact identity; a multiplexer/selected principal only
+/// on exact string equality of two supplied identifiers — and an
+/// empty/whitespace principal is NO model identity (two empty strings
+/// agreeing is not an association). The ONE association rule, shared by
+/// the capability decision and the family identity so they cannot drift.
+fn principal_associates(bound_model: Option<&str>, principal: ServingPrincipal<'_>) -> bool {
+    match principal {
+        ServingPrincipal::Instance => true,
+        ServingPrincipal::MultiplexerModel(current) | ServingPrincipal::SelectedModel(current) => {
+            !current.trim().is_empty() && bound_model == Some(current)
+        }
+        _ => false,
+    }
+}
+
 impl ResolvedCapabilities {
     /// Resolve one backend's layers from its [`CardBindingSeed`]. ONE catalog
     /// lookup ([`crate::card_catalog::ModelCardCatalog::resolve_exact`]); the
@@ -737,10 +773,16 @@ impl ResolvedCapabilities {
         let card = catalog
             .resolve_exact(name)
             .map_err(|e| format!("backend `{}` names model card `{name}` — {e}", backend.name))?;
+        let capability = card.capability;
+        let family = card.family.clone().filter(|f| !f.trim().is_empty());
         Ok(Self {
-            binding: card.capability.map(|capability| CardBinding {
+            // ONE binding whenever the card CONTRIBUTES anything —
+            // capability, family, or both. A card with neither contributes
+            // nothing: no binding, no applicability chatter downstream.
+            binding: (capability.is_some() || family.is_some()).then(|| CardBinding {
                 name: name.to_string(),
                 capability,
+                family,
                 // The effective-model rule, defensively: an empty/whitespace
                 // bound model in a hand-built seed is no identity.
                 bound_model: seed.bound_model.clone().filter(|m| !m.trim().is_empty()),
@@ -764,6 +806,28 @@ impl ResolvedCapabilities {
     #[must_use]
     pub fn card(&self) -> Option<&str> {
         self.binding.as_ref().map(|b| b.name.as_str())
+    }
+
+    /// The typed model-family identity for the CURRENT route, or `None` —
+    /// the anti-substring seam: family comes from the exact catalog lookup
+    /// of the operator's named card, under the SAME association gates as
+    /// the capability decision (concrete equal destination + exact
+    /// principal association), NEVER from model-name inference. Present
+    /// even when the card carries no `[capability]`, and independent of
+    /// whether a `cards/families/<name>.toml` default profile exists.
+    #[must_use]
+    pub fn family_for_route(
+        &self,
+        active_destination: &crate::config::BackendDestination,
+        principal: ServingPrincipal<'_>,
+    ) -> Option<&str> {
+        let b = self.binding.as_ref()?;
+        let family = b.family.as_deref()?;
+        (b.bound_destination.is_concrete()
+            && active_destination.is_concrete()
+            && b.bound_destination == *active_destination
+            && principal_associates(b.bound_model.as_deref(), principal))
+        .then_some(family)
     }
 
     /// THE decision — pure over the layers, the session's ROUTE destination,
@@ -821,21 +885,17 @@ impl ResolvedCapabilities {
                 },
             };
         }
-        let applies = match principal {
-            ServingPrincipal::Instance => true,
-            ServingPrincipal::MultiplexerModel(current)
-            | ServingPrincipal::SelectedModel(current) => {
-                // An empty/whitespace principal is NO model identity — two
-                // empty strings agreeing is not an exact association.
-                !current.trim().is_empty() && b.bound_model.as_deref() == Some(current)
-            }
-            _ => false,
-        };
+        let applies = principal_associates(b.bound_model.as_deref(), principal);
         if applies {
-            let effective = Some(match self.inline.clone() {
-                Some(inl) => b.capability.clone().merge(inl),
-                None => b.capability.clone(),
-            });
+            // A family-only binding activates with NO capability layer —
+            // inline stays the whole capability story while the family
+            // policy engages; the applicability is Active either way, so
+            // its transitions render exactly like a capability card's.
+            let effective = match (b.capability.clone(), self.inline.clone()) {
+                (Some(cap), Some(inl)) => Some(cap.merge(inl)),
+                (Some(cap), None) => Some(cap),
+                (None, inline) => inline,
+            };
             return CapabilityDecision {
                 effective,
                 applicability: CardApplicability::Active {
@@ -1144,29 +1204,59 @@ reasoning_replay_scope = "current_user_turn"
     }
 
     #[test]
-    fn finalize_rejects_an_unknown_family() {
-        // The fully resolved card is validated — an unknown family (almost
-        // always a typo) is a loud error, never a silent no-layer.
+    fn finalize_accepts_an_arbitrary_family_without_a_defaults_profile() {
+        // Family is an IDENTITY, decoupled from serving defaults: a family
+        // with no `cards/families/<name>.toml` profile validates and simply
+        // gets no defaults layer — the card's own [vllm] block is exactly
+        // what comes out. (Previously this was rejected, which made the
+        // typed family seam unable to carry nemotron/gemma/… identities.)
         let card: ModelCard = toml::from_str(
-            "name = \"test\"\nbackend = \"vllm\"\nfamily = \"bogus\"\n\
+            "name = \"test\"\nbackend = \"vllm\"\nfamily = \"nemotron\"\n\
              [vllm]\nserved_name = \"test\"\n",
         )
         .unwrap();
-        let err = crate::card_catalog::finalize(card).expect_err("unknown family");
-        assert!(err.contains("bogus"), "{err}");
+        let resolved = crate::card_catalog::finalize(card).expect("identity needs no profile");
+        assert_eq!(resolved.family.as_deref(), Some("nemotron"));
+        let vllm = resolved.vllm.expect("own block kept");
+        assert_eq!(vllm.served_name.as_deref(), Some("test"));
+        assert_eq!(
+            vllm.reasoning_parser, None,
+            "no defaults profile ⇒ no serving defaults applied"
+        );
     }
 
     #[test]
-    fn validate_rejects_an_unknown_family_name() {
+    fn finalize_rejects_an_empty_family_identity() {
+        // The empty/whitespace non-identity is still rejected — an empty
+        // string can never be an exact family.
+        let card: ModelCard = toml::from_str(
+            "name = \"test\"\nbackend = \"vllm\"\nfamily = \"  \"\n\
+             [vllm]\nserved_name = \"test\"\n",
+        )
+        .unwrap();
+        let err = crate::card_catalog::finalize(card).expect_err("empty family");
+        assert!(err.contains("family"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_an_arbitrary_family_identity() {
+        // Identity is decoupled from serving-default availability: a family
+        // outside the defaults registry (a `qwenn3` typo included — the
+        // registry cannot tell a typo from a real new family) validates;
+        // only the empty non-identity is rejected.
         let card: ModelCard = toml::from_str(
             "name = \"test\"\nbackend = \"vllm\"\nfamily = \"qwenn3\"\n\
              [vllm]\nserved_name = \"test\"\n",
         )
         .unwrap();
-        let err = card
-            .validate()
-            .expect_err("unknown family must be rejected");
-        assert!(err.contains("qwenn3"), "{err}");
+        card.validate().expect("an explicit family is an identity");
+        let empty: ModelCard = toml::from_str(
+            "name = \"test\"\nbackend = \"vllm\"\nfamily = \"\"\n\
+             [vllm]\nserved_name = \"test\"\n",
+        )
+        .unwrap();
+        let err = empty.validate().expect_err("empty family is no identity");
+        assert!(err.contains("family"), "{err}");
     }
 
     #[test]

@@ -998,6 +998,77 @@ pub(crate) trait InputSurface {
     fn turn_ended(&mut self) {}
 }
 
+/// M (#1819): re-derive the AUTOMATIC bundle/profile pick from the CURRENT
+/// typed card family at every refresh funnel, so switching families cannot
+/// leave family-A behavioral techniques active on model B. Explicit
+/// `NEWT_PROFILE` / `--profile` / `--bundle` selections stay pinned by the
+/// pick's own precedence (they dominate the family input). Announces only
+/// on an actual change; a failed re-pick keeps the current profile and
+/// says so.
+fn repick_active_profile(
+    cfg: &newt_core::ResolvedConfig,
+    choice: &crate::BackendChoice,
+    active_profile: &mut Option<newt_core::config::ProfileConfig>,
+    color: bool,
+    verbose: bool,
+) {
+    let family = choice
+        .capabilities
+        .family_for_route(&choice.route_destination(), choice.principal())
+        .map(str::to_string);
+    let profile_env = std::env::var("NEWT_PROFILE").ok();
+    let bundle_env = std::env::var("NEWT_BUNDLE").ok();
+    let pick = match cfg.pick_active_profile(
+        profile_env.as_deref(),
+        bundle_env.as_deref(),
+        family.as_deref(),
+    ) {
+        Ok(pick) => pick,
+        Err(e) => {
+            print_newt(
+                &format!("profile re-pick failed ({e}) — keeping the current profile"),
+                color,
+                verbose,
+            );
+            return;
+        }
+    };
+    let next = match pick {
+        Some(p) => match cfg.resolve_profile(&p.name) {
+            Ok(profile) => Some((p, profile.clone())),
+            Err(e) => {
+                print_newt(
+                    &format!("profile '{}': {e} — keeping the current profile", p.name),
+                    color,
+                    verbose,
+                );
+                return;
+            }
+        },
+        None => None,
+    };
+    // ProfileConfig carries no name — compare CONTENT identity (a re-pick
+    // resolving to an identical profile is a no-op, whatever its name).
+    let changed = active_profile.as_ref() != next.as_ref().map(|(_, p)| p);
+    if !changed {
+        return;
+    }
+    match next {
+        Some((pick, profile)) => {
+            announce_profile(&pick.name, &profile, &pick.via, color);
+            *active_profile = Some(profile);
+        }
+        None => {
+            print_newt(
+                "profile cleared — the current route has no associated family bundle",
+                color,
+                verbose,
+            );
+            *active_profile = None;
+        }
+    }
+}
+
 pub(crate) fn run_chat(
     workspace: &str,
     color: bool,
@@ -1195,7 +1266,20 @@ fn session_body(
     // Resolve config ONCE per session and reuse it for every read this turn.
     // It is re-read (`Config::resolve`) only after a slash command, the one
     // intentional refresh point — config.toml may have changed on disk.
-    let mut cfg = newt_core::Config::resolve().unwrap_or_default();
+    // UNPUBLISHED resolution: process-globals land only after the typed
+    // backend choice below ACCEPTS — a refused startup publishes nothing.
+    // A resolution failure is visible, then the session runs on defaults.
+    let mut cfg = match newt_core::Config::resolve_runtime_unpublished() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            print_newt(
+                &format!("config resolution failed: {e:#} — running on built-in defaults"),
+                color,
+                verbose,
+            );
+            newt_core::ResolvedConfig::unrequested(newt_core::Config::default())
+        }
+    };
     // The active profile is resolved just below, AFTER the model is known — a
     // `--bundle`/inferred bundle picks its profile from the model id.
 
@@ -1262,34 +1346,48 @@ fn session_body(
 
     // Resolve the inference backend and permission caveats once at session
     // start.  Both are re-read after each slash command (config.toml on disk).
-    let mut choice = resolve_backend_choice(&cfg);
-    // A card-resolution error (an unknown named card) minted during choice
-    // resolution surfaces at STARTUP too, not only at mid-session refresh —
-    // the operator must see it before the first turn runs without the
-    // declarations they believe are active. Adoption-time retarget notices
-    // arrive through the adoption lines below.
-    if let Some(error) = choice.card_suppressed_notice.take() {
-        print_newt(&error, color, verbose);
-    }
+    // The typed selection contract can REFUSE (an explicit
+    // $NEWT_PROVIDER/default_backend naming something unknown, unroutable,
+    // or a provider) — at startup that is a hard error, never a silent run
+    // of some other backend.
+    let mut choice = resolve_backend_choice(&cfg).map_err(|e| anyhow::anyhow!(e))?;
+    // The typed choice ACCEPTED — the session's process-global settings
+    // publish here, and only here, at startup.
+    cfg.publish_runtime_settings();
     // #1126 C1b: the server dictates — adopt what the endpoint actually
-    // serves (bounded ~1s; offline keeps the file hint + says so).
+    // serves (bounded ~1s; offline keeps the file hint + says so). The
+    // adoption lines already include the card-layer transitions from the
+    // ONE display owner.
     for line in adopt_backend_choice(&mut choice, prewarm) {
         print_newt(&line, color, verbose);
     }
-    let (mut inf_url, mut inf_model) = (choice.url.clone(), choice.model.clone());
+    // Card-resolution errors + the startup applicability state surface at
+    // STARTUP too (offline/no-adoption paths included) — deduped by typed
+    // identity, so nothing re-prints if adoption already showed it.
+    for line in choice.card_notice_lines() {
+        print_newt(&line, color, verbose);
+    }
+    let (mut inf_url, mut inf_model) = (
+        choice.url.clone(),
+        choice.active_model.clone().unwrap_or_default(),
+    );
     // The canonical capability identity for the ACTIVE serving principal — the
     // single key for every empirical-capability lookup/observation below
     // (multiplexer → model, instance → backend; see `probe::cap_key`). Recomputed
     // in lockstep with the route after every switch funnel (`refresh_backend` /
     // `apply_persona_backend`), so two vLLM instances serving the same model name
     // never share (or poison) each other's tuning evidence.
-    let mut cap_id = session_cap_id(choice.serving, &choice.name, &inf_model);
-    // #1139: attribute the resolved model's family so per-family `[tenacity]`
-    // config defaults apply in CHAT, exactly as they do in solve. This was the
-    // ACTIVE_FAMILY gap — `set_active_model_family` was called ONLY in solve, so
-    // chat left the family None and a `[tenacity.families]` default silently never
-    // applied to an interactive session.
-    newt_core::tenacity::attribute_active_family(cfg.tenacity.as_ref(), &inf_model);
+    let mut cap_id = session_cap_id(choice.route_serving(), &choice.name, &inf_model);
+    // #1139: the TYPED model family — the resolved card's declared metadata
+    // under the same association gates as the capability decision, never
+    // inferred from the model name (the anti-substring law). No associated
+    // card family ⇒ no family. ONE derivation feeds both the per-family
+    // `[tenacity]` default and the automatic bundle/profile pick below.
+    let session_family = choice
+        .capabilities
+        .family_for_route(&choice.route_destination(), choice.principal())
+        .map(str::to_string);
+    newt_core::tenacity::set_active_model_family(session_family.clone());
     // #1199: the server-declared window from adopt, fresh per session — feeds
     // the budget without the persisted cache.
     let mut inf_context_window: Option<u32> = choice.context_window;
@@ -1304,11 +1402,15 @@ fn session_body(
     // naming an unknown technique / unmet presupposition — is a hard error; a
     // selector that silently did nothing would be a false claim. Held for the loop
     // to apply.
-    let active_profile = {
+    let mut active_profile = {
         let profile_env = std::env::var("NEWT_PROFILE").ok();
         let bundle_env = std::env::var("NEWT_BUNDLE").ok();
         let pick = cfg
-            .pick_active_profile(profile_env.as_deref(), bundle_env.as_deref(), &inf_model)
+            .pick_active_profile(
+                profile_env.as_deref(),
+                bundle_env.as_deref(),
+                session_family.as_deref(),
+            )
             .map_err(|e| anyhow::anyhow!(e))?;
         match pick {
             Some(p) => {
@@ -1668,8 +1770,12 @@ fn session_body(
         }
         // A startup persona may have switched the backend/model; re-derive the
         // capability identity so the budget block below keys the resolved route.
-        cap_id = session_cap_id(choice.serving, &choice.name, &inf_model);
+        cap_id = session_cap_id(choice.route_serving(), &choice.name, &inf_model);
     }
+    // The persona reroute may have changed the route family — re-derive
+    // the automatic profile pick from the POST-persona typed family (this
+    // closes the long-documented follow-up above).
+    repick_active_profile(&cfg, &choice, &mut active_profile, color, verbose);
 
     // Pluggable memory manager — replaces the old conv Vec.
     let mem_cfg = cfg.memory.clone().unwrap_or_default();
@@ -5174,7 +5280,14 @@ fn session_body(
                                 .pick_active_profile(
                                     profile_env.as_deref(),
                                     bundle_env.as_deref(),
-                                    &inf_model,
+                                    choice
+                                        .capabilities
+                                        .family_for_route(
+                                            &choice.route_destination(),
+                                            choice.principal(),
+                                        )
+                                        .map(str::to_string)
+                                        .as_deref(),
                                 )
                                 .ok()
                                 .flatten();
@@ -5282,30 +5395,29 @@ fn session_body(
                             // seam /models uses, tagged with cached conformance
                             // symbols. An unreachable backend → None → the row
                             // renders but won't dial.
-                            let panel_choice = resolve_backend_choice(&cfg);
-                            let served_models = fetch_models_for(
-                                &panel_choice.url,
-                                panel_choice.kind,
-                                panel_choice.api_key.as_deref(),
-                            )
-                            .ok()
-                            .map(|names| {
-                                let cache = probe::load_cache();
-                                names
-                                    .into_iter()
-                                    .map(|name| {
-                                        let tag = cache
-                                            .get(&probe::cap_key(
-                                                newt_core::Serving::Multiplexer,
-                                                "",
-                                                &name,
-                                            ))
-                                            .map(|e| e.conformance.symbol().to_string())
-                                            .unwrap_or_default();
-                                        config_panel::ModelChoice { name, tag }
-                                    })
-                                    .collect::<Vec<_>>()
-                            });
+                            let panel_choice = resolve_backend_choice(&cfg).ok();
+                            let served_models = panel_choice
+                                .as_ref()
+                                .and_then(|pc| {
+                                    fetch_models_for(&pc.url, pc.kind, pc.api_key.as_deref()).ok()
+                                })
+                                .map(|names| {
+                                    let cache = probe::load_cache();
+                                    names
+                                        .into_iter()
+                                        .map(|name| {
+                                            let tag = cache
+                                                .get(&probe::cap_key(
+                                                    newt_core::Serving::Multiplexer,
+                                                    "",
+                                                    &name,
+                                                ))
+                                                .map(|e| e.conformance.symbol().to_string())
+                                                .unwrap_or_default();
+                                            config_panel::ModelChoice { name, tag }
+                                        })
+                                        .collect::<Vec<_>>()
+                                });
                             let outcome = run_psyche_panel(
                                 config_panel::PanelSeed {
                                     personas,
@@ -5313,7 +5425,10 @@ fn session_body(
                                     backend,
                                     base_tenacity,
                                     models: served_models,
-                                    current_model: panel_choice.model.clone(),
+                                    current_model: panel_choice
+                                        .as_ref()
+                                        .map(|pc| pc.display_model().to_string())
+                                        .unwrap_or_default(),
                                 },
                                 persist,
                                 color,
@@ -5443,7 +5558,7 @@ fn session_body(
                                     // independently-mutated sources and could pair
                                     // the operator's provider with a persona
                                     // backend's model.
-                                    cfg = newt_core::Config::resolve().unwrap_or_default();
+                                    cfg = crate::resolve_runtime_or_default();
                                     let _ = refresh_backend(
                                         &cfg,
                                         &mut choice,
@@ -5452,6 +5567,13 @@ fn session_body(
                                         &mut inf_kind,
                                         &mut inf_key,
                                         &mut inf_context_window,
+                                        color,
+                                        verbose,
+                                    );
+                                    repick_active_profile(
+                                        &cfg,
+                                        &choice,
+                                        &mut active_profile,
                                         color,
                                         verbose,
                                     );
@@ -5556,12 +5678,12 @@ fn session_body(
                             ),
                             // No named match (env-shim / kind-forced session):
                             // mark the kind fallback the session resolves to.
-                            None => {
-                                let k = resolve_backend_choice(&cfg).kind.label();
+                            None => resolve_backend_choice(&cfg).ok().and_then(|choice| {
+                                let k = choice.kind.label();
                                 options.iter().position(
                                     |o| matches!(o.selection, BackendSelection::Kind(s) if s == k),
                                 )
-                            }
+                            }),
                         };
                         // Persistence is I/O-INJECTED (config_panel review-3 §1):
                         // these closures are the panel's ONLY filesystem writes,
@@ -5714,7 +5836,7 @@ fn session_body(
                             // re-probe telemetry only when the URL changed
                             // (verbose-only; dropping the old receiver stops
                             // the previous background sampler, #412/#414).
-                            cfg = newt_core::Config::resolve().unwrap_or_default();
+                            cfg = crate::resolve_runtime_or_default();
                             let url_changed = refresh_backend(
                                 &cfg,
                                 &mut choice,
@@ -5723,6 +5845,13 @@ fn session_body(
                                 &mut inf_kind,
                                 &mut inf_key,
                                 &mut inf_context_window,
+                                color,
+                                verbose,
+                            );
+                            repick_active_profile(
+                                &cfg,
+                                &choice,
+                                &mut active_profile,
                                 color,
                                 verbose,
                             );
@@ -5763,7 +5892,7 @@ fn session_body(
                     // session picks up edits, then derive everything from it.
                     // Permissions can only NARROW within a session; a widening
                     // request is clamped (restart to widen — see SessionCapability).
-                    cfg = newt_core::Config::resolve().unwrap_or_default();
+                    cfg = crate::resolve_runtime_or_default();
                     // Ephemeral is a session-wide decision (17.7): a config
                     // refresh never re-grows a store handle mid-session.
                     if !ephemeral_session {
@@ -5780,6 +5909,7 @@ fn session_body(
                         color,
                         verbose,
                     );
+                    repick_active_profile(&cfg, &choice, &mut active_profile, color, verbose);
                     // Re-probe DCGM ONLY when the backend URL actually changed
                     // (and only in verbose mode, where the snapshot is shown).
                     // `try_connect` is a blocking ~3s network call (issue #412);
@@ -6130,7 +6260,7 @@ fn session_body(
                     // rebudget below keys the CURRENT serving principal — never the
                     // previous model's evidence, and never poisoning a sibling
                     // instance that happens to share a model name.
-                    cap_id = session_cap_id(choice.serving, &choice.name, &inf_model);
+                    cap_id = session_cap_id(choice.route_serving(), &choice.name, &inf_model);
 
                     // Per-model tuning: explicit config overrides global defaults.
                     let model_tune = cfg.find_model_tuning(&inf_model);

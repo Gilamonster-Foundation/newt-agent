@@ -19,10 +19,7 @@
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 
-use newt_core::model_card::{
-    builtin_cards, load_card_file, load_dropin_dir, no_hardware_leak, Backend, ModelCard,
-    VllmProfile,
-};
+use newt_core::model_card::{load_card_file, no_hardware_leak, Backend, ModelCard, VllmProfile};
 
 use crate::dgx::{CardCmd, VllmPlanArgs};
 
@@ -47,37 +44,39 @@ fn dropin_dir(config_path: Option<&Path>) -> Option<PathBuf> {
 /// the built-in row tagged `built-in (overridden)` — it *overrides* rather than
 /// duplicates, matching [`resolve`]'s precedence. Pure.
 #[must_use]
-pub fn catalog(builtins: Vec<ModelCard>, dropins: Vec<ModelCard>) -> Vec<CardEntry> {
-    use std::collections::BTreeSet;
-    let dropin_names: BTreeSet<String> = dropins.iter().map(|c| c.name.clone()).collect();
-    let builtin_names: BTreeSet<String> = builtins.iter().map(|c| c.name.clone()).collect();
-    let mut entries: Vec<CardEntry> = Vec::new();
-    for b in builtins {
-        let source = if dropin_names.contains(&b.name) {
-            "built-in (overridden)"
-        } else {
-            "built-in"
-        };
-        entries.push(CardEntry { source, card: b });
-    }
-    for d in dropins {
-        if !builtin_names.contains(&d.name) {
-            entries.push(CardEntry {
-                source: "drop-in",
-                card: d,
-            });
+/// The card catalog as LIST/PICK rows, through THE canonical typed catalog
+/// ([`newt_core::card_catalog::ModelCardCatalog::entries`]) — every row is
+/// the same finalized/validated resolution `card show`, `card setup`, and
+/// the runtime use, so a listing can never disagree with them; files that
+/// fail to parse (or resolve) come back as `problems`, visibly, instead of
+/// being silently skipped the way the old `load_dropin_dir` walk did.
+pub fn catalog_rows(dir: Option<&Path>) -> (Vec<CardEntry>, Vec<String>) {
+    use newt_core::card_catalog::{CatalogOrigin, ModelCardCatalog};
+    let catalog = ModelCardCatalog::load(dir);
+    let mut rows = Vec::new();
+    let mut problems = Vec::new();
+    for entry in catalog.entries() {
+        match entry.resolved {
+            Ok(card) => rows.push(CardEntry {
+                source: match entry.origin {
+                    CatalogOrigin::Builtin => "built-in",
+                    CatalogOrigin::BuiltinOverridden => "built-in (overridden)",
+                    CatalogOrigin::Dropin => "drop-in",
+                },
+                card,
+            }),
+            Err(e) => problems.push(format!("{}: {e}", entry.name)),
         }
     }
-    entries.sort_by(|a, b| a.card.name.cmp(&b.card.name));
-    entries
+    (rows, problems)
 }
 
 /// Render `card list` — a fixed-width table, or a JSON array under `--json`.
 /// Pure.
 #[must_use]
-pub fn render_list(entries: &[CardEntry], json: bool) -> String {
+pub fn render_list(entries: &[CardEntry], problems: &[String], json: bool) -> String {
     if json {
-        let arr: Vec<serde_json::Value> = entries
+        let mut arr: Vec<serde_json::Value> = entries
             .iter()
             .map(|e| {
                 serde_json::json!({
@@ -89,8 +88,10 @@ pub fn render_list(entries: &[CardEntry], json: bool) -> String {
                 })
             })
             .collect();
+        // Unresolvable names ride the same array, visibly, as error rows.
+        arr.extend(problems.iter().map(|p| serde_json::json!({ "error": p })));
         serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_string())
-    } else if entries.is_empty() {
+    } else if entries.is_empty() && problems.is_empty() {
         "no cards found".to_string()
     } else {
         let mut out = format!(
@@ -112,6 +113,9 @@ pub fn render_list(entries: &[CardEntry], json: bool) -> String {
                 "{:<22} {:<8} {:>6}  {:<6} {}\n",
                 e.card.name, backend, gib, gated, e.source
             ));
+        }
+        for problem in problems {
+            out.push_str(&format!("!  {problem}\n"));
         }
         out
     }
@@ -155,42 +159,29 @@ pub fn validate_report(card: &ModelCard) -> Result<String, String> {
     ))
 }
 
-/// Resolve `name` from the built-in + drop-in sets via the precedence chain, or
-/// an `Err` listing the known names. Pure — the caller supplies the sets.
-///
-/// # Errors
-/// Returns a "no such card" message (with the known names) when neither a
-/// built-in nor a drop-in matches `name`.
-fn resolve_from(
-    name: &str,
-    builtins: Vec<ModelCard>,
-    dropins: Vec<ModelCard>,
-) -> Result<ModelCard, String> {
-    // ONE canonical resolver: `model_card::named_card` is the same lookup the
-    // runtime's capability materialization uses, so `dgx card show` and a
-    // running session can never disagree about what a name means. (This
-    // replaced a local duplicate whose builtin match was case-SENSITIVE while
-    // the core's is case-insensitive — two lookups, two case rules, and the
-    // divergence was found by audit, not by a failure, which is the worst way
-    // to run two implementations of one meaning.) The CLI's added value is
-    // only the decorated error: the catalog of names that DO exist.
-    match newt_core::model_card::named_card(name, &builtins, &dropins) {
-        Some(card) => Ok(card),
-        None => {
-            let known: Vec<String> = catalog(builtins, dropins)
-                .into_iter()
-                .map(|e| e.card.name)
-                .collect();
-            Err(format!(
+/// Resolve `name` through THE canonical catalog
+/// ([`newt_core::card_catalog::ModelCardCatalog::resolve_exact`]) — the
+/// same exact, case-sensitive lookup the runtime's capability sidecar
+/// uses, so `dgx card show` and a running session can never disagree about
+/// what a name means (nor about the typed Duplicate / Malformed /
+/// NameMismatch / Invalid diagnostics). The CLI's added value is only the
+/// decorated NotFound: the names that DO exist.
+fn resolve_from(name: &str, dir: Option<&Path>) -> Result<ModelCard, String> {
+    let catalog = newt_core::card_catalog::ModelCardCatalog::load(dir);
+    catalog.resolve_exact(name).map_err(|e| match e {
+        newt_core::card_catalog::CatalogError::NotFound { .. } => {
+            let known = catalog.names();
+            format!(
                 "no card named `{name}`. Known cards: {}",
                 if known.is_empty() {
                     "(none)".to_string()
                 } else {
                     known.join(", ")
                 }
-            ))
+            )
         }
-    }
+        other => other.to_string(),
+    })
 }
 
 /// Map a card's vLLM profile onto the `vllm up` plan args, folding the structured
@@ -231,20 +222,15 @@ pub fn card_to_vllm_plan_args(vllm: &VllmProfile) -> VllmPlanArgs {
 /// Surfaces a bad name/card (unknown, unreadable, invalid, or leaky) or a
 /// stand-up failure as an `anyhow` error for the CLI to print.
 pub async fn run(cmd: CardCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
-    let dropins = || {
-        dropin_dir(config_path)
-            .map(|d| load_dropin_dir(&d))
-            .unwrap_or_default()
-    };
     match cmd {
         CardCmd::List { json } => {
-            let entries = catalog(builtin_cards(), dropins());
-            println!("{}", render_list(&entries, json));
+            let (entries, problems) = catalog_rows(dropin_dir(config_path).as_deref());
+            println!("{}", render_list(&entries, &problems, json));
             Ok(())
         }
         CardCmd::Show { name, json } => {
-            let card =
-                resolve_from(&name, builtin_cards(), dropins()).map_err(|e| anyhow::anyhow!(e))?;
+            let card = resolve_from(&name, dropin_dir(config_path).as_deref())
+                .map_err(|e| anyhow::anyhow!(e))?;
             println!(
                 "{}",
                 render_show(&card, json).map_err(|e| anyhow::anyhow!(e))?
@@ -272,7 +258,10 @@ pub async fn run(cmd: CardCmd, config_path: Option<&Path>) -> anyhow::Result<()>
             dry_run,
             force,
         } => {
-            let entries = catalog(builtin_cards(), dropins());
+            let (entries, problems) = catalog_rows(dropin_dir(config_path).as_deref());
+            for problem in &problems {
+                eprintln!("card problem (not pickable): {problem}");
+            }
             if entries.is_empty() {
                 anyhow::bail!("no cards found — nothing to pick from");
             }
@@ -349,10 +338,8 @@ async fn setup_card(
     dry_run: bool,
     force: bool,
 ) -> anyhow::Result<()> {
-    let dropins = dropin_dir(config_path)
-        .map(|d| load_dropin_dir(&d))
-        .unwrap_or_default();
-    let card = resolve_from(name, builtin_cards(), dropins).map_err(|e| anyhow::anyhow!(e))?;
+    let card =
+        resolve_from(name, dropin_dir(config_path).as_deref()).map_err(|e| anyhow::anyhow!(e))?;
     // Validate (schema + host/LAN-IP leak) BEFORE standing anything up.
     validate_report(&card).map_err(|e| anyhow::anyhow!(e))?;
     let backend = match backend.as_deref() {
@@ -443,7 +430,6 @@ fn setup_ollama_stub(card: &ModelCard) {
 mod tests {
     use super::*;
     use newt_core::model_card::parse_card;
-    use newt_core::model_card::resolve;
 
     /// Build a card from a TOML literal (pure — no fs).
     fn card(toml: &str) -> ModelCard {
@@ -456,53 +442,141 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn catalog_tags_builtin_dropin_and_override() {
-        let builtins = vec![vllm_card("aaa", 0.6), vllm_card("bbb", 0.6)];
-        let dropins = vec![vllm_card("bbb", 0.1), vllm_card("ccc", 0.2)];
-        let entries = catalog(builtins, dropins);
+    /// Write `(<file-stem>, <body>)` pairs into a temp catalog dir.
+    fn catalog_dir_raw(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (stem, body) in files {
+            std::fs::write(dir.path().join(format!("{stem}.toml")), body).expect("write card");
+        }
+        dir
+    }
 
-        // Sorted by name, each name once.
-        let names: Vec<&str> = entries.iter().map(|e| e.card.name.as_str()).collect();
-        assert_eq!(names, ["aaa", "bbb", "ccc"]);
-        assert_eq!(entries[0].source, "built-in");
-        assert_eq!(entries[1].source, "built-in (overridden)"); // bbb shadowed
-        assert_eq!(entries[2].source, "drop-in"); // ccc is net-new
+    fn valid_body(name: &str, temp: f64) -> String {
+        format!(
+            "name = \"{name}\"\nbackend = \"vllm\"\n\n[vllm]\nserved_name = \"{name}\"\n\n[tuning]\ntemperature = {temp}\n"
+        )
     }
 
     #[test]
-    fn render_list_table_has_header_and_rows() {
-        let entries = catalog(vec![vllm_card("demo", 0.6)], vec![]);
-        let out = render_list(&entries, false);
+    fn catalog_rows_tag_origin_and_surface_problems() {
+        // A valid drop-in, a builtin override at the declared key, a
+        // MALFORMED file, and a NAME-MISMATCHED file: the listing shows the
+        // same canonical resolution show/setup/runtime use — the broken
+        // files surface as problems instead of silently vanishing.
+        let dir = catalog_dir_raw(&[
+            ("ccc", &valid_body("ccc", 0.2)),
+            (
+                "ornith-1.0-35b",
+                "name = \"Ornith-1.0-35B\"\n\n[tuning]\ntemperature = 0.1\n",
+            ),
+            ("broken", "name = \"broken\"\nbackend = [not toml"),
+            ("mismatch", &valid_body("elsewhere", 0.3)),
+        ]);
+        let (rows, problems) = catalog_rows(Some(dir.path()));
+        let names: Vec<&str> = rows.iter().map(|e| e.card.name.as_str()).collect();
+        assert!(names.contains(&"ccc"), "{names:?}");
+        assert!(names.contains(&"Ornith-1.0-35B"), "{names:?}");
+        let ornith = rows
+            .iter()
+            .find(|e| e.card.name == "Ornith-1.0-35B")
+            .expect("listed");
+        assert_eq!(ornith.source, "built-in (overridden)");
+        assert_eq!(
+            ornith.card.tuning.as_ref().and_then(|t| t.temperature),
+            Some(0.1),
+            "the LISTED row is the canonical resolved card, override applied"
+        );
+        assert!(
+            rows.iter()
+                .any(|e| e.card.name == "ccc" && e.source == "drop-in"),
+            "{names:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("broken")),
+            "malformed files SHOW: {problems:?}"
+        );
+        // The name-mismatched file lists under its PARSED (true) name — the
+        // body name is the identity; the filename-keyed lookup errors with
+        // the typed NameMismatch through the same canonical resolver.
+        assert!(
+            rows.iter().any(|e| e.card.name == "elsewhere"),
+            "the card lists under its declared name: {names:?}"
+        );
+        let err = resolve_from("mismatch", Some(dir.path()))
+            .expect_err("the filename key is not the identity");
+        assert!(err.contains("elsewhere"), "{err}");
+    }
+
+    #[test]
+    fn catalog_rows_surface_duplicates_and_invalid_overrides() {
+        // Two files claiming one logical name → the row is the typed
+        // Duplicate problem; an invalid resolved override → Invalid.
+        let dir = catalog_dir_raw(&[
+            ("dup-a", &valid_body("twin", 0.1)),
+            ("dup-b", &valid_body("twin", 0.2)),
+            (
+                "nobackend",
+                "name = \"nobackend\"\n\n[tuning]\ntemperature = 0.5\n",
+            ),
+        ]);
+        let (rows, problems) = catalog_rows(Some(dir.path()));
+        assert!(
+            !rows.iter().any(|e| e.card.name == "twin"),
+            "a duplicate never lists as a clean row"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("twin")),
+            "duplicate surfaces: {problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("nobackend")),
+            "invalid override surfaces: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn render_list_table_has_header_rows_and_problems() {
+        let dir = catalog_dir_raw(&[("demo", &valid_body("demo", 0.6))]);
+        let (entries, problems) = catalog_rows(Some(dir.path()));
+        let out = render_list(&entries, &problems, false);
         assert!(out.contains("NAME") && out.contains("BACKEND") && out.contains("SOURCE"));
         assert!(out.contains("demo"));
         assert!(out.contains("vllm"));
+        // Problems render visibly in the table form.
+        let out = render_list(&entries, &["bad: malformed".to_string()], false);
+        assert!(out.contains("!  bad: malformed"), "{out}");
     }
 
     #[test]
-    fn render_list_json_is_a_valid_array() {
-        let entries = catalog(vec![vllm_card("demo", 0.6)], vec![]);
-        let out = render_list(&entries, true);
+    fn render_list_json_is_a_valid_array_with_error_rows() {
+        let dir = catalog_dir_raw(&[("demo", &valid_body("demo", 0.6))]);
+        let (entries, _) = catalog_rows(Some(dir.path()));
+        let out = render_list(&entries, &["bad: malformed".to_string()], true);
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         let arr = v.as_array().expect("array");
-        assert_eq!(arr[0]["name"], "demo");
-        assert_eq!(arr[0]["backend"], "vllm");
-        assert_eq!(arr[0]["source"], "built-in");
+        assert!(arr.iter().any(|r| r["name"] == "demo"));
+        assert!(arr.iter().any(|r| r["error"] == "bad: malformed"));
     }
 
     #[test]
     fn render_list_empty_is_friendly() {
-        assert_eq!(render_list(&[], false), "no cards found");
-        assert_eq!(render_list(&[], true), "[]");
+        assert_eq!(render_list(&[], &[], false), "no cards found");
+        assert_eq!(render_list(&[], &[], true), "[]");
     }
 
     #[test]
     fn render_menu_numbers_every_card() {
-        let entries = catalog(vec![vllm_card("aaa", 0.6), vllm_card("bbb", 0.6)], vec![]);
+        let dir = catalog_dir_raw(&[
+            ("aaa", &valid_body("aaa", 0.6)),
+            ("bbb", &valid_body("bbb", 0.6)),
+        ]);
+        let (entries, _) = catalog_rows(Some(dir.path()));
         let out = render_menu(&entries);
-        // 1-based numbering, one line per card, backend shown.
-        assert!(out.contains(" 1. aaa"));
-        assert!(out.contains(" 2. bbb"));
+        // 1-based numbering, one line per card (built-ins list too), the
+        // drop-ins present with their backend shown.
+        assert!(out.contains(" 1. "), "{out}");
+        assert!(out.contains(". aaa"), "{out}");
+        assert!(out.contains(". bbb"), "{out}");
         assert!(out.contains("vllm"));
     }
 
@@ -567,48 +641,75 @@ mod tests {
         assert!(err.contains(&ip), "names the offending token: {err}");
     }
 
+    /// Write `cards` into a temp catalog dir (one `<name>.toml` each).
+    fn catalog_dir(cards: &[(&str, f64)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, temp) in cards {
+            std::fs::write(
+                dir.path().join(format!("{name}.toml")),
+                format!(
+                    "name = \"{name}\"\nbackend = \"vllm\"\n\n[vllm]\nserved_name = \"{name}\"\n\n[tuning]\ntemperature = {temp}\n"
+                ),
+            )
+            .expect("write card");
+        }
+        dir
+    }
+
     #[test]
     fn resolve_from_unknown_lists_known_names() {
-        let err =
-            resolve_from("nope", vec![vllm_card("aaa", 0.6)], vec![]).expect_err("unknown card");
+        let dir = catalog_dir(&[("aaa", 0.6)]);
+        let err = resolve_from("nope", Some(dir.path())).expect_err("unknown card");
         assert!(err.contains("no card named `nope`"), "got: {err}");
         assert!(err.contains("aaa"), "lists known names: {err}");
     }
 
     #[test]
     fn resolve_from_dropin_overrides_builtin() {
-        // Built-in temp 0.6; a drop-in of the same name sets 0.1 -> 0.1 wins.
-        let resolved = resolve_from(
-            "demo",
-            vec![vllm_card("demo", 0.6)],
-            vec![vllm_card("demo", 0.1)],
+        // The built-in Ornith card overridden by a drop-in at its DECLARED
+        // source key, carrying the exact logical name: the drop-in's tuning
+        // wins through the canonical catalog merge (identity stays exact —
+        // see `resolve_from_is_exact_never_case_folded`).
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("ornith-1.0-35b.toml"),
+            "name = \"Ornith-1.0-35B\"\n\n[tuning]\ntemperature = 0.1\n",
         )
-        .expect("resolves");
+        .expect("write override");
+        let resolved = resolve_from("Ornith-1.0-35B", Some(dir.path())).expect("resolves");
         assert_eq!(resolved.tuning.and_then(|t| t.temperature), Some(0.1));
     }
 
     #[test]
     fn resolve_from_dropin_only_card_resolves() {
         // A user card for a model with no built-in resolves from the drop-in.
-        let resolved =
-            resolve_from("custom", vec![], vec![vllm_card("custom", 0.3)]).expect("drop-in only");
+        let dir = catalog_dir(&[("custom", 0.3)]);
+        let resolved = resolve_from("custom", Some(dir.path())).expect("drop-in only");
         assert_eq!(resolved.name, "custom");
     }
 
     #[test]
+    fn resolve_from_is_exact_never_case_folded() {
+        // The catalog's identity contract rides through the CLI: a case
+        // near-collision is NotFound (listing the exact names), never a
+        // silent bind.
+        let dir = catalog_dir(&[("custom", 0.3)]);
+        let err = resolve_from("Custom", Some(dir.path())).expect_err("exact identity");
+        assert!(err.contains("no card named `Custom`"), "got: {err}");
+        assert!(err.contains("custom"), "lists the exact name: {err}");
+    }
+
+    #[test]
     fn card_to_plan_args_folds_parser_flags_into_extra() {
-        // The Ornith built-in exercises the full mapping. Goes through
-        // `resolve()`, not the raw builtin card directly: the parser fields
-        // now come from the qwen3 family defaults (the card's own [vllm]
-        // table no longer redeclares them), so reading the unresolved card
-        // would see them as absent.
-        let vllm = resolve(
-            newt_core::model_card::builtin_card("Ornith-1.0-35B").unwrap(),
-            &[],
-            None,
-        )
-        .vllm
-        .unwrap();
+        // The Ornith built-in exercises the full mapping. Goes through the
+        // canonical catalog (exact identity), not the raw builtin card
+        // directly: the parser fields come from the qwen3 family defaults
+        // (the card's own [vllm] table no longer redeclares them), so
+        // reading the unresolved card would see them as absent.
+        let vllm = resolve_from("Ornith-1.0-35B", None)
+            .expect("builtin resolves")
+            .vllm
+            .unwrap();
         let args = card_to_vllm_plan_args(&vllm);
         assert_eq!(args.served_name.as_deref(), Some("Ornith-1.0-35B"));
         assert_eq!(args.max_model_len, Some(262144));

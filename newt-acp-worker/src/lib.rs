@@ -253,11 +253,19 @@ fn resolve_configured_backend(
 async fn resolve_backend() -> anyhow::Result<Arc<dyn newt_inference::InferenceBackend>> {
     use anyhow::Context as _;
 
-    let cfg =
-        newt_core::Config::resolve().context("worker: failed to resolve Newt configuration")?;
+    // UNPUBLISHED resolution (receipts retained): process-global settings
+    // publish only after selection + instantiation ACCEPT below — a worker
+    // that refuses its selection (unknown/unroutable/provider error) must
+    // not have published globals from a route it never ran.
+    let cfg = newt_core::Config::resolve_runtime_unpublished()
+        .context("worker: failed to resolve Newt configuration")?;
     let ollama_host = std::env::var("OLLAMA_HOST").ok().filter(|h| !h.is_empty());
 
-    match resolve_configured_backend(&cfg, ollama_host.as_deref())? {
+    let resolved_backend = resolve_configured_backend(&cfg, ollama_host.as_deref())?;
+    // Selection accepted — the worker's process-global settings publish at
+    // this boundary.
+    cfg.publish_runtime_settings();
+    match resolved_backend {
         ResolvedBackend::Ready(backend) => Ok(backend),
         ResolvedBackend::DiscoverLocalOllama => {
             let default_model =

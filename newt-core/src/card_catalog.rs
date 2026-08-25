@@ -50,6 +50,31 @@ pub struct ModelCardCatalog {
     dir: Option<PathBuf>,
 }
 
+/// One catalog listing row — see [`ModelCardCatalog::entries`].
+#[derive(Debug)]
+pub struct CatalogEntry {
+    /// The logical card name (for a file that failed to parse: its source
+    /// key, the only identity it has).
+    pub name: String,
+    /// Where the name comes from.
+    pub origin: CatalogOrigin,
+    /// The canonical resolution for this name — the same typed diagnostics
+    /// [`ModelCardCatalog::resolve_exact`] produces.
+    pub resolved: Result<ModelCard, CatalogError>,
+}
+
+/// Where a listing row's name comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogOrigin {
+    /// A built-in card, no override present.
+    Builtin,
+    /// A built-in card with a drop-in override (by logical name or at its
+    /// declared source key).
+    BuiltinOverridden,
+    /// A drop-in-only card (or an unparseable drop-in file).
+    Dropin,
+}
+
 /// Why a card name did not resolve — stable, typed, and actionable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogError {
@@ -190,6 +215,66 @@ impl ModelCardCatalog {
     #[must_use]
     pub fn sources(&self) -> &[CardSource] {
         &self.sources
+    }
+
+    /// The catalog as typed LISTING rows: every logical name it knows,
+    /// resolved through the SAME canonical path [`Self::resolve_exact`]
+    /// uses — so `card list`/`card pick` and `card show`/the runtime can
+    /// never disagree about a name — plus every file that failed to parse
+    /// (a malformed override must SHOW in a listing, never silently
+    /// vanish). Duplicate/invalid/name-mismatch overrides surface as the
+    /// row's typed error. Sorted by name.
+    #[must_use]
+    pub fn entries(&self) -> Vec<CatalogEntry> {
+        let parsed_names: std::collections::BTreeSet<&str> = self
+            .sources
+            .iter()
+            .filter_map(|s| s.parsed.as_ref().ok())
+            .map(|c| c.name.as_str())
+            .collect();
+        let mut rows: Vec<CatalogEntry> = Vec::new();
+        for b in &self.builtins {
+            let overridden = parsed_names.contains(b.card.name.as_str())
+                || self.sources.iter().any(|s| s.key == b.source_key);
+            rows.push(CatalogEntry {
+                name: b.card.name.clone(),
+                origin: if overridden {
+                    CatalogOrigin::BuiltinOverridden
+                } else {
+                    CatalogOrigin::Builtin
+                },
+                resolved: self.resolve_exact(&b.card.name),
+            });
+        }
+        let builtin_names: std::collections::BTreeSet<&str> =
+            self.builtins.iter().map(|b| b.card.name.as_str()).collect();
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for source in &self.sources {
+            match &source.parsed {
+                Ok(card) => {
+                    if builtin_names.contains(card.name.as_str())
+                        || !seen.insert(card.name.as_str())
+                    {
+                        continue;
+                    }
+                    rows.push(CatalogEntry {
+                        name: card.name.clone(),
+                        origin: CatalogOrigin::Dropin,
+                        resolved: self.resolve_exact(&card.name),
+                    });
+                }
+                Err(error) => rows.push(CatalogEntry {
+                    name: source.key.clone(),
+                    origin: CatalogOrigin::Dropin,
+                    resolved: Err(CatalogError::Malformed {
+                        path: source.path.clone(),
+                        error: error.clone(),
+                    }),
+                }),
+            }
+        }
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        rows
     }
 
     /// Every resolvable card name — built-ins plus parsed drop-ins, sorted,
@@ -598,5 +683,46 @@ mod tests {
             None,
         );
         assert_eq!(catalog.names(), ["aaa", "bbb"]);
+    }
+
+    /// Family identity is decoupled from serving defaults: an arbitrary
+    /// explicit family resolves through the exact catalog with NO defaults
+    /// applied (its own serving block comes out untouched), while a family
+    /// WITH a defaults profile (qwen3) still receives its defaults layer.
+    #[test]
+    fn arbitrary_families_resolve_without_defaults_and_qwen3_keeps_its_layer() {
+        let nano = card(
+            "name = \"nano\"\nbackend = \"vllm\"\nfamily = \"nemotron\"\n\n[vllm]\nserved_name = \"nano\"\n",
+        );
+        let catalog = ModelCardCatalog::new(
+            crate::model_card::builtin_card_entries(),
+            vec![source("nano", Ok(nano))],
+            None,
+        );
+        let resolved = catalog
+            .resolve_exact("nano")
+            .expect("identity needs no profile");
+        assert_eq!(
+            resolved.family.as_deref(),
+            Some("nemotron"),
+            "family metadata exposed"
+        );
+        let vllm = resolved.vllm.expect("own serving block");
+        assert_eq!(
+            vllm.reasoning_parser, None,
+            "no defaults profile ⇒ nothing overlaid"
+        );
+        // The qwen3 defaults behavior is intact: the builtin ornith card
+        // (family qwen3) still gets the family's parser defaults.
+        let ornith = catalog
+            .resolve_exact("Ornith-1.0-35B")
+            .expect("builtin resolves");
+        assert_eq!(ornith.family.as_deref(), Some("qwen3"));
+        let vllm = ornith.vllm.expect("serving block");
+        assert_eq!(
+            vllm.reasoning_parser.as_deref(),
+            Some("qwen3"),
+            "the qwen3 defaults layer still applies"
+        );
     }
 }
