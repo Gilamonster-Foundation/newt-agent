@@ -110,6 +110,10 @@ pub struct TurnDriverConfig {
     pub chat_completions_capability: crate::model_card::ChatCompletionsCapability,
     /// Whether the active backend accepts replayed assistant reasoning.
     pub reasoning_replay_scope: crate::model_card::ReasoningReplayScope,
+    /// Whether the active model streams a lone leading `</think>` closer, so
+    /// the stream filter must start inside the reasoning block (#528).
+    /// Resolved from the model's explicit capability card — never its name.
+    pub emits_leading_reasoning: bool,
     /// Absolute workspace path the tool loop runs against.
     pub workspace: String,
     /// Permission caveats enforced for this turn's tool calls.
@@ -184,6 +188,7 @@ impl TurnDriverConfig {
             api_key: None,
             chat_completions_capability: Default::default(),
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
+            emits_leading_reasoning: false,
             workspace: workspace.into(),
             caveats: crate::caveats::Caveats::top(),
             max_tool_rounds: 40,
@@ -606,6 +611,7 @@ async fn run_one_turn(
         cognition: runtime.cognition,
         chat_completions_capability: config.chat_completions_capability,
         reasoning_replay_scope: config.reasoning_replay_scope,
+        emits_leading_reasoning: config.emits_leading_reasoning,
         max_tool_rounds: config.max_tool_rounds,
         narration_nudge_cap: config.narration_nudge_cap,
         workflow_grace_rounds: config.workflow_grace_rounds,

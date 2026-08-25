@@ -3471,6 +3471,9 @@ pub(crate) struct BackendChoice {
     pub(crate) api_key: Option<String>,
     pub(crate) chat_completions_capability: newt_core::model_card::ChatCompletionsCapability,
     pub(crate) reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope,
+    /// Whether the resolved model streams a lone leading `</think>` closer
+    /// (#528). From the model's explicit capability card — never its name.
+    pub(crate) emits_leading_reasoning: bool,
     /// For an OpenAI backend: which HTTP surface (chat/completions vs the newer
     /// /v1/responses). Surfaced to the agent loop via `NEWT_OPENAI_API`.
     pub(crate) api: newt_core::OpenAiApi,
@@ -4006,6 +4009,7 @@ fn codex_env_backend(
         api_key: api_key.map(str::to_string),
         chat_completions_capability: Default::default(),
         reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
+        emits_leading_reasoning: false,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: true,
         context_window: None,
@@ -4091,6 +4095,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         api_key: b.resolve_api_key(),
         chat_completions_capability: b.chat_completions_capability(),
         reasoning_replay_scope: b.reasoning_replay_scope(),
+        emits_leading_reasoning: b.emits_leading_reasoning(),
         api: b.api.unwrap_or_default(),
         api_needs_probe: b.api.is_none(),
         context_window: None,
@@ -4159,6 +4164,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             api_key: None,
             chat_completions_capability: Default::default(),
             reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
+            emits_leading_reasoning: false,
             api: newt_core::OpenAiApi::default(),
             api_needs_probe: false,
             context_window: None,
@@ -4205,6 +4211,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             api_key: None,
             chat_completions_capability: Default::default(),
             reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
+            emits_leading_reasoning: false,
             api: newt_core::OpenAiApi::default(),
             api_needs_probe: false,
             context_window: None,
@@ -4232,6 +4239,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         api_key: None,
         chat_completions_capability: Default::default(),
         reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
+        emits_leading_reasoning: false,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: false,
         context_window: None,
@@ -15646,6 +15654,7 @@ mod tool_round_cap_tests {
                             url: &server.uri(),
                             model: "cw-test-model",
                             kind: BackendKind::Openai,
+                            emits_leading_reasoning: false,
                             api_key: Some("sk-test"),
                             messages: &messages,
                             task: "do the thing",

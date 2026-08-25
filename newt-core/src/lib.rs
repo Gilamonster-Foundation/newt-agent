@@ -54,6 +54,7 @@ pub mod memory;
 pub mod metrics;
 pub mod model_card;
 pub mod model_id;
+pub mod model_identity;
 pub mod navigator;
 pub mod notes;
 pub mod notes_scan;

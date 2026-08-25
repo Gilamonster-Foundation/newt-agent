@@ -3086,6 +3086,29 @@ impl BackendConfig {
             .unwrap_or_default()
     }
 
+    /// Whether this model streams its chain-of-thought as a lone leading
+    /// closer (`reasoning</think>answer`, no opening tag) and therefore needs
+    /// the stream filter to start INSIDE the reasoning block.
+    ///
+    /// Resolved from the model's explicit [`Capability`] — never from its
+    /// name. Model display names are labels, not evidence: an operator may
+    /// serve any artifact under any alias, so `contains("qwen3")` is wrong in
+    /// both directions (it suppresses output from things that are not Qwen,
+    /// and prints raw reasoning from things that are). This replaces the #384
+    /// name-list stopgap.
+    ///
+    /// **Unknown defaults to `false` — do not suppress.** The two failure
+    /// modes are not symmetric: filtering when we should not DROPS real answer
+    /// text silently, while not filtering when we should shows reasoning the
+    /// operator can see and correct. Fail toward the visible one.
+    #[must_use]
+    pub fn emits_leading_reasoning(&self) -> bool {
+        self.capability
+            .as_ref()
+            .and_then(|capability| capability.emits_leading_reasoning)
+            .unwrap_or(false)
+    }
+
     /// Resolve the backend's reasoning replay contract. Unknown or legacy
     /// endpoints remain conservative and never receive replayed reasoning.
     #[must_use]
