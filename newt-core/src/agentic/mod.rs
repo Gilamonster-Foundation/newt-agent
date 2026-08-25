@@ -1287,10 +1287,13 @@ pub struct ChatCtx<'a> {
     /// Whether this model streams a lone leading `</think>` closer, so the
     /// filter must start inside the reasoning block (#528).
     ///
-    /// Resolved by the caller from the model's explicit capability card —
-    /// NEVER from the model name. Unknown resolves to `false` (do not
-    /// suppress): filtering wrongly drops real answer text silently, while
-    /// not filtering wrongly shows reasoning the operator can see.
+    /// Resolved by the caller from an INLINE BACKEND CAPABILITY declaration
+    /// (`[backends.<name>.capability]`) — never from the model name. A named
+    /// `card =` pointer is not consulted by any capability accessor today.
+    ///
+    /// Undeclared resolves to `false` (do not suppress): filtering wrongly
+    /// drops real answer text silently, while not filtering wrongly shows
+    /// reasoning the operator can see.
     pub emits_leading_reasoning: bool,
     /// Maximum tool-call rounds before forcing a final tools-disabled
     /// completion (from `[tui].max_tool_rounds`, default 40).

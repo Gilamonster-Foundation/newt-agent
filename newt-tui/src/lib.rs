@@ -3472,7 +3472,8 @@ pub(crate) struct BackendChoice {
     pub(crate) chat_completions_capability: newt_core::model_card::ChatCompletionsCapability,
     pub(crate) reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope,
     /// Whether the resolved model streams a lone leading `</think>` closer
-    /// (#528). From the model's explicit capability card — never its name.
+    /// (#528). From an inline backend capability declaration
+    /// (`[backends.<name>.capability]`) — never from the model name.
     pub(crate) emits_leading_reasoning: bool,
     /// For an OpenAI backend: which HTTP surface (chat/completions vs the newer
     /// /v1/responses). Surfaced to the agent loop via `NEWT_OPENAI_API`.

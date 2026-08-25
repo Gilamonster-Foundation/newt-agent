@@ -341,6 +341,13 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     dc.api_key = api_key;
     dc.chat_completions_capability = chat_capability;
     dc.reasoning_replay_scope = backend.reasoning_replay_scope();
+    // Paired with the line above ON PURPOSE. Headless `solve` resolves the
+    // model's capabilities from the same backend the TUI does; omitting this
+    // left `solve` on the `false` default, so a declared reasoning model had
+    // its chain-of-thought printed into the answer in headless runs only —
+    // the N-call-sites trap, in the one lane with no human watching the
+    // stream. `capability_wiring_is_paired_across_call_sites` pins the pair.
+    dc.emits_leading_reasoning = backend.emits_leading_reasoning();
     dc.max_tool_rounds = solve_tool_round_limit(
         dc.max_tool_rounds,
         newt_core::tenacity::cli_tenacity(),

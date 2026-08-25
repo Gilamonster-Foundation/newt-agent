@@ -112,7 +112,10 @@ pub struct TurnDriverConfig {
     pub reasoning_replay_scope: crate::model_card::ReasoningReplayScope,
     /// Whether the active model streams a lone leading `</think>` closer, so
     /// the stream filter must start inside the reasoning block (#528).
-    /// Resolved from the model's explicit capability card — never its name.
+    ///
+    /// Resolved from an INLINE BACKEND CAPABILITY declaration
+    /// (`[backends.<name>.capability]`) — never from the model name, and not
+    /// from a named `card =` pointer, which no capability accessor resolves.
     pub emits_leading_reasoning: bool,
     /// Absolute workspace path the tool loop runs against.
     pub workspace: String,

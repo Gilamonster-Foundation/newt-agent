@@ -210,16 +210,19 @@ impl ThinkFilter {
 // had its output filtered, while a genuine Qwen3 served as `ornith-1.0` had
 // its raw reasoning printed into the answer.
 //
-// The flag now comes from the model's explicit capability
-// (`Capability::emits_leading_reasoning` → `Config::emits_leading_reasoning`
-// → `ChatCtx::emits_leading_reasoning`), which is what #384 asked for. When
-// no capability is declared the family is Unknown and NO family policy
-// applies — the filter stays off, because filtering wrongly drops real answer
-// text silently while not filtering wrongly only shows reasoning the operator
-// can see and correct.
+// The flag now comes from an INLINE BACKEND CAPABILITY DECLARATION
+// (`[backends.<name>.capability] emits_leading_reasoning = true` →
+// `BackendConfig::emits_leading_reasoning` → `ChatCtx`/`TurnDriverConfig`),
+// which is the direction #384 asked for.
 //
-// A name may still HINT: `model_identity::suggest_family_from_name` returns a
-// non-authoritative `FamilySuggestion` for an operator to confirm.
+// Note the precise source: a named `card = "…"` pointer is NOT consulted —
+// `card` is copied between configs but never resolved into a capability by
+// any of the three accessors. Saying "capability card" here would describe a
+// path that does not run.
+//
+// With nothing declared, no policy applies and the filter stays off:
+// filtering wrongly drops real answer text silently, while not filtering
+// wrongly only shows reasoning the operator can see and correct.
 
 /// The length of `buf` that is safe to commit (emit *or* discard) without splitting
 /// a possible `tag` — i.e. `buf` minus its longest suffix that is a proper prefix of

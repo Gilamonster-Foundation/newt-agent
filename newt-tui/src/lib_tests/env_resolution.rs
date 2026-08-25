@@ -281,6 +281,74 @@ fn backend(
     }
 }
 
+/// #384/#528: a declared `emits_leading_reasoning` reaches `BackendChoice`
+/// through the REAL resolution path, and an alias alone never does.
+///
+/// This exercises `resolve_backend_choice` itself — the seam the TUI actually
+/// uses — rather than assigning the field by hand. A test that constructs the
+/// destination directly proves the struct has a field, not that anything
+/// fills it, and the defect independent review found in headless `solve` was
+/// precisely a field nobody filled.
+#[test]
+fn backend_choice_carries_declared_leading_reasoning() {
+    let mut configured = backend(
+        "declared",
+        "http://local:8000",
+        // An alias with NO lineage token: under the old substring test this
+        // model got no filtering. The declaration must carry it anyway.
+        "ornith-1.0-35b",
+        newt_core::BackendKind::Openai,
+    );
+    configured.capability = Some(newt_core::model_card::Capability {
+        emits_leading_reasoning: Some(true),
+        ..Default::default()
+    });
+    let cfg = newt_core::Config {
+        backends: vec![configured],
+        ..Default::default()
+    };
+    with_env_vars(
+        &[],
+        &["NEWT_PROVIDER", "NEWT_DGX_MODEL", "NEWT_BACKEND"],
+        || {
+            let choice = resolve_backend_choice(&cfg);
+            assert!(
+                choice.emits_leading_reasoning,
+                "an inline declaration must reach BackendChoice through resolution"
+            );
+        },
+    );
+}
+
+/// The other direction: an alias that WOULD have matched the deleted
+/// substring list grants nothing without a declaration.
+#[test]
+fn backend_choice_ignores_a_lineage_alias_without_a_declaration() {
+    for alias in ["qwen3:8b", "nemotron-3-nano:30b", "deepseek-r1:7b"] {
+        let configured = backend(
+            "undeclared",
+            "http://local:8000",
+            alias,
+            newt_core::BackendKind::Openai,
+        );
+        let cfg = newt_core::Config {
+            backends: vec![configured],
+            ..Default::default()
+        };
+        with_env_vars(
+            &[],
+            &["NEWT_PROVIDER", "NEWT_DGX_MODEL", "NEWT_BACKEND"],
+            || {
+                let choice = resolve_backend_choice(&cfg);
+                assert!(
+                    !choice.emits_leading_reasoning,
+                    "`{alias}` is a label — with nothing declared, no policy applies"
+                );
+            },
+        );
+    }
+}
+
 #[test]
 fn backend_choice_carries_chat_generation_capabilities() {
     let mut configured = backend(
