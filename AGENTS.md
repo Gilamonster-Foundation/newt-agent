@@ -251,6 +251,65 @@ RAII, and required parameters so the broken call does not compile.
 If a second implementation is truly warranted, say so in the PR and explain
 what the existing abstraction could not be widened to cover.
 
+## Content-addressable data structures — the base rule
+
+**Every data structure that is persisted, transmitted, chained, or identified
+derives its identity from the `content-addressable` crate (v0.1.1). Hand-rolling
+a hash, digest, id, or canonical encoding is a defect, not a style choice.**
+
+This sits at the same tier as TDD discipline below. It is not advice.
+
+### What the crate mints — check this BEFORE designing anything
+
+| Use | Type |
+|---|---|
+| a canonical **structured value** (a record, an event, a manifest) | `ContentId` — CIDv1, dag-cbor, BLAKE3 |
+| an opaque **byte string** (a file, a payload, a tool result, a cache key) | `RawContentId` — CIDv1, raw, BLAKE3 |
+| a node with **causal parents** (a chain or DAG link) | `MerkleNode<T>` — id derived over payload AND parents |
+| **storing** addressed nodes | `NodeStore` (`StoreError::Backend` anticipates a disk backend) |
+| carrying a **foreign** CID without minting it | `ClassifiedCid` |
+
+`ContentId` and `RawContentId` are **different identities even with identical
+digest bytes** — the profile is semantic, not cosmetic. Pick by what the thing
+IS, not by what is convenient.
+
+The recommended implementation is one method: `canonical_form()` deferring to
+`to_canonical_dagcbor` on a `Serialize` type. `content_id()` comes free.
+
+### Step zero, before writing any new record type
+
+1. **Inventory.** List what the crate already mints and what this repo already
+   has: `grep -rn "blake3::hash(\|content_addressable\|SpillStore"`. Design
+   only the gap, and say what you are reusing.
+2. **Invoke the `provenance-audit` skill.** It is deliberately over-applied.
+3. Only then design.
+
+### Why this is a hard rule (2026-08-22, #1786)
+
+Three design rounds and ~70 confirmed review findings were spent rebuilding a
+content-addressed span store, a dag-cbor identity scheme, and a Merkle DAG —
+all three already shipped, in a crate already in `newt-core`'s dependency tree.
+Separately, **every** hand-rolled canonicalization written here has had a flaw
+found by review: an unkeyed manifest id (trivially recomputable), content ids
+used as membership keys (they collide by design), a sorted-JSON form that
+needed a byte-compare to defend itself. Identities minted through the crate
+have had **none**.
+
+Grounding a design in the code it replaces is not the same as inventorying
+what is already available to it.
+
+### Migration posture
+
+This project is deliberately unadvertised and owes no backwards compatibility.
+**Prefer smashing a bespoke format** — one importer, then one encoding — over
+carrying a compatibility arm forever. A third dispatch arm is a permanent tax;
+a one-time importer is not (`import_legacy_json` is the in-repo precedent).
+
+Where bespoke structures already exist, they are enumerated in a conformance
+ratchet whose count may only go DOWN
+(`newt-core/tests/first_principle.rs`). Fix the mess by ratchet, never by
+rewrite: a rewrite discards the tests that make incremental change safe.
+
 ## TDD discipline
 
 1. Write the failing test first. Verify it fails.
