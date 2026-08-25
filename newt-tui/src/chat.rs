@@ -1263,6 +1263,14 @@ fn session_body(
     // Resolve the inference backend and permission caveats once at session
     // start.  Both are re-read after each slash command (config.toml on disk).
     let mut choice = resolve_backend_choice(&cfg);
+    // A card-resolution error (an unknown named card) minted during choice
+    // resolution surfaces at STARTUP too, not only at mid-session refresh —
+    // the operator must see it before the first turn runs without the
+    // declarations they believe are active. Adoption-time retarget notices
+    // arrive through the adoption lines below.
+    if let Some(error) = choice.card_suppressed_notice.take() {
+        print_newt(&error, color, verbose);
+    }
     // #1126 C1b: the server dictates — adopt what the endpoint actually
     // serves (bounded ~1s; offline keeps the file hint + says so).
     for line in adopt_backend_choice(&mut choice, prewarm) {
@@ -6695,7 +6703,8 @@ fn session_body(
                         let responses = std::env::var("NEWT_OPENAI_API")
                             .is_ok_and(|v| v.eq_ignore_ascii_case("responses"));
                         let capable_chat = choice.kind == newt_core::BackendKind::Openai
-                            && choice.chat_completions_capability.cognition == Some(true);
+                            && choice.capability_decision().chat_completions().cognition
+                                == Some(true);
                         if !responses && !capable_chat {
                             print_newt(
                                 "note: the active backend does not advertise a cognition generation policy — cognition is ignored.",
@@ -7033,9 +7042,13 @@ fn session_body(
                                         persona_tools,
                                         cognition,
                                         chat_completions_capability: choice
-                                            .chat_completions_capability,
-                                        reasoning_replay_scope: choice.reasoning_replay_scope,
-                                        emits_leading_reasoning: choice.emits_leading_reasoning,
+                                            .capability_decision().chat_completions(),
+                                        reasoning_replay_scope: choice
+                                            .capability_decision()
+                                            .reasoning_replay_scope(),
+                                        emits_leading_reasoning: choice
+                                            .capability_decision()
+                                            .emits_leading_reasoning(),
                                         max_tool_rounds: eff_max_tool_rounds,
                                         narration_nudge_cap: eff_narration_nudge_cap,
                                         // #1162: the /nudge dial — env set by the
@@ -7624,8 +7637,8 @@ fn session_body(
                                         recovered_context_window.get(),
                                         eff_input_ceiling_pct,
                                         cognition,
-                                        choice.chat_completions_capability,
-                                        choice.reasoning_replay_scope,
+                                        choice.capability_decision().chat_completions(),
+                                        choice.capability_decision().reasoning_replay_scope(),
                                         gauge_max_ok,
                                         gauge_safe,
                                     );

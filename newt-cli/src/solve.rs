@@ -208,6 +208,11 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     //    search order (Config::resolve — honors disk drop-ins + --backend-*).
     let cfg = match &args.profile {
         Some(path) => {
+            // With the capability SIDECAR there is no load-time
+            // materialization step any more: `Config::load` is a
+            // deterministic parse, and card resolution/validation happens at
+            // sidecar construction below (which errors fast on an unknown
+            // card, before any inference). Runtime settings publish after.
             let mut cfg = Config::load(path)
                 .with_context(|| format!("loading --profile {}", path.display()))?;
             cfg.apply_runtime_settings();
@@ -282,7 +287,30 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     let kind = backend.kind.unwrap_or(BackendKind::Openai);
     let api_key = backend.resolve_api_key();
     let api = backend.api.unwrap_or_default();
-    let chat_capability = backend.chat_completions_capability();
+    // The SAME capability sidecar + typed principal decision the TUI uses —
+    // one owner of the merge, one decision, no drift between lanes. Headless
+    // has no adoption: the principal is the backend's own declaration
+    // (Instance ⇒ the binding holds; a declared-model multiplexer ⇒ exact
+    // bound-model equality, true by construction here; undeclared ⇒
+    // conservative). An unknown named card is a hard error — headless fails
+    // fast and names the fix rather than running without declarations the
+    // operator believes are active.
+    let pinned = newt_core::Config::pinned_config_path();
+    let card_source = args.profile.as_deref().or(pinned.as_deref());
+    let caps = newt_core::model_card::ResolvedCapabilities::resolve(backend, card_source)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let principal = match backend.serving {
+        Some(newt_core::Serving::Instance) => newt_core::model_card::ServingPrincipal::Instance,
+        Some(newt_core::Serving::Multiplexer) => {
+            newt_core::model_card::ServingPrincipal::MultiplexerModel(&model)
+        }
+        _ => newt_core::model_card::ServingPrincipal::Unknown,
+    };
+    let decision = caps.for_principal(principal);
+    if let Some(notice) = &decision.retarget_notice {
+        eprintln!("newt: {notice}");
+    }
+    let chat_capability = decision.chat_completions();
     // Surface the backend's wire API (`api = "responses"`) to the agentic loop,
     // exactly as the chat path does — without this, a responses-only model like
     // gpt-5.6-sol is driven over /v1/chat/completions and 400s on function tools.
@@ -340,14 +368,14 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     apply_context_config(&mut dc, cfg.context.as_ref());
     dc.api_key = api_key;
     dc.chat_completions_capability = chat_capability;
-    dc.reasoning_replay_scope = backend.reasoning_replay_scope();
+    dc.reasoning_replay_scope = decision.reasoning_replay_scope();
     // Paired with the line above ON PURPOSE. Headless `solve` resolves the
     // model's capabilities from the same backend the TUI does; omitting this
     // left `solve` on the `false` default, so a declared reasoning model had
     // its chain-of-thought printed into the answer in headless runs only —
     // the N-call-sites trap, in the one lane with no human watching the
     // stream. `capability_wiring_is_paired_across_call_sites` pins the pair.
-    dc.emits_leading_reasoning = backend.emits_leading_reasoning();
+    dc.emits_leading_reasoning = decision.emits_leading_reasoning();
     dc.max_tool_rounds = solve_tool_round_limit(
         dc.max_tool_rounds,
         newt_core::tenacity::cli_tenacity(),

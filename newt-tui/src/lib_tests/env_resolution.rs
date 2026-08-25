@@ -289,6 +289,93 @@ fn backend(
 /// destination directly proves the struct has a field, not that anything
 /// fills it, and the defect independent review found in headless `solve` was
 /// precisely a field nobody filled.
+/// #1786 slice: a named CARD binding reaches the choice through the real
+/// `resolve_backend_choice` seam, decided per serving principal — Instance
+/// holds the binding; a Multiplexer session override to a different model
+/// drops the card layer with a visible notice while inline survives.
+#[test]
+fn backend_choice_resolves_a_named_card_and_decides_per_principal() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("pinned.toml");
+    std::fs::write(&config, "# pinned\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("models")).unwrap();
+    std::fs::write(
+        dir.path().join("models/team-reasoner.toml"),
+        "name = \"team-reasoner\"\n\n[capability]\nemits_leading_reasoning = true\n",
+    )
+    .unwrap();
+
+    let mut configured = backend(
+        "carded",
+        "http://local:8000",
+        "bound-model",
+        newt_core::BackendKind::Openai,
+    );
+    configured.card = Some("team-reasoner".to_string());
+    configured.serving = Some(newt_core::Serving::Instance);
+    let cfg = newt_core::Config {
+        backends: vec![configured.clone()],
+        ..Default::default()
+    };
+    let config_str = config.display().to_string();
+
+    // Instance: the binding holds, whatever the label.
+    with_env_vars(
+        &[("NEWT_CONFIG", config_str.as_str())],
+        &["NEWT_PROVIDER", "NEWT_DGX_MODEL", "NEWT_BACKEND"],
+        || {
+            let choice = resolve_backend_choice(&cfg);
+            assert!(
+                choice.capability_decision().emits_leading_reasoning(),
+                "an Instance holds the card binding through the real seam"
+            );
+            assert!(choice.capability_decision().retarget_notice.is_none());
+        },
+    );
+
+    // Multiplexer + session override to a DIFFERENT model: the card layer is
+    // off, visibly, and switching back needs no state reset (pure decision).
+    let mut mux = configured;
+    mux.serving = Some(newt_core::Serving::Multiplexer);
+    let cfg = newt_core::Config {
+        backends: vec![mux],
+        ..Default::default()
+    };
+    with_env_vars(
+        &[
+            ("NEWT_CONFIG", config_str.as_str()),
+            ("NEWT_DGX_MODEL", "warm-pick"),
+        ],
+        &["NEWT_PROVIDER", "NEWT_BACKEND"],
+        || {
+            let choice = resolve_backend_choice(&cfg);
+            let d = choice.capability_decision();
+            assert!(
+                !d.emits_leading_reasoning(),
+                "a multiplexer serving a model the card was not bound to must \
+                 not carry card behavior"
+            );
+            let notice = d.retarget_notice.expect("the retarget is visible");
+            assert!(notice.contains("team-reasoner") && notice.contains("warm-pick"));
+        },
+    );
+    with_env_vars(
+        &[
+            ("NEWT_CONFIG", config_str.as_str()),
+            ("NEWT_DGX_MODEL", "bound-model"),
+        ],
+        &["NEWT_PROVIDER", "NEWT_BACKEND"],
+        || {
+            let choice = resolve_backend_choice(&cfg);
+            assert!(
+                choice.capability_decision().emits_leading_reasoning(),
+                "the exact bound model on a multiplexer re-applies the card — \
+                 stateless decision, nothing to reset"
+            );
+        },
+    );
+}
+
 #[test]
 fn backend_choice_carries_declared_leading_reasoning() {
     let mut configured = backend(
@@ -313,7 +400,7 @@ fn backend_choice_carries_declared_leading_reasoning() {
         || {
             let choice = resolve_backend_choice(&cfg);
             assert!(
-                choice.emits_leading_reasoning,
+                choice.capability_decision().emits_leading_reasoning(),
                 "an inline declaration must reach BackendChoice through resolution"
             );
         },
@@ -341,7 +428,7 @@ fn backend_choice_ignores_a_lineage_alias_without_a_declaration() {
             || {
                 let choice = resolve_backend_choice(&cfg);
                 assert!(
-                    !choice.emits_leading_reasoning,
+                    !choice.capability_decision().emits_leading_reasoning(),
                     "`{alias}` is a label — with nothing declared, no policy applies"
                 );
             },
@@ -378,12 +465,18 @@ fn backend_choice_carries_chat_generation_capabilities() {
         || {
             let choice = resolve_backend_choice(&cfg);
             assert_eq!(
-                choice.reasoning_replay_scope,
+                choice.capability_decision().reasoning_replay_scope(),
                 newt_core::model_card::ReasoningReplayScope::CurrentUserTurn
             );
-            assert_eq!(choice.chat_completions_capability.cognition, Some(true));
             assert_eq!(
-                choice.chat_completions_capability.parallel_tool_calls,
+                choice.capability_decision().chat_completions().cognition,
+                Some(true)
+            );
+            assert_eq!(
+                choice
+                    .capability_decision()
+                    .chat_completions()
+                    .parallel_tool_calls,
                 Some(false)
             );
         },

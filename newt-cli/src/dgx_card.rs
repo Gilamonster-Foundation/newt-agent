@@ -20,7 +20,7 @@ use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use newt_core::model_card::{
-    builtin_cards, load_card_file, load_dropin_dir, no_hardware_leak, resolve, Backend, ModelCard,
+    builtin_cards, load_card_file, load_dropin_dir, no_hardware_leak, Backend, ModelCard,
     VllmProfile,
 };
 
@@ -166,23 +166,31 @@ fn resolve_from(
     builtins: Vec<ModelCard>,
     dropins: Vec<ModelCard>,
 ) -> Result<ModelCard, String> {
-    let builtin = builtins.iter().find(|c| c.name == name).cloned();
-    let dropin = dropins.iter().find(|c| c.name == name).cloned();
-    let Some(base) = builtin.or(dropin) else {
-        let known: Vec<String> = catalog(builtins, dropins)
-            .into_iter()
-            .map(|e| e.card.name)
-            .collect();
-        return Err(format!(
-            "no card named `{name}`. Known cards: {}",
-            if known.is_empty() {
-                "(none)".to_string()
-            } else {
-                known.join(", ")
-            }
-        ));
-    };
-    Ok(resolve(base, &dropins, None))
+    // ONE canonical resolver: `model_card::named_card` is the same lookup the
+    // runtime's capability materialization uses, so `dgx card show` and a
+    // running session can never disagree about what a name means. (This
+    // replaced a local duplicate whose builtin match was case-SENSITIVE while
+    // the core's is case-insensitive — two lookups, two case rules, and the
+    // divergence was found by audit, not by a failure, which is the worst way
+    // to run two implementations of one meaning.) The CLI's added value is
+    // only the decorated error: the catalog of names that DO exist.
+    match newt_core::model_card::named_card(name, &builtins, &dropins) {
+        Some(card) => Ok(card),
+        None => {
+            let known: Vec<String> = catalog(builtins, dropins)
+                .into_iter()
+                .map(|e| e.card.name)
+                .collect();
+            Err(format!(
+                "no card named `{name}`. Known cards: {}",
+                if known.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    known.join(", ")
+                }
+            ))
+        }
+    }
 }
 
 /// Map a card's vLLM profile onto the `vllm up` plan args, folding the structured
@@ -435,6 +443,7 @@ fn setup_ollama_stub(card: &ModelCard) {
 mod tests {
     use super::*;
     use newt_core::model_card::parse_card;
+    use newt_core::model_card::resolve;
 
     /// Build a card from a TOML literal (pure — no fs).
     fn card(toml: &str) -> ModelCard {

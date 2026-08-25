@@ -3077,7 +3077,11 @@ impl BackendConfig {
         Ok(doc.to_string())
     }
 
-    /// Resolve explicitly accepted Chat Completions request extensions.
+    /// Resolve explicitly accepted Chat Completions request extensions —
+    /// from the INLINE block only. The card-aware answer is
+    /// [`crate::model_card::ResolvedCapabilities`], constructed once per
+    /// backend choice; these inline accessors stay for the card-less callers
+    /// and as the conservative floor.
     #[must_use]
     pub fn chat_completions_capability(&self) -> crate::model_card::ChatCompletionsCapability {
         self.capability
@@ -3096,12 +3100,11 @@ impl BackendConfig {
     /// suppresses output from things that are not Qwen, and prints raw
     /// reasoning from things that are). Replaces the #384 name-list stopgap.
     ///
-    /// **Scope, stated precisely:** like its two siblings above, this reads
-    /// the inline `capability` field only. A named `card =` pointer is copied
-    /// between configs but never resolved into a capability, so a card's
-    /// `[capability]` block does not reach here. Fixing that is one step for
-    /// all three accessors — doing it for one would leave siblings behaving
-    /// differently, which is worse than a uniform gap.
+    /// **Scope:** like its two siblings above, this reads the inline
+    /// `capability` field only — the conservative floor. The card-aware
+    /// surface is [`crate::model_card::ResolvedCapabilities`], which resolves
+    /// the named `card =` binding once per backend choice and decides per
+    /// serving principal; every runtime lane consumes that, not this.
     ///
     /// **Unknown defaults to `false` — do not suppress.** The two failure
     /// modes are not symmetric: filtering when we should not DROPS real answer
@@ -4021,6 +4024,23 @@ impl Config {
             .unwrap_or_else(default_output_cap_chars_per_token)
     }
 
+    /// Resolve every backend's named model card ONCE and materialize the
+    /// effective capability layer — the canonical seam behind all three
+    /// capability accessors.
+    ///
+    /// Precedence: the exact named card (built-in overlaid by
+    /// `~/.newt/models/<name>` drop-ins, the established `dgx card` order)
+    /// supplies missing declarations; the inline `capability` block overrides
+    /// it FIELD-BY-FIELD (an explicit inline `false` beats a card's `true` —
+    /// `Option::or` keeps `Some(false)`). No card and no inline stays
+    /// conservative.
+    ///
+    /// A named card that resolves to nothing is a VISIBLE misconfiguration —
+    /// warned with the fix (`dgx card list`), never silently treated as
+    /// no-card-at-all and never guessed around by name matching. The card is
+    /// operator-pinned and backend-scoped: which card applies is never a
+    /// function of the served model id, so adoption replacing the model
+    /// cannot retarget it.
     /// Merge per-file backends from the `backends/` dirs next to the config:
     /// `~/.newt/backends/*.toml` first, then the project `.newt/backends/` (so
     /// project overrides home overrides inline `[[backends]]`). Filename stem =
@@ -4092,6 +4112,58 @@ impl Config {
                             if backend.api_key_file.is_none() {
                                 backend.api_key_file = existing.api_key_file.clone();
                             }
+                            // Same contract again for the model-card pointer and
+                            // the inline capability block: probing records reality
+                            // (endpoint / model / api / serving), never operator
+                            // DECLARATIONS. The first adopt writeback creates a
+                            // same-name drop-in carrying neither, and before this
+                            // preserve that drop-in silently CLEARED both on the
+                            // next resolve — the card's [capability] stopped
+                            // applying the moment adoption succeeded once.
+                            // …and gated on PROBE PROVENANCE, the
+                            // discriminator the writeback already stamps: a
+                            // probe drop-in records reality (endpoint / kind /
+                            // api / serving), never operator DECLARATIONS, so
+                            // its omission of card/capability must not clear
+                            // them. An operator-authored drop-in (no probe
+                            // stamp) omitting them is a deliberate clearing
+                            // and is honored — unconditional inheritance would
+                            // make rebinding-by-drop-in impossible.
+                            let probe_stamped = backend
+                                .provenance
+                                .as_ref()
+                                .is_some_and(|p| p.probed.is_some());
+                            if probe_stamped {
+                                if backend.card.is_none() {
+                                    backend.card = existing.card.clone();
+                                }
+                                if backend.capability.is_none() {
+                                    backend.capability = existing.capability.clone();
+                                }
+                                // A Multiplexer writeback deliberately omits
+                                // its per-session adopted model — that
+                                // omission must not CLEAR the declared one
+                                // (found by the writeback regression on its
+                                // first run, not by inspection). Probe-gated
+                                // like its siblings: an OPERATOR drop-in
+                                // omitting `model` keeps the omission, which
+                                // legitimately means "let adoption pick".
+                                if backend.model.is_none() {
+                                    backend.model = existing.model.clone();
+                                }
+                            }
+                            // KNOWN GAP, deliberately not guessed at here: a
+                            // probe writeback that adopted a DIFFERENT model
+                            // persists model=B beside the preserved card=A, and
+                            // the next session resolves card-A capability for
+                            // model B until its own adoption re-evaluates the
+                            // binding. A disk-merge guard was tried and
+                            // removed: at THIS seam a probe drop-in and an
+                            // operator drop-in are indistinguishable, so the
+                            // guard also reverted legitimate operator
+                            // rebindings. Closing it needs probe-specific
+                            // provenance policy (the writeback already stamps
+                            // `provenance.probed`) — its own slice.
                             // Same contract for tier assignment: probing records
                             // reality (endpoint / model / api / serving) but never
                             // tiers — tiers are an operator choice, so the adopt
@@ -4322,6 +4394,25 @@ impl Config {
     }
 
     /// The user-writable config root: `$NEWT_CONFIG_DIR` or `~/.newt`.
+    /// The operator-PINNED config path (`$NEWT_CONFIG`), when set — the one
+    /// base whose sibling `models/` is a legitimate card source. Pure env
+    /// mirror of `candidate_paths`' first entry; deliberately NOT "whatever
+    /// base resolve happened to pick", because an ambient `./newt.toml` base
+    /// is attacker-reachable (#1301) and its sibling `./models/` must never
+    /// satisfy a trusted backend's card pointer.
+    #[must_use]
+    pub fn pinned_config_path() -> Option<PathBuf> {
+        std::env::var("NEWT_CONFIG")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            // A set-but-missing NEWT_CONFIG falls through to the next
+            // candidate at load — so it must not redirect the card catalog
+            // either, or cards would resolve relative to a config that was
+            // never actually selected.
+            .filter(|p| p.is_file())
+    }
+
     pub fn user_config_dir() -> Option<PathBuf> {
         if let Some(path) = std::env::var_os(NEWT_CONFIG_DIR_ENV)
             .filter(|value| !value.is_empty())
@@ -5358,6 +5449,100 @@ mod tests {
     use std::io::Write;
 
     // ── input-footer mode ──────────────────────────────────────────────
+
+    /// #1786-slice regression: the REAL probe writeback followed by the real
+    /// disk merge must not clear an operator's card/capability declarations —
+    /// and the preservation is gated on the probe stamp, so an
+    /// operator-authored drop-in omitting them still clears deliberately.
+    #[test]
+    #[serial_test::serial(real_fs)] // pins NEWT_CONFIG_DIR, like its writeback sibling
+    fn probe_writeback_then_merge_preserves_declarations_and_operator_dropins_clear() {
+        // A config-declared backend with a card binding + inline capability.
+        let mut declared = BackendConfig {
+            name: "dgx1".into(),
+            endpoint: "http://dgx:8000".into(),
+            model: Some("bound-model".into()),
+            card: Some("team-reasoner".into()),
+            ..Default::default()
+        };
+        declared.capability = Some(crate::model_card::Capability {
+            emits_leading_reasoning: Some(true),
+            ..Default::default()
+        });
+
+        // 1. The REAL writeback path, into a temp user config dir.
+        let home = tempfile::tempdir().unwrap();
+        let saved = std::env::var_os(NEWT_CONFIG_DIR_ENV);
+        unsafe { std::env::set_var(NEWT_CONFIG_DIR_ENV, home.path()) };
+        std::fs::write(home.path().join("config.toml"), "# cfg\n").unwrap();
+        let probe_patch = BackendConfig {
+            name: "dgx1".into(),
+            endpoint: "http://dgx:8000".into(),
+            kind: Some(BackendKind::Openai),
+            // A Multiplexer writeback deliberately carries NO model (the TUI
+            // patch omits it) — mirrored here.
+            ..Default::default()
+        };
+        let path = writeback_probed_backend(&probe_patch)
+            .expect("writeback runs")
+            .expect("user config dir exists");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("probed"),
+            "the writeback stamps probe provenance — the discriminator the \
+             merge gates on: {body}"
+        );
+
+        // 2. The REAL disk merge: probe drop-in over the declared backend.
+        let mut cfg = Config {
+            backends: vec![declared.clone()],
+            ..Default::default()
+        };
+        cfg.merge_backends_from_dir(&home.path().join("backends"));
+        let merged = &cfg.backends[0];
+        assert_eq!(
+            merged.card.as_deref(),
+            Some("team-reasoner"),
+            "a probe drop-in must not clear the operator's card binding"
+        );
+        assert!(
+            merged.capability.is_some(),
+            "…nor the inline capability block"
+        );
+        assert_eq!(
+            merged.effective_model(),
+            Some("bound-model"),
+            "no model persisted by the multiplexer writeback ⇒ declared model holds"
+        );
+        assert_eq!(
+            merged.kind,
+            Some(BackendKind::Openai),
+            "probed reality applies"
+        );
+
+        // 3. An OPERATOR-authored drop-in (no probe stamp) omitting the card
+        //    is a deliberate clearing, and is honored.
+        std::fs::write(
+            home.path().join("backends/dgx1.toml"),
+            "endpoint = \"http://dgx:8000\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![declared],
+            ..Default::default()
+        };
+        cfg.merge_backends_from_dir(&home.path().join("backends"));
+        assert_eq!(
+            cfg.backends[0].card, None,
+            "an unstamped drop-in omitting the card CLEARS it — rebinding by \
+             drop-in must stay possible"
+        );
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var(NEWT_CONFIG_DIR_ENV, v) },
+            None => unsafe { std::env::remove_var(NEWT_CONFIG_DIR_ENV) },
+        }
+    }
 
     #[test]
     fn footer_mode_defaults_to_auto_and_round_trips() {

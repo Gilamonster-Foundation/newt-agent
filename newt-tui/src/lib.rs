@@ -3469,15 +3469,21 @@ pub(crate) struct BackendChoice {
     /// instead of trusting a placeholder wire protocol.
     pub(crate) kind_needs_probe: bool,
     pub(crate) api_key: Option<String>,
-    pub(crate) chat_completions_capability: newt_core::model_card::ChatCompletionsCapability,
-    pub(crate) reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope,
-    /// Whether the resolved model streams a lone leading `</think>` closer
-    /// (#528). From an inline backend capability declaration
-    /// (`[backends.<name>.capability]`) — never from the model name.
-    pub(crate) emits_leading_reasoning: bool,
+    /// The immutable capability layers (card-derived + inline), constructed
+    /// once per resolution by `ResolvedCapabilities::resolve`. Carrying the
+    /// sidecar itself — not flattened scalars — keeps the FULL capability
+    /// seam (thinking_default, reasoning_content_field, future fields) and
+    /// leaves exactly one owner of the merge logic.
+    pub(crate) capabilities: newt_core::model_card::ResolvedCapabilities,
+    /// A suppression notice minted during resolution (a session model
+    /// override diverged from the card-bound declared model) that the next
+    /// printing seam surfaces and clears. Resolution is pure; printing is
+    /// the caller's.
+    pub(crate) card_suppressed_notice: Option<String>,
     /// For an OpenAI backend: which HTTP surface (chat/completions vs the newer
     /// /v1/responses). Surfaced to the agent loop via `NEWT_OPENAI_API`.
     pub(crate) api: newt_core::OpenAiApi,
+    // (impl block with `suppress_card_capability` follows the struct.)
     /// True when the config omitted `api` — adopt must run `detect_openai_api`
     /// for OpenAI backends instead of trusting the chat_completions placeholder.
     pub(crate) api_needs_probe: bool,
@@ -3486,6 +3492,48 @@ pub(crate) struct BackendChoice {
     /// None). `None` when the API can't be asked; the budget then falls back to
     /// config / the learned cache.
     pub(crate) context_window: Option<u32>,
+}
+
+impl BackendChoice {
+    /// Drop the card-derived capability layer, keep the backend-inline one,
+    /// and return the visible notice — the fail-closed answer when the
+    /// session's serving principal stops being the model the operator bound
+    /// the card against.
+    ///
+    /// EVENT-based, never name-based: an explicit session model override, or
+    /// the server dictating a different model at adoption, is the event.
+    /// Card names are never compared against model labels and no family is
+    /// inferred — names cannot select (or retain) a card, so the sound
+    /// options were refusing the switch or dropping the layer visibly; this
+    /// is the latter. Idempotent: once the layer is gone a second call
+    /// returns `None`, so re-resolution cannot double-print.
+    ///
+    /// The restart half of the policy lives in the store, not here: the
+    /// resolve-side merge refuses to persist a diverged model under a card
+    /// binding, so the suppressed state cannot silently rematerialize as
+    /// card-A-behavior-on-model-B after a restart.
+    /// The serving principal this choice currently represents, for the
+    /// capability decision. Empty model on a multiplexer = adoption pending
+    /// = Unknown (deferred), so a half-initialized choice never reports a
+    /// retarget it cannot yet know about.
+    pub(crate) fn principal(&self) -> newt_core::model_card::ServingPrincipal<'_> {
+        use newt_core::model_card::ServingPrincipal as P;
+        match self.serving {
+            Some(newt_core::Serving::Instance) => P::Instance,
+            Some(newt_core::Serving::Multiplexer) if !self.model.is_empty() => {
+                P::MultiplexerModel(&self.model)
+            }
+            _ => P::Unknown,
+        }
+    }
+
+    /// The capability decision for the CURRENT principal — computed at use
+    /// time, never cached across a serving/model change, so a rebuilt or
+    /// refreshed choice cannot re-enable a card the current model does not
+    /// match (the flaw the earlier destructive-suppression draft had).
+    pub(crate) fn capability_decision(&self) -> newt_core::model_card::CapabilityDecision {
+        self.capabilities.for_principal(self.principal())
+    }
 }
 
 /// The session-start ready preamble. Includes the backend wire protocol
@@ -3748,6 +3796,18 @@ fn finish_adoption(
                         ));
                     }
                     choice.model = m;
+                    // Card binding, evaluated AFTER the final serving/model
+                    // is set, through the typed principal decision: Instance
+                    // preserves the binding (one artifact; the served label
+                    // is its alias, requested_ignored included); a
+                    // Multiplexer whose final model is not the exact bound
+                    // model — warm pick, fallback, override — reports the
+                    // binding inactive. Surfacing it HERE makes the adoption
+                    // transition visible; the decision itself is recomputed
+                    // at every use, so nothing here mutates state.
+                    if let Some(notice) = choice.capability_decision().retarget_notice {
+                        lines.push(notice);
+                    }
                 }
                 None => lines.push(format!(
                     "{} listed no models — pull one (or start the server with a model),                      then /models",
@@ -3818,7 +3878,16 @@ fn finish_adoption(
                     endpoint: choice.url.clone(),
                     kind: Some(choice.kind),
                     api: (choice.kind == newt_core::BackendKind::Openai).then_some(choice.api),
-                    model: (!choice.model.is_empty()).then(|| choice.model.clone()),
+                    // A MULTIPLEXER's adopted model is a per-session pick
+                    // (warm state, fallbacks), not backend truth — persisting
+                    // it would freeze today's pick as tomorrow's declared
+                    // model and, under a card binding, resolve card-A
+                    // capability for a model the card was never bound to
+                    // before any live decision runs. An INSTANCE's model IS
+                    // backend truth (one artifact) and persists.
+                    model: (choice.serving != Some(newt_core::Serving::Multiplexer)
+                        && !choice.model.is_empty())
+                    .then(|| choice.model.clone()),
                     serving: choice.serving,
                     ..Default::default()
                 };
@@ -4008,9 +4077,8 @@ fn codex_env_backend(
         kind: newt_core::BackendKind::Openai,
         kind_needs_probe: false,
         api_key: api_key.map(str::to_string),
-        chat_completions_capability: Default::default(),
-        reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
-        emits_leading_reasoning: false,
+        capabilities: newt_core::model_card::ResolvedCapabilities::none(),
+        card_suppressed_notice: None,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: true,
         context_window: None,
@@ -4082,24 +4150,54 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             .ok()
             .filter(|s| !s.is_empty())
     };
-    let from_backend = |b: &newt_core::BackendConfig| BackendChoice {
-        name: b.name.clone(),
-        serving: b.serving,
-        url: b.endpoint.clone(),
-        // Session override > declared model > empty-until-adopted (#1126: the
-        // server dictates; adopt() fills an empty model at session start).
-        model: session_model()
-            .or_else(|| b.effective_model().map(str::to_string))
-            .unwrap_or_default(),
-        kind: b.kind.unwrap_or(newt_core::BackendKind::Ollama),
-        kind_needs_probe: b.needs_kind_probe(),
-        api_key: b.resolve_api_key(),
-        chat_completions_capability: b.chat_completions_capability(),
-        reasoning_replay_scope: b.reasoning_replay_scope(),
-        emits_leading_reasoning: b.emits_leading_reasoning(),
-        api: b.api.unwrap_or_default(),
-        api_needs_probe: b.api.is_none(),
-        context_window: None,
+    let from_backend = |b: &newt_core::BackendConfig| {
+        // ONE sidecar construction per choice: the immutable card+inline
+        // capability layers. An unknown named card is a real config error but
+        // choice resolution is infallible by contract (a broken backend list
+        // must not crash the TUI) — so the error becomes a VISIBLE notice at
+        // the next printing seam and the capabilities fall to the
+        // conservative inline-only floor. Fail closed, fail loud, keep going.
+        let (caps, card_error) = match newt_core::model_card::ResolvedCapabilities::resolve(
+            b,
+            newt_core::Config::pinned_config_path().as_deref(),
+        ) {
+            Ok(caps) => (caps, None),
+            Err(e) => (
+                newt_core::model_card::ResolvedCapabilities::resolve(
+                    &newt_core::BackendConfig {
+                        card: None,
+                        ..b.clone()
+                    },
+                    None,
+                )
+                .expect("card-less resolution is infallible"),
+                Some(e),
+            ),
+        };
+        let choice = BackendChoice {
+            name: b.name.clone(),
+            serving: b.serving,
+            url: b.endpoint.clone(),
+            // Session override > declared model > empty-until-adopted (#1126: the
+            // server dictates; adopt() fills an empty model at session start).
+            model: session_model()
+                .or_else(|| b.effective_model().map(str::to_string))
+                .unwrap_or_default(),
+            kind: b.kind.unwrap_or(newt_core::BackendKind::Ollama),
+            kind_needs_probe: b.needs_kind_probe(),
+            api_key: b.resolve_api_key(),
+            capabilities: caps,
+            api: b.api.unwrap_or_default(),
+            api_needs_probe: b.api.is_none(),
+            context_window: None,
+            card_suppressed_notice: card_error,
+        };
+        // No override-event logic here, on purpose: the principal decision
+        // (`capability_decision`) is computed at USE time from the current
+        // serving + model, so a session override, a warm adoption, or a
+        // refresh all get the correct answer from the same pure function —
+        // and its retarget notice is surfaced at the printing seams.
+        choice
     };
     // 1. A pinned provider (loadout `provider` axis → NEWT_PROVIDER) selects a
     //    named backend, regardless of wire protocol. Unknown name falls through
@@ -4163,9 +4261,8 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             kind: newt_core::BackendKind::Ollama,
             kind_needs_probe: false,
             api_key: None,
-            chat_completions_capability: Default::default(),
-            reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
-            emits_leading_reasoning: false,
+            capabilities: newt_core::model_card::ResolvedCapabilities::none(),
+            card_suppressed_notice: None,
             api: newt_core::OpenAiApi::default(),
             api_needs_probe: false,
             context_window: None,
@@ -4210,9 +4307,8 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             kind: newt_core::BackendKind::Ollama,
             kind_needs_probe: false,
             api_key: None,
-            chat_completions_capability: Default::default(),
-            reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
-            emits_leading_reasoning: false,
+            capabilities: newt_core::model_card::ResolvedCapabilities::none(),
+            card_suppressed_notice: None,
             api: newt_core::OpenAiApi::default(),
             api_needs_probe: false,
             context_window: None,
@@ -4238,9 +4334,8 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         kind: newt_core::BackendKind::Ollama,
         kind_needs_probe: false,
         api_key: None,
-        chat_completions_capability: Default::default(),
-        reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
-        emits_leading_reasoning: false,
+        capabilities: newt_core::model_card::ResolvedCapabilities::none(),
+        card_suppressed_notice: None,
         api: newt_core::OpenAiApi::default(),
         api_needs_probe: false,
         context_window: None,
@@ -4292,6 +4387,19 @@ pub(crate) fn refresh_backend(
     if choice.url != prev_url || choice.model != *inf_model {
         for line in adopt_backend_choice(choice, None) {
             print_newt(&line, color, verbose);
+        }
+    }
+    // Card-layer notices surface HERE — the seam every mid-session
+    // backend/model change flows through. Resolution errors (an unknown
+    // named card) are taken once; the retarget notice is recomputed by the
+    // pure decision and printed only when the model actually changed, so a
+    // steady-state refresh stays quiet while every transition is visible.
+    if let Some(error) = choice.card_suppressed_notice.take() {
+        print_newt(&error, color, verbose);
+    }
+    if choice.model != *inf_model {
+        if let Some(notice) = choice.capability_decision().retarget_notice {
+            print_newt(&notice, color, verbose);
         }
     }
     *inf_url = choice.url.clone();

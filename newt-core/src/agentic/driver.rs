@@ -113,9 +113,9 @@ pub struct TurnDriverConfig {
     /// Whether the active model streams a lone leading `</think>` closer, so
     /// the stream filter must start inside the reasoning block (#528).
     ///
-    /// Resolved from an INLINE BACKEND CAPABILITY declaration
-    /// (`[backends.<name>.capability]`) — never from the model name, and not
-    /// from a named `card =` pointer, which no capability accessor resolves.
+    /// Resolved from the backend's capability layers (inline declaration,
+    /// and a named `card =` binding via `ResolvedCapabilities`) — never from
+    /// the model name.
     pub emits_leading_reasoning: bool,
     /// Absolute workspace path the tool loop runs against.
     pub workspace: String,

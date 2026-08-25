@@ -254,8 +254,11 @@ pub struct Capability {
 }
 
 impl Capability {
+    /// Field-by-field overlay: `o` wins where it declares, `self` fills the
+    /// rest. `pub(crate)` so the config-side capability resolution can layer
+    /// an inline block over a named card without reimplementing the merge.
     #[must_use]
-    fn merge(self, o: Self) -> Self {
+    pub(crate) fn merge(self, o: Self) -> Self {
         Self {
             emits_leading_reasoning: o.emits_leading_reasoning.or(self.emits_leading_reasoning),
             thinking_default: o.thinking_default.or(self.thinking_default),
@@ -485,6 +488,257 @@ pub fn builtin_cards() -> Vec<ModelCard> {
         .iter()
         .map(|s| parse_card(s, "toml").expect("built-in card is valid TOML"))
         .collect()
+}
+
+/// The resolved capability layers for one backend — constructed ONCE per
+/// backend choice, immutable, and consulted through a TYPED PRINCIPAL
+/// DECISION rather than mutated.
+///
+/// # Why layers + a decision, not a mutable "suppressed" state
+///
+/// Earlier drafts flattened the merge into scalar fields and suppressed the
+/// card layer destructively (`take()` on a fallback tuple). Review rejected
+/// both, correctly: flattening loses the full [`Capability`] seam
+/// (`thinking_default`, `reasoning_content_field`, future fields), and a
+/// destructive flag means a REBUILT choice silently re-enables a card the
+/// session had already suppressed. Here the layers are kept whole and the
+/// decision is a pure function of the CURRENT serving principal — rebuilds,
+/// refreshes, restarts, and adoptions all get the same answer from the same
+/// facts.
+///
+/// # The decision ([`Self::for_principal`])
+///
+/// * **Instance** — card + inline. An instance serves exactly one artifact,
+///   so the operator's binding names that artifact and the served display
+///   label is its alias (`requested_ignored` included).
+/// * **Multiplexer, final model known** — card only when the EXACT bound
+///   model equals the final model. Exact string equality of two operator/
+///   server-supplied identifiers inside the typed Multiplexer arm —
+///   association, never family inference; no substring, no normalization.
+///   Mismatch or an unbound card ⇒ inline-only, with a typed visible notice.
+/// * **Unknown serving** — inline-only, no notice (deferred until adoption
+///   establishes the principal).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedCapabilities {
+    inline: Option<Capability>,
+    binding: Option<CardBinding>,
+}
+
+/// An operator's card binding: the card's declared capability plus the model
+/// the backend declared when the binding was resolved.
+#[derive(Debug, Clone, PartialEq)]
+struct CardBinding {
+    name: String,
+    capability: Capability,
+    /// The backend's declared model at resolve time — what the operator
+    /// bound the card against. `None` when the backend declared no model.
+    bound_model: Option<String>,
+}
+
+/// The serving principal a capability decision is made for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServingPrincipal<'a> {
+    /// A single-artifact server: the binding holds whatever the label says.
+    Instance,
+    /// A multi-model server with the FINAL adopted model known.
+    MultiplexerModel(&'a str),
+    /// Serving not yet established — stay conservative.
+    Unknown,
+}
+
+/// The outcome of a principal decision: which capability layer applies, and
+/// the visible notice when a card binding was set aside.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapabilityDecision {
+    effective: Option<Capability>,
+    /// `Some` exactly when a card binding exists but does not apply to this
+    /// principal — the operator must SEE that their binding is inactive.
+    pub retarget_notice: Option<String>,
+}
+
+impl CapabilityDecision {
+    #[must_use]
+    pub fn chat_completions(&self) -> ChatCompletionsCapability {
+        self.effective
+            .as_ref()
+            .and_then(|c| c.chat_completions)
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn reasoning_replay_scope(&self) -> ReasoningReplayScope {
+        self.effective
+            .as_ref()
+            .and_then(|c| c.reasoning_replay_scope)
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn emits_leading_reasoning(&self) -> bool {
+        self.effective
+            .as_ref()
+            .and_then(|c| c.emits_leading_reasoning)
+            .unwrap_or(false)
+    }
+}
+
+impl ResolvedCapabilities {
+    /// Resolve one backend's layers. ONE catalog scan; the catalog dir
+    /// follows `dgx card`'s either/or rule via `explicit_config`: an
+    /// operator-explicit config resolves cards from ITS sibling `models/`,
+    /// everything else from the user catalog. Callers pass
+    /// [`crate::Config::pinned_config_path`] (or their `--profile` path) —
+    /// never an ambient `./newt.toml`, per the #1301 trust boundary.
+    ///
+    /// # Errors
+    ///
+    /// A backend that NAMES a card which resolves to nothing is a hard error
+    /// naming the backend, the card, and the searched dir. A resolved card
+    /// that merely lacks a `[capability]` block is valid — serving/tuning-
+    /// only — and contributes NO layer: `binding` stays `None`, so nothing
+    /// downstream reports an inactive binding for declarations that never
+    /// existed.
+    pub fn resolve(
+        backend: &crate::BackendConfig,
+        explicit_config: Option<&Path>,
+    ) -> Result<Self, String> {
+        let inline = backend.capability.clone();
+        let Some(name) = backend
+            .card
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        else {
+            return Ok(Self {
+                inline,
+                binding: None,
+            });
+        };
+        let dir = explicit_config
+            .and_then(|p| p.parent())
+            .map(|d| d.join("models"))
+            .or_else(|| crate::Config::user_config_dir().map(|d| d.join("models")));
+        let dropins = dir.as_deref().map(load_dropin_dir).unwrap_or_default();
+        let Some(card) = named_card(name, &builtin_cards(), &dropins) else {
+            let searched = dir
+                .as_deref()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|| "(no card dir)".to_string());
+            let broken = dir.as_deref().is_some_and(|d| {
+                ["toml", "yaml", "yml"]
+                    .iter()
+                    .any(|ext| d.join(format!("{name}.{ext}")).exists())
+            });
+            let hint = if broken {
+                "a file of that name EXISTS there but did not parse as a card — fix the file"
+            } else {
+                "fix the name or add the card; `newt dgx card list` shows what exists"
+            };
+            return Err(format!(
+                "backend `{}` names model card `{name}`, which resolves to nothing \
+                 (searched built-ins, then {searched}) — {hint}",
+                backend.name
+            ));
+        };
+        Ok(Self {
+            binding: card.capability.map(|capability| CardBinding {
+                name: name.to_string(),
+                capability,
+                bound_model: backend.effective_model().map(str::to_string),
+            }),
+            inline,
+        })
+    }
+
+    /// No declarations at all — the conservative floor, for choices built
+    /// without a backend (tests, empty defaults).
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            inline: None,
+            binding: None,
+        }
+    }
+
+    /// The bound card's name, when a binding with declarations exists.
+    #[must_use]
+    pub fn card(&self) -> Option<&str> {
+        self.binding.as_ref().map(|b| b.name.as_str())
+    }
+
+    /// THE decision — pure over the layers and the principal; see the type
+    /// docs for the three arms. Call it at use time with the CURRENT
+    /// principal, never cache its output across a serving/model change.
+    #[must_use]
+    pub fn for_principal(&self, principal: ServingPrincipal<'_>) -> CapabilityDecision {
+        let card_applies = match (&self.binding, principal) {
+            (None, _) => false,
+            (Some(_), ServingPrincipal::Instance) => true,
+            (Some(b), ServingPrincipal::MultiplexerModel(final_model)) => {
+                // Exact equality of two supplied identifiers, inside the
+                // typed Multiplexer arm — association, never inference.
+                b.bound_model.as_deref() == Some(final_model)
+            }
+            (Some(_), ServingPrincipal::Unknown) => false,
+        };
+        if card_applies {
+            let b = self.binding.as_ref().expect("card_applies implies binding");
+            let effective = Some(match self.inline.clone() {
+                Some(inl) => b.capability.clone().merge(inl),
+                None => b.capability.clone(),
+            });
+            return CapabilityDecision {
+                effective,
+                retarget_notice: None,
+            };
+        }
+        let retarget_notice = match (&self.binding, principal) {
+            (Some(b), ServingPrincipal::MultiplexerModel(final_model)) => Some(format!(
+                "card `{}` is bound to {} — the session is serving {final_model}, so \
+                 card-derived capabilities are off (inline backend settings kept); \
+                 rebind the card or switch back",
+                b.name,
+                b.bound_model.as_deref().unwrap_or("(no declared model)"),
+            )),
+            // Unknown serving: deferred, not retargeted — no notice yet.
+            _ => None,
+        };
+        CapabilityDecision {
+            effective: self.inline.clone(),
+            retarget_notice,
+        }
+    }
+}
+
+/// The card `name` resolves to — [`resolve`]'s precedence, not a second one.
+///
+/// A built-in of that name (case-insensitive, [`builtin_card`]'s own rule) is
+/// the base and goes through [`resolve`] VERBATIM, so drop-in overlay
+/// semantics are the single existing implementation. A drop-in-only card uses
+/// the same exact-name merge rule `resolve` applies internally
+/// (`d.name == name`, case-sensitive — the drop-in filename convention),
+/// seeded by the first file of that name. `None` when nothing carries the
+/// name: a card applies because an operator wrote its name, never because a
+/// model id resembles it.
+///
+/// (Deliberately not [`family_defaults`]-aware beyond what `resolve` already
+/// does: that table carries `[vllm]` serving knobs, not capability.)
+#[must_use]
+pub fn named_card(name: &str, builtins: &[ModelCard], dropins: &[ModelCard]) -> Option<ModelCard> {
+    let want = name.trim();
+    if want.is_empty() {
+        return None;
+    }
+    let builtin = builtins
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(want))
+        .cloned();
+    if let Some(base) = builtin {
+        return Some(resolve(base, dropins, None));
+    }
+    let mut matching = dropins.iter().filter(|d| d.name == want).cloned();
+    let first = matching.next()?;
+    Some(matching.fold(first, ModelCard::merge))
 }
 
 /// The built-in card whose `name` matches (case-insensitive), if any.

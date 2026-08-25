@@ -1287,9 +1287,9 @@ pub struct ChatCtx<'a> {
     /// Whether this model streams a lone leading `</think>` closer, so the
     /// filter must start inside the reasoning block (#528).
     ///
-    /// Resolved by the caller from an INLINE BACKEND CAPABILITY declaration
-    /// (`[backends.<name>.capability]`) — never from the model name. A named
-    /// `card =` pointer is not consulted by any capability accessor today.
+    /// Resolved by the caller from the backend's capability layers (inline
+    /// declaration + named `card =` binding, decided per serving principal
+    /// by `ResolvedCapabilities`) — never from the model name.
     ///
     /// Undeclared resolves to `false` (do not suppress): filtering wrongly
     /// drops real answer text silently, while not filtering wrongly shows
