@@ -1542,6 +1542,49 @@ branch") against a scripted model as the durable regression gate.
 
 ---
 
+# The model-identity / card-capability train (2026-08) — #1818 → #1819 → #1820
+
+Recorded out of step order (this ledger predates the train). It is **phase 1
+of the public context seam** — the predecessor work epic #1805's
+"Implementation order" sequences before #1803 and the server epic itself.
+
+## PR 1 — model identity: names are labels, never evidence — **LANDED**
+
+`0b3deae6` (#1818). Leading-reasoning behavior now comes from a declared
+backend capability (inline `[backends.<name>.capability]`), never from
+model-name matching; card-sourced capability starts in PR 2.
+
+## PR 2 — named-card capability resolution — **LANDED**
+
+`5228b6e0` (#1819). Exact typed card identity
+(`ModelCardCatalog::resolve_exact`), slot-aligned backend resolution receipts
+(declaration → operator drop-in → probe observation → CLI request),
+destination-first capability decisions (`ResolvedCapabilities::for_route`),
+typed refusals in the TUI and solve lanes, and `family_for_route` feeding
+tenacity in both.
+
+## PR 3 — tenacity exact-family migration — **open, CI green**
+
+#1820 → PR #1821 (awaiting human review; GitHub wins on live state). Deletes
+tenacity's model-name substring family inference; family flows only from
+typed resolved-card metadata. Deliberate behavior loss (documented in
+CHANGELOG): a cardless model whose name merely contains a configured
+`[tenacity.families]` key now gets NO family — opt back in with a drop-in
+card naming the family. Guarded by
+`newt-core/tests/tenacity_exact_family_ratchet.rs`.
+
+## Next in sequence (per epic #1805's "Implementation order")
+
+1. **#1803 — Newt Markup**: the renderer-neutral interaction spine (first
+   slice A0: inventory + ADR ratification).
+2. **#1805 — pinned Codex app-server compatibility**, starting at **#1806**
+   (pin the exact reference contract, traces, and compatibility matrix).
+
+The forward sequencing lives in the root `ROADMAP.md` ("The context-seam →
+server track"); this entry is the ledger record.
+
+---
+
 # Backlog — unscheduled candidates
 
 Filed and triaged, not yet sequenced into a phase. Each entry links the issue and

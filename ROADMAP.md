@@ -14,7 +14,7 @@ disagree, GitHub wins. A future agent (or human) reconciles with:
 ```bash
 # State of every item in this roadmap:
 gh issue list --repo Gilamonster-Foundation/newt-agent \
-  --search "1064 1065 1066 1067 1068 1069 1070 1071 1072 1073 1074 1075 1076 948 979 1051 1048 1053 1021" \
+  --search "1064 1065 1066 1067 1068 1069 1070 1071 1072 1073 1074 1075 1076 948 979 1051 1048 1053 1021 1096 1097 1098 1100 1818 1819 1820 1821 1803 1805 1806" \
   --state all --json number,title,state
 # Or per item:
 gh issue view <N> --json state,title,closedAt
@@ -166,6 +166,26 @@ lands in small, legible modules. Tracking checklist: **#1096**.
 **Exit:** input line is the CC two-namespace model with no bare-verb
 interception, and every surface it touches lives in a cohesively-named
 module under `newt-tui/src/`.
+
+## The context-seam → server track (sequenced by epic #1805)
+
+Runs beside Phases 0–6. It is **not** in the 0.8.0 release criteria below
+unless explicitly re-scoped (epic #1805 names "v0.8.0 in September 2026" as
+a planning target, not a promise). The order is fixed by #1805's
+"Implementation order": land the public context-seam refactor, land #1803,
+then execute the server epic.
+
+| Item | Tracker | Status |
+|---|---|---|
+| Model identity — names are labels, never evidence | PR #1818 | ✅ merged 2026-08-25 (`0b3deae6`) |
+| Named-card capability resolution — receipts + typed route decisions | PR #1819 | ✅ merged 2026-08-25 (`5228b6e0`) |
+| Tenacity exact-family migration — delete name-substring inference | #1820 → PR #1821 | 🔄 open, CI green, awaiting review |
+| Newt Markup — one interaction model, many native views | Epic #1803 | ⬜ next; first slice A0 (inventory + ADR) |
+| Pinned Codex app-server compatibility for remote Newt sessions | Epic #1805 | ⬜ after #1803; first sub-issue #1806 |
+
+**Exit:** #1820 closed; #1803's spine ratified and landed per its slice
+order; #1805 executed to its Phase-1 exit criteria (a stock pinned Codex
+client drives a remote Newt session black-box on a clean remote POSIX host).
 
 ## v0.8.0 release criteria
 
