@@ -371,23 +371,45 @@ pub struct Cli {
 /// in place (e.g. just `--backend-model`). Built into a
 /// [`newt_core::config::BackendOverride`] by [`Cli::backend_override`].
 #[derive(clap::Args, Debug, Default, Clone)]
+// Every arg carries an EXPLICIT namespaced clap id (`backend_*`): clap
+// identifies args by id, not by long flag, and these are `global = true`,
+// so a bare derive id like `name` collides with any subcommand's own
+// `--name` — global-value propagation then silently hands the
+// subcommand's value to the backend override (`mcp probe --name X`
+// became `--backend-name X`, latent until the named-miss hard error).
 pub struct BackendArgs {
     /// Backend endpoint URL. Setting this makes the CLI backend EXCLUSIVE:
     /// discovery and probe drop-ins are bypassed for the session.
-    #[arg(long = "backend-endpoint", global = true, value_name = "URL")]
+    #[arg(
+        id = "backend_endpoint",
+        long = "backend-endpoint",
+        global = true,
+        value_name = "URL"
+    )]
     pub endpoint: Option<String>,
 
     /// Model this backend serves (e.g. `qwen3-coder_30b`).
-    #[arg(long = "backend-model", global = true, value_name = "MODEL")]
+    #[arg(
+        id = "backend_model",
+        long = "backend-model",
+        global = true,
+        value_name = "MODEL"
+    )]
     pub model: Option<String>,
 
     /// For `--backend-kind embedded`: local GGUF model file path.
-    #[arg(long = "backend-model-path", global = true, value_name = "PATH")]
+    #[arg(
+        id = "backend_model_path",
+        long = "backend-model-path",
+        global = true,
+        value_name = "PATH"
+    )]
     pub model_path: Option<String>,
 
     /// Tiers this backend serves, comma-separated: FAST,STANDARD,COMPLEX,REVIEW
     /// (case-insensitive). Default when creating an exclusive backend: all four.
     #[arg(
+        id = "backend_tiers",
         long = "backend-tiers",
         global = true,
         value_name = "TIERS",
@@ -398,49 +420,84 @@ pub struct BackendArgs {
 
     /// Wire protocol: `ollama`, `openai` (alias `vllm`), `anthropic` (alias
     /// `claude`), or `embedded`.
-    #[arg(long = "backend-kind", global = true, value_name = "KIND", value_parser = parse_backend_kind)]
+    #[arg(id = "backend_kind", long = "backend-kind", global = true, value_name = "KIND", value_parser = parse_backend_kind)]
     pub kind: Option<newt_core::config::BackendKind>,
 
     /// Detected inference engine metadata: `ollama`, `llama.cpp`, or `vllm`.
-    #[arg(long = "backend-engine", global = true, value_name = "ENGINE", value_parser = parse_engine)]
+    #[arg(id = "backend_engine", long = "backend-engine", global = true, value_name = "ENGINE", value_parser = parse_engine)]
     pub engine: Option<newt_core::config::Engine>,
 
     /// OpenAI HTTP surface: `chat_completions` or `responses`.
-    #[arg(long = "backend-api", global = true, value_name = "API", value_parser = parse_openai_api)]
+    #[arg(id = "backend_api", long = "backend-api", global = true, value_name = "API", value_parser = parse_openai_api)]
     pub api: Option<newt_core::config::OpenAiApi>,
 
     /// Env var holding the bearer token (takes precedence over the file).
-    #[arg(long = "backend-api-key-env", global = true, value_name = "VAR")]
+    #[arg(
+        id = "backend_api_key_env",
+        long = "backend-api-key-env",
+        global = true,
+        value_name = "VAR"
+    )]
     pub api_key_env: Option<String>,
 
     /// File whose first non-empty line is the bearer token.
-    #[arg(long = "backend-api-key-file", global = true, value_name = "PATH")]
+    #[arg(
+        id = "backend_api_key_file",
+        long = "backend-api-key-file",
+        global = true,
+        value_name = "PATH"
+    )]
     pub api_key_file: Option<String>,
 
     /// Serving axis: `multiplexer` or `instance`.
-    #[arg(long = "backend-serving", global = true, value_name = "AXIS", value_parser = parse_serving)]
+    #[arg(id = "backend_serving", long = "backend-serving", global = true, value_name = "AXIS", value_parser = parse_serving)]
     pub serving: Option<newt_core::config::Serving>,
 
     /// Physical host of the endpoint, for same-host reasoning.
-    #[arg(long = "backend-host", global = true, value_name = "HOST")]
+    #[arg(
+        id = "backend_host",
+        long = "backend-host",
+        global = true,
+        value_name = "HOST"
+    )]
     pub host: Option<String>,
 
     /// Assert this host can run this backend alongside others (suppress the
     /// same-host starvation rule).
-    #[arg(long = "backend-coexist", global = true, value_name = "BOOL")]
+    #[arg(
+        id = "backend_coexist",
+        long = "backend-coexist",
+        global = true,
+        value_name = "BOOL"
+    )]
     pub coexist: Option<bool>,
 
     /// Host memory available for serving (GiB), for the crew fit-gate.
-    #[arg(long = "backend-ram-gib", global = true, value_name = "GIB")]
+    #[arg(
+        id = "backend_ram_gib",
+        long = "backend-ram-gib",
+        global = true,
+        value_name = "GIB"
+    )]
     pub ram_gib: Option<f64>,
 
     /// Model-card pointer for this backend.
-    #[arg(long = "backend-card", global = true, value_name = "CARD")]
+    #[arg(
+        id = "backend_card",
+        long = "backend-card",
+        global = true,
+        value_name = "CARD"
+    )]
     pub card: Option<String>,
 
     /// Backend name (default `cli`). Names the exclusive backend, or selects
     /// which existing backend a field-only override targets.
-    #[arg(long = "backend-name", global = true, value_name = "NAME")]
+    #[arg(
+        id = "backend_name",
+        long = "backend-name",
+        global = true,
+        value_name = "NAME"
+    )]
     pub name: Option<String>,
 }
 
