@@ -1082,10 +1082,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     }
 
     // CLI `--backend-*` flags: install the process-global override so every
-    // Config::resolve honors it, and — when a destination is pinned — set
-    // NEWT_PROVIDER to the backend so the tier→backend selector picks exactly
-    // it. This is the explicit escape hatch against discovery/probe drop-ins
-    // silently rerouting the session (the local-ollama-fallback incident).
+    // Config::resolve honors it, and set NEWT_PROVIDER to the backend the
+    // flags name so the tier→backend selector picks exactly it —
+    // `--backend-name` is BOTH the edit target and this invocation's
+    // selection, and a pinned destination selects its (possibly synthetic
+    // `cli`) backend. This is the explicit escape hatch against
+    // discovery/probe drop-ins silently rerouting the session (the
+    // local-ollama-fallback incident).
     //
     // #1668: an axis THIS invocation set explicitly is recorded, so a resumed
     // conversation's stored preference pin never overwrites the flag the
@@ -1103,10 +1106,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         let over = cli.backend.to_override();
         if !over.is_empty() {
             let has_destination = over.endpoint.is_some() || over.model_path.is_some();
+            let named = over.name.as_deref().is_some_and(|n| !n.is_empty());
             newt_core::runtime::record_cli_preference_axes(backend_flag_axes(&over));
             let provider = over.name.clone().unwrap_or_else(|| "cli".to_string());
             newt_core::config::set_cli_backend_override(over);
-            if has_destination {
+            if named || has_destination {
                 // SAFETY: single-threaded before the TUI starts any async work.
                 unsafe { std::env::set_var("NEWT_PROVIDER", provider) };
             }

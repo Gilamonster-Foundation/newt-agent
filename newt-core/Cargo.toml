@@ -189,6 +189,10 @@ macos-seatbelt = ["agent-bridle/macos-seatbelt"]
 tests-pty.workspace = true
 
 [dev-dependencies]
+# Warning-shape regressions (#1819): the drop-in loader's diagnostics are
+# tracing warnings, so tests that pin "warns here, NOT there" capture them
+# through a thread-local fmt subscriber.
+tracing-subscriber.workspace = true
 # #1786: tests/store.rs re-derives content ids from raw stored bytes the way
 # an independent implementation would — deliberately NOT through the crate's
 # own function, so encoding drift between the two is a test failure, not a

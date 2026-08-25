@@ -32,8 +32,11 @@ pub struct BackendState {
     pub operator: Option<String>,
     /// The active persona's declared `backend:`, if any.
     pub persona: Option<String>,
-    /// The single backend name every entry point resolves to (via
-    /// [`Config::select_configured_backend`]).
+    /// The single backend/provider name every entry point resolves to (via
+    /// the typed [`Config::select_backend`] contract). `None` when nothing
+    /// qualifies — INCLUDING when an explicit `$NEWT_PROVIDER` /
+    /// `default_backend` names something unknown or destination-less: the
+    /// posture never displays a fallback the selection contract refuses.
     pub effective: Option<String>,
     /// The effective model of the resolved backend (`None` ⇒ the server decides).
     pub model: Option<String>,
@@ -62,7 +65,26 @@ impl RuntimeSettingsSnapshot {
     /// backend) the caller supplies — they are not newt-core globals.
     #[must_use]
     pub fn resolve(cfg: &Config, persona: Option<&str>, persona_backend: Option<&str>) -> Self {
-        let effective = cfg.select_configured_backend();
+        use crate::config::{SelectedBackend, SelectionOutcome};
+        // The TYPED selection contract — not the lossy Option surface: when
+        // `$NEWT_PROVIDER` / `default_backend` names something unknown or
+        // destination-less, the posture resolves to NO effective backend
+        // rather than displaying a fallback the selection contract refuses
+        // to run. A selected provider is the effective route and shows as
+        // such.
+        let (effective, model) = match cfg.select_backend() {
+            SelectionOutcome::Selected(SelectedBackend::Configured(b)) => (
+                Some(b.name.clone()).filter(|n| !n.is_empty()),
+                b.effective_model().map(str::to_string),
+            ),
+            SelectionOutcome::Selected(SelectedBackend::Provider(p)) => (
+                Some(p.name.clone()).filter(|n| !n.is_empty()),
+                p.model.clone(),
+            ),
+            SelectionOutcome::UnknownNamed(_)
+            | SelectionOutcome::UnroutableNamed(_)
+            | SelectionOutcome::Unset => (None, None),
+        };
         Self {
             cognition: crate::cognition::effective_cognition(),
             tenacity: effective_tenacity(),
@@ -74,10 +96,8 @@ impl RuntimeSettingsSnapshot {
                     .ok()
                     .filter(|s| !s.is_empty()),
                 persona: persona_backend.map(str::to_string),
-                effective: effective.map(|b| b.name.clone()).filter(|n| !n.is_empty()),
-                model: effective
-                    .and_then(|b| b.effective_model())
-                    .map(str::to_string),
+                effective,
+                model,
             },
         }
     }
@@ -611,6 +631,46 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// An explicit `$NEWT_PROVIDER` naming something UNKNOWN or
+    /// destination-less resolves to NO effective backend — the posture
+    /// never displays a fallback the typed selection contract refuses to
+    /// run. A provider-named selection shows the provider (it IS the
+    /// effective route).
+    #[test]
+    fn resolve_never_displays_a_fallback_for_a_refused_explicit_selection() {
+        let _g = GlobalSettingsGuard::acquire();
+        // Unknown env name: `real` must NOT appear as effective.
+        // SAFETY: single-threaded guarded test.
+        unsafe { std::env::set_var("NEWT_PROVIDER", "ghost") };
+        let cfg = cfg_with(None, &[("real", "http://r:1")]);
+        let snap = RuntimeSettingsSnapshot::resolve(&cfg, None, None);
+        assert_eq!(snap.backend.operator.as_deref(), Some("ghost"));
+        assert_eq!(
+            snap.backend.effective, None,
+            "an unknown explicit selection resolves to nothing, not to `real`"
+        );
+        // Destination-less env name: same refusal.
+        // SAFETY: single-threaded guarded test.
+        unsafe { std::env::set_var("NEWT_PROVIDER", "hollow") };
+        let cfg = cfg_with(None, &[("real", "http://r:1"), ("hollow", "")]);
+        let snap = RuntimeSettingsSnapshot::resolve(&cfg, None, None);
+        assert_eq!(snap.backend.effective, None);
+        // A provider claiming the env name IS the effective route.
+        // SAFETY: single-threaded guarded test.
+        unsafe { std::env::set_var("NEWT_PROVIDER", "acme") };
+        let mut cfg = cfg_with(None, &[("real", "http://r:1")]);
+        cfg.providers = vec![crate::config::ProviderConfig {
+            name: "acme".into(),
+            command: "newt-provider-openai".into(),
+            model: Some("gpt-test".into()),
+            env_pass: vec![],
+            tiers: vec![],
+        }];
+        let snap = RuntimeSettingsSnapshot::resolve(&cfg, None, None);
+        assert_eq!(snap.backend.effective.as_deref(), Some("acme"));
+        assert_eq!(snap.backend.model.as_deref(), Some("gpt-test"));
     }
 
     #[test]

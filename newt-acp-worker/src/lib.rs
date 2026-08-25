@@ -226,6 +226,11 @@ fn resolve_configured_backend(
              [[backends]] or [[providers]] entry — fix the \
              $NEWT_PROVIDER / default_backend selector (no silent fallback)"
         ),
+        SelectionOutcome::UnroutableNamed(name) => anyhow::bail!(
+            "worker: selected backend '{name}' has neither an endpoint nor a \
+             model_path — give it a destination, or fix the \
+             $NEWT_PROVIDER / default_backend selector (no silent fallback)"
+        ),
         SelectionOutcome::Unset => Ok(ResolvedBackend::DiscoverLocalOllama),
     }
 }
@@ -239,7 +244,8 @@ fn resolve_configured_backend(
 /// provider backend still wins even when `$OLLAMA_HOST` is set. Local discovery
 /// is a fallback ONLY when the selection is
 /// [`SelectionOutcome::Unset`](newt_core::config::SelectionOutcome) — nothing is
-/// configured. A [`SelectionOutcome::UnknownNamed`] selector is a hard error.
+/// configured. A [`SelectionOutcome::UnknownNamed`] or
+/// [`SelectionOutcome::UnroutableNamed`] selector is a hard error.
 ///
 /// A configuration RESOLUTION error propagates (it is not swallowed into an empty
 /// config): a malformed or unreadable config must not silently become a different
@@ -462,6 +468,36 @@ mod backend_selection_tests {
         assert_eq!(backend.name(), "myplugin");
         // A subprocess plugin bridges inference in-process → no HTTP endpoint.
         assert_eq!(backend.endpoint(), None);
+    }
+
+    #[test]
+    fn unroutable_named_backend_is_an_error_not_a_silent_fallback() {
+        // default_backend names a configured backend with neither endpoint
+        // nor model_path, while a routable OpenAI backend is present. The
+        // worker must error, never silently run the other backend.
+        let mut c = cfg(
+            vec![
+                openai(
+                    "cloud",
+                    OpenAiApi::ChatCompletions,
+                    "http://vllm.host:8000/",
+                ),
+                newt_core::BackendConfig {
+                    name: "hollow".into(),
+                    ..Default::default()
+                },
+            ],
+            vec![],
+        );
+        c.default_backend = Some("hollow".into());
+        let err = resolve_configured_backend(&c, None)
+            .err()
+            .expect("an unroutable explicit selection is a hard error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hollow") && msg.contains("endpoint"),
+            "names the backend and the gap: {msg}"
+        );
     }
 
     #[test]

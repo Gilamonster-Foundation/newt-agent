@@ -3452,38 +3452,46 @@ async fn retry_revert(
     })
 }
 
-/// The inference backend the TUI session should talk to: endpoint, model,
-/// wire protocol, and (for authenticated OpenAI-compatible endpoints) the
-/// resolved bearer token.
+/// The inference backend the TUI session should talk to — a flat split of
+/// immutable INTENT (what config + operator asked for, captured at resolve
+/// time and never touched by probes) and mutable ROUTE (what probing and
+/// adoption established since). Adoption evidence survives refreshes via
+/// [`merge_refresh`], and overlays never destroy the declaration they
+/// overlaid.
 pub(crate) struct BackendChoice {
     /// The configured backend's name ("" for env-synthesized/legacy choices) —
     /// feeds cap_key (instance keying) and honest status lines.
     pub(crate) name: String,
-    /// Declared serving axis when the backend file pins one; None = derive at
-    /// probe/adopt time; session-start adopt caches the derived value here.
-    pub(crate) serving: Option<newt_core::Serving>,
     pub(crate) url: String,
-    pub(crate) model: String,
+    // ── immutable intent ─────────────────────────────────────────────
+    /// The backend's declared model, if any.
+    pub(crate) declared_model: Option<String>,
+    /// The operator's explicit per-session request (`NEWT_DGX_MODEL`),
+    /// kept apart from the declaration so adoption can fall back to the
+    /// declared model when the request is unavailable.
+    pub(crate) requested_model: Option<String>,
+    /// Declared serving axis when the backend file pins one.
+    pub(crate) configured_serving: Option<newt_core::Serving>,
+    /// The config-declared wire protocol (`None` = probe at connect).
+    pub(crate) configured_kind: Option<newt_core::BackendKind>,
+    /// The config-declared OpenAI surface (`None` = probe at connect).
+    pub(crate) configured_api: Option<newt_core::OpenAiApi>,
+    /// Managed mode — lets adoption prefer a warm model on a Shared box.
+    pub(crate) managed: Option<newt_core::ManagedMode>,
+    pub(crate) api_key: Option<String>,
+    // ── mutable route ────────────────────────────────────────────────
+    /// The model the session is actually driving: request > declaration at
+    /// resolve time; adoption replaces it with served reality.
+    pub(crate) active_model: String,
+    /// The serving axis adoption/probing established this session.
+    pub(crate) adopted_serving: Option<newt_core::Serving>,
     pub(crate) kind: newt_core::BackendKind,
     /// True when the config omitted `kind` — adopt must run `detect_endpoint`
     /// instead of trusting a placeholder wire protocol.
     pub(crate) kind_needs_probe: bool,
-    pub(crate) api_key: Option<String>,
-    /// The immutable capability layers (card-derived + inline), constructed
-    /// once per resolution by `ResolvedCapabilities::resolve`. Carrying the
-    /// sidecar itself — not flattened scalars — keeps the FULL capability
-    /// seam (thinking_default, reasoning_content_field, future fields) and
-    /// leaves exactly one owner of the merge logic.
-    pub(crate) capabilities: newt_core::model_card::ResolvedCapabilities,
-    /// A suppression notice minted during resolution (a session model
-    /// override diverged from the card-bound declared model) that the next
-    /// printing seam surfaces and clears. Resolution is pure; printing is
-    /// the caller's.
-    pub(crate) card_suppressed_notice: Option<String>,
     /// For an OpenAI backend: which HTTP surface (chat/completions vs the newer
     /// /v1/responses). Surfaced to the agent loop via `NEWT_OPENAI_API`.
     pub(crate) api: newt_core::OpenAiApi,
-    // (impl block with `suppress_card_capability` follows the struct.)
     /// True when the config omitted `api` — adopt must run `detect_openai_api`
     /// for OpenAI backends instead of trusting the chat_completions placeholder.
     pub(crate) api_needs_probe: bool,
@@ -3492,47 +3500,218 @@ pub(crate) struct BackendChoice {
     /// None). `None` when the API can't be asked; the budget then falls back to
     /// config / the learned cache.
     pub(crate) context_window: Option<u32>,
+    // ── capability layers + display history ──────────────────────────
+    /// The immutable capability layers (card binding + inline), constructed
+    /// once per resolution by `ResolvedCapabilities::resolve` from the
+    /// config's pre-overlay binding seed.
+    pub(crate) capabilities: newt_core::model_card::ResolvedCapabilities,
+    /// A card-resolution error minted by THIS resolution (unknown/invalid
+    /// card) — held for identity-compared display, never destroyed.
+    pub(crate) card_resolution_error: Option<String>,
+    /// What the card display owner last SHOWED — survives refreshes so an
+    /// unchanged state stays quiet.
+    pub(crate) notices: CardNotices,
 }
 
 impl BackendChoice {
-    /// Drop the card-derived capability layer, keep the backend-inline one,
-    /// and return the visible notice — the fail-closed answer when the
-    /// session's serving principal stops being the model the operator bound
-    /// the card against.
-    ///
-    /// EVENT-based, never name-based: an explicit session model override, or
-    /// the server dictating a different model at adoption, is the event.
-    /// Card names are never compared against model labels and no family is
-    /// inferred — names cannot select (or retain) a card, so the sound
-    /// options were refusing the switch or dropping the layer visibly; this
-    /// is the latter. Idempotent: once the layer is gone a second call
-    /// returns `None`, so re-resolution cannot double-print.
-    ///
-    /// The restart half of the policy lives in the store, not here: the
-    /// resolve-side merge refuses to persist a diverged model under a card
-    /// binding, so the suppressed state cannot silently rematerialize as
-    /// card-A-behavior-on-model-B after a restart.
+    /// A choice with no config-backed intent — the env-synthesized/legacy
+    /// arms and tests. Route starts at `active_model` with nothing adopted;
+    /// callers set the request/declaration facts they actually have.
+    pub(crate) fn synthesized(
+        name: &str,
+        url: String,
+        kind: newt_core::BackendKind,
+        active_model: String,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            url,
+            declared_model: None,
+            requested_model: None,
+            configured_serving: None,
+            configured_kind: None,
+            configured_api: None,
+            managed: None,
+            api_key: None,
+            active_model,
+            adopted_serving: None,
+            kind,
+            kind_needs_probe: false,
+            api: newt_core::OpenAiApi::default(),
+            api_needs_probe: false,
+            context_window: None,
+            capabilities: newt_core::model_card::ResolvedCapabilities::none(),
+            card_resolution_error: None,
+            notices: CardNotices::default(),
+        }
+    }
+
+    /// The serving axis the session currently operates under: adopted
+    /// (established) beats configured (declared).
+    pub(crate) fn route_serving(&self) -> Option<newt_core::Serving> {
+        self.adopted_serving.or(self.configured_serving)
+    }
+
     /// The serving principal this choice currently represents, for the
-    /// capability decision. Empty model on a multiplexer = adoption pending
-    /// = Unknown (deferred), so a half-initialized choice never reports a
-    /// retarget it cannot yet know about.
+    /// capability decision.
+    ///
+    /// * An established/declared **Instance** (or a config-declared embedded
+    ///   engine) is a single artifact.
+    /// * A **Multiplexer** with a live model is that model; with none yet,
+    ///   Unknown (a half-initialized choice must not report a retarget it
+    ///   cannot know about).
+    /// * **No axis at all**: an operator-SELECTED identity (request, else
+    ///   declaration) justifies exact association — an adopted guess never
+    ///   does, so `active_model` is deliberately not consulted here.
     pub(crate) fn principal(&self) -> newt_core::model_card::ServingPrincipal<'_> {
         use newt_core::model_card::ServingPrincipal as P;
-        match self.serving {
+        match self.route_serving() {
             Some(newt_core::Serving::Instance) => P::Instance,
-            Some(newt_core::Serving::Multiplexer) if !self.model.is_empty() => {
-                P::MultiplexerModel(&self.model)
+            Some(newt_core::Serving::Multiplexer) if !self.active_model.is_empty() => {
+                P::MultiplexerModel(&self.active_model)
             }
-            _ => P::Unknown,
+            Some(newt_core::Serving::Multiplexer) => P::Unknown,
+            None if self.configured_kind == Some(newt_core::BackendKind::Embedded) => P::Instance,
+            None => match self
+                .requested_model
+                .as_deref()
+                .or(self.declared_model.as_deref())
+            {
+                Some(m) => P::SelectedModel(m),
+                None => P::Unknown,
+            },
         }
     }
 
     /// The capability decision for the CURRENT principal — computed at use
     /// time, never cached across a serving/model change, so a rebuilt or
     /// refreshed choice cannot re-enable a card the current model does not
-    /// match (the flaw the earlier destructive-suppression draft had).
+    /// match.
     pub(crate) fn capability_decision(&self) -> newt_core::model_card::CapabilityDecision {
         self.capabilities.for_principal(self.principal())
+    }
+
+    /// Observe + render card-layer state at a printing seam — THE display
+    /// owner. Compares typed applicability identity and the resolution
+    /// error against what was last shown, records the new history, and
+    /// returns only the lines worth printing (nothing on a no-op).
+    pub(crate) fn card_notice_lines(&mut self) -> Vec<String> {
+        let now = self.capability_decision().applicability().clone();
+        let (next, lines) =
+            notice_transition(&self.notices, self.card_resolution_error.as_deref(), &now);
+        self.notices = next;
+        lines
+    }
+}
+
+/// The display history for card-layer notices — what has been SHOWN, so
+/// every seam (startup, adoption, refresh) dedupes by TYPED identity
+/// instead of prose comparison or destructive `take()`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct CardNotices {
+    last_error: Option<String>,
+    last_applicability: Option<newt_core::model_card::CardApplicability>,
+}
+
+/// Pure transition function: compare what is now true against what was last
+/// shown; return the updated history and the lines worth printing.
+/// Identity rules: an identical `Inactive(A,B)` stays quiet;
+/// `Inactive(…,B) → Inactive(…,C)` is a new transition; `Inactive → Active`
+/// announces the card re-applying; a resolution error prints once per
+/// distinct message.
+fn notice_transition(
+    prev: &CardNotices,
+    error: Option<&str>,
+    now: &newt_core::model_card::CardApplicability,
+) -> (CardNotices, Vec<String>) {
+    use newt_core::model_card::CardApplicability as A;
+    let mut lines = Vec::new();
+    if let Some(e) = error {
+        if prev.last_error.as_deref() != Some(e) {
+            lines.push(e.to_string());
+        }
+    }
+    if prev.last_applicability.as_ref() != Some(now) {
+        if let Some(line) = now.describe() {
+            lines.push(line);
+        } else if let (A::Active { card }, Some(A::Inactive { .. } | A::Undecided { .. })) =
+            (now, prev.last_applicability.as_ref())
+        {
+            lines.push(format!(
+                "card `{card}` applies again — the session is serving its bound model"
+            ));
+        }
+    }
+    (
+        CardNotices {
+            last_error: error.map(str::to_string),
+            last_applicability: Some(now.clone()),
+        },
+        lines,
+    )
+}
+
+/// The complete INTENT key: two resolutions with equal intent describe the
+/// same operator ask, so the established route may carry across a refresh.
+fn same_intent(a: &BackendChoice, b: &BackendChoice) -> bool {
+    a.name == b.name
+        && a.url == b.url
+        && a.declared_model == b.declared_model
+        && a.requested_model == b.requested_model
+        && a.configured_serving == b.configured_serving
+        && a.configured_kind == b.configured_kind
+        && a.configured_api == b.configured_api
+        && a.managed == b.managed
+        && a.api_key == b.api_key
+}
+
+/// Fold a fresh resolution over the previous choice. On a same-intent no-op
+/// ONLY the established route/probe results carry over; the freshly
+/// resolved capabilities and resolution error always stand (a config edit
+/// must be able to fix a card without a restart); display history always
+/// survives. Returns whether adoption needs to (re)run.
+fn merge_refresh(prev: &BackendChoice, next: &mut BackendChoice) -> bool {
+    next.notices = prev.notices.clone();
+    if !same_intent(prev, next) {
+        return true;
+    }
+    next.kind = prev.kind;
+    next.kind_needs_probe = prev.kind_needs_probe;
+    next.api = prev.api;
+    next.api_needs_probe = prev.api_needs_probe;
+    next.adopted_serving = prev.adopted_serving;
+    next.active_model = prev.active_model.clone();
+    next.context_window = prev.context_window;
+    false
+}
+
+/// Adoption inputs from the choice's IMMUTABLE intent: the synthesized view
+/// carries the DECLARED model / configured serving / managed mode — never
+/// the session override — while the override rides separately as the
+/// REQUEST. `adopt()` then owns the policy: an unavailable request falls
+/// back to the declaration, and a Managed Shared backend may prefer a warm
+/// model.
+fn adoption_inputs(choice: &BackendChoice) -> (newt_core::BackendConfig, Option<String>) {
+    (
+        newt_core::BackendConfig {
+            name: choice.name.clone(),
+            endpoint: choice.url.clone(),
+            model: choice.declared_model.clone(),
+            kind: Some(choice.kind),
+            serving: choice.configured_serving,
+            managed: choice.managed,
+            ..Default::default()
+        },
+        choice.requested_model.clone(),
+    )
+}
+
+/// Adoption mutates ONLY the route: the established serving axis and the
+/// active model. Intent fields are never written.
+fn apply_adoption(choice: &mut BackendChoice, adoption: &newt_core::backend_probe::Adoption) {
+    choice.adopted_serving = Some(adoption.serving);
+    if let Some(m) = &adoption.model {
+        choice.active_model = m.clone();
     }
 }
 
