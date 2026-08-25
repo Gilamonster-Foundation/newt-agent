@@ -315,6 +315,8 @@ pub fn backend_from_preset(
             probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
             derived_serving: Some(true),
         }),
+        // Operator-ACCEPTED configuration (setup asked): tagged so the
+        // loader replaces wholesale and the probe writeback never edits it.
         ..Default::default()
     })
 }

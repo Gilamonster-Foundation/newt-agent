@@ -1970,43 +1970,47 @@ impl Config {
     /// The profile name `bundle` yields for `model`: the longest-prefix `families`
     /// match, else `default_profile`. `None` ⇒ the bundle applies no profile here.
     #[must_use]
-    pub fn bundle_profile_for_model<'a>(
+    pub fn bundle_profile_for_family<'a>(
         &self,
         bundle: &'a BundleConfig,
-        model: &str,
+        family: Option<&str>,
     ) -> Option<&'a str> {
-        bundle
-            .families
-            .iter()
-            .filter(|(prefix, _)| model.starts_with(prefix.as_str()))
-            .max_by_key(|(prefix, _)| prefix.len()) // longest-prefix-wins
-            .map(|(_, p)| p.as_str())
+        family
+            .and_then(|fam| {
+                bundle
+                    .families
+                    .iter()
+                    .find(|(key, _)| key.as_str() == fam)
+                    .map(|(_, p)| p.as_str())
+            })
             .or(bundle.default_profile.as_deref())
     }
 
-    /// Infer the bundle for `model` from `applies_to` (longest-prefix-wins). Only
-    /// bundles with a non-empty `applies_to` participate — a use-case bundle (empty
-    /// `applies_to`) is never auto-inferred, only chosen explicitly via `--bundle`.
+    /// Infer the bundle for the TYPED model family (the resolved card's
+    /// declared metadata under the route-association gates — never a
+    /// model-name prefix): a bundle applies when its `applies_to` names the
+    /// family EXACTLY. No family ⇒ no automatic bundle — a qwen-LOOKING
+    /// alias with no exact card gets no family behavior (the anti-substring
+    /// law: names are labels, never evidence). Only bundles with a
+    /// non-empty `applies_to` participate — a use-case bundle (empty
+    /// `applies_to`) is never auto-inferred, only chosen explicitly via
+    /// `--bundle`.
     #[must_use]
-    pub fn infer_bundle(&self, model: &str) -> Option<(&str, &BundleConfig)> {
+    pub fn infer_bundle_for_family(&self, family: Option<&str>) -> Option<(&str, &BundleConfig)> {
+        let fam = family?;
         self.bundles
             .iter()
-            .filter_map(|(name, b)| {
-                b.applies_to
-                    .iter()
-                    .filter(|p| model.starts_with(p.as_str()))
-                    .map(String::len)
-                    .max()
-                    .map(|best| (best, name.as_str(), b))
-            })
-            .max_by_key(|(best, _, _)| *best)
-            .map(|(_, name, b)| (name, b))
+            .find(|(_, b)| b.applies_to.iter().any(|a| a == fam))
+            .map(|(name, b)| (name.as_str(), b))
     }
 
-    /// Resolve the active profile from the selectors + the active `model`:
-    /// `--profile` (explicit) > `--bundle` (its profile for this model) > an
-    /// inferred bundle (`applies_to`) > `None` (today's no-profile behavior).
-    /// Returns the profile NAME + how it was chosen (for the banner).
+    /// Resolve the active profile from the selectors + the TYPED model
+    /// family: `--profile` (explicit) > `--bundle` (its profile for this
+    /// family) > a bundle inferred from the exact family (`applies_to`) >
+    /// `None`. Automatic selection keys on the resolved card's declared
+    /// family under the route-association gates — NEVER on model-name
+    /// prefixes. Returns the profile NAME + how it was chosen (for the
+    /// banner).
     ///
     /// # Errors
     /// An unknown explicit `--bundle` is a hard error. An unknown explicit
@@ -2016,7 +2020,7 @@ impl Config {
         &self,
         profile_flag: Option<&str>,
         bundle_flag: Option<&str>,
-        model: &str,
+        family: Option<&str>,
     ) -> std::result::Result<Option<ProfilePick>, String> {
         if let Some(p) = profile_flag.filter(|s| !s.is_empty()) {
             return Ok(Some(ProfilePick {
@@ -2027,15 +2031,15 @@ impl Config {
         if let Some(b) = bundle_flag.filter(|s| !s.is_empty()) {
             let bundle = self.resolve_bundle(b)?;
             return Ok(self
-                .bundle_profile_for_model(bundle, model)
+                .bundle_profile_for_family(bundle, family)
                 .map(|p| ProfilePick {
                     name: p.to_string(),
                     via: PickVia::Bundle(b.to_string()),
                 }));
         }
-        if let Some((name, bundle)) = self.infer_bundle(model) {
+        if let Some((name, bundle)) = self.infer_bundle_for_family(family) {
             return Ok(self
-                .bundle_profile_for_model(bundle, model)
+                .bundle_profile_for_family(bundle, family)
                 .map(|p| ProfilePick {
                     name: p.to_string(),
                     via: PickVia::InferredBundle(name.to_string()),
@@ -2052,9 +2056,9 @@ impl Config {
 /// ```toml
 /// [bundles.nemotron]
 /// about = "Support bundle for the nemotron family"
-/// applies_to = ["nemotron"]                 # longest-prefix-wins; "nemotron3:33b" matches
+/// applies_to = ["nemotron"]                 # EXACT typed family names (card metadata)
 /// default_profile = "nemotron"
-/// families = { "nemotron" = "nemotron", "qwen" = "qwen-coder" }
+/// families = { "nemotron" = "nemotron", "qwen3" = "qwen-coder" }
 /// ```
 ///
 /// A bundle carries **no authority** — there is deliberately no caveats/preset
@@ -2914,9 +2918,29 @@ impl Default for Discovery {
     }
 }
 
+/// Explicit ownership of a backend drop-in record — who may rewrite the file
+/// and how the loader merges it. This is the discriminator the loader
+/// BRANCHES on; [`BackendProvenance`] below stays purely informational.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RecordTag {
+    /// Operator-owned: the loader replaces the same-name backend WHOLESALE,
+    /// so omissions deliberately clear/rebind. The runtime writeback never
+    /// touches such a file. Untagged files are operator-owned too — except
+    /// the legacy ambiguity the backend assembly's drop-in merge refuses to guess
+    /// about (see there).
+    OperatorV1,
+    /// Probe-owned overlay: associated by exact name + endpoint, whitelist-
+    /// merged (observed `kind`/`api`/`serving`, plus `model` only for an
+    /// Instance observation) onto the same-name backend. Never touches card,
+    /// capability, auth, tiers, managed, host, or operator provenance.
+    ProbeV1,
+}
+
 /// Where a backend file came from — written by `newt setup`, hand-authored,
-/// or probe-derived. Pure data; nothing branches on it. Makes a generated
-/// file self-describing and lets `doctor` show declared-vs-derived drift.
+/// or probe-derived. Pure data; nothing branches on it (ownership branches
+/// on [`RecordTag`]). Makes a generated file self-describing and lets
+/// `doctor` show declared-vs-derived drift.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BackendProvenance {
     /// Who wrote the file (e.g. `newt setup v0.7.3`).
@@ -3077,7 +3101,11 @@ impl BackendConfig {
         Ok(doc.to_string())
     }
 
-    /// Resolve explicitly accepted Chat Completions request extensions.
+    /// Resolve explicitly accepted Chat Completions request extensions —
+    /// from the INLINE block only. The card-aware answer is
+    /// [`crate::model_card::ResolvedCapabilities`], constructed once per
+    /// backend choice; these inline accessors stay for the card-less callers
+    /// and as the conservative floor.
     #[must_use]
     pub fn chat_completions_capability(&self) -> crate::model_card::ChatCompletionsCapability {
         self.capability
@@ -3096,12 +3124,11 @@ impl BackendConfig {
     /// suppresses output from things that are not Qwen, and prints raw
     /// reasoning from things that are). Replaces the #384 name-list stopgap.
     ///
-    /// **Scope, stated precisely:** like its two siblings above, this reads
-    /// the inline `capability` field only. A named `card =` pointer is copied
-    /// between configs but never resolved into a capability, so a card's
-    /// `[capability]` block does not reach here. Fixing that is one step for
-    /// all three accessors — doing it for one would leave siblings behaving
-    /// differently, which is worse than a uniform gap.
+    /// **Scope:** like its two siblings above, this reads the inline
+    /// `capability` field only — the conservative floor. The card-aware
+    /// surface is [`crate::model_card::ResolvedCapabilities`], which resolves
+    /// the named `card =` binding once per backend choice and decides per
+    /// serving principal; every runtime lane consumes that, not this.
     ///
     /// **Unknown defaults to `false` — do not suppress.** The two failure
     /// modes are not symmetric: filtering when we should not DROPS real answer
@@ -3266,6 +3293,1223 @@ pub(crate) fn resolve_api_key_common(
     Ok(None)
 }
 
+/// A backend's EXACT destination — where the session's bytes go: an HTTP
+/// `endpoint`, or (`kind = "embedded"`) a local `model_path`. The ONLY
+/// normalization anywhere is empty-string-to-`None`; comparison is exact
+/// string equality, never URL parsing or trimming (a near-collision must
+/// compare unequal, not get "helpfully" unified).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackendDestination {
+    /// The HTTP endpoint, when one is declared/requested (empty ⇒ `None`).
+    pub endpoint: Option<String>,
+    /// The local artifact path for an embedded backend.
+    pub model_path: Option<String>,
+}
+
+impl BackendDestination {
+    /// Empty-to-`None` construction — the one normalization.
+    #[must_use]
+    pub fn new(endpoint: Option<String>, model_path: Option<String>) -> Self {
+        Self {
+            endpoint: endpoint.filter(|e| !e.is_empty()),
+            model_path: model_path.filter(|p| !p.is_empty()),
+        }
+    }
+
+    /// The destination a backend declaration names.
+    #[must_use]
+    pub fn of(backend: &BackendConfig) -> Self {
+        Self::new(Some(backend.endpoint.clone()), backend.model_path.clone())
+    }
+
+    /// A CONCRETE destination: exactly one NONEMPTY axis (endpoint XOR
+    /// model_path). A hollow destination (neither) routes nowhere and a
+    /// composite one (both) is two identities — neither may anchor an exact
+    /// association ([`crate::model_card::ResolvedCapabilities::for_route`]
+    /// refuses to activate a card across a non-concrete destination). The
+    /// fields are public, so a hand-built literal can hold `Some("")` that
+    /// [`BackendDestination::new`] would have normalized away — concreteness
+    /// therefore checks CONTENT, not `Option` presence: two empty-string
+    /// endpoints agreeing are two absences, not an identity.
+    #[must_use]
+    pub fn is_concrete(&self) -> bool {
+        let endpoint = self.endpoint.as_deref().is_some_and(|e| !e.is_empty());
+        let model_path = self.model_path.as_deref().is_some_and(|p| !p.is_empty());
+        endpoint ^ model_path
+    }
+}
+
+/// The operator's DECLARED backend facts — the layer as configured (inline
+/// `[[backends]]` or an `operator_v1` drop-in), before any probe overlay or
+/// CLI request. Immutable intent: never probe residue, never a request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeclaredBackend {
+    /// Where the operator pointed this backend.
+    pub destination: BackendDestination,
+    /// The declared model, if any.
+    pub model: Option<String>,
+    /// The declared model card, if any.
+    pub card: Option<String>,
+    /// The declared serving axis.
+    pub serving: Option<Serving>,
+    /// The declared wire protocol.
+    pub kind: Option<BackendKind>,
+    /// The declared OpenAI HTTP surface.
+    pub api: Option<OpenAiApi>,
+    /// The declared managed mode.
+    pub managed: Option<ManagedMode>,
+}
+
+impl DeclaredBackend {
+    /// Snapshot the declaration layer from a backend that IS pure
+    /// declaration (nothing has overlaid it).
+    #[must_use]
+    pub fn of(backend: &BackendConfig) -> Self {
+        Self {
+            destination: BackendDestination::of(backend),
+            // The effective-model rule: an empty/whitespace model string is
+            // NO model identity — it must never become an exact identifier
+            // a card binding could associate against.
+            model: backend.effective_model().map(str::to_string),
+            card: backend.card.clone(),
+            serving: backend.serving,
+            kind: backend.kind,
+            api: backend.api,
+            managed: backend.managed,
+        }
+    }
+}
+
+/// How a CLI `--backend-*` request targets the config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestMode {
+    /// A destination (`--backend-url` / `--backend-model-path`) was given:
+    /// the request defines an EXCLUSIVE backend — one slot survives.
+    ExclusiveDestination,
+    /// Field-only: the named (else first) backend is edited in place.
+    FieldOnly,
+}
+
+/// The explicit per-invocation CLI request, recorded AS a request — typed
+/// facts taken from the `--backend-*` flags themselves, never re-derived
+/// from the mutated backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendRequest {
+    /// Exclusive-destination or field-only (see [`RequestMode`]).
+    pub mode: RequestMode,
+    /// The requested endpoint, if any (empty ⇒ `None`).
+    pub endpoint: Option<String>,
+    /// The requested embedded artifact path, if any.
+    pub model_path: Option<String>,
+    /// The requested model, if any.
+    pub model: Option<String>,
+    /// The requested card rebind, if any.
+    pub card: Option<String>,
+    /// The requested serving axis, if any.
+    pub serving: Option<Serving>,
+    /// The requested wire protocol, if any.
+    pub kind: Option<BackendKind>,
+    /// The requested OpenAI HTTP surface, if any.
+    pub api: Option<OpenAiApi>,
+}
+
+impl BackendRequest {
+    fn from_override(over: &BackendOverride) -> Self {
+        let mode = if over.endpoint.is_some() || over.model_path.is_some() {
+            RequestMode::ExclusiveDestination
+        } else {
+            RequestMode::FieldOnly
+        };
+        Self {
+            mode,
+            endpoint: over.endpoint.clone().filter(|e| !e.is_empty()),
+            model_path: over.model_path.clone().filter(|p| !p.is_empty()),
+            // Same effective-model rule as the declaration layer: an
+            // empty/whitespace request is no model identity.
+            model: over.model.clone().filter(|m| !m.trim().is_empty()),
+            card: over.card.clone(),
+            serving: over.serving,
+            kind: over.kind,
+            api: over.api,
+        }
+    }
+
+    /// The destination the request lands on, given the declared one: the
+    /// requested endpoint/model_path override their declared counterparts
+    /// field-by-field; a request with neither lands where declared.
+    #[must_use]
+    pub fn destination_over(&self, declared: &BackendDestination) -> BackendDestination {
+        if self.endpoint.is_none() && self.model_path.is_none() {
+            return declared.clone();
+        }
+        // A destination request REPLACES the destination: `--backend-url`
+        // points the exclusive backend at that URL (it does not inherit a
+        // declared model_path, nor vice versa).
+        BackendDestination {
+            endpoint: self.endpoint.clone(),
+            model_path: self.model_path.clone(),
+        }
+    }
+}
+
+/// Per-backend provenance receipt: the LAYERS a resolved backend was
+/// composed from, kept distinguishable. [`Config::resolve`] flattens
+/// operator declaration → cached `probe_v1` observation → per-invocation
+/// CLI request into one effective [`BackendConfig`] — right for wire
+/// routing, wrong for evidence: a consumer reading `backend.model` cannot
+/// tell a declaration from probe residue or a request. Receipts are built
+/// by the private backend assembly and ride in [`ResolvedConfig`], aligned
+/// 1:1 by slot with `config.backends` — never looked up by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendResolutionReceipt {
+    /// The operator's declaration layer.
+    pub declaration: DeclaredBackend,
+    /// The explicit CLI request, if any.
+    pub request: Option<BackendRequest>,
+    /// The cached probe observation this resolution retained, if any. A
+    /// requested destination CHANGE clears it (cached truth about one
+    /// server must not ride to another); an identical destination retains.
+    pub observation: Option<ProbeObservation>,
+    /// The card-binding evidence this resolution justifies — see
+    /// [`crate::model_card::CardBindingSeed`]:
+    ///
+    /// * an explicit `--backend-card` is a deliberate rebind — the requested
+    ///   card binds at the post-request destination, to the requested model
+    ///   (else the declared one, NEVER a probed one);
+    /// * otherwise the declared card binds to the declared model at the
+    ///   declared destination — a model-only or endpoint-only request
+    ///   RETAINS this binding untouched, and visibility is decided
+    ///   downstream by typed applicability
+    ///   ([`crate::model_card::ResolvedCapabilities::for_route`]), never by
+    ///   erasing evidence here.
+    pub binding: crate::model_card::CardBindingSeed,
+}
+
+/// Shared backend-identity validation: nonempty and unique names. Selection
+/// (`default_backend`, `$NEWT_PROVIDER`), CLI overrides, drop-in merging,
+/// and the slot-aligned receipts are all name-addressed at their edges —
+/// with a duplicate, different consumers can disagree about WHICH backend a
+/// name means and hand backend A the card binding declared for backend B.
+/// Hard, actionable error instead. Used by the assembly constructor on
+/// every path (normal resolve AND profiles) and again after the CLI
+/// request.
+fn validate_backend_names<'a>(
+    backends: impl Iterator<Item = &'a BackendConfig>,
+) -> std::result::Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (i, b) in backends.enumerate() {
+        if b.name.trim().is_empty() {
+            return Err(format!(
+                "backend #{} has no name — every [[backends]] entry needs a unique \
+                 `name` (selection, overrides, and card bindings are name-based)",
+                i + 1
+            ));
+        }
+        if !seen.insert(b.name.clone()) {
+            return Err(format!(
+                "two backends share the name `{}` — backend selection is name-based \
+                 everywhere (default_backend, $NEWT_PROVIDER, --backend-*, card \
+                 bindings), so a duplicate can activate the wrong card; rename one",
+                b.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Shared provider-identity validation: nonempty and unique names. The
+/// unified selection contract ([`Config::select_backend`]) name-addresses
+/// providers, so a duplicate can hand the session a different provider
+/// than the one the operator meant. Cross-namespace ties (a backend and a
+/// provider sharing one name) are DELIBERATE and documented: a ROUTABLE
+/// backend wins the tie; a destination-less backend loses it to the
+/// provider — pinned by tests, not rejected.
+fn validate_provider_names(providers: &[ProviderConfig]) -> std::result::Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (i, p) in providers.iter().enumerate() {
+        if p.name.trim().is_empty() {
+            return Err(format!(
+                "provider #{} has no name — every [[providers]] entry needs a unique \
+                 `name` (selection is name-based)",
+                i + 1
+            ));
+        }
+        if !seen.insert(p.name.clone()) {
+            return Err(format!(
+                "two providers share the name `{}` — provider selection is name-based \
+                 ($NEWT_PROVIDER, default_backend), so a duplicate can run the wrong \
+                 one; rename one",
+                p.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A backend with a COHERENT wire destination — a nonempty HTTP `endpoint`,
+/// or a nonempty embedded `model_path` on a backend whose kind is embedded
+/// (or unset — composition pins it to Embedded). The ONE usability
+/// predicate selection runs on: an embedded backend is exactly as
+/// selectable as an HTTP one, but a `model_path` on an HTTP-kind backend is
+/// an incoherent declaration, not a route.
+fn backend_is_routable(b: &BackendConfig) -> bool {
+    if !b.endpoint.is_empty() {
+        return true;
+    }
+    b.model_path.as_deref().is_some_and(|p| !p.is_empty())
+        && matches!(b.kind, None | Some(BackendKind::Embedded))
+}
+
+/// The typed outcome of the shared slot selector — kept distinct so an
+/// explicit selector naming a DESTINATION-LESS backend cannot collapse into
+/// either "selected" (routing nowhere) or "nothing selected" (silently
+/// running something else).
+enum SlotSelection {
+    /// The precedence picked this slot (routable by construction).
+    Slot(usize),
+    /// An explicit selector (`$NEWT_PROVIDER` / `default_backend`) named a
+    /// configured backend with neither endpoint nor model_path. Surfaced,
+    /// never silently skipped: consumers turn this into a hard error
+    /// ([`SelectionOutcome::UnroutableNamed`], the assembly's field-only
+    /// targeting error) or a documented `None`
+    /// ([`Config::select_configured_backend`]).
+    ExplicitlyUnroutable { name: String },
+    /// An explicit selector names NOTHING among these backends — a typo, or
+    /// a provider's name (this selector only knows `[[backends]]`; the
+    /// caller that knows providers decides). Surfaced the same way:
+    /// selection must not silently desert an explicit selector for the
+    /// preference rules.
+    ExplicitlyUnmatched { name: String },
+    /// Nothing explicitly selected and nothing routable configured.
+    None,
+}
+
+/// The ONE config-backend slot selector — shared by
+/// [`Config::select_configured_backend`], [`Config::select_backend`],
+/// [`ResolvedConfig::selected_backend`], and the assembly's unnamed
+/// field-only CLI targeting, so "which backend is selected" has exactly one
+/// answer. Precedence, most-specific first: `$NEWT_PROVIDER` names a
+/// backend > `default_backend` > a sole routable backend > prefer an
+/// OpenAI-kind routable entry, else the first routable one. An EXPLICIT
+/// selector (env/default) naming a configured but destination-less backend
+/// is [`SlotSelection::ExplicitlyUnroutable`] — never a silent pick of it,
+/// never a silent fall-through past it.
+fn select_backend_slot(
+    backends: &[&BackendConfig],
+    default_backend: Option<&str>,
+) -> SlotSelection {
+    // 1. Operator / live override: $NEWT_PROVIDER names a backend.
+    if let Ok(name) = std::env::var("NEWT_PROVIDER") {
+        if !name.is_empty() {
+            return match backends.iter().position(|b| b.name == name) {
+                Some(i) if backend_is_routable(backends[i]) => SlotSelection::Slot(i),
+                Some(_) => SlotSelection::ExplicitlyUnroutable { name },
+                None => SlotSelection::ExplicitlyUnmatched { name },
+            };
+        }
+    }
+    // 2. The configured default. An EMPTY string is absent, exactly as
+    //    `select_backend` treats it — never an authoritative selector for a
+    //    backend named "".
+    if let Some(name) = default_backend.filter(|n| !n.is_empty()) {
+        return match backends.iter().position(|b| b.name == name) {
+            Some(i) if backend_is_routable(backends[i]) => SlotSelection::Slot(i),
+            Some(_) => SlotSelection::ExplicitlyUnroutable {
+                name: name.to_string(),
+            },
+            None => SlotSelection::ExplicitlyUnmatched {
+                name: name.to_string(),
+            },
+        };
+    }
+    // 3. A sole backend is the obvious choice.
+    if backends.len() == 1 {
+        return match backends.first().filter(|b| backend_is_routable(b)) {
+            Some(_) => SlotSelection::Slot(0),
+            None => SlotSelection::None,
+        };
+    }
+    // 4. Prefer an OpenAI-kind entry, else the first routable one.
+    backends
+        .iter()
+        .position(|b| b.kind == Some(BackendKind::Openai) && backend_is_routable(b))
+        .or_else(|| backends.iter().position(|b| backend_is_routable(b)))
+        .map_or(SlotSelection::None, SlotSelection::Slot)
+}
+
+/// A declaration with SOME destination — a nonempty endpoint or a nonempty
+/// `model_path`. `model_path = ""` is NOT a destination: an empty-path
+/// drop-in must not pass destination checks and strip a valid slot.
+fn backend_has_destination(b: &BackendConfig) -> bool {
+    !b.endpoint.is_empty() || b.model_path.as_deref().is_some_and(|p| !p.is_empty())
+}
+
+/// Shared destination-XOR validation for DECLARATIONS: a backend has ONE
+/// destination — an HTTP `endpoint`, or an embedded `model_path`, never
+/// both (a composite destination is two identities in one slot; every
+/// consumer — routing, probe association, card bindings — would pick a
+/// side silently). CLI requests get the same rule in
+/// [`BackendAssembly::apply_request`].
+fn validate_backend_destination(b: &BackendConfig) -> std::result::Result<(), String> {
+    if !b.endpoint.is_empty() && b.model_path.as_deref().is_some_and(|p| !p.is_empty()) {
+        return Err(format!(
+            "backend `{}` declares BOTH an endpoint and a model_path — a backend has \
+             ONE destination; remove one",
+            b.name
+        ));
+    }
+    Ok(())
+}
+
+/// A defensive name-lookup outcome — assembly operations never assume a
+/// name resolves, even though the constructor validated uniqueness.
+enum NameMatch {
+    Missing,
+    Unique(usize),
+    Ambiguous,
+}
+
+/// One backend under assembly: the operator's declaration plus the layers
+/// that may (or may not) apply to it. The layers stay SEPARATE until
+/// [`BackendAssembly::finish`] composes the effective backend and mints the
+/// receipt — so a later layer can never masquerade as an earlier one.
+#[derive(Debug)]
+struct AssemblySlot {
+    /// The declaration: inline `[[backends]]`, replaced wholesale by an
+    /// `operator_v1` drop-in.
+    declaration: BackendConfig,
+    /// The exact probe observation attached to this slot, if any.
+    observation: Option<ProbeObservation>,
+    /// The CLI `--backend-*` request targeted at this slot, if any.
+    request: Option<BackendOverride>,
+}
+
+impl AssemblySlot {
+    fn declared(declaration: BackendConfig) -> Self {
+        Self {
+            declaration,
+            observation: None,
+            request: None,
+        }
+    }
+
+    /// The declaration with this slot's observation overlaid — the
+    /// PROBE-INFORMED effective view (pre-request). Used both by
+    /// [`BackendAssembly::finish`]'s composition and by the CLI targeting
+    /// in [`BackendAssembly::apply_request`], so the backend a field-only
+    /// edit lands on and the backend the final resolution selects can
+    /// never diverge over probed facts.
+    fn observed_view(&self) -> BackendConfig {
+        let mut backend = self.declaration.clone();
+        if let Some(obs) = &self.observation {
+            overlay_observation(&mut backend, obs);
+        }
+        normalize_destination_kind(&mut backend);
+        backend
+    }
+}
+
+/// Destination/kind coherence normalization — the SAME rule in composition
+/// ([`BackendAssembly::finish`]) and the targeting preview
+/// ([`AssemblySlot::observed_view`]), so a declaration the composition
+/// would accept (model_path + a stale HTTP kind, normalized to Embedded)
+/// is never refused by a harmless field-only edit that previewed it
+/// un-normalized. Both axes:
+///
+/// * **kind** — a model_path route IS embedded; an endpoint route never
+///   retains Embedded (cleared to probe-at-connect);
+/// * **serving** — an embedded backend serves exactly ONE artifact
+///   ([`derive_serving`] makes Embedded intrinsically Instance), so a
+///   model_path route never retains an inherited/declared Multiplexer —
+///   Phase B's principal decision must never see
+///   `kind = Embedded + serving = multiplexer`. (EXPLICITLY contradictory
+///   requests are rejected in `apply_request`, not normalized away.)
+fn normalize_destination_kind(backend: &mut BackendConfig) {
+    if backend.endpoint.is_empty() && backend.model_path.as_deref().is_some_and(|p| !p.is_empty()) {
+        backend.kind = Some(BackendKind::Embedded);
+        backend.serving = Some(Serving::Instance);
+    } else if !backend.endpoint.is_empty() && backend.kind == Some(BackendKind::Embedded) {
+        backend.kind = None;
+    }
+}
+
+/// Overlay a probe observation's facts onto a backend — only what a probe
+/// observes: `kind`/`api`/`serving`, plus the model iff Instance (the typed
+/// [`ProbeObservation::serving_axis`] gate). The ONE overlay, shared by
+/// composition and targeting.
+fn overlay_observation(backend: &mut BackendConfig, obs: &ProbeObservation) {
+    if let Some(kind) = obs.kind {
+        backend.kind = Some(kind);
+    }
+    if let Some(api) = obs.api {
+        backend.api = Some(api);
+    }
+    let (serving, model) = obs.serving_axis();
+    if let Some(serving) = serving {
+        backend.serving = Some(serving);
+        // Only an Instance observation carries backend-truth model; a
+        // multiplexer/unknown observation leaves the declared model
+        // standing.
+        if let Some(model) = model {
+            backend.model = Some(model);
+        }
+    }
+}
+
+/// A probe record staged during the directory walk, attached only after
+/// EVERY directory's operator declarations have applied — so a probe in an
+/// earlier directory is judged against the FINAL declaration, not against
+/// whichever declaration happened to exist when its file was read.
+#[derive(Debug)]
+struct PendingProbe {
+    path: PathBuf,
+    stem: String,
+    observation: ProbeObservation,
+}
+
+/// The PRIVATE backend assembly: the one place the four layers of a
+/// backend meet, in order — inline/project declaration → operator drop-in
+/// replacement → exact probe observation → CLI request. Owns the layering
+/// rules so [`ResolvedConfig`]'s receipts are correct BY CONSTRUCTION:
+///
+/// * the constructor validates backend identity (nonempty, unique names)
+///   on every path — normal resolve and profiles alike;
+/// * an operator drop-in REPLACES its slot's declaration and resets the
+///   slot's observation (the file IS the backend);
+/// * a probe record attaches only to the UNIQUE slot with the exact same
+///   name AND destination — cached truth about one server never rides to
+///   another;
+/// * the CLI request is recorded as a request; an exclusive destination
+///   request retains exactly one (chosen or new) slot.
+#[derive(Debug)]
+struct BackendAssembly {
+    slots: Vec<AssemblySlot>,
+    /// Probe records staged for post-declaration attachment, in walk order
+    /// (directory precedence, then path order) — attachment is last-wins,
+    /// so a later directory's probe record deterministically supersedes an
+    /// earlier one for the same slot.
+    pending_probes: Vec<PendingProbe>,
+    /// An operator drop-in merged — the config is operator-configured.
+    operator_configured: bool,
+    /// A nonempty CLI request was applied.
+    requested: bool,
+}
+
+impl BackendAssembly {
+    /// Stage `backends` (pure declarations) for assembly, validating
+    /// backend identity first — see [`validate_backend_names`].
+    fn new(backends: Vec<BackendConfig>) -> std::result::Result<Self, String> {
+        validate_backend_names(backends.iter())?;
+        for b in &backends {
+            validate_backend_destination(b)?;
+        }
+        Ok(Self {
+            slots: backends.into_iter().map(AssemblySlot::declared).collect(),
+            pending_probes: Vec::new(),
+            operator_configured: false,
+            requested: false,
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    fn operator_configured(&self) -> bool {
+        self.operator_configured
+    }
+
+    fn requested(&self) -> bool {
+        self.requested
+    }
+
+    /// The compiled-in localhost fallback, staged as a declaration.
+    fn push_fallback(&mut self, backend: BackendConfig) {
+        self.slots.push(AssemblySlot::declared(backend));
+    }
+
+    fn find(&self, name: &str) -> NameMatch {
+        let mut hits = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.declaration.name == name)
+            .map(|(i, _)| i);
+        match (hits.next(), hits.next()) {
+            (None, _) => NameMatch::Missing,
+            (Some(i), None) => NameMatch::Unique(i),
+            (Some(_), Some(_)) => NameMatch::Ambiguous,
+        }
+    }
+
+    /// Merge `<dir>/*.toml` drop-ins (filename stem = name), branching on
+    /// the file's raw `record` header:
+    ///
+    /// * **Operator records** (`record = "operator_v1"`, or untagged and
+    ///   classified operator) — REPLACE the same-name slot's declaration
+    ///   wholesale (resetting its observation), else append a new slot.
+    ///   Omissions deliberately clear/rebind; the file IS the backend.
+    /// * **Probe records** (`record = "probe_v1"`, or an unambiguous
+    ///   legacy probe cache) — parsed through the STRICT machine schema
+    ///   and STAGED; they attach as slot observations only after every
+    ///   directory's declarations have applied (see
+    ///   [`Self::attach_pending_probes`]), so a home-dir probe survives to
+    ///   be judged against a project-dir declaration. Never card,
+    ///   capability, auth, tiers, managed, host, or operator provenance;
+    ///   an invalid record is skipped with a visible warning.
+    ///
+    /// A malformed file is skipped with a warning. The one HARD ERROR is
+    /// the legacy ambiguity: a file carrying the exact old newt-adopt probe
+    /// marker AND binding/operator evidence cannot be attributed (operator
+    /// declaration, or probe residue?) — refuse to guess, name the path and
+    /// the remediations.
+    fn merge_dir(&mut self, dir: &Path) -> std::result::Result<(), String> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Ok(()); // no backends dir — fine
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let tag = match disk_record_tag(&text) {
+                Ok(tag) => tag,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "skipping malformed backend file");
+                    continue;
+                }
+            };
+            match tag {
+                Some(RecordTag::ProbeV1) => self.stage_probe(&path, stem, &text),
+                Some(RecordTag::OperatorV1) => self.merge_operator(&path, stem, &text),
+                None => {
+                    let backend = match toml::from_str::<BackendConfig>(&text) {
+                        Ok(backend) => backend,
+                        Err(e) => {
+                            // The header parse is laxer than the full parse
+                            // (it reads one key) — a body-malformed file
+                            // lands here, same visible skip as everywhere.
+                            tracing::warn!(path = %path.display(), error = %e, "skipping malformed backend file");
+                            continue;
+                        }
+                    };
+                    match classify_untagged_dropin(&backend, &text) {
+                        Ok(DropinOwner::Operator) => self.merge_operator(&path, stem, &text),
+                        Ok(DropinOwner::Probe) => self.stage_probe(&path, stem, &text),
+                        Err(reason) => return Err(format!("{}: {reason}", path.display())),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// An operator record: the file IS the backend — its declaration
+    /// replaces the slot wholesale and resets the slot's observation. It
+    /// needs a destination — an HTTP `endpoint`, or (`kind = "embedded"`)
+    /// a local `model_path`; a record with neither is skipped TOUCHING
+    /// NOTHING (a skipped record must not strip what an earlier layer
+    /// established).
+    fn merge_operator(&mut self, path: &Path, stem: &str, text: &str) {
+        let mut backend = match toml::from_str::<BackendConfig>(text) {
+            Ok(backend) => backend,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "skipping malformed backend file");
+                return;
+            }
+        };
+        // The filename is authoritative for the name (collision-free).
+        backend.name = stem.to_string();
+        if !backend_has_destination(&backend) {
+            tracing::warn!(
+                path = %path.display(),
+                "skipping backend with neither endpoint nor model_path"
+            );
+            return;
+        }
+        if let Err(reason) = validate_backend_destination(&backend) {
+            tracing::warn!(path = %path.display(), %reason, "skipping backend drop-in");
+            return;
+        }
+        self.operator_configured = true;
+        match self.find(stem) {
+            NameMatch::Unique(i) => self.slots[i] = AssemblySlot::declared(backend),
+            NameMatch::Missing => self.slots.push(AssemblySlot::declared(backend)),
+            NameMatch::Ambiguous => {
+                // Unreachable (the constructor validated uniqueness) — but
+                // never guess which duplicate a file means.
+                tracing::warn!(
+                    path = %path.display(),
+                    "several staged backends share this name — drop-in not merged"
+                );
+            }
+        }
+    }
+
+    /// A probe record: parse through the STRICT machine schema and stage it
+    /// for attachment after all declarations are in.
+    fn stage_probe(&mut self, path: &Path, stem: &str, text: &str) {
+        let record = match parse_probe_record(text) {
+            Ok(record) => record,
+            Err(reason) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    %reason,
+                    "invalid probe record — not overlaid (delete the file to re-probe)"
+                );
+                return;
+            }
+        };
+        self.pending_probes.push(PendingProbe {
+            path: path.to_path_buf(),
+            stem: stem.to_string(),
+            observation: record.to_observation(stem),
+        });
+    }
+
+    /// Attach every staged probe record against the FINAL declarations:
+    /// the unique slot with the exact same name AND destination. Walk
+    /// order, last-wins — a later directory's record deterministically
+    /// supersedes an earlier one. A name or destination that no final
+    /// declaration matches is skipped with a visible warning.
+    fn attach_pending_probes(&mut self) {
+        for pending in std::mem::take(&mut self.pending_probes) {
+            let PendingProbe {
+                path,
+                stem,
+                observation,
+            } = pending;
+            let slot = match self.find(&stem) {
+                NameMatch::Unique(i) => &mut self.slots[i],
+                NameMatch::Missing => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "probe record names an unconfigured backend — ignored (delete the file)"
+                    );
+                    continue;
+                }
+                NameMatch::Ambiguous => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "several staged backends share this name — probe record not attached"
+                    );
+                    continue;
+                }
+            };
+            // Association is the exact declared destination — an endpoint-less
+            // (embedded) backend is never overlaid, and a near-collision is a
+            // different destination, not a match.
+            let observed_at = BackendDestination::new(Some(observation.endpoint.clone()), None);
+            let declared_at = BackendDestination::of(&slot.declaration);
+            if declared_at != observed_at {
+                tracing::warn!(
+                    path = %path.display(),
+                    configured = %slot.declaration.endpoint,
+                    probed = %observation.endpoint,
+                    "probe record's destination does not match the configured backend — not overlaid"
+                );
+                continue;
+            }
+            slot.observation = Some(observation);
+        }
+    }
+
+    /// Record the CLI `--backend-*` request.
+    ///
+    /// A destination request (`--backend-url` XOR `--backend-model-path` —
+    /// exactly one, nonempty) defines an EXCLUSIVE backend: exactly one
+    /// slot survives — the uniquely named existing one (its declaration and
+    /// observation intact; whether the observation still applies is decided
+    /// in [`Self::finish`]) or a brand-new slot with no declaration layer.
+    ///
+    /// A field-only request targets ONE slot in place: the named one (a
+    /// name matching nothing is a hard, actionable error — `--backend-name`
+    /// is both the edit target and this invocation's selection, never a
+    /// silent no-op), else the slot the shared [`select_backend_slot`]
+    /// picks — the SAME selector every consumer uses, so the edited backend
+    /// IS the selected backend, never "index 0".
+    ///
+    /// Names are validated AGAIN afterwards — a request-created slot's name
+    /// enters here.
+    /// Returns the SLOT INDEX the request landed on (`None` when there was
+    /// no request) so composing callers can align config-level selection
+    /// with the target.
+    fn apply_request(
+        &mut self,
+        over: Option<BackendOverride>,
+        default_backend: Option<&str>,
+    ) -> std::result::Result<Option<usize>, String> {
+        // Probe attachment resolves against the FINAL directory
+        // declarations BEFORE any exclusive pruning — a valid cache for a
+        // disk-declared backend must not look "unconfigured" (and emit the
+        // destructive delete/re-probe warning) merely because THIS
+        // invocation selected another backend.
+        self.attach_pending_probes();
+        let Some(over) = over.filter(|o| !o.is_empty()) else {
+            return Ok(None);
+        };
+        // Destination invariants: empty strings are malformed requests, and
+        // a request cannot point two places at once.
+        if over.endpoint.as_deref().is_some_and(str::is_empty) {
+            return Err("--backend-url is empty — give a URL or omit the flag".into());
+        }
+        if over.model_path.as_deref().is_some_and(str::is_empty) {
+            return Err("--backend-model-path is empty — give a path or omit the flag".into());
+        }
+        if over.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
+            return Err(
+                "--backend-model is empty — give a model or omit the flag (there is \
+                 no implicit clear: the flattened route would serve \
+                 server-decides while the receipt fell back to the stale \
+                 declared model)"
+                    .into(),
+            );
+        }
+        if over.endpoint.is_some() && over.model_path.is_some() {
+            return Err(
+                "--backend-url and --backend-model-path are mutually exclusive — a \
+                 backend has ONE destination (an HTTP endpoint, or an embedded \
+                 artifact path)"
+                    .into(),
+            );
+        }
+        // Destination/kind coherence: an explicitly contradictory pair is an
+        // operator error, not something to silently normalize away.
+        if over.endpoint.is_some() && over.kind == Some(BackendKind::Embedded) {
+            return Err(
+                "--backend-url with --backend-kind embedded is contradictory — an \
+                 embedded backend has no endpoint; use --backend-model-path"
+                    .into(),
+            );
+        }
+        if over.model_path.is_some() && over.kind.is_some_and(|k| k != BackendKind::Embedded) {
+            return Err(format!(
+                "--backend-model-path with --backend-kind {:?} is contradictory — a \
+                 model_path destination is an embedded backend",
+                over.kind.unwrap()
+            ));
+        }
+        if over.model_path.is_some() && over.serving == Some(Serving::Multiplexer) {
+            return Err(
+                "--backend-model-path with --backend-serving multiplexer is \
+                 contradictory — an embedded backend serves exactly one artifact \
+                 (instance)"
+                    .into(),
+            );
+        }
+        self.requested = true;
+        let has_destination = over.endpoint.is_some() || over.model_path.is_some();
+        if has_destination {
+            let name = over.name.clone().unwrap_or_else(|| "cli".to_string());
+            let kept = match self.find(&name) {
+                NameMatch::Unique(i) => self.slots.swap_remove(i),
+                NameMatch::Missing => AssemblySlot::declared(BackendConfig {
+                    name: name.clone(),
+                    ..Default::default()
+                }),
+                NameMatch::Ambiguous => {
+                    return Err(format!(
+                        "--backend-* targets `{name}`, which several backends share — \
+                         rename one"
+                    ));
+                }
+            };
+            self.slots = vec![kept];
+            self.slots[0].request = Some(over);
+            validate_backend_names(self.slots.iter().map(|s| &s.declaration))?;
+            return Ok(Some(0));
+        }
+        {
+            // Field-only targeting runs over the PROBE-INFORMED effective
+            // view ([`AssemblySlot::observed_view`]) — the same facts the
+            // final resolution selects on — so the slot the edit lands on
+            // and the slot the session then selects cannot diverge over a
+            // probed kind.
+            let effective: Vec<BackendConfig> =
+                self.slots.iter().map(AssemblySlot::observed_view).collect();
+            let idx = match over.name.as_deref() {
+                Some(n) => match self.find(n) {
+                    NameMatch::Unique(i) => {
+                        if !backend_is_routable(&effective[i]) {
+                            return Err(format!(
+                                "--backend-name `{n}` names a backend with neither an \
+                                 endpoint nor a model_path — a field-only --backend-* \
+                                 cannot route it; give it a destination \
+                                 (--backend-url / --backend-model-path) or fix the \
+                                 backend"
+                            ));
+                        }
+                        i
+                    }
+                    NameMatch::Missing => {
+                        let configured: Vec<&str> = self
+                            .slots
+                            .iter()
+                            .map(|s| s.declaration.name.as_str())
+                            .collect();
+                        return Err(format!(
+                            "--backend-name `{n}` matches no configured backend \
+                             (configured: {configured:?}) — a field-only --backend-* \
+                             edits an existing backend; add --backend-url to define \
+                             a new one"
+                        ));
+                    }
+                    NameMatch::Ambiguous => {
+                        return Err(format!(
+                            "--backend-* targets `{n}`, which several backends share — \
+                             rename one"
+                        ));
+                    }
+                },
+                None => {
+                    let declarations: Vec<&BackendConfig> = effective.iter().collect();
+                    match select_backend_slot(&declarations, default_backend) {
+                        SlotSelection::Slot(i) => i,
+                        // A field-only request supplies no destination, so
+                        // editing the explicitly selected but destination-less
+                        // backend could not make it routable — and editing any
+                        // OTHER backend would desert the explicit selection.
+                        SlotSelection::ExplicitlyUnroutable { name } => {
+                            return Err(format!(
+                                "--backend-* targets `{name}` (named by $NEWT_PROVIDER or \
+                                 default_backend), which has neither an endpoint nor a \
+                                 model_path — a field-only --backend-* cannot route it; \
+                                 give it a destination (--backend-url / \
+                                 --backend-model-path) or fix the backend"
+                            ));
+                        }
+                        SlotSelection::ExplicitlyUnmatched { name } => {
+                            return Err(format!(
+                                "--backend-* would apply to the selected backend, but \
+                                 $NEWT_PROVIDER/default_backend names `{name}`, which \
+                                 matches no configured backend (it may name a provider, \
+                                 which --backend-* cannot edit) — fix the selector or \
+                                 name a backend with --backend-name"
+                            ));
+                        }
+                        SlotSelection::None => {
+                            return Err("--backend-* has no backend to apply to — nothing \
+                                 configured is routable; name one with --backend-name \
+                                 or define one with --backend-url"
+                                .into());
+                        }
+                    }
+                }
+            };
+            // A field-only kind change must agree with the destination the
+            // target already has — refused ATOMICALLY here, never recorded
+            // and then silently normalized away in composition.
+            if let Some(kind) = over.kind {
+                let target = &effective[idx];
+                if kind == BackendKind::Embedded && !target.endpoint.is_empty() {
+                    return Err(format!(
+                        "--backend-kind embedded on `{}` is contradictory — its \
+                         destination is an HTTP endpoint; retarget with \
+                         --backend-model-path or pick an HTTP kind",
+                        target.name
+                    ));
+                }
+                if kind != BackendKind::Embedded
+                    && target.endpoint.is_empty()
+                    && target.model_path.as_deref().is_some_and(|p| !p.is_empty())
+                {
+                    return Err(format!(
+                        "--backend-kind {kind:?} on `{}` is contradictory — its \
+                         destination is an embedded model_path; retarget with \
+                         --backend-url or keep kind embedded",
+                        target.name
+                    ));
+                }
+            }
+            // A field-only serving change must agree with the target's
+            // destination, exactly like kind: an embedded (model_path)
+            // backend serves one artifact — refused ATOMICALLY, never
+            // recorded and then silently normalized away.
+            if over.serving == Some(Serving::Multiplexer) {
+                let target = &effective[idx];
+                if target.endpoint.is_empty()
+                    && target.model_path.as_deref().is_some_and(|p| !p.is_empty())
+                {
+                    return Err(format!(
+                        "--backend-serving multiplexer on `{}` is contradictory — an \
+                         embedded (model_path) backend serves exactly one artifact \
+                         (instance); retarget with --backend-url for a multiplexer",
+                        target.name
+                    ));
+                }
+            }
+            // Selection PARITY for the unnamed edit: the request itself can
+            // reorder the shared precedence (a kind edit adds/removes the
+            // prefer-OpenAI property), so re-run the selector over the
+            // POST-request view and require it to still pick the edited
+            // slot — otherwise the backend the edit landed on and the
+            // backend the session then selects would diverge. A
+            // destabilizing edit must name its target.
+            if over.name.is_none() {
+                let mut post: Vec<BackendConfig> = effective.clone();
+                over.overlay(&mut post[idx]);
+                let post_refs: Vec<&BackendConfig> = post.iter().collect();
+                match select_backend_slot(&post_refs, default_backend) {
+                    SlotSelection::Slot(i) if i == idx => {}
+                    _ => {
+                        return Err(format!(
+                            "--backend-* would edit `{}` (the currently selected \
+                             backend), but the edit changes which backend the shared \
+                             precedence selects — name the target explicitly with \
+                             --backend-name",
+                            self.slots[idx].declaration.name
+                        ));
+                    }
+                }
+            }
+            self.slots[idx].request = Some(over);
+            validate_backend_names(self.slots.iter().map(|s| &s.declaration))?;
+            Ok(Some(idx))
+        }
+    }
+
+    /// Compose the layers: per slot, the effective [`BackendConfig`]
+    /// (declaration → retained observation → request) and the
+    /// [`BackendResolutionReceipt`], aligned 1:1 by index.
+    ///
+    /// * A requested destination CHANGE clears the cached observation —
+    ///   truth observed at one destination never rides to another; an
+    ///   identical requested destination retains it.
+    /// * The binding: an explicit `--backend-card` rebinds at the
+    ///   post-request destination to the requested-or-DECLARED model (never
+    ///   a probed one); otherwise the declared binding stands untouched —
+    ///   including under a model-only or endpoint-only request, whose
+    ///   visibility is a typed downstream decision, not an erasure here.
+    fn finish(mut self) -> (Vec<BackendConfig>, Vec<BackendResolutionReceipt>) {
+        self.attach_pending_probes();
+        let mut backends = Vec::with_capacity(self.slots.len());
+        let mut receipts = Vec::with_capacity(self.slots.len());
+        for slot in self.slots {
+            let declaration = DeclaredBackend::of(&slot.declaration);
+            let request = slot.request.as_ref().map(BackendRequest::from_override);
+            let destination = request
+                .as_ref()
+                .map(|r| r.destination_over(&declaration.destination))
+                .unwrap_or_else(|| declaration.destination.clone());
+            let observation = slot
+                .observation
+                .filter(|_| destination == declaration.destination);
+
+            let mut backend = slot.declaration;
+            if let Some(obs) = &observation {
+                overlay_observation(&mut backend, obs);
+            }
+            if let Some(over) = &slot.request {
+                over.overlay(&mut backend);
+                // Tier defaulting belongs to the EXCLUSIVE destination
+                // request only (a fresh/retargeted backend must actually
+                // serve). A field-only edit never invents tiers: an
+                // intentionally empty `tiers = []` declaration stays empty.
+                let exclusive = over.endpoint.is_some() || over.model_path.is_some();
+                if exclusive && backend.tiers.is_empty() {
+                    backend.tiers = vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review];
+                }
+            }
+            // Destination/kind coherence — the SAME normalization the
+            // targeting preview applies ([`normalize_destination_kind`]).
+            // Explicitly CONTRADICTORY requests were rejected in
+            // `apply_request`; this normalizes residual declared/probed kind
+            // after a destination changed around it.
+            normalize_destination_kind(&mut backend);
+
+            let binding = match &request {
+                Some(req) if req.card.is_some() => crate::model_card::CardBindingSeed {
+                    card: req.card.clone(),
+                    bound_model: req.model.clone().or_else(|| declaration.model.clone()),
+                    bound_destination: destination.clone(),
+                },
+                _ => crate::model_card::CardBindingSeed {
+                    card: declaration.card.clone(),
+                    bound_model: declaration.model.clone(),
+                    bound_destination: declaration.destination.clone(),
+                },
+            };
+            receipts.push(BackendResolutionReceipt {
+                declaration,
+                request,
+                observation,
+                binding,
+            });
+            backends.push(backend);
+        }
+        (backends, receipts)
+    }
+}
+
+/// Selection follows the request in EVERY composer: a destination request
+/// or a NAMED field-only edit makes its target the config-level selection
+/// (`default_backend`), so an exclusive request can never leave a stale
+/// default naming a discarded backend — with no CLI-installed
+/// `$NEWT_PROVIDER`, typed/receipt selection would otherwise resolve
+/// Unknown/None against a config that plainly contains the requested
+/// backend. An UNNAMED field-only edit already targeted the selected
+/// backend — nothing to move.
+fn pin_requested_selection(
+    cfg: &mut Config,
+    over: Option<&BackendOverride>,
+    requested_slot: Option<usize>,
+) {
+    let Some(over) = over.filter(|o| !o.is_empty()) else {
+        return;
+    };
+    if over.endpoint.is_some() || over.model_path.is_some() || over.name.is_some() {
+        if let Some(target) = requested_slot.and_then(|i| cfg.backends.get(i)) {
+            cfg.default_backend = Some(target.name.clone());
+        }
+    }
+}
+
+/// A runtime-resolved configuration: the flattened [`Config`] plus the
+/// per-backend provenance receipts, aligned **1:1 by slot** with
+/// `config.backends` — receipt `i` is about backend `i`, full stop. Never
+/// looked up by name or by `&BackendConfig` (both were how a receipt could
+/// end up describing the wrong backend). Immutably derefs to [`Config`];
+/// there is deliberately NO `DerefMut` — mutating the config would silently
+/// invalidate the receipts.
+#[derive(Debug, Clone)]
+pub struct ResolvedConfig {
+    config: Config,
+    receipts: Vec<BackendResolutionReceipt>,
+}
+
+/// One backend of a [`ResolvedConfig`]: the slot index, the effective
+/// backend, and its provenance receipt — the three always travel together.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedBackend<'a> {
+    /// The slot index into `config.backends` / the receipts.
+    pub slot: usize,
+    /// The effective (flattened) backend at that slot.
+    pub backend: &'a BackendConfig,
+    /// The provenance receipt for that slot.
+    pub receipt: &'a BackendResolutionReceipt,
+}
+
+impl std::ops::Deref for ResolvedConfig {
+    type Target = Config;
+    fn deref(&self) -> &Config {
+        &self.config
+    }
+}
+
+impl ResolvedConfig {
+    /// Discard the receipts and keep the flattened config — the
+    /// compatibility exit for consumers that predate receipts.
+    #[must_use]
+    pub fn into_config(self) -> Config {
+        self.config
+    }
+
+    /// A resolution of `config` AS-IS: pure declarations — no disk merge,
+    /// no CLI request, receipts minted 1:1 from each backend's own
+    /// declaration. The INFALLIBLE last-resort constructor for surfaces
+    /// that must render something even when resolution proper failed (the
+    /// TUI's `unwrap_or_default` lane); it validates nothing, exactly like
+    /// the bare `Config` it wraps.
+    #[must_use]
+    pub fn unrequested(config: Config) -> Self {
+        let receipts = config
+            .backends
+            .iter()
+            .map(|b| BackendResolutionReceipt {
+                declaration: DeclaredBackend::of(b),
+                request: None,
+                observation: None,
+                binding: crate::model_card::CardBindingSeed::from_backend(b),
+            })
+            .collect();
+        Self { config, receipts }
+    }
+
+    /// Test-support (doc-hidden, the `test_guard` precedent): run the
+    /// backend assembly over `config` + explicit drop-in `dirs` + an
+    /// explicit request, exactly as `resolve_runtime_unpublished` does but
+    /// without candidate-path/env IO — so dependent crates' tests can
+    /// build receipt-bearing resolutions deterministically.
+    ///
+    /// # Errors
+    /// The assembly's identity/destination/request errors.
+    #[doc(hidden)]
+    pub fn assemble_for_test(
+        mut config: Config,
+        dirs: &[&Path],
+        over: Option<BackendOverride>,
+    ) -> std::result::Result<Self, String> {
+        let mut assembly = BackendAssembly::new(std::mem::take(&mut config.backends))?;
+        for dir in dirs {
+            assembly.merge_dir(dir)?;
+        }
+        let default_backend = config.default_backend.clone();
+        let _slot = assembly.apply_request(over, default_backend.as_deref())?;
+        let (backends, receipts) = assembly.finish();
+        config.backends = backends;
+        Ok(Self { config, receipts })
+    }
+
+    /// Publish this resolution's process-global settings —
+    /// [`Config::publish_runtime_settings`] without giving up the receipts:
+    /// validate first, publish explicitly, keep selecting through the
+    /// receipt-bearing view.
+    pub fn publish_runtime_settings(&self) {
+        self.config.publish_runtime_settings();
+    }
+
+    /// The receipts, slot-aligned with `backends`.
+    #[must_use]
+    pub fn receipts(&self) -> &[BackendResolutionReceipt] {
+        &self.receipts
+    }
+
+    /// The backend at `slot`, with its receipt.
+    #[must_use]
+    pub fn backend(&self, slot: usize) -> Option<ResolvedBackend<'_>> {
+        match (self.config.backends.get(slot), self.receipts.get(slot)) {
+            (Some(backend), Some(receipt)) => Some(ResolvedBackend {
+                slot,
+                backend,
+                receipt,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Every backend, zipped with its receipt, in slot order.
+    pub fn backends(&self) -> impl Iterator<Item = ResolvedBackend<'_>> {
+        self.config
+            .backends
+            .iter()
+            .zip(self.receipts.iter())
+            .enumerate()
+            .map(|(slot, (backend, receipt))| ResolvedBackend {
+                slot,
+                backend,
+                receipt,
+            })
+    }
+
+    /// The backend [`Config::select_configured_backend`] would pick, WITH
+    /// its receipt — the same shared index selector, so the two can never
+    /// disagree about which backend was selected.
+    #[must_use]
+    pub fn selected_backend(&self) -> Option<ResolvedBackend<'_>> {
+        self.config
+            .selected_configured_slot()
+            .and_then(|slot| self.backend(slot))
+    }
+}
+
 /// CLI-supplied backend override (`newt --backend-*` flags). Each field mirrors
 /// an operator-settable [`BackendConfig`] field; `None` means "not set on the
 /// command line". Applied LAST in [`Config::resolve`] so it wins over disk
@@ -3302,56 +4546,83 @@ impl BackendOverride {
         *self == Self::default()
     }
 
-    /// Apply to a resolved config.
-    ///
-    /// When a destination is given (`endpoint` or `model_path`), the override
-    /// defines an **exclusive** backend that REPLACES all others — so CLI intent
-    /// beats disk drop-ins and localhost discovery, and no later probe write-back
-    /// can misroute the session. Tiers default to all four when unset so the
-    /// backend actually serves. Without a destination the provided fields
-    /// **override in place** the backend named by `name` (else the first
-    /// backend), e.g. `--backend-model` to swap only the model.
+    /// Apply to a resolved config — the INFALLIBLE compatibility surface:
+    /// delegates to [`BackendOverride::try_apply`] (the one invariant-owning
+    /// composer) and, when the request is refused (both/empty destinations,
+    /// a contradictory kind, a named backend that does not exist, duplicate
+    /// names), warns and leaves the config untouched. It can no longer
+    /// violate the XOR/nonempty/shared-selector/named-miss semantics the
+    /// assembly enforces.
     pub fn apply(&self, cfg: &mut Config) {
+        if let Err(e) = self.try_apply(cfg) {
+            tracing::warn!(error = %e, "--backend-* override not applied");
+        }
+    }
+
+    /// Apply to a resolved config through the SAME backend-assembly path
+    /// `Config::resolve_runtime` uses — one composer, one set of
+    /// invariants:
+    ///
+    /// * a destination request (`--backend-url` XOR `--backend-model-path`,
+    ///   nonempty, kind-coherent) defines an **exclusive** backend that
+    ///   REPLACES all others;
+    /// * a field-only request edits the NAMED backend (a name matching
+    ///   nothing is an error, never a silent no-op) or, unnamed, the
+    ///   backend the shared selection precedence picks — never "index 0";
+    /// * destination/kind coherence is normalized exactly as in
+    ///   `resolve_runtime` (a model_path route is Embedded; an endpoint
+    ///   route never retains Embedded).
+    ///
+    /// On error the config is byte-for-byte untouched.
+    ///
+    /// # Errors
+    /// Duplicate/empty backend names; both or empty destinations; a
+    /// contradictory destination/kind pair; a named or explicitly selected
+    /// target that does not exist or cannot be routed.
+    pub fn try_apply(&self, cfg: &mut Config) -> std::result::Result<(), String> {
         if self.is_empty() {
-            return;
+            return Ok(());
         }
-        // An explicit `--backend-*` flag is operator configuration — the
-        // session is no longer running on the bare compiled-in fallback.
-        cfg.backend_fallback = false;
-        let name = self.name.clone().unwrap_or_else(|| "cli".to_string());
-        let has_destination = self.endpoint.is_some() || self.model_path.is_some();
-
-        if has_destination {
-            let mut backend = cfg
-                .backends
-                .iter()
-                .find(|b| b.name == name)
-                .cloned()
-                .unwrap_or_else(|| BackendConfig {
-                    name: name.clone(),
-                    ..Default::default()
-                });
-            backend.name = name;
-            self.overlay(&mut backend);
-            if backend.tiers.is_empty() {
-                backend.tiers = vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review];
+        let original = cfg.backends.clone();
+        let mut assembly = match BackendAssembly::new(std::mem::take(&mut cfg.backends)) {
+            Ok(assembly) => assembly,
+            Err(e) => {
+                cfg.backends = original;
+                return Err(e);
             }
-            cfg.backends = vec![backend];
-            return;
-        }
-
-        // Field-only override: mutate the named backend (else the first) in place.
-        let idx = match self.name.as_deref() {
-            Some(n) => cfg.backends.iter().position(|b| b.name == n),
-            None => (!cfg.backends.is_empty()).then_some(0),
         };
-        if let Some(i) = idx {
-            self.overlay(&mut cfg.backends[i]);
+        let default_backend = cfg.default_backend.clone();
+        let applied = assembly.apply_request(Some(self.clone()), default_backend.as_deref());
+        let (backends, _receipts) = assembly.finish();
+        match applied {
+            Ok(target) => {
+                cfg.backends = backends;
+                // An explicit `--backend-*` flag is operator configuration —
+                // the session is no longer on the bare compiled-in fallback.
+                cfg.backend_fallback = false;
+                // The one selection-follows-the-request rule, shared with
+                // the runtime composers (the binary additionally sets
+                // $NEWT_PROVIDER).
+                pin_requested_selection(cfg, Some(self), target);
+                Ok(())
+            }
+            Err(e) => {
+                cfg.backends = original;
+                Err(e)
+            }
         }
     }
 
     /// Copy every set field onto `backend` (leaving unset fields untouched).
+    /// A requested destination REPLACES the destination axis whole: both
+    /// effective fields are cleared before the requested one installs, so an
+    /// HTTP→embedded (or embedded→HTTP) retarget cannot retain the opposite
+    /// field and leave the backend pointing two places at once.
     fn overlay(&self, backend: &mut BackendConfig) {
+        if self.endpoint.is_some() || self.model_path.is_some() {
+            backend.endpoint = String::new();
+            backend.model_path = None;
+        }
         if let Some(v) = &self.endpoint {
             backend.endpoint = v.clone();
         }
@@ -3586,6 +4857,13 @@ pub enum SelectionOutcome<'a> {
     Selected(SelectedBackend<'a>),
     /// An explicit selector named something that matches no configured entry.
     UnknownNamed(String),
+    /// An explicit selector (`$NEWT_PROVIDER` / `default_backend`) named a
+    /// configured backend that has NEITHER an endpoint NOR an embedded
+    /// `model_path` — there is nothing to route to, and an explicit
+    /// selection is authoritative, so silently running some other backend
+    /// is as wrong as it is for `UnknownNamed`. The caller MUST surface it:
+    /// fix the backend (give it a destination) or the selector.
+    UnroutableNamed(String),
     /// Nothing explicitly selected and nothing configured qualified.
     Unset,
 }
@@ -3595,7 +4873,8 @@ pub enum SelectionOutcome<'a> {
 // ---------------------------------------------------------------------------
 
 /// Write one backend as a per-file drop-in `<config dir>/backends/<name>.toml`
-/// (#1140, epic #1126) — the shape `merge_backends_from_dir` reads back. The
+/// (#1140, epic #1126) — the shape the backend assembly's drop-in merge reads
+/// back. The
 /// canonical writer for `newt init` / `newt setup`: one endpoint, one file,
 /// provenance-stamped by the caller. Returns the written path.
 pub fn write_backend_dropin(
@@ -3621,89 +4900,565 @@ fn write_backend_dropin_unlocked(
     let path = dir.join(format!("{}.toml", backend.name));
     let destination = crate::atomic_fs::ResolvedPath::resolve(&path)
         .map_err(|e| format!("resolve {}: {e:#}", path.display()))?;
-    let body = toml::to_string(backend).map_err(|e| format!("serialize backend: {e}"))?;
+    // Every canonical operator write is TAGGED `operator_v1` —
+    // UNCONDITIONALLY, injected at the file boundary by the ONE shared
+    // renderer ([`render_operator_backend_dropin`]). `BackendConfig`
+    // carries no `record` field at all, so there is no in-memory tag to
+    // launder through this channel; probe persistence has its own API
+    // ([`persist_probe_observation`]).
+    let body = render_operator_backend_dropin(backend)?;
     destination
         .atomic_write(body.as_bytes())
         .map_err(|e| format!("write {}: {e:#}", path.display()))?;
     Ok(path)
 }
 
-/// Persist probed backend fields into `~/.newt/backends/<name>.toml` (or
-/// `$NEWT_CONFIG_DIR/backends/<name>.toml`) — never into the main
-/// `config.toml`. Reset = delete that one file.
+/// Who owns a backend drop-in FILE — the public ownership view for setup /
+/// panel surfaces ("may I edit this file?", "is this a probe cache?"),
+/// without exposing the raw on-disk tag vocabulary. Ownership is about the
+/// FILE: [`crate::BackendConfig`] deliberately carries no tag, so this is
+/// decided from raw text ([`classify_backend_dropin`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DropinOwnership {
+    /// Operator-owned: explicitly tagged as operator configuration, or
+    /// untagged (hand-authored files and every legacy operator writer).
+    /// Panels may edit it; the probe writeback never touches it.
+    Operator,
+    /// Machine-owned probe record: explicitly tagged, or the unambiguous
+    /// legacy probe cache. The runtime rewrites it wholesale; delete (or
+    /// [`claim_backend_dropin_as_operator`]) to take it over.
+    Probe,
+}
+
+/// Classify a backend drop-in file's raw text — the SAME ownership decision
+/// the loader and [`persist_probe_observation`] make, exposed for panel /
+/// setup surfaces. Ownership only: a probe-owned file that later fails the
+/// strict probe schema is still probe-owned (and will be skipped, not
+/// reinterpreted, by the loader).
 ///
-/// Merges into an existing drop-in of the same name (preserving auth refs and
-/// any operator-set fields not in `patch`), else creates a new minimal drop-in
-/// from `patch`. Returns the written path, or `None` when there is no user
-/// config dir / empty name.
-pub fn writeback_probed_backend(
-    patch: &BackendConfig,
-) -> std::result::Result<Option<std::path::PathBuf>, String> {
-    if patch.name.trim().is_empty() {
-        return Ok(None);
+/// # Errors
+/// Malformed TOML, and the legacy ambiguity (the exact old newt-adopt probe
+/// marker beside binding/operator evidence) with both remediations.
+pub fn classify_backend_dropin(text: &str) -> std::result::Result<DropinOwnership, String> {
+    match disk_record_tag(text)? {
+        Some(RecordTag::ProbeV1) => Ok(DropinOwnership::Probe),
+        Some(RecordTag::OperatorV1) => Ok(DropinOwnership::Operator),
+        None => {
+            let backend = toml::from_str::<BackendConfig>(text).map_err(|e| e.to_string())?;
+            match classify_untagged_dropin(&backend, text)? {
+                DropinOwner::Operator => Ok(DropinOwnership::Operator),
+                DropinOwner::Probe => Ok(DropinOwnership::Probe),
+            }
+        }
+    }
+}
+
+/// The canonical operator drop-in body: the ownership stamp as the first
+/// top-level key (always valid TOML), then the backend's serialization,
+/// byte-identical to serializing `backend` alone. The ONE producer of
+/// operator-record bytes — [`write_backend_dropin`] writes exactly this,
+/// and a panel/setup surface that builds file bodies itself must use it
+/// rather than hand-roll the stamp.
+///
+/// # Errors
+/// Serialization failure, as a human-readable string.
+pub fn render_operator_backend_dropin(
+    backend: &BackendConfig,
+) -> std::result::Result<String, String> {
+    let serialized = toml::to_string(backend).map_err(|e| format!("serialize backend: {e}"))?;
+    Ok(format!("record = \"operator_v1\"\n{serialized}"))
+}
+
+/// Claim a drop-in file as OPERATOR configuration — retag a probe record
+/// (or tag an untagged file) **preserving comments, key order, and every
+/// key newt does not model**, unlike a serde round-trip. The panel's "keep
+/// this probed result as my configuration" edit; idempotent on a file that
+/// is already operator-tagged.
+///
+/// # Errors
+/// Text that is not valid TOML.
+pub fn claim_backend_dropin_as_operator(text: &str) -> std::result::Result<String, String> {
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("backend drop-in is not valid TOML: {e}"))?;
+    let root = doc.as_table_mut();
+    match root.get_mut("record") {
+        // Retag IN PLACE, keeping the existing value's decor — the trailing
+        // comment on `record = "probe_v1"  # ownership note` is the
+        // operator's annotation, and a blunt replacement would drop it.
+        Some(item) if item.is_value() => {
+            let value = item.as_value_mut().expect("checked is_value");
+            let decor = value.decor().clone();
+            *value = toml_edit::Value::from("operator_v1");
+            *value.decor_mut() = decor;
+        }
+        // A `[record]` table or `[[record]]` array is NOT an ownership tag
+        // — refuse rather than overwrite someone's data with a stamp.
+        Some(_) => {
+            return Err(
+                "this drop-in has a `[record]` table/array where the ownership tag \
+                 would go — refusing to overwrite it; rename or remove that table \
+                 first, then claim the file"
+                    .to_string(),
+            );
+        }
+        // Absent: stamp a fresh top-level key.
+        None => {
+            root.insert("record", toml_edit::value("operator_v1"));
+        }
+    }
+    Ok(doc.to_string())
+}
+
+/// What a session probe/adoption OBSERVED — the ONLY thing the runtime may
+/// persist about a backend. Typed so an unpersistable fact is
+/// unrepresentable: only an [`ProbedServing::Instance`] carries a model
+/// (one artifact = backend truth); a multiplexer's per-session pick and an
+/// unestablished axis have no model field to persist at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeObservation {
+    /// The configured backend the observation is about (the drop-in filename).
+    pub name: String,
+    /// The endpoint the probe actually spoke to — the association key.
+    pub endpoint: String,
+    /// The detected wire protocol, when the probe established one.
+    pub kind: Option<BackendKind>,
+    /// The detected OpenAI HTTP surface, when probed.
+    pub api: Option<OpenAiApi>,
+    /// The observed serving principal.
+    pub serving: ProbedServing,
+}
+
+/// The serving principal a probe observed — the typed gate on model
+/// persistence (see [`ProbeObservation`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbedServing {
+    /// A single-artifact server; its model IS backend truth and may persist.
+    Instance { model: Option<String> },
+    /// A multi-model server; the adopted model is a per-session pick and has
+    /// no field here to persist through.
+    Multiplexer,
+    /// Serving was not established — nothing about the axis persists.
+    Unknown,
+}
+
+impl ProbeObservation {
+    /// The `(serving, model)` axis pair this observation's typed principal
+    /// flattens to — the ONLY conversion, so "model iff Instance" holds by
+    /// construction everywhere the observation is applied or serialized.
+    #[must_use]
+    pub fn serving_axis(&self) -> (Option<Serving>, Option<String>) {
+        match &self.serving {
+            ProbedServing::Instance { model } => (Some(Serving::Instance), model.clone()),
+            ProbedServing::Multiplexer => (Some(Serving::Multiplexer), None),
+            ProbedServing::Unknown => (None, None),
+        }
+    }
+}
+
+/// The `record = "probe_v1"` machine record an observation serializes as —
+/// only observed fields, never card/capability/auth/tiers/managed/host.
+/// Pure; [`persist_probe_observation`] owns the IO.
+fn probe_machine_record(observation: &ProbeObservation) -> ProbeRecordV1 {
+    let (serving, model) = observation.serving_axis();
+    ProbeRecordV1 {
+        name: Some(observation.name.clone()),
+        endpoint: observation.endpoint.clone(),
+        kind: observation.kind,
+        api: observation.api,
+        serving,
+        model,
+        tiers: Vec::new(),
+        record: Some(RecordTag::ProbeV1),
+        provenance: Some(ProbeProvenanceV1 {
+            source: Some(format!(
+                "newt adopt v{} (probe_v1 overlay; delete this file to reset)",
+                crate::build_info::VERSION_WITH_COMMIT
+            )),
+            probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+            derived_serving: serving.map(|_| true),
+        }),
+    }
+}
+
+/// Who an UNTAGGED drop-in belongs to (files written before [`RecordTag`]
+/// existed).
+#[derive(Debug)]
+enum DropinOwner {
+    Operator,
+    Probe,
+}
+
+/// The fully anchored EXACT marker the old runtime writeback stamped:
+/// `newt adopt v{version} (probed; delete this file to reset)` — prefix and
+/// suffix both anchored, nonempty version between. A near-prefix, a
+/// near-suffix, or any custom source is NOT this marker.
+fn is_legacy_adopt_probe_marker(source: &str) -> bool {
+    source
+        .strip_prefix("newt adopt v")
+        .and_then(|rest| rest.strip_suffix(" (probed; delete this file to reset)"))
+        .is_some_and(|version| !version.is_empty())
+}
+
+/// Classify an untagged backend drop-in. **Untagged is Operator by
+/// default** — the hand-authored file, the old `newt setup v{…}` /
+/// `newt init v{…}` / provider-preset (`newt setup v{…} (preset {name})`)
+/// writers, and every custom or probe-stamped source alike: a generic
+/// `provenance.probed` timestamp proves nothing (operator writers stamped
+/// one too) and is never branched on.
+///
+/// The ONE exception is the fully anchored exact historical newt-adopt
+/// probe marker ([`is_legacy_adopt_probe_marker`]). A file carrying exactly
+/// that marker is judged on its RAW key shape (`text`, through the strict
+/// [`ProbeRecordV1`] whitelist — the permissive [`BackendConfig`] parse
+/// silently DROPS unknown evidence and must not decide this):
+///
+/// * the strict MODEL-LESS probe shape (endpoint/kind/api/serving only,
+///   empty `tiers`, no unknown keys top-level or under `[provenance]`) →
+///   the legacy probe cache, [`DropinOwner::Probe`] — overlaid under
+///   today's probe rules and migrated on next writeback;
+/// * ANYTHING else beside the marker — a `model` (whatever the serving
+///   axis), a `card`, auth/tiers/managed/…, or any UNKNOWN key (evidence
+///   the old writer never produced) — is genuinely ambiguous: hard-error
+///   with both remediations rather than guess.
+fn classify_untagged_dropin(
+    b: &BackendConfig,
+    text: &str,
+) -> std::result::Result<DropinOwner, String> {
+    let source = b
+        .provenance
+        .as_ref()
+        .and_then(|p| p.source.as_deref())
+        .unwrap_or("");
+    if !is_legacy_adopt_probe_marker(source) {
+        return Ok(DropinOwner::Operator);
+    }
+    let strict = toml::from_str::<ProbeRecordV1>(text);
+    if let Ok(record) = &strict {
+        if record.model.is_none() && record.tiers.is_empty() {
+            return Ok(DropinOwner::Probe);
+        }
+    }
+    let carried = match (b.model.is_some(), b.card.is_some(), strict.is_err()) {
+        (true, true, _) => "a model and a card",
+        (true, false, _) => "a model",
+        (false, true, _) => "a card",
+        (false, false, true) => "keys outside the old probe cache's raw shape",
+        (false, false, false) => "operator fields beside the probe marker",
+    };
+    Err(format!(
+        "this backend drop-in carries the old newt-adopt probe marker but also \
+         {carried} — written by an older newt, its declarations cannot be \
+         attributed: as an operator record (A) they replace the configured \
+         backend wholesale; as a probe overlay (B) they are per-session residue \
+         that must be discarded. Refusing to guess — delete the file to \
+         re-probe, or add `record = \"operator_v1\"` to claim it as \
+         configuration."
+    ))
+}
+
+/// A probe record may carry ONLY what a probe can observe: `endpoint` (the
+/// association key, nonempty), `kind`, `api`, `serving`, and `model` iff
+/// `serving = "instance"`. Enforced on load AND around every write, so a
+/// hand-edited or corrupted `probe_v1` file cannot smuggle operator fields
+/// through the machine-owned channel.
+fn validate_probe_record(r: &ProbeRecordV1) -> std::result::Result<(), String> {
+    if r.endpoint.trim().is_empty() {
+        return Err("probe record has no endpoint (the association key)".to_string());
+    }
+    if r.model.is_some() && r.serving != Some(Serving::Instance) {
+        return Err(
+            "probe record carries a model without serving = \"instance\" — only an \
+             instance's model is backend truth"
+                .to_string(),
+        );
+    }
+    // Operator-owned keys are UNREPRESENTABLE in [`ProbeRecordV1`] (denied
+    // at parse). The one legacy leftover the schema tolerates on read is an
+    // empty `tiers = []`; a NONEMPTY one is operator configuration.
+    if !r.tiers.is_empty() {
+        return Err(
+            "probe record carries operator-owned field `tiers` — a probe overlay may \
+             hold only endpoint/kind/api/serving (plus an instance's model)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The PRIVATE raw header of a backend drop-in file — the only place the
+/// `record` ownership key is read. [`BackendConfig`] deliberately does NOT
+/// carry the tag: ownership is a property of the FILE, decided at the disk
+/// boundary, and a tag smuggled through the in-memory config type was how a
+/// probe record could try to launder itself through the operator writer.
+#[derive(Deserialize)]
+struct DiskRecordHeader {
+    #[serde(default)]
+    record: Option<RecordTag>,
+}
+
+/// The `record` tag of a drop-in's raw text, if any. Unknown sibling keys
+/// are ignored — this reads the header, nothing else.
+fn disk_record_tag(text: &str) -> std::result::Result<Option<RecordTag>, String> {
+    toml::from_str::<DiskRecordHeader>(text)
+        .map(|h| h.record)
+        .map_err(|e| e.to_string())
+}
+
+/// The strict machine-record schema for a probe drop-in — a
+/// `deny_unknown_fields` mirror of the probe-legal subset of
+/// [`BackendConfig`]. [`BackendConfig`] itself tolerates unknown TOML keys
+/// (forward compatibility for operator files), which means parsing a probe
+/// record through it silently DROPS whatever a hand-edit smuggled in —
+/// [`validate_probe_record`] can only reject what survives the parse. Probe
+/// records are machine-owned, so they get the opposite contract: an unknown
+/// key is a hard parse error, an operator-owned key doubly so (it is
+/// unknown HERE by construction).
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeRecordV1 {
+    /// The filename stem is authoritative, but the body may repeat it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default)]
+    endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<BackendKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api: Option<OpenAiApi>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    serving: Option<Serving>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    /// Accepted on READ only: the old writeback serialized its
+    /// `BackendConfig` patch verbatim, so genuine legacy probe caches carry
+    /// a literal `tiers = []`. [`validate_probe_record`] still rejects a
+    /// NONEMPTY value; the writer never emits the key again.
+    #[serde(default, skip_serializing)]
+    tiers: Vec<Tier>,
+    /// Absent on a legacy (pre-[`RecordTag`]) probe cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    record: Option<RecordTag>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provenance: Option<ProbeProvenanceV1>,
+}
+
+/// Strict mirror of [`BackendProvenance`] for probe records — the parent is
+/// permissive (operator files get forward compatibility), so reusing it
+/// here would let unknown NESTED keys deserialize away and the strictness
+/// of [`ProbeRecordV1`] would stop one level deep.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeProvenanceV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    probed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    derived_serving: Option<bool>,
+}
+
+/// Parse the raw text of a probe-owned drop-in through the strict
+/// [`ProbeRecordV1`] schema. Callers still run [`validate_probe_record`] on
+/// the result (endpoint nonempty, model iff instance) — this layer's job is
+/// the key set, which the permissive [`BackendConfig`] parse cannot police.
+fn parse_probe_record(text: &str) -> std::result::Result<ProbeRecordV1, String> {
+    let r: ProbeRecordV1 =
+        toml::from_str(text).map_err(|e| format!("not a valid probe record: {e}"))?;
+    validate_probe_record(&r).map(|()| r)
+}
+
+impl ProbeRecordV1 {
+    /// The typed observation a validated record attests — `name` supplied by
+    /// the caller (the filename stem is authoritative for drop-ins).
+    fn to_observation(&self, name: &str) -> ProbeObservation {
+        ProbeObservation {
+            name: name.to_string(),
+            endpoint: self.endpoint.clone(),
+            kind: self.kind,
+            api: self.api,
+            serving: match (self.serving, &self.model) {
+                (Some(Serving::Instance), model) => ProbedServing::Instance {
+                    model: model.clone(),
+                },
+                (Some(Serving::Multiplexer), _) => ProbedServing::Multiplexer,
+                (None, _) => ProbedServing::Unknown,
+            },
+        }
+    }
+}
+
+/// The visible outcome of a probe writeback — persistence is explicitly
+/// owned, so "did not write" states are typed, never silent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeWriteback {
+    /// The probe_v1 record was created or updated at this path.
+    Written(std::path::PathBuf),
+    /// The same-name path is operator-owned (`operator_v1` or untagged) —
+    /// its bytes and comments were left untouched.
+    SkippedOperatorOwned(std::path::PathBuf),
+    /// No user config dir, or an unnamed backend — nothing to persist to.
+    NotWritten,
+}
+
+/// Persist a probe observation as `~/.newt/backends/<name>.toml` (or under
+/// `$NEWT_CONFIG_DIR`) — never into the main `config.toml`. Reset = delete
+/// that one file.
+///
+/// Creates or updates ONLY probe-owned files. An existing same-name file
+/// that is operator-owned (tagged `operator_v1`, or untagged and classified
+/// operator — same classifier as the loader) is returned as
+/// [`ProbeWriteback::SkippedOperatorOwned`] byte-for-byte untouched — the
+/// runtime never rewrites operator configuration. An unambiguous LEGACY
+/// probe cache (untagged, exact old adopt marker, probe-shaped) is treated
+/// as the prior probe record and MIGRATES to tagged `probe_v1` on this
+/// write; the genuinely ambiguous legacy file hard-errors with both
+/// remediations, exactly as on load. An update re-serializes the probe
+/// schema, carrying forward the prior probe file's `kind`/`api` only when
+/// its endpoint equals this observation's — `serving`/`model` are NEVER
+/// carried, so an Instance-observed model is REMOVED the moment a later
+/// observation sees a multiplexer (or nothing).
+///
+/// # Errors
+/// Lock/read/parse/serialize/write failures — and the legacy ambiguity —
+/// as human-readable strings.
+pub fn persist_probe_observation(
+    observation: &ProbeObservation,
+) -> std::result::Result<ProbeWriteback, String> {
+    if observation.name.trim().is_empty() {
+        return Ok(ProbeWriteback::NotWritten);
     }
     let Some(config_path) = Config::user_config_path() else {
-        return Ok(None);
+        return Ok(ProbeWriteback::NotWritten);
     };
     let config_destination = crate::atomic_fs::ResolvedPath::resolve(&config_path)
         .map_err(|error| format!("resolve config destination: {error:#}"))?;
     let _lock = crate::atomic_fs::acquire_lock(&config_destination.lock_path())
         .map_err(|error| format!("lock {}: {error:#}", config_path.display()))?;
     let dir = config_path.with_file_name("backends");
-    let path = dir.join(format!("{}.toml", patch.name));
+    let path = dir.join(format!("{}.toml", observation.name));
     let destination = crate::atomic_fs::ResolvedPath::resolve(&path)
         .map_err(|e| format!("resolve {}: {e:#}", path.display()))?;
-    let mut merged = if destination.as_path().is_file() {
+    let mut merged = probe_machine_record(observation);
+    if destination.as_path().is_file() {
         let text = std::fs::read_to_string(destination.as_path())
             .map_err(|e| format!("read {}: {e}", path.display()))?;
-        toml::from_str::<BackendConfig>(&text)
-            .map_err(|e| format!("parse {}: {e}", path.display()))?
-    } else {
-        BackendConfig {
-            name: patch.name.clone(),
-            endpoint: patch.endpoint.clone(),
-            ..Default::default()
+        // Ownership is decided the SAME way the loader decides it — the raw
+        // `record` header, else the legacy classifier — or an unambiguous
+        // legacy probe cache would permanently block refresh.
+        let owned_by_probe =
+            match disk_record_tag(&text).map_err(|e| format!("parse {}: {e}", path.display()))? {
+                Some(RecordTag::ProbeV1) => true,
+                Some(RecordTag::OperatorV1) => false,
+                None => {
+                    let prior = toml::from_str::<BackendConfig>(&text)
+                        .map_err(|e| format!("parse {}: {e}", path.display()))?;
+                    match classify_untagged_dropin(&prior, &text) {
+                        Ok(DropinOwner::Probe) => true,
+                        Ok(DropinOwner::Operator) => false,
+                        Err(reason) => return Err(format!("{}: {reason}", path.display())),
+                    }
+                }
+            };
+        if !owned_by_probe {
+            return Ok(ProbeWriteback::SkippedOperatorOwned(path));
         }
-    };
-    // Filename stem is authoritative.
-    merged.name = patch.name.clone();
-    if !patch.endpoint.is_empty() {
-        merged.endpoint = patch.endpoint.clone();
+        let prior = parse_probe_record(&text).map_err(|e| {
+            format!(
+                "{}: existing probe record is invalid ({e}) — delete it to re-probe",
+                path.display()
+            )
+        })?;
+        // Prior fields may be reused only for the SAME endpoint — an
+        // endpoint change means every prior observation was about some
+        // other server. serving/model are NEVER carried forward at all:
+        // stale principal evidence must not be re-stamped under a fresh
+        // probe date (an Unknown/model-less observation writes an
+        // empty-principal record, it does not refresh the old one).
+        if prior.endpoint == observation.endpoint {
+            merged.kind = merged.kind.or(prior.kind);
+            merged.api = merged.api.or(prior.api);
+        }
     }
-    if patch.kind.is_some() {
-        merged.kind = patch.kind;
-    }
-    if patch.api.is_some() {
-        merged.api = patch.api;
-    }
-    if patch.model.is_some() {
-        merged.model = patch.model.clone();
-    }
-    if patch.serving.is_some() {
-        merged.serving = patch.serving;
-    }
-    if patch.api_key_env.is_some() {
-        merged.api_key_env = patch.api_key_env.clone();
-    }
-    if patch.api_key_file.is_some() {
-        merged.api_key_file = patch.api_key_file.clone();
-    }
-    merged.provenance = Some(BackendProvenance {
-        source: Some(format!(
-            "newt adopt v{} (probed; delete this file to reset)",
-            crate::build_info::VERSION_WITH_COMMIT
-        )),
-        probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
-        derived_serving: patch
-            .serving
-            .map(|_| true)
-            .or_else(|| merged.provenance.as_ref().and_then(|p| p.derived_serving)),
-    });
-    let body = toml::to_string(&merged).map_err(|e| format!("serialize backend: {e}"))?;
+    validate_probe_record(&merged)
+        .map_err(|e| format!("refusing to write an invalid probe record: {e}"))?;
+    let body = toml::to_string(&merged).map_err(|e| format!("serialize probe record: {e}"))?;
     destination
         .atomic_write(body.as_bytes())
         .map_err(|e| format!("write {}: {e:#}", path.display()))?;
-    Ok(Some(path))
+    Ok(ProbeWriteback::Written(path))
+}
+
+/// Deprecated compatibility shim for the pre-#1819 writeback API, which
+/// took a raw [`BackendConfig`] patch and merged it into the drop-in. The
+/// typed channel is [`persist_probe_observation`]; this shim converts the
+/// patch — and REFUSES, before any write, a patch the typed channel cannot
+/// represent, instead of reporting a lossy conversion as success:
+///
+/// * a `model` without `serving = "instance"` (a per-session pick is not
+///   persistable backend truth);
+/// * any operator-owned field (card, capability, auth, tiers, managed,
+///   host, coexist, ram_gib, engine, model_path).
+///
+/// An operator-owned same-name file is likewise an ERROR naming the path —
+/// the old API's `Ok(Some(path))` meant "persisted", and silently not
+/// persisting is not compatibility. `Ok(None)` is returned only for the
+/// true nothing-to-do cases (unnamed backend, no user config dir).
+#[deprecated(note = "use persist_probe_observation — probe persistence is typed (#1819)")]
+pub fn writeback_probed_backend(
+    patch: &BackendConfig,
+) -> std::result::Result<Option<std::path::PathBuf>, String> {
+    if patch.model.is_some() && patch.serving != Some(Serving::Instance) {
+        return Err(
+            "probe writeback carries a model without serving = \"instance\" — only an \
+             instance's model is backend truth; use persist_probe_observation"
+                .to_string(),
+        );
+    }
+    let operator_owned: &[(&str, bool)] = &[
+        ("card", patch.card.is_some()),
+        ("capability", patch.capability.is_some()),
+        ("api_key_env", patch.api_key_env.is_some()),
+        ("api_key_file", patch.api_key_file.is_some()),
+        ("managed", patch.managed.is_some()),
+        ("host", patch.host.is_some()),
+        ("coexist", patch.coexist.is_some()),
+        ("ram_gib", patch.ram_gib.is_some()),
+        ("engine", patch.engine.is_some()),
+        ("model_path", patch.model_path.is_some()),
+        ("tiers", !patch.tiers.is_empty()),
+    ];
+    if let Some((field, _)) = operator_owned.iter().find(|(_, present)| *present) {
+        return Err(format!(
+            "probe writeback carries operator-owned field `{field}` — a probe record may \
+             hold only endpoint/kind/api/serving (plus an instance's model); use \
+             write_backend_dropin for operator configuration"
+        ));
+    }
+    let serving = match patch.serving {
+        Some(Serving::Instance) => ProbedServing::Instance {
+            model: patch.model.clone(),
+        },
+        Some(Serving::Multiplexer) => ProbedServing::Multiplexer,
+        None => ProbedServing::Unknown,
+    };
+    let observation = ProbeObservation {
+        name: patch.name.clone(),
+        endpoint: patch.endpoint.clone(),
+        kind: patch.kind,
+        api: patch.api,
+        serving,
+    };
+    match persist_probe_observation(&observation)? {
+        ProbeWriteback::Written(path) => Ok(Some(path)),
+        ProbeWriteback::SkippedOperatorOwned(path) => Err(format!(
+            "{}: the same-name drop-in is operator-owned — the probe record was NOT \
+             written (delete the file, or keep it and stop probing this backend)",
+            path.display()
+        )),
+        ProbeWriteback::NotWritten => Ok(None),
+    }
 }
 
 /// The last-resort localhost Ollama backend: used both as `Config::default()`'s
@@ -3796,8 +5551,10 @@ impl Config {
     /// first-match behavior. Returns `Config::default()` if nothing is found.
     /// True when no operator-supplied inference backend exists anywhere: no
     /// inline `[[backends]]` in any config file, no `backends/*.toml`
-    /// drop-in, no `--backend-*` CLI override — the backend list is exactly
-    /// the compiled-in localhost fallback. This is the first-run wizard's
+    /// drop-in, no `[[providers]]`, no `--backend-*` CLI override — the
+    /// backend list is exactly the compiled-in localhost fallback (which is
+    /// synthesized ONLY in that fully-bare case; a provider-only config is
+    /// configured and gets no synthetic backend). This is the first-run wizard's
     /// "nothing configured" predicate: [`Config::resolve`] otherwise silently
     /// invents a localhost Ollama, so a missing config was never observable
     /// as a state. Meaningful only on a config produced by `resolve()`.
@@ -3807,6 +5564,31 @@ impl Config {
     }
 
     pub fn resolve() -> Result<Self> {
+        Self::resolve_runtime().map(ResolvedConfig::into_config)
+    }
+
+    /// [`Config::resolve_runtime_unpublished`] plus the process-global
+    /// publication — the full runtime resolution, receipts kept.
+    ///
+    /// # Errors
+    /// Any config-load error `resolve` itself would surface.
+    pub fn resolve_runtime() -> Result<ResolvedConfig> {
+        let resolved = Self::resolve_runtime_unpublished()?;
+        resolved.publish_runtime_settings();
+        Ok(resolved)
+    }
+
+    /// The full disk resolution WITH per-backend provenance receipts and
+    /// WITHOUT the process-global publication: file layering, then the
+    /// backend assembly (identity validation → operator drop-in replacement
+    /// → exact probe observation → CLI request), receipts aligned 1:1 with
+    /// `backends`. For consumers that must resolve and VALIDATE (backend
+    /// pick, card binding, principal decision) before anything touches
+    /// process-global state — publish explicitly afterwards.
+    ///
+    /// # Errors
+    /// Any config-load error `resolve` itself would surface.
+    pub fn resolve_runtime_unpublished() -> Result<ResolvedConfig> {
         let base_path = Self::candidate_paths().into_iter().find(|p| p.is_file());
         // #1301 trust boundary: is the chosen base the AMBIENT cwd-relative
         // `./newt.toml` fallthrough (a freshly cloned repo can ship one at its
@@ -3915,14 +5697,48 @@ impl Config {
         // `config.toml` edit, and no overlapping inline `[[backends]]` to
         // hand-deconflict. Runs first so disk loadouts/crews can name a disk
         // backend's provider.
-        cfg.merge_disk_backends();
+        // The backend assembly: identity validation FIRST (name-keyed
+        // machinery is unsound on duplicate/empty names), then per-file
+        // drop-ins from the `backends/` dirs next to the config —
+        // `~/.newt/backends/*.toml` first, then the project
+        // `.newt/backends/` (so project overrides home overrides inline
+        // `[[backends]]`).
+        let mut assembly =
+            BackendAssembly::new(std::mem::take(&mut cfg.backends)).map_err(NewtError::Config)?;
+        validate_provider_names(&cfg.providers).map_err(NewtError::Config)?;
+        if let Some(dir) = Self::user_config_dir() {
+            assembly
+                .merge_dir(&dir.join("backends"))
+                .map_err(NewtError::Config)?;
+        }
+        if let Some(proj) = Self::project_config_path() {
+            if let Some(parent) = proj.parent() {
+                assembly
+                    .merge_dir(&parent.join("backends"))
+                    .map_err(NewtError::Config)?;
+            }
+        }
+        // A successfully merged operator drop-in is operator-supplied
+        // configuration — the resolved backend list is no longer the bare
+        // compiled-in fallback (see `is_unconfigured`).
+        if assembly.operator_configured() {
+            cfg.backend_fallback = false;
+        }
         // Localhost fallback: a config that declared no inline `[[backends]]`
         // deserializes to empty (see the field doc); if no drop-in supplied one
-        // either, restore the bare-install localhost Ollama so newt still has a
-        // backend to talk to.
-        if cfg.backends.is_empty() {
-            cfg.backend_fallback = true;
-            cfg.backends.push(fallback_localhost_backend());
+        // either — AND no `[[providers]]` exist — restore the bare-install
+        // localhost Ollama so newt still has a backend to talk to. A
+        // provider-only config is CONFIGURED: synthesizing a backend here
+        // would outrank the provider (a Configured pick precedes
+        // `providers.first`), silently deserting the operator's provider on
+        // the normal path while the profile path selected it.
+        if assembly.is_empty() {
+            if cfg.providers.is_empty() {
+                cfg.backend_fallback = true;
+                assembly.push_fallback(fallback_localhost_backend());
+            } else {
+                cfg.backend_fallback = false;
+            }
         }
         // Per-file bundles (the model-support-kit control surface): drop a
         // `~/.newt/bundles/<name>.toml` to add a bundle — no `config.toml` edit.
@@ -3940,25 +5756,80 @@ impl Config {
         // own file, no inline `[[dgx.nodes]]`. The active selection
         // (active_node/active_endpoint/active_model) stays in `[dgx]`.
         cfg.merge_disk_dgx_nodes();
-        cfg.apply_runtime_settings();
-        Ok(cfg)
+        // The explicit per-invocation CLI `--backend-*` request — the single
+        // owner of that precedence, so an explicit config file cannot defeat
+        // a per-invocation backend pin. Recorded AS a request on the target
+        // slot's receipt, never blended into the declaration.
+        let over = cli_backend_override();
+        let requested_slot = assembly
+            .apply_request(over.clone(), cfg.default_backend.as_deref())
+            .map_err(NewtError::Config)?;
+        if assembly.requested() {
+            cfg.backend_fallback = false;
+        }
+        let (backends, receipts) = assembly.finish();
+        cfg.backends = backends;
+        pin_requested_selection(&mut cfg, over.as_ref(), requested_slot);
+        Ok(ResolvedConfig {
+            config: cfg,
+            receipts,
+        })
     }
 
-    /// Apply one final resolved configuration to the runtime.
-    ///
-    /// Configuration loading stays pure. Runtime consumers that use
-    /// [`Config::load`] for an explicit profile must invoke this once after
-    /// loading; normal discovery via [`Config::resolve`] invokes it before
-    /// returning. This is also the single owner for process-global
-    /// `--backend-*` precedence, so an explicit config file cannot defeat a
-    /// higher-precedence per-invocation backend pin.
+    /// Apply one final resolved configuration to the runtime: the CLI
+    /// `--backend-*` override (through [`BackendOverride::apply`] — the
+    /// invariant-owning composer, which warns and leaves the config
+    /// untouched on a refused request), then the process-global
+    /// publications. Compatibility surface for consumers that hold a bare
+    /// [`Config`] (e.g. [`Config::load`] of an explicit profile) and do not
+    /// need provenance receipts. Consumers that must validate before any
+    /// process-global mutation use [`Config::prepare_runtime`] /
+    /// [`Config::resolve_runtime_unpublished`] and publish explicitly.
     pub fn apply_runtime_settings(&mut self) {
-        // CLI `--backend-*` flags win over every configuration source. Apply
-        // them here, after both explicit loading and normal discovery have
-        // finished, so all runtime entry points receive the same backend.
-        if let Some(over) = cli_backend_override() {
+        if let Some(over) = cli_backend_override().filter(|o| !o.is_empty()) {
             over.apply(self);
         }
+        self.publish_runtime_settings();
+    }
+
+    /// Prepare an already-loaded config (an explicit `--profile` file, a
+    /// constructed config) for the runtime WITHOUT touching process-global
+    /// state: run the backend assembly over its backends — identity
+    /// validation, then the CLI `--backend-*` request — and return the
+    /// receipt-bearing [`ResolvedConfig`]. No disk drop-ins are merged and
+    /// no localhost fallback is invented: the profile IS the whole config.
+    /// Publish explicitly afterwards.
+    ///
+    /// # Errors
+    /// Duplicate or empty backend names; a CLI request naming an ambiguous
+    /// backend.
+    pub fn prepare_runtime(mut self) -> Result<ResolvedConfig> {
+        let mut assembly =
+            BackendAssembly::new(std::mem::take(&mut self.backends)).map_err(NewtError::Config)?;
+        validate_provider_names(&self.providers).map_err(NewtError::Config)?;
+        let default_backend = self.default_backend.clone();
+        let over = cli_backend_override();
+        let requested_slot = assembly
+            .apply_request(over.clone(), default_backend.as_deref())
+            .map_err(NewtError::Config)?;
+        if assembly.requested() {
+            self.backend_fallback = false;
+        }
+        let (backends, receipts) = assembly.finish();
+        self.backends = backends;
+        pin_requested_selection(&mut self, over.as_ref(), requested_slot);
+        Ok(ResolvedConfig {
+            config: self,
+            receipts,
+        })
+    }
+
+    /// Publish the resolved configuration's process-global settings. Keep
+    /// this AFTER any validation that should be able to fail without leaving
+    /// half-published globals behind. Reads only (`&self`): publication
+    /// copies resolved values into process-global slots, it never edits the
+    /// config.
+    pub fn publish_runtime_settings(&self) {
         // #726: push the resolved `[tools] max_output_tokens` into the
         // process-wide model-facing output budget without threading a new
         // `usize` through `ChatCtx` + `execute_tool` + every call site.
@@ -4021,99 +5892,16 @@ impl Config {
             .unwrap_or_else(default_output_cap_chars_per_token)
     }
 
-    /// Merge per-file backends from the `backends/` dirs next to the config:
-    /// `~/.newt/backends/*.toml` first, then the project `.newt/backends/` (so
-    /// project overrides home overrides inline `[[backends]]`). Filename stem =
-    /// backend name. A malformed drop-in is skipped with a warning; it must not
-    /// break startup.
-    fn merge_disk_backends(&mut self) {
-        if let Some(dir) = Self::user_config_dir() {
-            self.merge_backends_from_dir(&dir.join("backends"));
-        }
-        if let Some(proj) = Self::project_config_path() {
-            if let Some(parent) = proj.parent() {
-                self.merge_backends_from_dir(&parent.join("backends"));
-            }
-        }
-    }
-
-    /// Load `<dir>/*.toml` as backends (filename stem = name) into
-    /// `self.backends`. A drop-in **replaces** an existing backend of the same
-    /// name (last-wins), else it is appended — so a `dgx1.toml` file supersedes
-    /// an inline `[[backends]]` named `dgx1` without a duplicate. A malformed
-    /// file is skipped with a warning.
-    fn merge_backends_from_dir(&mut self, dir: &Path) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return; // no backends dir — fine
-        };
-        let mut paths: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
-            .collect();
-        paths.sort();
-        for path in paths {
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            match std::fs::read_to_string(&path).map(|t| toml::from_str::<BackendConfig>(&t)) {
-                Ok(Ok(mut backend)) => {
-                    // A backend needs a destination: an HTTP `endpoint`, or — for
-                    // `kind = "embedded"` — a local `model_path`. Skip those with
-                    // neither (the "malformed → skip, not fatal" contract; before
-                    // `endpoint` became defaultable, the missing-endpoint case was
-                    // a parse error).
-                    if backend.endpoint.is_empty() && backend.model_path.is_none() {
-                        tracing::warn!(
-                            path = %path.display(),
-                            "skipping backend with neither endpoint nor model_path"
-                        );
-                        continue;
-                    }
-                    // The filename is authoritative for the name (collision-free).
-                    backend.name = stem.to_string();
-                    // A successfully merged drop-in is operator-supplied
-                    // configuration — the resolved backend list is no longer
-                    // the bare compiled-in fallback (see `is_unconfigured`).
-                    self.backend_fallback = false;
-                    match self.backends.iter_mut().find(|b| b.name == backend.name) {
-                        Some(existing) => {
-                            // A probe-cache drop-in records probed REALITY
-                            // (endpoint / model / api / serving) — it must never
-                            // CLEAR auth the config declared. Preserve api_key_*
-                            // when the drop-in omits them; otherwise an
-                            // OpenAI-kind backend silently loses its bearer token
-                            // after the first adopt writeback (the writeback
-                            // never persists secrets), and every later session
-                            // 401s. See writeback_probed_backend.
-                            if backend.api_key_env.is_none() {
-                                backend.api_key_env = existing.api_key_env.clone();
-                            }
-                            if backend.api_key_file.is_none() {
-                                backend.api_key_file = existing.api_key_file.clone();
-                            }
-                            // Same contract for tier assignment: probing records
-                            // reality (endpoint / model / api / serving) but never
-                            // tiers — tiers are an operator choice, so the adopt
-                            // writeback always emits `tiers = []`. An empty
-                            // drop-in `tiers` must not CLEAR the tiers the config
-                            // declared, or the backend serves no tier after the
-                            // first writeback and newt silently falls back to an
-                            // auto-discovered local backend.
-                            if backend.tiers.is_empty() {
-                                backend.tiers = existing.tiers.clone();
-                            }
-                            *existing = backend;
-                        }
-                        None => self.backends.push(backend),
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(path = %path.display(), error = %e, "skipping malformed backend file");
-                }
-                Err(_) => {}
-            }
-        }
+    /// Validate backend IDENTITY before any name-keyed machinery runs:
+    /// every backend needs a nonempty name, and no two may share one.
+    /// Selection (`default_backend`, `$NEWT_PROVIDER`), CLI overrides,
+    /// drop-in merging, and the provenance receipts are all name-keyed —
+    /// with a duplicate, receipts collapse last-wins while selection takes
+    /// the first match, which can hand backend A the card binding declared
+    /// for backend B and activate the wrong card. Hard, actionable error
+    /// instead.
+    pub fn validate_backend_identities(&self) -> std::result::Result<(), String> {
+        validate_backend_names(self.backends.iter())
     }
 
     /// Merge per-file DGX nodes from the `dgx/` dirs next to the config:
@@ -4322,6 +6110,25 @@ impl Config {
     }
 
     /// The user-writable config root: `$NEWT_CONFIG_DIR` or `~/.newt`.
+    /// The operator-PINNED config path (`$NEWT_CONFIG`), when set — the one
+    /// base whose sibling `models/` is a legitimate card source. Pure env
+    /// mirror of `candidate_paths`' first entry; deliberately NOT "whatever
+    /// base resolve happened to pick", because an ambient `./newt.toml` base
+    /// is attacker-reachable (#1301) and its sibling `./models/` must never
+    /// satisfy a trusted backend's card pointer.
+    #[must_use]
+    pub fn pinned_config_path() -> Option<PathBuf> {
+        std::env::var("NEWT_CONFIG")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            // A set-but-missing NEWT_CONFIG falls through to the next
+            // candidate at load — so it must not redirect the card catalog
+            // either, or cards would resolve relative to a config that was
+            // never actually selected.
+            .filter(|p| p.is_file())
+    }
+
     pub fn user_config_dir() -> Option<PathBuf> {
         if let Some(path) = std::env::var_os(NEWT_CONFIG_DIR_ENV)
             .filter(|value| !value.is_empty())
@@ -4343,39 +6150,41 @@ impl Config {
     /// single definition used by chat's `resolve_backend_choice` config rungs, by
     /// `solve`, and by the ACP worker, so every entry point agrees on which
     /// configured backend the operator named. Most-specific first: `$NEWT_PROVIDER`
-    /// names a backend > `default_backend` (usable) > a sole backend > prefer an
-    /// OpenAI-kind entry, else the first endpoint-bearing one. `None` only when no
-    /// backend has an endpoint. Env-synthesized fallbacks (codex, legacy dgx,
-    /// localhost) stay in chat's `resolve_backend_choice`, layered around this.
+    /// names a backend > `default_backend` > a sole backend > prefer an
+    /// OpenAI-kind entry, else the first routable one — where routable means a
+    /// nonempty endpoint OR an embedded `model_path` ([`backend_is_routable`]).
+    ///
+    /// `None` in exactly three cases: no configured backend has a
+    /// destination; an EXPLICIT selector (`$NEWT_PROVIDER` /
+    /// `default_backend`) names a configured but destination-less backend;
+    /// or an explicit selector names NOTHING configured. This `Option`
+    /// surface cannot carry those errors, so it selects NOTHING rather than
+    /// silently selecting the unroutable backend or silently running some
+    /// other one (both pre-#1819 behaviors); the typed errors are
+    /// [`SelectionOutcome::UnroutableNamed`] /
+    /// [`SelectionOutcome::UnknownNamed`] on [`Config::select_backend`].
+    /// Env-synthesized fallbacks (codex, legacy dgx, localhost) stay in chat's
+    /// `resolve_backend_choice`, layered around this.
     #[must_use]
     pub fn select_configured_backend(&self) -> Option<&BackendConfig> {
-        // 1. Operator / live override: $NEWT_PROVIDER names a backend.
-        if let Ok(name) = std::env::var("NEWT_PROVIDER") {
-            if !name.is_empty() {
-                if let Some(b) = self.backends.iter().find(|b| b.name == name) {
-                    return Some(b);
-                }
-            }
+        self.selected_configured_slot().map(|i| &self.backends[i])
+    }
+
+    /// The index behind [`Config::select_configured_backend`] and
+    /// [`ResolvedConfig::selected_backend`] — the shared
+    /// [`select_backend_slot`], so the borrowed pick, the receipt-bearing
+    /// pick, and the CLI's unnamed field-only targeting can never disagree.
+    fn selected_configured_slot(&self) -> Option<usize> {
+        let backends: Vec<&BackendConfig> = self.backends.iter().collect();
+        match select_backend_slot(&backends, self.default_backend.as_deref()) {
+            SlotSelection::Slot(i) => Some(i),
+            // The Option surfaces select NOTHING here — see the
+            // `select_configured_backend` doc; `select_backend` carries the
+            // typed `UnknownNamed` / `UnroutableNamed` errors.
+            SlotSelection::ExplicitlyUnroutable { .. }
+            | SlotSelection::ExplicitlyUnmatched { .. }
+            | SlotSelection::None => None,
         }
-        // 2. The configured default (usable — skip an endpointless one).
-        if let Some(name) = &self.default_backend {
-            if let Some(b) = self
-                .backends
-                .iter()
-                .find(|b| b.name == *name && !b.endpoint.is_empty())
-            {
-                return Some(b);
-            }
-        }
-        // 3. A sole backend is the obvious choice.
-        if self.backends.len() == 1 {
-            return self.backends.first().filter(|b| !b.endpoint.is_empty());
-        }
-        // 4. Prefer an OpenAI-kind entry, else the first endpoint-bearing one.
-        self.backends
-            .iter()
-            .find(|b| b.kind == Some(BackendKind::Openai) && !b.endpoint.is_empty())
-            .or_else(|| self.backends.iter().find(|b| !b.endpoint.is_empty()))
     }
 
     /// The ONE backend-selection contract, unified across `[[backends]]` and
@@ -4388,9 +6197,12 @@ impl Config {
     /// Returns a [`SelectionOutcome`]: `Selected` when the precedence picks a
     /// concrete backend/provider; `UnknownNamed` when an *explicit* selector
     /// names something that matches nothing configured (an operator error — the
-    /// caller must NOT fall back to a different backend); `Unset` only when
-    /// nothing is explicitly selected and nothing configured qualifies, at which
-    /// point the caller may fall back to local discovery.
+    /// caller must NOT fall back to a different backend); `UnroutableNamed`
+    /// when an explicit selector names a configured backend with neither
+    /// endpoint nor model_path (equally an operator error — nothing to route
+    /// to, and no silent fallback); `Unset` only when nothing is explicitly
+    /// selected and nothing configured qualifies, at which point the caller
+    /// may fall back to local discovery.
     ///
     /// A provider is chosen only when the precedence selects it: a bare
     /// `providers.first()` never bypasses `$NEWT_PROVIDER` / `default_backend`
@@ -4406,25 +6218,28 @@ impl Config {
             .filter(|n| !n.is_empty())
             .or_else(|| self.default_backend.clone().filter(|n| !n.is_empty()));
         if let Some(name) = explicit_selector {
-            // A usable backend claims this name → fall through to the shared
+            // A routable backend claims this name → fall through to the shared
             // precedence below (which re-checks `$NEWT_PROVIDER` / `default_backend`
             // and selects exactly that backend). Backends win a name tie.
-            let usable_backend = self
+            let routable_backend = self
                 .backends
                 .iter()
-                .any(|b| b.name == name && !b.endpoint.is_empty());
-            if !usable_backend {
-                // A provider claims this name → select it.
+                .any(|b| b.name == name && backend_is_routable(b));
+            if !routable_backend {
+                // A provider claims this name → select it (an unroutable
+                // backend does not win a name tie against a provider).
                 if let Some(provider) = self.providers.iter().find(|p| p.name == name) {
                     return SelectionOutcome::Selected(SelectedBackend::Provider(provider));
                 }
-                // The name matches nothing configured — neither a backend (even an
-                // endpointless one) nor a provider — so it is an operator error.
-                // (A name matching only an endpointless backend is "configured but
-                // unusable", not "unknown": fall through to the preference rules.)
-                if !self.backends.iter().any(|b| b.name == name) {
-                    return SelectionOutcome::UnknownNamed(name);
+                // A destination-less backend claims it → an operator error:
+                // the explicit selection is authoritative, there is nothing
+                // to route to, and silently running another backend is the
+                // exact failure mode `UnknownNamed` exists for.
+                if self.backends.iter().any(|b| b.name == name) {
+                    return SelectionOutcome::UnroutableNamed(name);
                 }
+                // Nothing configured claims it at all.
+                return SelectionOutcome::UnknownNamed(name);
             }
         }
         // The shared backend precedence (sole > prefer-openai > first usable).
@@ -5357,7 +7172,245 @@ mod tests {
     use crate::caveats::CaveatsExt;
     use std::io::Write;
 
+    /// Test seam for loader semantics: run the backend assembly over
+    /// `cfg.backends` plus `dirs` (in order), exactly the way
+    /// `resolve_runtime_unpublished` does — effective backends written
+    /// back, receipts returned for inspection.
+    fn merge_for_test(
+        cfg: &mut Config,
+        dirs: &[&Path],
+    ) -> std::result::Result<Vec<BackendResolutionReceipt>, String> {
+        let mut assembly = BackendAssembly::new(std::mem::take(&mut cfg.backends))?;
+        for dir in dirs {
+            assembly.merge_dir(dir)?;
+        }
+        if assembly.operator_configured() {
+            cfg.backend_fallback = false;
+        }
+        let (backends, receipts) = assembly.finish();
+        cfg.backends = backends;
+        Ok(receipts)
+    }
+
+    /// Test seam for the CLI-request phase: assembly over `cfg.backends` +
+    /// `dirs` + an explicit request — the whole pipeline minus file
+    /// layering, receipts returned.
+    fn resolve_for_test(
+        cfg: &mut Config,
+        dirs: &[&Path],
+        over: Option<BackendOverride>,
+    ) -> std::result::Result<Vec<BackendResolutionReceipt>, String> {
+        let mut assembly = BackendAssembly::new(std::mem::take(&mut cfg.backends))?;
+        for dir in dirs {
+            assembly.merge_dir(dir)?;
+        }
+        let _slot = assembly.apply_request(over, cfg.default_backend.as_deref())?;
+        let (backends, receipts) = assembly.finish();
+        cfg.backends = backends;
+        Ok(receipts)
+    }
+
+    /// Capture every WARN+ tracing message emitted by `f` — the loader's
+    /// diagnostics are warnings, so "warns here, NOT there" regressions
+    /// must observe them, not just return values. Thread-local subscriber:
+    /// parallel-test safe.
+    fn captured_warnings<T>(f: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
+        (out, text)
+    }
+
+    /// Pin the FULL config-resolution environment (`NEWT_CONFIG` removed,
+    /// `NEWT_CONFIG_DIR` + `HOME` + cwd → `dir`) for a resolve-level test,
+    /// restoring everything on drop — panic-safe, unlike the manual
+    /// save/restore pattern. Users stay in the `real_fs` serial lane.
+    struct HomeSandbox {
+        config: Option<std::ffi::OsString>,
+        config_dir: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+        cwd: PathBuf,
+    }
+    impl HomeSandbox {
+        fn enter(dir: &Path) -> Self {
+            let sandbox = Self {
+                config: std::env::var_os("NEWT_CONFIG"),
+                config_dir: std::env::var_os(NEWT_CONFIG_DIR_ENV),
+                home: std::env::var_os("HOME"),
+                cwd: std::env::current_dir().unwrap(),
+            };
+            // SAFETY: the `real_fs` serial lane serializes every test that
+            // touches these; restoration runs on drop.
+            unsafe {
+                std::env::remove_var("NEWT_CONFIG");
+                std::env::set_var(NEWT_CONFIG_DIR_ENV, dir);
+                std::env::set_var("HOME", dir);
+            }
+            std::env::set_current_dir(dir).unwrap();
+            sandbox
+        }
+    }
+    impl Drop for HomeSandbox {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.cwd);
+            // SAFETY: as above — serialized by the `real_fs` lane.
+            unsafe {
+                match self.config.take() {
+                    Some(v) => std::env::set_var("NEWT_CONFIG", v),
+                    None => std::env::remove_var("NEWT_CONFIG"),
+                }
+                match self.config_dir.take() {
+                    Some(v) => std::env::set_var(NEWT_CONFIG_DIR_ENV, v),
+                    None => std::env::remove_var(NEWT_CONFIG_DIR_ENV),
+                }
+                match self.home.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    /// Pin `NEWT_CONFIG_DIR` for a test's duration and restore the prior
+    /// value on drop — INCLUDING through a panic or failed assertion, which
+    /// a manual end-of-test restore does not survive (a mid-test panic then
+    /// leaks the tempdir path into every later `user_config_dir()` reader).
+    /// Same RAII shape as the established `EnvGuard`s elsewhere in the
+    /// crate; env is process-global, so users stay in the
+    /// `#[serial_test::serial(real_fs)]` lane.
+    struct ConfigDirGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+    impl ConfigDirGuard {
+        fn set(dir: &Path) -> Self {
+            let prev = std::env::var_os(NEWT_CONFIG_DIR_ENV);
+            // SAFETY: the `real_fs` serial lane serializes every test that
+            // touches this env var; restoration runs on drop.
+            unsafe { std::env::set_var(NEWT_CONFIG_DIR_ENV, dir) };
+            Self { prev }
+        }
+    }
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: as above — serialized by the `real_fs` lane.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var(NEWT_CONFIG_DIR_ENV, v),
+                    None => std::env::remove_var(NEWT_CONFIG_DIR_ENV),
+                }
+            }
+        }
+    }
+
     // ── input-footer mode ──────────────────────────────────────────────
+
+    /// #1786/#1819: a REAL multiplexer probe writeback followed by the REAL
+    /// disk merge retains the operator\'s declared model/card/capability
+    /// across a restart — the probe_v1 overlay has no fields to clear them
+    /// with, and its observed kind/serving still apply.
+    #[test]
+    #[serial_test::serial(real_fs)] // pins NEWT_CONFIG_DIR, like its writeback sibling
+    fn inline_declarations_survive_a_mux_probe_writeback_and_restart_merge() {
+        let declared = BackendConfig {
+            name: "dgx1".into(),
+            endpoint: "http://dgx:8000".into(),
+            model: Some("bound-model".into()),
+            card: Some("team-reasoner".into()),
+            capability: Some(crate::model_card::Capability {
+                emits_leading_reasoning: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let home = tempfile::tempdir().unwrap();
+        let _env = ConfigDirGuard::set(home.path());
+        std::fs::write(home.path().join("config.toml"), "# cfg\n").unwrap();
+        let observation = ProbeObservation {
+            name: "dgx1".into(),
+            endpoint: "http://dgx:8000".into(),
+            kind: Some(BackendKind::Openai),
+            api: None,
+            serving: ProbedServing::Multiplexer,
+        };
+        assert!(matches!(
+            persist_probe_observation(&observation).expect("writeback runs"),
+            ProbeWriteback::Written(_)
+        ));
+
+        // "Restart": a fresh config resolves the declared backend plus the
+        // probe drop-in.
+        let mut cfg = Config {
+            backends: vec![declared],
+            ..Default::default()
+        };
+        merge_for_test(&mut cfg, &[&home.path().join("backends")]).unwrap();
+        let merged = &cfg.backends[0];
+        assert_eq!(merged.card.as_deref(), Some("team-reasoner"));
+        assert!(merged.capability.is_some());
+        assert_eq!(
+            merged.effective_model(),
+            Some("bound-model"),
+            "a mux writeback persists no model — the declaration stands"
+        );
+        assert_eq!(
+            merged.kind,
+            Some(BackendKind::Openai),
+            "observed kind applies"
+        );
+        assert_eq!(merged.serving, Some(Serving::Multiplexer));
+    }
+
+    /// The legacy ambiguity refuses to load: a file carrying the EXACT old
+    /// newt-adopt probe marker plus a model (old writebacks merged INTO
+    /// operator files) cannot be attributed — the error names the file and
+    /// both remediations. (A probe timestamp WITHOUT that marker proves
+    /// nothing and stays operator — see the classification matrix test.)
+    #[test]
+    fn legacy_untagged_probe_stamped_model_fails_visibly() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("dgx1.toml"),
+            "endpoint = \"http://dgx:8000\"\nmodel = \"warm-pick\"\n\n[provenance]\nsource = \"newt adopt v0.7.9 (probed; delete this file to reset)\"\nprobed = \"2026-08-01\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![],
+            ..Default::default()
+        };
+        let err =
+            merge_for_test(&mut cfg, &[dir.path()]).expect_err("the ambiguity must refuse to load");
+        assert!(err.contains("dgx1.toml"), "names the file: {err}");
+        assert!(
+            err.contains("operator_v1"),
+            "names the claim remediation: {err}"
+        );
+        assert!(
+            err.contains("delete"),
+            "offers the reset remediation: {err}"
+        );
+    }
 
     #[test]
     fn footer_mode_defaults_to_auto_and_round_trips() {
@@ -5988,69 +8041,79 @@ mod tests {
     }
 
     #[test]
-    fn bundle_profile_for_model_longest_prefix_then_default() {
+    fn bundle_profile_for_family_exact_then_default() {
         let cfg = bundle_cfg();
         let b = cfg.resolve_bundle("nemotron").unwrap();
-        // family-prefix match
+        // EXACT typed-family match — never a model-name prefix.
         assert_eq!(
-            cfg.bundle_profile_for_model(b, "nemotron3:33b"),
+            cfg.bundle_profile_for_family(b, Some("nemotron")),
             Some("nemotron")
         );
         assert_eq!(
-            cfg.bundle_profile_for_model(b, "qwen2.5-coder"),
+            cfg.bundle_profile_for_family(b, Some("qwen")),
             Some("qwen-coder")
         );
-        // no family match → default_profile
+        // An unmapped family — or no family at all — falls to the bundle's
+        // default profile (the bundle was chosen; its default applies).
         assert_eq!(
-            cfg.bundle_profile_for_model(b, "llama3.1:8b"),
+            cfg.bundle_profile_for_family(b, Some("llama")),
             Some("nemotron")
         );
+        assert_eq!(cfg.bundle_profile_for_family(b, None), Some("nemotron"));
     }
 
     #[test]
-    fn infer_bundle_only_from_applies_to() {
+    fn infer_bundle_only_from_exact_family() {
         let cfg = bundle_cfg();
-        // nemotron model → the nemotron bundle (applies_to match)
+        // The exact typed family → the nemotron bundle.
         assert_eq!(
-            cfg.infer_bundle("nemotron3:33b").map(|(n, _)| n),
+            cfg.infer_bundle_for_family(Some("nemotron"))
+                .map(|(n, _)| n),
             Some("nemotron")
         );
-        // a model no applies_to matches → no inference (the use-case bundle is never inferred)
-        assert!(cfg.infer_bundle("gpt-4.1").is_none());
+        // A family nothing names — and NO family (the qwen-LOOKING alias
+        // with no exact card: labels are never evidence) → no inference.
+        assert!(cfg.infer_bundle_for_family(Some("gpt")).is_none());
+        assert!(cfg.infer_bundle_for_family(None).is_none());
+        // A model-name-shaped string is NOT a family key: exact equality
+        // only, no prefix matching.
+        assert!(cfg.infer_bundle_for_family(Some("nemotron3:33b")).is_none());
     }
 
     #[test]
     fn pick_active_profile_precedence() {
         let cfg = bundle_cfg();
-        // 1. explicit --profile wins over everything
+        // 1. explicit --profile wins over everything.
         let p = cfg
-            .pick_active_profile(Some("qwen-coder"), Some("nemotron"), "nemotron3:33b")
+            .pick_active_profile(Some("qwen-coder"), Some("nemotron"), Some("nemotron"))
             .unwrap()
             .unwrap();
         assert_eq!(p.name, "qwen-coder");
         assert_eq!(p.via, PickVia::Profile);
-        // 2. --bundle resolves to its profile for the model
+        // 2. --bundle resolves to its profile for the TYPED family.
         let p = cfg
-            .pick_active_profile(None, Some("nemotron"), "nemotron3:33b")
+            .pick_active_profile(None, Some("nemotron"), Some("nemotron"))
             .unwrap()
             .unwrap();
         assert_eq!(
             (p.name.as_str(), p.via),
             ("nemotron", PickVia::Bundle("nemotron".into()))
         );
-        // 3. inferred from the model when neither flag is set
+        // 3. inferred from the exact family when neither flag is set —
+        //    and family A → profile A, family gone → None (the refresh
+        //    funnel re-derives per route transition).
         let p = cfg
-            .pick_active_profile(None, None, "nemotron3:33b")
+            .pick_active_profile(None, None, Some("nemotron"))
             .unwrap()
             .unwrap();
         assert_eq!(p.via, PickVia::InferredBundle("nemotron".into()));
-        // 4. nothing matches → None (today's behavior)
+        assert!(cfg.pick_active_profile(None, None, None).unwrap().is_none());
+        // 4. a card-less qwen-looking ALIAS has no family → no profile.
+        assert!(cfg.pick_active_profile(None, None, None).unwrap().is_none());
+        // an unknown explicit bundle is a hard error.
         assert!(cfg
-            .pick_active_profile(None, None, "gpt-4.1")
-            .unwrap()
-            .is_none());
-        // an unknown explicit bundle is a hard error
-        assert!(cfg.pick_active_profile(None, Some("ghost"), "x").is_err());
+            .pick_active_profile(None, Some("ghost"), Some("x"))
+            .is_err());
     }
 
     // ── loadouts (the top-level composition; inert until Slice 1) ───────
@@ -6555,7 +8618,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        cfg.merge_backends_from_dir(dir.path());
+        merge_for_test(&mut cfg, &[dir.path()]).unwrap();
 
         // The drop-in replaced the inline dgx1 in place (no duplicate), gpu-runner kept.
         assert_eq!(cfg.backends.len(), 2, "only the valid .toml loads, no dup");
@@ -6570,16 +8633,15 @@ mod tests {
     }
 
     #[test]
-    fn dropin_probe_cache_preserves_config_declared_auth() {
-        // Regression: an OpenAI-kind backend declares its bearer token in
-        // config.toml (api_key_env / api_key_file). The adopt writeback persists
-        // probed endpoint/model but NEVER secrets, so the drop-in carries no
-        // auth. The load-merge must PRESERVE the config's auth, not clear it —
-        // otherwise every session after the first adopt writeback 401s.
+    fn probe_records_overlay_only_observed_fields_never_auth_or_tiers() {
+        // A probe_v1 record structurally carries no auth/tiers, and the
+        // loader's whitelist overlay never touches them — the config's
+        // bearer token and tier assignment survive BY CONSTRUCTION, not by
+        // inheritance heuristics.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("gpt41.toml"),
-            "endpoint = \"https://api.openai.com\"\nmodel = \"gpt-4.1\"\nkind = \"openai\"\n",
+            "record = \"probe_v1\"\nendpoint = \"https://api.openai.com\"\nkind = \"openai\"\nserving = \"multiplexer\"\n",
         )
         .unwrap();
         let mut cfg = Config {
@@ -6587,43 +8649,45 @@ mod tests {
                 name: "gpt41".into(),
                 endpoint: "https://api.openai.com".into(),
                 model: Some("gpt-4.1".into()),
-                kind: Some(BackendKind::Openai),
                 api_key_env: Some("OPENAI_API_KEY".into()),
                 api_key_file: Some("/vault/openai".into()),
+                tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
                 ..Default::default()
             }],
             ..Default::default()
         };
-        cfg.merge_backends_from_dir(dir.path());
+        merge_for_test(&mut cfg, &[dir.path()]).unwrap();
         let b = cfg.backends.iter().find(|b| b.name == "gpt41").unwrap();
-        assert_eq!(b.model.as_deref(), Some("gpt-4.1"), "probed model applied");
+        assert_eq!(b.kind, Some(BackendKind::Openai), "observed kind overlaid");
         assert_eq!(
-            b.api_key_env.as_deref(),
-            Some("OPENAI_API_KEY"),
-            "config-declared api_key_env must survive a keyless probe drop-in"
+            b.serving,
+            Some(Serving::Multiplexer),
+            "observed serving overlaid"
+        );
+        assert_eq!(b.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+        assert_eq!(b.api_key_file.as_deref(), Some("/vault/openai"));
+        assert_eq!(
+            b.tiers,
+            vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
+            "tiers untouched"
         );
         assert_eq!(
-            b.api_key_file.as_deref(),
-            Some("/vault/openai"),
-            "config-declared api_key_file must survive a keyless probe drop-in"
+            b.effective_model(),
+            Some("gpt-4.1"),
+            "a mux record leaves the declared model standing"
         );
     }
 
     #[test]
-    fn dropin_probe_cache_preserves_config_declared_tiers() {
-        // Regression (2026-07-27, steering-regressions): the adopt writeback
-        // records probed endpoint/model/api/serving but NOT tiers — tier
-        // assignment is an operator choice, never a probed property — so the
-        // drop-in carries `tiers = []`. The load-merge must PRESERVE the
-        // config's tiers, not clear them. Otherwise the backend serves NO tier
-        // after the first adopt writeback, and newt silently falls back to an
-        // auto-discovered local backend: a live eval drive configured for a 30B
-        // model on the remote router instead ran a 9B model on local ollama,
-        // grinding the local GPU while the remote box sat idle.
+    fn operator_record_omissions_clear_even_with_a_probe_timestamp() {
+        // The TAG owns the merge semantics; BackendProvenance stays
+        // informational. An operator_v1 file that happens to carry a probed
+        // timestamp still replaces wholesale — its omissions deliberately
+        // clear/rebind.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("eval.toml"),
-            "endpoint = \"http://router:8080\"\nmodel = \"big-30b\"\nkind = \"openai\"\ntiers = []\n",
+            "record = \"operator_v1\"\nendpoint = \"http://router:8080\"\n\n[provenance]\nprobed = \"2026-08-01\"\n",
         )
         .unwrap();
         let mut cfg = Config {
@@ -6631,20 +8695,300 @@ mod tests {
                 name: "eval".into(),
                 endpoint: "http://router:8080".into(),
                 model: Some("big-30b".into()),
-                kind: Some(BackendKind::Openai),
-                tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
+                card: Some("team-reasoner".into()),
+                api_key_env: Some("TOKEN".into()),
+                tiers: vec![Tier::Fast, Tier::Standard],
                 ..Default::default()
             }],
             ..Default::default()
         };
-        cfg.merge_backends_from_dir(dir.path());
+        merge_for_test(&mut cfg, &[dir.path()]).unwrap();
         let b = cfg.backends.iter().find(|b| b.name == "eval").unwrap();
-        assert_eq!(b.model.as_deref(), Some("big-30b"), "probed model applied");
+        assert_eq!(b.model, None, "omitted model clears");
         assert_eq!(
-            b.tiers,
-            vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
-            "config-declared tiers must survive a probe drop-in that omits them (tiers=[])"
+            b.card, None,
+            "omitted card clears — rebinding stays possible"
         );
+        assert_eq!(b.api_key_env, None, "omitted auth clears");
+        assert!(b.tiers.is_empty(), "omitted tiers clear");
+    }
+
+    #[test]
+    fn probe_record_with_a_different_endpoint_does_not_overlay() {
+        // Association is exact name PLUS endpoint: a probe of some other
+        // endpoint may not rewrite this backend, whatever the filename says.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("gpt41.toml"),
+            "record = \"probe_v1\"\nendpoint = \"http://other:9\"\nkind = \"ollama\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "gpt41".into(),
+                endpoint: "https://api.openai.com".into(),
+                kind: Some(BackendKind::Openai),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        merge_for_test(&mut cfg, &[dir.path()]).unwrap();
+        assert_eq!(
+            cfg.backends[0].kind,
+            Some(BackendKind::Openai),
+            "not overlaid"
+        );
+    }
+
+    #[test]
+    fn probe_record_for_an_unconfigured_backend_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ghost.toml"),
+            "record = \"probe_v1\"\nendpoint = \"http://h:1\"\nkind = \"ollama\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![],
+            ..Default::default()
+        };
+        merge_for_test(&mut cfg, &[dir.path()]).unwrap();
+        assert!(
+            cfg.backends.is_empty(),
+            "a probe OVERLAY cannot define a backend"
+        );
+    }
+
+    /// P0 (#1819 review): the probe overlay may rewrite the backend's live
+    /// `model`, but the card-binding SEED is captured first — declared
+    /// A/cardA + probed Instance B seeds cardA bound to A, so the session's
+    /// principal (B) is an exact mux/selected MISMATCH (typed inactive),
+    /// never a silent rebind of cardA onto B.
+    #[test]
+    fn probe_overlay_preserves_the_declared_binding_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("dgx1.toml"),
+            "record = \"probe_v1\"\nendpoint = \"http://dgx:8000\"\nkind = \"openai\"\nserving = \"instance\"\nmodel = \"probed-b\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "dgx1".into(),
+                endpoint: "http://dgx:8000".into(),
+                model: Some("declared-a".into()),
+                card: Some("team-reasoner".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let receipts = merge_for_test(&mut cfg, &[dir.path()]).unwrap();
+        let b = cfg.backends.iter().find(|b| b.name == "dgx1").unwrap();
+        assert_eq!(
+            b.effective_model(),
+            Some("probed-b"),
+            "the live route adopts the probed instance model"
+        );
+        let receipt = &receipts[0];
+        assert_eq!(
+            receipt.declaration.model.as_deref(),
+            Some("declared-a"),
+            "the declaration layer never absorbs a probe result"
+        );
+        assert_eq!(
+            receipt.observation.as_ref().map(|o| &o.serving),
+            Some(&ProbedServing::Instance {
+                model: Some("probed-b".into())
+            }),
+            "the probed model is recorded as an OBSERVATION"
+        );
+        assert_eq!(receipt.binding.card.as_deref(), Some("team-reasoner"));
+        assert_eq!(
+            receipt.binding.bound_model.as_deref(),
+            Some("declared-a"),
+            "the binding evidence is the DECLARATION, not the probe result — \
+             deciding for principal `probed-b` is an exact mismatch (inactive)"
+        );
+        assert_eq!(
+            receipt.binding.bound_destination,
+            BackendDestination::new(Some("http://dgx:8000".into()), None)
+        );
+    }
+
+    /// Old `newt setup` / `newt init` files are untagged AND probe-stamped
+    /// AND carry a model — but their source marker identifies an operator
+    /// writer, so they classify as operator records, not as the ambiguity.
+    #[test]
+    fn setup_written_untagged_files_stay_operator() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lab.toml"),
+            "endpoint = \"http://lab:8000\"\nmodel = \"qwen3:30b\"\nkind = \"openai\"\n\n\
+             [provenance]\nsource = \"newt setup v0.7.9 (auto-detected Openai)\"\nprobed = \"2026-07-01\"\nderived_serving = true\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![],
+            ..Default::default()
+        };
+        merge_for_test(&mut cfg, &[dir.path()]).unwrap();
+        assert_eq!(cfg.backends.len(), 1, "loads as an operator definition");
+        assert_eq!(cfg.backends[0].effective_model(), Some("qwen3:30b"));
+    }
+
+    /// A legacy model-less adopt cache (the exact old runtime-writer marker,
+    /// probe-shaped) overlays like a probe record — it must NOT wholesale-
+    /// replace and clear the config's declarations.
+    #[test]
+    fn legacy_adopt_probe_cache_overlays_without_clearing_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("dgx1.toml"),
+            "endpoint = \"http://dgx:8000\"\nkind = \"openai\"\nserving = \"multiplexer\"\ntiers = []\n\n\
+             [provenance]\nsource = \"newt adopt v0.8.0 abcdef123456 (probed; delete this file to reset)\"\nprobed = \"2026-08-01\"\nderived_serving = true\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "dgx1".into(),
+                endpoint: "http://dgx:8000".into(),
+                model: Some("declared-a".into()),
+                card: Some("team-reasoner".into()),
+                api_key_env: Some("TOKEN".into()),
+                tiers: vec![Tier::Fast],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        merge_for_test(&mut cfg, &[dir.path()]).unwrap();
+        let b = &cfg.backends[0];
+        assert_eq!(b.card.as_deref(), Some("team-reasoner"), "card survives");
+        assert_eq!(b.api_key_env.as_deref(), Some("TOKEN"), "auth survives");
+        assert_eq!(b.tiers, vec![Tier::Fast], "tiers survive");
+        assert_eq!(b.effective_model(), Some("declared-a"), "model survives");
+        assert_eq!(b.kind, Some(BackendKind::Openai), "observed kind applies");
+    }
+
+    /// A legacy adopt-marked file that ALSO carries operator fields (the old
+    /// writeback merged into operator files) is the genuinely ambiguous
+    /// hybrid — hard error, both remediations named.
+    #[test]
+    fn legacy_adopt_hybrid_with_operator_fields_is_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("dgx1.toml"),
+            "endpoint = \"http://dgx:8000\"\nmodel = \"warm-pick\"\napi_key_env = \"TOKEN\"\n\n\
+             [provenance]\nsource = \"newt adopt v0.7.9 (probed; delete this file to reset)\"\nprobed = \"2026-08-01\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![],
+            ..Default::default()
+        };
+        let err = merge_for_test(&mut cfg, &[dir.path()]).expect_err("hybrids refuse to load");
+        assert!(
+            err.contains("operator_v1") && err.contains("delete"),
+            "{err}"
+        );
+    }
+
+    /// A `probe_v1` record smuggling operator-owned fields (or a model with
+    /// no instance serving) is rejected whole — nothing overlays, the
+    /// declarations stand.
+    #[test]
+    fn probe_record_smuggling_operator_fields_is_rejected() {
+        for body in [
+            // card through the machine channel
+            "record = \"probe_v1\"\nendpoint = \"http://h:1\"\nkind = \"ollama\"\ncard = \"evil\"\n",
+            // model without instance serving
+            "record = \"probe_v1\"\nendpoint = \"http://h:1\"\nserving = \"multiplexer\"\nmodel = \"b\"\n",
+            // no endpoint (no association key)
+            "record = \"probe_v1\"\nkind = \"ollama\"\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("gpt41.toml"), body).unwrap();
+            let mut cfg = Config {
+                backends: vec![BackendConfig {
+                    name: "gpt41".into(),
+                    endpoint: "http://h:1".into(),
+                    kind: Some(BackendKind::Openai),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            merge_for_test(&mut cfg, &[dir.path()]).unwrap();
+            assert_eq!(
+                cfg.backends[0].kind,
+                Some(BackendKind::Openai),
+                "nothing overlays from an invalid probe record: {body}"
+            );
+            assert_eq!(cfg.backends[0].card, None);
+        }
+    }
+
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn writeback_does_not_carry_prior_fields_across_an_endpoint_change() {
+        // E1's kind/api/serving/model must not be re-stamped under E2: an
+        // endpoint change makes every prior observation someone else's.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "# cfg\n").unwrap();
+        let _env = ConfigDirGuard::set(dir.path());
+
+        let e1 = ProbeObservation {
+            name: "roamer".into(),
+            endpoint: "http://e1:8000".into(),
+            kind: Some(BackendKind::Openai),
+            api: Some(OpenAiApi::Responses),
+            serving: ProbedServing::Instance {
+                model: Some("b".into()),
+            },
+        };
+        assert!(matches!(
+            persist_probe_observation(&e1).unwrap(),
+            ProbeWriteback::Written(_)
+        ));
+        let e2 = ProbeObservation {
+            name: "roamer".into(),
+            endpoint: "http://e2:9000".into(),
+            kind: None,
+            api: None,
+            serving: ProbedServing::Unknown,
+        };
+        let ProbeWriteback::Written(path) = persist_probe_observation(&e2).unwrap() else {
+            panic!("probe_v1 file updates");
+        };
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("http://e2:9000"));
+        for stale in ["kind =", "api =", "serving =", "model ="] {
+            assert!(
+                !body.contains(stale),
+                "`{stale}` carried across the endpoint change: {body}"
+            );
+        }
+    }
+
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn writeback_creates_the_backends_dir_when_missing() {
+        // Regression pin: the writer must work into a fresh config dir with
+        // no backends/ subdir (today ResolvedPath::atomic_write creates it;
+        // this keeps that load-bearing behavior observed).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "# cfg\n").unwrap();
+        let _env = ConfigDirGuard::set(dir.path());
+
+        let observation = ProbeObservation {
+            name: "fresh".into(),
+            endpoint: "http://h:1".into(),
+            kind: Some(BackendKind::Ollama),
+            api: None,
+            serving: ProbedServing::Multiplexer,
+        };
+        let ProbeWriteback::Written(path) = persist_probe_observation(&observation).unwrap() else {
+            panic!("must write into a freshly created backends dir");
+        };
+        assert!(path.is_file());
     }
 
     #[test]
@@ -6734,33 +9078,36 @@ mod tests {
     #[serial_test::serial(real_fs)]
     #[test]
     fn writeback_probed_backend_lands_in_dedicated_dropin_not_config_toml() {
-        // Probe write-back must never touch config.toml — only backends/<name>.toml
-        // so reset = delete that one file. Serial: pins NEWT_CONFIG_DIR, which
-        // races any parallel test that resolves the user config dir.
+        // Probe write-back must never touch config.toml — only
+        // backends/<name>.toml, tagged `record = "probe_v1"`, so reset =
+        // delete that one file. Serial: pins NEWT_CONFIG_DIR.
         let dir = tempfile::tempdir().unwrap();
         let config_toml = dir.path().join("config.toml");
         std::fs::write(&config_toml, "# keep me\n").unwrap();
-        // SAFETY: test-local env pin; restored below.
-        let prev = std::env::var_os(NEWT_CONFIG_DIR_ENV);
-        unsafe { std::env::set_var(NEWT_CONFIG_DIR_ENV, dir.path()) };
+        let _env = ConfigDirGuard::set(dir.path());
 
-        let patch = BackendConfig {
+        let observation = ProbeObservation {
             name: "dgx1-llama".into(),
             endpoint: "http://host:8000".into(),
             kind: Some(BackendKind::Openai),
             api: Some(OpenAiApi::Responses),
-            model: Some("nemotron".into()),
-            serving: Some(Serving::Instance),
-            ..Default::default()
+            serving: ProbedServing::Instance {
+                model: Some("nemotron".into()),
+            },
         };
-        let written = writeback_probed_backend(&patch)
-            .unwrap()
-            .expect("user config dir is set");
+        let ProbeWriteback::Written(written) = persist_probe_observation(&observation).unwrap()
+        else {
+            panic!("user config dir is set — the record must write");
+        };
         assert_eq!(written, dir.path().join("backends").join("dgx1-llama.toml"));
         let body = std::fs::read_to_string(&written).unwrap();
+        assert!(body.contains("record = \"probe_v1\""), "tagged: {body}");
         assert!(body.contains("kind = \"openai\""));
         assert!(body.contains("api = \"responses\""));
-        assert!(body.contains("model = \"nemotron\""));
+        assert!(
+            body.contains("model = \"nemotron\""),
+            "an INSTANCE model is backend truth and persists: {body}"
+        );
         assert!(body.contains("serving = \"instance\""));
         // Main config untouched.
         assert_eq!(
@@ -6768,29 +9115,2820 @@ mod tests {
             "# keep me\n"
         );
 
-        // Second write merges and preserves auth refs already on disk.
-        std::fs::write(
-            &written,
-            "endpoint = \"http://host:8000\"\napi_key_env = \"DGX_TOKEN\"\n",
-        )
-        .unwrap();
-        let patch2 = BackendConfig {
+        // A later MULTIPLEXER observation on the same probe_v1 file REMOVES
+        // the previously observed instance model — a mux pick is per-session
+        // and has no field to persist through.
+        let observation2 = ProbeObservation {
             name: "dgx1-llama".into(),
             endpoint: "http://host:8000".into(),
             kind: Some(BackendKind::Openai),
             api: Some(OpenAiApi::ChatCompletions),
-            model: Some("other".into()),
+            serving: ProbedServing::Multiplexer,
+        };
+        assert!(matches!(
+            persist_probe_observation(&observation2).unwrap(),
+            ProbeWriteback::Written(_)
+        ));
+        let body2 = std::fs::read_to_string(&written).unwrap();
+        assert!(
+            !body2.contains("model ="),
+            "the instance model is removed by the mux rewrite: {body2}"
+        );
+        assert!(body2.contains("serving = \"multiplexer\""));
+        assert!(body2.contains("api = \"chat_completions\""));
+    }
+
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn writeback_skips_an_operator_owned_file_byte_for_byte() {
+        // Untagged and operator_v1 files are operator property: the runtime
+        // returns a typed SkippedOperatorOwned outcome and leaves every byte
+        // — comments included — untouched.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "# cfg\n").unwrap();
+        let backends = dir.path().join("backends");
+        std::fs::create_dir_all(&backends).unwrap();
+        let _env = ConfigDirGuard::set(dir.path());
+
+        let observation = ProbeObservation {
+            name: "ops".into(),
+            endpoint: "http://host:8000".into(),
+            kind: Some(BackendKind::Openai),
+            api: None,
+            serving: ProbedServing::Multiplexer,
+        };
+        for body in [
+            "# hand-authored\nendpoint = \"http://host:8000\"\n",
+            "record = \"operator_v1\"\nendpoint = \"http://host:8000\"\n",
+        ] {
+            let path = backends.join("ops.toml");
+            std::fs::write(&path, body).unwrap();
+            let outcome = persist_probe_observation(&observation).unwrap();
+            assert_eq!(outcome, ProbeWriteback::SkippedOperatorOwned(path.clone()));
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                body,
+                "byte-for-byte untouched"
+            );
+        }
+    }
+
+    // ── the backend assembly: identity, slots, layers (#1819) ─────────
+
+    /// Backend identity is validated on EVERY assembly path — normal
+    /// resolve and profiles alike: duplicate names (which could hand A the
+    /// card declared for B) and empty names are hard, actionable errors.
+    #[test]
+    fn backend_identity_is_validated_on_normal_and_profile_paths() {
+        let dup = || {
+            vec![
+                BackendConfig {
+                    name: "twin".into(),
+                    endpoint: "http://a:1".into(),
+                    model: Some("model-a".into()),
+                    card: Some("card-a".into()),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    name: "twin".into(),
+                    endpoint: "http://b:2".into(),
+                    model: Some("model-b".into()),
+                    card: Some("card-b".into()),
+                    ..Default::default()
+                },
+            ]
+        };
+        // Normal path: the assembly constructor refuses.
+        let err = BackendAssembly::new(dup()).expect_err("duplicates refuse");
+        assert!(err.contains("twin") && err.contains("rename one"), "{err}");
+        // Profile path: the same shared validation, through prepare_runtime.
+        let cfg = Config {
+            backends: dup(),
             ..Default::default()
         };
-        writeback_probed_backend(&patch2).unwrap();
-        let body2 = std::fs::read_to_string(&written).unwrap();
-        assert!(body2.contains("api_key_env"), "auth ref preserved: {body2}");
-        assert!(body2.contains("api = \"chat_completions\""));
-        assert!(body2.contains("model = \"other\""));
+        let err = cfg.prepare_runtime().expect_err("profiles validate too");
+        assert!(err.to_string().contains("twin"), "{err}");
+        // Empty name.
+        let err = BackendAssembly::new(vec![BackendConfig {
+            name: "  ".into(),
+            endpoint: "http://a:1".into(),
+            ..Default::default()
+        }])
+        .expect_err("empty names refuse");
+        assert!(err.contains("has no name"), "{err}");
+    }
 
-        match prev {
-            Some(v) => unsafe { std::env::set_var(NEWT_CONFIG_DIR_ENV, v) },
-            None => unsafe { std::env::remove_var(NEWT_CONFIG_DIR_ENV) },
+    /// Receipts align 1:1 BY SLOT with `backends`; indexed and zipped
+    /// access agree, and resolved selection uses the same index selector as
+    /// `select_configured_backend`, so the two can never disagree.
+    #[test]
+    fn receipts_align_by_slot_and_selection_agrees() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("second.toml"),
+            "record = \"probe_v1\"\nendpoint = \"http://b:2\"\nkind = \"openai\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![
+                BackendConfig {
+                    name: "first".into(),
+                    endpoint: "http://a:1".into(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    name: "second".into(),
+                    endpoint: "http://b:2".into(),
+                    ..Default::default()
+                },
+            ],
+            default_backend: Some("second".into()),
+            ..Default::default()
+        };
+        let receipts = merge_for_test(&mut cfg, &[dir.path()]).unwrap();
+        assert_eq!(receipts.len(), cfg.backends.len(), "1:1 by construction");
+        assert!(receipts[0].observation.is_none());
+        assert!(
+            receipts[1].observation.is_some(),
+            "the probe attached to ITS slot"
+        );
+        let resolved = ResolvedConfig {
+            config: cfg,
+            receipts,
+        };
+        let rb = resolved.backend(1).expect("slot 1 exists");
+        assert_eq!(rb.slot, 1);
+        assert_eq!(rb.backend.name, "second");
+        assert!(rb.receipt.observation.is_some());
+        assert!(resolved.backend(2).is_none(), "out of range is None");
+        let zipped: Vec<(usize, &str)> = resolved
+            .backends()
+            .map(|rb| (rb.slot, rb.backend.name.as_str()))
+            .collect();
+        assert_eq!(zipped, vec![(0, "first"), (1, "second")]);
+        // Selection: default_backend names slot 1 — the receipt-bearing pick
+        // and the borrowed pick agree by shared index selector.
+        let picked = resolved.selected_backend().expect("default selects");
+        assert_eq!(picked.slot, 1);
+        assert_eq!(
+            resolved
+                .select_configured_backend()
+                .map(|b| b.name.as_str()),
+            Some("second"),
+            "same slot through the Config surface"
+        );
+    }
+
+    /// Three layers, in order: inline A/cardA declaration → a probe
+    /// observation attaches → a SKIPPED operator record (no destination)
+    /// touches NOTHING — declaration AND observation survive. A VALID
+    /// operator record then resets both.
+    #[test]
+    fn a_skipped_operator_record_touches_nothing_and_a_valid_one_resets() {
+        let probe_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            probe_dir.path().join("dgx1.toml"),
+            "record = \"probe_v1\"\nendpoint = \"http://dgx:8000\"\nserving = \"instance\"\nmodel = \"probed-b\"\n",
+        )
+        .unwrap();
+        let hollow_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            hollow_dir.path().join("dgx1.toml"),
+            "record = \"operator_v1\"\nmodel = \"only-a-model\"\n",
+        )
+        .unwrap();
+        let declared = BackendConfig {
+            name: "dgx1".into(),
+            endpoint: "http://dgx:8000".into(),
+            model: Some("declared-a".into()),
+            card: Some("card-a".into()),
+            ..Default::default()
+        };
+        let mut cfg = Config {
+            backends: vec![declared.clone()],
+            ..Default::default()
+        };
+        let receipts = merge_for_test(&mut cfg, &[probe_dir.path(), hollow_dir.path()]).unwrap();
+        let receipt = &receipts[0];
+        assert_eq!(
+            receipt.declaration.model.as_deref(),
+            Some("declared-a"),
+            "the skipped operator record must not strip the declaration"
+        );
+        assert!(
+            receipt.observation.is_some(),
+            "…nor the earlier probe observation"
+        );
+        assert_eq!(receipt.binding.card.as_deref(), Some("card-a"));
+
+        // A VALID operator record replaces wholesale and resets the slot.
+        let replace_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            replace_dir.path().join("dgx1.toml"),
+            "record = \"operator_v1\"\nendpoint = \"http://new:9000\"\nmodel = \"fresh\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![declared],
+            ..Default::default()
+        };
+        let receipts = merge_for_test(&mut cfg, &[probe_dir.path(), replace_dir.path()]).unwrap();
+        let receipt = &receipts[0];
+        assert_eq!(receipt.declaration.model.as_deref(), Some("fresh"));
+        assert_eq!(receipt.declaration.card, None, "reset — omissions clear");
+        assert!(
+            receipt.observation.is_none(),
+            "the observation was about the OLD declaration — reset with it"
+        );
+    }
+
+    /// A requested destination CHANGE clears the cached observation — E1
+    /// truth (kind/serving/model) must not ride to E2 in the receipt OR the
+    /// flattened backend — while the declared binding stands untouched at
+    /// its declared destination (typed InactiveDestination downstream, not
+    /// erasure). A near-collision (trailing slash) is a change.
+    #[test]
+    fn a_requested_destination_change_clears_the_cached_observation() {
+        for e2 in ["http://e2:9000", "http://dgx:8000/"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("dgx1.toml"),
+                "record = \"probe_v1\"\nendpoint = \"http://dgx:8000\"\nkind = \"openai\"\nserving = \"instance\"\nmodel = \"probed-b\"\n",
+            )
+            .unwrap();
+            let mut cfg = Config {
+                backends: vec![BackendConfig {
+                    name: "dgx1".into(),
+                    endpoint: "http://dgx:8000".into(),
+                    model: Some("declared-a".into()),
+                    card: Some("card-a".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let over = BackendOverride {
+                name: Some("dgx1".into()),
+                endpoint: Some(e2.into()),
+                ..Default::default()
+            };
+            let receipts = resolve_for_test(&mut cfg, &[dir.path()], Some(over)).unwrap();
+            let receipt = &receipts[0];
+            assert!(
+                receipt.observation.is_none(),
+                "`{e2}`: cached E1 observation must not ride to a new destination"
+            );
+            let b = &cfg.backends[0];
+            assert_eq!(b.endpoint, e2);
+            assert_eq!(b.kind, None, "`{e2}`: no probed kind leaks");
+            assert_eq!(b.serving, None, "`{e2}`: no probed serving leaks");
+            assert_eq!(
+                b.model.as_deref(),
+                Some("declared-a"),
+                "`{e2}`: the declaration, never the probed model"
+            );
+            assert_eq!(
+                receipt.binding.card.as_deref(),
+                Some("card-a"),
+                "`{e2}`: binding evidence preserved, not erased"
+            );
+            assert_eq!(
+                receipt.binding.bound_destination,
+                BackendDestination::new(Some("http://dgx:8000".into()), None),
+                "`{e2}`: still bound at the DECLARED destination"
+            );
+        }
+    }
+
+    /// An IDENTICAL requested destination retains the observation — the
+    /// request re-states where the backend already points, so cached truth
+    /// still describes the same server.
+    #[test]
+    fn an_identical_requested_destination_retains_the_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("dgx1.toml"),
+            "record = \"probe_v1\"\nendpoint = \"http://dgx:8000\"\nkind = \"openai\"\nserving = \"multiplexer\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "dgx1".into(),
+                endpoint: "http://dgx:8000".into(),
+                model: Some("declared-a".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            name: Some("dgx1".into()),
+            endpoint: Some("http://dgx:8000".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[dir.path()], Some(over)).unwrap();
+        assert!(
+            receipts[0].observation.is_some(),
+            "same destination retains"
+        );
+        assert_eq!(cfg.backends[0].kind, Some(BackendKind::Openai));
+        assert_eq!(cfg.backends[0].serving, Some(Serving::Multiplexer));
+    }
+
+    /// A model-only request routes the session to B but RETAINS the
+    /// declared binding (cardA bound to A at the declared destination) —
+    /// association is decided downstream, never silently rebound.
+    #[test]
+    fn a_model_only_request_retains_the_declared_binding() {
+        // The unnamed field-only path reads $NEWT_PROVIDER through the
+        // shared selector — pin it unset (guard-restored) so the sole
+        // backend is selected deterministically.
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "dgx1".into(),
+                endpoint: "http://dgx:8000".into(),
+                model: Some("declared-a".into()),
+                card: Some("card-a".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            model: Some("requested-b".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[], Some(over)).unwrap();
+        let receipt = &receipts[0];
+        assert_eq!(cfg.backends[0].model.as_deref(), Some("requested-b"));
+        let request = receipt.request.as_ref().expect("recorded as a request");
+        assert_eq!(request.mode, RequestMode::FieldOnly);
+        assert_eq!(request.model.as_deref(), Some("requested-b"));
+        assert_eq!(
+            receipt.declaration.model.as_deref(),
+            Some("declared-a"),
+            "the request never masquerades as declaration"
+        );
+        assert_eq!(receipt.binding.card.as_deref(), Some("card-a"));
+        assert_eq!(receipt.binding.bound_model.as_deref(), Some("declared-a"));
+    }
+
+    /// A card-only request rebinds to the DECLARED model — never to a
+    /// probed one, even when a cached Instance observation routed the
+    /// session to B.
+    #[test]
+    fn a_card_only_request_binds_to_the_declared_model_never_the_probed_one() {
+        // Unnamed field-only request — same $NEWT_PROVIDER pin as above.
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("dgx1.toml"),
+            "record = \"probe_v1\"\nendpoint = \"http://dgx:8000\"\nserving = \"instance\"\nmodel = \"probed-b\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "dgx1".into(),
+                endpoint: "http://dgx:8000".into(),
+                model: Some("declared-a".into()),
+                card: Some("card-a".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            card: Some("card-c".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[dir.path()], Some(over)).unwrap();
+        let receipt = &receipts[0];
+        assert_eq!(
+            cfg.backends[0].model.as_deref(),
+            Some("probed-b"),
+            "the route still adopts the cached instance model"
+        );
+        assert_eq!(receipt.binding.card.as_deref(), Some("card-c"));
+        assert_eq!(
+            receipt.binding.bound_model.as_deref(),
+            Some("declared-a"),
+            "an explicit rebind binds to requested-or-DECLARED, never probed"
+        );
+    }
+
+    /// An explicit card + destination request rebinds AT the new
+    /// destination, to the requested model (else the declared one).
+    #[test]
+    fn an_explicit_card_and_destination_request_rebinds_at_the_new_destination() {
+        let base = || Config {
+            backends: vec![BackendConfig {
+                name: "dgx1".into(),
+                endpoint: "http://dgx:8000".into(),
+                model: Some("declared-a".into()),
+                card: Some("card-a".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let e2 = BackendDestination::new(Some("http://e2:9000".into()), None);
+        // With a requested model: card-c bound to requested-m at E2.
+        let mut cfg = base();
+        let over = BackendOverride {
+            name: Some("dgx1".into()),
+            endpoint: Some("http://e2:9000".into()),
+            model: Some("requested-m".into()),
+            card: Some("card-c".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[], Some(over)).unwrap();
+        let binding = &receipts[0].binding;
+        assert_eq!(binding.card.as_deref(), Some("card-c"));
+        assert_eq!(binding.bound_model.as_deref(), Some("requested-m"));
+        assert_eq!(binding.bound_destination, e2);
+        // Without a requested model: the declared one.
+        let mut cfg = base();
+        let over = BackendOverride {
+            name: Some("dgx1".into()),
+            endpoint: Some("http://e2:9000".into()),
+            card: Some("card-c".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[], Some(over)).unwrap();
+        let binding = &receipts[0].binding;
+        assert_eq!(binding.bound_model.as_deref(), Some("declared-a"));
+        assert_eq!(binding.bound_destination, e2);
+    }
+
+    /// An exclusive destination request keeps exactly ONE slot: the
+    /// uniquely named existing one (declaration intact), else a brand-new
+    /// slot with no declaration layer.
+    #[test]
+    fn an_exclusive_destination_request_keeps_one_chosen_slot() {
+        let backends = || {
+            vec![
+                BackendConfig {
+                    name: "first".into(),
+                    endpoint: "http://a:1".into(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    name: "second".into(),
+                    endpoint: "http://b:2".into(),
+                    model: Some("declared-b".into()),
+                    ..Default::default()
+                },
+            ]
+        };
+        // Named: the chosen slot survives with its declaration.
+        let mut cfg = Config {
+            backends: backends(),
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            name: Some("second".into()),
+            endpoint: Some("http://new:9".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[], Some(over)).unwrap();
+        assert_eq!(cfg.backends.len(), 1);
+        assert_eq!(receipts.len(), 1, "receipts stay 1:1");
+        assert_eq!(cfg.backends[0].name, "second");
+        assert_eq!(
+            receipts[0].declaration.model.as_deref(),
+            Some("declared-b"),
+            "the chosen slot's declaration layer survives"
+        );
+        // Unnamed: a brand-new `cli` slot, declaration layer empty.
+        let mut cfg = Config {
+            backends: backends(),
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            endpoint: Some("http://new:9".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[], Some(over)).unwrap();
+        assert_eq!(cfg.backends.len(), 1);
+        assert_eq!(cfg.backends[0].name, "cli");
+        assert_eq!(receipts[0].declaration, DeclaredBackend::default());
+        assert_eq!(
+            receipts[0].request.as_ref().map(|r| r.mode),
+            Some(RequestMode::ExclusiveDestination)
+        );
+    }
+
+    /// A destination request holds exactly ONE nonempty destination:
+    /// both-set and empty-string requests are hard errors, before anything
+    /// mutates.
+    #[test]
+    fn a_destination_request_is_exactly_one_nonempty_destination() {
+        let base = || Config {
+            backends: vec![BackendConfig {
+                name: "a".into(),
+                endpoint: "http://a:1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for (what, over) in [
+            (
+                "both destinations",
+                BackendOverride {
+                    endpoint: Some("http://h:1".into()),
+                    model_path: Some("/m.gguf".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "empty endpoint",
+                BackendOverride {
+                    endpoint: Some(String::new()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "empty model_path",
+                BackendOverride {
+                    model_path: Some(String::new()),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut cfg = base();
+            let err = resolve_for_test(&mut cfg, &[], Some(over)).expect_err(what);
+            assert!(err.contains("--backend-"), "{what}: {err}");
+        }
+    }
+
+    /// A destination retarget replaces the destination AXIS whole:
+    /// HTTP→embedded clears the endpoint, embedded→HTTP clears the
+    /// model_path — through the assembly AND the compatibility
+    /// `BackendOverride::apply` alike. And an explicit card rebind's
+    /// destination is one value in three places: the flattened backend, the
+    /// receipt's request, and the binding.
+    #[test]
+    fn a_destination_retarget_replaces_the_destination_axis_whole() {
+        // HTTP-declared backend, embedded request — assembly path.
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "a".into(),
+                endpoint: "http://a:1".into(),
+                model: Some("declared".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            name: Some("a".into()),
+            model_path: Some("/models/x.gguf".into()),
+            card: Some("card-x".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[], Some(over)).unwrap();
+        let b = &cfg.backends[0];
+        assert_eq!(b.endpoint, "", "HTTP endpoint cleared by embedded retarget");
+        assert_eq!(b.model_path.as_deref(), Some("/models/x.gguf"));
+        let flat = BackendDestination::of(b);
+        let receipt = &receipts[0];
+        let requested = receipt
+            .request
+            .as_ref()
+            .unwrap()
+            .destination_over(&receipt.declaration.destination);
+        assert_eq!(flat, requested, "flattened == requested destination");
+        assert_eq!(
+            receipt.binding.bound_destination, requested,
+            "explicit card rebind binds AT the requested destination"
+        );
+        // Embedded-declared backend, HTTP request — compat apply path.
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "emb".into(),
+                model_path: Some("/models/x.gguf".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        BackendOverride {
+            name: Some("emb".into()),
+            endpoint: Some("http://h:1".into()),
+            ..Default::default()
+        }
+        .apply(&mut cfg);
+        let b = &cfg.backends[0];
+        assert_eq!(b.endpoint, "http://h:1");
+        assert_eq!(b.model_path, None, "embedded path cleared by HTTP retarget");
+    }
+
+    /// `--backend-name` naming nothing is a hard, actionable error — never
+    /// a silent no-op that edits nothing and selects something else.
+    #[test]
+    fn a_named_field_only_request_missing_its_slot_is_a_hard_error() {
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "real".into(),
+                endpoint: "http://a:1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            name: Some("ghost".into()),
+            model: Some("m".into()),
+            ..Default::default()
+        };
+        let err = resolve_for_test(&mut cfg, &[], Some(over)).expect_err("no fallback");
+        assert!(
+            err.contains("ghost") && err.contains("real"),
+            "names the miss and the configured set: {err}"
+        );
+    }
+
+    /// An unnamed field-only request targets the slot the SHARED selector
+    /// picks (`$NEWT_PROVIDER` / `default_backend` / preference) — never
+    /// index 0 — and the receipt lands on that same slot.
+    #[test]
+    #[serial_test::serial(real_fs)] // mutates NEWT_PROVIDER (guard-restored)
+    fn an_unnamed_field_only_request_targets_the_selected_slot_not_index_zero() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        let base = || Config {
+            backends: vec![
+                BackendConfig {
+                    name: "a".into(),
+                    endpoint: "http://a:1".into(),
+                    model: Some("model-a".into()),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    name: "b".into(),
+                    endpoint: "http://b:2".into(),
+                    model: Some("model-b".into()),
+                    ..Default::default()
+                },
+            ],
+            default_backend: Some("b".into()),
+            ..Default::default()
+        };
+        // default_backend picks b.
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let mut cfg = base();
+        let over = BackendOverride {
+            model: Some("new-model".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[], Some(over.clone())).unwrap();
+        assert_eq!(
+            cfg.backends[0].model.as_deref(),
+            Some("model-a"),
+            "a untouched"
+        );
+        assert_eq!(
+            cfg.backends[1].model.as_deref(),
+            Some("new-model"),
+            "b edited"
+        );
+        assert!(receipts[0].request.is_none());
+        assert!(
+            receipts[1].request.is_some(),
+            "receipt on the SELECTED slot"
+        );
+        // $NEWT_PROVIDER=a outranks the default and retargets the edit.
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::set_var("NEWT_PROVIDER", "a") };
+        let mut cfg = base();
+        let receipts = resolve_for_test(&mut cfg, &[], Some(over)).unwrap();
+        assert_eq!(
+            cfg.backends[0].model.as_deref(),
+            Some("new-model"),
+            "a edited"
+        );
+        assert_eq!(
+            cfg.backends[1].model.as_deref(),
+            Some("model-b"),
+            "b untouched"
+        );
+        assert!(receipts[0].request.is_some());
+    }
+
+    /// `--backend-name b` is BOTH the edit target and this invocation's
+    /// selection: the named slot takes the edit with an aligned receipt,
+    /// and (with the CLI's `$NEWT_PROVIDER` install) selection picks b over
+    /// the configured default.
+    #[test]
+    #[serial_test::serial(real_fs)] // mutates NEWT_PROVIDER (guard-restored)
+    fn a_named_request_edits_and_selects_the_named_backend() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::set_var("NEWT_PROVIDER", "b") };
+        let mut cfg = Config {
+            backends: vec![
+                BackendConfig {
+                    name: "a".into(),
+                    endpoint: "http://a:1".into(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    name: "b".into(),
+                    endpoint: "http://b:2".into(),
+                    model: Some("model-b".into()),
+                    ..Default::default()
+                },
+            ],
+            default_backend: Some("a".into()),
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            name: Some("b".into()),
+            model: Some("new-model".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[], Some(over)).unwrap();
+        assert_eq!(cfg.backends[1].model.as_deref(), Some("new-model"));
+        assert!(
+            receipts[1].request.is_some(),
+            "receipt aligned with the edit"
+        );
+        let resolved = ResolvedConfig {
+            config: cfg,
+            receipts,
+        };
+        let picked = resolved.selected_backend().expect("named selection");
+        assert_eq!(picked.slot, 1, "name-only selection beats the default");
+        assert_eq!(picked.backend.model.as_deref(), Some("new-model"));
+        assert!(picked.receipt.request.is_some());
+    }
+
+    /// A valid embedded `model_path` is routable everywhere selection used
+    /// to require an endpoint: sole, default, preference, and the exclusive
+    /// model_path request.
+    #[test]
+    #[serial_test::serial(real_fs)] // reads NEWT_PROVIDER (guard-restored)
+    fn embedded_backends_are_routable_for_selection() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let embedded = BackendConfig {
+            name: "emb".into(),
+            model_path: Some("/models/x.gguf".into()),
+            kind: Some(BackendKind::Embedded),
+            ..Default::default()
+        };
+        // Sole.
+        let cfg = Config {
+            backends: vec![embedded.clone()],
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.select_configured_backend().map(|b| b.name.as_str()),
+            Some("emb")
+        );
+        // Default names it.
+        let cfg = Config {
+            backends: vec![
+                BackendConfig {
+                    name: "http".into(),
+                    endpoint: "http://a:1".into(),
+                    ..Default::default()
+                },
+                embedded.clone(),
+            ],
+            default_backend: Some("emb".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.select_configured_backend().map(|b| b.name.as_str()),
+            Some("emb")
+        );
+        // Preference: first ROUTABLE wins when nothing is more specific.
+        let cfg = Config {
+            backends: vec![
+                BackendConfig {
+                    name: "hollow".into(),
+                    ..Default::default()
+                },
+                embedded.clone(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.select_configured_backend().map(|b| b.name.as_str()),
+            Some("emb")
+        );
+        // Exclusive model_path request: the one slot, selected.
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "http".into(),
+                endpoint: "http://a:1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            model_path: Some("/models/x.gguf".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[], Some(over)).unwrap();
+        let resolved = ResolvedConfig {
+            config: cfg,
+            receipts,
+        };
+        let picked = resolved
+            .selected_backend()
+            .expect("embedded exclusive selects");
+        assert_eq!(picked.slot, 0);
+        assert_eq!(picked.backend.model_path.as_deref(), Some("/models/x.gguf"));
+        assert_eq!(
+            picked.backend.endpoint, "",
+            "no endpoint on the embedded route"
+        );
+    }
+
+    /// The external validate → publish → keep-using-the-receipts flow:
+    /// publication reads (`&self`), so the receipt-bearing view survives it.
+    #[test]
+    fn validate_then_publish_then_keep_the_receipt_view() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        let cfg = Config {
+            backends: vec![BackendConfig {
+                name: "a".into(),
+                endpoint: "http://a:1".into(),
+                card: Some("card-a".into()),
+                model: Some("model-a".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        cfg.validate_backend_identities().expect("valid first");
+        let mut cfg = cfg;
+        let receipts = resolve_for_test(&mut cfg, &[], None).unwrap();
+        let resolved = ResolvedConfig {
+            config: cfg,
+            receipts,
+        };
+        resolved.publish_runtime_settings();
+        // The same immutable view keeps answering AFTER publication.
+        let picked = resolved.backend(0).expect("slot 0");
+        assert_eq!(picked.receipt.binding.card.as_deref(), Some("card-a"));
+    }
+
+    /// Two-phase directory loading: a HOME-dir probe survives to be judged
+    /// against a PROJECT-dir operator declaration — attached on an exact
+    /// destination match, skipped on a mismatch — and a later probe record
+    /// deterministically supersedes an earlier one.
+    #[test]
+    fn a_home_probe_attaches_against_the_final_project_declaration() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("roamer.toml"),
+            "record = \"probe_v1\"\nendpoint = \"http://e:8000\"\nkind = \"ollama\"\n",
+        )
+        .unwrap();
+        // Exact match: the project dir DECLARES roamer at the probed
+        // destination — the earlier probe attaches against it.
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("roamer.toml"),
+            "record = \"operator_v1\"\nendpoint = \"http://e:8000\"\nmodel = \"declared\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![],
+            ..Default::default()
+        };
+        let receipts = merge_for_test(&mut cfg, &[home.path(), project.path()]).unwrap();
+        assert!(
+            receipts[0].observation.is_some(),
+            "the home probe reached the project declaration"
+        );
+        assert_eq!(cfg.backends[0].kind, Some(BackendKind::Ollama));
+        assert_eq!(cfg.backends[0].effective_model(), Some("declared"));
+        // Mismatch: the project declaration moved — the probe is skipped.
+        let moved = tempfile::tempdir().unwrap();
+        std::fs::write(
+            moved.path().join("roamer.toml"),
+            "record = \"operator_v1\"\nendpoint = \"http://elsewhere:9\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![],
+            ..Default::default()
+        };
+        let receipts = merge_for_test(&mut cfg, &[home.path(), moved.path()]).unwrap();
+        assert!(
+            receipts[0].observation.is_none(),
+            "a probe of E never attaches to a declaration at E2"
+        );
+        assert_eq!(cfg.backends[0].kind, None);
+        // Probe precedence: a project-dir probe supersedes the home one.
+        let project_probe = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project_probe.path().join("roamer.toml"),
+            "record = \"probe_v1\"\nendpoint = \"http://e:8000\"\nkind = \"openai\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "roamer".into(),
+                endpoint: "http://e:8000".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let receipts = merge_for_test(&mut cfg, &[home.path(), project_probe.path()]).unwrap();
+        assert_eq!(
+            receipts[0].observation.as_ref().and_then(|o| o.kind),
+            Some(BackendKind::Openai),
+            "deterministic last-wins probe precedence"
+        );
+    }
+
+    /// The full legacy-ownership matrix: untagged is Operator by default —
+    /// a probe timestamp, a custom source, setup/init/preset markers, and
+    /// every near-collision of the adopt marker included. Only the fully
+    /// anchored exact newt-adopt marker classifies further: strict
+    /// model-less probe shape → Probe; ANY model/card/operator field
+    /// beside it → the hard ambiguity.
+    #[test]
+    fn legacy_ownership_classification_matrix() {
+        const MARKER: &str = "newt adopt v0.7.9 (probed; delete this file to reset)";
+        let with = |source: Option<&str>, probed: bool, f: fn(&mut BackendConfig)| {
+            let mut b = BackendConfig {
+                name: "x".into(),
+                endpoint: "http://e:1".into(),
+                provenance: Some(BackendProvenance {
+                    source: source.map(str::to_string),
+                    probed: probed.then(|| "2026-08-01".to_string()),
+                    derived_serving: None,
+                }),
+                ..Default::default()
+            };
+            f(&mut b);
+            b
+        };
+        let operator_cases: &[(&str, BackendConfig)] = &[
+            (
+                "no provenance at all",
+                BackendConfig {
+                    name: "x".into(),
+                    endpoint: "http://e:1".into(),
+                    model: Some("m".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "probed timestamp, no source, model",
+                with(None, true, |b| {
+                    b.model = Some("m".into());
+                }),
+            ),
+            (
+                "custom probed source, model",
+                with(Some("my-tool 1.0"), true, |b| {
+                    b.model = Some("m".into());
+                }),
+            ),
+            (
+                "setup marker",
+                with(
+                    Some("newt setup v0.7.9 (auto-detected Openai)"),
+                    true,
+                    |b| {
+                        b.model = Some("m".into());
+                    },
+                ),
+            ),
+            (
+                "preset marker",
+                with(Some("newt setup v0.7.3 (preset acme)"), true, |b| {
+                    b.model = Some("m".into());
+                }),
+            ),
+            ("init marker", with(Some("newt init v0.8.0"), true, |_| {})),
+            (
+                "adopt near-suffix",
+                with(
+                    Some("newt adopt v0.7.9 (probed; delete this file to reset)."),
+                    true,
+                    |_| {},
+                ),
+            ),
+            (
+                "adopt near-prefix",
+                with(
+                    Some("my newt adopt v0.7.9 (probed; delete this file to reset)"),
+                    true,
+                    |_| {},
+                ),
+            ),
+            (
+                "adopt empty version",
+                with(
+                    Some("newt adopt v (probed; delete this file to reset)"),
+                    true,
+                    |_| {},
+                ),
+            ),
+        ];
+        // The raw text for a constructed case is its own serialization (the
+        // canonical shape — the raw-key cases below use literal fixtures).
+        let classify =
+            |b: &BackendConfig| classify_untagged_dropin(b, &toml::to_string(b).unwrap());
+        for (what, b) in operator_cases {
+            assert!(
+                matches!(classify(b), Ok(DropinOwner::Operator)),
+                "{what} must classify Operator"
+            );
+        }
+        // The exact marker, strict model-less probe shape → Probe.
+        assert!(matches!(
+            classify(&with(Some(MARKER), true, |b| {
+                b.kind = Some(BackendKind::Openai);
+                b.serving = Some(Serving::Multiplexer);
+            })),
+            Ok(DropinOwner::Probe)
+        ));
+        // …even without the probe timestamp (the marker is the evidence).
+        assert!(matches!(
+            classify(&with(Some(MARKER), false, |_| {})),
+            Ok(DropinOwner::Probe)
+        ));
+        // The exact marker + UNKNOWN evidence — judged on RAW keys (the
+        // permissive parse would silently drop these): both remediations.
+        for (what, raw) in [
+            (
+                "unknown top-level key",
+                "endpoint = \"http://e:1\"\nwarm_pool = 3\n\n[provenance]\nsource = \"newt adopt v0.7.9 (probed; delete this file to reset)\"\nprobed = \"2026-08-01\"\n",
+            ),
+            (
+                "unknown [provenance] key",
+                "endpoint = \"http://e:1\"\n\n[provenance]\nsource = \"newt adopt v0.7.9 (probed; delete this file to reset)\"\nprobed = \"2026-08-01\"\nsmuggled = \"x\"\n",
+            ),
+        ] {
+            let b: BackendConfig = toml::from_str(raw).unwrap();
+            let err = classify_untagged_dropin(&b, raw).expect_err(what);
+            assert!(
+                err.contains("operator_v1") && err.contains("delete"),
+                "{what}: both remediations named: {err}"
+            );
+        }
+        // The exact marker + ANY binding/operator evidence → hard ambiguity.
+        type Mutation = fn(&mut BackendConfig);
+        let ambiguous_cases: &[(&str, Mutation)] = &[
+            ("instance + model", |b| {
+                b.serving = Some(Serving::Instance);
+                b.model = Some("m".into());
+            }),
+            ("multiplexer + model", |b| {
+                b.serving = Some(Serving::Multiplexer);
+                b.model = Some("m".into());
+            }),
+            ("card", |b| b.card = Some("c".into())),
+            ("auth", |b| b.api_key_env = Some("K".into())),
+            ("tiers", |b| b.tiers = vec![Tier::Fast]),
+            ("managed", |b| b.managed = Some(ManagedMode::Shared)),
+        ];
+        for (what, f) in ambiguous_cases {
+            let err = classify(&with(Some(MARKER), true, *f)).expect_err(what);
+            assert!(
+                err.contains("operator_v1") && err.contains("delete"),
+                "{what}: both remediations named: {err}"
+            );
+        }
+    }
+
+    /// The public ownership boundary: classification, the canonical
+    /// operator render (shared with the writer), and the comment-preserving
+    /// claim/retag — without the raw tag vocabulary in the API.
+    #[test]
+    fn the_dropin_ownership_boundary_classifies_stamps_and_claims() {
+        // Classification.
+        assert_eq!(
+            classify_backend_dropin("record = \"operator_v1\"\nendpoint = \"http://e:1\"\n"),
+            Ok(DropinOwnership::Operator)
+        );
+        assert_eq!(
+            classify_backend_dropin("record = \"probe_v1\"\nendpoint = \"http://e:1\"\n"),
+            Ok(DropinOwnership::Probe)
+        );
+        assert_eq!(
+            classify_backend_dropin("# hand-authored\nendpoint = \"http://e:1\"\n"),
+            Ok(DropinOwnership::Operator)
+        );
+        assert_eq!(
+            classify_backend_dropin(
+                "endpoint = \"http://e:1\"\nkind = \"openai\"\n\n[provenance]\nsource = \"newt adopt v0.7.9 (probed; delete this file to reset)\"\nprobed = \"2026-08-01\"\n"
+            ),
+            Ok(DropinOwnership::Probe),
+            "the unambiguous legacy probe cache"
+        );
+        assert!(
+            classify_backend_dropin("endpoint = 42\n").is_err(),
+            "malformed"
+        );
+        let err = classify_backend_dropin(
+            "endpoint = \"http://e:1\"\nmodel = \"m\"\n\n[provenance]\nsource = \"newt adopt v0.7.9 (probed; delete this file to reset)\"\n"
+        )
+        .expect_err("the ambiguity is an error here too");
+        assert!(
+            err.contains("operator_v1") && err.contains("delete"),
+            "{err}"
+        );
+
+        // The canonical render IS what the writer writes.
+        let backend = BackendConfig {
+            name: "ops".into(),
+            endpoint: "http://e:1".into(),
+            model: Some("m".into()),
+            ..Default::default()
+        };
+        let rendered = render_operator_backend_dropin(&backend).unwrap();
+        assert_eq!(
+            classify_backend_dropin(&rendered),
+            Ok(DropinOwnership::Operator)
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "# cfg\n").unwrap();
+        let written = write_backend_dropin(&config_path, &backend).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&written).unwrap(),
+            rendered,
+            "one renderer, shared by the core writer"
+        );
+
+        // Claim/retag: comments, key order, and unknown keys preserved; the
+        // stamp lands TOP-LEVEL even when a [provenance] table follows.
+        let probe_text = "# probed by newt\nendpoint = \"http://e:1\" # the server\nrecord = \"probe_v1\"\nfuture_key = 1\n\n[provenance]\nprobed = \"2026-08-01\"\n";
+        let claimed = claim_backend_dropin_as_operator(probe_text).unwrap();
+        assert_eq!(
+            classify_backend_dropin(&claimed),
+            Ok(DropinOwnership::Operator)
+        );
+        for preserved in [
+            "# probed by newt",
+            "# the server",
+            "future_key = 1",
+            "[provenance]",
+        ] {
+            assert!(claimed.contains(preserved), "`{preserved}` lost: {claimed}");
+        }
+        assert!(!claimed.contains("probe_v1"), "retagged: {claimed}");
+        // Untagged file with a trailing table: the new stamp must not land
+        // inside [provenance].
+        let untagged = "endpoint = \"http://e:1\"\n\n[provenance]\nprobed = \"2026-08-01\"\n";
+        let claimed = claim_backend_dropin_as_operator(untagged).unwrap();
+        assert_eq!(
+            classify_backend_dropin(&claimed),
+            Ok(DropinOwnership::Operator)
+        );
+        // Idempotent.
+        assert_eq!(
+            claim_backend_dropin_as_operator(&claimed).unwrap(),
+            claimed,
+            "claiming an operator file changes nothing"
+        );
+        assert!(
+            claim_backend_dropin_as_operator("endpoint = \n").is_err(),
+            "claiming non-TOML errors"
+        );
+    }
+
+    /// `$NEWT_PROVIDER` naming a configured but DESTINATION-LESS backend is
+    /// a typed hard error on the selection contract — never the pre-#1819
+    /// silent pick of the unroutable backend, and never a silent
+    /// fall-through to some other backend. The `Option` surfaces select
+    /// NOTHING (documented), the receipts stay slot-aligned, and a provider
+    /// still wins the name tie against an unroutable backend.
+    #[test]
+    #[serial_test::serial(real_fs)] // mutates NEWT_PROVIDER (guard-restored)
+    fn an_env_named_unroutable_backend_is_a_typed_error_never_a_silent_pick() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::set_var("NEWT_PROVIDER", "hollow") };
+        let mut cfg = Config {
+            backends: vec![
+                BackendConfig {
+                    name: "routable".into(),
+                    endpoint: "http://a:1".into(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    name: "hollow".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            matches!(cfg.select_backend(), SelectionOutcome::UnroutableNamed(ref n) if n == "hollow"),
+            "the high-level contract surfaces the error: {:?}",
+            cfg.select_backend()
+        );
+        assert!(
+            cfg.select_configured_backend().is_none(),
+            "the Option surface selects NOTHING — not `hollow`, not `routable`"
+        );
+        // Receipts stay slot-aligned; the receipt-bearing pick agrees (None).
+        let receipts = resolve_for_test(&mut cfg, &[], None).unwrap();
+        assert_eq!(receipts.len(), 2);
+        let resolved = ResolvedConfig {
+            config: cfg,
+            receipts,
+        };
+        assert!(
+            resolved.selected_backend().is_none(),
+            "same shared selector"
+        );
+        // A provider claiming the name still wins the tie.
+        let cfg = Config {
+            backends: vec![BackendConfig {
+                name: "hollow".into(),
+                ..Default::default()
+            }],
+            providers: vec![ProviderConfig {
+                name: "hollow".into(),
+                command: "newt-provider-openai".into(),
+                model: None,
+                env_pass: vec![],
+                tiers: vec![],
+            }],
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                cfg.select_backend(),
+                SelectionOutcome::Selected(SelectedBackend::Provider(p)) if p.name == "hollow"
+            ),
+            "provider wins the name tie: {:?}",
+            cfg.select_backend()
+        );
+    }
+
+    /// `default_backend` naming a destination-less backend errors the same
+    /// way — previously it silently fell through to the preference rules
+    /// and ran a different backend than the one the operator configured.
+    #[test]
+    #[serial_test::serial(real_fs)] // reads NEWT_PROVIDER (guard-restored)
+    fn a_default_named_unroutable_backend_errors_instead_of_silent_preference() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let cfg = Config {
+            backends: vec![
+                BackendConfig {
+                    name: "routable".into(),
+                    endpoint: "http://a:1".into(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    name: "hollow".into(),
+                    ..Default::default()
+                },
+            ],
+            default_backend: Some("hollow".into()),
+            ..Default::default()
+        };
+        assert!(
+            matches!(cfg.select_backend(), SelectionOutcome::UnroutableNamed(ref n) if n == "hollow"),
+            "{:?}",
+            cfg.select_backend()
+        );
+        assert!(cfg.select_configured_backend().is_none());
+    }
+
+    /// A field-only `--backend-*` cannot edit the explicitly selected but
+    /// destination-less slot (editing it routes nothing; editing another
+    /// deserts the selection) — while a DESTINATION request targeting the
+    /// same backend by name is fine: the request itself supplies the route.
+    #[test]
+    #[serial_test::serial(real_fs)] // mutates NEWT_PROVIDER (guard-restored)
+    fn an_unnamed_field_only_request_cannot_edit_an_unroutable_selected_slot() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        let base = || Config {
+            backends: vec![
+                BackendConfig {
+                    name: "routable".into(),
+                    endpoint: "http://a:1".into(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    name: "hollow".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let model_only = BackendOverride {
+            model: Some("m".into()),
+            ..Default::default()
+        };
+        // $NEWT_PROVIDER selects the hollow slot.
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::set_var("NEWT_PROVIDER", "hollow") };
+        let mut cfg = base();
+        let err = resolve_for_test(&mut cfg, &[], Some(model_only.clone()))
+            .expect_err("no silent edit of an unroutable selection");
+        assert!(
+            err.contains("hollow") && err.contains("--backend-url"),
+            "names the slot and the remediation: {err}"
+        );
+        // default_backend selecting it errors identically.
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let mut cfg = Config {
+            default_backend: Some("hollow".into()),
+            ..base()
+        };
+        let err = resolve_for_test(&mut cfg, &[], Some(model_only))
+            .expect_err("default-selected unroutable slot refuses the edit");
+        assert!(err.contains("hollow"), "{err}");
+        // A destination request naming it supplies the route — allowed.
+        let mut cfg = Config {
+            default_backend: Some("hollow".into()),
+            ..base()
+        };
+        let over = BackendOverride {
+            name: Some("hollow".into()),
+            endpoint: Some("http://now-routable:9".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[], Some(over)).unwrap();
+        assert_eq!(cfg.backends.len(), 1);
+        assert_eq!(cfg.backends[0].endpoint, "http://now-routable:9");
+        assert_eq!(
+            receipts[0].request.as_ref().map(|r| r.mode),
+            Some(RequestMode::ExclusiveDestination)
+        );
+    }
+
+    /// Destination/kind coherence is one invariant everywhere: a
+    /// model_path route composes to `BackendKind::Embedded`; an endpoint
+    /// route never retains Embedded (cleared to probe-at-connect). Asserted
+    /// on the EFFECTIVE backend and the receipt destination, not just
+    /// selection.
+    #[test]
+    fn destination_kind_coherence_is_enforced_in_composition() {
+        // HTTP/OpenAI backend retargeted to a model_path.
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "a".into(),
+                endpoint: "http://a:1".into(),
+                kind: Some(BackendKind::Openai),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            name: Some("a".into()),
+            model_path: Some("/models/x.gguf".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[], Some(over)).unwrap();
+        let b = &cfg.backends[0];
+        assert_eq!(
+            b.kind,
+            Some(BackendKind::Embedded),
+            "model_path route IS embedded"
+        );
+        assert_eq!(b.endpoint, "");
+        let requested = receipts[0]
+            .request
+            .as_ref()
+            .unwrap()
+            .destination_over(&receipts[0].declaration.destination);
+        assert_eq!(
+            requested,
+            BackendDestination::new(None, Some("/models/x.gguf".into()))
+        );
+        assert_eq!(BackendDestination::of(b), requested);
+
+        // A brand-new path-only CLI backend.
+        let mut cfg = Config {
+            backends: vec![],
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            model_path: Some("/models/y.gguf".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[], Some(over)).unwrap();
+        assert_eq!(cfg.backends[0].kind, Some(BackendKind::Embedded));
+        assert_eq!(
+            receipts[0]
+                .request
+                .as_ref()
+                .unwrap()
+                .destination_over(&receipts[0].declaration.destination),
+            BackendDestination::new(None, Some("/models/y.gguf".into()))
+        );
+
+        // Embedded backend retargeted to an endpoint: Embedded must not ride.
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "emb".into(),
+                model_path: Some("/models/x.gguf".into()),
+                kind: Some(BackendKind::Embedded),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            name: Some("emb".into()),
+            endpoint: Some("http://h:1".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[], Some(over)).unwrap();
+        let b = &cfg.backends[0];
+        assert_eq!(b.endpoint, "http://h:1");
+        assert_eq!(b.model_path, None);
+        assert_eq!(
+            b.kind, None,
+            "an endpoint route never retains Embedded — cleared to probe-at-connect"
+        );
+        assert_eq!(
+            BackendDestination::of(b),
+            receipts[0]
+                .request
+                .as_ref()
+                .unwrap()
+                .destination_over(&receipts[0].declaration.destination)
+        );
+    }
+
+    /// Explicitly contradictory destination/kind pairs are refused, and an
+    /// incoherent model_path-on-HTTP-kind DECLARATION is not routable.
+    #[test]
+    fn contradictory_destination_kind_pairs_are_refused() {
+        let base = || Config {
+            backends: vec![BackendConfig {
+                name: "a".into(),
+                endpoint: "http://a:1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut cfg = base();
+        let err = resolve_for_test(
+            &mut cfg,
+            &[],
+            Some(BackendOverride {
+                endpoint: Some("http://h:1".into()),
+                kind: Some(BackendKind::Embedded),
+                ..Default::default()
+            }),
+        )
+        .expect_err("url + embedded kind");
+        assert!(err.contains("contradictory"), "{err}");
+        let mut cfg = base();
+        let err = resolve_for_test(
+            &mut cfg,
+            &[],
+            Some(BackendOverride {
+                model_path: Some("/m.gguf".into()),
+                kind: Some(BackendKind::Openai),
+                ..Default::default()
+            }),
+        )
+        .expect_err("model_path + HTTP kind");
+        assert!(err.contains("contradictory"), "{err}");
+        // The declaration-level incoherence: model_path on an HTTP kind is
+        // not a route.
+        assert!(!backend_is_routable(&BackendConfig {
+            name: "weird".into(),
+            model_path: Some("/m.gguf".into()),
+            kind: Some(BackendKind::Openai),
+            ..Default::default()
+        }));
+        assert!(backend_is_routable(&BackendConfig {
+            name: "emb".into(),
+            model_path: Some("/m.gguf".into()),
+            kind: Some(BackendKind::Embedded),
+            ..Default::default()
+        }));
+    }
+
+    /// A valid cached probe for a DISK-declared backend must not emit the
+    /// destructive "unconfigured — delete the file" warning merely because
+    /// this invocation exclusively selected another backend: attachment
+    /// resolves against final declarations BEFORE the CLI prunes. A genuine
+    /// disk-level endpoint mismatch still warns.
+    #[test]
+    fn exclusive_selection_of_another_backend_emits_no_orphan_probe_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("cached.toml"),
+            "record = \"probe_v1\"\nendpoint = \"http://cached:8000\"\nkind = \"openai\"\n",
+        )
+        .unwrap();
+        let base = || Config {
+            backends: vec![
+                BackendConfig {
+                    name: "cached".into(),
+                    endpoint: "http://cached:8000".into(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    name: "other".into(),
+                    endpoint: "http://other:9".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        // Exclusive selection of `other`: the cache quietly attaches (then
+        // its slot is pruned) — no orphan/delete warning.
+        let mut cfg = base();
+        let over = BackendOverride {
+            name: Some("other".into()),
+            endpoint: Some("http://other:9".into()),
+            ..Default::default()
+        };
+        let (result, warnings) =
+            captured_warnings(|| resolve_for_test(&mut cfg, &[dir.path()], Some(over)));
+        result.unwrap();
+        assert!(
+            !warnings.contains("unconfigured") && !warnings.contains("delete the file"),
+            "a valid cache for a disk-declared backend is not an orphan: {warnings}"
+        );
+        assert_eq!(cfg.backends.len(), 1);
+        assert_eq!(cfg.backends[0].name, "other");
+        // Control: a genuine disk-level mismatch still warns.
+        let mismatch = tempfile::tempdir().unwrap();
+        std::fs::write(
+            mismatch.path().join("cached.toml"),
+            "record = \"probe_v1\"\nendpoint = \"http://elsewhere:1\"\nkind = \"openai\"\n",
+        )
+        .unwrap();
+        let mut cfg = base();
+        let (result, warnings) =
+            captured_warnings(|| resolve_for_test(&mut cfg, &[mismatch.path()], None));
+        result.unwrap();
+        assert!(
+            warnings.contains("does not match"),
+            "the real mismatch keeps its warning: {warnings}"
+        );
+        // And a truly unconfigured probe still warns destructively-visibly.
+        let mut cfg = Config {
+            backends: vec![],
+            ..Default::default()
+        };
+        let (result, warnings) =
+            captured_warnings(|| resolve_for_test(&mut cfg, &[dir.path()], None));
+        result.unwrap();
+        assert!(warnings.contains("unconfigured"), "{warnings}");
+    }
+
+    /// Claiming preserves the `record` line's OWN decor — the trailing
+    /// ownership note survives the retag byte-for-byte, with exact output
+    /// order/comments/unknown keys and idempotence.
+    #[test]
+    fn claiming_preserves_the_record_lines_own_comment() {
+        let probe_text = "\
+# machine-written cache
+record = \"probe_v1\"  # ownership note: delete to re-probe
+endpoint = \"http://e:1\" # the server
+future_key = 1
+
+[provenance]
+probed = \"2026-08-01\"
+";
+        let claimed = claim_backend_dropin_as_operator(probe_text).unwrap();
+        let expected = probe_text.replace("probe_v1", "operator_v1");
+        assert_eq!(claimed, expected, "ONLY the tag value changes");
+        assert_eq!(
+            claim_backend_dropin_as_operator(&claimed).unwrap(),
+            claimed,
+            "idempotent"
+        );
+        assert_eq!(
+            classify_backend_dropin(&claimed),
+            Ok(DropinOwnership::Operator)
+        );
+    }
+
+    /// The public `BackendOverride::apply` delegates to the invariant-owning
+    /// assembly path: refusals leave the config byte-for-byte untouched
+    /// (warned, for the infallible surface; typed, via `try_apply`), the
+    /// unnamed field-only edit lands on the SELECTED slot, a named miss is
+    /// an error rather than a silent no-op, and cross-destination kind
+    /// coherence holds.
+    #[test]
+    #[serial_test::serial(real_fs)] // reads NEWT_PROVIDER (guard-restored)
+    fn backend_override_apply_delegates_to_the_invariant_owning_path() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let base = || Config {
+            backends: vec![
+                BackendConfig {
+                    name: "a".into(),
+                    endpoint: "http://a:1".into(),
+                    model: Some("model-a".into()),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    name: "b".into(),
+                    endpoint: "http://b:2".into(),
+                    model: Some("model-b".into()),
+                    ..Default::default()
+                },
+            ],
+            default_backend: Some("b".into()),
+            ..Default::default()
+        };
+        // BackendConfig carries no PartialEq — compare serialized bytes.
+        let snap = |cfg: &Config| -> Vec<String> {
+            cfg.backends
+                .iter()
+                .map(|b| toml::to_string(b).unwrap())
+                .collect()
+        };
+        let untouched = snap(&base());
+        // Both destinations / empty destination: refused, untouched.
+        for over in [
+            BackendOverride {
+                endpoint: Some("http://h:1".into()),
+                model_path: Some("/m.gguf".into()),
+                ..Default::default()
+            },
+            BackendOverride {
+                endpoint: Some(String::new()),
+                ..Default::default()
+            },
+        ] {
+            let mut cfg = base();
+            assert!(over.try_apply(&mut cfg).is_err());
+            assert_eq!(snap(&cfg), untouched, "refusal leaves it untouched");
+            let mut cfg = base();
+            over.apply(&mut cfg); // infallible surface: warns, same untouched state
+            assert_eq!(snap(&cfg), untouched);
+        }
+        // Unnamed field-only: the SELECTED slot (default_backend = b), not [0].
+        let mut cfg = base();
+        BackendOverride {
+            model: Some("new".into()),
+            ..Default::default()
+        }
+        .apply(&mut cfg);
+        assert_eq!(cfg.backends[0].model.as_deref(), Some("model-a"));
+        assert_eq!(cfg.backends[1].model.as_deref(), Some("new"));
+        // Named miss: an error via try_apply; untouched via apply.
+        let mut cfg = base();
+        let over = BackendOverride {
+            name: Some("ghost".into()),
+            model: Some("m".into()),
+            ..Default::default()
+        };
+        let err = over.try_apply(&mut cfg).expect_err("named miss");
+        assert!(err.contains("ghost"), "{err}");
+        assert_eq!(snap(&cfg), untouched);
+        // Cross-destination kind coherence through the public surface.
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "emb".into(),
+                model_path: Some("/m.gguf".into()),
+                kind: Some(BackendKind::Embedded),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        BackendOverride {
+            name: Some("emb".into()),
+            endpoint: Some("http://h:1".into()),
+            ..Default::default()
+        }
+        .apply(&mut cfg);
+        assert_eq!(
+            cfg.backends[0].kind, None,
+            "Embedded cleared on an HTTP route"
+        );
+        assert_eq!(cfg.backends[0].model_path, None);
+    }
+
+    /// An explicit env selector that matches NOTHING (a typo, or a
+    /// provider's name) stops the Option surface and the unnamed field-only
+    /// override — never a silent edit/selection of some other backend.
+    #[test]
+    #[serial_test::serial(real_fs)] // mutates NEWT_PROVIDER (guard-restored)
+    fn an_unmatched_env_selector_stops_option_surfaces_and_unnamed_overrides() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        let base = || Config {
+            backends: vec![BackendConfig {
+                name: "real".into(),
+                endpoint: "http://r:1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::set_var("NEWT_PROVIDER", "ghost") };
+        let cfg = base();
+        assert!(
+            cfg.select_configured_backend().is_none(),
+            "unknown env name selects NOTHING — not `real`"
+        );
+        let mut cfg = base();
+        let err = resolve_for_test(
+            &mut cfg,
+            &[],
+            Some(BackendOverride {
+                model: Some("m".into()),
+                ..Default::default()
+            }),
+        )
+        .expect_err("no silent edit of `real`");
+        assert!(err.contains("ghost"), "{err}");
+        // A provider's name behaves identically at this layer (the slot
+        // selector only knows [[backends]]); the error says so.
+        assert!(
+            err.contains("provider"),
+            "mentions the provider case: {err}"
+        );
+    }
+
+    /// Field-only targeting runs over the PROBE-INFORMED view: a cached
+    /// probe that makes B OpenAI moves both the preference selection AND
+    /// the unnamed edit to B — edit target and final selection agree.
+    #[test]
+    #[serial_test::serial(real_fs)] // reads NEWT_PROVIDER (guard-restored)
+    fn probe_informed_targeting_agrees_with_final_selection() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("b.toml"),
+            "record = \"probe_v1\"\nendpoint = \"http://b:2\"\nkind = \"openai\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![
+                BackendConfig {
+                    name: "a".into(),
+                    endpoint: "http://a:1".into(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    name: "b".into(),
+                    endpoint: "http://b:2".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            model: Some("m".into()),
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[dir.path()], Some(over)).unwrap();
+        assert!(
+            receipts[0].request.is_none(),
+            "raw-first `a` is NOT the target"
+        );
+        assert!(
+            receipts[1].request.is_some(),
+            "the probe-informed OpenAI preference targets `b`"
+        );
+        let resolved = ResolvedConfig {
+            config: cfg,
+            receipts,
+        };
+        let picked = resolved.selected_backend().expect("something selects");
+        assert_eq!(
+            picked.slot, 1,
+            "final selection agrees with the edit target"
+        );
+        assert!(picked.receipt.request.is_some());
+    }
+
+    /// A NAMED field-only request must target a routable backend — editing
+    /// a destination-less one routes nothing.
+    #[test]
+    fn a_named_field_only_request_must_target_a_routable_backend() {
+        let base = || Config {
+            backends: vec![
+                BackendConfig {
+                    name: "real".into(),
+                    endpoint: "http://r:1".into(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    name: "hollow".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        for over in [
+            BackendOverride {
+                name: Some("hollow".into()),
+                model: Some("m".into()),
+                ..Default::default()
+            },
+            BackendOverride {
+                name: Some("hollow".into()),
+                ..Default::default()
+            },
+        ] {
+            let mut cfg = base();
+            let err = resolve_for_test(&mut cfg, &[], Some(over.clone()))
+                .expect_err("a named unroutable target refuses the edit");
+            assert!(
+                err.contains("hollow") && err.contains("--backend-url"),
+                "{err}"
+            );
+            let mut cfg = base();
+            let err = over
+                .try_apply(&mut cfg)
+                .expect_err("same through try_apply");
+            assert!(err.contains("hollow"), "{err}");
+        }
+    }
+
+    /// Destination XOR holds for DECLARATIONS too: an inline backend with
+    /// both endpoint and model_path is a hard error on normal AND profile
+    /// paths; a both-destination drop-in warn-skips, leaving the prior
+    /// declaration standing.
+    #[test]
+    fn a_both_destination_declaration_is_rejected_everywhere() {
+        let both = BackendConfig {
+            name: "twoplace".into(),
+            endpoint: "http://h:1".into(),
+            model_path: Some("/m.gguf".into()),
+            ..Default::default()
+        };
+        let mut cfg = Config {
+            backends: vec![both.clone()],
+            ..Default::default()
+        };
+        let err = resolve_for_test(&mut cfg, &[], None).expect_err("inline both");
+        assert!(err.contains("ONE destination"), "{err}");
+        let err = Config {
+            backends: vec![both],
+            ..Default::default()
+        }
+        .prepare_runtime()
+        .expect_err("profile path validates too");
+        assert!(err.to_string().contains("ONE destination"), "{err}");
+        // Drop-in variant: warn-skip; the prior declaration survives.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("keep.toml"),
+            "record = \"operator_v1\"\nendpoint = \"http://new:9\"\nmodel_path = \"/m.gguf\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "keep".into(),
+                endpoint: "http://old:1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (result, warnings) = captured_warnings(|| merge_for_test(&mut cfg, &[dir.path()]));
+        result.unwrap();
+        assert!(warnings.contains("ONE destination"), "{warnings}");
+        assert_eq!(cfg.backends[0].endpoint, "http://old:1", "prior survives");
+    }
+
+    /// A kind-only field request must match the target's EXISTING
+    /// destination — refused atomically, never silently normalized away.
+    #[test]
+    fn kind_only_field_requests_must_match_the_targets_destination() {
+        let http = || Config {
+            backends: vec![BackendConfig {
+                name: "http".into(),
+                endpoint: "http://h:1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let emb = || Config {
+            backends: vec![BackendConfig {
+                name: "emb".into(),
+                model_path: Some("/m.gguf".into()),
+                kind: Some(BackendKind::Embedded),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // embedded kind onto an HTTP destination: refused (both surfaces).
+        let over = BackendOverride {
+            name: Some("http".into()),
+            kind: Some(BackendKind::Embedded),
+            ..Default::default()
+        };
+        let mut cfg = http();
+        let err = resolve_for_test(&mut cfg, &[], Some(over.clone())).expect_err("refuse");
+        assert!(err.contains("contradictory"), "{err}");
+        let mut cfg = http();
+        assert!(over.try_apply(&mut cfg).is_err());
+        assert_eq!(cfg.backends[0].kind, None, "untouched");
+        // HTTP kind onto a model_path destination: refused.
+        let over = BackendOverride {
+            name: Some("emb".into()),
+            kind: Some(BackendKind::Openai),
+            ..Default::default()
+        };
+        let mut cfg = emb();
+        let err = resolve_for_test(&mut cfg, &[], Some(over)).expect_err("refuse");
+        assert!(err.contains("contradictory"), "{err}");
+        // embedded kind onto a model_path destination: fine.
+        let over = BackendOverride {
+            name: Some("emb".into()),
+            kind: Some(BackendKind::Embedded),
+            ..Default::default()
+        };
+        let mut cfg = emb();
+        resolve_for_test(&mut cfg, &[], Some(over)).unwrap();
+        assert_eq!(cfg.backends[0].kind, Some(BackendKind::Embedded));
+    }
+
+    /// A field-only edit never invents tiers: an intentionally empty
+    /// `tiers = []` declaration stays empty. Tier defaulting belongs to the
+    /// exclusive destination request alone.
+    #[test]
+    fn a_field_only_edit_never_invents_tiers() {
+        let base = || Config {
+            backends: vec![BackendConfig {
+                name: "a".into(),
+                endpoint: "http://a:1".into(),
+                tiers: vec![],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let over = BackendOverride {
+            name: Some("a".into()),
+            model: Some("m".into()),
+            ..Default::default()
+        };
+        let mut cfg = base();
+        resolve_for_test(&mut cfg, &[], Some(over.clone())).unwrap();
+        assert!(cfg.backends[0].tiers.is_empty(), "assembly path");
+        let mut cfg = base();
+        over.try_apply(&mut cfg).unwrap();
+        assert!(cfg.backends[0].tiers.is_empty(), "public composer path");
+        // Exclusive destination still defaults tiers so it serves.
+        let mut cfg = base();
+        BackendOverride {
+            name: Some("a".into()),
+            endpoint: Some("http://new:9".into()),
+            ..Default::default()
+        }
+        .try_apply(&mut cfg)
+        .unwrap();
+        assert_eq!(cfg.backends[0].tiers.len(), 4, "exclusive defaults tiers");
+    }
+
+    /// Public composition aligns config-level selection with the request
+    /// target: an exclusive request re-points `default_backend` at its
+    /// (kept or new) backend, a NAMED edit selects its target, an unnamed
+    /// edit leaves the selection alone.
+    #[test]
+    #[serial_test::serial(real_fs)] // reads NEWT_PROVIDER (guard-restored)
+    fn try_apply_aligns_config_selection_with_the_request_target() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let base = || Config {
+            backends: vec![
+                BackendConfig {
+                    name: "a".into(),
+                    endpoint: "http://a:1".into(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    name: "b".into(),
+                    endpoint: "http://b:2".into(),
+                    ..Default::default()
+                },
+            ],
+            default_backend: Some("a".into()),
+            ..Default::default()
+        };
+        // Exclusive unnamed: the new `cli` backend IS the selection — no
+        // stale default naming a discarded backend.
+        let mut cfg = base();
+        BackendOverride {
+            endpoint: Some("http://new:9".into()),
+            ..Default::default()
+        }
+        .try_apply(&mut cfg)
+        .unwrap();
+        assert_eq!(cfg.default_backend.as_deref(), Some("cli"));
+        assert_eq!(
+            cfg.select_configured_backend().map(|b| b.name.as_str()),
+            Some("cli"),
+            "no stale selection after the exclusive request"
+        );
+        // Named field-only: the named target becomes the selection.
+        let mut cfg = base();
+        BackendOverride {
+            name: Some("b".into()),
+            model: Some("m".into()),
+            ..Default::default()
+        }
+        .try_apply(&mut cfg)
+        .unwrap();
+        assert_eq!(cfg.default_backend.as_deref(), Some("b"));
+        assert_eq!(
+            cfg.select_configured_backend().map(|b| b.name.as_str()),
+            Some("b")
+        );
+        // Unnamed field-only: edits the selected backend; selection stays.
+        let mut cfg = base();
+        BackendOverride {
+            model: Some("m".into()),
+            ..Default::default()
+        }
+        .try_apply(&mut cfg)
+        .unwrap();
+        assert_eq!(cfg.default_backend.as_deref(), Some("a"), "unchanged");
+        assert_eq!(cfg.backends[0].model.as_deref(), Some("m"));
+    }
+
+    /// Claiming refuses to overwrite a `[record]` table or `[[record]]`
+    /// array — those are someone's data, not an ownership tag.
+    #[test]
+    fn claiming_refuses_a_record_table() {
+        for body in [
+            "endpoint = \"http://e:1\"\n\n[record]\nx = 1\n",
+            "endpoint = \"http://e:1\"\n\n[[record]]\nx = 1\n",
+        ] {
+            let err =
+                claim_backend_dropin_as_operator(body).expect_err("a record table is not a tag");
+            assert!(err.contains("refusing"), "{err}");
+        }
+    }
+
+    /// `model_path = ""` is not a destination: an empty-path drop-in cannot
+    /// pass the destination check and strip a valid earlier declaration.
+    #[test]
+    fn an_empty_model_path_dropin_cannot_replace_a_declaration() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("keep.toml"),
+            "record = \"operator_v1\"\nmodel_path = \"\"\nmodel = \"stripper\"\n",
+        )
+        .unwrap();
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "keep".into(),
+                endpoint: "http://old:1".into(),
+                model: Some("declared".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (result, warnings) = captured_warnings(|| merge_for_test(&mut cfg, &[dir.path()]));
+        result.unwrap();
+        assert!(
+            warnings.contains("neither endpoint nor model_path"),
+            "{warnings}"
+        );
+        assert_eq!(cfg.backends[0].endpoint, "http://old:1");
+        assert_eq!(cfg.backends[0].model.as_deref(), Some("declared"));
+    }
+
+    /// An EMPTY `default_backend` is absent on every surface — Option,
+    /// typed, and override targeting agree (previously the slot selector
+    /// treated `Some("")` as an authoritative selector for a backend named
+    /// `""`).
+    #[test]
+    #[serial_test::serial(real_fs)] // reads NEWT_PROVIDER (guard-restored)
+    fn an_empty_default_backend_is_absent_on_every_surface() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let base = || Config {
+            backends: vec![BackendConfig {
+                name: "real".into(),
+                endpoint: "http://r:1".into(),
+                ..Default::default()
+            }],
+            default_backend: Some(String::new()),
+            ..Default::default()
+        };
+        let cfg = base();
+        assert_eq!(
+            cfg.select_configured_backend().map(|b| b.name.as_str()),
+            Some("real"),
+            "Option surface"
+        );
+        assert!(
+            matches!(
+                cfg.select_backend(),
+                SelectionOutcome::Selected(SelectedBackend::Configured(b)) if b.name == "real"
+            ),
+            "typed surface"
+        );
+        let mut cfg = base();
+        let receipts = resolve_for_test(
+            &mut cfg,
+            &[],
+            Some(BackendOverride {
+                model: Some("m".into()),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        assert!(receipts[0].request.is_some(), "override targeting agrees");
+    }
+
+    /// Provider identity is validated on normal and profile paths, and the
+    /// deliberate cross-namespace tie precedence is pinned: a ROUTABLE
+    /// backend wins the name tie; a destination-less one loses it to the
+    /// provider.
+    #[test]
+    #[serial_test::serial(real_fs)] // reads NEWT_PROVIDER (guard-restored)
+    fn provider_identity_is_validated_and_name_ties_are_pinned() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let provider = |name: &str| ProviderConfig {
+            name: name.into(),
+            command: "newt-provider-openai".into(),
+            model: None,
+            env_pass: vec![],
+            tiers: vec![],
+        };
+        // Duplicate providers: hard error (profile path shown; the normal
+        // path shares the same validation call).
+        let err = Config {
+            providers: vec![provider("twin"), provider("twin")],
+            ..Default::default()
+        }
+        .prepare_runtime()
+        .expect_err("duplicate providers");
+        assert!(err.to_string().contains("twin"), "{err}");
+        // Empty provider name: hard error.
+        let err = Config {
+            providers: vec![provider(" ")],
+            ..Default::default()
+        }
+        .prepare_runtime()
+        .expect_err("empty provider name");
+        assert!(err.to_string().contains("no name"), "{err}");
+        // Tie precedence: a ROUTABLE backend beats the same-name provider…
+        let cfg = Config {
+            backends: vec![BackendConfig {
+                name: "tie".into(),
+                endpoint: "http://t:1".into(),
+                ..Default::default()
+            }],
+            providers: vec![provider("tie")],
+            default_backend: Some("tie".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            cfg.select_backend(),
+            SelectionOutcome::Selected(SelectedBackend::Configured(b)) if b.name == "tie"
+        ));
+        // …and a destination-less backend loses the tie to the provider.
+        let cfg = Config {
+            backends: vec![BackendConfig {
+                name: "tie".into(),
+                ..Default::default()
+            }],
+            providers: vec![provider("tie")],
+            default_backend: Some("tie".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            cfg.select_backend(),
+            SelectionOutcome::Selected(SelectedBackend::Provider(p)) if p.name == "tie"
+        ));
+    }
+
+    /// An unnamed kind edit that would REORDER the shared precedence is
+    /// refused with a demand for --backend-name — edit target and final
+    /// selection must be the same slot.
+    #[test]
+    #[serial_test::serial(real_fs)] // reads NEWT_PROVIDER (guard-restored)
+    fn a_destabilizing_unnamed_kind_edit_requires_a_name() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let base = || Config {
+            backends: vec![
+                BackendConfig {
+                    name: "b".into(),
+                    endpoint: "http://b:1".into(),
+                    kind: Some(BackendKind::Ollama),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    name: "a".into(),
+                    endpoint: "http://a:2".into(),
+                    kind: Some(BackendKind::Openai),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        // Preference selects `a` (OpenAI). Retagging it ollama would make
+        // `b` the selection — divergence, refused.
+        let over = BackendOverride {
+            kind: Some(BackendKind::Ollama),
+            ..Default::default()
+        };
+        let mut cfg = base();
+        let err = resolve_for_test(&mut cfg, &[], Some(over)).expect_err("diverges");
+        assert!(err.contains("--backend-name"), "{err}");
+        // Named, the same edit is explicit and fine.
+        let over = BackendOverride {
+            name: Some("a".into()),
+            kind: Some(BackendKind::Ollama),
+            ..Default::default()
+        };
+        let mut cfg = base();
+        resolve_for_test(&mut cfg, &[], Some(over)).unwrap();
+        assert_eq!(cfg.backends[1].kind, Some(BackendKind::Ollama));
+    }
+
+    /// Preview/composition NORMALIZATION parity: a declaration with a
+    /// model_path and a stale HTTP kind composes to Embedded with no CLI
+    /// request — so the identical config must also accept a harmless
+    /// model-only edit (the preview normalizes the same way), never refuse
+    /// it as "unroutable".
+    #[test]
+    #[serial_test::serial(real_fs)] // reads NEWT_PROVIDER (guard-restored)
+    fn an_incoherent_model_path_declaration_normalizes_with_and_without_an_edit() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let base = || Config {
+            backends: vec![BackendConfig {
+                name: "weird".into(),
+                model_path: Some("/m.gguf".into()),
+                kind: Some(BackendKind::Openai),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // Without any request: composes, normalized to Embedded.
+        let mut cfg = base();
+        resolve_for_test(&mut cfg, &[], None).unwrap();
+        assert_eq!(cfg.backends[0].kind, Some(BackendKind::Embedded));
+        // With a harmless model-only edit: SAME acceptance, same shape.
+        let mut cfg = base();
+        let receipts = resolve_for_test(
+            &mut cfg,
+            &[],
+            Some(BackendOverride {
+                model: Some("m".into()),
+                ..Default::default()
+            }),
+        )
+        .expect("the preview normalizes exactly as composition does");
+        assert!(receipts[0].request.is_some());
+        assert_eq!(cfg.backends[0].kind, Some(BackendKind::Embedded));
+        assert_eq!(cfg.backends[0].model.as_deref(), Some("m"));
+    }
+
+    /// Provider-only parity: the NORMAL path must not synthesize a
+    /// localhost backend when `[[providers]]` exist — the synthetic backend
+    /// would outrank the provider that the profile path selects. A
+    /// provider-only config is configured (`is_unconfigured` = false); the
+    /// fully bare config still gets the localhost fallback.
+    #[test]
+    #[serial_test::serial(real_fs)] // pins NEWT_CONFIG/HOME/cwd + NEWT_PROVIDER
+    fn a_provider_only_config_selects_the_provider_on_normal_and_profile_paths() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let dir = tempfile::tempdir().unwrap();
+        let _sandbox = HomeSandbox::enter(dir.path());
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[[providers]]\nname = \"acme\"\ncommand = \"newt-provider-openai\"\nenv_pass = []\ntiers = []\n",
+        )
+        .unwrap();
+        // Normal path: no synthesized backend, the provider is selected.
+        let resolved = Config::resolve_runtime_unpublished().unwrap();
+        assert!(
+            resolved.backends.is_empty(),
+            "no synthetic localhost backend beside a provider"
+        );
+        assert!(!resolved.is_unconfigured(), "a provider IS configuration");
+        assert!(matches!(
+            resolved.select_backend(),
+            SelectionOutcome::Selected(SelectedBackend::Provider(p)) if p.name == "acme"
+        ));
+        // Profile path: the same selection from the same config.
+        let profile = Config {
+            providers: vec![ProviderConfig {
+                name: "acme".into(),
+                command: "newt-provider-openai".into(),
+                model: None,
+                env_pass: vec![],
+                tiers: vec![],
+            }],
+            backends: vec![],
+            ..Default::default()
+        };
+        let resolved = profile.prepare_runtime().unwrap();
+        assert!(resolved.backends.is_empty());
+        assert!(matches!(
+            resolved.select_backend(),
+            SelectionOutcome::Selected(SelectedBackend::Provider(p)) if p.name == "acme"
+        ));
+        // Fully bare (no providers either): the localhost fallback remains.
+        std::fs::write(dir.path().join("config.toml"), "# empty\n").unwrap();
+        let resolved = Config::resolve_runtime_unpublished().unwrap();
+        assert_eq!(resolved.backends.len(), 1);
+        assert_eq!(resolved.backends[0].name, "ollama");
+        assert!(resolved.is_unconfigured());
+    }
+
+    /// K: requested-slot pinning applies to the RUNTIME composers too —
+    /// with a stale `default_backend = a`, an exclusive or NAMED request
+    /// for `b` and NO CLI-installed env, the composed config must select
+    /// `b` (default re-pointed), never resolve Unknown/None against a
+    /// config that plainly contains it.
+    #[test]
+    #[serial_test::serial(real_fs)] // mutates the CLI-override global + env
+    fn runtime_composers_pin_selection_to_the_requested_slot() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        // The process-global CLI override is not guard-covered — clear it
+        // on every exit path.
+        struct OverrideGuard;
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                set_cli_backend_override(BackendOverride::default());
+            }
+        }
+        let _o = OverrideGuard;
+        let base = || Config {
+            backends: vec![
+                BackendConfig {
+                    name: "a".into(),
+                    endpoint: "http://a:1".into(),
+                    ..Default::default()
+                },
+                BackendConfig {
+                    name: "b".into(),
+                    endpoint: "http://b:2".into(),
+                    ..Default::default()
+                },
+            ],
+            default_backend: Some("a".into()),
+            ..Default::default()
+        };
+        // NAMED field-only request for b (profile composer).
+        set_cli_backend_override(BackendOverride {
+            name: Some("b".into()),
+            model: Some("m".into()),
+            ..Default::default()
+        });
+        let resolved = base().prepare_runtime().unwrap();
+        assert_eq!(resolved.default_backend.as_deref(), Some("b"));
+        let picked = resolved.selected_backend().expect("b selects");
+        assert_eq!(picked.backend.name, "b");
+        assert!(
+            picked.receipt.request.is_some(),
+            "receipt on the pinned slot"
+        );
+        // Exclusive destination request (profile composer): the surviving
+        // slot is the selection — no stale default naming a discarded a.
+        set_cli_backend_override(BackendOverride {
+            endpoint: Some("http://new:9".into()),
+            ..Default::default()
+        });
+        let resolved = base().prepare_runtime().unwrap();
+        assert_eq!(resolved.default_backend.as_deref(), Some("cli"));
+        let picked = resolved
+            .selected_backend()
+            .expect("the exclusive slot selects");
+        assert_eq!(picked.backend.name, "cli");
+        assert_eq!(picked.slot, 0);
+    }
+
+    /// Embedded destinations are intrinsically Instance (`derive_serving`):
+    /// a model_path route never composes with `serving = multiplexer` — a
+    /// declared/inherited multiplexer normalizes to Instance, and the
+    /// EXPLICIT contradictions (destination request + serving, field-only
+    /// serving on an embedded target) refuse atomically.
+    #[test]
+    fn an_embedded_route_never_composes_as_a_multiplexer() {
+        // Declaration: model_path + declared multiplexer → Instance.
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "emb".into(),
+                model_path: Some("/m.gguf".into()),
+                serving: Some(Serving::Multiplexer),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        resolve_for_test(&mut cfg, &[], None).unwrap();
+        assert_eq!(cfg.backends[0].kind, Some(BackendKind::Embedded));
+        assert_eq!(
+            cfg.backends[0].serving,
+            Some(Serving::Instance),
+            "an embedded route serves exactly one artifact"
+        );
+        // Exclusive retarget: HTTP multiplexer → model_path inherits the
+        // declared serving, normalized to Instance.
+        let http_mux = || Config {
+            backends: vec![BackendConfig {
+                name: "mux".into(),
+                endpoint: "http://m:1".into(),
+                serving: Some(Serving::Multiplexer),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let retarget = BackendOverride {
+            name: Some("mux".into()),
+            model_path: Some("/m.gguf".into()),
+            ..Default::default()
+        };
+        let mut cfg = http_mux();
+        resolve_for_test(&mut cfg, &[], Some(retarget.clone())).unwrap();
+        assert_eq!(cfg.backends[0].serving, Some(Serving::Instance));
+        assert_eq!(cfg.backends[0].kind, Some(BackendKind::Embedded));
+        let mut cfg = http_mux();
+        retarget.try_apply(&mut cfg).unwrap();
+        assert_eq!(
+            cfg.backends[0].serving,
+            Some(Serving::Instance),
+            "try_apply too"
+        );
+        // EXPLICIT model_path + serving=multiplexer: refused atomically.
+        let contradictory = BackendOverride {
+            name: Some("mux".into()),
+            model_path: Some("/m.gguf".into()),
+            serving: Some(Serving::Multiplexer),
+            ..Default::default()
+        };
+        let mut cfg = http_mux();
+        let err = resolve_for_test(&mut cfg, &[], Some(contradictory.clone()))
+            .expect_err("explicit contradiction refuses");
+        assert!(err.contains("contradictory"), "{err}");
+        let mut cfg = http_mux();
+        assert!(contradictory.try_apply(&mut cfg).is_err());
+        assert_eq!(
+            cfg.backends[0].endpoint, "http://m:1",
+            "untouched on refusal"
+        );
+        // Field-only serving=multiplexer on an embedded target: refused
+        // atomically, target untouched.
+        let emb = || Config {
+            backends: vec![BackendConfig {
+                name: "emb".into(),
+                model_path: Some("/m.gguf".into()),
+                kind: Some(BackendKind::Embedded),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let field_only = BackendOverride {
+            name: Some("emb".into()),
+            serving: Some(Serving::Multiplexer),
+            ..Default::default()
+        };
+        let mut cfg = emb();
+        let err = resolve_for_test(&mut cfg, &[], Some(field_only.clone()))
+            .expect_err("field-only serving refuses on embedded");
+        assert!(
+            err.contains("emb") && err.contains("contradictory"),
+            "{err}"
+        );
+        let mut cfg = emb();
+        assert!(field_only.try_apply(&mut cfg).is_err());
+        assert_eq!(cfg.backends[0].serving, None, "untouched on refusal");
+        // Control: serving=multiplexer on an HTTP target stays legitimate.
+        let mut cfg = http_mux();
+        resolve_for_test(
+            &mut cfg,
+            &[],
+            Some(BackendOverride {
+                name: Some("mux".into()),
+                serving: Some(Serving::Multiplexer),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        assert_eq!(cfg.backends[0].serving, Some(Serving::Multiplexer));
+    }
+
+    /// L: empty/whitespace model strings never become receipt identity —
+    /// the declaration and request layers both normalize through the
+    /// effective-model rule before bindings are minted.
+    #[test]
+    fn empty_model_strings_never_become_receipt_identity() {
+        // Declaration: model = "" + a card → binding bound to NO model.
+        let mut cfg = Config {
+            backends: vec![BackendConfig {
+                name: "a".into(),
+                endpoint: "http://a:1".into(),
+                model: Some("".into()),
+                card: Some("card-a".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let receipts = resolve_for_test(&mut cfg, &[], None).unwrap();
+        assert_eq!(receipts[0].declaration.model, None, "effective-model rule");
+        assert_eq!(receipts[0].binding.bound_model, None);
+    }
+
+    /// O: an empty/whitespace `--backend-model` is refused ATOMICALLY —
+    /// there is no implicit clear. Otherwise the flattened route would
+    /// serve server-decides while the receipt/binding fell back to the
+    /// STALE declared model, and Phase B's principal derivation would
+    /// activate against a model the session is not running. With and
+    /// without a card rebind; config untouched on refusal.
+    #[test]
+    fn an_empty_model_request_is_refused_never_a_stale_fallback() {
+        let base = || Config {
+            backends: vec![BackendConfig {
+                name: "a".into(),
+                endpoint: "http://a:1".into(),
+                model: Some("declared-a".into()),
+                card: Some("card-a".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let snap = |cfg: &Config| -> Vec<String> {
+            cfg.backends
+                .iter()
+                .map(|b| toml::to_string(b).unwrap())
+                .collect()
+        };
+        let untouched = snap(&base());
+        for model in ["", "   "] {
+            for card in [None, Some("card-c")] {
+                let over = BackendOverride {
+                    name: Some("a".into()),
+                    model: Some(model.to_string()),
+                    card: card.map(str::to_string),
+                    ..Default::default()
+                };
+                let mut cfg = base();
+                let err = resolve_for_test(&mut cfg, &[], Some(over.clone()))
+                    .expect_err("an empty model request must refuse");
+                assert!(err.contains("--backend-model"), "{err}");
+                let mut cfg = base();
+                assert!(over.try_apply(&mut cfg).is_err(), "try_apply refuses too");
+                assert_eq!(snap(&cfg), untouched, "config untouched on refusal");
+                assert_eq!(
+                    cfg.backends[0].model.as_deref(),
+                    Some("declared-a"),
+                    "the declared model is neither cleared nor re-bound"
+                );
+            }
+        }
+    }
+
+    /// Serde compatibility: a `Config` never serializes receipt state, and
+    /// an OLD drop-in body carrying `record = "operator_v1"` (plus keys newt
+    /// does not model) still loads as a `BackendConfig`.
+    #[test]
+    fn serde_receipts_never_serialize_and_old_records_still_load() {
+        let cfg = Config::default();
+        let body = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!body.contains("record"), "no record key: {body}");
+        assert!(!body.contains("receipt"), "no receipt state: {body}");
+        // The public type tolerates the (now file-private) tag key and
+        // unknown siblings — forward/backward compatible.
+        let b: BackendConfig =
+            toml::from_str("endpoint = \"http://h:1\"\nrecord = \"operator_v1\"\nfuture_key = 1\n")
+                .unwrap();
+        assert_eq!(b.endpoint, "http://h:1");
+    }
+
+    /// The operator writer stamps `operator_v1` at the FILE boundary —
+    /// `BackendConfig` has no tag field to launder through it — and the
+    /// private header reader sees exactly that tag.
+    #[test]
+    fn the_operator_writer_stamps_the_tag_at_the_file_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "# cfg\n").unwrap();
+        let backend = BackendConfig {
+            name: "ops".into(),
+            endpoint: "http://host:8000".into(),
+            model: Some("m".into()),
+            ..Default::default()
+        };
+        let path = write_backend_dropin(&config_path, &backend).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.starts_with("record = \"operator_v1\"\n"),
+            "stamped first: {body}"
+        );
+        assert_eq!(
+            disk_record_tag(&body).unwrap(),
+            Some(RecordTag::OperatorV1),
+            "the header reader agrees"
+        );
+        // And the loader treats it as an operator definition.
+        let mut cfg = Config {
+            backends: vec![],
+            ..Default::default()
+        };
+        merge_for_test(&mut cfg, &[path.parent().unwrap()]).unwrap();
+        assert_eq!(cfg.backends.len(), 1);
+        assert_eq!(cfg.backends[0].effective_model(), Some("m"));
+    }
+
+    /// An unambiguous LEGACY probe cache (untagged, exact old adopt marker,
+    /// probe-shaped) migrates to tagged `probe_v1` through the typed
+    /// writeback — and an endpoint change afterwards clears every piece of
+    /// the old serving/model evidence.
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn a_legacy_probe_cache_migrates_to_probe_v1_through_typed_writeback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "# cfg\n").unwrap();
+        let backends = dir.path().join("backends");
+        std::fs::create_dir_all(&backends).unwrap();
+        let _env = ConfigDirGuard::set(dir.path());
+        let path = backends.join("roamer.toml");
+        std::fs::write(
+            &path,
+            "endpoint = \"http://e1:8000\"\nkind = \"openai\"\nserving = \"instance\"\ntiers = []\n\n\
+             [provenance]\nsource = \"newt adopt v0.7.9 (probed; delete this file to reset)\"\nprobed = \"2026-08-01\"\n",
+        )
+        .unwrap();
+        // Same endpoint: the legacy cache is the prior probe record —
+        // refresh migrates it to a tagged probe_v1 (kind carried forward).
+        let observation = ProbeObservation {
+            name: "roamer".into(),
+            endpoint: "http://e1:8000".into(),
+            kind: None,
+            api: None,
+            serving: ProbedServing::Multiplexer,
+        };
+        assert!(matches!(
+            persist_probe_observation(&observation).unwrap(),
+            ProbeWriteback::Written(_)
+        ));
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("record = \"probe_v1\""), "migrated: {body}");
+        assert!(body.contains("kind = \"openai\""), "same-endpoint carry");
+        assert!(body.contains("serving = \"multiplexer\""));
+        // Endpoint change: nothing of E1 survives under E2.
+        let moved = ProbeObservation {
+            name: "roamer".into(),
+            endpoint: "http://e2:9000".into(),
+            kind: None,
+            api: None,
+            serving: ProbedServing::Unknown,
+        };
+        assert!(matches!(
+            persist_probe_observation(&moved).unwrap(),
+            ProbeWriteback::Written(_)
+        ));
+        let body = std::fs::read_to_string(&path).unwrap();
+        for stale in ["kind =", "serving =", "model =", "e1:8000"] {
+            assert!(!body.contains(stale), "`{stale}` survived the move: {body}");
+        }
+    }
+
+    /// The deprecated `writeback_probed_backend` wrapper keeps its source
+    /// signature but NEVER reports a lossy conversion as success: a valid
+    /// instance patch writes a probe_v1 record (`Ok(Some(path))`);
+    /// unrepresentable patches (model off-instance, operator-owned fields)
+    /// error BEFORE any write; an operator-owned same-name file is a
+    /// path-bearing error with the bytes untouched.
+    #[serial_test::serial(real_fs)]
+    #[test]
+    #[allow(deprecated)]
+    fn the_deprecated_writeback_wrapper_never_reports_lossy_success() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), "# cfg\n").unwrap();
+        let _env = ConfigDirGuard::set(dir.path());
+        let patch = BackendConfig {
+            name: "compat".into(),
+            endpoint: "http://h:1".into(),
+            serving: Some(Serving::Instance),
+            model: Some("m".into()),
+            ..Default::default()
+        };
+        // Valid Instance+model: persists through the typed channel.
+        let path = writeback_probed_backend(&patch)
+            .unwrap()
+            .expect("writes through the typed channel");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("record = \"probe_v1\""));
+        assert!(body.contains("model = \"m\""));
+        // Model without Instance serving: error BEFORE any write — the
+        // existing probe file's bytes stay put.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let mux = BackendConfig {
+            serving: Some(Serving::Multiplexer),
+            ..patch.clone()
+        };
+        let err = writeback_probed_backend(&mux).expect_err("lossy model is refused");
+        assert!(err.contains("instance"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "no write");
+        // An operator-owned field: refused before any write, too.
+        let smuggle = BackendConfig {
+            api_key_env: Some("TOKEN".into()),
+            ..patch.clone()
+        };
+        let err = writeback_probed_backend(&smuggle).expect_err("operator fields refused");
+        assert!(err.contains("api_key_env"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "no write");
+        // Operator-owned same-name file: a path-bearing error, bytes intact.
+        let operator_body = "# mine\nrecord = \"operator_v1\"\nendpoint = \"http://h:1\"\n";
+        std::fs::write(&path, operator_body).unwrap();
+        let err = writeback_probed_backend(&patch).expect_err("skips are not silent");
+        assert!(
+            err.contains("compat.toml") && err.contains("operator-owned"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), operator_body);
+    }
+
+    /// The strict machine schema rejects EVERY operator-owned or unknown
+    /// key — top-level and nested — and a nonempty legacy `tiers`.
+    #[test]
+    fn probe_records_reject_every_operator_owned_and_unknown_key() {
+        for (key, line) in [
+            ("card", "card = \"x\""),
+            ("capability", "capability = {}"),
+            ("api_key_env", "api_key_env = \"K\""),
+            ("api_key_file", "api_key_file = \"/f\""),
+            ("managed", "managed = \"shared\""),
+            ("host", "host = \"h\""),
+            ("coexist", "coexist = true"),
+            ("ram_gib", "ram_gib = 1.5"),
+            ("engine", "engine = \"x\""),
+            ("model_path", "model_path = \"/m\""),
+            ("wholly unknown", "future_key = 1"),
+        ] {
+            let body = format!("record = \"probe_v1\"\nendpoint = \"http://h:1\"\n{line}\n");
+            assert!(
+                parse_probe_record(&body).is_err(),
+                "`{key}` must not ride the machine channel"
+            );
+        }
+        // Nested provenance smuggling is denied one level down, too.
+        assert!(parse_probe_record(
+            "record = \"probe_v1\"\nendpoint = \"http://h:1\"\n\n[provenance]\nprobed = \"2026-08-01\"\nsmuggled = \"x\"\n"
+        )
+        .is_err());
+        // A nonempty legacy tiers is operator configuration.
+        assert!(parse_probe_record(
+            "record = \"probe_v1\"\nendpoint = \"http://h:1\"\ntiers = [\"FAST\"]\n"
+        )
+        .is_err());
+        // …while the empty legacy `tiers = []` is tolerated on read.
+        assert!(parse_probe_record(
+            "record = \"probe_v1\"\nendpoint = \"http://h:1\"\ntiers = []\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn probe_observation_record_is_typed_only_instance_carries_model() {
+        // The record derives from a TYPED observation: a multiplexer or
+        // unknown observation has no model field to persist AT ALL, so a
+        // per-session pick can never freeze into tomorrow's declared model —
+        // and no probe record ever carries operator-owned fields.
+        let base = ProbeObservation {
+            name: "b".into(),
+            endpoint: "http://h:1".into(),
+            kind: Some(BackendKind::Openai),
+            api: None,
+            serving: ProbedServing::Multiplexer,
+        };
+        let mux = probe_machine_record(&base);
+        assert_eq!(mux.model, None);
+        assert_eq!(mux.serving, Some(Serving::Multiplexer));
+        assert_eq!(mux.record, Some(RecordTag::ProbeV1));
+        assert!(!toml::to_string(&mux).unwrap().contains("model ="));
+
+        let unknown = probe_machine_record(&ProbeObservation {
+            serving: ProbedServing::Unknown,
+            ..base.clone()
+        });
+        assert_eq!(unknown.model, None);
+        assert_eq!(unknown.serving, None, "nothing observed, nothing recorded");
+
+        let instance = probe_machine_record(&ProbeObservation {
+            serving: ProbedServing::Instance {
+                model: Some("m".into()),
+            },
+            ..base
+        });
+        assert_eq!(instance.model.as_deref(), Some("m"));
+        let body = toml::to_string(&instance).unwrap();
+        for banned in ["card", "capability", "api_key", "managed", "host ="] {
+            assert!(!body.contains(banned), "`{banned}` leaked into: {body}");
         }
     }
 
@@ -7326,7 +12464,7 @@ tiers = ["COMPLEX"]
         .unwrap();
         let mut cfg = Config::default();
         assert!(cfg.is_unconfigured());
-        cfg.merge_backends_from_dir(dir.path());
+        merge_for_test(&mut cfg, &[dir.path()]).unwrap();
         assert!(
             !cfg.is_unconfigured(),
             "a successfully merged drop-in is operator configuration"
@@ -7341,7 +12479,7 @@ tiers = ["COMPLEX"]
         // No endpoint and no model_path → skipped by the destination check.
         std::fs::write(dir.path().join("hollow.toml"), "model = \"m\"\n").unwrap();
         let mut cfg = Config::default();
-        cfg.merge_backends_from_dir(dir.path());
+        merge_for_test(&mut cfg, &[dir.path()]).unwrap();
         assert!(
             cfg.is_unconfigured(),
             "only a drop-in that actually merges counts as configuration"
@@ -9087,6 +14225,7 @@ mod select_backend_tests {
                 format!("provider:{}", p.name)
             }
             SelectionOutcome::UnknownNamed(n) => format!("unknown:{n}"),
+            SelectionOutcome::UnroutableNamed(n) => format!("unroutable:{n}"),
             SelectionOutcome::Unset => "unset".to_string(),
         }
     }
@@ -9094,6 +14233,10 @@ mod select_backend_tests {
     /// Run `f` with `$NEWT_PROVIDER=value`, restoring the prior value afterwards.
     /// The closure returns an OWNED value so no borrow escapes the restore.
     fn with_newt_provider<T>(value: &str, f: impl FnOnce() -> T) -> T {
+        // Serialize against every other NEWT_PROVIDER-touching test — the
+        // guard's shared lock is what config/runtime tests hold; without it
+        // this helper raced them (env is process-global).
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
         let prev = std::env::var("NEWT_PROVIDER").ok();
         unsafe { std::env::set_var("NEWT_PROVIDER", value) };
         let out = f();
@@ -9107,6 +14250,8 @@ mod select_backend_tests {
     /// Guarantee `$NEWT_PROVIDER` is unset for an env-free scenario (so the lane
     /// is deterministic regardless of a stray ambient value), restoring after.
     fn without_newt_provider<T>(f: impl FnOnce() -> T) -> T {
+        // Same shared-lock serialization as `with_newt_provider`.
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
         let prev = std::env::var("NEWT_PROVIDER").ok();
         unsafe { std::env::remove_var("NEWT_PROVIDER") };
         let out = f();

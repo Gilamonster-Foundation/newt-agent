@@ -58,7 +58,7 @@ pub(crate) struct TabSwitchCtx<'a> {
     pub pending: &'a mut newt_core::PreferenceActions,
     pub base_provider: &'a mut Option<String>,
     pub base_model: &'a mut Option<String>,
-    pub cfg: &'a newt_core::Config,
+    pub cfg: &'a newt_core::ResolvedConfig,
     pub choice: &'a mut crate::BackendChoice,
     pub inf_url: &'a mut String,
     pub inf_model: &'a mut String,
@@ -934,8 +934,8 @@ mod state_machine_tests {
     /// Every backend shares one endpoint AND one model, so no route change ever
     /// fires `refresh_backend`'s served-adoption probe — the tier stays
     /// network-free while still exercising the real posture machinery.
-    fn cfg_with(names: &[&str]) -> newt_core::Config {
-        newt_core::Config {
+    fn cfg_with(names: &[&str]) -> newt_core::ResolvedConfig {
+        newt_core::ResolvedConfig::unrequested(newt_core::Config {
             default_backend: names.first().map(|n| (*n).to_string()),
             backends: names
                 .iter()
@@ -948,7 +948,7 @@ mod state_machine_tests {
                 })
                 .collect(),
             ..Default::default()
-        }
+        })
     }
 
     /// Owns every piece of live session state a switch touches, so a test can
@@ -973,7 +973,7 @@ mod state_machine_tests {
         pending: newt_core::PreferenceActions,
         base_provider: Option<String>,
         base_model: Option<String>,
-        cfg: newt_core::Config,
+        cfg: newt_core::ResolvedConfig,
         choice: crate::BackendChoice,
         inf_url: String,
         inf_model: String,
@@ -993,7 +993,7 @@ mod state_machine_tests {
             let ws = tempfile::tempdir().unwrap();
             let store = newt_core::ConversationStore::new(root.path(), ws.path(), 100).unwrap();
             let cfg = cfg_with(backends);
-            let choice = crate::resolve_backend_choice(&cfg);
+            let choice = crate::resolve_backend_choice(&cfg).expect("test configs resolve");
             let first = newt_core::new_conversation_id();
             store.claim(&first).unwrap();
             let workspace = ws.path().to_string_lossy().into_owned();
@@ -1023,7 +1023,7 @@ mod state_machine_tests {
                     base_provider: None,
                     base_model: None,
                     inf_url: choice.url.clone(),
-                    inf_model: choice.model.clone(),
+                    inf_model: choice.active_model.clone().unwrap_or_default(),
                     inf_kind: choice.kind,
                     inf_key: choice.api_key.clone(),
                     inf_context_window: choice.context_window,
@@ -2234,10 +2234,10 @@ mod state_machine_tests {
     async fn tab_new_from_a_pinned_tab_reports_the_endpoint_change() {
         let _g = guard();
         // Two DIFFERENT endpoints, so a route change is a real url change.
-        let mut cfg = cfg_with(&["sol", "other"]);
-        cfg.backends[1].endpoint = "http://elsewhere.test:2".to_string();
+        let mut base = cfg_with(&["sol", "other"]).into_config();
+        base.backends[1].endpoint = "http://elsewhere.test:2".to_string();
         let (mut h, mut tabs) = Harness::new(&["sol"]);
-        h.cfg = cfg;
+        h.cfg = newt_core::ResolvedConfig::unrequested(base);
         let a = h.active_conversation_id.clone();
         h.store.create_with_id(&a, "A", None).unwrap();
         h.store

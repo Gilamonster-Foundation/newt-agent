@@ -21,10 +21,11 @@
 //! because a test that constructs the destination proves the struct has a
 //! field, and the defect review found was a field nobody filled.
 //!
-//! Where a capability may be DECLARED today, stated plainly because the PR's
-//! story depends on it: inline, on the backend
-//! (`[backends.<name>.capability]`). A named `card = "…"` pointer is NOT
-//! consulted — see the note at the foot of this file.
+//! Where a capability may be declared: inline on the backend
+//! (`[backends.<name>.capability]`), or via a named `card = "…"` binding —
+//! resolved by `ResolvedCapabilities` (see `resolved_capabilities.rs` for
+//! that seam's own tests). The unit tests HERE cover the inline accessor and
+//! the driver hand-off only.
 
 use newt_core::model_card::Capability;
 use newt_core::BackendKind;
@@ -123,26 +124,8 @@ fn the_declared_value_reaches_the_driver_config() {
 }
 
 // ---------------------------------------------------------------------------
-// Known gap, stated rather than implied
-// ---------------------------------------------------------------------------
-//
-// `BackendConfig.card` points at a named model card whose `[capability]`
-// block ought to apply. It does NOT: `card` is only ever copied between
-// configs, never resolved, and ALL THREE capability accessors
-// (`chat_completions_capability`, `reasoning_replay_scope`, and now
-// `emits_leading_reasoning`) read the inline `capability` field alone.
-//
-// That gap is pre-existing and uniform. Fixing it for one accessor would
-// leave two behaving differently from their sibling, which is worse than a
-// consistent gap — so it is its own roadmap step, and until it lands the
-// working declaration site is inline on the backend.
-//
-// A test asserting that the capability survives adoption replacing the
-// serving model was written here and REMOVED as fake: it changed `b.model`
-// and read `b.capability`, two independent fields, so it could not fail —
-// and would not start failing when card resolution lands, because a
-// card-reading accessor still ignores a model swap unless a card is
-// configured. A tripwire that cannot trip is worse than none: it advertises
-// coverage of the exact hazard it does not cover. The real post-adoption and
-// per-switch test belongs in the named-card seam PR, where capability
-// actually becomes model-dependent and the assertion has something to bite.
+// The named-card gap this file used to document is CLOSED: `BackendConfig.card`
+// now resolves through `ResolvedCapabilities` (one exact-name resolver shared
+// with `dgx card`), decided per serving principal. The inline accessors below
+// remain inline-only BY DESIGN — they are the conservative floor, and the
+// sidecar is the card-aware surface every lane consumes.

@@ -110,8 +110,10 @@ impl Respond for ReadThenFinishOnNudge {
 /// Grounds the in-process tenacity/unit-loop tests with a real `newt solve`
 /// subprocess, an explicitly loaded TOML file, a real temporary workspace, and
 /// the real `list_dir` dispatch. The inference service alone is mocked so the
-/// test can inspect the second request and prove the configured Nemotron-family
-/// level changed runtime behavior as well as the emitted contract.
+/// test can inspect the second request and prove the TYPED card-family
+/// attribution (#1819: an exact catalog card declaring `family = "nemotron"`,
+/// associated through the SelectedModel principal — never a model-name
+/// substring) changed runtime behavior as well as the emitted contract.
 #[tokio::test(flavor = "multi_thread")]
 async fn explicit_config_applies_nemotron_tenacity_to_runtime_and_contract() {
     let server = MockServer::start().await;
@@ -129,6 +131,20 @@ async fn explicit_config_applies_nemotron_tenacity_to_runtime_and_contract() {
     let config_path = workspace.path().join("benchmark.toml");
     let instruction_path = workspace.path().join("instruction.md");
     let events_path = workspace.path().join("events.jsonl");
+    // The family arrives TYPED: an exact catalog card in the config's
+    // sibling models/ dir declares `family = "nemotron"`, bound to this
+    // backend's declared model — the model NAME is deliberately an alias
+    // the old substring matcher would also have caught, so this fixture
+    // proves the typed path carries it now.
+    let models_dir = workspace.path().join("models");
+    std::fs::create_dir_all(&models_dir).expect("models dir");
+    std::fs::write(
+        models_dir.join("nemo-run.toml"),
+        format!(
+            "name = \"nemo-run\"\nbackend = \"vllm\"\nfamily = \"nemotron\"\n\n[vllm]\nserved_name = \"{NEMOTRON_MODEL}\"\n"
+        ),
+    )
+    .expect("write family card");
     std::fs::write(
         &config_path,
         format!(
@@ -139,6 +155,7 @@ name = "nemotron"
 endpoint = "{}"
 model = "{NEMOTRON_MODEL}"
 kind = "openai"
+card = "nemo-run"
 
 [tenacity]
 default = "relaxed"
@@ -216,6 +233,81 @@ nemotron = "relentless"
         "solve emits exactly one contract record"
     );
     assert_eq!(contracts[0]["effective_config"]["tenacity"], "relentless");
+}
+
+/// The anti-substring negative: the SAME nemotron-looking model alias with
+/// NO card gets NO family attribution — the `[tenacity.families]` default
+/// must not engage from the model NAME, so the contract records the
+/// config default.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cardless_nemotron_looking_alias_gets_no_family_tenacity() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ReadThenFinishOnNudge {
+            requests: requests.clone(),
+            sequence: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace = tempfile::tempdir().expect("temporary solve workspace");
+    let config_path = workspace.path().join("benchmark.toml");
+    let instruction_path = workspace.path().join("instruction.md");
+    let events_path = workspace.path().join("events.jsonl");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"default_backend = "nemotron"
+
+[[backends]]
+name = "nemotron"
+endpoint = "{}"
+model = "{NEMOTRON_MODEL}"
+kind = "openai"
+
+[tenacity]
+default = "relaxed"
+
+[tenacity.families]
+nemotron = "relentless"
+"#,
+            server.uri()
+        ),
+    )
+    .expect("write explicit solve config");
+    std::fs::write(&instruction_path, "Complete the task.\n").expect("write instruction");
+
+    Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["solve", "--cwd"])
+        .arg(workspace.path())
+        .arg("--instruction-file")
+        .arg(&instruction_path)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "2"])
+        .assert()
+        .success();
+
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&events_path)
+        .expect("read solve events")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("event line is JSON"))
+        .collect();
+    let contract = records
+        .iter()
+        .find(|record| record.get("contract_version").is_some())
+        .expect("solve emits a contract record");
+    assert_eq!(
+        contract["effective_config"]["tenacity"], "relaxed",
+        "a model-name alias is a LABEL — with no exact card family, the \
+         per-family default must not engage"
+    );
 }
 
 /// Grounds the headless crew gate with a real `newt solve` subprocess. The

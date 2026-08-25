@@ -14,6 +14,7 @@ pub mod atomic_fs;
 pub mod attribution;
 pub mod backend_probe;
 pub mod build_info;
+pub mod card_catalog;
 pub mod caveats;
 pub mod classifiers;
 /// The cognition session dial — the `/cognition` override resolved over a
@@ -174,18 +175,24 @@ pub use caveats::{permits_path, CaveatsExt, CountBoundExt, ScopeExt};
 pub use classifiers::{
     classifier_config_dir, NudgeClass, NudgeClassification, NudgeClassifier, NudgeClassifierConfig,
 };
+#[allow(deprecated)]
+pub use config::writeback_probed_backend;
 pub use config::{
-    confined_default_engine, derive_serving, full_access_default_engine, mcp_stdio_env_passthrough,
-    ocap_l3_backend, resolve_shell_engine, resolve_shell_engine_choice, resolved_confined_default,
-    shell_env_passthrough_default, write_backend_dropin, writeback_probed_backend, AgentsConfig,
-    BackendConfig, BackendKind, BundleConfig, ChatStyle, ColorMode, CompactionTriggerPolicy,
-    Config, ContextConfig, ContextFeature, ContextFeatureSet, ContextFeatures, ContextManager,
-    ConversationsConfig, CrewPolicyConfig, EditMode, ExposureProfile, FooterMode, IntakeConfig,
-    Loadout, LoadoutSettings, LogConfig, MarkdownMode, MemoryConfig, MemoryDisclosure,
-    MemoryProviderKind, OnEmbedFailure, OpenAiApi, PermissionPreset, PickVia, PlanConfig,
-    PlanPruneConfig, ProfilePick, ProviderConfig, ScratchConfig, SemanticConfig, Serving,
-    ShellConfig, ShellEngine, SkillsConfig, SummarizerConfig, ThinkingMode, ToolExposureConfig,
-    ToolPermissions, TuiConfig,
+    claim_backend_dropin_as_operator, classify_backend_dropin, confined_default_engine,
+    derive_serving, full_access_default_engine, mcp_stdio_env_passthrough, ocap_l3_backend,
+    persist_probe_observation, render_operator_backend_dropin, resolve_shell_engine,
+    resolve_shell_engine_choice, resolved_confined_default, shell_env_passthrough_default,
+    write_backend_dropin, AgentsConfig, BackendConfig, BackendDestination, BackendKind,
+    BackendRequest, BackendResolutionReceipt, BundleConfig, ChatStyle, ColorMode,
+    CompactionTriggerPolicy, Config, ContextConfig, ContextFeature, ContextFeatureSet,
+    ContextFeatures, ContextManager, ConversationsConfig, CrewPolicyConfig, DeclaredBackend,
+    DropinOwnership, EditMode, ExposureProfile, FooterMode, IntakeConfig, Loadout, LoadoutSettings,
+    LogConfig, ManagedMode, MarkdownMode, MemoryConfig, MemoryDisclosure, MemoryProviderKind,
+    OnEmbedFailure, OpenAiApi, PermissionPreset, PickVia, PlanConfig, PlanPruneConfig,
+    ProbeObservation, ProbeWriteback, ProbedServing, ProfilePick, ProviderConfig, RequestMode,
+    ResolvedBackend, ResolvedConfig, ScratchConfig, SemanticConfig, Serving, ShellConfig,
+    ShellEngine, SkillsConfig, SummarizerConfig, ThinkingMode, ToolExposureConfig, ToolPermissions,
+    TuiConfig,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,

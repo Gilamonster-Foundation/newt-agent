@@ -215,10 +215,10 @@ impl ThinkFilter {
 // `BackendConfig::emits_leading_reasoning` → `ChatCtx`/`TurnDriverConfig`),
 // which is the direction #384 asked for.
 //
-// Note the precise source: a named `card = "…"` pointer is NOT consulted —
-// `card` is copied between configs but never resolved into a capability by
-// any of the three accessors. Saying "capability card" here would describe a
-// path that does not run.
+// A named `card = "…"` binding is ALSO consulted — resolved once per backend
+// choice by `model_card::ResolvedCapabilities` and decided per serving
+// principal (Instance holds the binding; a Multiplexer serving a model other
+// than the exact bound one drops the card layer, visibly).
 //
 // With nothing declared, no policy applies and the filter stays off:
 // filtering wrongly drops real answer text silently, while not filtering

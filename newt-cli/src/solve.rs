@@ -165,8 +165,11 @@ fn apply_context_window(driver: &mut TurnDriverConfig, context_window: u32) {
     driver.num_ctx = Some(context_window);
 }
 
-fn resolve_runtime_posture(cfg: &Config, model: &str) -> RuntimeSettingsSnapshot {
-    newt_core::tenacity::attribute_active_family(cfg.tenacity.as_ref(), model);
+/// Install the TYPED model family (the resolved card's declared metadata
+/// under the same association gates as the capability decision — never
+/// model-name substring inference) and resolve the posture snapshot.
+fn resolve_runtime_posture(cfg: &Config, family: Option<&str>) -> RuntimeSettingsSnapshot {
+    newt_core::tenacity::set_active_model_family(family.map(str::to_string));
     RuntimeSettingsSnapshot::resolve(cfg, None, None)
 }
 
@@ -176,6 +179,28 @@ fn solve_tool_round_limit(
     explicit_rounds: Option<usize>,
 ) -> usize {
     newt_core::tenacity::resolve_tool_round_limit(configured, explicit_tenacity, explicit_rounds)
+}
+
+/// The serving principal headless `solve` decides capabilities for — the
+/// SAME mapping the TUI's `BackendChoice::principal()` uses, so one
+/// backend/card pair can never get exact capabilities + typed family in
+/// chat but Undecided/no-family in solve (or vice versa):
+///
+/// * Instance ⇒ artifact identity;
+/// * Multiplexer ⇒ the effective operator model is the pick;
+/// * **no serving axis ⇒ `SelectedModel`** — solve requires a nonempty
+///   effective operator model before this runs, and an operator-SELECTED
+///   identity justifies exact association exactly as in chat.
+fn solve_principal(
+    serving: Option<newt_core::Serving>,
+    model: &str,
+) -> newt_core::model_card::ServingPrincipal<'_> {
+    use newt_core::model_card::ServingPrincipal as P;
+    match serving {
+        Some(newt_core::Serving::Instance) => P::Instance,
+        Some(newt_core::Serving::Multiplexer) => P::MultiplexerModel(model),
+        None => P::SelectedModel(model),
+    }
 }
 
 /// The cognition level this backend can actually receive from Newt. Responses
@@ -208,13 +233,20 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     //    search order (Config::resolve — honors disk drop-ins + --backend-*).
     let cfg = match &args.profile {
         Some(path) => {
-            let mut cfg = Config::load(path)
-                .with_context(|| format!("loading --profile {}", path.display()))?;
-            cfg.apply_runtime_settings();
-            cfg
+            // With the capability SIDECAR there is no load-time
+            // materialization step any more: `Config::load` is a
+            // deterministic parse; the FALLIBLE backend assembly
+            // (`prepare_runtime`) then validates identity/destination and
+            // applies the CLI request — a duplicate/empty backend name or
+            // an invalid `--backend-*` is a hard error here, never a
+            // warn-and-continue.
+            resolve_profile(path)?
         }
-        None => Config::resolve().context("resolving config")?,
+        None => newt_core::Config::resolve_runtime_unpublished().context("resolving config")?,
     };
+    // NOTHING is published yet: the process-global settings land only after
+    // the backend pick + capability sidecar VALIDATE below — a refused
+    // selection or an unknown card must not leave half-published globals.
 
     // 2. Choose the headless lane (pure resolution → unit-tested precedence),
     //    then apply its process-env setup.
@@ -271,9 +303,12 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // authority mid-run (noninteractive-launch-policy).
     newt_core::launch_authority::freeze(newt_core::launch_authority::LaunchAuthority::from_env());
 
-    // 3. Backend: honor NEWT_PROVIDER, else the first backend with an endpoint.
-    let backend = pick_backend(&cfg)
-        .context("no usable backend in config (set one in the --profile [[backends]] or via --backend-endpoint)")?;
+    // 3. Backend: the shared TYPED selection contract — an explicit
+    // $NEWT_PROVIDER/default_backend that cannot be honored is a hard error
+    // (never a silent fallback), carried by pick_backend itself — paired
+    // with the slot's own provenance receipt.
+    let picked = pick_backend(&cfg)?;
+    let backend = picked.backend;
     let url = backend.endpoint.clone();
     let model = backend
         .effective_model()
@@ -282,7 +317,35 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     let kind = backend.kind.unwrap_or(BackendKind::Openai);
     let api_key = backend.resolve_api_key();
     let api = backend.api.unwrap_or_default();
-    let chat_capability = backend.chat_completions_capability();
+    // The SAME capability sidecar + typed principal decision the TUI uses —
+    // one owner of the merge, one decision, no drift between lanes. Headless
+    // has no adoption: the principal is the backend's own declaration
+    // (Instance ⇒ the binding holds; a declared-model multiplexer ⇒ exact
+    // bound-model equality, true by construction here; undeclared ⇒
+    // conservative). An unknown named card is a hard error — headless fails
+    // fast and names the fix rather than running without declarations the
+    // operator believes are active.
+    let pinned = newt_core::Config::pinned_config_path();
+    let card_source = args.profile.as_deref().or(pinned.as_deref());
+    // The binding evidence comes from the RECEIPT (pre-overlay declaration,
+    // or an explicit --backend-card rebind) — never re-derived from the
+    // flattened backend a CLI/session override may have retargeted.
+    let caps = newt_core::model_card::ResolvedCapabilities::resolve(
+        backend,
+        &picked.receipt.binding,
+        card_source,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let principal = solve_principal(backend.serving, &model);
+    let destination = newt_core::BackendDestination::of(backend);
+    let decision = caps.for_route(&destination, principal);
+    if let Some(notice) = newt_tui::applicability_prose(decision.applicability()) {
+        eprintln!("newt: {notice}");
+    }
+    let chat_capability = decision.chat_completions();
+    // The pick + capability sidecar VALIDATED — only now do the resolved
+    // configuration's process-global settings publish.
+    cfg.publish_runtime_settings();
     // Surface the backend's wire API (`api = "responses"`) to the agentic loop,
     // exactly as the chat path does — without this, a responses-only model like
     // gpt-5.6-sol is driven over /v1/chat/completions and 400s on function tools.
@@ -297,7 +360,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // W0 (#1511): the LEVEL this run resolves to, recorded verbatim in the
     // contract's effective_config — the bench never re-derives it from a
     // profile (contract requirement 5).
-    let runtime = resolve_runtime_posture(&cfg, &model);
+    let runtime = resolve_runtime_posture(&cfg, caps.family_for_route(&destination, principal));
     let tenacity_level = runtime.tenacity.label();
     let cognition = projected_cognition(runtime.cognition, kind, api, chat_capability);
     // `None` means Newt projects no cognition controls. Call that `default`
@@ -340,14 +403,14 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     apply_context_config(&mut dc, cfg.context.as_ref());
     dc.api_key = api_key;
     dc.chat_completions_capability = chat_capability;
-    dc.reasoning_replay_scope = backend.reasoning_replay_scope();
+    dc.reasoning_replay_scope = decision.reasoning_replay_scope();
     // Paired with the line above ON PURPOSE. Headless `solve` resolves the
     // model's capabilities from the same backend the TUI does; omitting this
     // left `solve` on the `false` default, so a declared reasoning model had
     // its chain-of-thought printed into the answer in headless runs only —
     // the N-call-sites trap, in the one lane with no human watching the
     // stream. `capability_wiring_is_paired_across_call_sites` pins the pair.
-    dc.emits_leading_reasoning = backend.emits_leading_reasoning();
+    dc.emits_leading_reasoning = decision.emits_leading_reasoning();
     dc.max_tool_rounds = solve_tool_round_limit(
         dc.max_tool_rounds,
         newt_core::tenacity::cli_tenacity(),
@@ -381,7 +444,9 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         .with_tenacity(runtime.tenacity);
     if runtime.crew {
         driver = driver.with_crew_runner(Arc::new(crate::crew_runner::LocalCrewRunner::new(
-            cfg.clone(),
+            // The crew runner needs an owned flattened Config; the
+            // receipts stay with this run.
+            newt_core::Config::clone(&cfg),
             PathBuf::from(&workspace),
             newt_core::agentic::Presence::Prompt,
         )));
@@ -565,11 +630,71 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     Ok(if clean { 0 } else { 1 })
 }
 
-/// Pick the backend to drive. Delegates to the **shared** config precedence
-/// (#1320, PR-3) so `solve` selects exactly as chat + the worker do:
-/// `NEWT_PROVIDER` > `default_backend` > sole > prefer-OpenAI, else first usable.
-fn pick_backend(cfg: &Config) -> Option<&newt_core::config::BackendConfig> {
-    cfg.select_configured_backend()
+/// Load an explicit `--profile` FILE and run it through the fallible
+/// backend assembly — identity/destination validation, CLI `--backend-*`
+/// request, route/kind normalization, receipts — WITHOUT publishing any
+/// process-global state, so callers (and tests) can validate first and
+/// publish explicitly.
+fn resolve_profile(path: &std::path::Path) -> Result<newt_core::ResolvedConfig> {
+    use anyhow::Context as _;
+    Config::load(path)
+        .with_context(|| format!("loading --profile {}", path.display()))?
+        .prepare_runtime()
+        .with_context(|| format!("preparing --profile {}", path.display()))
+}
+
+/// Pick the backend to drive. Delegates to the **shared, typed** selection
+/// contract (#1320, PR-3) so `solve` selects exactly as chat + the worker
+/// do: `NEWT_PROVIDER` > `default_backend` > sole > prefer-OpenAI, else
+/// first routable — and FAILS, naming the selector, when the explicit
+/// selection cannot be honored. Headless must never silently run a
+/// fallback the operator did not select: an unknown name, a
+/// destination-less backend, and a provider (which `solve` cannot drive)
+/// are each their own actionable error, not a cue to pick something else.
+fn pick_backend(
+    resolved: &newt_core::ResolvedConfig,
+) -> anyhow::Result<newt_core::ResolvedBackend<'_>> {
+    use newt_core::config::{SelectedBackend, SelectionOutcome};
+    match resolved.select_backend() {
+        SelectionOutcome::Selected(SelectedBackend::Configured(backend)) => {
+            // The shared contract treats an embedded (model_path) backend as
+            // fully routable — but `newt solve` only instantiates the HTTP
+            // turn driver, and an empty endpoint would fall into the Ollama
+            // loop against nothing. Refuse typed instead.
+            if backend.endpoint.is_empty() || backend.kind == Some(BackendKind::Embedded) {
+                anyhow::bail!(
+                    "backend `{}` is an embedded (model_path) backend — `newt solve` \
+                     drives HTTP backends only; select an HTTP backend, or give this \
+                     one an endpoint",
+                    backend.name
+                );
+            }
+            // The SAME shared index selector pairs the pick with its
+            // provenance receipt — never a name lookup.
+            Ok(resolved
+                .selected_backend()
+                .expect("the shared index selector just picked a configured backend"))
+        }
+        SelectionOutcome::Selected(SelectedBackend::Provider(p)) => anyhow::bail!(
+            "the backend selection resolves to provider `{}` — `newt solve` drives \
+             configured [[backends]] only; point $NEWT_PROVIDER/default_backend at a \
+             backend (or unset them)",
+            p.name
+        ),
+        SelectionOutcome::UnknownNamed(name) => anyhow::bail!(
+            "$NEWT_PROVIDER/default_backend names `{name}`, which matches nothing \
+             configured — fix the selector (solve will not silently run another backend)"
+        ),
+        SelectionOutcome::UnroutableNamed(name) => anyhow::bail!(
+            "$NEWT_PROVIDER/default_backend names `{name}`, which has neither an \
+             endpoint nor a model_path — give it a destination (solve will not \
+             silently run another backend)"
+        ),
+        SelectionOutcome::Unset => anyhow::bail!(
+            "no usable backend in config (set one in the --profile [[backends]] or via \
+             --backend-endpoint)"
+        ),
+    }
 }
 
 /// The workspace-fenced authority for the OCAP-ON bench lane.
@@ -654,10 +779,78 @@ mod tests {
         }
     }
 
+    /// Parity (#1819 finding 4): serving=None + a known effective model is
+    /// `SelectedModel` — the same principal chat derives — so an exact
+    /// bound card activates capabilities AND typed family identically in
+    /// both lanes; a mismatched model stays typed-inactive with no family
+    /// (the control proving no false activation).
+    #[test]
+    fn solve_principal_parity_for_unset_serving() {
+        use newt_core::model_card::{
+            CardApplicability, CardBindingSeed, ResolvedCapabilities, ServingPrincipal,
+        };
+        assert!(matches!(
+            solve_principal(None, "bound-model"),
+            ServingPrincipal::SelectedModel("bound-model")
+        ));
+        assert!(matches!(
+            solve_principal(Some(newt_core::Serving::Instance), "m"),
+            ServingPrincipal::Instance
+        ));
+        // Behavioral: an exact card on a serving-less backend activates.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = dir.path().join("profile.toml");
+        std::fs::write(&profile, "# profile\n").expect("write profile");
+        std::fs::create_dir_all(dir.path().join("models")).expect("models dir");
+        std::fs::write(
+            dir.path().join("models/team.toml"),
+            "name = \"team\"\nbackend = \"vllm\"\nfamily = \"nemotron\"\n\n[vllm]\nserved_name = \"team\"\n\n[capability]\nemits_leading_reasoning = true\n",
+        )
+        .expect("write card");
+        let b = newt_core::BackendConfig {
+            name: "carded".into(),
+            endpoint: "http://local:8000".into(),
+            model: Some("bound-model".into()),
+            card: Some("team".into()),
+            ..Default::default()
+        };
+        // The seed constructed LITERALLY (the receipt supplies it in
+        // production; the banned from_backend re-derivation stays banned).
+        let seed = CardBindingSeed {
+            card: b.card.clone(),
+            bound_model: b.model.clone(),
+            bound_destination: newt_core::BackendDestination::of(&b),
+        };
+        let caps = ResolvedCapabilities::resolve(&b, &seed, Some(&profile)).expect("resolves");
+        let destination = newt_core::BackendDestination::of(&b);
+        // Exact effective model: capabilities + family both engage.
+        let d = caps.for_route(&destination, solve_principal(None, "bound-model"));
+        assert!(d.emits_leading_reasoning(), "exact association activates");
+        assert_eq!(
+            caps.family_for_route(&destination, solve_principal(None, "bound-model")),
+            Some("nemotron")
+        );
+        // Retarget control: a different effective model must NOT activate.
+        let d = caps.for_route(&destination, solve_principal(None, "other-model"));
+        assert!(!d.emits_leading_reasoning(), "no false activation");
+        assert!(matches!(
+            d.applicability(),
+            CardApplicability::InactiveModel { .. }
+        ));
+        assert_eq!(
+            caps.family_for_route(&destination, solve_principal(None, "other-model")),
+            None,
+            "no family on a retargeted principal"
+        );
+    }
+
     #[test]
     fn pick_backend_skips_endpointless_and_takes_the_first_usable() {
-        // Deterministic: no NEWT_PROVIDER selection path.
-        // SAFETY: single-threaded test; restore is not needed (we only remove).
+        // Deterministic: no NEWT_PROVIDER selection path. The guard's shared
+        // lock serializes every NEWT_PROVIDER-touching test in the workspace
+        // and restores the prior value on drop.
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
         unsafe { std::env::remove_var("NEWT_PROVIDER") };
         let cfg = Config {
             backends: vec![
@@ -667,21 +860,26 @@ mod tests {
             ],
             ..Default::default()
         };
+        let cfg = newt_core::ResolvedConfig::unrequested(cfg);
         let chosen = pick_backend(&cfg).expect("a usable backend exists");
         assert_eq!(
-            chosen.name, "dgx",
+            chosen.backend.name, "dgx",
             "skip the endpointless one, take the first usable"
         );
     }
 
     #[test]
-    fn pick_backend_none_when_no_endpoints() {
+    fn pick_backend_errors_when_no_endpoints() {
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
         unsafe { std::env::remove_var("NEWT_PROVIDER") };
         let cfg = Config {
             backends: vec![backend("a", ""), backend("b", "")],
             ..Default::default()
         };
-        assert!(pick_backend(&cfg).is_none());
+        let cfg = newt_core::ResolvedConfig::unrequested(cfg);
+        let err = pick_backend(&cfg).expect_err("nothing routable");
+        assert!(err.to_string().contains("no usable backend"), "{err}");
     }
 
     /// W0 (#1511): digest resolution is flag > env twin, blank falls through,
@@ -710,6 +908,8 @@ mod tests {
     fn pick_backend_honors_default_backend_over_first_endpoint() {
         // #1320: `--config X` sets `default_backend`; solve must route to it, not to
         // the first endpoint-bearing entry (the coincidence that masked the bug).
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
         unsafe { std::env::remove_var("NEWT_PROVIDER") };
         let cfg = Config {
             default_backend: Some("sol".to_string()),
@@ -719,24 +919,147 @@ mod tests {
             ],
             ..Default::default()
         };
+        let cfg = newt_core::ResolvedConfig::unrequested(cfg);
         assert_eq!(
-            pick_backend(&cfg).expect("a backend").name,
+            pick_backend(&cfg).expect("a backend").backend.name,
             "sol",
             "default_backend wins over the first endpoint-bearing entry"
         );
     }
 
     #[test]
-    fn pick_backend_default_backend_falls_through_when_unusable() {
-        // A `default_backend` naming an endpointless entry is skipped for the first
-        // usable one, rather than returning an unreachable backend.
+    fn pick_backend_default_backend_unroutable_is_a_hard_error_not_a_fallback() {
+        // A `default_backend` naming a destination-less entry used to be
+        // silently skipped for the first usable backend — running something
+        // the operator did not select. It is now the typed UnroutableNamed
+        // error: fix the backend or the selector.
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
         unsafe { std::env::remove_var("NEWT_PROVIDER") };
         let cfg = Config {
             default_backend: Some("ghost".to_string()),
             backends: vec![backend("ghost", ""), backend("real", "http://r:1")],
             ..Default::default()
         };
-        assert_eq!(pick_backend(&cfg).expect("a backend").name, "real");
+        let cfg = newt_core::ResolvedConfig::unrequested(cfg);
+        let err = pick_backend(&cfg).expect_err("no silent fallback to `real`");
+        assert!(
+            err.to_string().contains("ghost") && err.to_string().contains("destination"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn pick_backend_unknown_env_name_is_a_hard_error_not_a_fallback() {
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::set_var("NEWT_PROVIDER", "no-such-backend") };
+        let cfg = Config {
+            backends: vec![backend("real", "http://r:1")],
+            ..Default::default()
+        };
+        let cfg = newt_core::ResolvedConfig::unrequested(cfg);
+        let err = pick_backend(&cfg).expect_err("no silent fallback to `real`");
+        assert!(err.to_string().contains("no-such-backend"), "{err}");
+    }
+
+    #[test]
+    fn pick_backend_provider_named_env_is_a_hard_error_not_a_fallback() {
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::set_var("NEWT_PROVIDER", "acme") };
+        let cfg = Config {
+            backends: vec![backend("real", "http://r:1")],
+            providers: vec![newt_core::config::ProviderConfig {
+                name: "acme".into(),
+                command: "newt-provider-openai".into(),
+                model: None,
+                env_pass: vec![],
+                tiers: vec![],
+            }],
+            ..Default::default()
+        };
+        let cfg = newt_core::ResolvedConfig::unrequested(cfg);
+        let err = pick_backend(&cfg).expect_err("solve cannot drive a provider");
+        assert!(err.to_string().contains("provider `acme`"), "{err}");
+    }
+
+    /// G (#1819): the shared contract treats embedded (model_path) backends
+    /// as routable, but solve only drives HTTP — an embedded selection must
+    /// be a typed refusal, never an empty-endpoint fall into the Ollama
+    /// loop. Covered for the sole, default-named, and env-named selections.
+    #[test]
+    fn pick_backend_rejects_embedded_model_path_backends() {
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        let embedded = || newt_core::BackendConfig {
+            name: "emb".into(),
+            model_path: Some("/models/x.gguf".into()),
+            kind: Some(newt_core::BackendKind::Embedded),
+            ..Default::default()
+        };
+        // Sole.
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::remove_var("NEWT_PROVIDER") };
+        let cfg = Config {
+            backends: vec![embedded()],
+            ..Default::default()
+        };
+        let cfg = newt_core::ResolvedConfig::unrequested(cfg);
+        let err = pick_backend(&cfg).expect_err("sole embedded refused");
+        assert!(err.to_string().contains("HTTP backends only"), "{err}");
+        // default_backend names it.
+        let cfg = Config {
+            backends: vec![backend("http", "http://h:1"), embedded()],
+            default_backend: Some("emb".into()),
+            ..Default::default()
+        };
+        let cfg = newt_core::ResolvedConfig::unrequested(cfg);
+        let err = pick_backend(&cfg).expect_err("default-named embedded refused");
+        assert!(err.to_string().contains("emb"), "{err}");
+        // $NEWT_PROVIDER names it.
+        // SAFETY: guard held; restored on drop.
+        unsafe { std::env::set_var("NEWT_PROVIDER", "emb") };
+        let cfg = Config {
+            backends: vec![backend("http", "http://h:1"), embedded()],
+            ..Default::default()
+        };
+        let cfg = newt_core::ResolvedConfig::unrequested(cfg);
+        let err = pick_backend(&cfg).expect_err("env-named embedded refused");
+        assert!(err.to_string().contains("emb"), "{err}");
+    }
+
+    /// #1819: a `--profile` runs through the FALLIBLE backend assembly —
+    /// duplicate or empty backend names are hard errors, not silently
+    /// loaded configs.
+    #[test]
+    fn a_profile_with_invalid_backend_identity_is_a_hard_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dup = dir.path().join("dup.toml");
+        std::fs::write(
+            &dup,
+            "[[backends]]\nname = \"twin\"\nendpoint = \"http://a:1\"\n\n\
+             [[backends]]\nname = \"twin\"\nendpoint = \"http://b:2\"\n",
+        )
+        .expect("write profile");
+        let err = resolve_profile(&dup).expect_err("duplicate names refuse");
+        assert!(format!("{err:#}").contains("twin"), "{err:#}");
+        let empty = dir.path().join("empty.toml");
+        std::fs::write(
+            &empty,
+            "[[backends]]\nname = \"\"\nendpoint = \"http://a:1\"\n",
+        )
+        .expect("write profile");
+        let err = resolve_profile(&empty).expect_err("empty names refuse");
+        assert!(format!("{err:#}").contains("no name"), "{err:#}");
+        // A valid profile resolves, receipts and all — no publish happened.
+        let ok = dir.path().join("ok.toml");
+        std::fs::write(
+            &ok,
+            "[[backends]]\nname = \"a\"\nendpoint = \"http://a:1\"\n",
+        )
+        .expect("write profile");
+        let resolved = resolve_profile(&ok).expect("valid profile");
+        assert_eq!(resolved.receipts().len(), 1);
     }
 
     #[test]
@@ -792,7 +1115,7 @@ mod tests {
         newt_core::tenacity::set_cli_tenacity(newt_core::Tenacity::Insistent);
 
         assert_eq!(
-            resolve_runtime_posture(&Config::default(), "model").tenacity,
+            resolve_runtime_posture(&Config::default(), None).tenacity,
             newt_core::Tenacity::Insistent
         );
     }
