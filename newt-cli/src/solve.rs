@@ -353,10 +353,8 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
 
     // #tenacity: attribute the model's family so a per-family `[tenacity]` config
     // default applies to this run (an explicit `--tenacity` still supersedes it).
-    // The card's `family` if a built-in card names one, else a family inferred
-    // from the model NAME against the configured `[tenacity.families]` keys — so
-    // the model matrix (qwen3/gemma/nemotron/…) works from config without a card
-    // per model.
+    // The family comes ONLY from the route-gated typed card decision (#1820) —
+    // a cardless model gets no family regardless of what its name resembles.
     // W0 (#1511): the LEVEL this run resolves to, recorded verbatim in the
     // contract's effective_config — the bench never re-derives it from a
     // profile (contract requirement 5).

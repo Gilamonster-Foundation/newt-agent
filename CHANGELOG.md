@@ -25,6 +25,20 @@ deviations in
   (`ocap_check.py`) forbids any deep `env::var` authority read outside the sole
   resolver. Register: 11 CLOSED / 4 OPEN.
 
+### Changed — tenacity family attribution is card-evidence only (#1820)
+
+- **Deliberate behavior loss.** Per-family `[tenacity]` defaults no longer
+  attach by model-NAME matching. Previously a cardless model whose name merely
+  contained a configured family key (e.g. model `qwen3-coder_30b` with
+  `[tenacity.families] qwen3`) picked up that family's level by
+  case-insensitive containment; now the family comes ONLY from typed
+  resolved-card metadata (the route-gated capability decision feeding
+  `tenacity::set_active_model_family`), and such a model falls to the
+  configured `default` level. Opt back in by writing a drop-in model card that
+  names the family. Names are labels, never evidence (#1818/#1819); a source
+  ratchet (`newt-core/tests/tenacity_exact_family_ratchet.rs`) keeps the
+  inference channel from returning.
+
 ### Added — splash-first startup, open provider roster, Hermes compatibility
 
 - **Splash first, always a spinner.** The splash now precedes the first-run
