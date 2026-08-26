@@ -3,9 +3,10 @@
 //! at the encoding, not at the fixture.
 
 use newt_interaction::{
-    Audience, Control, ControlId, ControlKind, ControlValue, IdempotencyKey, InteractionDefinition,
-    InteractionInstance, InteractionKind, LifecycleState, Nonce, Provenance, ResponderPolicy,
-    Response, Revision, Scope, SemanticRole, RESPONSE_SCHEMA_V1,
+    AssertionKind, Audience, Control, ControlId, ControlKind, ControlValue, IdempotencyKey,
+    InteractionDefinition, InteractionInstance, InteractionKind, LifecycleState, Nonce, Provenance,
+    ResponderPolicy, ResponderProvenance, Response, Revision, Scope, SemanticRole,
+    RESPONSE_SCHEMA_V1,
 };
 
 #[must_use]
@@ -69,5 +70,11 @@ pub fn response(def: &InteractionDefinition, inst: &InteractionInstance) -> Resp
         }],
         idempotency_key: IdempotencyKey::new("first-try").unwrap(),
         responder: Audience::Web,
+        responder_provenance: ResponderProvenance {
+            kind: AssertionKind::SignedAssertion,
+            subject: "operator:hartsock".to_string(),
+            audience: Audience::Web,
+            assertion: Some("assertion-handle-1".to_string()),
+        },
     }
 }

@@ -21,6 +21,50 @@ pub struct ControlValue {
     pub value: String,
 }
 
+/// How a responder was authenticated, IDENTIFIED — never the credential
+/// itself.
+///
+/// A2 gives responder provenance a place to live and binds it into the
+/// response's identity; A3 authenticates it and revalidates it. The
+/// separation matters: an [`Audience`] says which KIND of surface answered,
+/// which is not who did.
+///
+/// **This record carries no credentials and no secrets.** It names the
+/// assertion by reference — a kind, a subject, and an opaque
+/// [`assertion`](ResponderProvenance::assertion) handle the host can
+/// resolve — so a durable, content-addressed response never becomes a
+/// disclosure liability. A digest in the record beats the bytes: it is
+/// tamper-evident without being a secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponderProvenance {
+    /// What kind of assertion authenticated this responder.
+    pub kind: AssertionKind,
+    /// The principal the assertion speaks for, as the host names it. A
+    /// stable reference, never a credential.
+    pub subject: String,
+    /// Which audience the assertion was presented from.
+    pub audience: Audience,
+    /// An opaque handle the host can resolve to the assertion itself — a
+    /// content id, a row id, or a session reference. `None` when the
+    /// responder was unauthenticated, which is a fact worth recording
+    /// rather than hiding: A3 decides whether that is admissible.
+    pub assertion: Option<String>,
+}
+
+/// What established the responder's identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum AssertionKind {
+    /// The operator at the terminal that owns the session; authority comes
+    /// from holding the terminal, not from a presented token.
+    TerminalOperator,
+    /// A signed assertion from an enrolled credential.
+    SignedAssertion,
+    /// No assertion was presented. Recorded, not hidden.
+    Unauthenticated,
+}
+
 /// A submission bound to the exact offer it answers.
 ///
 /// Binds type, definition, instance, digest, revision, control values,
@@ -45,6 +89,10 @@ pub struct Response {
     pub idempotency_key: IdempotencyKey,
     /// Which audience the responder answered from.
     pub responder: Audience,
+    /// How that responder was authenticated, by reference. Bound into the
+    /// response's identity, so a submission cannot be re-attributed after
+    /// the fact.
+    pub responder_provenance: ResponderProvenance,
 }
 
 impl Response {

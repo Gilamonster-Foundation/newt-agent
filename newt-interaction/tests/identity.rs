@@ -228,4 +228,15 @@ fn a_response_binds_everything_it_claims_to() {
         base_id,
         "the responder is unbound"
     );
+
+    // #1828 §3.2 and the ADR bind a response to "... idempotency key +
+    // responder provenance". An audience is not provenance: it says which
+    // KIND of surface answered, not which authenticated party did.
+    let mut provenance = base.clone();
+    provenance.responder_provenance.subject = "someone-else".to_string();
+    assert_ne!(
+        provenance.response_id().unwrap(),
+        base_id,
+        "responder provenance is unbound"
+    );
 }

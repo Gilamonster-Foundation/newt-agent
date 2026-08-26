@@ -43,4 +43,6 @@ pub use instance::{
     Audience, InteractionInstance, LifecycleState, Provenance, ResponderPolicy, Scope,
     INSTANCE_SCHEMA_V1,
 };
-pub use response::{ControlValue, Response, RESPONSE_SCHEMA_V1};
+pub use response::{
+    AssertionKind, ControlValue, ResponderProvenance, Response, RESPONSE_SCHEMA_V1,
+};
