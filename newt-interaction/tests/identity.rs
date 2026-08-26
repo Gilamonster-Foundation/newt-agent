@@ -217,7 +217,6 @@ fn every_field_a_response_claims_to_bind_moves_its_id() {
         revision: _,
         values: _,
         idempotency_key: _,
-        responder: _,
         responder_provenance: _,
     } = &base;
 
@@ -252,9 +251,6 @@ fn every_field_a_response_claims_to_bind_moves_its_id() {
         }),
         ("idempotency_key", |r| {
             r.idempotency_key = newt_interaction::IdempotencyKey::new("second-try").unwrap();
-        }),
-        ("responder", |r| {
-            r.responder = newt_interaction::Audience::Terminal
         }),
         ("responder_provenance.kind", |r| {
             r.responder_provenance.kind = newt_interaction::AssertionKind::Unauthenticated;

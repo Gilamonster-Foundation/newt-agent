@@ -167,11 +167,15 @@ pub struct Response {
     pub values: Vec<Submission>,
     /// Makes a retry the same submission rather than a second one.
     pub idempotency_key: IdempotencyKey,
-    /// Which audience the responder answered from.
-    pub responder: Audience,
-    /// How that responder was authenticated, by reference. Bound into the
-    /// response's identity, so a submission cannot be re-attributed after
-    /// the fact.
+    /// How the responder was authenticated, by reference — including which
+    /// audience they answered from. Bound into the response's identity, so
+    /// a submission cannot be re-attributed after the fact.
+    ///
+    /// There is deliberately no second `responder: Audience` field beside
+    /// this one. Two bound fields carrying the same fact can disagree, and
+    /// nothing in a plain record keeps them equal; the identity table would
+    /// then be pinning a contradiction. The audience a responder was
+    /// authenticated FROM is part of the assertion, so it lives with it.
     pub responder_provenance: ResponderProvenance,
 }
 

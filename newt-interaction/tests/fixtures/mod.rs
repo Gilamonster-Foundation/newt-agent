@@ -70,7 +70,6 @@ pub fn response(def: &InteractionDefinition, inst: &InteractionInstance) -> Resp
             },
         }],
         idempotency_key: IdempotencyKey::new("first-try").unwrap(),
-        responder: Audience::Web,
         responder_provenance: ResponderProvenance {
             kind: AssertionKind::SignedAssertion,
             subject: "operator:hartsock".to_string(),
