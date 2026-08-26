@@ -246,11 +246,22 @@ fn squeeze_into(out: &mut String, code: &str) {
 fn production_code() -> BTreeMap<String, FileCode> {
     let root = workspace_root();
     let mut files: BTreeMap<String, FileCode> = BTreeMap::new();
+    // `rel` allocates, and the visitor fires once per production LINE — so
+    // remember the file it was last computed for.
+    let mut last: Option<(std::path::PathBuf, String)> = None;
     for_each_production_line(
         &production_roots(&root),
         &no_extra_skips,
         &mut |path, code, _| {
-            let entry = files.entry(rel(&root, path)).or_insert_with(|| FileCode {
+            let name = match &last {
+                Some((p, name)) if p == path => name.clone(),
+                _ => {
+                    let name = rel(&root, path);
+                    last = Some((path.to_path_buf(), name.clone()));
+                    name
+                }
+            };
+            let entry = files.entry(name).or_insert_with(|| FileCode {
                 squeezed: String::new(),
                 imports_pulldown: false,
             });
@@ -337,28 +348,20 @@ fn duplicate_site_baselines_only_ratchet_down() {
 /// mentioning it, or a fourth branch, extends the coupling mid-migration.
 #[test]
 fn prompt_surface_stays_confined_to_its_three_branches() {
-    let root = workspace_root();
-    let mut files: BTreeMap<String, usize> = BTreeMap::new();
-    let mut branches = 0usize;
-    for_each_production_line(
-        &production_roots(&root),
-        &no_extra_skips,
-        &mut |path, code, _| {
-            if code.contains("PromptSurface") {
-                *files.entry(rel(&root, path)).or_default() += 1;
-            }
-            if rel(&root, path) == "newt-tui/src/permissions.rs"
-                && (code.contains("matches!(surface,") || code.contains("match (tier, surface)"))
-            {
-                branches += 1;
-            }
-        },
-    );
+    let files = production_code();
+    let mentions: Vec<&String> = files
+        .iter()
+        .filter(|(_, code)| code.squeezed.contains("PromptSurface"))
+        .map(|(path, _)| path)
+        .collect();
     assert_eq!(
-        files.keys().collect::<Vec<_>>(),
+        mentions,
         vec!["newt-tui/src/permissions.rs"],
-        "PromptSurface leaked beyond newt-tui/src/permissions.rs: {files:?}"
+        "PromptSurface leaked beyond newt-tui/src/permissions.rs"
     );
+    let permissions = &files["newt-tui/src/permissions.rs"].squeezed;
+    let branches = count_sites(permissions, "matches!(surface,")
+        + count_sites(permissions, "match(tier,surface)");
     assert_eq!(
         branches, 3,
         "surface-branch count changed from the A0 baseline of 3 (two \
@@ -367,10 +370,6 @@ fn prompt_surface_stays_confined_to_its_three_branches() {
     );
 }
 
-/// The enumerated action-model registry: every enum that models
-/// user-selectable actions/outcomes, by (file, name). Down-only; a NEWLY
-/// NAMED parallel action enum cannot be detected by name and is caught in
-/// review with the A0 inventory as the checklist.
 #[test]
 fn action_model_registry_is_exact() {
     // (workspace-relative file, enum name, expected definition count there)
