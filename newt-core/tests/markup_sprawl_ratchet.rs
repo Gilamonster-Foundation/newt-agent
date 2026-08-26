@@ -35,51 +35,82 @@ fn no_extra_skips(_: &Path) -> bool {
     false
 }
 
-/// One armed category: a needle matched against production code lines
-/// (string-literal contents blanked), and the exact per-file baseline.
+/// One armed category. Counting runs over a file's **whitespace-squeezed**
+/// production code, so a needle cannot be lost to a rustfmt line split
+/// (`console\n    .ask(` and `console.ask(` are the same site) — the
+/// dangerous direction, because a silent count DROP reads as "Progress!
+/// Ratchet down" and lowers a baseline that should not move.
 struct Category {
     name: &'static str,
-    /// (code-line, trimmed-code-line) -> does this line hold one site?
-    matches: fn(&str, &str) -> bool,
-    /// Workspace-relative path -> exact expected production line count.
+    /// Sites in one file's squeezed production code.
+    count: fn(&FileCode) -> usize,
+    /// Workspace-relative path -> exact expected production count.
     baseline: &'static [(&'static str, usize)],
     rationale: &'static str,
 }
 
-/// `needle` preceded by a non-identifier char (so `Question {` cannot match
-/// `PendingQuestion {`).
-fn word_hit(code: &str, needle: &str) -> bool {
+/// One file's production code, squeezed of all whitespace, plus the facts a
+/// category may need about the file as a whole.
+struct FileCode {
+    squeezed: String,
+    /// The file names `pulldown_cmark` — the only `Parser` this repo's
+    /// dialect cares about.
+    imports_pulldown: bool,
+}
+
+/// Non-overlapping occurrences of `needle` in `hay`, ignoring matches whose
+/// preceding character continues an identifier (so `Question{` does not
+/// match `PendingQuestion{`, and `console.ask(` does not match
+/// `my_console.ask(` — a different receiver is a different site).
+fn count_sites(hay: &str, needle: &str) -> usize {
+    let mut count = 0;
     let mut from = 0;
-    while let Some(i) = code[from..].find(needle) {
+    while let Some(i) = hay[from..].find(needle) {
         let at = from + i;
         let boundary = at == 0
-            || !code[..at]
+            || !hay[..at]
                 .chars()
                 .next_back()
                 .is_some_and(|c| c.is_alphanumeric() || c == '_');
         if boundary {
-            return true;
+            count += 1;
         }
         from = at + needle.len();
     }
-    false
+    count
+}
+
+fn count_any(hay: &str, needles: &[&str]) -> usize {
+    needles.iter().map(|n| count_sites(hay, n)).sum()
 }
 
 const CATEGORIES: &[Category] = &[
     Category {
         name: "markdown parser sites",
-        matches: |code, _| code.contains("Parser::new"),
+        // Pinned to pulldown-cmark's constructor in a file that actually
+        // imports it: `Parser::new` as a bare substring matched
+        // `Parser::new_ext` only by luck and could not tell pulldown's
+        // Parser from any other type named Parser (newt-cli already has a
+        // private `struct Parser`) — so A1's own `+++` grammar work would
+        // have tripped the very ratchet meant to guide it.
+        count: |f| {
+            if f.imports_pulldown {
+                count_any(&f.squeezed, &["Parser::new_ext(", "Parser::new("])
+            } else {
+                0
+            }
+        },
         baseline: &[
             ("newt-core/src/agentic/markdown/mod.rs", 1),
             ("newt-web/src/shell.rs", 1),
         ],
         rationale: "two Markdown parsers with two option matrices (TUI dialect \
-                    vs web Options::all) is the dialect fork A1 unifies; a \
-                    third instantiation forks the dialect again",
+                    vs web Options::all) is the dialect fork the epic's A1/C3 \
+                    slices own; a third instantiation forks the dialect again",
     },
     Category {
         name: "question construction sites",
-        matches: |code, _| word_hit(code, "Question {") || word_hit(code, "Question::<"),
+        count: |f| count_any(&f.squeezed, &["Question{", "Question::<"]),
         baseline: &[
             ("newt-tui/src/permissions.rs", 2),
             ("newt-core/src/agentic/tools.rs", 1),
@@ -89,11 +120,15 @@ const CATEGORIES: &[Category] = &[
     },
     Category {
         name: "console ask sites",
-        matches: |code, ctrim| {
-            code.contains("console.ask(")
-                || code.contains("console.ask_secret(")
-                || code.contains("window.ask(")
-                || ctrim.starts_with(".ask(")
+        // Receiver-explicit: a bare `.ask(` cannot tell `console.ask(` from
+        // `gate.ask(` (the PermissionGate, seven sites in tools.rs) or a
+        // mesh RPC's `asker.ask(`. Squeezing rejoins the rustfmt-split
+        // calls that the old line-oriented rule needed a separate arm for.
+        count: |f| {
+            count_any(
+                &f.squeezed,
+                &["console.ask(", "console.ask_secret(", "window.ask("],
+            )
         },
         baseline: &[
             ("newt-tui/src/setup.rs", 23),
@@ -111,7 +146,7 @@ const CATEGORIES: &[Category] = &[
     },
     Category {
         name: "prompt confirm helpers",
-        matches: |code, _| code.contains("fn confirm_prompt("),
+        count: |f| count_sites(&f.squeezed, "fn confirm_prompt("),
         baseline: &[
             ("newt-core/src/sas_confirm.rs", 1),
             ("newt-tui/src/rich_input.rs", 1),
@@ -120,8 +155,18 @@ const CATEGORIES: &[Category] = &[
     },
     Category {
         name: "direct blocking reads",
-        matches: |code, _| {
-            code.contains("stdin()") && (code.contains(".read_line(") || code.contains(".read("))
+        // Squeezed, so `io::stdin()\n    .read_line(..)` counts once and the
+        // `.lock()` spelling is covered explicitly rather than by accident.
+        count: |f| {
+            count_any(
+                &f.squeezed,
+                &[
+                    "stdin().read_line(",
+                    "stdin().read(",
+                    "stdin().lock().read_line(",
+                    "stdin().lock().read(",
+                ],
+            )
         },
         baseline: &[
             ("newt-tui/src/line_console.rs", 2),
@@ -139,11 +184,16 @@ const CATEGORIES: &[Category] = &[
     },
     Category {
         name: "table renderer implementations",
-        matches: |code, _| {
-            code.contains("fn render_table(")
-                || code.contains("fn tidy_markdown_tables(")
-                || code.contains("fn render_panel(")
-                || code.contains("push_html(")
+        count: |f| {
+            count_any(
+                &f.squeezed,
+                &[
+                    "fn render_table(",
+                    "fn tidy_markdown_tables(",
+                    "fn render_panel(",
+                    "push_html(",
+                ],
+            )
         },
         baseline: &[
             ("newt-core/src/agentic/markdown/table.rs", 1),
@@ -161,21 +211,68 @@ const CATEGORIES: &[Category] = &[
     },
 ];
 
-fn production_counts() -> BTreeMap<(&'static str, String), usize> {
+/// Append `code` to `out` with whitespace squeezed OUT of token joins but
+/// PRESERVED between two identifier characters.
+///
+/// Deleting every space would join `match console` into `matchconsole`,
+/// where the identifier-boundary check in [`count_sites`] then reads `h`
+/// before `console` and rejects a real site — which is exactly how a
+/// rustfmt-split `let raw = match console\n    .ask(..)` went missing while
+/// the baseline was right. Dropping a run only when one of its neighbours is
+/// punctuation joins the method chain without welding two words together.
+fn squeeze_into(out: &mut String, code: &str) {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut chars = code.chars().peekable();
+    while let Some(c) = chars.next() {
+        if !c.is_whitespace() {
+            out.push(c);
+            continue;
+        }
+        while chars.peek().is_some_and(|n| n.is_whitespace()) {
+            chars.next();
+        }
+        let before = out.chars().next_back();
+        let after = chars.peek().copied();
+        // A run between two identifier characters is a real token boundary.
+        if before.is_some_and(is_ident) && after.is_some_and(is_ident) {
+            out.push(' ');
+        }
+    }
+    // A line ends where the next begins: keep the same rule across the seam
+    // by leaving no trailing separator — the next call re-evaluates it.
+}
+
+/// Squeezed production code per file, for every production root.
+fn production_code() -> BTreeMap<String, FileCode> {
     let root = workspace_root();
-    let mut counts: BTreeMap<(&'static str, String), usize> = BTreeMap::new();
+    let mut files: BTreeMap<String, FileCode> = BTreeMap::new();
     for_each_production_line(
         &production_roots(&root),
         &no_extra_skips,
-        &mut |path, code, _raw| {
-            let ctrim = code.trim_start();
-            for cat in CATEGORIES {
-                if (cat.matches)(code, ctrim) {
-                    *counts.entry((cat.name, rel(&root, path))).or_default() += 1;
-                }
+        &mut |path, code, _| {
+            let entry = files.entry(rel(&root, path)).or_insert_with(|| FileCode {
+                squeezed: String::new(),
+                imports_pulldown: false,
+            });
+            if code.contains("pulldown_cmark") {
+                entry.imports_pulldown = true;
             }
+            squeeze_into(&mut entry.squeezed, code);
         },
     );
+    files
+}
+
+fn production_counts() -> BTreeMap<(&'static str, String), usize> {
+    let mut counts: BTreeMap<(&'static str, String), usize> = BTreeMap::new();
+    for (path, code) in production_code() {
+        for cat in CATEGORIES {
+            let n = (cat.count)(&code);
+            if n > 0 {
+                counts.insert((cat.name, path.clone()), n);
+            }
+        }
+    }
     counts
 }
 
@@ -442,6 +539,83 @@ fn the_ratchet_scans_the_real_workspace() {
         saw_anchor,
         "scanner never saw permission_question_for in newt-tui — production \
          lines are not being visited"
+    );
+}
+
+/// **Needles survive a line split and name their receiver.** The old
+/// needles were single-line and receiver-blind, which fails in both
+/// directions: rustfmt splitting a call DROPPED a site (the count falls,
+/// the ratchet says "Progress! Ratchet down", and a baseline that should
+/// not move gets lowered — after which the next real duplicate lands
+/// green), while a bare `.ask(` counted any receiver at all, so a
+/// `gate.ask(` or a mesh `asker.ask(` reformatted onto its own line would
+/// report as a NEW interactive prompt.
+///
+/// Regression (#1823 review A0-4/A0-5). Counting now runs over
+/// whitespace-normalized code with explicit receivers.
+#[test]
+fn needles_survive_a_line_split_and_name_their_receiver() {
+    let code = |src: &str| {
+        let mut squeezed = String::new();
+        for line in src.lines() {
+            squeeze_into(&mut squeezed, line);
+        }
+        FileCode {
+            squeezed,
+            imports_pulldown: src.contains("pulldown_cmark"),
+        }
+    };
+    let count = |name: &str, src: &str| {
+        let file = code(src);
+        (CATEGORIES.iter().find(|c| c.name == name).unwrap().count)(&file)
+    };
+
+    // Split by rustfmt — still one site, in both spellings the repo has.
+    assert_eq!(
+        count(
+            "console ask sites",
+            "let k = console\n    .ask_secret(\"key\")?;"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            "console ask sites",
+            "let r = match console\n    .ask(\"q\")?;"
+        ),
+        1,
+        "a keyword before the receiver must not weld into it"
+    );
+    assert_eq!(
+        count(
+            "direct blocking reads",
+            "let n = io::stdin()\n    .read_line(&mut buf)?;"
+        ),
+        1
+    );
+
+    // Receiver-explicit: neither of these is an interactive console prompt.
+    assert_eq!(count("console ask sites", "gate.ask(&req)?;"), 0);
+    assert_eq!(
+        count("console ask sites", "let r = asker\n    .ask(m)?;"),
+        0
+    );
+    // ...and a longer identifier ending in the receiver name is its own thing.
+    assert_eq!(count("console ask sites", "my_console.ask(\"q\")?;"), 0);
+
+    // The parser needle is pinned to pulldown-cmark, so an unrelated type
+    // named Parser (newt-cli already has one) is not a dialect fork.
+    assert_eq!(
+        count("markdown parser sites", "let p = Parser::new(input);"),
+        0,
+        "a Parser in a file that never names pulldown_cmark is not the dialect"
+    );
+    assert_eq!(
+        count(
+            "markdown parser sites",
+            "use pulldown_cmark::Parser;\nlet p = Parser::new_ext(src, opts);"
+        ),
+        1
     );
 }
 
