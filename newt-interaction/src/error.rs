@@ -37,6 +37,22 @@ pub enum ProtocolError {
         /// Whether this build recognizes the name at all.
         known: bool,
     },
+    /// The bytes decode, but they are not the canonical encoding of what
+    /// they decode to — reordered map keys, a non-minimal integer, an
+    /// indefinite-length string. Accepting them would mint an id different
+    /// from the one their author published.
+    #[error(
+        "non-canonical encoding of {schema}: {input_len} bytes in, \
+         {decoded_len} out when re-encoded"
+    )]
+    NonCanonical {
+        /// The tag the record declared.
+        schema: String,
+        /// Length of the canonical re-encoding.
+        decoded_len: usize,
+        /// Length of the input.
+        input_len: usize,
+    },
     /// The bytes are not a readable record. Corruption is a different fact
     /// from a version we do not know, and is reported differently.
     #[error("malformed record: {reason}")]

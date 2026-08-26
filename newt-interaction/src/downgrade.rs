@@ -12,13 +12,28 @@
 //! record and calling the result a v1 is the tempting failure — it yields
 //! a record that looks valid and carries an id its author never minted.
 
-use content_addressable::canonical;
+use content_addressable::{canonical, ContentAddressable};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::definition::{InteractionDefinition, Requirement, SurfaceFeature};
 use crate::error::ProtocolError;
+use crate::instance::InteractionInstance;
+use crate::response::Response;
 
-/// A record whose schema tag this build does not know, kept whole.
+/// Why a record was preserved instead of interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnknownReason {
+    /// The schema tag names a version this build does not have.
+    ForwardVersion,
+    /// The tag is ours, but the record does not fit the shape this build
+    /// knows — most often a field we have no name for. Its requiredness is
+    /// unknowable, so it is never interpreted.
+    Uninterpretable,
+}
+
+/// A record this build did not interpret, kept whole.
 ///
 /// The bytes are the payload: not re-serialized, not normalized, not
 /// trimmed. A consumer can pass them on, store them, or show them, and
@@ -27,6 +42,7 @@ use crate::error::ProtocolError;
 pub struct RawRecord {
     schema: String,
     bytes: Vec<u8>,
+    reason: UnknownReason,
 }
 
 impl RawRecord {
@@ -41,14 +57,20 @@ impl RawRecord {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// Why it was not interpreted.
+    #[must_use]
+    pub fn reason(&self) -> UnknownReason {
+        self.reason
+    }
 }
 
 /// The result of reading a record: understood, or preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decoded<T> {
-    /// The tag was known and the record parsed.
+    /// The tag was known, the shape fit, and the bytes were canonical.
     Known(T),
-    /// The tag was not known. Deliberately no partial interpretation.
+    /// Anything else. Deliberately no partial interpretation.
     Unknown(RawRecord),
 }
 
@@ -58,38 +80,97 @@ struct SchemaProbe {
     schema: String,
 }
 
-/// Read a definition, preserving it whole if this build does not know its
-/// version.
+/// Read a record of type `T`, preserving it whole unless this build can
+/// account for every byte.
 ///
-/// # Errors
+/// Three gates, in order, and each exists because the one before it is not
+/// enough on its own:
 ///
-/// [`ProtocolError::Malformed`] when the bytes are not a readable record
-/// carrying a `schema` string — corruption is a different fact from a
-/// version we do not know, and is reported differently.
-pub fn decode_definition(bytes: &[u8]) -> Result<Decoded<InteractionDefinition>, ProtocolError> {
-    // Canonical DAG-CBOR: the same bytes identity is minted over, so a
-    // record that survives this round trip is the record whose id its
-    // author published. Reading the tag first, with a probe that commits
-    // to no other field, is what makes "unknown" a decision rather than a
-    // parse failure.
+/// 1. **The tag.** A version we do not have is preserved (law 1) and never
+///    guessed at.
+/// 2. **The shape.** `deny_unknown_fields` refuses a record carrying a
+///    field we have no name for. Serde's default is to DROP such a field,
+///    which silently discards whatever it said — possibly a required
+///    demand — and yields a record whose id its author never minted.
+/// 3. **The bytes.** Even a record that decodes may not be the record that
+///    was written: reordered map keys, a non-minimal integer, an
+///    indefinite-length string all decode fine and re-encode differently.
+///    So the decoded value is re-encoded and compared byte-for-byte with
+///    the input, and any difference is a refusal.
+///
+/// Gate 3 is not redundant with gate 2. It does not depend on how strict
+/// the CBOR decoder happens to be in the version we have locked, and
+/// decoder strictness drifts between releases — this repo has been bitten
+/// by exactly that before. The rule learned there applies here: prove a
+/// non-canonical encoding by FORWARD encoding, never by trusting a decoder
+/// to reject it.
+fn decode<T>(bytes: &[u8], expected: &'static str) -> Result<Decoded<T>, ProtocolError>
+where
+    T: DeserializeOwned + ContentAddressable,
+{
     let probe: SchemaProbe =
         canonical::from_canonical_dagcbor(bytes).map_err(|e| ProtocolError::Malformed {
             reason: format!("no readable schema tag: {e}"),
         })?;
-    if probe.schema != crate::definition::DEFINITION_SCHEMA_V1 {
+    if probe.schema != expected {
         return Ok(Decoded::Unknown(RawRecord {
             schema: probe.schema,
             bytes: bytes.to_vec(),
+            reason: UnknownReason::ForwardVersion,
         }));
     }
-    let definition =
-        canonical::from_canonical_dagcbor(bytes).map_err(|e| ProtocolError::Malformed {
-            reason: format!(
-                "record claims {} but does not parse as one: {e}",
-                crate::definition::DEFINITION_SCHEMA_V1
-            ),
-        })?;
-    Ok(Decoded::Known(definition))
+
+    // Gate 2. A shape we cannot fully account for is preserved, not
+    // partially read. The probe already proved these bytes are a map with
+    // a schema string, so a failure here is "shaped like a record we do
+    // not know", not "not a record".
+    let Ok(record) = canonical::from_canonical_dagcbor::<T>(bytes) else {
+        return Ok(Decoded::Unknown(RawRecord {
+            schema: probe.schema,
+            bytes: bytes.to_vec(),
+            reason: UnknownReason::Uninterpretable,
+        }));
+    };
+
+    // Gate 3.
+    let reencoded = record.canonical_form()?;
+    if reencoded != bytes {
+        return Err(ProtocolError::NonCanonical {
+            schema: probe.schema,
+            decoded_len: reencoded.len(),
+            input_len: bytes.len(),
+        });
+    }
+    Ok(Decoded::Known(record))
+}
+
+/// Read a definition. See [`decode`] for the three gates.
+///
+/// # Errors
+///
+/// [`ProtocolError::Malformed`] when the bytes are not a readable record;
+/// [`ProtocolError::NonCanonical`] when they decode but are not the
+/// canonical encoding of what they decode to.
+pub fn decode_definition(bytes: &[u8]) -> Result<Decoded<InteractionDefinition>, ProtocolError> {
+    decode(bytes, crate::definition::DEFINITION_SCHEMA_V1)
+}
+
+/// Read an instance. See [`decode`] for the three gates.
+///
+/// # Errors
+///
+/// As [`decode_definition`].
+pub fn decode_instance(bytes: &[u8]) -> Result<Decoded<InteractionInstance>, ProtocolError> {
+    decode(bytes, crate::instance::INSTANCE_SCHEMA_V1)
+}
+
+/// Read a response. See [`decode`] for the three gates.
+///
+/// # Errors
+///
+/// As [`decode_definition`].
+pub fn decode_response(bytes: &[u8]) -> Result<Decoded<Response>, ProtocolError> {
+    decode(bytes, crate::response::RESPONSE_SCHEMA_V1)
 }
 
 /// One demand a surface could not meet, reported rather than swallowed.

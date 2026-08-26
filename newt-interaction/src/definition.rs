@@ -93,6 +93,7 @@ pub enum Requirement {
 /// One control: a stable id, what it means, and how it takes input.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Control {
     /// Stable within the definition; the definition commits to it.
     pub id: ControlId,
@@ -169,6 +170,7 @@ impl SurfaceFeature {
 /// is.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeatureDemand {
     /// Which capability.
     pub feature: SurfaceFeature,
@@ -182,6 +184,7 @@ pub struct FeatureDemand {
 /// encoding of this whole record, which is also its **exact form digest**.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InteractionDefinition {
     /// Versioned type tag; see [`DEFINITION_SCHEMA_V1`].
     pub schema: String,

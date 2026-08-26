@@ -68,7 +68,7 @@ impl SecretRef {
 /// (`{"kind":"toggle","on":true}`).
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControlValue {
     /// One of the definition's controls was chosen.
     Choice {
@@ -110,6 +110,7 @@ pub enum ControlValue {
 /// tamper-evident without being a secret.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponderProvenance {
     /// What kind of assertion authenticated this responder.
     pub kind: AssertionKind,
@@ -143,6 +144,7 @@ pub enum AssertionKind {
 /// One control's answer: which control, and the typed value.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Submission {
     /// Which control this answers.
     pub control: ControlId,
@@ -158,6 +160,7 @@ pub struct Submission {
 /// against the definition before it resolves anything.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Response {
     /// Versioned type tag; see [`RESPONSE_SCHEMA_V1`].
     pub schema: String,

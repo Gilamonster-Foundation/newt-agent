@@ -39,7 +39,8 @@ pub use definition::{
     SemanticRole, SurfaceFeature, DEFINITION_SCHEMA_V1,
 };
 pub use downgrade::{
-    decode_definition, plan_presentation, Decoded, Degradation, Presentation, RawRecord,
+    decode_definition, decode_instance, decode_response, plan_presentation, Decoded, Degradation,
+    Presentation, RawRecord, UnknownReason,
 };
 pub use error::ProtocolError;
 pub use ids::{ControlId, DefinitionId, IdempotencyKey, InstanceId, Nonce, ResponseId, Revision};

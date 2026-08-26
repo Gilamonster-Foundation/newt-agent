@@ -369,3 +369,64 @@ fn the_corpus_covers_every_record_and_value_variant() {
         );
     }
 }
+
+/// **Every committed vector survives a decode/encode round trip.**
+///
+/// The corpus is the cross-language contract, so it has to satisfy the
+/// same rule the decoder enforces: canonical bytes decode to a record that
+/// re-encodes to exactly those bytes, and the id recomputed from them is
+/// the id recorded beside them. A vector that failed this would be
+/// teaching foreign implementations something untrue.
+#[test]
+fn decoding_then_encoding_reproduces_every_vector() {
+    let committed: Vec<Vector> = serde_json::from_str(
+        &std::fs::read_to_string(vectors_path()).expect("vectors file exists"),
+    )
+    .expect("vectors parse");
+    assert!(!committed.is_empty(), "no vectors to check");
+
+    for vector in &committed {
+        let bytes = from_hex(&vector.dagcbor_hex);
+        let (reencoded, id) = match vector.record.as_str() {
+            "definition" => match newt_interaction::decode_definition(&bytes).unwrap() {
+                newt_interaction::Decoded::Known(r) => (
+                    r.canonical_form().unwrap(),
+                    r.content_id().unwrap().to_string(),
+                ),
+                newt_interaction::Decoded::Unknown(_) => {
+                    panic!("vector `{}` did not decode as known", vector.name)
+                }
+            },
+            "instance" => match newt_interaction::decode_instance(&bytes).unwrap() {
+                newt_interaction::Decoded::Known(r) => (
+                    r.canonical_form().unwrap(),
+                    r.content_id().unwrap().to_string(),
+                ),
+                newt_interaction::Decoded::Unknown(_) => {
+                    panic!("vector `{}` did not decode as known", vector.name)
+                }
+            },
+            "response" => match newt_interaction::decode_response(&bytes).unwrap() {
+                newt_interaction::Decoded::Known(r) => (
+                    r.canonical_form().unwrap(),
+                    r.content_id().unwrap().to_string(),
+                ),
+                newt_interaction::Decoded::Unknown(_) => {
+                    panic!("vector `{}` did not decode as known", vector.name)
+                }
+            },
+            other => panic!("vector `{}` names unknown record `{other}`", vector.name),
+        };
+        assert_eq!(
+            to_hex(&reencoded),
+            vector.dagcbor_hex,
+            "vector `{}`: decode then encode did not reproduce the bytes",
+            vector.name
+        );
+        assert_eq!(
+            id, vector.content_id,
+            "vector `{}`: the recomputed id differs from the recorded one",
+            vector.name
+        );
+    }
+}

@@ -20,8 +20,9 @@
 
 use content_addressable::canonical;
 use newt_interaction::{
-    decode_definition, plan_presentation, Decoded, FeatureDemand, ProtocolError, Requirement,
-    SurfaceFeature, DEFINITION_SCHEMA_V1,
+    decode_definition, decode_instance, decode_response, plan_presentation, Decoded, FeatureDemand,
+    InteractionDefinition, ProtocolError, Requirement, SurfaceFeature, UnknownReason,
+    DEFINITION_SCHEMA_V1,
 };
 use serde::Serialize;
 
@@ -174,4 +175,166 @@ fn an_unknown_optional_behavior_degrades_visibly() {
     let plain = plan_presentation(&definition(), &[]).unwrap();
     assert!(plain.degradations().is_empty());
     assert!(plain.is_faithful());
+}
+
+/// Append one unknown field to an encoded DAG-CBOR map.
+///
+/// The key is 24 `z`s: DAG-CBOR sorts map keys length-first, so a key
+/// longer than every real one belongs LAST, and appending it keeps the
+/// encoding canonical. That matters — the point is to test the
+/// unknown-FIELD rule, not to accidentally test canonical ordering at the
+/// same time.
+fn with_extra_field(bytes: &[u8]) -> Vec<u8> {
+    let header = bytes[0];
+    assert!(
+        (0xa0..0xb7).contains(&header),
+        "expected a small CBOR map header, got {header:#04x}"
+    );
+    let mut out = vec![header + 1];
+    out.extend_from_slice(&bytes[1..]);
+    out.push(0x78); // text, one-byte length
+    out.push(24);
+    out.extend_from_slice(&[b'z'; 24]);
+    out.push(0x61); // text, length 1
+    out.push(b'x');
+    out
+}
+
+/// **A record carrying a field this build does not know is NEVER `Known`.**
+///
+/// Serde drops unknown fields by default, so before this rule a v1 record
+/// with one extra field decoded happily, re-encoded 43 bytes shorter, and
+/// minted an id for a record its author never wrote — while whatever that
+/// field said, possibly a REQUIRED demand, vanished without trace. An
+/// unknown field's requiredness is unknowable, so law 5 says fail closed:
+/// never interpreted, bytes preserved for whoever does understand them.
+#[test]
+fn a_known_tag_with_an_unknown_field_is_never_known() {
+    let def = definition();
+    let inst = fixtures::instance(&def);
+    let resp = fixtures::response(&def, &inst);
+
+    let def_bytes = canonical::to_canonical_dagcbor(&def).unwrap();
+    let inst_bytes = canonical::to_canonical_dagcbor(&inst).unwrap();
+    let resp_bytes = canonical::to_canonical_dagcbor(&resp).unwrap();
+
+    // Each clean record decodes, or the tainted assertions prove nothing.
+    assert!(matches!(
+        decode_definition(&def_bytes).unwrap(),
+        Decoded::Known(_)
+    ));
+    assert!(matches!(
+        decode_instance(&inst_bytes).unwrap(),
+        Decoded::Known(_)
+    ));
+    assert!(matches!(
+        decode_response(&resp_bytes).unwrap(),
+        Decoded::Known(_)
+    ));
+
+    // ...and each tainted one does not, preserving its bytes verbatim.
+    let tainted_def = with_extra_field(&def_bytes);
+    match decode_definition(&tainted_def).unwrap() {
+        Decoded::Unknown(raw) => {
+            assert_eq!(raw.bytes(), tainted_def.as_slice());
+            assert_eq!(raw.reason(), UnknownReason::Uninterpretable);
+        }
+        Decoded::Known(known) => panic!(
+            "an unknown field was dropped and the record minted {} — an id \
+             its author never wrote",
+            known.definition_id().unwrap()
+        ),
+    }
+
+    let tainted_inst = with_extra_field(&inst_bytes);
+    assert!(
+        matches!(decode_instance(&tainted_inst).unwrap(), Decoded::Unknown(_)),
+        "an instance with an unknown field decoded as known"
+    );
+
+    let tainted_resp = with_extra_field(&resp_bytes);
+    assert!(
+        matches!(decode_response(&tainted_resp).unwrap(), Decoded::Unknown(_)),
+        "a response with an unknown field decoded as known"
+    );
+}
+
+/// Rewrite `revision`'s value from CBOR's minimal form to a non-minimal
+/// one: `0x00` (immediate 0) becomes `0x18 0x00` (one-byte follow, still
+/// 0). Valid CBOR, decodes to the same number, and is NOT the canonical
+/// encoding — the shape a foreign encoder produces by accident.
+fn make_non_canonical(bytes: &[u8]) -> Vec<u8> {
+    let key: Vec<u8> = std::iter::once(0x68u8)
+        .chain(b"revision".iter().copied())
+        .collect();
+    let at = bytes
+        .windows(key.len())
+        .position(|w| w == key.as_slice())
+        .expect("the record carries a `revision` key");
+    let value_at = at + key.len();
+    assert_eq!(
+        bytes[value_at], 0x00,
+        "expected revision 0 in minimal form, got {:#04x}",
+        bytes[value_at]
+    );
+    let mut out = bytes[..value_at].to_vec();
+    out.extend_from_slice(&[0x18, 0x00]);
+    out.extend_from_slice(&bytes[value_at + 1..]);
+    out
+}
+
+/// **Bytes that decode are not thereby canonical.**
+///
+/// A reordered map key, a non-minimal integer, an indefinite-length string
+/// — each decodes to the right value and re-encodes to different bytes,
+/// which means a different id. Accepting them would let two encodings of
+/// one record carry two identities, and the one an author published would
+/// not be the one a consumer computed.
+#[test]
+fn non_canonical_bytes_of_a_valid_record_are_refused() {
+    let def = definition();
+    let canonical_bytes = canonical::to_canonical_dagcbor(&def).unwrap();
+    let perturbed = make_non_canonical(&canonical_bytes);
+    assert_ne!(perturbed, canonical_bytes, "the fixture perturbed nothing");
+
+    // It really does still decode — otherwise this tests the decoder's
+    // strictness rather than our check.
+    let lenient: InteractionDefinition =
+        canonical::from_canonical_dagcbor(&perturbed).expect("perturbed bytes still decode");
+    assert_eq!(
+        lenient, def,
+        "the perturbation changed the VALUE, not just the bytes"
+    );
+
+    match decode_definition(&perturbed) {
+        Err(ProtocolError::NonCanonical { ref schema, .. }) => {
+            assert_eq!(schema, DEFINITION_SCHEMA_V1);
+        }
+        Err(other) => panic!("expected NonCanonical, got {other:?}"),
+        Ok(_) => panic!("non-canonical bytes were accepted"),
+    }
+}
+
+/// **Anti-vacuous twin for the byte-equality gate.** The same bytes, run
+/// through a decoder WITHOUT that gate, are accepted — which is what makes
+/// the refusal above attributable to the gate rather than to the decoder
+/// happening to be strict. (It is not: the assertion above proves it
+/// decodes.)
+#[test]
+fn without_the_byte_check_the_same_bytes_are_accepted() {
+    let def = definition();
+    let perturbed = make_non_canonical(&canonical::to_canonical_dagcbor(&def).unwrap());
+
+    // Gates 1 and 2 only — the shape this decoder had before the byte
+    // check existed.
+    let probe: serde_json::Value = {
+        let decoded: InteractionDefinition =
+            canonical::from_canonical_dagcbor(&perturbed).expect("gate 2 passes");
+        serde_json::to_value(decoded).unwrap()
+    };
+    assert_eq!(
+        probe["schema"], DEFINITION_SCHEMA_V1,
+        "a gate-2-only decoder accepts these bytes, so the refusal is the \
+         byte check's doing"
+    );
 }

@@ -67,6 +67,7 @@ pub enum Audience {
 /// fact, which is the "attenuate, never amplify" law applied to responders.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponderPolicy {
     /// Audiences this offer is open to.
     pub audiences: Vec<Audience>,
@@ -77,6 +78,7 @@ pub struct ResponderPolicy {
 /// The workspace fence an instance is confined to.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Scope {
     /// Opaque workspace key — the same fence every permission query already
     /// applies in `newt_core`'s store.
@@ -93,6 +95,7 @@ pub struct Scope {
 /// repeats the defect the ledger counts.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Provenance {
     /// What minted this instance (a tool name, a subsystem, a persona).
     pub origin: String,
@@ -108,6 +111,7 @@ pub struct Provenance {
 /// without changing its [`InstanceId`].
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InteractionInstance {
     /// Versioned type tag; see [`INSTANCE_SCHEMA_V1`].
     pub schema: String,
