@@ -2894,3 +2894,93 @@ mod permission_prompt_tests {
         );
     }
 }
+
+/// **A0 byte goldens (#1823, epic #1803): the plain permission-prompt
+/// rendering, frozen verbatim.** These strings ARE the current contract —
+/// including the deliberately DIFFERENT terminal/web action matrices (web
+/// omits every durable grant; net+low+terminal is the only permanent-allow) —
+/// and epic law 1 says a later slice must keep the plain fallback while
+/// C0 extracts `terminal_text()` out of the semantic type. An intentional
+/// rendering change updates these strings in the same PR, listed as an
+/// intentional diff (unlisted golden drift is a bug, per the epic's F0 rule).
+#[cfg(test)]
+mod a0_freeze_goldens {
+    use super::*;
+    use newt_core::{DenialKind, PermissionRequest};
+
+    fn net_low() -> PermissionRequest {
+        PermissionRequest {
+            tool: "http".into(),
+            kind: DenialKind::Net,
+            target: "https://example.com/api".into(),
+            reason: String::new(),
+        }
+    }
+
+    fn exec_high() -> PermissionRequest {
+        PermissionRequest {
+            tool: "run_command".into(),
+            kind: DenialKind::Exec,
+            target: "bash".into(),
+            reason: "exec of \"bash\" is not within the granted authority".into(),
+        }
+    }
+
+    fn text(req: &PermissionRequest, surface: PromptSurface) -> String {
+        let table = danger::DangerTable::builtin();
+        permission_question_for(req, &table, surface).terminal_text()
+    }
+
+    #[test]
+    fn terminal_low_net_offers_every_grant_including_the_permanents() {
+        assert_eq!(
+            text(&net_low(), PromptSurface::Terminal),
+            "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
+             Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
+             [a]llow once   [s]ession allow   [A]llow permanently (adds host to config)   [d]eny (default)   [D]eny always   [P]ermanently deny"
+        );
+    }
+
+    #[test]
+    fn web_low_net_omits_every_durable_grant() {
+        assert_eq!(
+            text(&net_low(), PromptSurface::Web),
+            "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
+             Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
+             [a]llow once   [s]ession allow   [d]eny (default)"
+        );
+    }
+
+    #[test]
+    fn terminal_high_exec_refuses_session_allow_and_says_why() {
+        assert_eq!(
+            text(&exec_high(), PromptSurface::Terminal),
+            "\u{2298} run_command wants to run `bash` \u{2014} outside the granted exec allowlist.\n\
+             \u{26a0} `bash` is an interpreter: this grants arbitrary command execution\n  \
+             (exec of \"bash\" is not within the granted authority)\n\
+             high-danger: session allow refused; key allow / step-up is the future path, P3\n\
+             Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
+             [a]llow once   [d]eny (default)   [D]eny always   [P]ermanently deny"
+        );
+    }
+
+    #[test]
+    fn web_high_exec_is_allow_once_or_deny_only() {
+        assert_eq!(
+            text(&exec_high(), PromptSurface::Web),
+            "\u{2298} run_command wants to run `bash` \u{2014} outside the granted exec allowlist.\n\
+             \u{26a0} `bash` is an interpreter: this grants arbitrary command execution\n  \
+             (exec of \"bash\" is not within the granted authority)\n\
+             High danger: session authorization is unavailable.\n\
+             Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
+             [a]llow once   [d]eny (default)"
+        );
+    }
+
+    /// The control hint every prompt note carries; the goldens above embed it,
+    /// and the free-text form (`prompt_user_input`) reuses the same constant.
+    #[test]
+    fn the_modal_control_hint_is_the_frozen_control_vocabulary() {
+        assert_eq!(MODAL_CONTROL_HINT, "Esc=back \u{b7} Ctrl-C/Ctrl-D=exit");
+    }
+}

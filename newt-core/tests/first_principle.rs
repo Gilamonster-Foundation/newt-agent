@@ -40,6 +40,9 @@
 
 use newt_core::{ConversationStore, PhantomReach, PhantomResolution};
 
+mod common;
+use common::{cfg_is_test_only, for_each_production_line, production_roots};
+
 /// Number of laws in this file currently marked as violations. This may only
 /// go DOWN, and only in a change that also removes the corresponding
 /// `#[ignore]` and shows the test passing. Raising it requires filing the
@@ -397,199 +400,91 @@ fn cfg_test_only_matcher_is_conservative() {
 /// property under test is "this code is reachable in production", which is a
 /// fact about the program text, not about any value the program computes.
 fn production_callers_of(names: &[&str]) -> Vec<String> {
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("newt-core has a parent workspace directory")
-        .to_path_buf();
-    production_callers_of_in(&workspace_root, names)
+    production_callers_of_in(&common::workspace_root(), names)
+}
+
+/// The roots a law scans. Scoped to production workspace members (plus
+/// newt-web) — see `common::production_roots`.
+///
+/// The `<root>/src` fallback exists for the tempdir fixtures below, which
+/// have no workspace manifest at all. It is gated on that shape on purpose:
+/// falling back whenever the roots come back empty would let a
+/// manifest-parse failure (a reformatted `members` list, a moved table)
+/// silently redirect every law at a non-existent `newt-agent/src`, where an
+/// absence-style law — "no production caller does X" — passes vacuously
+/// because nothing at all was scanned. A real workspace that yields no
+/// roots is a broken scanner, and it says so.
+fn roots_for(workspace_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let declares_workspace = std::fs::read_to_string(workspace_root.join("Cargo.toml"))
+        .is_ok_and(|manifest| manifest.contains("[workspace]"));
+    let roots = production_roots(workspace_root);
+    assert!(
+        !(declares_workspace && roots.is_empty()),
+        "the workspace manifest at {} yielded no production roots — the \
+         members list did not parse, so every law below would scan nothing \
+         and pass vacuously",
+        workspace_root.display()
+    );
+    if roots.is_empty() {
+        vec![workspace_root.join("src")]
+    } else {
+        roots
+    }
+}
+
+/// Regression (#1823 review follow-up): a workspace whose members list does
+/// not parse must fail LOUDLY rather than fall back to a path that does not
+/// exist, which would make every absence-style law vacuously green.
+#[test]
+#[should_panic(expected = "yielded no production roots")]
+fn an_unparseable_members_list_fails_loudly_instead_of_scanning_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    // A real `[workspace]` table, but nothing this parser can read as a
+    // members list.
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    let _ = roots_for(root.path());
+}
+
+/// ...and the fixture shape the laws' own scanner tests rely on still
+/// works: no workspace manifest, so `<root>/src` is the honest answer.
+#[test]
+fn a_manifestless_fixture_still_falls_back_to_its_src() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    assert_eq!(roots_for(root.path()), vec![root.path().join("src")]);
 }
 
 fn production_callers_of_in(workspace_root: &std::path::Path, names: &[&str]) -> Vec<String> {
     let mut found = Vec::new();
-    let mut stack = vec![workspace_root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if path.is_dir() {
-                // Skip build output, VCS, and vendored/worktree copies — a hit
-                // inside target/ or .claude/worktrees/ is not this build's code.
-                if matches!(name.as_ref(), "target" | ".git" | ".claude" | "docs") {
-                    continue;
-                }
-                stack.push(path);
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            // newt-tui's out-of-line lib_tests files are each reached by a
-            // parent-side #[cfg(test)] #[path = ...] declaration. The child
-            // itself has no local cfg for this line scanner to see.
-            if is_test_only_source_path(&path) {
-                continue;
-            }
-            // agentic/artifact_read.rs defines a PRIVATE fn of the same name —
-            // the session-local artifact ledger's verifier (the one that was
-            // already wired correctly). Counting its `self.verify_chain(..)`
-            // calls as callers of the STORE's chain verifier would make this
-            // law pass with the store still unverified — a name collision a
-            // textual scanner cannot resolve by types, so it is excluded by
-            // file. Discovered red-first: reverting the #1785 fix left the law
-            // green until this exclusion was added.
-            if path.ends_with("agentic/artifact_read.rs") {
-                continue;
-            }
-            // Only production sources: a call from tests/ or benches/ is
-            // exactly the situation this law is trying to detect.
-            if !path.components().any(|c| c.as_os_str() == "src") {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            // Skip cfg items that cannot compile in production by brace depth:
-            // from the attribute, ignore lines until the braces opened after
-            // it close again. A simple latch ("saw #[cfg(test)], skip the rest
-            // of the file") is NOT good enough — a large file with an early
-            // test seam would hide every later production line, making this
-            // scanner blind in exactly the way it exists to detect.
-            let mut test_depth: i32 = 0;
-            let mut pending_test_attr = false;
-            for line in text.lines() {
-                let trimmed = line.trim_start();
-                // Doc comments describe the guarantee; they do not invoke it.
-                if trimmed.starts_with("//") {
-                    continue;
-                }
-                // Brace counting and cfg matching both work on the line with
-                // string literals blanked, so `"{"` in a message or `"test"`
-                // in a feature name (`feature = "test-util"`) cannot skew
-                // either. (Multi-line string literals would still confuse a
-                // line scanner; none of the scanned guarantees sit near one,
-                // and this is a structural ratchet, not a parser.)
-                let code = strip_string_literals(line);
-                let ctrim = code.trim_start();
-                if test_depth == 0 && !pending_test_attr && cfg_is_test_only(ctrim) {
-                    // Do not continue yet: an inline attribute item such as
-                    // #[cfg(test)] fn f() { must contribute its opening brace
-                    // before the test-only body is skipped.
-                    pending_test_attr = true;
-                }
-                if test_depth > 0 || pending_test_attr {
-                    let opens = code.matches('{').count() as i32;
-                    let closes = code.matches('}').count() as i32;
-                    if pending_test_attr {
-                        if opens > 0 {
-                            pending_test_attr = false;
-                        } else if ctrim.ends_with(';') {
-                            // A brace-less gated item (`#[cfg(test)] use …;`,
-                            // `mod x;`) ends at its semicolon. Without this
-                            // the pending flag latches forever and everything
-                            // after it in the file goes invisible — the same
-                            // blindness the brace tracker was built to fix.
-                            pending_test_attr = false;
-                            continue;
-                        }
-                    }
-                    test_depth = (test_depth + opens - closes).max(0);
-                    continue;
-                }
-                for n in names {
-                    // A call, not the definition — matched on the stripped
-                    // line, so the name inside a string literal (an error
-                    // message, a doc example) cannot satisfy the law.
-                    if ctrim.contains(&format!("{n}(")) && !ctrim.contains(&format!("fn {n}(")) {
-                        found.push(format!("{}: {}", path.display(), trimmed));
-                    }
+    for_each_production_line(
+        &roots_for(workspace_root),
+        // agentic/artifact_read.rs defines a PRIVATE fn of the same name —
+        // the session-local artifact ledger's verifier (the one that was
+        // already wired correctly). Counting its `self.verify_chain(..)`
+        // calls as callers of the STORE's chain verifier would make this
+        // law pass with the store still unverified — a name collision a
+        // textual scanner cannot resolve by types, so it is excluded by
+        // file. Discovered red-first: reverting the #1785 fix left the law
+        // green until this exclusion was added.
+        &|path| path.ends_with("agentic/artifact_read.rs"),
+        &mut |path, code, raw| {
+            let ctrim = code.trim_start();
+            for n in names {
+                // A call, not the definition — matched on the stripped
+                // line, so the name inside a string literal (an error
+                // message, a doc example) cannot satisfy the law.
+                if ctrim.contains(&format!("{n}(")) && !ctrim.contains(&format!("fn {n}(")) {
+                    found.push(format!("{}: {}", path.display(), raw.trim_start()));
                 }
             }
-        }
-    }
+        },
+    );
     found
-}
-
-/// Whether `path` is an out-of-line test module below a crate's `src/`.
-/// These modules are parent-gated, so scanning the child file alone cannot
-/// recover its cfg context.
-fn is_test_only_source_path(path: &std::path::Path) -> bool {
-    let mut below_src = false;
-    for component in path.components() {
-        if component.as_os_str() == "src" {
-            below_src = true;
-        } else if below_src && component.as_os_str() == "lib_tests" {
-            return true;
-        }
-    }
-    false
-}
-
-/// Return true only for cfg predicates that require the `test` atom. This is
-/// deliberately conservative: `#[cfg(not(test))]` and
-/// `#[cfg(any(test, unix))]` can compile in production and must stay visible.
-fn cfg_is_test_only(code: &str) -> bool {
-    let Some(rest) = code.strip_prefix("#[cfg(") else {
-        return false;
-    };
-    let mut depth = 1_i32;
-    for (index, ch) in rest.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            _ => {}
-        }
-        if depth == 0 {
-            return cfg_all_requires_test(&rest[..index]);
-        }
-    }
-    false
-}
-
-/// An `all(...)` predicate requires tests when any of its factors does.
-fn cfg_all_requires_test(predicate: &str) -> bool {
-    let predicate = predicate.trim();
-    if predicate == "test" {
-        return true;
-    }
-    let Some(open) = predicate.find('(') else {
-        return false;
-    };
-    if predicate[..open].trim() != "all" || !predicate.ends_with(')') {
-        return false;
-    }
-    split_cfg_args(&predicate[open + 1..predicate.len() - 1])
-        .into_iter()
-        .any(cfg_all_requires_test)
-}
-
-/// Split cfg-function arguments while preserving nested cfg expressions.
-fn split_cfg_args(args: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut depth = 0_i32;
-    for (index, ch) in args.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
-                let part = args[start..index].trim();
-                if !part.is_empty() {
-                    parts.push(part);
-                }
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    let part = args[start..].trim();
-    if !part.is_empty() {
-        parts.push(part);
-    }
-    parts
 }
 
 /// Regression for #1785, write path: an append onto a conversation whose
@@ -881,42 +776,6 @@ fn restore_read_refuses_a_witness_with_no_writer() {
     // Evidence preserved.
     let rec = store.load(&id).unwrap();
     assert_eq!(rec.turns.len(), 1, "refusal must not drop rows");
-}
-
-/// Blank out string literal contents on one line (keeps the quotes), so
-/// brace counting and word matching see only code. Handles `\"` escapes;
-/// deliberately does not handle raw strings or multi-line literals — see the
-/// call site for why that is acceptable for a ratchet.
-fn strip_string_literals(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut in_str = false;
-    let mut escaped = false;
-    for c in line.chars() {
-        if escaped {
-            escaped = false;
-            if in_str {
-                out.push('_');
-            } else {
-                out.push(c);
-            }
-            continue;
-        }
-        match c {
-            '\\' => {
-                escaped = true;
-                if !in_str {
-                    out.push(c);
-                }
-            }
-            '"' => {
-                in_str = !in_str;
-                out.push('"');
-            }
-            _ if in_str => out.push('_'),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 // =========================================================================
