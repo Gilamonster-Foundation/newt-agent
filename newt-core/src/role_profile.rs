@@ -548,10 +548,6 @@ impl NamedPermissionPreset {
     }
 }
 
-/// The fence marker for TOML front-matter (must be on its own line at the very
-/// top of the file).
-const FENCE: &str = "+++";
-
 impl RoleProfile {
     /// Parse a role-profile `.md` file's full text into a [`RoleProfile`].
     ///
@@ -565,7 +561,15 @@ impl RoleProfile {
     /// Returns an error if a front-matter fence is opened but never closed, or
     /// if the front-matter is not valid TOML for the expected shape.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let (front_matter, body) = split_front_matter(text)?;
+        // The envelope grammar moved to `crate::markup` (A1, #1825); role
+        // profiles are its first consumer. Error text preserved verbatim.
+        let split = crate::markup::split_newt_metadata(text).map_err(|e| match e {
+            crate::markup::EnvelopeError::Unclosed => {
+                anyhow::anyhow!("role-profile front-matter opened with `+++` but never closed")
+            }
+            other => anyhow::anyhow!("role-profile front-matter: {other}"),
+        })?;
+        let (front_matter, body) = (split.front_matter, split.body);
         let body = body.trim().to_string();
         let Some(fm_text) = front_matter else {
             // No front-matter: prompt-only, exactly today's persona.
@@ -645,71 +649,6 @@ impl RoleProfile {
             anyhow::bail!("persona `{name}` is empty: {}", path.display());
         }
         Ok(profile)
-    }
-}
-
-/// Split optional `+++`-fenced TOML front-matter from a markdown body.
-///
-/// Returns `(Some(front_matter_text), body)` when a fence is present, or
-/// `(None, whole_text)` otherwise.
-fn split_front_matter(text: &str) -> anyhow::Result<(Option<&str>, &str)> {
-    // Front-matter must be the very first line (allowing a leading BOM /
-    // whitespace-free start). We intentionally do not skip blank lines before
-    // the fence: a leading blank line means "no front-matter".
-    let trimmed_start = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let Some(rest) = trimmed_start.strip_prefix(FENCE) else {
-        return Ok((None, text));
-    };
-    // The opening fence must be its own line: the char right after `+++` must
-    // be a newline (or the string ends).
-    let rest = match rest.strip_prefix('\n') {
-        Some(r) => r,
-        None => match rest.strip_prefix("\r\n") {
-            Some(r) => r,
-            // `+++foo` on the first line is not a fence — treat as body.
-            None if rest.is_empty() => "",
-            None => return Ok((None, text)),
-        },
-    };
-    // Find the closing fence: a line that is exactly `+++`.
-    for (idx, line) in LineOffsets::new(rest) {
-        if line.trim_end_matches(['\r', '\n']).trim() == FENCE {
-            let fm = &rest[..idx];
-            let after = &rest[idx + line.len()..];
-            return Ok((Some(fm), after));
-        }
-    }
-    anyhow::bail!("role-profile front-matter opened with `+++` but never closed")
-}
-
-/// Iterator over `(byte_offset, line_with_terminator)` pairs of a string.
-struct LineOffsets<'a> {
-    rest: &'a str,
-    offset: usize,
-}
-
-impl<'a> LineOffsets<'a> {
-    fn new(s: &'a str) -> Self {
-        Self { rest: s, offset: 0 }
-    }
-}
-
-impl<'a> Iterator for LineOffsets<'a> {
-    type Item = (usize, &'a str);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.rest.is_empty() {
-            return None;
-        }
-        let end = match self.rest.find('\n') {
-            Some(i) => i + 1,
-            None => self.rest.len(),
-        };
-        let line = &self.rest[..end];
-        let start = self.offset;
-        self.offset += end;
-        self.rest = &self.rest[end..];
-        Some((start, line))
     }
 }
 
