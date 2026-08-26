@@ -44,5 +44,6 @@ pub use instance::{
     INSTANCE_SCHEMA_V1,
 };
 pub use response::{
-    AssertionKind, ControlValue, ResponderProvenance, Response, RESPONSE_SCHEMA_V1,
+    AssertionKind, ControlValue, ResponderProvenance, Response, SecretRef, Submission,
+    RESPONSE_SCHEMA_V1,
 };

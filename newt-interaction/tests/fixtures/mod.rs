@@ -5,7 +5,7 @@
 use newt_interaction::{
     AssertionKind, Audience, Control, ControlId, ControlKind, ControlValue, IdempotencyKey,
     InteractionDefinition, InteractionInstance, InteractionKind, Nonce, Provenance,
-    ResponderPolicy, ResponderProvenance, Response, Revision, Scope, SemanticRole,
+    ResponderPolicy, ResponderProvenance, Response, Revision, Scope, SemanticRole, Submission,
     RESPONSE_SCHEMA_V1,
 };
 
@@ -63,9 +63,11 @@ pub fn response(def: &InteractionDefinition, inst: &InteractionInstance) -> Resp
         definition: def.definition_id().unwrap(),
         instance: inst.instance_id().unwrap(),
         revision: Revision::FIRST,
-        values: vec![ControlValue {
+        values: vec![Submission {
             control: ControlId::new("deny").unwrap(),
-            value: "deny".to_string(),
+            value: ControlValue::Choice {
+                option: ControlId::new("deny").unwrap(),
+            },
         }],
         idempotency_key: IdempotencyKey::new("first-try").unwrap(),
         responder: Audience::Web,

@@ -11,14 +11,85 @@ use crate::instance::Audience;
 /// The versioned type tag every response carries.
 pub const RESPONSE_SCHEMA_V1: &str = "newt.interaction.response/v1";
 
-/// One control's submitted value.
+/// A reference to a secret the host holds — never the secret.
+///
+/// A response is durable, content-addressed, and tamper-evident, which is
+/// exactly what makes a secret inside one a permanent disclosure
+/// liability. The record names the sealed value; resolving the handle is
+/// the host's business and requires its own authority (ADR D1: never
+/// persist secret values in markup or logs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ControlValue {
-    /// Which control this answers.
-    pub control: ControlId,
-    /// What was submitted. A secret control's value never reaches a durable
-    /// record; the controller substitutes a handle (ADR D1).
-    pub value: String,
+#[serde(transparent)]
+pub struct SecretRef(String);
+
+impl SecretRef {
+    /// Adopt a handle the host can resolve.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::InvalidId`] when empty — a reference that
+    /// references nothing is not a reference.
+    pub fn new(handle: impl Into<String>) -> Result<Self, ProtocolError> {
+        let handle = handle.into();
+        if handle.is_empty() {
+            return Err(ProtocolError::InvalidId {
+                kind: "secret reference",
+                reason: "must not be empty".to_string(),
+            });
+        }
+        Ok(Self(handle))
+    }
+
+    /// The handle as adopted.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// What was submitted for one control, typed.
+///
+/// Typed at the TYPE rather than at a downstream parser: a `String` here
+/// would make every consumer decide whether `"TRUE"`, `"1"`, and `"yes"`
+/// are the same toggle, which is the per-surface drift the epic exists to
+/// end. Canonicalization lives in the shape, so A3 revalidates rather than
+/// re-parses.
+/// Deliberately NOT `#[non_exhaustive]`, unlike the open vocabularies in
+/// this crate (`InteractionKind`, `SemanticRole`, `Audience`, …). This
+/// variant set is a security boundary: "no variant can carry a secret" is
+/// provable only by an exhaustive match, and `#[non_exhaustive]` would
+/// force every such match to end in a wildcard — after which adding a
+/// plaintext-carrying variant would compile silently everywhere. Adding a
+/// variant here SHOULD break every consumer that reasons about the set.
+/// Every variant is a STRUCT variant: serde's internally-tagged form
+/// cannot represent a newtype variant wrapping a primitive, and the named
+/// field is the clearer thing to freeze into A2.1's vectors anyway
+/// (`{"kind":"toggle","on":true}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ControlValue {
+    /// One of the definition's controls was chosen.
+    Choice {
+        /// Which control. Its charset is enforced at construction, so a
+        /// choice can never carry a sentence.
+        option: ControlId,
+    },
+    /// Free text, as typed.
+    Text {
+        /// The submitted text.
+        text: String,
+    },
+    /// A boolean. Travels as a bool, never as text.
+    Toggle {
+        /// Whether the control is on.
+        on: bool,
+    },
+    /// A secret, BY REFERENCE. There is deliberately no variant that can
+    /// hold plaintext.
+    Secret {
+        /// The handle the host can resolve.
+        reference: SecretRef,
+    },
 }
 
 /// How a responder was authenticated, IDENTIFIED — never the credential
@@ -65,6 +136,15 @@ pub enum AssertionKind {
     Unauthenticated,
 }
 
+/// One control's answer: which control, and the typed value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Submission {
+    /// Which control this answers.
+    pub control: ControlId,
+    /// What was submitted.
+    pub value: ControlValue,
+}
+
 /// A submission bound to the exact offer it answers.
 ///
 /// Binds type, definition, instance, digest, revision, control values,
@@ -83,8 +163,8 @@ pub struct Response {
     pub instance: InstanceId,
     /// The revision the responder saw.
     pub revision: Revision,
-    /// The submitted values.
-    pub values: Vec<ControlValue>,
+    /// The submitted values, each against the control it answers.
+    pub values: Vec<Submission>,
     /// Makes a retry the same submission rather than a second one.
     pub idempotency_key: IdempotencyKey,
     /// Which audience the responder answered from.
