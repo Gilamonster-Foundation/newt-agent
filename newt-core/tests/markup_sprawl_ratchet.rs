@@ -821,6 +821,100 @@ fn a_trailing_comment_on_a_gated_item_does_not_blind_the_file() {
     );
 }
 
+/// **The manifest is parsed as TOML, not scanned for a needle.**
+///
+/// Root discovery is a gate: if it under-reports members, the scan
+/// narrows silently and every absence-style law ("no production caller
+/// does X") passes because nothing was scanned. A hand-rolled reader
+/// scanning for `members = [` and splitting the array by LINES fails on
+/// two shapes cargo accepts:
+///
+/// - the inline form `members = ["a", "b"]`, where the whole array is one
+///   line that does not begin with a quote; and
+/// - a `default-members` key BEFORE `members`, whose name contains the
+///   needle, so the wrong array is read.
+///
+/// Regression (#1824 external review A): against the hand-rolled reader
+/// both fixtures produced ZERO members. Zero is not a loud failure —
+/// `production_roots` still returns `newt-web/src`, so the root list is
+/// non-empty and first_principle's laws would quietly scan one crate.
+#[test]
+fn the_inline_members_form_yields_every_member() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .unwrap();
+    for m in ["alpha", "beta"] {
+        std::fs::create_dir_all(root.path().join(m).join("src")).unwrap();
+    }
+    assert_eq!(
+        production_roots(root.path()),
+        vec![
+            root.path().join("alpha").join("src"),
+            root.path().join("beta").join("src"),
+        ]
+    );
+}
+
+#[test]
+fn default_members_does_not_shadow_the_real_members_list() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[workspace]\ndefault-members = [\"alpha\"]\nmembers = [\n    \"alpha\",\n    \"beta\",\n]\n",
+    )
+    .unwrap();
+    for m in ["alpha", "beta"] {
+        std::fs::create_dir_all(root.path().join(m).join("src")).unwrap();
+    }
+    assert_eq!(
+        production_roots(root.path()).len(),
+        2,
+        "`default-members` contains the substring `members` — reading it \
+         instead of the real list silently narrows the scan"
+    );
+}
+
+/// A globbed member must still expand: a `crates/*` entry that resolves to
+/// nothing is the same invisible gap in a different disguise.
+#[test]
+fn a_globbed_member_expands_against_the_filesystem() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    )
+    .unwrap();
+    for m in ["crates/one", "crates/two"] {
+        std::fs::create_dir_all(root.path().join(m).join("src")).unwrap();
+    }
+    assert_eq!(production_roots(root.path()).len(), 2);
+}
+
+/// The real workspace still yields exactly today's root set — the rewrite
+/// must not move the scope it establishes.
+#[test]
+fn the_real_workspace_root_set_is_unchanged() {
+    let roots = production_roots(&workspace_root());
+    assert_eq!(
+        roots.len(),
+        21,
+        "20 production members + newt-web; a change here rescopes every \
+         law and every baseline"
+    );
+    let names: Vec<String> = roots
+        .iter()
+        .map(|r| rel(&workspace_root(), r))
+        .filter(|r| r.starts_with("tests/"))
+        .collect();
+    assert!(
+        names.is_empty(),
+        "test-support members are not production: {names:?}"
+    );
+}
+
 /// **The walk is scoped to production workspace members.** Walking
 /// "everything under the repo root" swept in crates the workspace
 /// deliberately `exclude`s (newt-mesh, whose `.ask(` is a mesh RPC, not an

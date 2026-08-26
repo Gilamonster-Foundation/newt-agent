@@ -67,70 +67,61 @@ pub fn production_roots(workspace_root: &Path) -> Vec<PathBuf> {
     roots
 }
 
-/// `[workspace] members` entries from `workspace_root/Cargo.toml`, in
-/// declaration order. A trailing `*` segment (`crates/*`) is expanded
-/// against the filesystem so a globbed member cannot become an invisible
-/// scanning gap.
+/// `[workspace] members` from `workspace_root/Cargo.toml`, in declaration
+/// order, with a trailing `*` segment (`crates/*`) expanded against the
+/// filesystem so a globbed member cannot become an invisible scanning gap.
+///
+/// Parsed as TOML rather than scanned for a needle. Root discovery is a
+/// GATE: under-report the members and the scan narrows silently, after
+/// which every absence-style law ("no production caller does X") passes
+/// because nothing was scanned. A needle scan gets that wrong on shapes
+/// cargo accepts — the inline `members = ["a", "b"]` array, and a
+/// `default-members` key whose name contains the needle — and each returns
+/// an empty list rather than an error, which `production_roots` then
+/// papers over with `newt-web/src` alone. An unreadable or `[workspace]`-less
+/// manifest yields nothing, which `roots_for` and the ratchet's
+/// `every_baselined_path_is_inside_a_production_root` turn into a loud
+/// failure.
 fn workspace_members(workspace_root: &Path) -> Vec<String> {
     let Ok(manifest) = std::fs::read_to_string(workspace_root.join("Cargo.toml")) else {
         return Vec::new();
     };
-    // Tolerate the spellings a toml formatter produces: `members = [`,
-    // `members=[`, or a newline before the array. A parse miss is not
-    // silent — `roots_for` and the ratchet's self-check turn an empty root
-    // list into a loud failure — but a spurious hard failure on a
-    // legitimate reformat is worth avoiding.
-    let Some(rest) = members_array(&manifest) else {
+    // `from_str::<Table>`, not `parse::<Value>()`: in toml 1.0 the latter
+    // reads a single VALUE, so a whole document fails at column 12 of
+    // `[workspace]` and every member silently disappears.
+    let Ok(parsed) = toml::from_str::<toml::Table>(&manifest) else {
         return Vec::new();
     };
-    let Some(end) = rest.find(']') else {
+    let Some(declared) = parsed
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(toml::Value::as_array)
+    else {
         return Vec::new();
     };
     let mut members = Vec::new();
-    for line in rest[..end].lines() {
-        let line = line.trim().trim_end_matches(',').trim();
-        let Some(member) = line.strip_prefix('"').and_then(|m| m.strip_suffix('"')) else {
+    for entry in declared {
+        let Some(member) = entry.as_str() else {
             continue;
         };
         match member.strip_suffix("/*") {
             Some(parent) => {
+                let mut expanded = Vec::new();
                 if let Ok(entries) = std::fs::read_dir(workspace_root.join(parent)) {
                     for entry in entries.flatten() {
                         if entry.path().is_dir() {
-                            members
+                            expanded
                                 .push(format!("{parent}/{}", entry.file_name().to_string_lossy()));
                         }
                     }
                 }
+                expanded.sort();
+                members.extend(expanded);
             }
             None => members.push(member.to_string()),
         }
     }
     members
-}
-
-/// Visit every production line of every Rust file under `roots` (see
-/// [`production_roots`]), as `visit(path, code, raw)` where `code` is the
-/// line with string-literal contents blanked and its trailing line comment
-/// removed, and `raw` is the original line. Doc/line comments and
-/// `#[cfg(test)]`-gated regions are not visited. `skip_file` lets a consumer
-/// add its own file-level exclusions.
-/// The `[workspace] members` array text, from its opening `[`, regardless
-/// of whitespace around the `=`.
-fn members_array(manifest: &str) -> Option<&str> {
-    let mut from = 0;
-    while let Some(i) = manifest[from..].find("members") {
-        let at = from + i;
-        let rest = manifest[at + "members".len()..].trim_start();
-        if let Some(array) = rest.strip_prefix('=') {
-            let array = array.trim_start();
-            if array.starts_with('[') {
-                return Some(array);
-            }
-        }
-        from = at + "members".len();
-    }
-    None
 }
 
 /// Every `.rs` file under `roots`, minus build output, hidden directories,
