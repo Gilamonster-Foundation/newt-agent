@@ -573,6 +573,37 @@ fn the_ratchet_scans_the_real_workspace() {
     );
 }
 
+/// **A needle inside a trailing comment is not a site.** Truncating
+/// trailing line comments is a semantic tightening of the shared scanner
+/// (it also governs first_principle's caller law), and it points the
+/// dangerous way for an EXACT-count ratchet: because a comment is not a
+/// hit, a comment can no longer SUBSTITUTE for a deleted real site and
+/// hold a baseline steady while the site disappears. Pinned rather than
+/// left to the commit message.
+#[test]
+fn a_needle_in_a_trailing_comment_is_not_a_site() {
+    let root = tempfile::tempdir().unwrap();
+    let src = root.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "fn f() { g(); } // like Parser::new_ext(a, b) but not\n\
+         // Parser::new_ext(c, d) in a whole-line comment either\n\
+         fn real() { let p = Parser::new_ext(e, f); }\n",
+    )
+    .unwrap();
+
+    let mut hits = 0;
+    for_each_production_line(
+        &[root.path().to_path_buf()],
+        &no_extra_skips,
+        &mut |_, code, _| {
+            hits += code.matches("Parser::new_ext(").count();
+        },
+    );
+    assert_eq!(hits, 1, "only the real call is a site");
+}
+
 /// **A quote inside a char literal must not open a string.**
 /// `strip_string_literals` blanks string contents so a needle in an error
 /// message cannot satisfy a law. It treated the `"` in the char literal
