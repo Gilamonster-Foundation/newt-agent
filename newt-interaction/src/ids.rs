@@ -22,8 +22,16 @@ macro_rules! content_id_newtype {
 
         impl $name {
             /// Wrap an id already minted from the record it names.
+            ///
+            /// Crate-private on purpose: a public constructor would let any
+            /// `ContentId` be DECLARED a definition id, which is the
+            /// assigned-identity failure the whole crate exists to avoid.
+            /// Records mint their own typed ids; the sanctioned ways in from
+            /// outside are [`parse`](Self::parse), which refuses a
+            /// non-canonical spelling, and serde at a wire boundary — after
+            /// which A3 revalidates against the record anyway.
             #[must_use]
-            pub fn from_content_id(id: ContentId) -> Self {
+            pub(crate) fn from_content_id(id: ContentId) -> Self {
                 Self(id)
             }
 
