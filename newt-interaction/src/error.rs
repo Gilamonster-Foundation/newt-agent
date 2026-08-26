@@ -23,6 +23,27 @@ pub enum ProtocolError {
         /// Why it was rejected.
         reason: String,
     },
+    /// A REQUIRED surface feature could not be met — either this build
+    /// does not recognize it, or the surface lacks it. Both are the same
+    /// fact to an operator: the document cannot be shown faithfully.
+    #[error(
+        "cannot present this interaction: it requires `{feature}`{}",
+        if *known { ", which this surface does not provide" }
+        else { ", which this build does not recognize" }
+    )]
+    UnsupportedFeature {
+        /// The feature name, verbatim as the document wrote it.
+        feature: String,
+        /// Whether this build recognizes the name at all.
+        known: bool,
+    },
+    /// The bytes are not a readable record. Corruption is a different fact
+    /// from a version we do not know, and is reported differently.
+    #[error("malformed record: {reason}")]
+    Malformed {
+        /// What could not be read.
+        reason: String,
+    },
     /// A record declared a schema tag this build does not know. Unknown
     /// REQUIRED behavior fails closed (ADR law 5).
     #[error("unknown schema tag `{tag}` for {expected}")]

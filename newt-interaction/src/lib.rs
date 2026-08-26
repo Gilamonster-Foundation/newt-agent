@@ -28,6 +28,7 @@
 //! This file is a manifest: composition only, no logic.
 
 pub mod definition;
+pub mod downgrade;
 pub mod error;
 pub mod ids;
 pub mod instance;
@@ -36,6 +37,9 @@ pub mod response;
 pub use definition::{
     Control, ControlKind, FeatureDemand, InteractionDefinition, InteractionKind, Requirement,
     SemanticRole, SurfaceFeature, DEFINITION_SCHEMA_V1,
+};
+pub use downgrade::{
+    decode_definition, plan_presentation, Decoded, Degradation, Presentation, RawRecord,
 };
 pub use error::ProtocolError;
 pub use ids::{ControlId, DefinitionId, IdempotencyKey, InstanceId, Nonce, ResponseId, Revision};

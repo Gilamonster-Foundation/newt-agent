@@ -1,3 +1,7 @@
+//! Shared fixtures — each test binary includes the whole module and uses
+//! the part it needs, so some are unused per binary.
+#![allow(dead_code)]
+
 //! Shared fixtures: one definition, one offer of it, one response to that
 //! offer. Deliberately plain values so a failing identity assertion points
 //! at the encoding, not at the fixture.
