@@ -448,6 +448,49 @@ fn the_ratchet_scans_the_real_workspace() {
     );
 }
 
+/// **A trailing comment on a gated brace-less item must not blind the rest
+/// of the file.** `#[cfg(test)] mod x;` is skipped by a pending-attribute
+/// latch that clears at the item's semicolon. Truncating trailing line
+/// comments (added so a needle inside a comment is not a hit) leaves the
+/// whitespace that preceded the `//`, so `mod tests; // out of line` ends
+/// with a SPACE, the latch never clears, and every later line in the file
+/// goes invisible — the exact blindness the brace tracker was built to fix.
+///
+/// Consequence if it regresses: production sites silently vanish from the
+/// counts, the ratchet reports "Progress! Ratchet down", and someone
+/// lowers a baseline that should not move — after which the next real
+/// duplicate lands green.
+///
+/// Regression (#1823 review A0-2): against the untrimmed check this failed
+/// with `production lines after a gated item are invisible: []`.
+#[test]
+fn a_trailing_comment_on_a_gated_item_does_not_blind_the_file() {
+    let root = tempfile::tempdir().unwrap();
+    let src = root.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "#[cfg(test)]\nmod tests; // declared out of line\n\nfn real() { Parser::new_ext(s, o); }\n",
+    )
+    .unwrap();
+
+    let mut visited = Vec::new();
+    for_each_production_line(
+        &[root.path().to_path_buf()],
+        &parent_gated_test_file,
+        &mut |_, code, _| {
+            if code.contains("Parser::new") {
+                visited.push(code.to_string());
+            }
+        },
+    );
+    assert_eq!(
+        visited.len(),
+        1,
+        "production lines after a gated item are invisible: {visited:?}"
+    );
+}
+
 /// **The walk is scoped to production workspace members.** Walking
 /// "everything under the repo root" swept in crates the workspace
 /// deliberately `exclude`s (newt-mesh, whose `.ask(` is a mesh RPC, not an

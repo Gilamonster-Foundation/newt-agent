@@ -192,12 +192,16 @@ pub fn for_each_production_line(
                     if pending_test_attr {
                         if opens > 0 {
                             pending_test_attr = false;
-                        } else if ctrim.ends_with(';') {
+                        } else if ctrim.trim_end().ends_with(';') {
                             // A brace-less gated item (`#[cfg(test)] use …;`,
                             // `mod x;`) ends at its semicolon. Without this
                             // the pending flag latches forever and everything
                             // after it in the file goes invisible — the same
                             // blindness the brace tracker was built to fix.
+                            // `trim_end` because truncating a trailing line
+                            // comment leaves the space that preceded the
+                            // `//`: `mod tests; // out of line` must still
+                            // read as terminated.
                             pending_test_attr = false;
                             continue;
                         }
