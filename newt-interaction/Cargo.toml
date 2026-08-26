@@ -1,0 +1,27 @@
+[package]
+name = "newt-interaction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Renderer-neutral interaction protocol model for Newt Markup (epic #1803, slice A2)"
+publish = false
+
+# DEPENDENCY DIRECTION IS BINDING (epic #1803, A2's dependency guard).
+# This crate is the INWARD layer: no Ratatui, crossterm, Axum, HTMX, ammonia,
+# browser, mobile, filesystem, or application dependency — and no `newt-*`
+# crate. `newt-core` depends on THIS; never the reverse. The rule is not a
+# comment: `tests/guard.rs` walks the resolved dependency closure and the
+# crate's own source, and both halves carry an anti-vacuous twin.
+[dependencies]
+content-addressable.workspace = true
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+# Dev-dependencies do not ship and are excluded from the closure guard by
+# dependency kind, not by name — see tests/guard.rs.
+serde_json.workspace = true
+toml.workspace = true
