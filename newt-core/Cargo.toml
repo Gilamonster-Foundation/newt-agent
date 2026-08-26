@@ -1,6 +1,17 @@
 [package]
 name = "newt-core"
 version.workspace = true
+# Cross-crate test suites do not ship. `markup_sprawl_ratchet` and the
+# scanner in `tests/common` read sibling crates (newt-tui, newt-cli,
+# newt-eval, newt-web) through the workspace manifest, so they fail
+# deterministically anywhere newt-core is not sitting in this monorepo —
+# an extracted package, a vendored copy, a `cargo test` on the published
+# tarball. Excluding them keeps the package self-contained (#1823 A0-9).
+exclude = [
+    "tests/markup_sprawl_ratchet.rs",
+    "tests/first_principle.rs",
+    "tests/common",
+]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
