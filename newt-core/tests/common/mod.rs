@@ -9,9 +9,18 @@
 //! reuse discipline forbids duplicating.
 //!
 //! Scope and honesty notes shared by every consumer:
-//! - Only crate `src/` trees are visited; `tests/`, `benches/`, build output,
-//!   `docs/`, and every hidden directory (`.git/`, `.claude/`, and this
-//!   repo's gitignored `.worktrees/` scratch checkouts) are skipped.
+//! - The walk is scoped to PRODUCTION workspace members: `<member>/src` for
+//!   every `[workspace] members` entry, minus the `tests/*` support crates,
+//!   plus `newt-web/src` (workspace-`exclude`d but a real production surface
+//!   this repo's ratchets baseline). Nothing else is visited — not
+//!   workspace-`exclude`d crates such as `newt-mesh`, not a nested worktree,
+//!   not a stray checkout. Scoping by MANIFEST rather than by "everything
+//!   under the repo root, minus a skip list" is what keeps a developer's
+//!   machine agreeing with CI.
+//! - Within a root, build output and hidden directories are still skipped —
+//!   `target/` for the former, and hidden-by-name for `.git/`, `.claude/`,
+//!   and this repo's gitignored `.worktrees/` scratch checkouts
+//!   (`.gitignore:107`), which really do carry full `src` trees.
 //! - Lines inside `#[cfg(test)]`-gated items are skipped by brace depth — a
 //!   simple "saw the attribute, skip the rest of the file" latch would blind
 //!   the scanner to production code after an early inline test seam.
@@ -31,17 +40,83 @@ pub fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Visit every production line of every crate `src/` Rust file under
-/// `workspace_root`, as `visit(path, code, raw)` where `code` is the line
-/// with string-literal contents blanked and `raw` is the original line.
-/// Doc/line comments and `#[cfg(test)]`-gated regions are not visited.
-/// `skip_file` lets a consumer add its own file-level exclusions.
+/// The production source roots of the workspace rooted at `workspace_root`:
+/// `<member>/src` for each `[workspace] members` entry, minus the `tests/*`
+/// support crates (whose `src/` is test scaffolding, not product code), plus
+/// `newt-web/src` — workspace-`exclude`d because it carries its own
+/// lockfile, but a production surface this repo's ratchets baseline.
+///
+/// A member that does not exist on disk is silently dropped; the consumer's
+/// own self-check (every baselined path must fall under some root) is what
+/// turns a scoping mistake into a loud failure rather than a silent gap.
+pub fn production_roots(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = workspace_members(workspace_root)
+        .into_iter()
+        // `tests/common` and `tests/pty` are workspace MEMBERS, so a filter
+        // like "is any path component `src`?" happily calls their scaffolding
+        // production code. Membership is not production-ness.
+        .filter(|m| !m.starts_with("tests/"))
+        .map(|m| workspace_root.join(m).join("src"))
+        .filter(|p| p.is_dir())
+        .collect();
+    let web = workspace_root.join("newt-web").join("src");
+    if web.is_dir() {
+        roots.push(web);
+    }
+    roots.sort();
+    roots
+}
+
+/// `[workspace] members` entries from `workspace_root/Cargo.toml`, in
+/// declaration order. A trailing `*` segment (`crates/*`) is expanded
+/// against the filesystem so a globbed member cannot become an invisible
+/// scanning gap.
+fn workspace_members(workspace_root: &Path) -> Vec<String> {
+    let Ok(manifest) = std::fs::read_to_string(workspace_root.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let Some(start) = manifest.find("members = [") else {
+        return Vec::new();
+    };
+    let rest = &manifest[start..];
+    let Some(end) = rest.find(']') else {
+        return Vec::new();
+    };
+    let mut members = Vec::new();
+    for line in rest[..end].lines() {
+        let line = line.trim().trim_end_matches(',').trim();
+        let Some(member) = line.strip_prefix('"').and_then(|m| m.strip_suffix('"')) else {
+            continue;
+        };
+        match member.strip_suffix("/*") {
+            Some(parent) => {
+                if let Ok(entries) = std::fs::read_dir(workspace_root.join(parent)) {
+                    for entry in entries.flatten() {
+                        if entry.path().is_dir() {
+                            members
+                                .push(format!("{parent}/{}", entry.file_name().to_string_lossy()));
+                        }
+                    }
+                }
+            }
+            None => members.push(member.to_string()),
+        }
+    }
+    members
+}
+
+/// Visit every production line of every Rust file under `roots` (see
+/// [`production_roots`]), as `visit(path, code, raw)` where `code` is the
+/// line with string-literal contents blanked and its trailing line comment
+/// removed, and `raw` is the original line. Doc/line comments and
+/// `#[cfg(test)]`-gated regions are not visited. `skip_file` lets a consumer
+/// add its own file-level exclusions.
 pub fn for_each_production_line(
-    workspace_root: &Path,
+    roots: &[PathBuf],
     skip_file: &dyn Fn(&Path) -> bool,
     visit: &mut dyn FnMut(&Path, &str, &str),
 ) {
-    let mut stack = vec![workspace_root.to_path_buf()];
+    let mut stack: Vec<PathBuf> = roots.to_vec();
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -51,14 +126,15 @@ pub fn for_each_production_line(
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if path.is_dir() {
-                // Skip build output, docs, and every HIDDEN directory — a hit
-                // inside `target/`, `.git/`, `.claude/worktrees/`, or this
-                // repo's own `.worktrees/` scratch convention
-                // (`.gitignore:107`) is not this build's code. Hidden-by-name
-                // rather than an enumerated list: the main checkout really
-                // does carry full `src` trees under `.worktrees/`, and an
-                // enumeration is always one convention behind.
-                if name.starts_with('.') || matches!(name.as_ref(), "target" | "docs") {
+                // Skip build output and every HIDDEN directory — a hit inside
+                // `target/`, `.git/`, `.claude/worktrees/`, or this repo's own
+                // `.worktrees/` scratch convention (`.gitignore:107`) is not
+                // this build's code. Hidden-by-name rather than an enumerated
+                // list: the main checkout really does carry full `src` trees
+                // under `.worktrees/`, and an enumeration is always one
+                // convention behind. (No `docs` skip: the roots are now
+                // `<member>/src`, where a `docs` module would be real code.)
+                if name.starts_with('.') || name == "target" {
                     continue;
                 }
                 stack.push(path);
@@ -74,11 +150,6 @@ pub fn for_each_production_line(
                 continue;
             }
             if skip_file(&path) {
-                continue;
-            }
-            // Only production sources: a hit in tests/ or benches/ is not a
-            // production path.
-            if !path.components().any(|c| c.as_os_str() == "src") {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&path) else {

@@ -41,7 +41,7 @@
 use newt_core::{ConversationStore, PhantomReach, PhantomResolution};
 
 mod common;
-use common::{cfg_is_test_only, for_each_production_line};
+use common::{cfg_is_test_only, for_each_production_line, production_roots};
 
 /// Number of laws in this file currently marked as violations. This may only
 /// go DOWN, and only in a change that also removes the corresponding
@@ -403,10 +403,23 @@ fn production_callers_of(names: &[&str]) -> Vec<String> {
     production_callers_of_in(&common::workspace_root(), names)
 }
 
+/// The roots a law scans. Scoped to production workspace members (plus
+/// newt-web) — see `common::production_roots`. A tempdir fixture with no
+/// workspace manifest falls back to `<root>/src`, which is the shape the
+/// scanner self-test builds.
+fn roots_for(workspace_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let roots = production_roots(workspace_root);
+    if roots.is_empty() {
+        vec![workspace_root.join("src")]
+    } else {
+        roots
+    }
+}
+
 fn production_callers_of_in(workspace_root: &std::path::Path, names: &[&str]) -> Vec<String> {
     let mut found = Vec::new();
     for_each_production_line(
-        workspace_root,
+        &roots_for(workspace_root),
         // agentic/artifact_read.rs defines a PRIVATE fn of the same name —
         // the session-local artifact ledger's verifier (the one that was
         // already wired correctly). Counting its `self.verify_chain(..)`

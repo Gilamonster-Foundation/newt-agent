@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 mod common;
-use common::{for_each_production_line, workspace_root};
+use common::{for_each_production_line, production_roots, workspace_root};
 
 /// In-src test modules reached through a parent-side `#[cfg(test)] mod x;`
 /// declaration (repo convention: `*_test.rs`). The child file carries no cfg
@@ -167,14 +167,18 @@ const CATEGORIES: &[Category] = &[
 fn production_counts() -> BTreeMap<(&'static str, String), usize> {
     let root = workspace_root();
     let mut counts: BTreeMap<(&'static str, String), usize> = BTreeMap::new();
-    for_each_production_line(&root, &parent_gated_test_file, &mut |path, code, _raw| {
-        let ctrim = code.trim_start();
-        for cat in CATEGORIES {
-            if (cat.matches)(code, ctrim) {
-                *counts.entry((cat.name, rel(&root, path))).or_default() += 1;
+    for_each_production_line(
+        &production_roots(&root),
+        &parent_gated_test_file,
+        &mut |path, code, _raw| {
+            let ctrim = code.trim_start();
+            for cat in CATEGORIES {
+                if (cat.matches)(code, ctrim) {
+                    *counts.entry((cat.name, rel(&root, path))).or_default() += 1;
+                }
             }
-        }
-    });
+        },
+    );
     counts
 }
 
@@ -242,16 +246,20 @@ fn prompt_surface_stays_confined_to_its_three_branches() {
     let root = workspace_root();
     let mut files: BTreeMap<String, usize> = BTreeMap::new();
     let mut branches = 0usize;
-    for_each_production_line(&root, &parent_gated_test_file, &mut |path, code, _| {
-        if code.contains("PromptSurface") {
-            *files.entry(rel(&root, path)).or_default() += 1;
-        }
-        if rel(&root, path) == "newt-tui/src/permissions.rs"
-            && (code.contains("matches!(surface,") || code.contains("match (tier, surface)"))
-        {
-            branches += 1;
-        }
-    });
+    for_each_production_line(
+        &production_roots(&root),
+        &parent_gated_test_file,
+        &mut |path, code, _| {
+            if code.contains("PromptSurface") {
+                *files.entry(rel(&root, path)).or_default() += 1;
+            }
+            if rel(&root, path) == "newt-tui/src/permissions.rs"
+                && (code.contains("matches!(surface,") || code.contains("match (tier, surface)"))
+            {
+                branches += 1;
+            }
+        },
+    );
     assert_eq!(
         files.keys().collect::<Vec<_>>(),
         vec!["newt-tui/src/permissions.rs"],
@@ -299,17 +307,21 @@ fn action_model_registry_is_exact() {
     let mut names: Vec<&'static str> = REGISTRY.iter().map(|(_, n, _)| *n).collect();
     names.sort_unstable();
     names.dedup();
-    for_each_production_line(&root, &parent_gated_test_file, &mut |path, code, _| {
-        for name in &names {
-            let needle = format!("enum {name}");
-            if let Some(at) = code.find(&needle) {
-                let after = code[at + needle.len()..].chars().next();
-                if matches!(after, None | Some(' ') | Some('<') | Some('{')) {
-                    *defs.entry((rel(&root, path), *name)).or_default() += 1;
+    for_each_production_line(
+        &production_roots(&root),
+        &parent_gated_test_file,
+        &mut |path, code, _| {
+            for name in &names {
+                let needle = format!("enum {name}");
+                if let Some(at) = code.find(&needle) {
+                    let after = code[at + needle.len()..].chars().next();
+                    if matches!(after, None | Some(' ') | Some('<') | Some('{')) {
+                        *defs.entry((rel(&root, path), *name)).or_default() += 1;
+                    }
                 }
             }
-        }
-    });
+        },
+    );
     let mut problems = Vec::new();
     for (file, name, expected) in REGISTRY {
         let n = defs.remove(&((*file).to_string(), *name)).unwrap_or(0);
@@ -381,17 +393,49 @@ fn frozen_wire_shapes_are_unchanged() {
 
 /// The scanner scans real code — a walker that visits nothing reports
 /// success forever.
+/// Every baselined path must actually fall under a production root. A
+/// scoping mistake (a member dropped from the manifest, a rename, a crate
+/// moved out of the workspace) would otherwise turn into a SILENT gap: the
+/// file stops being scanned, its count reads 0, and the down-only ratchet
+/// invites someone to delete the row as "progress".
+#[test]
+fn every_baselined_path_is_inside_a_production_root() {
+    let root = workspace_root();
+    let roots = production_roots(&root);
+    assert!(!roots.is_empty(), "the workspace manifest yielded no roots");
+    let mut missing = Vec::new();
+    let baselined = CATEGORIES
+        .iter()
+        .flat_map(|c| c.baseline.iter().map(|(p, _)| *p))
+        .chain(["newt-tui/src/permissions.rs"]);
+    for rel_path in baselined {
+        let abs = root.join(rel_path);
+        if !roots.iter().any(|r| abs.starts_with(r)) {
+            missing.push(rel_path.to_string());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "baselined paths outside every production root (they would silently \
+         read as zero): {missing:?}"
+    );
+}
+
 #[test]
 fn the_ratchet_scans_the_real_workspace() {
     let root = workspace_root();
     let mut files = std::collections::BTreeSet::new();
     let mut saw_anchor = false;
-    for_each_production_line(&root, &parent_gated_test_file, &mut |path, code, _| {
-        files.insert(path.to_path_buf());
-        if code.contains("fn permission_question_for") {
-            saw_anchor = true;
-        }
-    });
+    for_each_production_line(
+        &production_roots(&root),
+        &parent_gated_test_file,
+        &mut |path, code, _| {
+            files.insert(path.to_path_buf());
+            if code.contains("fn permission_question_for") {
+                saw_anchor = true;
+            }
+        },
+    );
     assert!(
         files.len() > 100,
         "scanner visited only {} files — the walk is broken",
@@ -401,6 +445,64 @@ fn the_ratchet_scans_the_real_workspace() {
         saw_anchor,
         "scanner never saw permission_question_for in newt-tui — production \
          lines are not being visited"
+    );
+}
+
+/// **The walk is scoped to production workspace members.** Walking
+/// "everything under the repo root" swept in crates the workspace
+/// deliberately `exclude`s (newt-mesh, whose `.ask(` is a mesh RPC, not an
+/// interactive prompt), the `tests/common` and `tests/pty` support crates
+/// (whose `src/` passes any "is it under src?" filter), and anything else a
+/// checkout happens to nest. Every one of those is a NEW-site false positive
+/// that fails on a developer's machine and cannot be reproduced from CI.
+///
+/// Regression (#1823 review A0-1/A0-8): against the old walker — which took
+/// one root and filtered by "any path component is `src`" — this failed with
+/// four visited files instead of one, including `tests/common/src/lib.rs`
+/// and the excluded crate.
+#[test]
+fn the_walk_is_scoped_to_production_workspace_members() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\n    \"alpha\",\n    \"tests/common\",\n]\nexclude = [\"excluded\"]\n",
+    )
+    .unwrap();
+    let needle = "let parser = Parser::new_ext(src, opts);\n";
+    for rel in [
+        "alpha/src",        // a production member — the only one in scope
+        "tests/common/src", // a test-support MEMBER: not production
+        "excluded/src",     // workspace-excluded crate
+        "stray/src",        // not a member at all
+    ] {
+        let dir = root.path().join(rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.rs"), needle).unwrap();
+    }
+
+    let scan = |roots: &[std::path::PathBuf]| {
+        let mut seen = Vec::new();
+        for_each_production_line(roots, &parent_gated_test_file, &mut |path, code, _| {
+            if code.contains("Parser::new") {
+                seen.push(rel(root.path(), path));
+            }
+        });
+        seen.sort();
+        seen
+    };
+
+    // The shape this test exists to prevent, made visible: rooting the walk
+    // at the repo directory sweeps in all four trees.
+    assert_eq!(
+        scan(&[root.path().to_path_buf()]).len(),
+        4,
+        "an unscoped walk sees every nested tree — the pre-fix behavior"
+    );
+    // Scoped by manifest: exactly the production member.
+    assert_eq!(
+        scan(&production_roots(root.path())),
+        vec!["alpha/src/lib.rs".to_string()],
+        "only production workspace members are in scope"
     );
 }
 
@@ -434,8 +536,10 @@ fn the_walker_never_descends_into_hidden_directories() {
     std::fs::write(hidden.join("lib.rs"), needle).unwrap();
 
     let mut visited = Vec::new();
+    // Root the walk AT the tempdir so the hidden-dir rule is what is under
+    // test here, not the workspace scoping (covered by its own test).
     for_each_production_line(
-        root.path(),
+        &[root.path().to_path_buf()],
         &parent_gated_test_file,
         &mut |path, code, _| {
             if code.contains("Parser::new") {
