@@ -903,9 +903,11 @@ fn the_real_workspace_root_set_is_unchanged() {
     let roots = production_roots(&workspace_root());
     assert_eq!(
         roots.len(),
-        21,
-        "20 production members + newt-web; a change here rescopes every \
-         law and every baseline"
+        22,
+        "21 production members + newt-web; a change here rescopes every \
+         law and every baseline. Moved 21 -> 22 by #1828 A2.0, which adds \
+         the `newt-interaction` protocol crate — the ratchet noticing a new \
+         member is this assertion working, not breaking"
     );
     let names: Vec<String> = roots
         .iter()
