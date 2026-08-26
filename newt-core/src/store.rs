@@ -7222,4 +7222,63 @@ mod tests {
             .to_ascii_lowercase()
             .contains("primary key (id, workspace_key)"));
     }
+
+    /// A0 freeze (#1823): `Verdict::from_db_str` is deliberately LENIENT — an
+    /// unknown persisted verdict string becomes `None`, never an error, and
+    /// the DB vocabulary is closed. (The end-to-end consequence is pinned
+    /// separately by `an_unknown_persisted_verdict_is_silently_consumed`.)
+    #[test]
+    fn unknown_persisted_verdict_string_reads_as_none_not_error() {
+        assert_eq!(Verdict::from_db_str("garbage"), None);
+        assert_eq!(Verdict::from_db_str(""), None);
+        // Wire strings round-trip exactly; the DB vocabulary is closed.
+        for v in [Verdict::AllowOnce, Verdict::AllowSession, Verdict::Deny] {
+            assert_eq!(Verdict::from_db_str(v.as_db_str()), Some(v));
+        }
+    }
+
+    /// A0 freeze (#1823), the end-to-end half: an unknown verdict string that
+    /// somehow reaches the `permission_requests` table is silently CONSUMED by
+    /// `take_permission_decision` — the row is marked resolved inside the same
+    /// transaction, the verdict is lost, and the caller sees `Ok(None)` as if
+    /// no answer existed. The A0 inventory records this as an unremarked
+    /// lenient read path; a migration slice that tightens it (error instead,
+    /// or leave the row unresolved) must list the change deliberately.
+    #[test]
+    fn an_unknown_persisted_verdict_is_silently_consumed() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+        let conv = store.create("session", None).unwrap();
+        let r1 = store
+            .publish_permission_request(&conv, r#"[{"tool":"run_command"}]"#, r#"["low"]"#)
+            .unwrap();
+
+        // Corrupt the persisted verdict the way only a foreign writer or a
+        // future vocabulary change could — the public API cannot write this.
+        store
+            .lock_conn()
+            .execute(
+                "UPDATE permission_requests SET verdict = 'garbage', answered_by = 'web'
+                  WHERE request_id = ?1",
+                [&r1],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.take_permission_decision(&conv, &r1).unwrap(),
+            None,
+            "an unknown verdict string reads as no-decision, not an error"
+        );
+        // ...and the row was consumed by that read: nothing is pending and a
+        // late web answer finds it already resolved.
+        assert_eq!(store.pending_permission_request(&conv).unwrap(), None);
+        assert_eq!(
+            store
+                .answer_permission_request(&conv, &r1, Verdict::Deny)
+                .unwrap(),
+            AnswerOutcome::AlreadyResolved,
+            "the silent consume resolved the row"
+        );
+    }
 }

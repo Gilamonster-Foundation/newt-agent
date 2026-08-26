@@ -79,6 +79,21 @@ impl Drop for RawGuard {
     }
 }
 
+/// Classify one submitted headless line (the piped/non-TTY branch, after its
+/// EOF check): a line that is exactly the literal ESC byte is the piped
+/// stand-in for the Back control; anything else — including an empty
+/// submission — is an answer, with the trailing newline family trimmed. Pure
+/// so the piped convention is testable without a terminal or a stdin read
+/// (#1823 A0 freeze; the Ok(0) => Eof arm above it stays in the caller).
+fn classify_headless_prompt_line(line: &str) -> PromptLine {
+    let line = line.trim_end_matches(['\r', '\n']);
+    if line == "\u{1b}" {
+        PromptLine::Back
+    } else {
+        PromptLine::Line(line.into())
+    }
+}
+
 /// Read a line while `window` exclusively owns the terminal.
 pub fn read_prompt_window_line(window: &PromptWindow, prompt: &str) -> io::Result<PromptLine> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -87,12 +102,7 @@ pub fn read_prompt_window_line(window: &PromptWindow, prompt: &str) -> io::Resul
         if window.read_line_into(&mut line)? == 0 {
             return Ok(PromptLine::Eof);
         }
-        let line = line.trim_end_matches(['\r', '\n']);
-        return Ok(if line == "\u{1b}" {
-            PromptLine::Back
-        } else {
-            PromptLine::Line(line.into())
-        });
+        return Ok(classify_headless_prompt_line(&line));
     }
 
     let result = {
@@ -314,5 +324,58 @@ mod raw_guard_tests {
             "prior mode restored on drop"
         );
         let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// A0 freeze (#1823): the piped/headless prompt-line convention, pinned. The
+/// deliberately different terminal path (key-by-key with prompt_control) has
+/// its own weekly PTY tier; THIS is the contract `newt solve`-when-piped and
+/// the eval harness rely on.
+///
+/// Boundary of this pin: these tests exercise the pure classifier directly;
+/// the guard that `read_prompt_window_line`'s non-TTY branch still CALLS it
+/// is the dead-code lint under the zero-warnings gate (the fn's only
+/// production caller is that branch). The C0/C1 slice that reworks the
+/// branch inherits responsibility for re-pinning the wiring.
+#[cfg(test)]
+mod headless_line_tests {
+    use super::*;
+
+    #[test]
+    fn a_literal_esc_line_is_the_piped_back_control() {
+        assert_eq!(classify_headless_prompt_line("\u{1b}\n"), PromptLine::Back);
+        assert_eq!(classify_headless_prompt_line("\u{1b}"), PromptLine::Back);
+    }
+
+    #[test]
+    fn an_answer_keeps_its_content_and_loses_only_the_newline_family() {
+        assert_eq!(
+            classify_headless_prompt_line("qwen2.5-coder:7b\r\n"),
+            PromptLine::Line("qwen2.5-coder:7b".into())
+        );
+        // Interior whitespace is the answer's own business.
+        assert_eq!(
+            classify_headless_prompt_line("  padded  \n"),
+            PromptLine::Line("  padded  ".into())
+        );
+    }
+
+    #[test]
+    fn an_explicitly_empty_submission_is_an_empty_answer_not_a_control() {
+        // EOF (Ok(0)) is classified UPSTREAM as PromptLine::Eof; an empty line
+        // that WAS submitted stays an answer — the distinction
+        // request_user_input's typed outcomes depend on.
+        assert_eq!(
+            classify_headless_prompt_line("\n"),
+            PromptLine::Line(String::new())
+        );
+    }
+
+    #[test]
+    fn esc_with_trailing_content_is_an_answer_not_back() {
+        assert_eq!(
+            classify_headless_prompt_line("\u{1b}[A\n"),
+            PromptLine::Line("\u{1b}[A".into())
+        );
     }
 }
