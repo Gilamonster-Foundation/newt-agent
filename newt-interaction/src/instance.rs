@@ -29,6 +29,7 @@ pub const INSTANCE_SCHEMA_V1: &str = "newt.interaction.instance/v1";
 /// content-addressed record would make that id name a snapshot — a
 /// Published X would become an Answered Y, and a response that bound X
 /// would refer to nothing the store still holds.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -49,6 +50,7 @@ pub enum LifecycleState {
 }
 
 /// Who may answer, as distinct from what a surface can draw.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -63,6 +65,7 @@ pub enum Audience {
 ///
 /// Frozen at publication: an offer cannot widen who may answer it after the
 /// fact, which is the "attenuate, never amplify" law applied to responders.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponderPolicy {
     /// Audiences this offer is open to.
@@ -72,6 +75,7 @@ pub struct ResponderPolicy {
 }
 
 /// The workspace fence an instance is confined to.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     /// Opaque workspace key — the same fence every permission query already
@@ -87,6 +91,7 @@ pub struct Scope {
 /// violation is exactly this hole in `ConversationTurn`
 /// (`first_principle.rs:802`); a new record type that cannot name its origin
 /// repeats the defect the ledger counts.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
     /// What minted this instance (a tool name, a subsystem, a persona).
@@ -101,6 +106,7 @@ pub struct Provenance {
 /// TTL, the scope, the frozen responder policy, and the provenance — and the
 /// whole binding is itself content-addressed, so an offer cannot be altered
 /// without changing its [`InstanceId`].
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InteractionInstance {
     /// Versioned type tag; see [`INSTANCE_SCHEMA_V1`].

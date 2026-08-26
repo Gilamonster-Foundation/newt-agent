@@ -106,7 +106,11 @@ jobs:
         # `--features newt-data/kernel` runs the Phase 21.3 live-kernel tests
         # (the pure accumulator + the mock-websocket rest.rs suite), which are
         # off by default; mirrored in the justfile `test`/`check` recipes.
-        run: cargo test --workspace --features newt-data/kernel
+        # HOOK PARITY: mirrored by `just check` / `just test`.
+        # `newt-interaction/schema` is off by default so schemars stays out
+        # of the inward layer's runtime closure (#1828); enabling it here is
+        # what keeps the published JSON Schemas from going stale unnoticed.
+        run: cargo test --workspace --features newt-data/kernel,newt-interaction/schema
 
   lean-build:
     name: lean strip-down build + tests (--no-default-features)
@@ -335,7 +339,11 @@ jobs:
         # `--features newt-data/kernel` exercises the Phase 21.3 live-kernel
         # tests on Windows too (the websocket/TLS stack must build there).
         if: always()
-        run: cargo test --workspace --features newt-data/kernel
+        # HOOK PARITY: mirrored by `just check` / `just test`.
+        # `newt-interaction/schema` is off by default so schemars stays out
+        # of the inward layer's runtime closure (#1828); enabling it here is
+        # what keeps the published JSON Schemas from going stale unnoticed.
+        run: cargo test --workspace --features newt-data/kernel,newt-interaction/schema
       # The #1746 ConPTY spike's whole product is EVIDENCE, and libtest captures
       # stdout on success — so the probes' verdict lines never reach the log in
       # the workspace test above. Re-run just those probes with --nocapture so

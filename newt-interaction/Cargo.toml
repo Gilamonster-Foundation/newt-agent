@@ -15,8 +15,17 @@ publish = false
 # crate. `newt-core` depends on THIS; never the reverse. The rule is not a
 # comment: `tests/guard.rs` walks the resolved dependency closure and the
 # crate's own source, and both halves carry an anti-vacuous twin.
+[features]
+# OFF BY DEFAULT, deliberately. Schema generation is a build-time concern,
+# and `schemars` would otherwise sit in the runtime closure this crate's
+# guard exists to keep at exactly three crates. `tests/guard.rs` asserts
+# the DEFAULT direct dependency set, so turning this on cannot smuggle a
+# runtime dependency in.
+schema = ["dep:schemars"]
+
 [dependencies]
 content-addressable.workspace = true
+schemars = { version = "0.8", optional = true }
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 

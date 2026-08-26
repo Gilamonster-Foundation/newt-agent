@@ -1,0 +1,253 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "InteractionDefinition",
+  "description": "The immutable semantic model of one interaction.\n\nIdentity is a [`DefinitionId`] — a `ContentId` over the canonical encoding of this whole record, which is also its **exact form digest**.",
+  "type": "object",
+  "required": [
+    "controls",
+    "features",
+    "kind",
+    "markdown",
+    "revision",
+    "schema"
+  ],
+  "properties": {
+    "controls": {
+      "description": "The controls, in presentation order.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Control"
+      }
+    },
+    "features": {
+      "description": "What a surface must be able to do to present this faithfully, each demand marked required or optional.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/FeatureDemand"
+      }
+    },
+    "kind": {
+      "description": "What kind of interaction this is.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/InteractionKind"
+        }
+      ]
+    },
+    "markdown": {
+      "description": "The readable body — canonical Markdown, the fallback every surface can render (ADR law 1). Held as text; parsing belongs to `newt_core::markup`, not to the protocol layer.",
+      "type": "string"
+    },
+    "revision": {
+      "description": "Which revision of this definition's authoring lineage this is.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "schema": {
+      "description": "Versioned type tag; see [`DEFINITION_SCHEMA_V1`].",
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "Control": {
+      "description": "One control: a stable id, what it means, and how it takes input.",
+      "type": "object",
+      "required": [
+        "id",
+        "kind",
+        "label",
+        "requirement",
+        "role"
+      ],
+      "properties": {
+        "id": {
+          "description": "Stable within the definition; the definition commits to it.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "How it accepts input.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ControlKind"
+            }
+          ]
+        },
+        "label": {
+          "description": "Human-readable label. Labels never confer authority (ADR law 2).",
+          "type": "string"
+        },
+        "requirement": {
+          "description": "Whether a response must include this control.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Requirement"
+            }
+          ]
+        },
+        "role": {
+          "description": "What answering with this control means.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SemanticRole"
+            }
+          ]
+        }
+      }
+    },
+    "ControlKind": {
+      "description": "How a control accepts input.",
+      "oneOf": [
+        {
+          "description": "One option from the definition's displayed set.",
+          "type": "string",
+          "enum": [
+            "choice"
+          ]
+        },
+        {
+          "description": "Free text.",
+          "type": "string",
+          "enum": [
+            "text"
+          ]
+        },
+        {
+          "description": "A boolean.",
+          "type": "string",
+          "enum": [
+            "toggle"
+          ]
+        },
+        {
+          "description": "A secret: never persisted in markup or logs (ADR D1).",
+          "type": "string",
+          "enum": [
+            "secret"
+          ]
+        }
+      ]
+    },
+    "FeatureDemand": {
+      "description": "A definition's demand for one surface feature, and how hard a demand it is.",
+      "type": "object",
+      "required": [
+        "feature",
+        "requirement"
+      ],
+      "properties": {
+        "feature": {
+          "description": "Which capability.",
+          "type": "string"
+        },
+        "requirement": {
+          "description": "Required, or merely preferred.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Requirement"
+            }
+          ]
+        }
+      }
+    },
+    "InteractionKind": {
+      "description": "What kind of interaction this is. The kind is semantic, never a renderer choice: `modal` is a view decision (ADR C1), not a kind.",
+      "oneOf": [
+        {
+          "description": "Pick one of a fixed, displayed set — today's `Question<A>`.",
+          "type": "string",
+          "enum": [
+            "choice"
+          ]
+        },
+        {
+          "description": "Free text.",
+          "type": "string",
+          "enum": [
+            "prompt"
+          ]
+        },
+        {
+          "description": "A yes/no decision.",
+          "type": "string",
+          "enum": [
+            "confirm"
+          ]
+        },
+        {
+          "description": "A multi-field form.",
+          "type": "string",
+          "enum": [
+            "form"
+          ]
+        },
+        {
+          "description": "A notice that carries no controls and expects no response.",
+          "type": "string",
+          "enum": [
+            "notice"
+          ]
+        }
+      ]
+    },
+    "Requirement": {
+      "description": "Whether something is REQUIRED to present or answer an interaction faithfully, or merely preferred.\n\nThis is the axis ADR law 5 turns on: *unknown REQUIRED behavior fails closed; unknown OPTIONAL behavior degrades visibly.* Without it a consumer that cannot satisfy a demand has only one move for both cases, and whichever it picks is wrong half the time — silently dropping a mandatory secret field, or refusing a document that merely wanted a diagram.\n\nOne vocabulary, deliberately: controls and surface features both use it, so a wire consumer learns the distinction once.",
+      "oneOf": [
+        {
+          "description": "Must be satisfiable. If it is not, the interaction is `Unsupported` and no answer may be guessed.",
+          "type": "string",
+          "enum": [
+            "required"
+          ]
+        },
+        {
+          "description": "Preferred. If it is not satisfiable, the interaction proceeds and the shortfall is reported visibly.",
+          "type": "string",
+          "enum": [
+            "optional"
+          ]
+        }
+      ]
+    },
+    "SemanticRole": {
+      "description": "What a control MEANS, independent of how any surface draws it.",
+      "oneOf": [
+        {
+          "description": "Grants the thing being asked about.",
+          "type": "string",
+          "enum": [
+            "allow"
+          ]
+        },
+        {
+          "description": "Refuses it. The fail-closed default for an absent answer.",
+          "type": "string",
+          "enum": [
+            "deny"
+          ]
+        },
+        {
+          "description": "Backs out without deciding.",
+          "type": "string",
+          "enum": [
+            "cancel"
+          ]
+        },
+        {
+          "description": "Ends the session.",
+          "type": "string",
+          "enum": [
+            "exit"
+          ]
+        },
+        {
+          "description": "Supplies a value rather than a decision.",
+          "type": "string",
+          "enum": [
+            "value"
+          ]
+        }
+      ]
+    }
+  }
+}

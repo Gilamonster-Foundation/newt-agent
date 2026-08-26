@@ -18,6 +18,7 @@ pub const RESPONSE_SCHEMA_V1: &str = "newt.interaction.response/v1";
 /// liability. The record names the sealed value; resolving the handle is
 /// the host's business and requires its own authority (ADR D1: never
 /// persist secret values in markup or logs).
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SecretRef(String);
@@ -65,6 +66,7 @@ impl SecretRef {
 /// cannot represent a newtype variant wrapping a primitive, and the named
 /// field is the clearer thing to freeze into A2.1's vectors anyway
 /// (`{"kind":"toggle","on":true}`).
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ControlValue {
@@ -106,6 +108,7 @@ pub enum ControlValue {
 /// resolve — so a durable, content-addressed response never becomes a
 /// disclosure liability. A digest in the record beats the bytes: it is
 /// tamper-evident without being a secret.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponderProvenance {
     /// What kind of assertion authenticated this responder.
@@ -123,6 +126,7 @@ pub struct ResponderProvenance {
 }
 
 /// What established the responder's identity.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -137,6 +141,7 @@ pub enum AssertionKind {
 }
 
 /// One control's answer: which control, and the typed value.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Submission {
     /// Which control this answers.
@@ -151,6 +156,7 @@ pub struct Submission {
 /// idempotency key, and responder provenance — the ADR's own list. Nothing
 /// here authorizes on its own: the controller revalidates every field
 /// against the definition before it resolves anything.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response {
     /// Versioned type tag; see [`RESPONSE_SCHEMA_V1`].

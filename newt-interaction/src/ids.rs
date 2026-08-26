@@ -16,9 +16,17 @@ use crate::error::ProtocolError;
 macro_rules! content_id_newtype {
     ($(#[$meta:meta])* $name:ident, $kind:literal) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
         #[serde(transparent)]
-        pub struct $name(ContentId);
+        // `ContentId` is a foreign type with no `JsonSchema` impl. In JSON
+        // it renders as its canonical string, which is what a schema
+        // consumer sees; in canonical DAG-CBOR it is a tag-42 LINK, which
+        // JSON Schema has no way to express and the vectors' `links` field
+        // documents instead.
+        pub struct $name(
+            #[cfg_attr(feature = "schema", schemars(with = "String"))] ContentId,
+        );
 
         impl $name {
             /// Wrap an id already minted from the record it names.
@@ -95,6 +103,7 @@ content_id_newtype!(
 /// Deliberately not content-derived: a control id must survive being written
 /// by a human in a `+++` envelope, and the definition it lives in commits to
 /// it — so the definition's `ContentId` is what protects its integrity.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ControlId(String);
@@ -138,6 +147,7 @@ impl ControlId {
 /// an instance unenumerable; it does not make its holder authorized. The
 /// controller revalidates every response against the definition regardless of
 /// who presented which nonce.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Nonce(String);
@@ -174,6 +184,7 @@ impl Nonce {
 /// crate cannot depend on `newt-core` (dependency direction is binding), so
 /// it carries the lesson rather than the type. #1828 records moving `Rev`
 /// down here as a named follow-up.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
 )]
@@ -205,6 +216,7 @@ impl Revision {
 
 /// A caller-supplied key that makes a response replay-safe: the same key on
 /// the same instance is the same submission, not a second one.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct IdempotencyKey(String);

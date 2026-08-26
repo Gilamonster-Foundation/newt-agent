@@ -15,6 +15,7 @@ pub const DEFINITION_SCHEMA_V1: &str = "newt.interaction.definition/v1";
 
 /// What kind of interaction this is. The kind is semantic, never a renderer
 /// choice: `modal` is a view decision (ADR C1), not a kind.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -32,6 +33,7 @@ pub enum InteractionKind {
 }
 
 /// What a control MEANS, independent of how any surface draws it.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -49,6 +51,7 @@ pub enum SemanticRole {
 }
 
 /// How a control accepts input.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -75,6 +78,7 @@ pub enum ControlKind {
 ///
 /// One vocabulary, deliberately: controls and surface features both use
 /// it, so a wire consumer learns the distinction once.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Requirement {
@@ -87,6 +91,7 @@ pub enum Requirement {
 }
 
 /// One control: a stable id, what it means, and how it takes input.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Control {
     /// Stable within the definition; the definition commits to it.
@@ -112,6 +117,7 @@ pub struct Control {
 /// on. Carrying the name verbatim is what lets an unknown demand be
 /// refused (when required) or reported (when optional) instead of
 /// silently vanishing.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SurfaceFeature(String);
@@ -161,6 +167,7 @@ impl SurfaceFeature {
 
 /// A definition's demand for one surface feature, and how hard a demand it
 /// is.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureDemand {
     /// Which capability.
@@ -173,6 +180,7 @@ pub struct FeatureDemand {
 ///
 /// Identity is a [`DefinitionId`] — a `ContentId` over the canonical
 /// encoding of this whole record, which is also its **exact form digest**.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InteractionDefinition {
     /// Versioned type tag; see [`DEFINITION_SCHEMA_V1`].
