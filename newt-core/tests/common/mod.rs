@@ -377,37 +377,53 @@ fn split_cfg_args(args: &str) -> Vec<&str> {
 }
 
 /// Blank out string literal contents on one line (keeps the quotes), so
-/// brace counting and word matching see only code. Handles `\"` escapes;
-/// deliberately does not handle raw strings or multi-line literals — see the
-/// module doc for why that is acceptable for a ratchet.
+/// brace counting and word matching see only code. Handles `\"` escapes and
+/// char literals — the `"` in `'"'` is a CHARACTER, not a string opener,
+/// and treating it as one blanks the rest of the line (braces included),
+/// which unbalances the `#[cfg(test)]` depth tracker and spills test-only
+/// lines into the production scan. Rust lifetimes (`'a`) have no closing
+/// quote and fall through untouched. Deliberately does not handle raw
+/// strings or multi-line literals — see the module doc for why that is
+/// acceptable for a ratchet.
 pub fn strip_string_literals(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
     let mut out = String::with_capacity(line.len());
+    let mut i = 0;
     let mut in_str = false;
-    let mut escaped = false;
-    for c in line.chars() {
-        if escaped {
-            escaped = false;
-            if in_str {
-                out.push('_');
-            } else {
-                out.push(c);
+    while i < chars.len() {
+        let c = chars[i];
+        if !in_str && c == '\'' {
+            // `'X'` — a plain char literal.
+            if i + 2 < chars.len() && chars[i + 1] != '\\' && chars[i + 2] == '\'' {
+                out.push_str("'_'");
+                i += 3;
+                continue;
             }
+            // `'\X'` — an escaped char literal.
+            if i + 3 < chars.len() && chars[i + 1] == '\\' && chars[i + 3] == '\'' {
+                out.push_str("'__'");
+                i += 4;
+                continue;
+            }
+            // Otherwise a lifetime: keep it.
+        }
+        if in_str && c == '\\' {
+            out.push('_');
+            if i + 1 < chars.len() {
+                out.push('_');
+                i += 1;
+            }
+            i += 1;
             continue;
         }
-        match c {
-            '\\' => {
-                escaped = true;
-                if !in_str {
-                    out.push(c);
-                }
-            }
-            '"' => {
-                in_str = !in_str;
-                out.push('"');
-            }
-            _ if in_str => out.push('_'),
-            _ => out.push(c),
+        if c == '"' {
+            in_str = !in_str;
+            out.push('"');
+            i += 1;
+            continue;
         }
+        out.push(if in_str { '_' } else { c });
+        i += 1;
     }
     out
 }

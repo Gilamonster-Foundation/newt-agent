@@ -542,6 +542,50 @@ fn the_ratchet_scans_the_real_workspace() {
     );
 }
 
+/// **A quote inside a char literal must not open a string.**
+/// `strip_string_literals` blanks string contents so a needle in an error
+/// message cannot satisfy a law. It treated the `"` in the char literal
+/// `'"'` as a string opener, blanking the REST of the line — including the
+/// brace that opens a block. Inside a `#[cfg(test)]` region (the real
+/// instance is `newt-tui/src/palette.rs:582`, `for banned in ['|', '<',
+/// '[', '"'] {`) the tracker then loses an opening brace, the depth
+/// unwinds early, and the remaining test-only lines are visited as
+/// production — feeding EXACT counts with test scaffolding.
+///
+/// Regression (#1823 review A0-6): against the old stripper this failed
+/// with `test-only lines scanned as production: ["letp=Parser::new_ext(a,b);"]`.
+#[test]
+fn a_quote_in_a_char_literal_does_not_open_a_string() {
+    let root = tempfile::tempdir().unwrap();
+    let src = root.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        // The blanked `{` unbalances the tracker, so the depth reaches
+        // zero one closing brace EARLY and everything after it — still
+        // inside `mod tests` — reads as production.
+        "#[cfg(test)]\nmod tests {\n    fn t() {\n        for banned in ['|', '\"'] {\n            noop();\n        }\n    }\n    fn later() {\n        let p = Parser::new_ext(a, b);\n    }\n}\n",
+    )
+    .unwrap();
+
+    let mut visited = Vec::new();
+    for_each_production_line(
+        &[root.path().to_path_buf()],
+        &no_extra_skips,
+        &mut |_, code, _| {
+            if code.contains("Parser::new") {
+                let mut squeezed = String::new();
+                squeeze_into(&mut squeezed, code);
+                visited.push(squeezed);
+            }
+        },
+    );
+    assert!(
+        visited.is_empty(),
+        "test-only lines scanned as production: {visited:?}"
+    );
+}
+
 /// **Needles survive a line split and name their receiver.** The old
 /// needles were single-line and receiver-blind, which fails in both
 /// directions: rustfmt splitting a call DROPPED a site (the count falls,
