@@ -26,7 +26,7 @@ mod width;
 pub use stream::MarkdownStreamWriter;
 
 use emitter::Emitter;
-use pulldown_cmark::{Options, Parser};
+use pulldown_cmark::Parser;
 
 /// Rendering inputs. `cols` is injected by the caller (the TUI passes
 /// `term_cols()`); the renderer never probes the terminal itself, keeping it
@@ -46,11 +46,7 @@ pub fn render_markdown(src: &str, opts: RenderOpts) -> String {
     if !opts.color {
         return src.to_string();
     }
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    options.insert(Options::ENABLE_TASKLISTS);
-    options.insert(Options::ENABLE_TABLES);
-    let parser = Parser::new_ext(src, options);
+    let parser = Parser::new_ext(src, crate::markup::dialect::canonical_options());
     let mut em = Emitter::new(opts.cols);
     for ev in parser {
         em.handle(ev);
@@ -70,6 +66,60 @@ mod tests {
     const RESET: &str = "\x1b[0m";
     const ORANGE: &str = "\x1b[38;2;220;60;20m";
     const FADE: &str = "\x1b[38;2;90;90;90m";
+
+    /// **A1 dialect pins (#1825, epic #1803 bullet 3).** The canonical
+    /// dialect's normalization rules, asserted rather than merely described
+    /// in `markup::dialect`'s docs: raw HTML is literal text (a scroller has
+    /// no DOM and executes nothing), soft breaks fold to a space per
+    /// CommonMark, fenced code is never interpreted, and an unknown fence
+    /// info string falls back to plain code presentation — visibly, per ADR
+    /// law 5. These are today's behavior, frozen so a later slice changing
+    /// them must do so deliberately.
+    #[test]
+    fn raw_html_renders_as_literal_text_never_a_dom() {
+        let out = r("before <b>not bold</b> after");
+        assert!(
+            out.contains("<b>") && out.contains("</b>"),
+            "raw HTML must survive as literal text: {out:?}"
+        );
+        assert!(
+            !out.contains(&format!("{BOLD}not bold")),
+            "raw HTML must not be interpreted as styling: {out:?}"
+        );
+        // A script tag is text like any other markup — nothing executes and
+        // nothing is silently dropped on the plain surface.
+        assert!(r("<script>alert(1)</script>").contains("<script>"));
+    }
+
+    #[test]
+    fn soft_breaks_fold_and_hard_breaks_do_not() {
+        // CommonMark soft break: one paragraph, joined by a space.
+        let soft = r("alpha\nbravo");
+        assert!(soft.contains("alpha bravo"), "soft break folds: {soft:?}");
+        // Two trailing spaces are a hard break: the line is kept.
+        let hard = r("alpha  \nbravo");
+        assert!(
+            !hard.contains("alpha bravo"),
+            "a hard break must not fold: {hard:?}"
+        );
+    }
+
+    #[test]
+    fn fenced_code_is_never_interpreted_and_unknown_infos_fall_back_visibly() {
+        // Markdown syntax inside a fence stays source, unstyled as markup.
+        let fenced = r("```\n**not bold** <b>not html</b>\n```");
+        assert!(
+            fenced.contains("**not bold**") && fenced.contains("<b>not html</b>"),
+            "fenced code is literal: {fenced:?}"
+        );
+        // An unknown info string is presented as ordinary code, and its
+        // content is still visible — never swallowed by an extension guess.
+        let unknown = r("```wingdings-9000\nplain content\n```");
+        assert!(
+            unknown.contains("plain content"),
+            "unknown fence info must fall back visibly: {unknown:?}"
+        );
+    }
 
     fn r(src: &str) -> String {
         render_markdown(
