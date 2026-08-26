@@ -315,28 +315,64 @@ fn non_canonical_bytes_of_a_valid_record_are_refused() {
     }
 }
 
-/// **Anti-vacuous twin for the byte-equality gate.** The same bytes, run
-/// through a decoder WITHOUT that gate, are accepted — which is what makes
-/// the refusal above attributable to the gate rather than to the decoder
-/// happening to be strict. (It is not: the assertion above proves it
-/// decodes.)
+/// **Anti-vacuous twin for gate 3.**
+///
+/// The refusal above is only meaningful if the perturbed bytes would
+/// otherwise be ACCEPTED. Asserting that they decode is not enough — the
+/// real decoder could still be refusing them for some other reason. So
+/// this runs them through a copy of the real decoder with gate 3, and
+/// only gate 3, removed: same tag probe, same strict typed decode, no
+/// byte comparison. That path returns the record, which attributes the
+/// refusal to the comparison rather than to `serde_ipld_dagcbor` 0.6.4
+/// happening to be strict — a property that drifts between releases and
+/// must never be what a guarantee rests on.
 #[test]
-fn without_the_byte_check_the_same_bytes_are_accepted() {
+fn decoding_would_accept_without_the_round_trip() {
+    /// The real `decode`, minus gate 3.
+    fn decode_without_round_trip(bytes: &[u8]) -> Decoded<InteractionDefinition> {
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            schema: String,
+        }
+        // Gate 1: the tag.
+        let probe: Probe = canonical::from_canonical_dagcbor(bytes).expect("readable tag");
+        if probe.schema != DEFINITION_SCHEMA_V1 {
+            panic!("fixture should carry the v1 tag");
+        }
+        // Gate 2: the shape.
+        match canonical::from_canonical_dagcbor::<InteractionDefinition>(bytes) {
+            Ok(record) => Decoded::Known(record),
+            Err(e) => panic!("gate 2 refused the fixture: {e}"),
+        }
+        // Gate 3 would go here.
+    }
+
     let def = definition();
     let perturbed = make_non_canonical(&canonical::to_canonical_dagcbor(&def).unwrap());
 
-    // Gates 1 and 2 only — the shape this decoder had before the byte
-    // check existed.
-    let probe: serde_json::Value = {
-        let decoded: InteractionDefinition =
-            canonical::from_canonical_dagcbor(&perturbed).expect("gate 2 passes");
-        serde_json::to_value(decoded).unwrap()
-    };
-    assert_eq!(
-        probe["schema"], DEFINITION_SCHEMA_V1,
-        "a gate-2-only decoder accepts these bytes, so the refusal is the \
-         byte check's doing"
+    // The real decoder refuses these bytes...
+    assert!(
+        matches!(
+            decode_definition(&perturbed),
+            Err(ProtocolError::NonCanonical { .. })
+        ),
+        "gate 3 did not refuse the perturbed bytes"
     );
+
+    // ...and the same decoder without gate 3 accepts them, returning a
+    // record equal to the original. Both halves are needed: the refusal
+    // alone could come from anywhere.
+    match decode_without_round_trip(&perturbed) {
+        Decoded::Known(record) => assert_eq!(
+            record, def,
+            "without gate 3 the perturbed bytes decode to the very record \
+             whose canonical encoding they are not"
+        ),
+        Decoded::Unknown(_) => panic!(
+            "the gate-3-less path also refused — the refusal above is not \
+             attributable to gate 3"
+        ),
+    }
 }
 
 /// **The tag probe must tolerate what everything else refuses.**
