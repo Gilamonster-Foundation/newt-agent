@@ -139,6 +139,18 @@ jobs:
       - name: test (newt-tui, rich-tui + live-spill stripped)
         if: always()
         run: cargo test -p newt-tui
+      # HOOK PARITY: mirrored by the `check` recipe in justfile, which
+      # .githooks/pre-push runs. When editing this step, update both.
+      #
+      # newt-interaction is the inward protocol layer (#1828): it must build
+      # and pass with no feature at all, because the wyvern/headless tier
+      # strips everything outward of it. Its own `tests/guard.rs` asserts the
+      # dependency closure and the absence of ambient authority; this line is
+      # the other half — that the crate is buildable in the configuration the
+      # guard describes.
+      - name: test (newt-interaction, inward protocol layer)
+        if: always()
+        run: cargo test -p newt-interaction --no-default-features
 
   coverage:
     name: Workspace coverage (cargo-llvm-cov)
