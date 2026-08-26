@@ -9,8 +9,8 @@
 
 use content_addressable::{canonical, ContentAddressable, ContentId};
 use newt_interaction::{
-    Control, ControlKind, DefinitionId, InteractionDefinition, InteractionInstance,
-    InteractionKind, Response, SemanticRole,
+    Control, ControlKind, DefinitionId, FeatureDemand, InteractionDefinition, InteractionInstance,
+    InteractionKind, Requirement, Response, SemanticRole, SurfaceFeature,
 };
 
 mod fixtures;
@@ -50,7 +50,7 @@ fn equal_values_have_equal_ids_and_field_order_is_irrelevant() {
     // Assemble the same value by a different route.
     b.controls = a.controls.clone();
     b.revision = a.revision;
-    b.features = a.features;
+    b.features = a.features.clone();
     assert_eq!(a, b);
     assert_eq!(a.definition_id().unwrap(), b.definition_id().unwrap());
     assert_eq!(
@@ -307,8 +307,8 @@ fn every_semantic_field_of_a_definition_moves_its_id() {
             d.controls[0].role = SemanticRole::Cancel
         }),
         ("controls.kind", |d| d.controls[0].kind = ControlKind::Text),
-        ("controls.required", |d| {
-            d.controls[0].required = !d.controls[0].required;
+        ("controls.requirement", |d| {
+            d.controls[0].requirement = Requirement::Required;
         }),
         ("controls.id", |d| {
             d.controls[0].id = newt_interaction::ControlId::new("renamed").unwrap();
@@ -319,13 +319,26 @@ fn every_semantic_field_of_a_definition_moves_its_id() {
                 role: SemanticRole::Cancel,
                 kind: ControlKind::Choice,
                 label: "back".to_string(),
-                required: false,
+                requirement: Requirement::Optional,
             });
         }),
-        ("features.secret_input", |d| d.features.secret_input = true),
-        ("features.diagrams", |d| d.features.diagrams = true),
-        ("features.multi_control", |d| {
-            d.features.multi_control = true
+        ("features.len", |d| {
+            d.features.push(FeatureDemand {
+                feature: SurfaceFeature::new(SurfaceFeature::DIAGRAMS).unwrap(),
+                requirement: Requirement::Optional,
+            });
+        }),
+        ("features.feature", |d| {
+            d.features = vec![FeatureDemand {
+                feature: SurfaceFeature::new(SurfaceFeature::SECRET_INPUT).unwrap(),
+                requirement: Requirement::Optional,
+            }];
+        }),
+        ("features.requirement", |d| {
+            d.features = vec![FeatureDemand {
+                feature: SurfaceFeature::new(SurfaceFeature::DIAGRAMS).unwrap(),
+                requirement: Requirement::Required,
+            }];
         }),
     ];
 

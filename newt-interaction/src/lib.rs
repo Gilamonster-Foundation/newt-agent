@@ -34,8 +34,8 @@ pub mod instance;
 pub mod response;
 
 pub use definition::{
-    Control, ControlKind, InteractionDefinition, InteractionKind, SemanticRole, SurfaceFeatures,
-    DEFINITION_SCHEMA_V1,
+    Control, ControlKind, FeatureDemand, InteractionDefinition, InteractionKind, Requirement,
+    SemanticRole, SurfaceFeature, DEFINITION_SCHEMA_V1,
 };
 pub use error::ProtocolError;
 pub use ids::{ControlId, DefinitionId, IdempotencyKey, InstanceId, Nonce, ResponseId, Revision};

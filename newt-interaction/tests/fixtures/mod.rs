@@ -4,7 +4,7 @@
 
 use newt_interaction::{
     AssertionKind, Audience, Control, ControlId, ControlKind, ControlValue, IdempotencyKey,
-    InteractionDefinition, InteractionInstance, InteractionKind, Nonce, Provenance,
+    InteractionDefinition, InteractionInstance, InteractionKind, Nonce, Provenance, Requirement,
     ResponderPolicy, ResponderProvenance, Response, Revision, Scope, SemanticRole, Submission,
     RESPONSE_SCHEMA_V1,
 };
@@ -20,14 +20,14 @@ pub fn definition() -> InteractionDefinition {
                 role: SemanticRole::Allow,
                 kind: ControlKind::Choice,
                 label: "allow once".to_string(),
-                required: false,
+                requirement: Requirement::Optional,
             },
             Control {
                 id: ControlId::new("deny").unwrap(),
                 role: SemanticRole::Deny,
                 kind: ControlKind::Choice,
                 label: "deny (default)".to_string(),
-                required: false,
+                requirement: Requirement::Optional,
             },
         ],
     )

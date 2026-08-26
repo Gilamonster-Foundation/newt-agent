@@ -63,6 +63,29 @@ pub enum ControlKind {
     Secret,
 }
 
+/// Whether something is REQUIRED to present or answer an interaction
+/// faithfully, or merely preferred.
+///
+/// This is the axis ADR law 5 turns on: *unknown REQUIRED behavior fails
+/// closed; unknown OPTIONAL behavior degrades visibly.* Without it a
+/// consumer that cannot satisfy a demand has only one move for both cases,
+/// and whichever it picks is wrong half the time — silently dropping a
+/// mandatory secret field, or refusing a document that merely wanted a
+/// diagram.
+///
+/// One vocabulary, deliberately: controls and surface features both use
+/// it, so a wire consumer learns the distinction once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Requirement {
+    /// Must be satisfiable. If it is not, the interaction is
+    /// `Unsupported` and no answer may be guessed.
+    Required,
+    /// Preferred. If it is not satisfiable, the interaction proceeds and
+    /// the shortfall is reported visibly.
+    Optional,
+}
+
 /// One control: a stable id, what it means, and how it takes input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Control {
@@ -75,23 +98,75 @@ pub struct Control {
     /// Human-readable label. Labels never confer authority (ADR law 2).
     pub label: String,
     /// Whether a response must include this control.
-    pub required: bool,
+    pub requirement: Requirement,
 }
 
-/// What a surface can DO, as distinct from who may answer.
+/// A capability a surface must have to present some part of an
+/// interaction: accepting secret input without echoing it, rendering a
+/// diagram, showing more than one control at once.
 ///
-/// ADR law 4 requires these be separate types from responder eligibility:
-/// conflating "this surface can render a secret field" with "this responder
-/// may grant permanently" is exactly the authority laundering the epic's
-/// risk table names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct SurfaceFeatures {
-    /// The surface can accept secret input without echoing it.
-    pub secret_input: bool,
-    /// The surface can render a diagram extension (E0).
-    pub diagrams: bool,
+/// A named string rather than a closed enum, on purpose. This is a WIRE
+/// vocabulary: a v2 document may demand a feature this build has never
+/// heard of, and a closed enum could not even represent it — the name
+/// would be lost at parse time and law 5 would have nothing left to act
+/// on. Carrying the name verbatim is what lets an unknown demand be
+/// refused (when required) or reported (when optional) instead of
+/// silently vanishing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SurfaceFeature(String);
+
+impl SurfaceFeature {
+    /// The surface accepts secret input without echoing or persisting it.
+    pub const SECRET_INPUT: &'static str = "secret-input";
+    /// The surface renders a diagram extension (epic slice E0).
+    pub const DIAGRAMS: &'static str = "diagrams";
     /// The surface can present more than one control at once.
-    pub multi_control: bool,
+    pub const MULTI_CONTROL: &'static str = "multi-control";
+
+    /// Every feature name this build understands.
+    pub const KNOWN: &'static [&'static str] =
+        &[Self::SECRET_INPUT, Self::DIAGRAMS, Self::MULTI_CONTROL];
+
+    /// Adopt a feature name.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::InvalidId`] when empty. An UNRECOGNIZED name is
+    /// not an error — that is the forward-compatibility case, and
+    /// [`is_known`](Self::is_known) is how a consumer asks.
+    pub fn new(name: impl Into<String>) -> Result<Self, ProtocolError> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(ProtocolError::InvalidId {
+                kind: "surface feature",
+                reason: "must not be empty".to_string(),
+            });
+        }
+        Ok(Self(name))
+    }
+
+    /// The name as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether this build understands the feature.
+    #[must_use]
+    pub fn is_known(&self) -> bool {
+        Self::KNOWN.contains(&self.0.as_str())
+    }
+}
+
+/// A definition's demand for one surface feature, and how hard a demand it
+/// is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeatureDemand {
+    /// Which capability.
+    pub feature: SurfaceFeature,
+    /// Required, or merely preferred.
+    pub requirement: Requirement,
 }
 
 /// The immutable semantic model of one interaction.
@@ -112,8 +187,9 @@ pub struct InteractionDefinition {
     pub markdown: String,
     /// The controls, in presentation order.
     pub controls: Vec<Control>,
-    /// What a surface must be able to do to present this faithfully.
-    pub features: SurfaceFeatures,
+    /// What a surface must be able to do to present this faithfully, each
+    /// demand marked required or optional.
+    pub features: Vec<FeatureDemand>,
 }
 
 impl InteractionDefinition {
@@ -126,7 +202,7 @@ impl InteractionDefinition {
             revision: Revision::FIRST,
             markdown: markdown.into(),
             controls,
-            features: SurfaceFeatures::default(),
+            features: Vec::new(),
         }
     }
 
