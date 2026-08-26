@@ -62,6 +62,7 @@
       "format": "int64"
     }
   },
+  "additionalProperties": false,
   "definitions": {
     "Audience": {
       "description": "Who may answer, as distinct from what a surface can draw.",
@@ -99,7 +100,8 @@
           "description": "What minted this instance (a tool name, a subsystem, a persona).",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ResponderPolicy": {
       "description": "The frozen eligibility rule for one instance.\n\nFrozen at publication: an offer cannot widen who may answer it after the fact, which is the \"attenuate, never amplify\" law applied to responders.",
@@ -120,7 +122,8 @@
           "description": "Whether the responder must present an authenticated assertion.",
           "type": "boolean"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Scope": {
       "description": "The workspace fence an instance is confined to.",
@@ -138,7 +141,8 @@
           "description": "Opaque workspace key — the same fence every permission query already applies in `newt_core`'s store.",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     }
   }
 }

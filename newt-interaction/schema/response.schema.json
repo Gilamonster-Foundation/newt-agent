@@ -51,6 +51,7 @@
       }
     }
   },
+  "additionalProperties": false,
   "definitions": {
     "AssertionKind": {
       "description": "What established the responder's identity.",
@@ -118,7 +119,8 @@
               "description": "Which control. Its charset is enforced at construction, so a choice can never carry a sentence.",
               "type": "string"
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Free text, as typed.",
@@ -138,7 +140,8 @@
               "description": "The submitted text.",
               "type": "string"
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "A boolean. Travels as a bool, never as text.",
@@ -158,7 +161,8 @@
               "description": "Whether the control is on.",
               "type": "boolean"
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
           "description": "A secret, BY REFERENCE. There is deliberately no variant that can hold plaintext.",
@@ -178,7 +182,8 @@
               "description": "The handle the host can resolve.",
               "type": "string"
             }
-          }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -218,7 +223,8 @@
           "description": "The principal the assertion speaks for, as the host names it. A stable reference, never a credential.",
           "type": "string"
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Submission": {
       "description": "One control's answer: which control, and the typed value.",
@@ -240,7 +246,8 @@
             }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     }
   }
 }

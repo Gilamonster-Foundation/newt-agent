@@ -115,3 +115,47 @@ fn each_schema_names_the_fields_of_its_record() {
         }
     }
 }
+
+/// **The published contract states its closedness.**
+///
+/// `deny_unknown_fields` makes schemars emit `additionalProperties: false`,
+/// which is the JSON-Schema way of saying what the decoder enforces: a
+/// record carrying a field this build has no name for is not a record of
+/// this type. Without it a foreign consumer would reasonably infer that
+/// extra fields are tolerated — and would be building exactly the record
+/// our decoder refuses.
+#[test]
+fn every_object_schema_forbids_additional_properties() {
+    for name in ["definition", "instance", "response"] {
+        let text = std::fs::read_to_string(schema_dir().join(format!("{name}.schema.json")))
+            .expect("schema exists");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("schema parses");
+
+        assert_eq!(
+            parsed["additionalProperties"],
+            serde_json::Value::Bool(false),
+            "the `{name}` schema does not forbid additional properties, but \
+             the decoder does"
+        );
+
+        // ...and so does every nested object definition, or the closedness
+        // stops at the top level while the decoder enforces it all the way
+        // down.
+        let mut open = Vec::new();
+        if let Some(defs) = parsed.get("definitions").and_then(|d| d.as_object()) {
+            for (def_name, def) in defs {
+                if def.get("type").and_then(|t| t.as_str()) != Some("object") {
+                    continue;
+                }
+                if def.get("additionalProperties") != Some(&serde_json::Value::Bool(false)) {
+                    open.push(def_name.clone());
+                }
+            }
+        }
+        assert!(
+            open.is_empty(),
+            "nested objects in the `{name}` schema still allow additional \
+             properties: {open:?}"
+        );
+    }
+}
