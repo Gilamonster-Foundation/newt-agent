@@ -404,6 +404,61 @@ fn the_ratchet_scans_the_real_workspace() {
     );
 }
 
+/// **The walker must never descend into a nested worktree.** This repo's
+/// own convention puts scratch/crew worktrees at `<repo>/.worktrees/`
+/// (`.gitignore:107`), and the main checkout really does carry full `src`
+/// trees there. `first_principle`'s laws tolerate the copies (they need at
+/// least one caller and a copy is still one), but THIS file's exact
+/// per-file counts and its "NEW site file" detection do not: a second copy
+/// of `newt-tui/src/permissions.rs` is a new path with its own hits, so the
+/// ratchet would trip for anyone running the suite from the main checkout
+/// while CI stayed green on a clean one — a red pre-push hook nobody can
+/// reproduce from the CI logs.
+///
+/// Regression (#1823 review): the skip list was `target|.git|.claude|docs`
+/// and missed `.worktrees`. Against that list this test failed with
+/// `the walker descended into a nested worktree: [".worktrees/x/newt-core/src/lib.rs"]`.
+/// The fix skips every HIDDEN directory, which subsumes `.git`, `.claude`,
+/// `.worktrees`, and `.github` — a rule that cannot be out-enumerated by
+/// the next dot-directory convention someone adds.
+#[test]
+fn the_walker_never_descends_into_hidden_directories() {
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("newt-core/src");
+    let hidden = root.path().join(".worktrees/x/newt-core/src");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::create_dir_all(&hidden).unwrap();
+    // The same needle in both trees: one real, one a nested-worktree copy.
+    let needle = "let parser = Parser::new_ext(src, opts);\n";
+    std::fs::write(real.join("lib.rs"), needle).unwrap();
+    std::fs::write(hidden.join("lib.rs"), needle).unwrap();
+
+    let mut visited = Vec::new();
+    for_each_production_line(
+        root.path(),
+        &parent_gated_test_file,
+        &mut |path, code, _| {
+            if code.contains("Parser::new") {
+                visited.push(rel(root.path(), path));
+            }
+        },
+    );
+
+    let strays: Vec<_> = visited
+        .iter()
+        .filter(|p| p.starts_with('.') || p.contains("/."))
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "the walker descended into a nested worktree: {strays:?}"
+    );
+    assert_eq!(
+        visited,
+        vec!["newt-core/src/lib.rs".to_string()],
+        "exactly the real tree is scanned"
+    );
+}
+
 /// From the start of `text` (which begins at the `permission_actions!`
 /// invocation), the substring up to the matching close of its first `{`.
 fn brace_block(text: &str) -> &str {

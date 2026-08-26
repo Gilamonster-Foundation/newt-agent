@@ -10,7 +10,8 @@
 //!
 //! Scope and honesty notes shared by every consumer:
 //! - Only crate `src/` trees are visited; `tests/`, `benches/`, build output,
-//!   VCS, vendored worktrees, and `docs/` are skipped.
+//!   `docs/`, and every hidden directory (`.git/`, `.claude/`, and this
+//!   repo's gitignored `.worktrees/` scratch checkouts) are skipped.
 //! - Lines inside `#[cfg(test)]`-gated items are skipped by brace depth — a
 //!   simple "saw the attribute, skip the rest of the file" latch would blind
 //!   the scanner to production code after an early inline test seam.
@@ -50,9 +51,14 @@ pub fn for_each_production_line(
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if path.is_dir() {
-                // Skip build output, VCS, and vendored/worktree copies — a hit
-                // inside target/ or .claude/worktrees/ is not this build's code.
-                if matches!(name.as_ref(), "target" | ".git" | ".claude" | "docs") {
+                // Skip build output, docs, and every HIDDEN directory — a hit
+                // inside `target/`, `.git/`, `.claude/worktrees/`, or this
+                // repo's own `.worktrees/` scratch convention
+                // (`.gitignore:107`) is not this build's code. Hidden-by-name
+                // rather than an enumerated list: the main checkout really
+                // does carry full `src` trees under `.worktrees/`, and an
+                // enumeration is always one convention behind.
+                if name.starts_with('.') || matches!(name.as_ref(), "target" | "docs") {
                     continue;
                 }
                 stack.push(path);
