@@ -404,16 +404,59 @@ fn production_callers_of(names: &[&str]) -> Vec<String> {
 }
 
 /// The roots a law scans. Scoped to production workspace members (plus
-/// newt-web) — see `common::production_roots`. A tempdir fixture with no
-/// workspace manifest falls back to `<root>/src`, which is the shape the
-/// scanner self-test builds.
+/// newt-web) — see `common::production_roots`.
+///
+/// The `<root>/src` fallback exists for the tempdir fixtures below, which
+/// have no workspace manifest at all. It is gated on that shape on purpose:
+/// falling back whenever the roots come back empty would let a
+/// manifest-parse failure (a reformatted `members` list, a moved table)
+/// silently redirect every law at a non-existent `newt-agent/src`, where an
+/// absence-style law — "no production caller does X" — passes vacuously
+/// because nothing at all was scanned. A real workspace that yields no
+/// roots is a broken scanner, and it says so.
 fn roots_for(workspace_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let declares_workspace = std::fs::read_to_string(workspace_root.join("Cargo.toml"))
+        .is_ok_and(|manifest| manifest.contains("[workspace]"));
     let roots = production_roots(workspace_root);
+    assert!(
+        !(declares_workspace && roots.is_empty()),
+        "the workspace manifest at {} yielded no production roots — the \
+         members list did not parse, so every law below would scan nothing \
+         and pass vacuously",
+        workspace_root.display()
+    );
     if roots.is_empty() {
         vec![workspace_root.join("src")]
     } else {
         roots
     }
+}
+
+/// Regression (#1823 review follow-up): a workspace whose members list does
+/// not parse must fail LOUDLY rather than fall back to a path that does not
+/// exist, which would make every absence-style law vacuously green.
+#[test]
+#[should_panic(expected = "yielded no production roots")]
+fn an_unparseable_members_list_fails_loudly_instead_of_scanning_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    // A real `[workspace]` table, but nothing this parser can read as a
+    // members list.
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    let _ = roots_for(root.path());
+}
+
+/// ...and the fixture shape the laws' own scanner tests rely on still
+/// works: no workspace manifest, so `<root>/src` is the honest answer.
+#[test]
+fn a_manifestless_fixture_still_falls_back_to_its_src() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    assert_eq!(roots_for(root.path()), vec![root.path().join("src")]);
 }
 
 fn production_callers_of_in(workspace_root: &std::path::Path, names: &[&str]) -> Vec<String> {

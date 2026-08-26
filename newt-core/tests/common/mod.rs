@@ -75,10 +75,14 @@ fn workspace_members(workspace_root: &Path) -> Vec<String> {
     let Ok(manifest) = std::fs::read_to_string(workspace_root.join("Cargo.toml")) else {
         return Vec::new();
     };
-    let Some(start) = manifest.find("members = [") else {
+    // Tolerate the spellings a toml formatter produces: `members = [`,
+    // `members=[`, or a newline before the array. A parse miss is not
+    // silent — `roots_for` and the ratchet's self-check turn an empty root
+    // list into a loud failure — but a spurious hard failure on a
+    // legitimate reformat is worth avoiding.
+    let Some(rest) = members_array(&manifest) else {
         return Vec::new();
     };
-    let rest = &manifest[start..];
     let Some(end) = rest.find(']') else {
         return Vec::new();
     };
@@ -111,6 +115,24 @@ fn workspace_members(workspace_root: &Path) -> Vec<String> {
 /// removed, and `raw` is the original line. Doc/line comments and
 /// `#[cfg(test)]`-gated regions are not visited. `skip_file` lets a consumer
 /// add its own file-level exclusions.
+/// The `[workspace] members` array text, from its opening `[`, regardless
+/// of whitespace around the `=`.
+fn members_array(manifest: &str) -> Option<&str> {
+    let mut from = 0;
+    while let Some(i) = manifest[from..].find("members") {
+        let at = from + i;
+        let rest = manifest[at + "members".len()..].trim_start();
+        if let Some(array) = rest.strip_prefix('=') {
+            let array = array.trim_start();
+            if array.starts_with('[') {
+                return Some(array);
+            }
+        }
+        from = at + "members".len();
+    }
+    None
+}
+
 /// Every `.rs` file under `roots`, minus build output, hidden directories,
 /// and whatever `skip_file` rejects.
 fn rust_files(roots: &[PathBuf], skip_file: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
