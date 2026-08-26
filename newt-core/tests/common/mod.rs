@@ -111,11 +111,10 @@ fn workspace_members(workspace_root: &Path) -> Vec<String> {
 /// removed, and `raw` is the original line. Doc/line comments and
 /// `#[cfg(test)]`-gated regions are not visited. `skip_file` lets a consumer
 /// add its own file-level exclusions.
-pub fn for_each_production_line(
-    roots: &[PathBuf],
-    skip_file: &dyn Fn(&Path) -> bool,
-    visit: &mut dyn FnMut(&Path, &str, &str),
-) {
+/// Every `.rs` file under `roots`, minus build output, hidden directories,
+/// and whatever `skip_file` rejects.
+fn rust_files(roots: &[PathBuf], skip_file: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
+    let mut files = Vec::new();
     let mut stack: Vec<PathBuf> = roots.to_vec();
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -143,91 +142,174 @@ pub fn for_each_production_line(
             if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                 continue;
             }
-            // newt-tui's out-of-line lib_tests files are each reached by a
-            // parent-side #[cfg(test)] #[path = ...] declaration. The child
-            // itself has no local cfg for this line scanner to see.
-            if is_test_only_source_path(&path) {
-                continue;
-            }
             if skip_file(&path) {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            // Skip cfg items that cannot compile in production by brace depth:
-            // from the attribute, ignore lines until the braces opened after
-            // it close again.
-            let mut test_depth: i32 = 0;
-            let mut pending_test_attr = false;
-            for line in text.lines() {
-                let trimmed = line.trim_start();
-                // Doc comments describe the guarantee; they do not invoke it.
-                if trimmed.starts_with("//") {
-                    continue;
-                }
-                // Brace counting and cfg matching both work on the line with
-                // string literals blanked, so `"{"` in a message or `"test"`
-                // in a feature name (`feature = "test-util"`) cannot skew
-                // either.
-                let mut code = strip_string_literals(line);
-                // Truncate the trailing line comment AFTER blanking strings
-                // (so a `//` inside a literal cannot trigger this). Without
-                // it, a needle inside a trailing comment counts as a hit —
-                // and under an exact-count baseline, a comment could silently
-                // SUBSTITUTE for a deleted real site.
-                if let Some(slashes) = code.find("//") {
-                    code.truncate(slashes);
-                }
-                let ctrim = code.trim_start();
-                if test_depth == 0 && !pending_test_attr && cfg_is_test_only(ctrim) {
-                    // Do not continue yet: an inline attribute item such as
-                    // #[cfg(test)] fn f() { must contribute its opening brace
-                    // before the test-only body is skipped.
-                    pending_test_attr = true;
-                }
-                if test_depth > 0 || pending_test_attr {
-                    let opens = code.matches('{').count() as i32;
-                    let closes = code.matches('}').count() as i32;
-                    if pending_test_attr {
-                        if opens > 0 {
-                            pending_test_attr = false;
-                        } else if ctrim.trim_end().ends_with(';') {
-                            // A brace-less gated item (`#[cfg(test)] use …;`,
-                            // `mod x;`) ends at its semicolon. Without this
-                            // the pending flag latches forever and everything
-                            // after it in the file goes invisible — the same
-                            // blindness the brace tracker was built to fix.
-                            // `trim_end` because truncating a trailing line
-                            // comment leaves the space that preceded the
-                            // `//`: `mod tests; // out of line` must still
-                            // read as terminated.
-                            pending_test_attr = false;
-                            continue;
-                        }
-                    }
-                    test_depth = (test_depth + opens - closes).max(0);
-                    continue;
-                }
-                visit(&path, &code, line);
-            }
+            files.push(path);
         }
     }
+    files.sort();
+    files
 }
 
-/// Whether `path` is an out-of-line test module below a crate's `src/`.
-/// These modules are parent-gated, so scanning the child file alone cannot
-/// recover its cfg context.
-pub fn is_test_only_source_path(path: &Path) -> bool {
-    let mut below_src = false;
-    for component in path.components() {
-        if component.as_os_str() == "src" {
-            below_src = true;
-        } else if below_src && component.as_os_str() == "lib_tests" {
-            return true;
+/// Files that some OTHER file declares as a `#[cfg(test)]`-gated out-of-line
+/// module (`#[cfg(test)] mod x;`, with or without `#[path = "..."]`).
+///
+/// Such a child carries no cfg of its own, so a line scanner reading it
+/// alone would call test scaffolding production code. Detecting them
+/// STRUCTURALLY — from the declaration — rather than by filename convention
+/// is what keeps this complete: this repo declares them as `lib_tests/*`,
+/// `mod_tests/*`, `tools_tests/*`, `*_test.rs`, and a plain `tests.rs`, and
+/// a name allowlist covers only the ones someone already noticed.
+fn test_gated_children(files: &[PathBuf]) -> std::collections::BTreeSet<PathBuf> {
+    let mut children = std::collections::BTreeSet::new();
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        let Some(dir) = file.parent() else { continue };
+        let mut gated = false;
+        let mut path_attr: Option<String> = None;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.starts_with("#[cfg(") {
+                gated |= cfg_is_test_only(trimmed);
+                // An inline `#[cfg(test)] mod x;` declares on this same line.
+                if let Some(rest) = trimmed.split_once(']').map(|(_, r)| r.trim()) {
+                    if gated {
+                        if let Some(child) = declared_child(dir, rest, path_attr.as_deref()) {
+                            children.insert(child);
+                            gated = false;
+                            path_attr = None;
+                        }
+                    }
+                }
+                continue;
+            }
+            if trimmed.starts_with("#[path") {
+                path_attr = trimmed
+                    .split('"')
+                    .nth(1)
+                    .map(std::string::ToString::to_string);
+                continue;
+            }
+            if trimmed.starts_with("#[") {
+                continue;
+            }
+            if gated {
+                if let Some(child) = declared_child(dir, trimmed, path_attr.as_deref()) {
+                    children.insert(child);
+                }
+            }
+            // Attributes bind to the next item only.
+            gated = false;
+            path_attr = None;
         }
     }
-    false
+    children
+}
+
+/// Resolve `mod NAME;` (optionally redirected by `#[path = "..."]`) against
+/// the declaring file's directory, which is where every out-of-line child in
+/// this repo lives.
+fn declared_child(dir: &Path, item: &str, path_attr: Option<&str>) -> Option<PathBuf> {
+    let rest = item.strip_prefix("mod ")?;
+    let name = rest.strip_suffix(';')?.trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    if let Some(rel) = path_attr {
+        return Some(dir.join(rel));
+    }
+    let flat = dir.join(format!("{name}.rs"));
+    if flat.is_file() {
+        return Some(flat);
+    }
+    let nested = dir.join(name).join("mod.rs");
+    nested.is_file().then_some(nested)
+}
+
+/// Visit every production line of every Rust file under `roots` (see
+/// [`production_roots`]), as `visit(path, code, raw)` where `code` is the
+/// line with string-literal contents blanked and its trailing line comment
+/// removed, and `raw` is the original line. Doc/line comments,
+/// `#[cfg(test)]`-gated regions, and parent-gated out-of-line test children
+/// are not visited. `skip_file` lets a consumer add its own exclusions.
+pub fn for_each_production_line(
+    roots: &[PathBuf],
+    skip_file: &dyn Fn(&Path) -> bool,
+    visit: &mut dyn FnMut(&Path, &str, &str),
+) {
+    let files = rust_files(roots, skip_file);
+    let children = test_gated_children(&files);
+    for path in &files {
+        if children.contains(path) {
+            continue;
+        }
+        let path = path.as_path();
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        // Skip cfg items that cannot compile in production by brace depth:
+        // from the attribute, ignore lines until the braces opened after
+        // it close again.
+        let mut test_depth: i32 = 0;
+        let mut pending_test_attr = false;
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            // Doc comments describe the guarantee; they do not invoke it.
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            // Brace counting and cfg matching both work on the line with
+            // string literals blanked, so `"{"` in a message or `"test"`
+            // in a feature name (`feature = "test-util"`) cannot skew
+            // either.
+            let mut code = strip_string_literals(line);
+            // Truncate the trailing line comment AFTER blanking strings
+            // (so a `//` inside a literal cannot trigger this). Without
+            // it, a needle inside a trailing comment counts as a hit —
+            // and under an exact-count baseline, a comment could silently
+            // SUBSTITUTE for a deleted real site.
+            if let Some(slashes) = code.find("//") {
+                code.truncate(slashes);
+            }
+            let ctrim = code.trim_start();
+            if test_depth == 0 && !pending_test_attr && cfg_is_test_only(ctrim) {
+                // Do not continue yet: an inline attribute item such as
+                // #[cfg(test)] fn f() { must contribute its opening brace
+                // before the test-only body is skipped.
+                pending_test_attr = true;
+            }
+            if test_depth > 0 || pending_test_attr {
+                let opens = code.matches('{').count() as i32;
+                let closes = code.matches('}').count() as i32;
+                if pending_test_attr {
+                    if opens > 0 {
+                        pending_test_attr = false;
+                    } else if ctrim.trim_end().ends_with(';') {
+                        // A brace-less gated item (`#[cfg(test)] use …;`,
+                        // `mod x;`) ends at its semicolon. Without this
+                        // the pending flag latches forever and everything
+                        // after it in the file goes invisible — the same
+                        // blindness the brace tracker was built to fix.
+                        // `trim_end` because truncating a trailing line
+                        // comment leaves the space that preceded the
+                        // `//`: `mod tests; // out of line` must still
+                        // read as terminated.
+                        pending_test_attr = false;
+                        continue;
+                    }
+                }
+                test_depth = (test_depth + opens - closes).max(0);
+                continue;
+            }
+            visit(path, &code, line);
+        }
+    }
 }
 
 /// Return true only for cfg predicates that require the `test` atom. This is

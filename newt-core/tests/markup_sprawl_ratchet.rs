@@ -29,13 +29,10 @@ use std::path::Path;
 mod common;
 use common::{for_each_production_line, production_roots, workspace_root};
 
-/// In-src test modules reached through a parent-side `#[cfg(test)] mod x;`
-/// declaration (repo convention: `*_test.rs`). The child file carries no cfg
-/// of its own, so the line scanner cannot see the gate; skip by name. This
-/// exclusion is ratchet-local — `first_principle.rs` deliberately scans them.
-fn parent_gated_test_file(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|n| n.to_string_lossy().ends_with("_test.rs"))
+/// The shared scanner already excludes build output, hidden directories,
+/// and parent-gated test children structurally; this ratchet adds nothing.
+fn no_extra_skips(_: &Path) -> bool {
+    false
 }
 
 /// One armed category: a needle matched against production code lines
@@ -169,7 +166,7 @@ fn production_counts() -> BTreeMap<(&'static str, String), usize> {
     let mut counts: BTreeMap<(&'static str, String), usize> = BTreeMap::new();
     for_each_production_line(
         &production_roots(&root),
-        &parent_gated_test_file,
+        &no_extra_skips,
         &mut |path, code, _raw| {
             let ctrim = code.trim_start();
             for cat in CATEGORIES {
@@ -248,7 +245,7 @@ fn prompt_surface_stays_confined_to_its_three_branches() {
     let mut branches = 0usize;
     for_each_production_line(
         &production_roots(&root),
-        &parent_gated_test_file,
+        &no_extra_skips,
         &mut |path, code, _| {
             if code.contains("PromptSurface") {
                 *files.entry(rel(&root, path)).or_default() += 1;
@@ -309,7 +306,7 @@ fn action_model_registry_is_exact() {
     names.dedup();
     for_each_production_line(
         &production_roots(&root),
-        &parent_gated_test_file,
+        &no_extra_skips,
         &mut |path, code, _| {
             for name in &names {
                 let needle = format!("enum {name}");
@@ -428,7 +425,7 @@ fn the_ratchet_scans_the_real_workspace() {
     let mut saw_anchor = false;
     for_each_production_line(
         &production_roots(&root),
-        &parent_gated_test_file,
+        &no_extra_skips,
         &mut |path, code, _| {
             files.insert(path.to_path_buf());
             if code.contains("fn permission_question_for") {
@@ -446,6 +443,59 @@ fn the_ratchet_scans_the_real_workspace() {
         "scanner never saw permission_question_for in newt-tui — production \
          lines are not being visited"
     );
+}
+
+/// **Parent-gated test children are excluded structurally, not by name.**
+/// A `#[cfg(test)] mod x;` child carries no cfg of its own, so a line
+/// scanner reading it alone calls test scaffolding production code. Two
+/// name allowlists (`*_test.rs` here, `lib_tests/` in the shared scanner)
+/// covered only the children someone had noticed; the repo has seven more
+/// under `mod_tests/`, `tools_tests/`, and `newt-skills/src/tests.rs`. A
+/// test-only `Question { .. }`, `console.ask(`, or `stdin().read_line` in
+/// any of them reports as a NEW production site, and the natural reaction
+/// is to add a third allowlist name.
+///
+/// Regression (#1823 review A0-3): against the name allowlists this failed
+/// listing the children they missed, led by
+/// `newt-core/src/agentic/mod_tests/anthropic_loop.rs`.
+#[test]
+fn parent_gated_test_children_are_excluded_structurally() {
+    let root = workspace_root();
+    let mut visited = std::collections::BTreeSet::new();
+    for_each_production_line(&production_roots(&root), &|_| false, &mut |path, _, _| {
+        visited.insert(rel(&root, path));
+    });
+
+    // Declared out of line behind `#[cfg(test)]`, by `#[path = "..."]` or by
+    // a plain `mod x;` — every form the repo actually uses.
+    let children = [
+        "newt-core/src/agentic/mod_tests/anthropic_loop.rs",
+        "newt-core/src/agentic/mod_tests/http_loop.rs",
+        "newt-core/src/agentic/mod_tests/artifact_provenance.rs",
+        "newt-core/src/agentic/mod_tests/bat_largest_files.rs",
+        "newt-core/src/agentic/tools_tests/private_url_mcp_bat.rs",
+        "newt-skills/src/tests.rs",
+        "newt-tui/src/lib_tests/core.rs",
+        "newt-tui/src/prompt_visibility_test.rs",
+        "newt-core/src/tty/pty_notice_test.rs",
+    ];
+    let leaked: Vec<_> = children.iter().filter(|c| visited.contains(**c)).collect();
+    assert!(
+        leaked.is_empty(),
+        "parent-gated test children scanned as production: {leaked:?}"
+    );
+    // The declaring parents ARE production — an exclusion that swallowed
+    // them would make the whole scan vacuous.
+    for parent in [
+        "newt-core/src/agentic/mod.rs",
+        "newt-skills/src/lib.rs",
+        "newt-tui/src/lib.rs",
+    ] {
+        assert!(
+            visited.contains(parent),
+            "the declaring parent must still be scanned: {parent}"
+        );
+    }
 }
 
 /// **A trailing comment on a gated brace-less item must not blind the rest
@@ -477,7 +527,7 @@ fn a_trailing_comment_on_a_gated_item_does_not_blind_the_file() {
     let mut visited = Vec::new();
     for_each_production_line(
         &[root.path().to_path_buf()],
-        &parent_gated_test_file,
+        &no_extra_skips,
         &mut |_, code, _| {
             if code.contains("Parser::new") {
                 visited.push(code.to_string());
@@ -525,7 +575,7 @@ fn the_walk_is_scoped_to_production_workspace_members() {
 
     let scan = |roots: &[std::path::PathBuf]| {
         let mut seen = Vec::new();
-        for_each_production_line(roots, &parent_gated_test_file, &mut |path, code, _| {
+        for_each_production_line(roots, &no_extra_skips, &mut |path, code, _| {
             if code.contains("Parser::new") {
                 seen.push(rel(root.path(), path));
             }
@@ -583,7 +633,7 @@ fn the_walker_never_descends_into_hidden_directories() {
     // test here, not the workspace scoping (covered by its own test).
     for_each_production_line(
         &[root.path().to_path_buf()],
-        &parent_gated_test_file,
+        &no_extra_skips,
         &mut |path, code, _| {
             if code.contains("Parser::new") {
                 visited.push(rel(root.path(), path));
