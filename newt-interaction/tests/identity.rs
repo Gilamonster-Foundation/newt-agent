@@ -174,14 +174,29 @@ fn every_binding_of_an_offer_is_covered() {
         base_id,
         "provenance is unbound"
     );
+}
 
-    let mut lifecycle = base.clone();
-    lifecycle.lifecycle = newt_interaction::LifecycleState::Published;
-    assert_ne!(
-        lifecycle.instance_id().unwrap(),
-        base_id,
-        "lifecycle is unbound"
+/// **`InstanceId` is the identity of the OFFER, never of its state.**
+///
+/// ADR laws 8 and 12 put instance state out of band: definition and
+/// transcript bytes are immutable, and progress, expiry, responses, and
+/// resolution travel in digest-bound sidecars. Carrying a lifecycle field
+/// inside the content-addressed record breaks that — a Published X becomes
+/// an Answered Y, so the id names a snapshot, and a response that bound X
+/// no longer refers to anything the store holds. A3's transition records
+/// reference this STABLE id instead.
+#[test]
+fn instance_identity_is_stable_across_lifecycle() {
+    let inst = instance(&definition());
+    let wire = serde_json::to_value(&inst).unwrap();
+    assert!(
+        wire.get("lifecycle").is_none(),
+        "the offer record carries lifecycle state, so its id is a snapshot \
+         id: {wire}"
     );
+    // The type still exists — A3's out-of-band records use it — it simply
+    // does not live inside the thing whose identity must not move.
+    let _ = newt_interaction::LifecycleState::Published;
 }
 
 /// A response binds the ADR's full list. The idempotency key and the

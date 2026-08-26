@@ -1,6 +1,15 @@
-//! The host-minted, out-of-band instance: everything mutable about a live
-//! interaction, kept OUT of the definition so definition bytes stay
-//! immutable (ADR law 12).
+//! The host-minted offer: the binding of a definition to an audience,
+//! kept OUT of the definition so definition bytes stay immutable (ADR law
+//! 12).
+//!
+//! **`InstanceId` is the identity of the OFFER, never of its state.** The
+//! record binds what the offer IS — which definition, at which revision, to
+//! whom, under which fence, until when, from where — and nothing that
+//! changes as the interaction proceeds. Lifecycle, progress, responses, and
+//! resolution are out of band (ADR law 8): A3's transition records carry
+//! them and reference this stable id. An id that moved when the state moved
+//! would be a snapshot id, and every response binding the earlier snapshot
+//! would dangle.
 
 use content_addressable::{canonical, ContentAddressable, ContentError};
 use serde::{Deserialize, Serialize};
@@ -11,8 +20,15 @@ use crate::ids::{DefinitionId, InstanceId, Nonce, Revision};
 /// The versioned type tag every instance carries.
 pub const INSTANCE_SCHEMA_V1: &str = "newt.interaction.instance/v1";
 
-/// Where an instance is in its life. A2 defines the STATES; A3 drives the
-/// transitions between them.
+/// Where an instance is in its life.
+///
+/// A2 defines the STATES; A3 drives the transitions. Deliberately NOT a
+/// field of [`InteractionInstance`]: state is out of band (ADR laws 8 and
+/// 12), so A3's transition records carry it and reference the offer by its
+/// stable [`InstanceId`](crate::InstanceId). Putting it inside the
+/// content-addressed record would make that id name a snapshot — a
+/// Published X would become an Answered Y, and a response that bound X
+/// would refer to nothing the store still holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -103,8 +119,6 @@ pub struct InteractionInstance {
     pub responder_policy: ResponderPolicy,
     /// Where this offer came from.
     pub provenance: Provenance,
-    /// Where it is in its life.
-    pub lifecycle: LifecycleState,
 }
 
 impl InteractionInstance {

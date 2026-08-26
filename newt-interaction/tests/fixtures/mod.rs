@@ -4,7 +4,7 @@
 
 use newt_interaction::{
     AssertionKind, Audience, Control, ControlId, ControlKind, ControlValue, IdempotencyKey,
-    InteractionDefinition, InteractionInstance, InteractionKind, LifecycleState, Nonce, Provenance,
+    InteractionDefinition, InteractionInstance, InteractionKind, Nonce, Provenance,
     ResponderPolicy, ResponderProvenance, Response, Revision, Scope, SemanticRole,
     RESPONSE_SCHEMA_V1,
 };
@@ -53,7 +53,6 @@ pub fn instance(def: &InteractionDefinition) -> InteractionInstance {
             origin: "permission-gate".to_string(),
             minted_tick: 42,
         },
-        lifecycle: LifecycleState::Draft,
     }
 }
 
