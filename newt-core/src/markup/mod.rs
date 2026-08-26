@@ -39,8 +39,17 @@
 //! guessing whether ten kilobytes of text "looked like" metadata is exactly
 //! the drift law 5 forbids. Front matter larger than
 //! [`MAX_ENVELOPE_BYTES`] is likewise malformed: no honest interaction
-//! definition needs it, and a bound keeps a hostile document from turning
-//! the closing-fence scan into work proportional to an unbounded envelope.
+//! definition needs it.
+//!
+//! The bound is a bound on WORK, not merely on the verdict. The
+//! closing-fence scan reads at most [`SCAN_WINDOW_BYTES`] — one maximal
+//! envelope plus one closing-fence line ([`CLOSING_FENCE_SLACK`], which
+//! caps fence padding at [`FENCE_PADDING_LIMIT`] rather than allowing
+//! unbounded whitespace). Bytes beyond the window are never examined; only
+//! `rest.len()`, an O(1) slice length, decides between `Oversized` and
+//! `Unclosed`. A fence line that would straddle the window edge is
+//! therefore not found — honoring a truncated one would place the body
+//! inside that line's tail.
 //!
 //! ## Idempotence boundary (documented, not hand-waved)
 //!
@@ -70,6 +79,34 @@ pub const FENCE: &str = "+++";
 /// profile's front matter is under 2 KiB), far below "the parser will chew
 /// on anything".
 pub const MAX_ENVELOPE_BYTES: usize = 64 * 1024;
+
+/// The most whitespace a closing-fence line may carry and still be
+/// honored. The closing scan trims, so `  +++  ` is a fence — but
+/// "unbounded padding" would make the fence line itself unbounded, and the
+/// scan window below could not be a fixed size. Sixty-four bytes is far
+/// more indentation than any real document and small enough to state.
+pub const FENCE_PADDING_LIMIT: usize = 64;
+
+/// The most a single closing-fence line can occupy: the fence, its padding
+/// allowance, and a `\r\n`.
+pub const CLOSING_FENCE_SLACK: usize = FENCE.len() + FENCE_PADDING_LIMIT + 2;
+
+/// The hard cap on how much input the closing-fence scan may READ:
+/// everything an in-bounds envelope could need, plus one closing-fence
+/// line. Bytes past this are never examined — only `rest.len()`, an O(1)
+/// slice length, is consulted to choose between `Oversized` and
+/// `Unclosed`.
+pub const SCAN_WINDOW_BYTES: usize = MAX_ENVELOPE_BYTES + CLOSING_FENCE_SLACK;
+
+/// The prefix of `rest` the closing-fence scan is allowed to read, cut to a
+/// char boundary so the slice is valid UTF-8.
+fn scan_window(rest: &str) -> &str {
+    let mut end = SCAN_WINDOW_BYTES.min(rest.len());
+    while end > 0 && !rest.is_char_boundary(end) {
+        end -= 1;
+    }
+    &rest[..end]
+}
 
 /// How an envelope can be malformed. Fail closed: none of these fall back
 /// to guessing.
@@ -168,10 +205,22 @@ pub fn split_newt_metadata(text: &str) -> Result<SplitDocument<'_>, EnvelopeErro
         },
     };
     // Find the closing fence: the first line that is exactly `+++` after
-    // whitespace trimming (frozen role-profile behavior).
-    for (idx, line) in LineOffsets::new(rest) {
+    // whitespace trimming (frozen role-profile behavior). The scan reads at
+    // most ONE WINDOW — everything an in-bounds envelope could need plus a
+    // single closing-fence line — so a hostile document cannot make this
+    // work proportional to its own size.
+    let window = scan_window(rest);
+    let truncated = window.len() < rest.len();
+    for (idx, line) in LineOffsets::new(window) {
         if idx > MAX_ENVELOPE_BYTES {
             return Err(EnvelopeError::Oversized { bytes: idx });
+        }
+        // The final line of a truncated window has no newline because the
+        // WINDOW ended, not because the line did. Honoring it would accept
+        // a fence that is really the head of a longer line and put the body
+        // inside that line's tail.
+        if truncated && !line.ends_with('\n') {
+            break;
         }
         if line.trim_end_matches(['\r', '\n']).trim() == FENCE {
             // `idx` IS the front matter's length here, and the check above
@@ -184,9 +233,10 @@ pub fn split_newt_metadata(text: &str) -> Result<SplitDocument<'_>, EnvelopeErro
             });
         }
     }
-    // The whole remainder was scanned without a closing fence. When that
-    // remainder itself exceeds the envelope bound, Oversized is the truer
-    // verdict than Unclosed — the document demanded an over-limit scan.
+    // No closing fence inside the window. `rest.len()` is an O(1) slice
+    // length, not a scan, so consulting it reads nothing further; it is
+    // reported as `bytes` because the true remainder is more useful to an
+    // operator than the window constant.
     if rest.len() > MAX_ENVELOPE_BYTES {
         return Err(EnvelopeError::Oversized { bytes: rest.len() });
     }
@@ -216,9 +266,10 @@ pub fn strip_newt_metadata(text: &str) -> Result<&str, EnvelopeError> {
 /// [`EnvelopeError::FrontMatterContainsFence`] when the front matter holds a
 /// line that would read as the closing fence (the split would truncate it);
 /// [`EnvelopeError::Oversized`] when it exceeds [`MAX_ENVELOPE_BYTES`];
-/// [`EnvelopeError::BodyStartsWithFence`] when the body's first line is a
-/// fence (strip idempotence — the lint the ADR requires of generated and
-/// hand-authored documents alike).
+/// [`EnvelopeError::BodyOpensAnEnvelope`] when the body would itself open
+/// an envelope (strip idempotence — the lint the ADR requires of generated
+/// and hand-authored documents alike). The lint asks the real splitter
+/// rather than approximating it, so it is exactly as strict as the grammar.
 pub fn assemble_newt_metadata(front_matter: &str, body: &str) -> Result<String, EnvelopeError> {
     let newline = if front_matter.is_empty() || front_matter.ends_with('\n') {
         ""
@@ -424,6 +475,25 @@ mod tests {
         let split = split_newt_metadata(&doc).unwrap();
         assert_eq!(split.front_matter.unwrap().len(), MAX_ENVELOPE_BYTES);
         assert_eq!(split.body, "body\n");
+        // The bound is inclusive on one side and exclusive on the other,
+        // asserted directly on `split` rather than only through `assemble`:
+        // exactly MAX bytes of front matter then `+++\n` splits; one more
+        // byte is Oversized.
+        let at_bound = format!("+++\n{}\n+++\nbody\n", "x".repeat(MAX_ENVELOPE_BYTES - 1));
+        assert_eq!(
+            split_newt_metadata(&at_bound)
+                .unwrap()
+                .front_matter
+                .unwrap()
+                .len(),
+            MAX_ENVELOPE_BYTES
+        );
+        let over = format!("+++\n{}\n+++\nbody\n", "x".repeat(MAX_ENVELOPE_BYTES));
+        assert!(matches!(
+            split_newt_metadata(&over),
+            Err(EnvelopeError::Oversized { bytes }) if bytes == MAX_ENVELOPE_BYTES + 1
+        ));
+
         // Already newline-terminated at exactly the bound: no supplement, so
         // it fits and round-trips.
         let exact_terminated = format!("{}\n", "x".repeat(MAX_ENVELOPE_BYTES - 1));
@@ -447,6 +517,55 @@ mod tests {
             assemble_newt_metadata("a = 1\n", split.body),
             Err(EnvelopeError::BodyOpensAnEnvelope),
             "assemble lints away the shape that would break idempotence"
+        );
+    }
+
+    /// **The envelope bound is a bound on WORK, observably.** The module
+    /// claims a hostile document cannot turn the closing-fence scan into
+    /// work proportional to an unbounded envelope. Asserting only the
+    /// `Oversized` VERDICT would not prove that — the old code returned
+    /// the right verdict after reading every byte, because
+    /// `LineOffsets::next` calls `find('\n')` over the whole remaining
+    /// input, and a single multi-megabyte line with no newline is scanned
+    /// in full before the per-line length check ever runs. So assert the
+    /// input the scanner is handed.
+    ///
+    /// Regression (#1826 external review C): against the unbounded scan
+    /// this failed with `the scanner was handed 262144 bytes, window is
+    /// 65605`.
+    #[test]
+    fn the_closing_fence_scan_reads_at_most_one_window() {
+        let hostile = "x".repeat(MAX_ENVELOPE_BYTES * 4);
+        assert!(
+            scan_window(&hostile).len() <= SCAN_WINDOW_BYTES,
+            "the scanner was handed {} bytes, window is {SCAN_WINDOW_BYTES}",
+            scan_window(&hostile).len()
+        );
+        // A short document is handed to the scanner whole.
+        assert_eq!(scan_window("a = 1\n+++\n").len(), "a = 1\n+++\n".len());
+        // The cut lands on a char boundary even when the window would
+        // split a multi-byte character.
+        let multibyte = "\u{2298}".repeat(MAX_ENVELOPE_BYTES);
+        let window = scan_window(&multibyte);
+        assert!(window.len() <= SCAN_WINDOW_BYTES);
+        assert!(multibyte.starts_with(window), "the window is a real prefix");
+    }
+
+    /// A closing fence whose line runs past the window is NOT a fence:
+    /// honoring a truncated one would put the body inside the padding.
+    #[test]
+    fn a_fence_line_straddling_the_window_is_not_found() {
+        let padding = " ".repeat(FENCE_PADDING_LIMIT * 4);
+        let doc = format!(
+            "+++\n{}\n+++{padding}\nbody\n",
+            "x".repeat(MAX_ENVELOPE_BYTES - 1)
+        );
+        assert!(
+            matches!(
+                split_newt_metadata(&doc),
+                Err(EnvelopeError::Oversized { .. })
+            ),
+            "an over-padded fence is not honored, and the envelope is over the limit"
         );
     }
 
