@@ -26,30 +26,33 @@ pub(crate) fn escape(s: &str) -> String {
 /// smuggle script into the cockpit. Soft line breaks become hard breaks so
 /// chat text keeps its newlines instead of Markdown-collapsing them.
 pub(crate) fn render_markdown(src: &str) -> String {
-    use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
+    use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Parser, Tag, TagEnd};
     let mut in_mermaid = false;
-    let parser = Parser::new_ext(src, Options::all()).map(|ev| match ev {
-        Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
-            let is_mermaid = info
-                .split_whitespace()
-                .next()
-                .is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"));
-            if is_mermaid {
-                in_mermaid = true;
-                Event::Html(CowStr::Borrowed(
-                    r#"<pre class="mermaid" data-markdown-extension="mermaid">"#,
-                ))
-            } else {
-                Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+    let parser =
+        Parser::new_ext(src, newt_core::markup::dialect::web_enhancement_options()).map(|ev| {
+            match ev {
+                Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
+                    let is_mermaid = info
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"));
+                    if is_mermaid {
+                        in_mermaid = true;
+                        Event::Html(CowStr::Borrowed(
+                            r#"<pre class="mermaid" data-markdown-extension="mermaid">"#,
+                        ))
+                    } else {
+                        Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+                    }
+                }
+                Event::End(TagEnd::CodeBlock) if in_mermaid => {
+                    in_mermaid = false;
+                    Event::Html(CowStr::Borrowed("</pre>"))
+                }
+                Event::SoftBreak => Event::HardBreak,
+                other => other,
             }
-        }
-        Event::End(TagEnd::CodeBlock) if in_mermaid => {
-            in_mermaid = false;
-            Event::Html(CowStr::Borrowed("</pre>"))
-        }
-        Event::SoftBreak => Event::HardBreak,
-        other => other,
-    });
+        });
     let mut raw = String::new();
     html::push_html(&mut raw, parser);
     ammonia::Builder::default()

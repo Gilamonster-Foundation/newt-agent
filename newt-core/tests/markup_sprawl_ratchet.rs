@@ -105,8 +105,11 @@ const CATEGORIES: &[Category] = &[
             ("newt-web/src/shell.rs", 1),
         ],
         rationale: "two Markdown parsers with two option matrices (TUI dialect \
-                    vs web Options::all) is the dialect fork the epic's A1/C3 \
-                    slices own; a third instantiation forks the dialect again",
+                    vs web Options::all). A1 (#1825) named both matrices in \
+                    newt_core::markup::dialect so neither site chooses \
+                    undocumented defaults; C3's deletion gate owns removing \
+                    the second matrix. A third instantiation forks the \
+                    dialect again",
     },
     Category {
         name: "question construction sites",
