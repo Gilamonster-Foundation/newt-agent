@@ -75,6 +75,15 @@ pub enum Decoded<T> {
 }
 
 /// Just enough of any record to read its tag without committing to a shape.
+///
+/// **Deliberately NOT `deny_unknown_fields`, and that absence is
+/// load-bearing.** Every other `Deserialize` type here forbids unknown
+/// fields; this one must tolerate them, because its entire job is to read
+/// the tag out of a record whose remaining shape is exactly what we do not
+/// yet know. Adding the attribute for consistency would make every real
+/// record fail the probe and turn all three gates into `Malformed`,
+/// including records this build understands perfectly.
+/// `the_probe_reads_a_tag_it_does_not_understand` pins it.
 #[derive(Deserialize)]
 struct SchemaProbe {
     schema: String,
@@ -174,6 +183,13 @@ pub fn decode_response(bytes: &[u8]) -> Result<Decoded<Response>, ProtocolError>
 }
 
 /// One demand a surface could not meet, reported rather than swallowed.
+///
+/// A consumer-side RESULT, not a wire record: it is computed here from a
+/// definition and a surface's capabilities, and nothing ever parses one.
+/// It therefore derives no serde traits at all — which is why it carries
+/// no `deny_unknown_fields`, and why it is absent from the schema and
+/// vector corpora. A2 publishes the records that travel; how A3 chooses to
+/// report a shortfall outward is A3's envelope to define.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Degradation {
     feature: SurfaceFeature,
@@ -188,6 +204,9 @@ impl Degradation {
 }
 
 /// What a surface can honestly present, and what it had to give up.
+///
+/// A consumer-side result like [`Degradation`], and not on the wire for
+/// the same reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Presentation {
     degradations: Vec<Degradation>,

@@ -338,3 +338,45 @@ fn without_the_byte_check_the_same_bytes_are_accepted() {
          byte check's doing"
     );
 }
+
+/// **The tag probe must tolerate what everything else refuses.**
+///
+/// Every `Deserialize` type in this crate forbids unknown fields except
+/// the private tag probe, which must accept them — its job is to read the
+/// tag out of a record whose remaining shape is precisely what we do not
+/// know yet. That asymmetry looks like an oversight and is not, so it is
+/// pinned: a sweep that "corrected" it for consistency would make every
+/// real record fail the probe and report `Malformed`, including records
+/// this build understands perfectly.
+#[test]
+fn the_probe_reads_a_tag_it_does_not_understand() {
+    let def = definition();
+    let tainted = with_extra_field(&canonical::to_canonical_dagcbor(&def).unwrap());
+
+    // The probe got far enough to classify this, rather than failing as
+    // unreadable — that is the tolerance under test.
+    match decode_definition(&tainted).unwrap() {
+        Decoded::Unknown(raw) => {
+            assert_eq!(
+                raw.schema(),
+                DEFINITION_SCHEMA_V1,
+                "the probe read the tag out of a record it could not interpret"
+            );
+            assert_eq!(raw.reason(), UnknownReason::Uninterpretable);
+        }
+        Decoded::Known(_) => panic!("an unknown field was interpreted"),
+    }
+
+    // ...and a forward version, whose whole shape may differ, is still
+    // classified rather than rejected as garbage.
+    match decode_definition(&forward_bytes(0, true)).unwrap() {
+        Decoded::Unknown(raw) => assert_eq!(raw.reason(), UnknownReason::ForwardVersion),
+        Decoded::Known(_) => panic!("a v2 record was read as a v1"),
+    }
+
+    // Only genuinely unreadable bytes are Malformed.
+    assert!(matches!(
+        decode_definition(b"not cbor at all"),
+        Err(ProtocolError::Malformed { .. })
+    ));
+}
