@@ -440,48 +440,80 @@ fn action_model_registry_is_exact() {
     );
 }
 
-/// Wire-shape tripwires for the legacy `Question` contract A0 freezes: the
-/// serde surface of `Question`/`Action` (exactly two attributes, both
-/// load-bearing per their doc comments) and the eight `PermissionAction` wire
-/// renames. Any drift here changes persisted/web JSON mid-migration.
+/// **The legacy `Question` wire shape, frozen as an exact JSON golden.**
+///
+/// This replaces a count of `#[serde` attributes, which was not a wire
+/// freeze at all: renaming `markdown` to `body`, changing `note` from
+/// `Option<String>` to `String`, or swapping `skip_serializing_if` for a
+/// `rename` all change persisted and web-facing JSON while leaving the
+/// count at two — and a doc comment quoting `#[serde(` tripped it with
+/// nothing on the wire changed. What the migration must not break is the
+/// BYTES, so assert the bytes.
+///
+/// Both load-bearing omissions are covered: `aliases` disappears when
+/// empty (so already-published web/DB JSON stays byte-identical) and
+/// `note` disappears when `None`. Their round trip back through
+/// `Question::parse` is what `store.rs` relies on to re-validate an
+/// answered action inside its own transaction.
 #[test]
-fn frozen_wire_shapes_are_unchanged() {
-    let root = workspace_root();
-    let question =
-        std::fs::read_to_string(root.join("newt-core/src/tty/widgets/question.rs")).unwrap();
-    let serde_attrs = question.matches("#[serde").count();
+fn the_question_wire_shape_is_frozen() {
+    use newt_core::{Action, PermissionAction, Question};
+
+    let full = Question {
+        markdown: "\u{2298} run_command wants to run `bash`".to_string(),
+        actions: vec![
+            Action::new(PermissionAction::AllowOnce, "a", "allow once"),
+            Action::new(PermissionAction::Deny, "d", "deny (default)").with_aliases(["n", "N"]),
+        ],
+        note: Some("Esc=back".to_string()),
+    };
     assert_eq!(
-        serde_attrs, 2,
-        "Question/Action serde attribute count changed from the frozen 2 \
-         (aliases + note) — the legacy wire shape moved during migration"
+        serde_json::to_string(&full).unwrap(),
+        r#"{"markdown":"⊘ run_command wants to run `bash`","actions":[{"value":"allow_once","key":"a","label":"allow once"},{"value":"deny","key":"d","label":"deny (default)","aliases":["n","N"]}],"note":"Esc=back"}"#
     );
 
-    let permissions =
-        std::fs::read_to_string(root.join("newt-core/src/agentic/permissions.rs")).unwrap();
-    let start = permissions
-        .find("permission_actions! {")
-        .expect("the permission_actions! invocation exists");
-    let block = brace_block(&permissions[start..]);
+    // Empty aliases and a missing note are OMITTED, not rendered as
+    // `[]`/`null` — the two `skip_serializing_if`s, pinned by their effect.
+    let minimal: Question<PermissionAction> = Question {
+        markdown: "m".to_string(),
+        actions: vec![Action::new(PermissionAction::Deny, "d", "deny")],
+        note: None,
+    };
     assert_eq!(
-        block.matches("=> \"").count(),
-        8,
-        "PermissionAction wire-rename arm count changed from the frozen 8"
+        serde_json::to_string(&minimal).unwrap(),
+        r#"{"markdown":"m","actions":[{"value":"deny","key":"d","label":"deny"}]}"#
     );
-    for wire in [
-        "\"allow_once\"",
-        "\"allow_session\"",
-        "\"allow_permanent\"",
-        "\"deny\"",
-        "\"deny_always\"",
-        "\"deny_permanent\"",
-        "\"back\"",
-        "\"exit\"",
+
+    // A payload written before `aliases` existed still deserializes, and
+    // still authorizes exactly the displayed action.
+    let legacy: Question<PermissionAction> = serde_json::from_str(
+        r#"{"markdown":"m","actions":[{"value":"deny","key":"d","label":"deny"}]}"#,
+    )
+    .expect("pre-aliases payloads must keep deserializing");
+    assert_eq!(legacy.parse("d"), Some(PermissionAction::Deny));
+    assert_eq!(
+        legacy.parse("a"),
+        None,
+        "an undisplayed action never parses"
+    );
+
+    // Every wire name, so a rename cannot hide behind an unchanged count.
+    for (action, wire) in [
+        (PermissionAction::AllowOnce, "allow_once"),
+        (PermissionAction::AllowSession, "allow_session"),
+        (PermissionAction::AllowPermanent, "allow_permanent"),
+        (PermissionAction::Deny, "deny"),
+        (PermissionAction::DenyAlways, "deny_always"),
+        (PermissionAction::DenyPermanent, "deny_permanent"),
+        (PermissionAction::Back, "back"),
+        (PermissionAction::Exit, "exit"),
     ] {
-        assert!(
-            block.contains(wire),
-            "PermissionAction wire string {wire} left the permission_actions! \
-             block — a wire rename mid-migration"
+        assert_eq!(
+            serde_json::to_string(&action).unwrap(),
+            format!("\"{wire}\""),
+            "PermissionAction wire name changed"
         );
+        assert_eq!(action.as_str(), wire, "as_str must match the wire name");
     }
 }
 
@@ -872,24 +904,4 @@ fn the_walker_never_descends_into_hidden_directories() {
         vec!["newt-core/src/lib.rs".to_string()],
         "exactly the real tree is scanned"
     );
-}
-
-/// From the start of `text` (which begins at the `permission_actions!`
-/// invocation), the substring up to the matching close of its first `{`.
-fn brace_block(text: &str) -> &str {
-    let open = text.find('{').expect("invocation has a block");
-    let mut depth = 0i32;
-    for (i, c) in text[open..].char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &text[..open + i + 1];
-                }
-            }
-            _ => {}
-        }
-    }
-    text
 }
