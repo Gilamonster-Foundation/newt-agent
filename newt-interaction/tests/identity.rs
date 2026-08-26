@@ -9,11 +9,15 @@
 
 use content_addressable::{canonical, ContentAddressable, ContentId};
 use newt_interaction::{
-    Control, ControlKind, DefinitionId, InteractionDefinition, InteractionKind, SemanticRole,
+    Control, ControlKind, DefinitionId, InteractionDefinition, InteractionInstance,
+    InteractionKind, Response, SemanticRole,
 };
 
 mod fixtures;
 use fixtures::{definition, instance, response};
+
+/// One mutation case: the field it perturbs, and how.
+type Case<T> = (&'static str, fn(&mut T));
 
 /// Each record's id is exactly what the crate's own primitives produce from
 /// its canonical bytes — there is no second minting path.
@@ -33,57 +37,6 @@ fn every_record_mints_through_content_addressable() {
     assert_eq!(
         resp.response_id().unwrap().content_id(),
         &ContentId::from_canonical_bytes(&resp.canonical_form().unwrap()),
-    );
-}
-
-/// The canonical form must cover the WHOLE record. Flipping any single field
-/// must move the id; a field the encoder skips is a field an attacker can
-/// change for free.
-#[test]
-fn a_changed_field_changes_the_definition_id() {
-    let base = definition();
-    let base_id = base.definition_id().unwrap();
-
-    let mut kind = base.clone();
-    kind.kind = InteractionKind::Confirm;
-    assert_ne!(kind.definition_id().unwrap(), base_id, "kind is unbound");
-
-    let mut revision = base.clone();
-    revision.revision = base.revision.next();
-    assert_ne!(
-        revision.definition_id().unwrap(),
-        base_id,
-        "revision is unbound"
-    );
-
-    let mut features = base.clone();
-    features.features.secret_input = true;
-    assert_ne!(
-        features.definition_id().unwrap(),
-        base_id,
-        "surface features are unbound"
-    );
-
-    let mut markdown = base.clone();
-    markdown.markdown.push('!');
-    assert_ne!(
-        markdown.definition_id().unwrap(),
-        base_id,
-        "markdown is unbound"
-    );
-
-    let mut controls = base.clone();
-    controls.controls.push(Control {
-        id: newt_interaction::ControlId::new("extra").unwrap(),
-        role: SemanticRole::Cancel,
-        kind: ControlKind::Choice,
-        label: "back".to_string(),
-        required: false,
-    });
-    assert_ne!(
-        controls.definition_id().unwrap(),
-        base_id,
-        "controls are unbound"
     );
 }
 
@@ -150,30 +103,75 @@ fn the_instance_nonce_is_not_the_identity() {
     );
 }
 
-/// Every mutable axis of an offer is bound: scope, TTL, provenance, and
-/// lifecycle all move the id. An offer whose fence could change without
-/// changing its identity is an offer that can be silently re-aimed.
+/// **Every semantic field of an offer moves its id — enumerated, not
+/// sampled.**
+///
+/// The table below is paired with an EXHAUSTIVE destructure of the record.
+/// Adding a field to `InteractionInstance` fails to compile here until it
+/// is named, and naming it without adding a mutation case is then a
+/// deliberate, visible act rather than an oversight. Sampling a few fields
+/// and asserting "the id covers everything" is the vacuous shape: it
+/// passes just as well when the encoder skips the field nobody perturbed.
 #[test]
-fn every_binding_of_an_offer_is_covered() {
+fn every_semantic_field_of_an_offer_moves_its_id() {
     let def = definition();
     let base = instance(&def);
+
+    // EXHAUSTIVE — no `..`. This is the compile-time half of the guard.
+    let InteractionInstance {
+        schema: _,
+        nonce: _,
+        definition: _,
+        revision: _,
+        ttl_ticks: _,
+        scope: _,
+        responder_policy: _,
+        provenance: _,
+    } = &base;
+
+    let cases: Vec<Case<InteractionInstance>> = vec![
+        ("schema", |i| {
+            i.schema = "newt.interaction.instance/v2".into()
+        }),
+        ("nonce", |i| {
+            i.nonce = newt_interaction::Nonce::new("another-handle").unwrap();
+        }),
+        ("definition", |i| {
+            let mut other = definition();
+            other.markdown.push('?');
+            i.definition = other.definition_id().unwrap();
+        }),
+        ("revision", |i| i.revision = i.revision.next()),
+        ("ttl_ticks", |i| i.ttl_ticks += 1),
+        ("scope.workspace_key", |i| {
+            i.scope.workspace_key = "somewhere-else".into();
+        }),
+        ("scope.conversation_id", |i| {
+            i.scope.conversation_id = "another-conversation".into();
+        }),
+        ("responder_policy.audiences", |i| {
+            i.responder_policy.audiences = vec![newt_interaction::Audience::Web];
+        }),
+        ("responder_policy.requires_assertion", |i| {
+            i.responder_policy.requires_assertion = !i.responder_policy.requires_assertion;
+        }),
+        ("provenance.origin", |i| {
+            i.provenance.origin = "someone-else".into();
+        }),
+        ("provenance.minted_tick", |i| i.provenance.minted_tick += 1),
+    ];
+
     let base_id = base.instance_id().unwrap();
-
-    let mut ttl = base.clone();
-    ttl.ttl_ticks += 1;
-    assert_ne!(ttl.instance_id().unwrap(), base_id, "ttl is unbound");
-
-    let mut scope = base.clone();
-    scope.scope.workspace_key = "somewhere-else".to_string();
-    assert_ne!(scope.instance_id().unwrap(), base_id, "scope is unbound");
-
-    let mut provenance = base.clone();
-    provenance.provenance.origin = "someone-else".to_string();
-    assert_ne!(
-        provenance.instance_id().unwrap(),
-        base_id,
-        "provenance is unbound"
-    );
+    for (field, mutate) in cases {
+        let mut altered = base.clone();
+        mutate(&mut altered);
+        assert_ne!(altered, base, "the `{field}` case mutated nothing");
+        assert_ne!(
+            altered.instance_id().unwrap(),
+            base_id,
+            "`{field}` is not bound into the instance's identity"
+        );
+    }
 }
 
 /// **`InstanceId` is the identity of the OFFER, never of its state.**
@@ -199,59 +197,151 @@ fn instance_identity_is_stable_across_lifecycle() {
     let _ = newt_interaction::LifecycleState::Published;
 }
 
-/// A response binds the ADR's full list. The idempotency key and the
-/// responder are part of it: the same values submitted twice under
-/// different keys are two submissions, and the same submission claimed by a
-/// different audience is a different record.
+/// **A response binds every field it claims to — enumerated, not sampled.**
+///
+/// Same shape as the offer table, and the same reason: the ADR's list is
+/// "type + definition + instance + digest + revision + control values +
+/// idempotency key + responder provenance", and a test that perturbs four
+/// of those proves nothing about the other four.
 #[test]
-fn a_response_binds_everything_it_claims_to() {
+fn every_field_a_response_claims_to_bind_moves_its_id() {
     let def = definition();
     let inst = instance(&def);
     let base = response(&def, &inst);
+
+    // EXHAUSTIVE — no `..`.
+    let Response {
+        schema: _,
+        definition: _,
+        instance: _,
+        revision: _,
+        values: _,
+        idempotency_key: _,
+        responder: _,
+        responder_provenance: _,
+    } = &base;
+
+    let cases: Vec<Case<Response>> = vec![
+        ("schema", |r| {
+            r.schema = "newt.interaction.response/v2".into()
+        }),
+        ("definition", |r| {
+            let mut other = definition();
+            other.markdown.push('?');
+            r.definition = other.definition_id().unwrap();
+        }),
+        ("instance", |r| {
+            let mut other = instance(&definition());
+            other.ttl_ticks += 7;
+            r.instance = other.instance_id().unwrap();
+        }),
+        ("revision", |r| r.revision = r.revision.next()),
+        ("values.control", |r| {
+            r.values[0].control = newt_interaction::ControlId::new("allow-once").unwrap();
+        }),
+        ("values.value", |r| {
+            r.values[0].value = newt_interaction::ControlValue::Text {
+                text: "typed instead".into(),
+            };
+        }),
+        ("values.len", |r| {
+            r.values.push(newt_interaction::Submission {
+                control: newt_interaction::ControlId::new("allow-once").unwrap(),
+                value: newt_interaction::ControlValue::Toggle { on: true },
+            });
+        }),
+        ("idempotency_key", |r| {
+            r.idempotency_key = newt_interaction::IdempotencyKey::new("second-try").unwrap();
+        }),
+        ("responder", |r| {
+            r.responder = newt_interaction::Audience::Terminal
+        }),
+        ("responder_provenance.kind", |r| {
+            r.responder_provenance.kind = newt_interaction::AssertionKind::Unauthenticated;
+        }),
+        ("responder_provenance.subject", |r| {
+            r.responder_provenance.subject = "someone-else".into();
+        }),
+        ("responder_provenance.audience", |r| {
+            r.responder_provenance.audience = newt_interaction::Audience::Terminal;
+        }),
+        ("responder_provenance.assertion", |r| {
+            r.responder_provenance.assertion = None;
+        }),
+    ];
+
     let base_id = base.response_id().unwrap();
+    for (field, mutate) in cases {
+        let mut altered = base.clone();
+        mutate(&mut altered);
+        assert_ne!(altered, base, "the `{field}` case mutated nothing");
+        assert_ne!(
+            altered.response_id().unwrap(),
+            base_id,
+            "`{field}` is not bound into the response's identity"
+        );
+    }
+}
 
-    let mut definition_swap = base.clone();
-    let mut other_def = def.clone();
-    other_def.markdown.push('?');
-    definition_swap.definition = other_def.definition_id().unwrap();
-    assert_ne!(
-        definition_swap.response_id().unwrap(),
-        base_id,
-        "the definition digest is unbound"
-    );
+/// Same guard for the definition: exhaustive destructure plus a case per
+/// field.
+#[test]
+fn every_semantic_field_of_a_definition_moves_its_id() {
+    let base = definition();
 
-    let mut revision = base.clone();
-    revision.revision = base.revision.next();
-    assert_ne!(
-        revision.response_id().unwrap(),
-        base_id,
-        "revision is unbound"
-    );
+    // EXHAUSTIVE — no `..`.
+    let InteractionDefinition {
+        schema: _,
+        kind: _,
+        revision: _,
+        markdown: _,
+        controls: _,
+        features: _,
+    } = &base;
 
-    let mut key = base.clone();
-    key.idempotency_key = newt_interaction::IdempotencyKey::new("second-try").unwrap();
-    assert_ne!(
-        key.response_id().unwrap(),
-        base_id,
-        "the idempotency key is unbound"
-    );
+    let cases: Vec<Case<InteractionDefinition>> = vec![
+        ("schema", |d| {
+            d.schema = "newt.interaction.definition/v2".into()
+        }),
+        ("kind", |d| d.kind = InteractionKind::Confirm),
+        ("revision", |d| d.revision = d.revision.next()),
+        ("markdown", |d| d.markdown.push('!')),
+        ("controls.label", |d| d.controls[0].label.push('!')),
+        ("controls.role", |d| {
+            d.controls[0].role = SemanticRole::Cancel
+        }),
+        ("controls.kind", |d| d.controls[0].kind = ControlKind::Text),
+        ("controls.required", |d| {
+            d.controls[0].required = !d.controls[0].required;
+        }),
+        ("controls.id", |d| {
+            d.controls[0].id = newt_interaction::ControlId::new("renamed").unwrap();
+        }),
+        ("controls.len", |d| {
+            d.controls.push(Control {
+                id: newt_interaction::ControlId::new("extra").unwrap(),
+                role: SemanticRole::Cancel,
+                kind: ControlKind::Choice,
+                label: "back".to_string(),
+                required: false,
+            });
+        }),
+        ("features.secret_input", |d| d.features.secret_input = true),
+        ("features.diagrams", |d| d.features.diagrams = true),
+        ("features.multi_control", |d| {
+            d.features.multi_control = true
+        }),
+    ];
 
-    let mut responder = base.clone();
-    responder.responder = newt_interaction::Audience::Terminal;
-    assert_ne!(
-        responder.response_id().unwrap(),
-        base_id,
-        "the responder is unbound"
-    );
-
-    // #1828 §3.2 and the ADR bind a response to "... idempotency key +
-    // responder provenance". An audience is not provenance: it says which
-    // KIND of surface answered, not which authenticated party did.
-    let mut provenance = base.clone();
-    provenance.responder_provenance.subject = "someone-else".to_string();
-    assert_ne!(
-        provenance.response_id().unwrap(),
-        base_id,
-        "responder provenance is unbound"
-    );
+    let base_id = base.definition_id().unwrap();
+    for (field, mutate) in cases {
+        let mut altered = base.clone();
+        mutate(&mut altered);
+        assert_ne!(altered, base, "the `{field}` case mutated nothing");
+        assert_ne!(
+            altered.definition_id().unwrap(),
+            base_id,
+            "`{field}` is not bound into the definition's identity"
+        );
+    }
 }
