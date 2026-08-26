@@ -1,0 +1,200 @@
+[
+  {
+    "name": "definition/choice-with-feature-demands",
+    "record": "definition",
+    "json": {
+      "controls": [
+        {
+          "id": "allow-once",
+          "kind": "choice",
+          "label": "allow-once label",
+          "requirement": "optional",
+          "role": "allow"
+        },
+        {
+          "id": "deny",
+          "kind": "choice",
+          "label": "deny label",
+          "requirement": "required",
+          "role": "deny"
+        }
+      ],
+      "features": [
+        {
+          "feature": "secret-input",
+          "requirement": "required"
+        },
+        {
+          "feature": "diagrams",
+          "requirement": "optional"
+        }
+      ],
+      "kind": "choice",
+      "markdown": "⊘ run_command wants to run `bash`",
+      "revision": 0,
+      "schema": "newt.interaction.definition/v1"
+    },
+    "links": [],
+    "dagcbor_hex": "a6646b696e646663686f69636566736368656d61781e6e6577742e696e746572616374696f6e2e646566696e6974696f6e2f763168636f6e74726f6c7382a56269646a616c6c6f772d6f6e6365646b696e646663686f69636564726f6c6565616c6c6f77656c6162656c70616c6c6f772d6f6e6365206c6162656c6b726571756972656d656e74686f7074696f6e616ca56269646464656e79646b696e646663686f69636564726f6c656464656e79656c6162656c6a64656e79206c6162656c6b726571756972656d656e7468726571756972656468666561747572657382a267666561747572656c7365637265742d696e7075746b726571756972656d656e74687265717569726564a26766656174757265686469616772616d736b726571756972656d656e74686f7074696f6e616c686d61726b646f776e7823e28a982072756e5f636f6d6d616e642077616e747320746f2072756e20606261736860687265766973696f6e00",
+    "content_id": "bafyr4ifrwrg46cs5phbwwcfdvmva7jkuckm3zselcoxxhkcalnfswo7soq"
+  },
+  {
+    "name": "instance/two-audiences-assertion-required",
+    "record": "instance",
+    "json": {
+      "definition": "bafyr4ifrwrg46cs5phbwwcfdvmva7jkuckm3zselcoxxhkcalnfswo7soq",
+      "nonce": "1756200000000000000-0f4c1b2e",
+      "provenance": {
+        "minted_tick": 42,
+        "origin": "permission-gate"
+      },
+      "responder_policy": {
+        "audiences": [
+          "terminal",
+          "web"
+        ],
+        "requires_assertion": true
+      },
+      "revision": 0,
+      "schema": "newt.interaction.instance/v1",
+      "scope": {
+        "conversation_id": "conv-1",
+        "workspace_key": "ws-abc"
+      },
+      "ttl_ticks": 300
+    },
+    "links": [
+      "definition"
+    ],
+    "dagcbor_hex": "a8656e6f6e6365781c313735363230303030303030303030303030302d30663463316232656573636f7065a26d776f726b73706163655f6b65796677732d6162636f636f6e766572736174696f6e5f696466636f6e762d3166736368656d61781c6e6577742e696e746572616374696f6e2e696e7374616e63652f7631687265766973696f6e006974746c5f7469636b7319012c6a646566696e6974696f6ed82a58250001711e20b1b44dcf0a5d79c36b08a3ab2a0fa5541299bcc88b13af73a8405b4b2b3bf2746a70726f76656e616e6365a2666f726967696e6f7065726d697373696f6e2d676174656b6d696e7465645f7469636b182a70726573706f6e6465725f706f6c696379a26961756469656e63657382687465726d696e616c637765627272657175697265735f617373657274696f6ef5",
+    "content_id": "bafyr4idvvkg3vuoqkdl745fjicovyg5kt3eijh3etvwsty34brarcyzfp4"
+  },
+  {
+    "name": "response/value-choice",
+    "record": "response",
+    "json": {
+      "definition": "bafyr4ifrwrg46cs5phbwwcfdvmva7jkuckm3zselcoxxhkcalnfswo7soq",
+      "idempotency_key": "first-try",
+      "instance": "bafyr4idvvkg3vuoqkdl745fjicovyg5kt3eijh3etvwsty34brarcyzfp4",
+      "responder_provenance": {
+        "assertion": "assertion-handle-1",
+        "audience": "web",
+        "kind": "signed-assertion",
+        "subject": "operator:example"
+      },
+      "revision": 0,
+      "schema": "newt.interaction.response/v1",
+      "values": [
+        {
+          "control": "deny",
+          "value": {
+            "kind": "choice",
+            "option": "deny"
+          }
+        }
+      ]
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657381a26576616c7565a2646b696e646663686f696365666f7074696f6e6464656e7967636f6e74726f6c6464656e7968696e7374616e6365d82a58250001711e2075aa8dbad1d050d7fe74a9409d5c1baa9ec8849f649d6d29e37c0c411163257f687265766973696f6e006a646566696e6974696f6ed82a58250001711e20b1b44dcf0a5d79c36b08a3ab2a0fa5541299bcc88b13af73a8405b4b2b3bf2746f6964656d706f74656e63795f6b65796966697273742d74727974726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374706f70657261746f723a6578616d706c656861756469656e63656377656269617373657274696f6e72617373657274696f6e2d68616e646c652d31",
+    "content_id": "bafyr4ihlyw65oeqhwjm6ig7gikpufonql3ezv4o5t5fsux2fg3zda2vmzy"
+  },
+  {
+    "name": "response/value-text",
+    "record": "response",
+    "json": {
+      "definition": "bafyr4ifrwrg46cs5phbwwcfdvmva7jkuckm3zselcoxxhkcalnfswo7soq",
+      "idempotency_key": "first-try",
+      "instance": "bafyr4idvvkg3vuoqkdl745fjicovyg5kt3eijh3etvwsty34brarcyzfp4",
+      "responder_provenance": {
+        "assertion": "assertion-handle-1",
+        "audience": "web",
+        "kind": "signed-assertion",
+        "subject": "operator:example"
+      },
+      "revision": 0,
+      "schema": "newt.interaction.response/v1",
+      "values": [
+        {
+          "control": "deny",
+          "value": {
+            "kind": "text",
+            "text": "a typed answer"
+          }
+        }
+      ]
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657381a26576616c7565a2646b696e64647465787464746578746e6120747970656420616e7377657267636f6e74726f6c6464656e7968696e7374616e6365d82a58250001711e2075aa8dbad1d050d7fe74a9409d5c1baa9ec8849f649d6d29e37c0c411163257f687265766973696f6e006a646566696e6974696f6ed82a58250001711e20b1b44dcf0a5d79c36b08a3ab2a0fa5541299bcc88b13af73a8405b4b2b3bf2746f6964656d706f74656e63795f6b65796966697273742d74727974726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374706f70657261746f723a6578616d706c656861756469656e63656377656269617373657274696f6e72617373657274696f6e2d68616e646c652d31",
+    "content_id": "bafyr4iadxagc7jsywmtfzbqlnw76ju2b5u6fdytg322th3nimkqut546om"
+  },
+  {
+    "name": "response/value-toggle",
+    "record": "response",
+    "json": {
+      "definition": "bafyr4ifrwrg46cs5phbwwcfdvmva7jkuckm3zselcoxxhkcalnfswo7soq",
+      "idempotency_key": "first-try",
+      "instance": "bafyr4idvvkg3vuoqkdl745fjicovyg5kt3eijh3etvwsty34brarcyzfp4",
+      "responder_provenance": {
+        "assertion": "assertion-handle-1",
+        "audience": "web",
+        "kind": "signed-assertion",
+        "subject": "operator:example"
+      },
+      "revision": 0,
+      "schema": "newt.interaction.response/v1",
+      "values": [
+        {
+          "control": "deny",
+          "value": {
+            "kind": "toggle",
+            "on": true
+          }
+        }
+      ]
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657381a26576616c7565a2626f6ef5646b696e6466746f67676c6567636f6e74726f6c6464656e7968696e7374616e6365d82a58250001711e2075aa8dbad1d050d7fe74a9409d5c1baa9ec8849f649d6d29e37c0c411163257f687265766973696f6e006a646566696e6974696f6ed82a58250001711e20b1b44dcf0a5d79c36b08a3ab2a0fa5541299bcc88b13af73a8405b4b2b3bf2746f6964656d706f74656e63795f6b65796966697273742d74727974726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374706f70657261746f723a6578616d706c656861756469656e63656377656269617373657274696f6e72617373657274696f6e2d68616e646c652d31",
+    "content_id": "bafyr4ieepizaninoxmur7dknszghwpcny2hwrclvfm64ob6pdvb7blax5m"
+  },
+  {
+    "name": "response/value-secret-by-reference",
+    "record": "response",
+    "json": {
+      "definition": "bafyr4ifrwrg46cs5phbwwcfdvmva7jkuckm3zselcoxxhkcalnfswo7soq",
+      "idempotency_key": "first-try",
+      "instance": "bafyr4idvvkg3vuoqkdl745fjicovyg5kt3eijh3etvwsty34brarcyzfp4",
+      "responder_provenance": {
+        "assertion": "assertion-handle-1",
+        "audience": "web",
+        "kind": "signed-assertion",
+        "subject": "operator:example"
+      },
+      "revision": 0,
+      "schema": "newt.interaction.response/v1",
+      "values": [
+        {
+          "control": "deny",
+          "value": {
+            "kind": "secret",
+            "reference": "vault-handle-9"
+          }
+        }
+      ]
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657381a26576616c7565a2646b696e6466736563726574697265666572656e63656e7661756c742d68616e646c652d3967636f6e74726f6c6464656e7968696e7374616e6365d82a58250001711e2075aa8dbad1d050d7fe74a9409d5c1baa9ec8849f649d6d29e37c0c411163257f687265766973696f6e006a646566696e6974696f6ed82a58250001711e20b1b44dcf0a5d79c36b08a3ab2a0fa5541299bcc88b13af73a8405b4b2b3bf2746f6964656d706f74656e63795f6b65796966697273742d74727974726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374706f70657261746f723a6578616d706c656861756469656e63656377656269617373657274696f6e72617373657274696f6e2d68616e646c652d31",
+    "content_id": "bafyr4iaqw4wgebffpcq4wfg6nqmo57h356xfamxdnmag6nrcloggjbyp6y"
+  }
+]
