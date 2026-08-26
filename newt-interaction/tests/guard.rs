@@ -43,7 +43,7 @@ const FORBIDDEN: &[&str] = &[
 
 /// Ambient authority this layer must never take. "filesystem" and
 /// "application" are capabilities, not crate names.
-const FORBIDDEN_STD: &[&str] = &["std::fs", "std::net", "std::process", "std::env"];
+const FORBIDDEN_STD: &[&str] = &["fs", "net", "process", "env"];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -52,12 +52,16 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The transitive NORMAL-dependency closure of `package`, by name.
+/// The transitive SHIPPED-dependency closure of `package`, by name: normal
+/// and BUILD dependencies, excluding only `dev`.
 ///
-/// Dev-dependencies are excluded by KIND, not by name: they do not ship, so
-/// `serde_json`/`toml` in `[dev-dependencies]` are not part of what this
-/// crate imposes on a consumer. Build-dependencies are excluded for the same
-/// reason.
+/// Build dependencies count. A build script runs with the full authority of
+/// the building user — reading the filesystem, spawning processes, reaching
+/// the network — before a line of the crate is compiled, so a forbidden
+/// crate arriving through `[build-dependencies]` is not a technicality; it
+/// is the guard's whole subject coming in another door. Only `dev` is
+/// excluded, because dev-dependencies impose nothing on a consumer, which
+/// is why this crate's own `serde_json`/`toml` are not violations.
 fn normal_dependency_closure(package: &str) -> BTreeSet<String> {
     let out = Command::new(env!("CARGO"))
         .args([
@@ -100,8 +104,12 @@ fn normal_dependency_closure(package: &str) -> BTreeSet<String> {
         let mut normal = Vec::new();
         for dep in node["deps"].as_array().into_iter().flatten() {
             let kinds = dep["dep_kinds"].as_array().cloned().unwrap_or_default();
-            // `kind: null` is a normal dependency; "dev"/"build" are not.
-            if kinds.iter().any(|k| k["kind"].is_null()) {
+            // `kind: null` is a normal dependency; "build" ships its
+            // authority into the build; only "dev" is excluded.
+            if kinds
+                .iter()
+                .any(|k| k["kind"].is_null() || k["kind"] == "build")
+            {
                 normal.push(dep["pkg"].as_str().expect("dep pkg id").to_string());
             }
         }
@@ -168,54 +176,98 @@ fn the_guard_would_notice_a_forbidden_dependency() {
          be trusted to see one in newt-interaction. Found: {found:?}"
     );
 }
+/// A0's hardened production-source scanner, reused rather than re-written.
+///
+/// A `#[path]` include is a SOURCE include: it creates no cargo dependency
+/// edge, so the closure guard above stays clean while this crate gets the
+/// brace-depth `#[cfg(test)]` tracking, the trailing-comment truncation,
+/// and the char-literal-safe string blanking that #1823's review rounds
+/// paid for. Re-deriving that logic here would be a second implementation
+/// of exactly what the reuse discipline forbids duplicating — and the first
+/// cut of this file did re-derive it, complete with the latch bug the
+/// shared scanner had already fixed.
+#[path = "../../newt-core/tests/common/mod.rs"]
+#[allow(dead_code)]
+mod common;
 
-/// Every `.rs` line under `dir`'s `src/`, outside `#[cfg(test)]`, as
-/// (path, line).
-fn production_lines(dir: &Path) -> Vec<(PathBuf, String)> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.join("src")];
-    while let Some(path) = stack.pop() {
-        if path.is_dir() {
-            for entry in std::fs::read_dir(&path).into_iter().flatten().flatten() {
-                stack.push(entry.path());
-            }
-            continue;
+/// Every production line of the crate rooted at `dir` that takes ambient
+/// authority, as `path: line [capability]`.
+///
+/// Matches the module path (`std::fs::read_to_string`), the plain import
+/// (`use std::fs;`), the aliased import (`use std::fs as x;`), and brace
+/// groups (`use std::{env, fs};`, `use std::{process::Command, …}`).
+///
+/// **Accepted residual, stated rather than implied:** this is a tripwire,
+/// not a proof. A determined author can still reach the filesystem through
+/// a re-export, a macro, or a dependency that does it for them. What it
+/// buys is that the ordinary ways in are loud, and that the epic's
+/// "filesystem/application dependency" clause — which names capabilities,
+/// not crates, so no closure walk can ever see it — has an armed check.
+fn ambient_authority(dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    common::for_each_production_line(&[dir.join("src")], &|_| false, &mut |path, code, raw| {
+        if let Some(hit) = ambient_hit(code) {
+            found.push(format!("{}: {} [{hit}]", path.display(), raw.trim()));
         }
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let mut in_test = false;
-        for line in text.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("#[cfg(test)]") {
-                in_test = true;
-            }
-            if trimmed.starts_with("//") || in_test {
-                continue;
-            }
-            out.push((path.clone(), line.to_string()));
-        }
-    }
-    out
+    });
+    found
 }
 
+/// The forbidden capability a line reaches, if any.
+fn ambient_hit(code: &str) -> Option<&'static str> {
+    for module in FORBIDDEN_STD {
+        if code.contains(&format!("std::{module}")) {
+            return Some(module);
+        }
+    }
+    // `use std::…` in any spelling: the tail may be one module, an alias, or
+    // a brace group with nested paths.
+    let tail = code.split("use std::").nth(1)?;
+    for module in FORBIDDEN_STD {
+        let mut rest = tail;
+        while let Some(at) = rest.find(module) {
+            let before_ok = at == 0
+                || !rest[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_');
+            let after_ok = rest[at + module.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+            if before_ok && after_ok {
+                return Some(module);
+            }
+            rest = &rest[at + module.len()..];
+        }
+    }
+    None
+}
+
+/// Write a throwaway crate under the temp dir and return its root.
+fn probe_crate(name: &str, source: &str) -> PathBuf {
+    let mut probe = std::env::temp_dir();
+    probe.push(format!(
+        "newt-interaction-guard-{name}-{}",
+        std::process::id()
+    ));
+    let src = probe.join("src");
+    std::fs::create_dir_all(&src).expect("probe dir");
+    std::fs::write(src.join("lib.rs"), source).expect("probe file");
+    probe
+}
 #[test]
 fn the_protocol_crate_touches_no_ambient_authority() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let lines = production_lines(root);
+    let mut scanned = 0usize;
+    common::for_each_production_line(&[root.join("src")], &|_| false, &mut |_, _, _| {
+        scanned += 1;
+    });
     assert!(
-        lines.len() > 50,
-        "the source scan saw only {} lines — it is not reading this crate",
-        lines.len()
+        scanned > 50,
+        "the source scan saw only {scanned} lines — it is not reading this crate"
     );
-    let found: Vec<String> = lines
-        .iter()
-        .filter(|(_, line)| FORBIDDEN_STD.iter().any(|n| line.contains(n)))
-        .map(|(path, line)| format!("{}: {}", path.display(), line.trim()))
-        .collect();
+    let found = ambient_authority(root);
     assert!(
         found.is_empty(),
         "newt-interaction takes ambient authority: {found:#?}\nThe protocol \
@@ -224,33 +276,71 @@ fn the_protocol_crate_touches_no_ambient_authority() {
     );
 }
 
-/// **Anti-vacuous twin.** The same scanner, pointed at this crate's own
-/// tests directory — which legitimately uses `std::process` and `std::fs`
-/// to run `cargo metadata` — must find them. A scanner that reports clean
-/// on code it cannot read reports clean on everything.
+/// **Anti-vacuous twin (b): a mid-file `#[cfg(test)]` must not blind the
+/// rest of the file.** A latch that flips on the first test attribute and
+/// never clears skips every later line — the exact blindness A0's shared
+/// scanner fixed by tracking brace depth
+/// (`newt-core/tests/common/mod.rs`). A scanner with that latch reports a
+/// crate clean the moment it contains one test module.
 #[test]
-fn the_source_scanner_would_notice_ambient_authority() {
-    let mut probe = std::env::temp_dir();
-    probe.push(format!(
-        "newt-interaction-guard-probe-{}",
-        std::process::id()
-    ));
-    let src = probe.join("src");
-    std::fs::create_dir_all(&src).expect("probe dir");
-    std::fs::write(
-        src.join("lib.rs"),
-        "pub fn read() -> String { std::fs::read_to_string(\"/etc/hostname\").unwrap() }\n",
-    )
-    .expect("probe file");
-
-    let lines = production_lines(&probe);
-    let found = lines
-        .iter()
-        .filter(|(_, line)| FORBIDDEN_STD.iter().any(|n| line.contains(n)))
-        .count();
+fn the_source_scanner_sees_past_a_test_module() {
+    let probe = probe_crate(
+        "mid-file-cfg",
+        "#[cfg(test)]\nmod tests {\n    fn t() { let _ = 1; }\n}\n\n\
+         pub fn real() -> String { std::fs::read_to_string(\"/etc/hostname\").unwrap() }\n",
+    );
+    let found = ambient_authority(&probe);
     std::fs::remove_dir_all(&probe).ok();
     assert_eq!(
-        found, 1,
+        found.len(),
+        1,
+        "production code after a test module went unscanned: {found:?}"
+    );
+}
+
+/// **Anti-vacuous twin (c): brace groups and aliases are the same import.**
+/// `use std::{env, fs};` and `use std::fs as filesystem;` reach exactly
+/// what `use std::fs;` reaches, and a needle that only knows the one
+/// spelling is a tripwire with a documented way around it.
+#[test]
+fn the_source_scanner_sees_grouped_and_aliased_imports() {
+    for (name, source) in [
+        (
+            "group",
+            "use std::{env, fs};\npub fn f() -> bool { true }\n",
+        ),
+        (
+            "alias",
+            "use std::fs as filesystem;\npub fn f() -> bool { true }\n",
+        ),
+        (
+            "nested-group",
+            "use std::{collections::BTreeMap, process::Command};\npub fn f() -> bool { true }\n",
+        ),
+    ] {
+        let probe = probe_crate(name, source);
+        let found = ambient_authority(&probe);
+        std::fs::remove_dir_all(&probe).ok();
+        assert!(
+            !found.is_empty(),
+            "the `{name}` spelling of an ambient-authority import was missed"
+        );
+    }
+}
+/// **Anti-vacuous twin.** The same scanner, pointed at a seeded `std::fs`
+/// call, must find it. A scanner that reports clean on code it cannot read
+/// reports clean on everything.
+#[test]
+fn the_source_scanner_would_notice_ambient_authority() {
+    let probe = probe_crate(
+        "plain",
+        "pub fn read() -> String { std::fs::read_to_string(\"/etc/hostname\").unwrap() }\n",
+    );
+    let found = ambient_authority(&probe);
+    std::fs::remove_dir_all(&probe).ok();
+    assert_eq!(
+        found.len(),
+        1,
         "the source scanner missed a std::fs call it was pointed straight at"
     );
 }
