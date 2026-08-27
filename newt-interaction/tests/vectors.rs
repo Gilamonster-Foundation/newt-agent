@@ -27,6 +27,63 @@ fn vectors_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/interaction-vectors.json")
 }
 
+fn invalid_vectors_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/interaction-vectors-invalid.json")
+}
+
+/// Records that encode and address correctly but are NOT valid against
+/// their definition — a submission whose value kind does not match the
+/// control it answers.
+///
+/// Kept in a separate file on purpose. Blending them into the corpus a
+/// foreign implementation reproduces would mean shipping records that A3
+/// will reject, labelled only by prose someone has to read; and coverage
+/// of an enum variant is not a reason to publish an invalid example.
+/// Here they earn their keep twice — as documentation of what invalid
+/// looks like, and as the consistency checker's own anti-vacuous twin.
+fn generate_invalid() -> Vec<Vector> {
+    let def = sample_definition();
+    let inst = sample_instance(&def);
+    let mismatches = [
+        (
+            "decision",
+            ControlValue::Text {
+                text: "not a choice".to_string(),
+            },
+            "control `decision` is kind=choice; a text value cannot answer it",
+        ),
+        (
+            "remember",
+            ControlValue::Choice {
+                option: OptionId::new("deny").unwrap(),
+            },
+            "control `remember` is kind=toggle; a choice value cannot answer it",
+        ),
+        (
+            "passphrase",
+            ControlValue::Toggle { on: true },
+            "control `passphrase` is kind=secret; a toggle value cannot answer it",
+        ),
+        (
+            "no-such-field",
+            ControlValue::Toggle { on: true },
+            "control `no-such-field` does not exist in the definition",
+        ),
+    ];
+    let mut out = Vec::new();
+    for (control, value, why) in mismatches {
+        let mut v = vector(
+            &format!("response/invalid-{control}"),
+            "response",
+            &["definition", "instance"],
+            &sample_response(&def, &inst, ControlId::new(control).unwrap(), value),
+        );
+        v.invalid_because = Some(why.to_string());
+        out.push(v);
+    }
+    out
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -41,7 +98,7 @@ fn from_hex(text: &str) -> Vec<u8> {
 
 /// One vector: everything a consumer needs to reproduce the id, and to
 /// locate which step it got wrong if it cannot.
-#[derive(Serialize, serde::Deserialize, PartialEq, Eq, Debug)]
+#[derive(Serialize, serde::Deserialize, PartialEq, Eq, Debug, Clone)]
 struct Vector {
     /// What this case is for.
     name: String,
@@ -60,6 +117,13 @@ struct Vector {
     dagcbor_hex: String,
     /// The resulting ContentId, canonically rendered.
     content_id: String,
+    /// Present ONLY in the negative corpus: why this record, though
+    /// structurally well-formed and correctly addressed, is not valid in
+    /// context. Never set in the positive corpus — a consumer must be able
+    /// to reproduce every entry there without reading prose to find out
+    /// which ones it should not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    invalid_because: Option<String>,
 }
 
 fn vector<T: ContentAddressable + Serialize>(
@@ -76,6 +140,7 @@ fn vector<T: ContentAddressable + Serialize>(
         json: serde_json::to_value(value).expect("json"),
         dagcbor_hex: to_hex(&bytes),
         content_id: value.content_id().expect("content id").to_string(),
+        invalid_because: None,
     }
 }
 
@@ -450,4 +515,186 @@ fn decoding_then_encoding_reproduces_every_vector() {
             vector.name
         );
     }
+}
+
+/// Every reason a vector corpus can be internally inconsistent.
+fn inconsistencies(corpus: &[Vector]) -> Vec<String> {
+    use newt_interaction::{ControlKind, Decoded};
+
+    let mut problems = Vec::new();
+
+    // Index the definitions and instances the corpus carries, by id.
+    let mut definitions = std::collections::BTreeMap::new();
+    let mut instances = std::collections::BTreeMap::new();
+    for vector in corpus {
+        let bytes = from_hex(&vector.dagcbor_hex);
+        match vector.record.as_str() {
+            "definition" => {
+                if let Ok(Decoded::Known(d)) = newt_interaction::decode_definition(&bytes) {
+                    definitions.insert(vector.content_id.clone(), d);
+                }
+            }
+            "instance" => {
+                if let Ok(Decoded::Known(i)) = newt_interaction::decode_instance(&bytes) {
+                    instances.insert(vector.content_id.clone(), i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for vector in corpus.iter().filter(|v| v.record == "response") {
+        let bytes = from_hex(&vector.dagcbor_hex);
+        let Ok(Decoded::Known(response)) = newt_interaction::decode_response(&bytes) else {
+            problems.push(format!("{}: does not decode as a response", vector.name));
+            continue;
+        };
+
+        let Some(definition) = definitions.get(&response.definition.to_string()) else {
+            problems.push(format!(
+                "{}: references definition {} which the corpus does not carry",
+                vector.name, response.definition
+            ));
+            continue;
+        };
+        let Some(instance) = instances.get(&response.instance.to_string()) else {
+            problems.push(format!(
+                "{}: references instance {} which the corpus does not carry",
+                vector.name, response.instance
+            ));
+            continue;
+        };
+        if instance.definition != response.definition {
+            problems.push(format!(
+                "{}: the instance offers a different definition than the response answers",
+                vector.name
+            ));
+        }
+        if instance.revision != response.revision {
+            problems.push(format!(
+                "{}: response revision {:?} does not match the offer's {:?}",
+                vector.name, response.revision, instance.revision
+            ));
+        }
+
+        for submission in &response.values {
+            let Some(control) = definition
+                .controls
+                .iter()
+                .find(|c| c.id == submission.control)
+            else {
+                problems.push(format!(
+                    "{}: answers control `{}`, absent from the definition",
+                    vector.name,
+                    submission.control.as_str()
+                ));
+                continue;
+            };
+            let matches = matches!(
+                (&control.kind, &submission.value),
+                (ControlKind::Choice { .. }, ControlValue::Choice { .. })
+                    | (ControlKind::Text, ControlValue::Text { .. })
+                    | (ControlKind::Toggle, ControlValue::Toggle { .. })
+                    | (ControlKind::Secret, ControlValue::Secret { .. })
+            );
+            if !matches {
+                problems.push(format!(
+                    "{}: control `{}` is {:?} but the value is a different kind",
+                    vector.name,
+                    submission.control.as_str(),
+                    control.kind
+                ));
+            }
+            // A choice must name an option the control actually offers.
+            if let (ControlKind::Choice { options }, ControlValue::Choice { option }) =
+                (&control.kind, &submission.value)
+            {
+                if !options.iter().any(|o| &o.id == option) {
+                    problems.push(format!(
+                        "{}: names option `{}`, which control `{}` does not offer",
+                        vector.name,
+                        option.as_str(),
+                        submission.control.as_str()
+                    ));
+                }
+            }
+        }
+    }
+    problems
+}
+
+/// **The positive corpus is valid IN CONTEXT, not merely well-encoded.**
+///
+/// A foreign implementation reproduces these; A3 will validate the exact
+/// control set and types against the definition. A corpus that is
+/// enum-complete but semantically wrong teaches consumers to build records
+/// the system rejects.
+#[test]
+fn the_positive_corpus_is_internally_consistent() {
+    let corpus: Vec<Vector> = serde_json::from_str(
+        &std::fs::read_to_string(vectors_path()).expect("vectors file exists"),
+    )
+    .expect("vectors parse");
+    let problems = inconsistencies(&corpus);
+    assert!(
+        problems.is_empty(),
+        "the corpus is inconsistent: {problems:#?}"
+    );
+    assert!(
+        corpus.iter().all(|v| v.invalid_because.is_none()),
+        "the positive corpus carries an entry labelled invalid"
+    );
+}
+
+/// **Anti-vacuous twin.** The same checker, run over the deliberately
+/// invalid corpus, must find every entry. A consistency check that passes
+/// everything is not one.
+#[test]
+fn the_checker_catches_every_labelled_invalid_vector() {
+    let mut corpus: Vec<Vector> = serde_json::from_str(
+        &std::fs::read_to_string(vectors_path()).expect("vectors file exists"),
+    )
+    .expect("vectors parse");
+    let invalid: Vec<Vector> = serde_json::from_str(
+        &std::fs::read_to_string(invalid_vectors_path()).expect("invalid vectors file exists"),
+    )
+    .expect("invalid vectors parse");
+    assert!(!invalid.is_empty(), "no negative vectors to check");
+
+    for entry in &invalid {
+        assert!(
+            entry.invalid_because.is_some(),
+            "negative vector `{}` does not say why it is invalid",
+            entry.name
+        );
+        // Check each against the definitions/instances of the real corpus.
+        let mut one = corpus.clone();
+        one.push(entry.clone());
+        let problems = inconsistencies(&one);
+        assert!(
+            !problems.is_empty(),
+            "the checker accepted `{}`, which is labelled: {}",
+            entry.name,
+            entry.invalid_because.as_deref().unwrap_or("")
+        );
+    }
+    corpus.clear();
+}
+
+#[test]
+fn the_committed_invalid_vectors_match_regeneration() {
+    let path = invalid_vectors_path();
+    let generated = render(&generate_invalid());
+    if std::env::var("NEWT_GOLDEN_UPDATE").is_ok() {
+        std::fs::create_dir_all(path.parent().unwrap()).expect("data dir");
+        std::fs::write(&path, &generated).expect("write vectors");
+        return;
+    }
+    let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "{} is missing ({e}). Re-baseline deliberately with NEWT_GOLDEN_UPDATE=1.",
+            path.display()
+        )
+    });
+    assert_eq!(committed, generated);
 }
