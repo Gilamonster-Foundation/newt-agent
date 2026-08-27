@@ -8,12 +8,17 @@ use std::time::{Duration, Instant};
 use crate::danger;
 use crate::mint_operating_key;
 use newt_core::agentic::{newt_line, print_newt};
+use newt_core::interaction_adapter::{definition_to_question, role_of, DECISION_CONTROL};
 use newt_core::tty::{
     modal_prompt_controls, read_prompt_window_line, ControlReader, PromptLine as ModalLine,
     PromptWindow, Terminal, MODAL_CONTROL_HINT, MODAL_INPUT_GLYPH,
 };
 pub(crate) use newt_core::PermissionAction as PromptChoice;
-use newt_core::{Action, HumanQuestionOutcome, Question};
+use newt_core::{HumanQuestionOutcome, Question};
+use newt_interaction::{
+    Audience, ChoiceOption, Control, ControlId, ControlKind, InteractionDefinition,
+    InteractionKind, OptionId, Requirement,
+};
 
 // ---------------------------------------------------------------------------
 
@@ -49,25 +54,101 @@ pub(crate) fn reason_is_model_authored(req: &newt_core::PermissionRequest) -> bo
     req.tool == "request_permissions"
 }
 
-#[derive(Clone, Copy)]
-enum PromptSurface {
-    Terminal,
-    Web,
+/// One action this policy offers, already decided.
+///
+/// The POLICY half hands these to the MARSHALLING half. The split is what
+/// lets tier and audience be consulted TOGETHER — they decide the action
+/// list *and* the note text in the same branches, exactly as before — while
+/// the construction of protocol records stays mechanical.
+struct OfferedAction {
+    action: PromptChoice,
+    key: &'static str,
+    label: &'static str,
 }
 
-/// Build the one typed form consumed by terminal and HTMX renderers.
-pub(crate) fn permission_question(
+/// **The POLICY half** (B0a, #1841): which actions this `(tier, audience)`
+/// pair offers, and the note that accompanies them.
+///
+/// This is a RESTRUCTURING of the old `permission_question_for`, not a
+/// relocation: the high-tier arms produce genuinely different per-surface
+/// text, and the durable grants are terminal-only, so tier and audience
+/// must still be known simultaneously.
+fn permission_policy(
     req: &newt_core::PermissionRequest,
     danger: &danger::DangerTable,
-) -> Question<PromptChoice> {
-    permission_question_for(req, danger, PromptSurface::Terminal)
+    audience: Audience,
+) -> (Vec<OfferedAction>, Option<String>) {
+    use newt_core::DenialKind;
+    let tier = danger.classify(req.kind, &req.target);
+    // ONE audience test, bound once. The A0 shape asked it twice; the two
+    // asks were always the same question, so the ratchet baseline goes
+    // DOWN by one branch rather than up.
+    let terminal = matches!(audience, Audience::Terminal);
+
+    let mut actions = vec![OfferedAction {
+        action: PromptChoice::AllowOnce,
+        key: "a",
+        label: "allow once",
+    }];
+    if tier == danger::DangerTier::Low {
+        actions.push(OfferedAction {
+            action: PromptChoice::AllowSession,
+            key: "s",
+            label: "session allow",
+        });
+        if req.kind == DenialKind::Net && terminal {
+            actions.push(OfferedAction {
+                action: PromptChoice::AllowPermanent,
+                key: "A",
+                label: "Allow permanently (adds host to config)",
+            });
+        }
+    }
+    actions.push(OfferedAction {
+        action: PromptChoice::Deny,
+        key: "d",
+        label: "deny (default)",
+    });
+    if terminal {
+        actions.push(OfferedAction {
+            action: PromptChoice::DenyAlways,
+            key: "D",
+            label: "Deny always",
+        });
+        actions.push(OfferedAction {
+            action: PromptChoice::DenyPermanent,
+            key: "P",
+            label: "Permanently deny",
+        });
+    }
+
+    // `Audience` is `#[non_exhaustive]`, so this crate cannot match it
+    // exhaustively and the wildcard is forced by the language rather than
+    // chosen. The tripwire that a third variant needs thinking about lives
+    // where the enum is DEFINED —
+    // `newt_interaction::binding::model_fidelity` (#1837).
+    let note = match (tier, audience) {
+        (danger::DangerTier::High, Audience::Terminal) => Some(format!(
+            "high-danger: session allow refused; key allow / step-up is the future path, P3\n{MODAL_CONTROL_HINT}"
+        )),
+        (danger::DangerTier::High, Audience::Web) => Some(format!(
+            "High danger: session authorization is unavailable.\n{MODAL_CONTROL_HINT}"
+        )),
+        _ => Some(MODAL_CONTROL_HINT.into()),
+    };
+    (actions, note)
 }
 
-fn permission_question_for(
+/// **The MARSHALLING half** (B0a, #1841): the policy's decisions as ONE
+/// [`InteractionDefinition`].
+///
+/// This is the single form both surfaces build. The prompt text itself is
+/// audience-independent; only the action list and the note are not.
+pub(crate) fn permission_definition(
     req: &newt_core::PermissionRequest,
     danger: &danger::DangerTable,
-    surface: PromptSurface,
-) -> Question<PromptChoice> {
+    audience: Audience,
+) -> InteractionDefinition {
     use newt_core::DenialKind;
     let (verb, axis) = match req.kind {
         DenialKind::Exec => ("run", "outside the granted exec allowlist"),
@@ -80,7 +161,6 @@ fn permission_question_for(
             "outside the granted git-write authority",
         ),
     };
-    let tier = danger.classify(req.kind, &req.target);
 
     let blast = match danger.blast_radius(req.kind, &req.target) {
         Some(line) => format!("{line}\n"),
@@ -97,52 +177,82 @@ fn permission_question_for(
         format!("  ({})\n", req.reason)
     };
 
-    let mut actions = vec![Action::new(PromptChoice::AllowOnce, "a", "allow once")];
-    if tier == danger::DangerTier::Low {
-        actions.push(Action::new(
-            PromptChoice::AllowSession,
-            "s",
-            "session allow",
-        ));
-        if req.kind == DenialKind::Net && matches!(surface, PromptSurface::Terminal) {
-            actions.push(Action::new(
-                PromptChoice::AllowPermanent,
-                "A",
-                "Allow permanently (adds host to config)",
-            ));
-        }
-    }
-    actions.push(Action::new(PromptChoice::Deny, "d", "deny (default)"));
-    if matches!(surface, PromptSurface::Terminal) {
-        actions.extend([
-            Action::new(PromptChoice::DenyAlways, "D", "Deny always"),
-            Action::new(PromptChoice::DenyPermanent, "P", "Permanently deny"),
-        ]);
-    }
-    let note = match (tier, surface) {
-        (danger::DangerTier::High, PromptSurface::Terminal) => Some(
-            format!(
-                "high-danger: session allow refused; key allow / step-up is the future path, P3\n{MODAL_CONTROL_HINT}"
-            ),
-        ),
-        (danger::DangerTier::High, PromptSurface::Web) => {
-            Some(format!(
-                "High danger: session authorization is unavailable.\n{MODAL_CONTROL_HINT}"
-            ))
-        }
-        (_, PromptSurface::Terminal) => Some(MODAL_CONTROL_HINT.into()),
-        (_, PromptSurface::Web) => Some(MODAL_CONTROL_HINT.into()),
-    };
-    Question {
-        markdown: format!(
-            "⊘ {} wants to {verb} `{}` — {axis}.\n{blast}{reason}",
+    let (offered, note) = permission_policy(req, danger, audience);
+    let options = offered
+        .into_iter()
+        .map(|offer| ChoiceOption {
+            // The WIRE name is the option's identity; the key is a
+            // presentation affordance. Both survive, which is what makes
+            // the adapter round trip field-identical.
+            id: OptionId::new(offer.action.as_str()).expect(WIRE_NAMES_ARE_OPTION_IDS),
+            role: role_of(offer.action),
+            label: offer.label.to_string(),
+            key: offer.key.to_string(),
+            aliases: Vec::new(),
+        })
+        .collect();
+
+    let mut definition = InteractionDefinition::new(
+        InteractionKind::Choice,
+        format!(
+            "\u{2298} {} wants to {verb} `{}` \u{2014} {axis}.\n{blast}{reason}",
             req.tool, req.target
         )
-        .trim_end()
-        .into(),
-        actions,
-        note,
-    }
+        .trim_end(),
+        vec![Control {
+            id: ControlId::new(DECISION_CONTROL).expect(WIRE_NAMES_ARE_OPTION_IDS),
+            kind: ControlKind::Choice { options },
+            label: String::new(),
+            // A permission prompt must be answered: an unanswered one
+            // denies by default, which is a decision, not an absence.
+            requirement: Requirement::Required,
+        }],
+    );
+    definition.note = note;
+    definition
+}
+
+/// Why the `expect`s above cannot fire.
+///
+/// Every `PermissionAction` wire name, and `DECISION_CONTROL`, is drawn
+/// from `[A-Za-z0-9_-]`, and that set is frozen.
+/// `b0a::every_offered_action_is_a_valid_option_id` walks every
+/// `(DenialKind, tier, audience)` combination this policy can produce and
+/// asserts the definition builds, so this branch is unreachable rather
+/// than merely unlikely.
+const WIRE_NAMES_ARE_OPTION_IDS: &str =
+    "every PermissionAction wire name is a valid option id (frozen set; see \
+     b0a::every_offered_action_is_a_valid_option_id)";
+
+/// Render the definition as the legacy typed form, **through the A2.2
+/// adapter**.
+///
+/// `terminal_text()` lives on [`Question`] and has no counterpart in
+/// `newt-interaction`, which is pure data — extracting rendering is C0's
+/// slice, not this one. So the adapter is a PERMANENT production
+/// dependency from here on, and byte preservation holds by construction:
+/// `adapter::a_question_round_trips_through_the_definition_byte_for_byte`
+/// proves the mapping is field-identical, and `terminal_text()` is a pure
+/// function of those fields.
+///
+/// Hand-writing a second renderer over `InteractionDefinition` to avoid
+/// this call would be a new duplicate string builder tracked by no
+/// baseline — the exact sprawl the epic exists to delete.
+fn question_for(
+    req: &newt_core::PermissionRequest,
+    danger: &danger::DangerTable,
+    audience: Audience,
+) -> Question<PromptChoice> {
+    definition_to_question(&permission_definition(req, danger, audience))
+        .expect(WIRE_NAMES_ARE_OPTION_IDS)
+}
+
+/// Build the one typed form consumed by terminal and HTMX renderers.
+pub(crate) fn permission_question(
+    req: &newt_core::PermissionRequest,
+    danger: &danger::DangerTable,
+) -> Question<PromptChoice> {
+    question_for(req, danger, Audience::Terminal)
 }
 
 /// Facade P1b: the production [`danger::DangerTable`] — the built-in
@@ -430,7 +540,7 @@ impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> PromptPer
         w: &newt_core::tty::PromptWindow,
         req: &newt_core::PermissionRequest,
     ) -> (PromptChoice, &'static str) {
-        let question = permission_question_for(req, &self.danger, PromptSurface::Web);
+        let question = question_for(req, &self.danger, Audience::Web);
         let tier = if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
             "\"high\""
         } else {
@@ -1113,8 +1223,7 @@ mod permission_prompt_tests {
     /// Publish a low-danger exec question and return its `request_id`.
     fn publish_low_danger(store: &newt_core::ConversationStore, conv: &str) -> String {
         let req = exec_request("bash");
-        let question =
-            permission_question_for(&req, &danger::DangerTable::builtin(), PromptSurface::Web);
+        let question = question_for(&req, &danger::DangerTable::builtin(), Audience::Web);
         store
             .publish_permission_question(conv, &question, "\"low\"")
             .unwrap()
@@ -1794,7 +1903,7 @@ mod permission_prompt_tests {
             .iter()
             .any(|a| a.value == PromptChoice::AllowSession));
 
-        let web_low = permission_question_for(&exec_request("npm"), &danger, PromptSurface::Web);
+        let web_low = question_for(&exec_request("npm"), &danger, Audience::Web);
         assert_eq!(
             web_low.actions.iter().map(|a| a.value).collect::<Vec<_>>(),
             [
@@ -1810,7 +1919,7 @@ mod permission_prompt_tests {
             .unwrap(),
             web_low
         );
-        let web_high = permission_question_for(&exec_request("bash"), &danger, PromptSurface::Web);
+        let web_high = question_for(&exec_request("bash"), &danger, Audience::Web);
         assert_eq!(
             web_high.actions.iter().map(|a| a.value).collect::<Vec<_>>(),
             [PromptChoice::AllowOnce, PromptChoice::Deny]
@@ -2926,15 +3035,15 @@ mod a0_freeze_goldens {
         }
     }
 
-    fn text(req: &PermissionRequest, surface: PromptSurface) -> String {
+    fn text(req: &PermissionRequest, audience: Audience) -> String {
         let table = danger::DangerTable::builtin();
-        permission_question_for(req, &table, surface).terminal_text()
+        question_for(req, &table, audience).terminal_text()
     }
 
     #[test]
     fn terminal_low_net_offers_every_grant_including_the_permanents() {
         assert_eq!(
-            text(&net_low(), PromptSurface::Terminal),
+            text(&net_low(), Audience::Terminal),
             "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
              Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
              [a]llow once   [s]ession allow   [A]llow permanently (adds host to config)   [d]eny (default)   [D]eny always   [P]ermanently deny"
@@ -2944,7 +3053,7 @@ mod a0_freeze_goldens {
     #[test]
     fn web_low_net_omits_every_durable_grant() {
         assert_eq!(
-            text(&net_low(), PromptSurface::Web),
+            text(&net_low(), Audience::Web),
             "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
              Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
              [a]llow once   [s]ession allow   [d]eny (default)"
@@ -2954,7 +3063,7 @@ mod a0_freeze_goldens {
     #[test]
     fn terminal_high_exec_refuses_session_allow_and_says_why() {
         assert_eq!(
-            text(&exec_high(), PromptSurface::Terminal),
+            text(&exec_high(), Audience::Terminal),
             "\u{2298} run_command wants to run `bash` \u{2014} outside the granted exec allowlist.\n\
              \u{26a0} `bash` is an interpreter: this grants arbitrary command execution\n  \
              (exec of \"bash\" is not within the granted authority)\n\
@@ -2967,7 +3076,7 @@ mod a0_freeze_goldens {
     #[test]
     fn web_high_exec_is_allow_once_or_deny_only() {
         assert_eq!(
-            text(&exec_high(), PromptSurface::Web),
+            text(&exec_high(), Audience::Web),
             "\u{2298} run_command wants to run `bash` \u{2014} outside the granted exec allowlist.\n\
              \u{26a0} `bash` is an interpreter: this grants arbitrary command execution\n  \
              (exec of \"bash\" is not within the granted authority)\n\
@@ -2982,5 +3091,242 @@ mod a0_freeze_goldens {
     #[test]
     fn the_modal_control_hint_is_the_frozen_control_vocabulary() {
         assert_eq!(MODAL_CONTROL_HINT, "Esc=back \u{b7} Ctrl-C/Ctrl-D=exit");
+    }
+}
+
+/// **B0a (#1841): one definition builder for both surfaces.**
+///
+/// A0 froze the rendered strings; these tests prove the DEFINITION path
+/// reproduces them and that the per-surface action matrices live in the
+/// definition rather than in a renderer. The golden strings are repeated
+/// here deliberately: A0's copy freezes the contract, this copy proves the
+/// new construction path reaches it, and an accidental edit to one copy is
+/// caught by the other.
+///
+/// **`Question::parse` remains the authoritative accept/deny path.**
+/// Nothing here uses `binding::validate_response` — that move, with the
+/// behavior-map and formal-model updates it requires, is #1842.
+#[cfg(test)]
+mod b0a {
+    use super::*;
+    use newt_core::interaction_adapter::question_to_definition;
+    use newt_core::{Action, DenialKind, PermissionRequest};
+
+    fn net_low() -> PermissionRequest {
+        PermissionRequest {
+            tool: "http".into(),
+            kind: DenialKind::Net,
+            target: "https://example.com/api".into(),
+            reason: String::new(),
+        }
+    }
+
+    fn exec_high() -> PermissionRequest {
+        PermissionRequest {
+            tool: "run_command".into(),
+            kind: DenialKind::Exec,
+            target: "bash".into(),
+            reason: "exec of \"bash\" is not within the granted authority".into(),
+        }
+    }
+
+    /// The option wire names a definition offers, in order.
+    fn offered(definition: &InteractionDefinition) -> Vec<String> {
+        let [control] = definition.controls.as_slice() else {
+            panic!("expected exactly one control");
+        };
+        let ControlKind::Choice { options } = &control.kind else {
+            panic!("the decision control is not a choice");
+        };
+        options.iter().map(|o| o.id.as_str().to_string()).collect()
+    }
+
+    fn definition_of(req: &PermissionRequest, audience: Audience) -> InteractionDefinition {
+        permission_definition(req, &danger::DangerTable::builtin(), audience)
+    }
+
+    #[test]
+    fn both_surfaces_build_one_definition_from_one_builder() {
+        for req in [net_low(), exec_high()] {
+            for audience in [Audience::Terminal, Audience::Web] {
+                let definition = definition_of(&req, audience.clone());
+                // ONE definition, ONE control, and it is the reserved
+                // decision control the adapter and #1842 both address.
+                assert_eq!(definition.controls.len(), 1);
+                assert_eq!(definition.controls[0].id.as_str(), DECISION_CONTROL);
+                assert!(matches!(
+                    definition.controls[0].kind,
+                    ControlKind::Choice { .. }
+                ));
+                assert_eq!(definition.kind, InteractionKind::Choice);
+                assert_eq!(definition.controls[0].requirement, Requirement::Required);
+
+                // The rendered form is the adapter's output for exactly
+                // this definition — not a second renderer that happens to
+                // agree.
+                let via_adapter = definition_to_question(&definition).expect("adapts");
+                assert_eq!(
+                    question_for(&req, &danger::DangerTable::builtin(), audience.clone()),
+                    via_adapter
+                );
+            }
+        }
+        // The two surfaces differ only where policy says they do.
+        assert_ne!(
+            offered(&definition_of(&net_low(), Audience::Terminal)),
+            offered(&definition_of(&net_low(), Audience::Web)),
+            "the surfaces would be indistinguishable, so the matrices are not being applied"
+        );
+    }
+
+    #[test]
+    fn the_terminal_matrix_is_byte_identical_to_its_a0_golden() {
+        let definition = definition_of(&net_low(), Audience::Terminal);
+        assert_eq!(
+            offered(&definition),
+            [
+                "allow_once",
+                "allow_session",
+                "allow_permanent",
+                "deny",
+                "deny_always",
+                "deny_permanent"
+            ]
+        );
+        assert_eq!(
+            definition_to_question(&definition)
+                .expect("adapts")
+                .terminal_text(),
+            "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
+             Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
+             [a]llow once   [s]ession allow   [A]llow permanently (adds host to config)   [d]eny (default)   [D]eny always   [P]ermanently deny"
+        );
+    }
+
+    #[test]
+    fn the_web_matrix_is_byte_identical_to_its_a0_golden() {
+        let definition = definition_of(&net_low(), Audience::Web);
+        assert_eq!(
+            offered(&definition),
+            ["allow_once", "allow_session", "deny"]
+        );
+        assert_eq!(
+            definition_to_question(&definition)
+                .expect("adapts")
+                .terminal_text(),
+            "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
+             Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
+             [a]llow once   [s]ession allow   [d]eny (default)"
+        );
+    }
+
+    #[test]
+    fn a_high_tier_target_offers_no_session_allow_on_either_surface() {
+        for audience in [Audience::Terminal, Audience::Web] {
+            let offered = offered(&definition_of(&exec_high(), audience.clone()));
+            assert!(
+                !offered.iter().any(|id| id == "allow_session"),
+                "a high-danger target offered a session allow to {audience:?}: {offered:?}"
+            );
+            assert!(
+                !offered.iter().any(|id| id == "allow_permanent"),
+                "a high-danger target offered a permanent allow to {audience:?}: {offered:?}"
+            );
+            // ...and it still offers a way to say yes once, or the prompt
+            // would be a notice rather than a decision.
+            assert!(offered.iter().any(|id| id == "allow_once"));
+        }
+    }
+
+    #[test]
+    fn the_web_definition_never_offers_a_durable_grant() {
+        const DURABLE: [&str; 3] = ["allow_permanent", "deny_always", "deny_permanent"];
+        for req in [net_low(), exec_high()] {
+            let offered = offered(&definition_of(&req, Audience::Web));
+            for durable in DURABLE {
+                assert!(
+                    !offered.iter().any(|id| id == durable),
+                    "the web definition offered `{durable}` for {}: {offered:?}",
+                    req.target
+                );
+            }
+        }
+        // The terminal still does, for the one case A0 froze — otherwise
+        // this test would pass by the grants having been deleted for
+        // everyone.
+        assert!(offered(&definition_of(&net_low(), Audience::Terminal))
+            .iter()
+            .any(|id| id == "allow_permanent"));
+    }
+
+    /// Aliases and ambiguity denial are properties of `Question::parse`,
+    /// which B0a leaves authoritative. What changes is that the form now
+    /// arrives through a definition — so the property must survive the
+    /// round trip.
+    #[test]
+    fn an_alias_still_resolves_and_an_ambiguous_answer_is_still_denied() {
+        let with_alias = Question::<PromptChoice> {
+            markdown: "confirm".to_string(),
+            actions: vec![
+                Action::new(PromptChoice::AllowOnce, "y", "yes").with_aliases(["Y"]),
+                Action::new(PromptChoice::Deny, "n", "no").with_aliases(["N"]),
+            ],
+            note: None,
+        };
+        let adapted = definition_to_question(&question_to_definition(&with_alias).expect("adapts"))
+            .expect("back");
+        assert_eq!(adapted.parse("Y"), Some(PromptChoice::AllowOnce));
+        assert_eq!(adapted.parse("n"), Some(PromptChoice::Deny));
+
+        // Ambiguity still denies: two actions sharing one alias resolve to
+        // nothing, and the caller's fail-closed default stands.
+        let ambiguous = Question::<PromptChoice> {
+            markdown: "confirm".to_string(),
+            actions: vec![
+                Action::new(PromptChoice::AllowOnce, "y", "yes").with_aliases(["x"]),
+                Action::new(PromptChoice::Deny, "n", "no").with_aliases(["x"]),
+            ],
+            note: None,
+        };
+        let adapted = definition_to_question(&question_to_definition(&ambiguous).expect("adapts"))
+            .expect("back");
+        assert_eq!(adapted.parse("x"), None, "an ambiguous answer resolved");
+
+        // And the real permission menu still parses its own keys.
+        let menu = permission_question(&net_low(), &danger::DangerTable::builtin());
+        assert_eq!(menu.parse("a"), Some(PromptChoice::AllowOnce));
+        assert_eq!(menu.parse("A"), Some(PromptChoice::AllowPermanent));
+        assert_eq!(menu.parse("zzz"), None);
+    }
+
+    /// The `expect`s in `permission_definition` and `question_for` are
+    /// unreachable rather than merely unlikely: every combination this
+    /// policy can produce builds and adapts.
+    #[test]
+    fn every_offered_action_is_a_valid_option_id() {
+        let kinds = [
+            (DenialKind::Exec, "npm"),
+            (DenialKind::Exec, "bash"),
+            (DenialKind::FsRead, "/etc/passwd"),
+            (DenialKind::FsWrite, "/tmp/x"),
+            (DenialKind::Net, "https://example.com/api"),
+            (DenialKind::RemoteTool, "some_tool"),
+            (DenialKind::GitWrite, "origin/main"),
+        ];
+        for (kind, target) in kinds {
+            for audience in [Audience::Terminal, Audience::Web] {
+                let req = PermissionRequest {
+                    tool: "t".into(),
+                    kind,
+                    target: target.into(),
+                    reason: String::new(),
+                };
+                let definition = definition_of(&req, audience.clone());
+                assert!(!offered(&definition).is_empty());
+                definition_to_question(&definition).unwrap_or_else(|e| {
+                    panic!("{kind:?}/{target}/{audience:?} did not adapt: {e}")
+                });
+            }
+        }
     }
 }
