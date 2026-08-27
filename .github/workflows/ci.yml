@@ -53,7 +53,11 @@ jobs:
         # `--features newt-data/kernel` lints the Phase 21.3 live-kernel code +
         # tests (off by default; mirrored in the justfile `lint`/`check`).
         if: always()
-        run: cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings
+        # HOOK PARITY: mirrored by `just check` / `just lint`.
+        # The feature list must match the TEST step's: linting without a
+        # feature the tests enable makes a feature-gated lint regression
+        # invisible until someone builds it locally.
+        run: cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
       # OCAP security gates (pure-Python, no cargo deps). Mirrored by the
       # `ocap-check` + `spawn-inventory` recipes in the justfile.
       - name: OCAP register honesty (ocap-check)
@@ -332,7 +336,7 @@ jobs:
       - name: Install AppContainer launcher
         run: cargo install agent-bridle-aclaunch --version 0.7.10 --locked
       - name: clippy
-        run: cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings
+        run: cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
       - name: cargo test
         # `if: always()` so a clippy failure can't mask a test failure — both
         # surface in one run (same rationale as the Linux lint job).
