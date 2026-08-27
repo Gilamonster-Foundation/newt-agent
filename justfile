@@ -134,7 +134,10 @@ clean:
 # A workspace-level feature flag only affects crates that declare it; the rest
 # build unchanged.
 test:
-    cargo test --workspace --features newt-data/kernel
+    # PIPELINE PARITY: mirrors ci.yml. `newt-interaction/schema` is
+    # off by default (schemars must not enter the runtime closure) and is
+    # enabled here so the published schemas cannot go stale unnoticed.
+    cargo test --workspace --features newt-data/kernel,newt-interaction/schema
 
 # --- Lint & format ---
 
@@ -145,7 +148,7 @@ fmt:
 # Lint with the workspace's clippy config; zero-warnings gate.
 # `--features newt-data/kernel` so the Phase 21.3 kernel code + tests are linted.
 lint:
-    cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings
+    cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings
 
 # Regenerate Cargo.lock from scratch (authoritative resolution).
 # Run this after adding or changing dependencies so the lock file matches
@@ -163,8 +166,9 @@ check:
     set -uo pipefail
     rc=0
     cargo fmt --all -- --check || rc=1
-    cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings || rc=1
-    cargo test --workspace --features newt-data/kernel || rc=1
+    cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings || rc=1
+    # PIPELINE PARITY: mirrors ci.yml (see the note in `test`).
+    cargo test --workspace --features newt-data/kernel,newt-interaction/schema || rc=1
     # rich-tui (issue #416) is now a DEFAULT feature (amphibian: comfortable by
     # default, strip for the water), so the workspace clippy/test above already
     # cover it. Guard the LEAN strip-down build instead — the wyvern/headless
@@ -199,7 +203,7 @@ check:
 
 [windows]
 check:
-    $rc = 0; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace --features newt-data/kernel; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy -p newt-agent --no-default-features --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-agent --no-default-features; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-tui; if ($LASTEXITCODE -ne 0) { $rc = 1 }; python3 scripts/docs_check.py --self-test; if ($LASTEXITCODE -ne 0) { $rc = 1 }; python3 scripts/docs_check.py --quiet; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
+    $rc = 0; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace --features newt-data/kernel,newt-interaction/schema; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy -p newt-agent --no-default-features --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-agent --no-default-features; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-tui; if ($LASTEXITCODE -ne 0) { $rc = 1 }; python3 scripts/docs_check.py --self-test; if ($LASTEXITCODE -ne 0) { $rc = 1 }; python3 scripts/docs_check.py --quiet; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
 
 # Documentation reference check: every relative link under docs/ resolves, and
 # every docs/....md path cited from a Rust comment exists. Runs inside `just

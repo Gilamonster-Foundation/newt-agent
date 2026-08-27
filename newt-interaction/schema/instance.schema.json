@@ -1,0 +1,164 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "InteractionInstance",
+  "description": "A live offer of one definition to one audience.\n\nBinds the routing nonce to the definition's content id, the revision, the TTL, the scope, the frozen responder policy, and the provenance — and the whole binding is itself content-addressed, so an offer cannot be altered without changing its [`InstanceId`].",
+  "type": "object",
+  "required": [
+    "definition",
+    "nonce",
+    "provenance",
+    "responder_policy",
+    "revision",
+    "schema",
+    "scope",
+    "ttl_ticks"
+  ],
+  "properties": {
+    "definition": {
+      "description": "The definition being offered — its exact form digest.",
+      "type": "string"
+    },
+    "nonce": {
+      "description": "Fresh, unguessable routing handle. Not the identity.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Nonce"
+        }
+      ]
+    },
+    "provenance": {
+      "description": "Where this offer came from.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Provenance"
+        }
+      ]
+    },
+    "responder_policy": {
+      "description": "Frozen eligibility.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ResponderPolicy"
+        }
+      ]
+    },
+    "revision": {
+      "description": "The revision offered.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "schema": {
+      "description": "Versioned type tag; see [`INSTANCE_SCHEMA_V1`].",
+      "allOf": [
+        {
+          "$ref": "#/definitions/InstanceTag"
+        }
+      ]
+    },
+    "scope": {
+      "description": "The workspace fence.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Scope"
+        }
+      ]
+    },
+    "ttl_ticks": {
+      "description": "Ticks after `provenance.minted_tick` at which this offer expires.",
+      "type": "integer",
+      "format": "int64"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "Audience": {
+      "description": "Who may answer, as distinct from what a surface can draw.",
+      "oneOf": [
+        {
+          "description": "The operator at the terminal that owns this session.",
+          "type": "string",
+          "enum": [
+            "terminal"
+          ]
+        },
+        {
+          "description": "An authenticated, in-scope web attachment.",
+          "type": "string",
+          "enum": [
+            "web"
+          ]
+        }
+      ]
+    },
+    "InstanceTag": {
+      "type": "string",
+      "const": "newt.interaction.instance/v1"
+    },
+    "Nonce": {
+      "type": "string",
+      "minLength": 1
+    },
+    "Provenance": {
+      "description": "Where an instance came from — the record's own sources.\n\nMandatory, not optional. The repo's one outstanding first-principle violation is exactly this hole in `ConversationTurn` (`first_principle.rs:802`); a new record type that cannot name its origin repeats the defect the ledger counts.",
+      "type": "object",
+      "required": [
+        "minted_tick",
+        "origin"
+      ],
+      "properties": {
+        "minted_tick": {
+          "description": "The tick at which it was minted, as the host counts ticks.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "origin": {
+          "description": "What minted this instance (a tool name, a subsystem, a persona).",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResponderPolicy": {
+      "description": "The frozen eligibility rule for one instance.\n\nFrozen at publication: an offer cannot widen who may answer it after the fact, which is the \"attenuate, never amplify\" law applied to responders.",
+      "type": "object",
+      "required": [
+        "audiences",
+        "requires_assertion"
+      ],
+      "properties": {
+        "audiences": {
+          "description": "Audiences this offer is open to.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Audience"
+          }
+        },
+        "requires_assertion": {
+          "description": "Whether the responder must present an authenticated assertion.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Scope": {
+      "description": "The workspace fence an instance is confined to.",
+      "type": "object",
+      "required": [
+        "conversation_id",
+        "workspace_key"
+      ],
+      "properties": {
+        "conversation_id": {
+          "description": "The conversation this instance belongs to.",
+          "type": "string"
+        },
+        "workspace_key": {
+          "description": "Opaque workspace key — the same fence every permission query already applies in `newt_core`'s store.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -28,17 +28,25 @@
 //! This file is a manifest: composition only, no logic.
 
 pub mod definition;
+pub mod downgrade;
 pub mod error;
 pub mod ids;
 pub mod instance;
 pub mod response;
+pub mod tag;
 
 pub use definition::{
-    Control, ControlKind, InteractionDefinition, InteractionKind, SemanticRole, SurfaceFeatures,
-    DEFINITION_SCHEMA_V1,
+    ChoiceOption, Control, ControlKind, FeatureDemand, InteractionDefinition, InteractionKind,
+    Requirement, SemanticRole, SurfaceFeature, DEFINITION_SCHEMA_V1,
+};
+pub use downgrade::{
+    decode_definition, decode_instance, decode_response, plan_presentation, Decoded, Degradation,
+    Presentation, RawRecord, UnknownReason,
 };
 pub use error::ProtocolError;
-pub use ids::{ControlId, DefinitionId, IdempotencyKey, InstanceId, Nonce, ResponseId, Revision};
+pub use ids::{
+    ControlId, DefinitionId, IdempotencyKey, InstanceId, Nonce, OptionId, ResponseId, Revision,
+};
 pub use instance::{
     Audience, InteractionInstance, LifecycleState, Provenance, ResponderPolicy, Scope,
     INSTANCE_SCHEMA_V1,
@@ -47,3 +55,4 @@ pub use response::{
     AssertionKind, ControlValue, ResponderProvenance, Response, SecretRef, Submission,
     RESPONSE_SCHEMA_V1,
 };
+pub use tag::{DefinitionTag, InstanceTag, ResponseTag};

@@ -5,7 +5,9 @@ use content_addressable::{canonical, ContentAddressable, ContentError};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ProtocolError;
-use crate::ids::{ControlId, DefinitionId, IdempotencyKey, InstanceId, ResponseId, Revision};
+use crate::ids::{
+    ControlId, DefinitionId, IdempotencyKey, InstanceId, OptionId, ResponseId, Revision,
+};
 use crate::instance::Audience;
 
 /// The versioned type tag every response carries.
@@ -19,8 +21,27 @@ pub const RESPONSE_SCHEMA_V1: &str = "newt.interaction.response/v1";
 /// the host's business and requires its own authority (ADR D1: never
 /// persist secret values in markup or logs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+// See the note on `ControlId`: deserialization goes through the
+// constructor so the wire cannot carry an empty reference.
+#[serde(into = "String", try_from = "String")]
 pub struct SecretRef(String);
+
+#[cfg(feature = "schema")]
+crate::string_scalar_schema!(SecretRef, None::<&str>);
+
+impl From<SecretRef> for String {
+    fn from(value: SecretRef) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<String> for SecretRef {
+    type Error = ProtocolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
 
 impl SecretRef {
     /// Adopt a handle the host can resolve.
@@ -65,14 +86,18 @@ impl SecretRef {
 /// cannot represent a newtype variant wrapping a primitive, and the named
 /// field is the clearer thing to freeze into A2.1's vectors anyway
 /// (`{"kind":"toggle","on":true}`).
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControlValue {
-    /// One of the definition's controls was chosen.
+    /// One of the control's options was chosen.
     Choice {
-        /// Which control. Its charset is enforced at construction, so a
-        /// choice can never carry a sentence.
-        option: ControlId,
+        /// Which OPTION of the control named by the enclosing
+        /// [`Submission`]. A distinct id space from `ControlId`, so the
+        /// pair cannot name two things of the same kind with no rule
+        /// saying which wins. Its charset is enforced on construction AND
+        /// on deserialization, so the guarantee holds on the wire too.
+        option: OptionId,
     },
     /// Free text, as typed.
     Text {
@@ -106,7 +131,9 @@ pub enum ControlValue {
 /// resolve — so a durable, content-addressed response never becomes a
 /// disclosure liability. A digest in the record beats the bytes: it is
 /// tamper-evident without being a secret.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponderProvenance {
     /// What kind of assertion authenticated this responder.
     pub kind: AssertionKind,
@@ -123,6 +150,7 @@ pub struct ResponderProvenance {
 }
 
 /// What established the responder's identity.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
@@ -137,7 +165,9 @@ pub enum AssertionKind {
 }
 
 /// One control's answer: which control, and the typed value.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Submission {
     /// Which control this answers.
     pub control: ControlId,
@@ -151,10 +181,12 @@ pub struct Submission {
 /// idempotency key, and responder provenance — the ADR's own list. Nothing
 /// here authorizes on its own: the controller revalidates every field
 /// against the definition before it resolves anything.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Response {
     /// Versioned type tag; see [`RESPONSE_SCHEMA_V1`].
-    pub schema: String,
+    pub schema: crate::tag::ResponseTag,
     /// The definition answered — and, being a content id, its exact form
     /// digest. A definition that changed by one byte cannot be answered by
     /// a response minted against the old one.
@@ -189,20 +221,17 @@ impl Response {
         Ok(ResponseId::from_content_id(self.content_id()?))
     }
 
-    /// Refuse an unknown schema tag; unknown required behavior fails closed.
+    /// The schema tag, as a string.
     ///
-    /// # Errors
-    ///
-    /// [`ProtocolError::UnknownSchema`] when the tag is not
-    /// [`RESPONSE_SCHEMA_V1`].
-    pub fn ensure_known_schema(&self) -> Result<(), ProtocolError> {
-        if self.schema != RESPONSE_SCHEMA_V1 {
-            return Err(ProtocolError::UnknownSchema {
-                tag: self.schema.clone(),
-                expected: RESPONSE_SCHEMA_V1,
-            });
-        }
-        Ok(())
+    /// Reading it needs no check: the tag is a TYPE that deserializes from
+    /// exactly one value, so a record of this type cannot carry any other
+    /// one. What used to be a runtime `ensure_known_schema` is now a thing
+    /// the wire cannot express — and the published schema says so with a
+    /// `const`, so a foreign implementor validating against the wrong
+    /// record's schema fails instead of passing.
+    #[must_use]
+    pub fn schema_tag(&self) -> &'static str {
+        self.schema.as_str()
     }
 }
 

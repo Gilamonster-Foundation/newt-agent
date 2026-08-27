@@ -1,0 +1,225 @@
+[
+  {
+    "name": "definition/choice-with-feature-demands",
+    "record": "definition",
+    "json": {
+      "controls": [
+        {
+          "id": "decision",
+          "kind": {
+            "choice": {
+              "options": [
+                {
+                  "id": "allow-once",
+                  "label": "allow once",
+                  "role": "allow"
+                },
+                {
+                  "id": "deny",
+                  "label": "deny (default)",
+                  "role": "deny"
+                }
+              ]
+            }
+          },
+          "label": "decision field",
+          "requirement": "required"
+        },
+        {
+          "id": "reason",
+          "kind": "text",
+          "label": "reason field",
+          "requirement": "optional"
+        },
+        {
+          "id": "remember",
+          "kind": "toggle",
+          "label": "remember field",
+          "requirement": "optional"
+        },
+        {
+          "id": "passphrase",
+          "kind": "secret",
+          "label": "passphrase field",
+          "requirement": "optional"
+        }
+      ],
+      "features": [
+        {
+          "feature": "secret-input",
+          "requirement": "required"
+        },
+        {
+          "feature": "diagrams",
+          "requirement": "optional"
+        }
+      ],
+      "kind": "form",
+      "markdown": "⊘ run_command wants to run `bash`",
+      "revision": 0,
+      "schema": "newt.interaction.definition/v1"
+    },
+    "links": [],
+    "dagcbor_hex": "a6646b696e6464666f726d66736368656d61781e6e6577742e696e746572616374696f6e2e646566696e6974696f6e2f763168636f6e74726f6c7384a4626964686465636973696f6e646b696e64a16663686f696365a1676f7074696f6e7382a36269646a616c6c6f772d6f6e636564726f6c6565616c6c6f77656c6162656c6a616c6c6f77206f6e6365a36269646464656e7964726f6c656464656e79656c6162656c6e64656e79202864656661756c7429656c6162656c6e6465636973696f6e206669656c646b726571756972656d656e74687265717569726564a462696466726561736f6e646b696e646474657874656c6162656c6c726561736f6e206669656c646b726571756972656d656e74686f7074696f6e616ca46269646872656d656d626572646b696e6466746f67676c65656c6162656c6e72656d656d626572206669656c646b726571756972656d656e74686f7074696f6e616ca46269646a70617373706872617365646b696e6466736563726574656c6162656c7070617373706872617365206669656c646b726571756972656d656e74686f7074696f6e616c68666561747572657382a267666561747572656c7365637265742d696e7075746b726571756972656d656e74687265717569726564a26766656174757265686469616772616d736b726571756972656d656e74686f7074696f6e616c686d61726b646f776e7823e28a982072756e5f636f6d6d616e642077616e747320746f2072756e20606261736860687265766973696f6e00",
+    "content_id": "bafyr4ihctz4cceaqfn6gj6gti4pzg4lpw6jpovxeovodczgoj6b2uy7zsa"
+  },
+  {
+    "name": "instance/two-audiences-assertion-required",
+    "record": "instance",
+    "json": {
+      "definition": "bafyr4ihctz4cceaqfn6gj6gti4pzg4lpw6jpovxeovodczgoj6b2uy7zsa",
+      "nonce": "1756200000000000000-0f4c1b2e",
+      "provenance": {
+        "minted_tick": 42,
+        "origin": "permission-gate"
+      },
+      "responder_policy": {
+        "audiences": [
+          "terminal",
+          "web"
+        ],
+        "requires_assertion": true
+      },
+      "revision": 0,
+      "schema": "newt.interaction.instance/v1",
+      "scope": {
+        "conversation_id": "conv-1",
+        "workspace_key": "ws-abc"
+      },
+      "ttl_ticks": 300
+    },
+    "links": [
+      "definition"
+    ],
+    "dagcbor_hex": "a8656e6f6e6365781c313735363230303030303030303030303030302d30663463316232656573636f7065a26d776f726b73706163655f6b65796677732d6162636f636f6e766572736174696f6e5f696466636f6e762d3166736368656d61781c6e6577742e696e746572616374696f6e2e696e7374616e63652f7631687265766973696f6e006974746c5f7469636b7319012c6a646566696e6974696f6ed82a58250001711e20e29e782110102b7c64f8d3471f93716fb792f756e4755c3164ce4f83aa63f9906a70726f76656e616e6365a2666f726967696e6f7065726d697373696f6e2d676174656b6d696e7465645f7469636b182a70726573706f6e6465725f706f6c696379a26961756469656e63657382687465726d696e616c637765627272657175697265735f617373657274696f6ef5",
+    "content_id": "bafyr4if74d2kztq43cz4s46udqqasfniyuzouygnblu37qd6bgjk62m3py"
+  },
+  {
+    "name": "response/value-choice",
+    "record": "response",
+    "json": {
+      "definition": "bafyr4ihctz4cceaqfn6gj6gti4pzg4lpw6jpovxeovodczgoj6b2uy7zsa",
+      "idempotency_key": "first-try",
+      "instance": "bafyr4if74d2kztq43cz4s46udqqasfniyuzouygnblu37qd6bgjk62m3py",
+      "responder_provenance": {
+        "assertion": "assertion-handle-1",
+        "audience": "web",
+        "kind": "signed-assertion",
+        "subject": "operator:example"
+      },
+      "revision": 0,
+      "schema": "newt.interaction.response/v1",
+      "values": [
+        {
+          "control": "decision",
+          "value": {
+            "kind": "choice",
+            "option": "deny"
+          }
+        }
+      ]
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657381a26576616c7565a2646b696e646663686f696365666f7074696f6e6464656e7967636f6e74726f6c686465636973696f6e68696e7374616e6365d82a58250001711e20bfe0f4acce1cd8b3c973d41c200915a8c532ea60cd0ae9bfc07e0992af699b7e687265766973696f6e006a646566696e6974696f6ed82a58250001711e20e29e782110102b7c64f8d3471f93716fb792f756e4755c3164ce4f83aa63f9906f6964656d706f74656e63795f6b65796966697273742d74727974726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374706f70657261746f723a6578616d706c656861756469656e63656377656269617373657274696f6e72617373657274696f6e2d68616e646c652d31",
+    "content_id": "bafyr4idkho5wva5zbcpv4xnbggemm3iy5wnwqoduxi6jkqeka3rlww2w3e"
+  },
+  {
+    "name": "response/value-text",
+    "record": "response",
+    "json": {
+      "definition": "bafyr4ihctz4cceaqfn6gj6gti4pzg4lpw6jpovxeovodczgoj6b2uy7zsa",
+      "idempotency_key": "first-try",
+      "instance": "bafyr4if74d2kztq43cz4s46udqqasfniyuzouygnblu37qd6bgjk62m3py",
+      "responder_provenance": {
+        "assertion": "assertion-handle-1",
+        "audience": "web",
+        "kind": "signed-assertion",
+        "subject": "operator:example"
+      },
+      "revision": 0,
+      "schema": "newt.interaction.response/v1",
+      "values": [
+        {
+          "control": "reason",
+          "value": {
+            "kind": "text",
+            "text": "a typed answer"
+          }
+        }
+      ]
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657381a26576616c7565a2646b696e64647465787464746578746e6120747970656420616e7377657267636f6e74726f6c66726561736f6e68696e7374616e6365d82a58250001711e20bfe0f4acce1cd8b3c973d41c200915a8c532ea60cd0ae9bfc07e0992af699b7e687265766973696f6e006a646566696e6974696f6ed82a58250001711e20e29e782110102b7c64f8d3471f93716fb792f756e4755c3164ce4f83aa63f9906f6964656d706f74656e63795f6b65796966697273742d74727974726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374706f70657261746f723a6578616d706c656861756469656e63656377656269617373657274696f6e72617373657274696f6e2d68616e646c652d31",
+    "content_id": "bafyr4ibmpat4ym3npjyu5ewnnsqw4j4bonmxnwdhrjnqorik75xcuv5srm"
+  },
+  {
+    "name": "response/value-toggle",
+    "record": "response",
+    "json": {
+      "definition": "bafyr4ihctz4cceaqfn6gj6gti4pzg4lpw6jpovxeovodczgoj6b2uy7zsa",
+      "idempotency_key": "first-try",
+      "instance": "bafyr4if74d2kztq43cz4s46udqqasfniyuzouygnblu37qd6bgjk62m3py",
+      "responder_provenance": {
+        "assertion": "assertion-handle-1",
+        "audience": "web",
+        "kind": "signed-assertion",
+        "subject": "operator:example"
+      },
+      "revision": 0,
+      "schema": "newt.interaction.response/v1",
+      "values": [
+        {
+          "control": "remember",
+          "value": {
+            "kind": "toggle",
+            "on": true
+          }
+        }
+      ]
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657381a26576616c7565a2626f6ef5646b696e6466746f67676c6567636f6e74726f6c6872656d656d62657268696e7374616e6365d82a58250001711e20bfe0f4acce1cd8b3c973d41c200915a8c532ea60cd0ae9bfc07e0992af699b7e687265766973696f6e006a646566696e6974696f6ed82a58250001711e20e29e782110102b7c64f8d3471f93716fb792f756e4755c3164ce4f83aa63f9906f6964656d706f74656e63795f6b65796966697273742d74727974726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374706f70657261746f723a6578616d706c656861756469656e63656377656269617373657274696f6e72617373657274696f6e2d68616e646c652d31",
+    "content_id": "bafyr4ifmcg2ejpmv26agsrosekaargalz3uzyysxumwgo44m6jspiqqzkm"
+  },
+  {
+    "name": "response/value-secret-by-reference",
+    "record": "response",
+    "json": {
+      "definition": "bafyr4ihctz4cceaqfn6gj6gti4pzg4lpw6jpovxeovodczgoj6b2uy7zsa",
+      "idempotency_key": "first-try",
+      "instance": "bafyr4if74d2kztq43cz4s46udqqasfniyuzouygnblu37qd6bgjk62m3py",
+      "responder_provenance": {
+        "assertion": "assertion-handle-1",
+        "audience": "web",
+        "kind": "signed-assertion",
+        "subject": "operator:example"
+      },
+      "revision": 0,
+      "schema": "newt.interaction.response/v1",
+      "values": [
+        {
+          "control": "passphrase",
+          "value": {
+            "kind": "secret",
+            "reference": "vault-handle-9"
+          }
+        }
+      ]
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657381a26576616c7565a2646b696e6466736563726574697265666572656e63656e7661756c742d68616e646c652d3967636f6e74726f6c6a7061737370687261736568696e7374616e6365d82a58250001711e20bfe0f4acce1cd8b3c973d41c200915a8c532ea60cd0ae9bfc07e0992af699b7e687265766973696f6e006a646566696e6974696f6ed82a58250001711e20e29e782110102b7c64f8d3471f93716fb792f756e4755c3164ce4f83aa63f9906f6964656d706f74656e63795f6b65796966697273742d74727974726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374706f70657261746f723a6578616d706c656861756469656e63656377656269617373657274696f6e72617373657274696f6e2d68616e646c652d31",
+    "content_id": "bafyr4ihxzlby5rzgkytlra44745bppdadg6nbyb2ynqxjfw2qrsu2khwfm"
+  }
+]

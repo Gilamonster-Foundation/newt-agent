@@ -12,7 +12,7 @@
 //! liability forever. So a secret is carried by REFERENCE and the type
 //! offers no way to put plaintext in.
 
-use newt_interaction::{ControlId, ControlValue, SecretRef};
+use newt_interaction::{ControlId, ControlValue, OptionId, SecretRef};
 
 /// A toggle is a bool. `"TRUE"` is not a value this protocol can express,
 /// on the wire or in memory.
@@ -42,13 +42,15 @@ fn a_toggle_cannot_be_submitted_as_a_string() {
 #[test]
 fn a_choice_names_a_control_not_free_text() {
     let choice = ControlValue::Choice {
-        option: ControlId::new("allow-once").unwrap(),
+        option: OptionId::new("allow-once").unwrap(),
     };
     let wire = serde_json::to_value(&choice).unwrap();
     assert_eq!(wire["kind"], "choice");
     assert_eq!(wire["option"], "allow-once");
-    // A control id's charset is enforced at construction, so a choice can
-    // never carry a sentence.
+    // An option id's charset is enforced at construction, so a choice can
+    // never carry a sentence. (Whether the WIRE path honours that is a
+    // separate question, pinned in `wire_validation.rs`.)
+    assert!(OptionId::new("not an option id").is_err());
     assert!(ControlId::new("not a control id").is_err());
 }
 
@@ -94,7 +96,7 @@ fn a_secret_reference_must_not_be_empty() {
 fn every_variant_round_trips() {
     let values = vec![
         ControlValue::Choice {
-            option: ControlId::new("deny").unwrap(),
+            option: OptionId::new("deny").unwrap(),
         },
         ControlValue::Text {
             text: "a typed answer".to_string(),
@@ -109,4 +111,45 @@ fn every_variant_round_trips() {
         let back: ControlValue = serde_json::from_str(&json).unwrap();
         assert_eq!(back, value, "round trip changed the value: {json}");
     }
+}
+
+/// **A choice names an OPTION; a submission names the CONTROL.** Two id
+/// spaces, so the pair cannot disagree.
+///
+/// Before this, `Submission{control: ControlId, value: Choice{option:
+/// ControlId}}` carried two same-typed ids with nothing saying which was
+/// authoritative — and both were bound into `ResponseId`, so a
+/// contradiction got permanently content-addressed. The golden vector hid
+/// it by repeating one name in both. This is the same argument that
+/// removed `responder` in round 2: two bound fields carrying one fact can
+/// disagree.
+///
+/// The shape follows B0's actual permission prompt, which is ONE question
+/// offering `[a]llow once  [s]ession allow  [d]eny (default)` — one field
+/// with N mutually-exclusive options, not N fields. Modelling each option
+/// as its own control would also make `Requirement` incoherent: under "the
+/// response must include this control", answering an allow would require
+/// answering the deny too.
+#[test]
+fn a_control_id_and_an_option_id_are_different_types() {
+    let submission = newt_interaction::Submission {
+        control: ControlId::new("decision").unwrap(),
+        value: ControlValue::Choice {
+            option: OptionId::new("deny").unwrap(),
+        },
+    };
+    let wire = serde_json::to_value(&submission).unwrap();
+    assert_eq!(wire["control"], "decision");
+    assert_eq!(wire["value"]["option"], "deny");
+
+    // The compiler is the guarantee: a ControlId cannot be handed to the
+    // option slot, so "which of these two ids wins?" is not a question the
+    // model can pose.
+    //
+    //     ControlValue::Choice { option: ControlId::new("deny").unwrap() }
+    //     ^ error[E0308]: expected `OptionId`, found `ControlId`
+    //
+    // Both id spaces share one validation rule, so neither is the lax one.
+    assert!(OptionId::new("not an option").is_err());
+    assert!(ControlId::new("not a control").is_err());
 }

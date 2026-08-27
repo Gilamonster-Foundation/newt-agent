@@ -9,8 +9,8 @@
 
 use content_addressable::{canonical, ContentAddressable, ContentId};
 use newt_interaction::{
-    Control, ControlKind, DefinitionId, InteractionDefinition, InteractionInstance,
-    InteractionKind, Response, SemanticRole,
+    Control, ControlKind, DefinitionId, FeatureDemand, InteractionDefinition, InteractionInstance,
+    InteractionKind, Requirement, Response, SemanticRole, SurfaceFeature,
 };
 
 mod fixtures;
@@ -50,7 +50,7 @@ fn equal_values_have_equal_ids_and_field_order_is_irrelevant() {
     // Assemble the same value by a different route.
     b.controls = a.controls.clone();
     b.revision = a.revision;
-    b.features = a.features;
+    b.features = a.features.clone();
     assert_eq!(a, b);
     assert_eq!(a.definition_id().unwrap(), b.definition_id().unwrap());
     assert_eq!(
@@ -118,6 +118,11 @@ fn every_semantic_field_of_an_offer_moves_its_id() {
     let base = instance(&def);
 
     // EXHAUSTIVE — no `..`. This is the compile-time half of the guard.
+    // `schema` has no mutation case below: it is a TYPE that deserializes
+    // from exactly one value, so a differently-tagged instance is not
+    // constructible in Rust. The property it used to check lives in
+    // `versioning::the_schema_tag_is_bound_into_identity`, which patches
+    // the tag in the ENCODED bytes and asserts the id moves.
     let InteractionInstance {
         schema: _,
         nonce: _,
@@ -130,9 +135,6 @@ fn every_semantic_field_of_an_offer_moves_its_id() {
     } = &base;
 
     let cases: Vec<Case<InteractionInstance>> = vec![
-        ("schema", |i| {
-            i.schema = "newt.interaction.instance/v2".into()
-        }),
         ("nonce", |i| {
             i.nonce = newt_interaction::Nonce::new("another-handle").unwrap();
         }),
@@ -210,6 +212,8 @@ fn every_field_a_response_claims_to_bind_moves_its_id() {
     let base = response(&def, &inst);
 
     // EXHAUSTIVE — no `..`.
+    // See the note above: `schema` is type-pinned, so its identity
+    // binding is asserted at the bytes rather than here.
     let Response {
         schema: _,
         definition: _,
@@ -221,9 +225,6 @@ fn every_field_a_response_claims_to_bind_moves_its_id() {
     } = &base;
 
     let cases: Vec<Case<Response>> = vec![
-        ("schema", |r| {
-            r.schema = "newt.interaction.response/v2".into()
-        }),
         ("definition", |r| {
             let mut other = definition();
             other.markdown.push('?');
@@ -236,7 +237,7 @@ fn every_field_a_response_claims_to_bind_moves_its_id() {
         }),
         ("revision", |r| r.revision = r.revision.next()),
         ("values.control", |r| {
-            r.values[0].control = newt_interaction::ControlId::new("allow-once").unwrap();
+            r.values[0].control = newt_interaction::ControlId::new("other-field").unwrap();
         }),
         ("values.value", |r| {
             r.values[0].value = newt_interaction::ControlValue::Text {
@@ -245,7 +246,7 @@ fn every_field_a_response_claims_to_bind_moves_its_id() {
         }),
         ("values.len", |r| {
             r.values.push(newt_interaction::Submission {
-                control: newt_interaction::ControlId::new("allow-once").unwrap(),
+                control: newt_interaction::ControlId::new("other-field").unwrap(),
                 value: newt_interaction::ControlValue::Toggle { on: true },
             });
         }),
@@ -286,6 +287,8 @@ fn every_semantic_field_of_a_definition_moves_its_id() {
     let base = definition();
 
     // EXHAUSTIVE — no `..`.
+    // See the note above: `schema` is type-pinned, so its identity
+    // binding is asserted at the bytes rather than here.
     let InteractionDefinition {
         schema: _,
         kind: _,
@@ -296,19 +299,40 @@ fn every_semantic_field_of_a_definition_moves_its_id() {
     } = &base;
 
     let cases: Vec<Case<InteractionDefinition>> = vec![
-        ("schema", |d| {
-            d.schema = "newt.interaction.definition/v2".into()
-        }),
         ("kind", |d| d.kind = InteractionKind::Confirm),
         ("revision", |d| d.revision = d.revision.next()),
         ("markdown", |d| d.markdown.push('!')),
         ("controls.label", |d| d.controls[0].label.push('!')),
-        ("controls.role", |d| {
-            d.controls[0].role = SemanticRole::Cancel
-        }),
         ("controls.kind", |d| d.controls[0].kind = ControlKind::Text),
-        ("controls.required", |d| {
-            d.controls[0].required = !d.controls[0].required;
+        // The options are part of the field. A definition whose option set
+        // could change without changing its id would let an offer be
+        // re-aimed at answers its author never wrote.
+        ("controls.option.id", |d| {
+            if let ControlKind::Choice { options } = &mut d.controls[0].kind {
+                options[0].id = newt_interaction::OptionId::new("renamed-option").unwrap();
+            }
+        }),
+        ("controls.option.role", |d| {
+            if let ControlKind::Choice { options } = &mut d.controls[0].kind {
+                options[0].role = SemanticRole::Cancel;
+            }
+        }),
+        ("controls.option.label", |d| {
+            if let ControlKind::Choice { options } = &mut d.controls[0].kind {
+                options[0].label.push('!');
+            }
+        }),
+        ("controls.option.len", |d| {
+            if let ControlKind::Choice { options } = &mut d.controls[0].kind {
+                options.push(newt_interaction::ChoiceOption {
+                    id: newt_interaction::OptionId::new("extra").unwrap(),
+                    role: SemanticRole::Cancel,
+                    label: "back".to_string(),
+                });
+            }
+        }),
+        ("controls.requirement", |d| {
+            d.controls[0].requirement = Requirement::Optional;
         }),
         ("controls.id", |d| {
             d.controls[0].id = newt_interaction::ControlId::new("renamed").unwrap();
@@ -316,16 +340,28 @@ fn every_semantic_field_of_a_definition_moves_its_id() {
         ("controls.len", |d| {
             d.controls.push(Control {
                 id: newt_interaction::ControlId::new("extra").unwrap(),
-                role: SemanticRole::Cancel,
-                kind: ControlKind::Choice,
-                label: "back".to_string(),
-                required: false,
+                kind: ControlKind::Text,
+                label: "a second field".to_string(),
+                requirement: Requirement::Optional,
             });
         }),
-        ("features.secret_input", |d| d.features.secret_input = true),
-        ("features.diagrams", |d| d.features.diagrams = true),
-        ("features.multi_control", |d| {
-            d.features.multi_control = true
+        ("features.len", |d| {
+            d.features.push(FeatureDemand {
+                feature: SurfaceFeature::new(SurfaceFeature::DIAGRAMS).unwrap(),
+                requirement: Requirement::Optional,
+            });
+        }),
+        ("features.feature", |d| {
+            d.features = vec![FeatureDemand {
+                feature: SurfaceFeature::new(SurfaceFeature::SECRET_INPUT).unwrap(),
+                requirement: Requirement::Optional,
+            }];
+        }),
+        ("features.requirement", |d| {
+            d.features = vec![FeatureDemand {
+                feature: SurfaceFeature::new(SurfaceFeature::DIAGRAMS).unwrap(),
+                requirement: Requirement::Required,
+            }];
         }),
     ];
 

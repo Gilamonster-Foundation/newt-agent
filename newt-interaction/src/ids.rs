@@ -16,9 +16,17 @@ use crate::error::ProtocolError;
 macro_rules! content_id_newtype {
     ($(#[$meta:meta])* $name:ident, $kind:literal) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
         #[serde(transparent)]
-        pub struct $name(ContentId);
+        // `ContentId` is a foreign type with no `JsonSchema` impl. In JSON
+        // it renders as its canonical string, which is what a schema
+        // consumer sees; in canonical DAG-CBOR it is a tag-42 LINK, which
+        // JSON Schema has no way to express and the vectors' `links` field
+        // documents instead.
+        pub struct $name(
+            #[cfg_attr(feature = "schema", schemars(with = "String"))] ContentId,
+        );
 
         impl $name {
             /// Wrap an id already minted from the record it names.
@@ -90,14 +98,59 @@ content_id_newtype!(
     "response id"
 );
 
-/// A stable, author-assigned name for one control inside a definition.
+/// Shared validation for author-assigned names: non-empty, ASCII
+/// alphanumeric plus `-` and `_`.
+fn validated_name(kind: &'static str, name: String) -> Result<String, ProtocolError> {
+    if name.is_empty() {
+        return Err(ProtocolError::InvalidId {
+            kind,
+            reason: "must not be empty".to_string(),
+        });
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ProtocolError::InvalidId {
+            kind,
+            reason: format!("`{name}` has characters outside [A-Za-z0-9_-]"),
+        });
+    }
+    Ok(name)
+}
+
+/// A stable, author-assigned name for one control — one FIELD of an
+/// interaction — inside a definition.
 ///
-/// Deliberately not content-derived: a control id must survive being written
-/// by a human in a `+++` envelope, and the definition it lives in commits to
-/// it — so the definition's `ContentId` is what protects its integrity.
+/// Deliberately not content-derived: a control id must survive being
+/// written by a human in a `+++` envelope, and the definition it lives in
+/// commits to it, so the definition's `ContentId` is what protects its
+/// integrity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+// Deserialization goes THROUGH the constructor. A derived impl on a
+// transparent newtype builds the private field directly, so an invalid
+// value arrives intact in canonical bytes that re-encode identically —
+// invisible to the byte-equality gate, and a guarantee the type's own
+// docs would otherwise be claiming falsely.
+#[serde(into = "String", try_from = "String")]
 pub struct ControlId(String);
+
+#[cfg(feature = "schema")]
+crate::string_scalar_schema!(ControlId, Some("^[A-Za-z0-9_-]+$"));
+
+impl From<ControlId> for String {
+    fn from(value: ControlId) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<String> for ControlId {
+    type Error = ProtocolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
 
 impl ControlId {
     /// Build a control id: non-empty, ASCII alphanumeric plus `-` and `_`.
@@ -106,23 +159,60 @@ impl ControlId {
     ///
     /// [`ProtocolError::InvalidId`] when empty or outside the charset.
     pub fn new(name: impl Into<String>) -> Result<Self, ProtocolError> {
-        let name = name.into();
-        if name.is_empty() {
-            return Err(ProtocolError::InvalidId {
-                kind: "control id",
-                reason: "must not be empty".to_string(),
-            });
-        }
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            return Err(ProtocolError::InvalidId {
-                kind: "control id",
-                reason: format!("`{name}` has characters outside [A-Za-z0-9_-]"),
-            });
-        }
-        Ok(Self(name))
+        Ok(Self(validated_name("control id", name.into())?))
+    }
+
+    /// The name as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A stable, author-assigned name for one OPTION of a choice control.
+///
+/// A separate id space from [`ControlId`] on purpose. A choice is one
+/// field with many mutually-exclusive options — the shape B0's permission
+/// prompt already has: one question offering `[a]llow once`,
+/// `[s]ession allow`, `[d]eny (default)` and the rest. Giving options
+/// their own type means a submission naming a control and an option cannot
+/// name two things of the same kind with no rule saying which is
+/// authoritative; the ambiguity is gone by construction rather than by
+/// prose.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+// Deserialization goes THROUGH the constructor. A derived impl on a
+// transparent newtype builds the private field directly, so an invalid
+// value arrives intact in canonical bytes that re-encode identically —
+// invisible to the byte-equality gate, and a guarantee the type's own
+// docs would otherwise be claiming falsely.
+#[serde(into = "String", try_from = "String")]
+pub struct OptionId(String);
+
+#[cfg(feature = "schema")]
+crate::string_scalar_schema!(OptionId, Some("^[A-Za-z0-9_-]+$"));
+
+impl From<OptionId> for String {
+    fn from(value: OptionId) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<String> for OptionId {
+    type Error = ProtocolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl OptionId {
+    /// Build an option id: same shape rule as a control id.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::InvalidId`] when empty or outside the charset.
+    pub fn new(name: impl Into<String>) -> Result<Self, ProtocolError> {
+        Ok(Self(validated_name("option id", name.into())?))
     }
 
     /// The name as written.
@@ -139,8 +229,30 @@ impl ControlId {
 /// controller revalidates every response against the definition regardless of
 /// who presented which nonce.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+// Deserialization goes THROUGH the constructor. A derived impl on a
+// transparent newtype builds the private field directly, so an invalid
+// value arrives intact in canonical bytes that re-encode identically —
+// invisible to the byte-equality gate, and a guarantee the type's own
+// docs would otherwise be claiming falsely.
+#[serde(into = "String", try_from = "String")]
 pub struct Nonce(String);
+
+#[cfg(feature = "schema")]
+crate::string_scalar_schema!(Nonce, None::<&str>);
+
+impl From<Nonce> for String {
+    fn from(value: Nonce) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<String> for Nonce {
+    type Error = ProtocolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
 
 impl Nonce {
     /// Adopt a nonce minted by the host.
@@ -174,6 +286,7 @@ impl Nonce {
 /// crate cannot depend on `newt-core` (dependency direction is binding), so
 /// it carries the lesson rather than the type. #1828 records moving `Rev`
 /// down here as a named follow-up.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
 )]
@@ -206,8 +319,30 @@ impl Revision {
 /// A caller-supplied key that makes a response replay-safe: the same key on
 /// the same instance is the same submission, not a second one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+// Deserialization goes THROUGH the constructor. A derived impl on a
+// transparent newtype builds the private field directly, so an invalid
+// value arrives intact in canonical bytes that re-encode identically —
+// invisible to the byte-equality gate, and a guarantee the type's own
+// docs would otherwise be claiming falsely.
+#[serde(into = "String", try_from = "String")]
 pub struct IdempotencyKey(String);
+
+#[cfg(feature = "schema")]
+crate::string_scalar_schema!(IdempotencyKey, None::<&str>);
+
+impl From<IdempotencyKey> for String {
+    fn from(value: IdempotencyKey) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<String> for IdempotencyKey {
+    type Error = ProtocolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
 
 impl IdempotencyKey {
     /// Adopt an idempotency key.

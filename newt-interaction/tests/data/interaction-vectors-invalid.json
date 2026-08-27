@@ -1,0 +1,134 @@
+[
+  {
+    "name": "response/invalid-decision",
+    "record": "response",
+    "json": {
+      "definition": "bafyr4ihctz4cceaqfn6gj6gti4pzg4lpw6jpovxeovodczgoj6b2uy7zsa",
+      "idempotency_key": "first-try",
+      "instance": "bafyr4if74d2kztq43cz4s46udqqasfniyuzouygnblu37qd6bgjk62m3py",
+      "responder_provenance": {
+        "assertion": "assertion-handle-1",
+        "audience": "web",
+        "kind": "signed-assertion",
+        "subject": "operator:example"
+      },
+      "revision": 0,
+      "schema": "newt.interaction.response/v1",
+      "values": [
+        {
+          "control": "decision",
+          "value": {
+            "kind": "text",
+            "text": "not a choice"
+          }
+        }
+      ]
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657381a26576616c7565a2646b696e64647465787464746578746c6e6f7420612063686f69636567636f6e74726f6c686465636973696f6e68696e7374616e6365d82a58250001711e20bfe0f4acce1cd8b3c973d41c200915a8c532ea60cd0ae9bfc07e0992af699b7e687265766973696f6e006a646566696e6974696f6ed82a58250001711e20e29e782110102b7c64f8d3471f93716fb792f756e4755c3164ce4f83aa63f9906f6964656d706f74656e63795f6b65796966697273742d74727974726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374706f70657261746f723a6578616d706c656861756469656e63656377656269617373657274696f6e72617373657274696f6e2d68616e646c652d31",
+    "content_id": "bafyr4ic5ddlsvdqzvlfccuqzw5pkp5eagr2kq7k6aqixdddbw53mmdemzu",
+    "invalid_because": "control `decision` is kind=choice; a text value cannot answer it"
+  },
+  {
+    "name": "response/invalid-remember",
+    "record": "response",
+    "json": {
+      "definition": "bafyr4ihctz4cceaqfn6gj6gti4pzg4lpw6jpovxeovodczgoj6b2uy7zsa",
+      "idempotency_key": "first-try",
+      "instance": "bafyr4if74d2kztq43cz4s46udqqasfniyuzouygnblu37qd6bgjk62m3py",
+      "responder_provenance": {
+        "assertion": "assertion-handle-1",
+        "audience": "web",
+        "kind": "signed-assertion",
+        "subject": "operator:example"
+      },
+      "revision": 0,
+      "schema": "newt.interaction.response/v1",
+      "values": [
+        {
+          "control": "remember",
+          "value": {
+            "kind": "choice",
+            "option": "deny"
+          }
+        }
+      ]
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657381a26576616c7565a2646b696e646663686f696365666f7074696f6e6464656e7967636f6e74726f6c6872656d656d62657268696e7374616e6365d82a58250001711e20bfe0f4acce1cd8b3c973d41c200915a8c532ea60cd0ae9bfc07e0992af699b7e687265766973696f6e006a646566696e6974696f6ed82a58250001711e20e29e782110102b7c64f8d3471f93716fb792f756e4755c3164ce4f83aa63f9906f6964656d706f74656e63795f6b65796966697273742d74727974726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374706f70657261746f723a6578616d706c656861756469656e63656377656269617373657274696f6e72617373657274696f6e2d68616e646c652d31",
+    "content_id": "bafyr4ibv3cuhd4ptsafn3p3bez54thnzrmxqqhfr6fhacl6oones3m6kh4",
+    "invalid_because": "control `remember` is kind=toggle; a choice value cannot answer it"
+  },
+  {
+    "name": "response/invalid-passphrase",
+    "record": "response",
+    "json": {
+      "definition": "bafyr4ihctz4cceaqfn6gj6gti4pzg4lpw6jpovxeovodczgoj6b2uy7zsa",
+      "idempotency_key": "first-try",
+      "instance": "bafyr4if74d2kztq43cz4s46udqqasfniyuzouygnblu37qd6bgjk62m3py",
+      "responder_provenance": {
+        "assertion": "assertion-handle-1",
+        "audience": "web",
+        "kind": "signed-assertion",
+        "subject": "operator:example"
+      },
+      "revision": 0,
+      "schema": "newt.interaction.response/v1",
+      "values": [
+        {
+          "control": "passphrase",
+          "value": {
+            "kind": "toggle",
+            "on": true
+          }
+        }
+      ]
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657381a26576616c7565a2626f6ef5646b696e6466746f67676c6567636f6e74726f6c6a7061737370687261736568696e7374616e6365d82a58250001711e20bfe0f4acce1cd8b3c973d41c200915a8c532ea60cd0ae9bfc07e0992af699b7e687265766973696f6e006a646566696e6974696f6ed82a58250001711e20e29e782110102b7c64f8d3471f93716fb792f756e4755c3164ce4f83aa63f9906f6964656d706f74656e63795f6b65796966697273742d74727974726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374706f70657261746f723a6578616d706c656861756469656e63656377656269617373657274696f6e72617373657274696f6e2d68616e646c652d31",
+    "content_id": "bafyr4ifjlioietl7efo42tpolebwsliorsnjp4adb2igg4knffxyp53awy",
+    "invalid_because": "control `passphrase` is kind=secret; a toggle value cannot answer it"
+  },
+  {
+    "name": "response/invalid-no-such-field",
+    "record": "response",
+    "json": {
+      "definition": "bafyr4ihctz4cceaqfn6gj6gti4pzg4lpw6jpovxeovodczgoj6b2uy7zsa",
+      "idempotency_key": "first-try",
+      "instance": "bafyr4if74d2kztq43cz4s46udqqasfniyuzouygnblu37qd6bgjk62m3py",
+      "responder_provenance": {
+        "assertion": "assertion-handle-1",
+        "audience": "web",
+        "kind": "signed-assertion",
+        "subject": "operator:example"
+      },
+      "revision": 0,
+      "schema": "newt.interaction.response/v1",
+      "values": [
+        {
+          "control": "no-such-field",
+          "value": {
+            "kind": "toggle",
+            "on": true
+          }
+        }
+      ]
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657381a26576616c7565a2626f6ef5646b696e6466746f67676c6567636f6e74726f6c6d6e6f2d737563682d6669656c6468696e7374616e6365d82a58250001711e20bfe0f4acce1cd8b3c973d41c200915a8c532ea60cd0ae9bfc07e0992af699b7e687265766973696f6e006a646566696e6974696f6ed82a58250001711e20e29e782110102b7c64f8d3471f93716fb792f756e4755c3164ce4f83aa63f9906f6964656d706f74656e63795f6b65796966697273742d74727974726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374706f70657261746f723a6578616d706c656861756469656e63656377656269617373657274696f6e72617373657274696f6e2d68616e646c652d31",
+    "content_id": "bafyr4ib36mdsdrl3y3ddu2e3enzvwau5goc5ak4yz4b7rybx32qe5czzqy",
+    "invalid_because": "control `no-such-field` does not exist in the definition"
+  }
+]

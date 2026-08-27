@@ -163,6 +163,65 @@ fn the_protocol_crate_has_no_forbidden_dependency() {
     );
 }
 
+/// **The runtime dependency set is exactly three, by default.**
+///
+/// The closure check above forbids specific crates; this forbids ADDITION.
+/// A2.1 adds an optional `schemars` for schema generation, and the whole
+/// reason it is optional is that a build-time convenience must not become
+/// a runtime dependency of the inward layer — so the DEFAULT manifest is
+/// pinned, not merely the absence of a forbidden name.
+#[test]
+fn the_default_runtime_dependencies_are_exactly_three() {
+    let manifest =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .expect("manifest");
+    let table = manifest
+        .split("[dependencies]")
+        .nth(1)
+        .expect("a [dependencies] table")
+        .split("\n[")
+        .next()
+        .expect("the table ends");
+
+    let mut declared: Vec<String> = Vec::new();
+    let mut optional: Vec<String> = Vec::new();
+    for line in table.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, rest)) = line.split_once(['=', '.']) else {
+            continue;
+        };
+        let name = name.trim().to_string();
+        if rest.contains("optional = true") {
+            optional.push(name);
+        } else {
+            declared.push(name);
+        }
+    }
+    declared.sort();
+    assert_eq!(
+        declared,
+        vec![
+            "content-addressable".to_string(),
+            "serde".to_string(),
+            "thiserror".to_string()
+        ],
+        "the inward layer's runtime dependencies changed. Anything new here \
+         ships to every consumer, including the wyvern tier; if it is a \
+         build-time convenience, mark it `optional = true` behind a feature."
+    );
+    optional.sort();
+    assert_eq!(
+        optional,
+        vec!["schemars".to_string(), "serde_json".to_string()],
+        "an optional dependency appeared or vanished — schema GENERATION is \
+         the only sanctioned reason for one (schemars, plus serde_json for \
+         the const tag schemas it emits). Neither is in the default build."
+    );
+}
+
 /// **Anti-vacuous twin.** The same walker, pointed at a package that really
 /// does depend on crossterm (`newt-core/Cargo.toml:76`, non-optional), must
 /// report it. If this passes vacuously, so does the guard above.

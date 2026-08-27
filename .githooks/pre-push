@@ -9,6 +9,10 @@
 # Install: `just install-hooks` (or `git config core.hooksPath .githooks`)
 #
 # PIPELINE PARITY: This hook mirrors .github/workflows/ci.yml.
+#   - The feature list passed to clippy and to cargo test must MATCH:
+#     `--features newt-data/kernel,newt-interaction/schema`. Linting without
+#     a feature the tests enable hides feature-gated lint regressions, which
+#     is the same class of gap as a pipeline step with no hook behind it.
 #   - `just check` matches the lint + test + lean-build jobs (fmt + clippy +
 #     cargo test, plus the `--no-default-features` lean build for issue #416 —
 #     rich-tui is a default feature now, so the main jobs already cover it —
