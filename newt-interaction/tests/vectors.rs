@@ -384,17 +384,18 @@ fn a_vector_id_is_reproducible_from_its_canonical_bytes() {
         let reencoded = match vector.record.as_str() {
             "definition" => {
                 let record: InteractionDefinition =
-                    canonical::from_canonical_dagcbor(&bytes).expect("decode definition");
+                    canonical::from_canonical_dagcbor_checked(&bytes)
+                        .expect("a committed vector decodes through the CHECKED door");
                 record.canonical_form().expect("re-encode")
             }
             "instance" => {
-                let record: InteractionInstance =
-                    canonical::from_canonical_dagcbor(&bytes).expect("decode instance");
+                let record: InteractionInstance = canonical::from_canonical_dagcbor_checked(&bytes)
+                    .expect("a committed vector decodes through the CHECKED door");
                 record.canonical_form().expect("re-encode")
             }
             "response" => {
-                let record: Response =
-                    canonical::from_canonical_dagcbor(&bytes).expect("decode response");
+                let record: Response = canonical::from_canonical_dagcbor_checked(&bytes)
+                    .expect("a committed vector decodes through the CHECKED door");
                 record.canonical_form().expect("re-encode")
             }
             other => panic!("vector `{}` names unknown record `{other}`", vector.name),
