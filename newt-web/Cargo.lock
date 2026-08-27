@@ -4316,6 +4316,7 @@ dependencies = [
  "crossterm",
  "ignore",
  "libc",
+ "newt-interaction",
  "newt-skills",
  "newt-tuner",
  "pulldown-cmark",
@@ -4366,6 +4367,15 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+]
+
+[[package]]
+name = "newt-interaction"
+version = "0.8.0"
+dependencies = [
+ "content-addressable",
+ "serde",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

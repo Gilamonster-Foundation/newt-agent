@@ -43,6 +43,7 @@ pub mod fs_cap;
 pub mod git_caveats;
 pub mod git_hardening;
 pub mod grounding;
+pub mod interaction_adapter;
 pub mod kit;
 pub mod launch_authority;
 pub mod lazy_emission;

@@ -278,6 +278,7 @@ newt-git          = { path = "newt-git",          version = "=0.8.0" }
 newt-inference    = { path = "newt-inference",    version = "=0.8.0" }
 newt-scheduler    = { path = "newt-scheduler",    version = "=0.8.0" }
 newt-tools        = { path = "newt-tools",        version = "=0.8.0" }
+newt-interaction  = { path = "newt-interaction",  version = "=0.8.0" }
 newt-skills       = { path = "newt-skills",       version = "=0.8.0" }
 newt-tui          = { path = "newt-tui",          version = "=0.8.0" }
 newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.8.0" }
