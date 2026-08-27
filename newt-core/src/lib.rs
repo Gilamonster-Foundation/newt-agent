@@ -7,7 +7,6 @@
 pub mod agent_identity;
 pub mod agentic;
 pub mod agents;
-pub mod answer_authz;
 pub mod api_surface;
 pub mod artifact;
 pub mod atomic_fs;
@@ -44,6 +43,7 @@ pub mod git_caveats;
 pub mod git_hardening;
 pub mod grounding;
 pub mod interaction_adapter;
+pub mod interaction_resolution;
 pub mod kit;
 pub mod launch_authority;
 pub mod lazy_emission;
