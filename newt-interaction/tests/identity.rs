@@ -296,6 +296,7 @@ fn every_semantic_field_of_a_definition_moves_its_id() {
         markdown: _,
         controls: _,
         features: _,
+        note: _,
     } = &base;
 
     let cases: Vec<Case<InteractionDefinition>> = vec![
@@ -322,12 +323,29 @@ fn every_semantic_field_of_a_definition_moves_its_id() {
                 options[0].label.push('!');
             }
         }),
+        // The accelerator and the hidden aliases both AUTHORIZE — the
+        // terminal parses on them — so a definition whose key set could
+        // change without changing its id would let an offer accept inputs
+        // its author never wrote.
+        ("controls.option.key", |d| {
+            if let ControlKind::Choice { options } = &mut d.controls[0].kind {
+                options[0].key = "z".to_string();
+            }
+        }),
+        ("controls.option.aliases", |d| {
+            if let ControlKind::Choice { options } = &mut d.controls[0].kind {
+                options[0].aliases.push("zz".to_string());
+            }
+        }),
+        ("note", |d| d.note = Some("a hint line".to_string())),
         ("controls.option.len", |d| {
             if let ControlKind::Choice { options } = &mut d.controls[0].kind {
                 options.push(newt_interaction::ChoiceOption {
                     id: newt_interaction::OptionId::new("extra").unwrap(),
                     role: SemanticRole::Cancel,
                     label: "back".to_string(),
+                    key: "b".to_string(),
+                    aliases: Vec::new(),
                 });
             }
         }),

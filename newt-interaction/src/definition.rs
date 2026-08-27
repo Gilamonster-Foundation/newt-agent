@@ -92,6 +92,23 @@ pub struct ChoiceOption {
     pub role: SemanticRole,
     /// Human-readable label. Labels never confer authority (ADR law 2).
     pub label: String,
+    /// The accelerator a keyboard surface offers for this option — `a`,
+    /// `d`. Presentation, but NOT only presentation: the terminal
+    /// authorizes on it, so it is part of what the definition means and
+    /// cannot live in the view.
+    ///
+    /// Omitted when empty, so an option that offers no accelerator is
+    /// byte-identical to one written before this field existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key: String,
+    /// Hidden inputs that also select this option — `n`/`N` for a deny.
+    /// Never rendered, and never able to shadow another option's
+    /// canonical id or key: matching is canonical-first, and ambiguity
+    /// denies.
+    ///
+    /// Omitted when empty, for the same reason as `key`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 /// How a control accepts input.
@@ -246,6 +263,15 @@ pub struct InteractionDefinition {
     /// What a surface must be able to do to present this faithfully, each
     /// demand marked required or optional.
     pub features: Vec<FeatureDemand>,
+    /// A subordinate line beneath the body — a control hint, a danger
+    /// warning. Readable content like `markdown`, kept separate because
+    /// surfaces place it differently and the legacy prompt already
+    /// distinguishes the two.
+    ///
+    /// Omitted when absent, so a definition without one is byte-identical
+    /// to one written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl InteractionDefinition {
@@ -259,6 +285,7 @@ impl InteractionDefinition {
             markdown: markdown.into(),
             controls,
             features: Vec::new(),
+            note: None,
         }
     }
 

@@ -38,6 +38,13 @@
       "description": "The readable body — canonical Markdown, the fallback every surface can render (ADR law 1). Held as text; parsing belongs to `newt_core::markup`, not to the protocol layer.",
       "type": "string"
     },
+    "note": {
+      "description": "A subordinate line beneath the body — a control hint, a danger warning. Readable content like `markdown`, kept separate because surfaces place it differently and the legacy prompt already distinguishes the two.\n\nOmitted when absent, so a definition without one is byte-identical to one written before this field existed.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "revision": {
       "description": "Which revision of this definition's authoring lineage this is.",
       "type": "integer",
@@ -64,6 +71,13 @@
         "role"
       ],
       "properties": {
+        "aliases": {
+          "description": "Hidden inputs that also select this option — `n`/`N` for a deny. Never rendered, and never able to shadow another option's canonical id or key: matching is canonical-first, and ambiguity denies.\n\nOmitted when empty, for the same reason as `key`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "id": {
           "description": "Stable within the control; the definition commits to it.",
           "allOf": [
@@ -71,6 +85,10 @@
               "$ref": "#/definitions/OptionId"
             }
           ]
+        },
+        "key": {
+          "description": "The accelerator a keyboard surface offers for this option — `a`, `d`. Presentation, but NOT only presentation: the terminal authorizes on it, so it is part of what the definition means and cannot live in the view.\n\nOmitted when empty, so an option that offers no accelerator is byte-identical to one written before this field existed.",
+          "type": "string"
         },
         "label": {
           "description": "Human-readable label. Labels never confer authority (ADR law 2).",

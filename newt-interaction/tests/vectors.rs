@@ -154,6 +154,8 @@ fn choice_field(id: &str, options: &[(&str, SemanticRole, &str)]) -> Control {
                     id: OptionId::new(*oid).unwrap(),
                     role: *role,
                     label: (*label).to_string(),
+                    key: String::new(),
+                    aliases: Vec::new(),
                 })
                 .collect(),
         },
