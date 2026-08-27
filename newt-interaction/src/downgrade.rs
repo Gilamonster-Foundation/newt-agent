@@ -25,8 +25,17 @@ use crate::response::Response;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UnknownReason {
-    /// The schema tag names a version this build does not have.
+    /// The tag names a LATER version of the record type that was asked
+    /// for. The operator's fix is a newer build.
     ForwardVersion,
+    /// The tag names a DIFFERENT record type in this protocol — an
+    /// instance handed to the definition decoder, say. The fix is a
+    /// routing correction, not an upgrade, and saying "forward version"
+    /// would send someone looking for a release that will never help.
+    WrongRecordType,
+    /// The tag is not one of this protocol's at all: foreign data, or
+    /// corruption that happened to leave a readable string.
+    UnknownSchema,
     /// The tag is ours, but the record does not fit the shape this build
     /// knows — most often a field we have no name for. Its requiredness is
     /// unknowable, so it is never interpreted.
@@ -122,10 +131,11 @@ where
             reason: format!("no readable schema tag: {e}"),
         })?;
     if probe.schema != expected {
+        let reason = classify_tag(&probe.schema, expected);
         return Ok(Decoded::Unknown(RawRecord {
             schema: probe.schema,
             bytes: bytes.to_vec(),
-            reason: UnknownReason::ForwardVersion,
+            reason,
         }));
     }
 
@@ -151,6 +161,25 @@ where
         });
     }
     Ok(Decoded::Known(record))
+}
+
+/// Which kind of schema mismatch this is.
+///
+/// Tags are `newt.interaction.<record>/v<n>`, so the record name is the
+/// segment before the last `/`. Same record, different version is a
+/// version gap; a different record in our namespace is a routing mistake;
+/// anything else is not ours.
+fn classify_tag(seen: &str, expected: &'static str) -> UnknownReason {
+    let family = |tag: &str| tag.rsplit_once('/').map(|(head, _)| head.to_string());
+    match (family(seen), family(expected)) {
+        (Some(seen_family), Some(expected_family)) if seen_family == expected_family => {
+            UnknownReason::ForwardVersion
+        }
+        (Some(seen_family), _) if seen_family.starts_with("newt.interaction.") => {
+            UnknownReason::WrongRecordType
+        }
+        _ => UnknownReason::UnknownSchema,
+    }
 }
 
 /// Read a definition. See [`decode`] for the three gates.

@@ -477,3 +477,53 @@ fn a_secret_control_implies_the_secret_input_capability() {
         "an unmet optional secret control must be reported"
     );
 }
+
+/// **A schema mismatch has more than one cause, and they need different
+/// responses.**
+///
+/// Labelling everything `ForwardVersion` tells an operator "your build is
+/// too old" when the truth may be "this is an instance, you asked to read
+/// a definition" (a routing bug) or "this tag is not ours at all" (foreign
+/// or corrupt data). Three facts, three fixes.
+///
+/// `UnknownReason` is NOT serialized — it appears in no schema and no
+/// vector, and `RawRecord` derives no `Serialize` — so this is not part of
+/// the frozen contract. Fixed here anyway because it is cheap and because
+/// A3 will branch on it.
+#[test]
+fn a_schema_mismatch_says_which_kind_it_is() {
+    let def = definition();
+    let inst = fixtures::instance(&def);
+
+    // A later version of the SAME record family.
+    match decode_definition(&forward_bytes(0, false)).unwrap() {
+        Decoded::Unknown(raw) => assert_eq!(raw.reason(), UnknownReason::ForwardVersion),
+        Decoded::Known(_) => panic!("a v2 definition decoded as v1"),
+    }
+
+    // A DIFFERENT record family — the routing bug, not an old build.
+    let instance_bytes = canonical::to_canonical_dagcbor(&inst).unwrap();
+    match decode_definition(&instance_bytes).unwrap() {
+        Decoded::Unknown(raw) => assert_eq!(
+            raw.reason(),
+            UnknownReason::WrongRecordType,
+            "an instance handed to the definition decoder is a routing \
+             mistake, not a version gap"
+        ),
+        Decoded::Known(_) => panic!("an instance decoded as a definition"),
+    }
+
+    // A tag that is not ours at all.
+    #[derive(serde::Serialize)]
+    struct Foreign {
+        schema: &'static str,
+    }
+    let foreign = canonical::to_canonical_dagcbor(&Foreign {
+        schema: "com.example.thing/v1",
+    })
+    .unwrap();
+    match decode_definition(&foreign).unwrap() {
+        Decoded::Unknown(raw) => assert_eq!(raw.reason(), UnknownReason::UnknownSchema),
+        Decoded::Known(_) => panic!("a foreign record decoded as a definition"),
+    }
+}
