@@ -4278,6 +4278,7 @@ dependencies = [
  "ignore",
  "libc",
  "markdown-table-formatter",
+ "newt-interaction",
  "newt-skills",
  "newt-tuner",
  "proptest",

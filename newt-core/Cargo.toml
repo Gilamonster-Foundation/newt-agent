@@ -74,6 +74,7 @@ uuid.workspace = true
 #    `execute_tool` routes `run_command` / `web_fetch` through.
 chrono.workspace = true
 crossterm.workspace = true
+newt-interaction.workspace = true
 newt-skills.workspace = true
 reqwest.workspace = true
 tokio.workspace = true

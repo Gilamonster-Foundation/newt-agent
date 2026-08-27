@@ -117,6 +117,15 @@ const CATEGORIES: &[Category] = &[
         baseline: &[
             ("newt-tui/src/permissions.rs", 2),
             ("newt-core/src/agentic/tools.rs", 1),
+            // A2.2's adapter (#1828), and the one entry here that is not a
+            // duplicate to migrate: it assembles a Question BY DEFINITION,
+            // reconstructing the legacy type from an InteractionDefinition
+            // to prove the new model can express the old one losslessly.
+            // Nothing calls it — `adapter::no_production_path_uses_the_
+            // adapter_yet` holds that line — and when B0 switches the
+            // surfaces over, the two rows above are what disappear, taking
+            // this count DOWN rather than up.
+            ("newt-core/src/interaction_adapter.rs", 1),
         ],
         rationale: "every place a user-facing Question is assembled outside \
                     the (future) one definition path; B0/D0 migrate these",
