@@ -115,16 +115,31 @@ const CATEGORIES: &[Category] = &[
         name: "question construction sites",
         count: |f| count_any(&f.squeezed, &["Question{", "Question::<"]),
         baseline: &[
-            ("newt-tui/src/permissions.rs", 2),
+            // B0a (#1841) ratcheted this from 2 to 1. The row that went is
+            // `permission_question_for`'s literal, now built as an
+            // InteractionDefinition and rendered through the adapter. The
+            // row that REMAINS is `prompt_user_input` (:221) — a free-text
+            // form with no actions, D0's territory, not B0's.
+            ("newt-tui/src/permissions.rs", 1),
+            // STAYS. `mutation_confirm_question` backs a `--yolo` confirm
+            // over a plain `&str`, not a permission decision; no slice of
+            // this epic deletes it.
             ("newt-core/src/agentic/tools.rs", 1),
-            // A2.2's adapter (#1828), and the one entry here that is not a
-            // duplicate to migrate: it assembles a Question BY DEFINITION,
-            // reconstructing the legacy type from an InteractionDefinition
-            // to prove the new model can express the old one losslessly.
-            // Nothing calls it — `adapter::no_production_path_uses_the_
-            // adapter_yet` holds that line — and when B0 switches the
-            // surfaces over, the two rows above are what disappear, taking
-            // this count DOWN rather than up.
+            // A2.2's adapter (#1828): the one entry here that is not a
+            // duplicate to migrate. It assembles a Question BY DEFINITION,
+            // reconstructing the legacy type from an InteractionDefinition.
+            // As of B0a it is a PERMANENT PRODUCTION DEPENDENCY, not a
+            // proof-only artifact — `terminal_text()` lives on Question and
+            // has no counterpart in newt-interaction until C0 extracts
+            // rendering. `b0a::the_definition_path_is_reached_from_both_
+            // surfaces` (newt-core/tests/adapter.rs) now holds the line
+            // that BOTH surfaces reach it, replacing A2.2's
+            // `no_production_path_uses_the_adapter_yet`.
+            //
+            // CORRECTION (B0a): the previous comment here claimed B0 would
+            // delete "the two rows above". That was wrong on both counts —
+            // permissions.rs goes to 1, not 0, and tools.rs does not move
+            // at all.
             ("newt-core/src/interaction_adapter.rs", 1),
         ],
         rationale: "every place a user-facing Question is assembled outside \
@@ -393,27 +408,53 @@ fn duplicate_site_baselines_only_ratchet_down() {
 /// coupling B0 dissolves into frozen responder policy) stays confined to its
 /// single current file, with its exact three branch sites. A new file
 /// mentioning it, or a fourth branch, extends the coupling mid-migration.
+/// **The renderer-identity discriminator, after B0a (#1841).**
+///
+/// This test used to be `prompt_surface_stays_confined_to_its_three_
+/// branches`, matching the literal string `PromptSurface`. B0a deleted
+/// that enum — and a ratchet keyed on the old name would have reported a
+/// clean deletion while the SAME semantic branch point survived under a
+/// new name in another crate. It did not disappear: it became
+/// `newt_interaction::instance::Audience`, the same two variants, because
+/// `validate_response` needs exactly this fact later (#1842).
+///
+/// So the test follows the discriminator rather than the name: audience
+/// branching in permission POLICY stays confined to one file, with an
+/// exact branch count.
 #[test]
-fn prompt_surface_stays_confined_to_its_three_branches() {
+fn the_audience_discriminator_stays_confined_to_its_branches() {
     let files = production_code();
     let mentions: Vec<&String> = files
         .iter()
-        .filter(|(_, code)| code.squeezed.contains("PromptSurface"))
+        .filter(|(path, code)| {
+            path.starts_with("newt-tui/") && code.squeezed.contains("Audience::")
+        })
         .map(|(path, _)| path)
         .collect();
     assert_eq!(
         mentions,
         vec!["newt-tui/src/permissions.rs"],
-        "PromptSurface leaked beyond newt-tui/src/permissions.rs"
+        "audience branching leaked beyond newt-tui/src/permissions.rs"
     );
+    // The old enum must be gone: if it comes back, there are two
+    // discriminators for one fact.
+    assert!(
+        files
+            .values()
+            .all(|c| !c.squeezed.contains("PromptSurface")),
+        "PromptSurface came back alongside Audience"
+    );
+
     let permissions = &files["newt-tui/src/permissions.rs"].squeezed;
-    let branches = count_sites(permissions, "matches!(surface,")
-        + count_sites(permissions, "match(tier,surface)");
+    let branches = count_sites(permissions, "matches!(audience,")
+        + count_sites(permissions, "match(tier,audience)");
     assert_eq!(
-        branches, 3,
-        "surface-branch count changed from the A0 baseline of 3 (two \
-         matches!(surface, ..) + one match (tier, surface)); down = ratchet \
-         the baseline, up = a new renderer-identity branch in policy"
+        branches, 2,
+        "audience-branch count changed. B0a ratcheted the A0 baseline of 3 \
+         DOWN to 2: the two identical `matches!(surface, Terminal)` tests \
+         were always the same question and collapsed into one binding, \
+         leaving one `matches!` + one `match (tier, audience)`. Down = \
+         ratchet again; up = a new renderer-identity branch in policy"
     );
 }
 
@@ -603,7 +644,10 @@ fn the_ratchet_scans_the_real_workspace() {
         &no_extra_skips,
         &mut |path, code, _| {
             files.insert(path.to_path_buf());
-            if code.contains("fn permission_question_for") {
+            // B0a (#1841) renamed the anchor: `permission_question_for`
+            // split into a policy half and a marshalling half, and the
+            // marshalling half is the one that builds the definition.
+            if code.contains("fn permission_definition") {
                 saw_anchor = true;
             }
         },
@@ -615,7 +659,7 @@ fn the_ratchet_scans_the_real_workspace() {
     );
     assert!(
         saw_anchor,
-        "scanner never saw permission_question_for in newt-tui — production \
+        "scanner never saw permission_definition in newt-tui — production \
          lines are not being visited"
     );
 }
