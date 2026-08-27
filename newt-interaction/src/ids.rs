@@ -126,7 +126,6 @@ fn validated_name(kind: &'static str, name: String) -> Result<String, ProtocolEr
 /// written by a human in a `+++` envelope, and the definition it lives in
 /// commits to it, so the definition's `ContentId` is what protects its
 /// integrity.
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 // Deserialization goes THROUGH the constructor. A derived impl on a
 // transparent newtype builds the private field directly, so an invalid
@@ -135,6 +134,9 @@ fn validated_name(kind: &'static str, name: String) -> Result<String, ProtocolEr
 // docs would otherwise be claiming falsely.
 #[serde(into = "String", try_from = "String")]
 pub struct ControlId(String);
+
+#[cfg(feature = "schema")]
+crate::string_scalar_schema!(ControlId, Some("^[A-Za-z0-9_-]+$"));
 
 impl From<ControlId> for String {
     fn from(value: ControlId) -> Self {
@@ -177,7 +179,6 @@ impl ControlId {
 /// name two things of the same kind with no rule saying which is
 /// authoritative; the ambiguity is gone by construction rather than by
 /// prose.
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 // Deserialization goes THROUGH the constructor. A derived impl on a
 // transparent newtype builds the private field directly, so an invalid
@@ -186,6 +187,9 @@ impl ControlId {
 // docs would otherwise be claiming falsely.
 #[serde(into = "String", try_from = "String")]
 pub struct OptionId(String);
+
+#[cfg(feature = "schema")]
+crate::string_scalar_schema!(OptionId, Some("^[A-Za-z0-9_-]+$"));
 
 impl From<OptionId> for String {
     fn from(value: OptionId) -> Self {
@@ -224,7 +228,6 @@ impl OptionId {
 /// an instance unenumerable; it does not make its holder authorized. The
 /// controller revalidates every response against the definition regardless of
 /// who presented which nonce.
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 // Deserialization goes THROUGH the constructor. A derived impl on a
 // transparent newtype builds the private field directly, so an invalid
@@ -233,6 +236,9 @@ impl OptionId {
 // docs would otherwise be claiming falsely.
 #[serde(into = "String", try_from = "String")]
 pub struct Nonce(String);
+
+#[cfg(feature = "schema")]
+crate::string_scalar_schema!(Nonce, None::<&str>);
 
 impl From<Nonce> for String {
     fn from(value: Nonce) -> Self {
@@ -312,7 +318,6 @@ impl Revision {
 
 /// A caller-supplied key that makes a response replay-safe: the same key on
 /// the same instance is the same submission, not a second one.
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 // Deserialization goes THROUGH the constructor. A derived impl on a
 // transparent newtype builds the private field directly, so an invalid
@@ -321,6 +326,9 @@ impl Revision {
 // docs would otherwise be claiming falsely.
 #[serde(into = "String", try_from = "String")]
 pub struct IdempotencyKey(String);
+
+#[cfg(feature = "schema")]
+crate::string_scalar_schema!(IdempotencyKey, None::<&str>);
 
 impl From<IdempotencyKey> for String {
     fn from(value: IdempotencyKey) -> Self {

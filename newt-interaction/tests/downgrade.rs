@@ -94,7 +94,7 @@ fn a_forward_version_is_never_guessed() {
     let known = canonical::to_canonical_dagcbor(&definition()).unwrap();
     match decode_definition(&known).unwrap() {
         Decoded::Known(def) => {
-            assert_eq!(def.schema, DEFINITION_SCHEMA_V1);
+            assert_eq!(def.schema_tag(), DEFINITION_SCHEMA_V1);
             assert_eq!(
                 def.definition_id().unwrap(),
                 definition().definition_id().unwrap()

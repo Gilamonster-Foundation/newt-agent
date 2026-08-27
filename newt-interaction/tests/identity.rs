@@ -118,6 +118,11 @@ fn every_semantic_field_of_an_offer_moves_its_id() {
     let base = instance(&def);
 
     // EXHAUSTIVE — no `..`. This is the compile-time half of the guard.
+    // `schema` has no mutation case below: it is a TYPE that deserializes
+    // from exactly one value, so a differently-tagged instance is not
+    // constructible in Rust. The property it used to check lives in
+    // `versioning::the_schema_tag_is_bound_into_identity`, which patches
+    // the tag in the ENCODED bytes and asserts the id moves.
     let InteractionInstance {
         schema: _,
         nonce: _,
@@ -130,9 +135,6 @@ fn every_semantic_field_of_an_offer_moves_its_id() {
     } = &base;
 
     let cases: Vec<Case<InteractionInstance>> = vec![
-        ("schema", |i| {
-            i.schema = "newt.interaction.instance/v2".into()
-        }),
         ("nonce", |i| {
             i.nonce = newt_interaction::Nonce::new("another-handle").unwrap();
         }),
@@ -210,6 +212,8 @@ fn every_field_a_response_claims_to_bind_moves_its_id() {
     let base = response(&def, &inst);
 
     // EXHAUSTIVE — no `..`.
+    // See the note above: `schema` is type-pinned, so its identity
+    // binding is asserted at the bytes rather than here.
     let Response {
         schema: _,
         definition: _,
@@ -221,9 +225,6 @@ fn every_field_a_response_claims_to_bind_moves_its_id() {
     } = &base;
 
     let cases: Vec<Case<Response>> = vec![
-        ("schema", |r| {
-            r.schema = "newt.interaction.response/v2".into()
-        }),
         ("definition", |r| {
             let mut other = definition();
             other.markdown.push('?');
@@ -286,6 +287,8 @@ fn every_semantic_field_of_a_definition_moves_its_id() {
     let base = definition();
 
     // EXHAUSTIVE — no `..`.
+    // See the note above: `schema` is type-pinned, so its identity
+    // binding is asserted at the bytes rather than here.
     let InteractionDefinition {
         schema: _,
         kind: _,
@@ -296,9 +299,6 @@ fn every_semantic_field_of_a_definition_moves_its_id() {
     } = &base;
 
     let cases: Vec<Case<InteractionDefinition>> = vec![
-        ("schema", |d| {
-            d.schema = "newt.interaction.definition/v2".into()
-        }),
         ("kind", |d| d.kind = InteractionKind::Confirm),
         ("revision", |d| d.revision = d.revision.next()),
         ("markdown", |d| d.markdown.push('!')),

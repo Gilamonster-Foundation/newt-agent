@@ -114,7 +114,7 @@ pub struct Provenance {
 #[serde(deny_unknown_fields)]
 pub struct InteractionInstance {
     /// Versioned type tag; see [`INSTANCE_SCHEMA_V1`].
-    pub schema: String,
+    pub schema: crate::tag::InstanceTag,
     /// Fresh, unguessable routing handle. Not the identity.
     pub nonce: Nonce,
     /// The definition being offered — its exact form digest.
@@ -141,20 +141,17 @@ impl InteractionInstance {
         Ok(InstanceId::from_content_id(self.content_id()?))
     }
 
-    /// Refuse an unknown schema tag; unknown required behavior fails closed.
+    /// The schema tag, as a string.
     ///
-    /// # Errors
-    ///
-    /// [`ProtocolError::UnknownSchema`] when the tag is not
-    /// [`INSTANCE_SCHEMA_V1`].
-    pub fn ensure_known_schema(&self) -> Result<(), ProtocolError> {
-        if self.schema != INSTANCE_SCHEMA_V1 {
-            return Err(ProtocolError::UnknownSchema {
-                tag: self.schema.clone(),
-                expected: INSTANCE_SCHEMA_V1,
-            });
-        }
-        Ok(())
+    /// Reading it needs no check: the tag is a TYPE that deserializes from
+    /// exactly one value, so a record of this type cannot carry any other
+    /// one. What used to be a runtime `ensure_known_schema` is now a thing
+    /// the wire cannot express — and the published schema says so with a
+    /// `const`, so a foreign implementor validating against the wrong
+    /// record's schema fails instead of passing.
+    #[must_use]
+    pub fn schema_tag(&self) -> &'static str {
+        self.schema.as_str()
     }
 }
 

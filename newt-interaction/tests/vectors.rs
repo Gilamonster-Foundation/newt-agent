@@ -18,8 +18,7 @@ use newt_interaction::{
     AssertionKind, Audience, ChoiceOption, Control, ControlId, ControlKind, ControlValue,
     FeatureDemand, IdempotencyKey, InteractionDefinition, InteractionInstance, InteractionKind,
     Nonce, OptionId, Provenance, Requirement, ResponderPolicy, ResponderProvenance, Response,
-    Revision, Scope, SecretRef, SemanticRole, Submission, SurfaceFeature, INSTANCE_SCHEMA_V1,
-    RESPONSE_SCHEMA_V1,
+    Revision, Scope, SecretRef, SemanticRole, Submission, SurfaceFeature,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -141,7 +140,7 @@ fn sample_definition() -> InteractionDefinition {
 
 fn sample_instance(def: &InteractionDefinition) -> InteractionInstance {
     InteractionInstance {
-        schema: INSTANCE_SCHEMA_V1.to_string(),
+        schema: newt_interaction::InstanceTag,
         nonce: Nonce::new("1756200000000000000-0f4c1b2e").unwrap(),
         definition: def.definition_id().unwrap(),
         revision: Revision::FIRST,
@@ -168,7 +167,7 @@ fn sample_response(
     value: ControlValue,
 ) -> Response {
     Response {
-        schema: RESPONSE_SCHEMA_V1.to_string(),
+        schema: newt_interaction::ResponseTag,
         definition: def.definition_id().unwrap(),
         instance: inst.instance_id().unwrap(),
         revision: Revision::FIRST,

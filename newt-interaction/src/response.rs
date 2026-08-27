@@ -20,12 +20,14 @@ pub const RESPONSE_SCHEMA_V1: &str = "newt.interaction.response/v1";
 /// liability. The record names the sealed value; resolving the handle is
 /// the host's business and requires its own authority (ADR D1: never
 /// persist secret values in markup or logs).
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 // See the note on `ControlId`: deserialization goes through the
 // constructor so the wire cannot carry an empty reference.
 #[serde(into = "String", try_from = "String")]
 pub struct SecretRef(String);
+
+#[cfg(feature = "schema")]
+crate::string_scalar_schema!(SecretRef, None::<&str>);
 
 impl From<SecretRef> for String {
     fn from(value: SecretRef) -> Self {
@@ -184,7 +186,7 @@ pub struct Submission {
 #[serde(deny_unknown_fields)]
 pub struct Response {
     /// Versioned type tag; see [`RESPONSE_SCHEMA_V1`].
-    pub schema: String,
+    pub schema: crate::tag::ResponseTag,
     /// The definition answered — and, being a content id, its exact form
     /// digest. A definition that changed by one byte cannot be answered by
     /// a response minted against the old one.
@@ -219,20 +221,17 @@ impl Response {
         Ok(ResponseId::from_content_id(self.content_id()?))
     }
 
-    /// Refuse an unknown schema tag; unknown required behavior fails closed.
+    /// The schema tag, as a string.
     ///
-    /// # Errors
-    ///
-    /// [`ProtocolError::UnknownSchema`] when the tag is not
-    /// [`RESPONSE_SCHEMA_V1`].
-    pub fn ensure_known_schema(&self) -> Result<(), ProtocolError> {
-        if self.schema != RESPONSE_SCHEMA_V1 {
-            return Err(ProtocolError::UnknownSchema {
-                tag: self.schema.clone(),
-                expected: RESPONSE_SCHEMA_V1,
-            });
-        }
-        Ok(())
+    /// Reading it needs no check: the tag is a TYPE that deserializes from
+    /// exactly one value, so a record of this type cannot carry any other
+    /// one. What used to be a runtime `ensure_known_schema` is now a thing
+    /// the wire cannot express — and the published schema says so with a
+    /// `const`, so a foreign implementor validating against the wrong
+    /// record's schema fails instead of passing.
+    #[must_use]
+    pub fn schema_tag(&self) -> &'static str {
+        self.schema.as_str()
     }
 }
 

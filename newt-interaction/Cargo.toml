@@ -21,11 +21,12 @@ publish = false
 # guard exists to keep at exactly three crates. `tests/guard.rs` asserts
 # the DEFAULT direct dependency set, so turning this on cannot smuggle a
 # runtime dependency in.
-schema = ["dep:schemars"]
+schema = ["dep:schemars", "dep:serde_json"]
 
 [dependencies]
 content-addressable.workspace = true
 schemars = { version = "0.8", optional = true }
+serde_json = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 

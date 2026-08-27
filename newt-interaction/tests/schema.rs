@@ -159,3 +159,115 @@ fn every_object_schema_forbids_additional_properties() {
         );
     }
 }
+
+/// **A published schema pins its record's version tag.**
+///
+/// With `"schema": {"type": "string"}` a foreign implementor could
+/// validate a DEFINITION record against `response.schema.json` and pass,
+/// while our decoder classifies it unknown — so the schema described "any
+/// record with some string in its schema field", not "response v1". Each
+/// now carries a `const`.
+#[test]
+fn each_schema_pins_exactly_its_own_version_tag() {
+    for (name, tag) in [
+        ("definition", newt_interaction::DEFINITION_SCHEMA_V1),
+        ("instance", newt_interaction::INSTANCE_SCHEMA_V1),
+        ("response", newt_interaction::RESPONSE_SCHEMA_V1),
+    ] {
+        let text = std::fs::read_to_string(schema_dir().join(format!("{name}.schema.json")))
+            .expect("schema exists");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("schema parses");
+
+        // The tag's schema is reached through the property, which schemars
+        // may express inline or via $ref into `definitions`.
+        let property = &parsed["properties"]["schema"];
+        // schemars expresses the tag inline, as a `$ref`, or — when the
+        // field carries a doc comment — as `allOf: [{ $ref }]`.
+        let reference = property.get("$ref").and_then(|r| r.as_str()).or_else(|| {
+            property
+                .get("allOf")
+                .and_then(|a| a.as_array())
+                .and_then(|a| a.first())
+                .and_then(|first| first.get("$ref"))
+                .and_then(|r| r.as_str())
+        });
+        let resolved = match reference {
+            Some(reference) => {
+                let key = reference.rsplit('/').next().expect("a $ref name");
+                &parsed["definitions"][key]
+            }
+            None => property,
+        };
+        let pinned = resolved
+            .get("const")
+            .and_then(|c| c.as_str())
+            .or_else(|| {
+                resolved
+                    .get("enum")
+                    .and_then(|e| e.as_array())
+                    .filter(|values| values.len() == 1)
+                    .and_then(|values| values[0].as_str())
+            })
+            .unwrap_or_else(|| {
+                panic!("the `{name}` schema does not pin its version tag: {resolved}")
+            });
+
+        // The exact v1 tag is pinned...
+        assert_eq!(pinned, tag, "`{name}` pins the wrong tag");
+        // ...so the v2 tag and another family's v1 tag both fail to match,
+        // which is precisely what a cross-record mix-up looks like.
+        assert_ne!(pinned, tag.replace("/v1", "/v2"));
+        for (other, other_tag) in [
+            ("definition", newt_interaction::DEFINITION_SCHEMA_V1),
+            ("instance", newt_interaction::INSTANCE_SCHEMA_V1),
+            ("response", newt_interaction::RESPONSE_SCHEMA_V1),
+        ] {
+            if other != name {
+                assert_ne!(
+                    pinned, other_tag,
+                    "the `{name}` schema accepts the `{other}` tag"
+                );
+            }
+        }
+    }
+}
+
+/// **The published schemas state the scalar rules the decoder enforces.**
+///
+/// A schema permitting any string while the decoder refuses most of them
+/// is the same false-guarantee defect as a doc comment claiming a
+/// validation the wire does not perform — and it is worse here, because
+/// the schema is what a foreign implementor builds against.
+#[test]
+fn validated_scalars_publish_their_constraints() {
+    let definition: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(schema_dir().join("definition.schema.json")).unwrap(),
+    )
+    .unwrap();
+    let response: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(schema_dir().join("response.schema.json")).unwrap(),
+    )
+    .unwrap();
+
+    // Author-assigned names carry the charset AND non-emptiness.
+    for (schema, name) in [(&definition, "ControlId"), (&definition, "OptionId")] {
+        let def = &schema["definitions"][name];
+        assert_eq!(def["minLength"], 1, "{name} may be empty on the wire");
+        assert_eq!(
+            def["pattern"], "^[A-Za-z0-9_-]+$",
+            "{name} does not publish its charset"
+        );
+    }
+
+    // The remaining validated scalars publish non-emptiness.
+    for (schema, name) in [
+        (&definition, "SurfaceFeature"),
+        (&response, "SecretRef"),
+        (&response, "IdempotencyKey"),
+    ] {
+        assert_eq!(
+            schema["definitions"][name]["minLength"], 1,
+            "{name} may be empty on the wire"
+        );
+    }
+}

@@ -50,7 +50,11 @@
     },
     "schema": {
       "description": "Versioned type tag; see [`INSTANCE_SCHEMA_V1`].",
-      "type": "string"
+      "allOf": [
+        {
+          "$ref": "#/definitions/InstanceTag"
+        }
+      ]
     },
     "scope": {
       "description": "The workspace fence.",
@@ -87,9 +91,13 @@
         }
       ]
     },
+    "InstanceTag": {
+      "type": "string",
+      "const": "newt.interaction.instance/v1"
+    },
     "Nonce": {
-      "description": "A host-minted, fresh, unguessable handle for one live instance.\n\n**The one thing here that is not content-derived, deliberately.** It makes an instance unenumerable; it does not make its holder authorized. The controller revalidates every response against the definition regardless of who presented which nonce.",
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "Provenance": {
       "description": "Where an instance came from — the record's own sources.\n\nMandatory, not optional. The repo's one outstanding first-principle violation is exactly this hole in `ConversationTurn` (`first_principle.rs:802`); a new record type that cannot name its origin repeats the defect the ledger counts.",

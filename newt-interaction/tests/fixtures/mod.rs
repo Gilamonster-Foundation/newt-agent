@@ -10,7 +10,7 @@ use newt_interaction::{
     AssertionKind, Audience, ChoiceOption, Control, ControlId, ControlKind, ControlValue,
     IdempotencyKey, InteractionDefinition, InteractionInstance, InteractionKind, Nonce, OptionId,
     Provenance, Requirement, ResponderPolicy, ResponderProvenance, Response, Revision, Scope,
-    SemanticRole, Submission, RESPONSE_SCHEMA_V1,
+    SemanticRole, Submission,
 };
 
 #[must_use]
@@ -43,7 +43,7 @@ pub fn definition() -> InteractionDefinition {
 #[must_use]
 pub fn instance(def: &InteractionDefinition) -> InteractionInstance {
     InteractionInstance {
-        schema: newt_interaction::INSTANCE_SCHEMA_V1.to_string(),
+        schema: newt_interaction::InstanceTag,
         nonce: Nonce::new("1756200000000000000-0f4c1b2e").unwrap(),
         definition: def.definition_id().unwrap(),
         revision: Revision::FIRST,
@@ -66,7 +66,7 @@ pub fn instance(def: &InteractionDefinition) -> InteractionInstance {
 #[must_use]
 pub fn response(def: &InteractionDefinition, inst: &InteractionInstance) -> Response {
     Response {
-        schema: RESPONSE_SCHEMA_V1.to_string(),
+        schema: newt_interaction::ResponseTag,
         definition: def.definition_id().unwrap(),
         instance: inst.instance_id().unwrap(),
         revision: Revision::FIRST,

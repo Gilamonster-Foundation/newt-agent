@@ -45,7 +45,11 @@
     },
     "schema": {
       "description": "Versioned type tag; see [`RESPONSE_SCHEMA_V1`].",
-      "type": "string"
+      "allOf": [
+        {
+          "$ref": "#/definitions/ResponseTag"
+        }
+      ]
     },
     "values": {
       "description": "The submitted values, each against the control it answers.",
@@ -103,8 +107,9 @@
       ]
     },
     "ControlId": {
-      "description": "A stable, author-assigned name for one control — one FIELD of an interaction — inside a definition.\n\nDeliberately not content-derived: a control id must survive being written by a human in a `+++` envelope, and the definition it lives in commits to it, so the definition's `ContentId` is what protects its integrity.",
-      "type": "string"
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_-]+$"
     },
     "ControlValue": {
       "description": "What was submitted for one control, typed.\n\nTyped at the TYPE rather than at a downstream parser: a `String` here would make every consumer decide whether `\"TRUE\"`, `\"1\"`, and `\"yes\"` are the same toggle, which is the per-surface drift the epic exists to end. Canonicalization lives in the shape, so A3 revalidates rather than re-parses. Deliberately NOT `#[non_exhaustive]`, unlike the open vocabularies in this crate (`InteractionKind`, `SemanticRole`, `Audience`, …). This variant set is a security boundary: \"no variant can carry a secret\" is provable only by an exhaustive match, and `#[non_exhaustive]` would force every such match to end in a wildcard — after which adding a plaintext-carrying variant would compile silently everywhere. Adding a variant here SHOULD break every consumer that reasons about the set. Every variant is a STRUCT variant: serde's internally-tagged form cannot represent a newtype variant wrapping a primitive, and the named field is the clearer thing to freeze into A2.1's vectors anyway (`{\"kind\":\"toggle\",\"on\":true}`).",
@@ -204,12 +209,13 @@
       ]
     },
     "IdempotencyKey": {
-      "description": "A caller-supplied key that makes a response replay-safe: the same key on the same instance is the same submission, not a second one.",
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "OptionId": {
-      "description": "A stable, author-assigned name for one OPTION of a choice control.\n\nA separate id space from [`ControlId`] on purpose. A choice is one field with many mutually-exclusive options — the shape B0's permission prompt already has: one question offering `[a]llow once`, `[s]ession allow`, `[d]eny (default)` and the rest. Giving options their own type means a submission naming a control and an option cannot name two things of the same kind with no rule saying which is authoritative; the ambiguity is gone by construction rather than by prose.",
-      "type": "string"
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_-]+$"
     },
     "ResponderProvenance": {
       "description": "How a responder was authenticated, IDENTIFIED — never the credential itself.\n\nA2 gives responder provenance a place to live and binds it into the response's identity; A3 authenticates it and revalidates it. The separation matters: an [`Audience`] says which KIND of surface answered, which is not who did.\n\n**This record carries no credentials and no secrets.** It names the assertion by reference — a kind, a subject, and an opaque [`assertion`](ResponderProvenance::assertion) handle the host can resolve — so a durable, content-addressed response never becomes a disclosure liability. A digest in the record beats the bytes: it is tamper-evident without being a secret.",
@@ -250,9 +256,13 @@
       },
       "additionalProperties": false
     },
+    "ResponseTag": {
+      "type": "string",
+      "const": "newt.interaction.response/v1"
+    },
     "SecretRef": {
-      "description": "A reference to a secret the host holds — never the secret.\n\nA response is durable, content-addressed, and tamper-evident, which is exactly what makes a secret inside one a permanent disclosure liability. The record names the sealed value; resolving the handle is the host's business and requires its own authority (ADR D1: never persist secret values in markup or logs).",
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "Submission": {
       "description": "One control's answer: which control, and the typed value.",

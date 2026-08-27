@@ -212,11 +212,13 @@ fn the_default_runtime_dependencies_are_exactly_three() {
          ships to every consumer, including the wyvern tier; if it is a \
          build-time convenience, mark it `optional = true` behind a feature."
     );
+    optional.sort();
     assert_eq!(
         optional,
-        vec!["schemars".to_string()],
-        "an optional dependency appeared or vanished — schema generation is \
-         the only sanctioned one"
+        vec!["schemars".to_string(), "serde_json".to_string()],
+        "an optional dependency appeared or vanished — schema GENERATION is \
+         the only sanctioned reason for one (schemars, plus serde_json for \
+         the const tag schemas it emits). Neither is in the default build."
     );
 }
 

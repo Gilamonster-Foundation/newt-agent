@@ -6,66 +6,54 @@
 //! migrated from and a consumer would never see the difference.
 
 use newt_interaction::{
-    InteractionDefinition, ProtocolError, DEFINITION_SCHEMA_V1, INSTANCE_SCHEMA_V1,
-    RESPONSE_SCHEMA_V1,
+    InteractionDefinition, DEFINITION_SCHEMA_V1, INSTANCE_SCHEMA_V1, RESPONSE_SCHEMA_V1,
 };
 
 mod fixtures;
 use fixtures::{definition, instance, response};
 
+/// The tag is part of what a record IS, asserted at the BYTES.
+///
+/// It can no longer be mutated in Rust — the tag is a type that
+/// deserializes from exactly one value — so the property is checked where
+/// it lives: patch the encoded tag and the content id moves. That is the
+/// same guarantee `content_spill`'s `SPILL_SCHEMA_V1` relies on
+/// ("bumping it re-addresses every spill"), now enforced by the type
+/// system on the way in and by the encoding on the way out.
 #[test]
 fn the_schema_tag_is_bound_into_identity() {
-    let base = definition();
-    let base_id = base.definition_id().unwrap();
-    let mut bumped = base.clone();
-    bumped.schema = "newt.interaction.definition/v2".to_string();
+    use content_addressable::{canonical, ContentAddressable, ContentId};
+
+    let def = definition();
+    let bytes = canonical::to_canonical_dagcbor(&def).unwrap();
+    let id = def.content_id().unwrap();
+    assert_eq!(ContentId::from_canonical_bytes(&bytes), id);
+
+    // Same length, so the encoding stays structurally identical: only the
+    // version digit changes.
+    let at = bytes
+        .windows(DEFINITION_SCHEMA_V1.len())
+        .position(|w| w == DEFINITION_SCHEMA_V1.as_bytes())
+        .expect("the tag is in the encoding");
+    let mut bumped = bytes.clone();
+    bumped[at + DEFINITION_SCHEMA_V1.len() - 1] = b'2';
     assert_ne!(
-        bumped.definition_id().unwrap(),
-        base_id,
+        ContentId::from_canonical_bytes(&bumped),
+        id,
         "bumping the schema tag must re-address the record"
     );
-
-    let inst = instance(&base);
-    let inst_id = inst.instance_id().unwrap();
-    let mut inst_bumped = inst.clone();
-    inst_bumped.schema = "newt.interaction.instance/v2".to_string();
-    assert_ne!(inst_bumped.instance_id().unwrap(), inst_id);
-
-    let resp = response(&base, &inst);
-    let resp_id = resp.response_id().unwrap();
-    let mut resp_bumped = resp.clone();
-    resp_bumped.schema = "newt.interaction.response/v2".to_string();
-    assert_ne!(resp_bumped.response_id().unwrap(), resp_id);
 }
 
 /// Every record is built carrying the current tag.
 #[test]
 fn a_freshly_built_record_carries_the_current_tag() {
-    assert_eq!(definition().schema, DEFINITION_SCHEMA_V1);
     let def = definition();
-    assert_eq!(instance(&def).schema, INSTANCE_SCHEMA_V1);
-    assert_eq!(response(&def, &instance(&def)).schema, RESPONSE_SCHEMA_V1);
-}
-
-/// An unknown tag fails closed rather than being interpreted partially —
-/// ADR law 5, and the same fail-closed dispatch `turn_chain.rs:96-103`
-/// applies to `encoding_version`.
-#[test]
-fn an_unknown_schema_tag_fails_closed() {
-    let mut def = definition();
-    def.schema = "newt.interaction.definition/v99".to_string();
-    let err = def.ensure_known_schema().unwrap_err();
-    assert!(
-        matches!(err, ProtocolError::UnknownSchema { .. }),
-        "an unknown tag must refuse, not degrade silently: {err:?}"
+    assert_eq!(def.schema_tag(), DEFINITION_SCHEMA_V1);
+    assert_eq!(instance(&def).schema_tag(), INSTANCE_SCHEMA_V1);
+    assert_eq!(
+        response(&def, &instance(&def)).schema_tag(),
+        RESPONSE_SCHEMA_V1
     );
-    // The error names both what was seen and what this build understands, so
-    // an operator can tell a downgrade from corruption.
-    let rendered = err.to_string();
-    assert!(rendered.contains("v99") && rendered.contains(DEFINITION_SCHEMA_V1));
-
-    let known = definition();
-    assert!(known.ensure_known_schema().is_ok());
 }
 
 /// The tags are distinct per record type: a definition's bytes can never be

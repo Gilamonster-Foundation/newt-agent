@@ -33,6 +33,7 @@ pub mod error;
 pub mod ids;
 pub mod instance;
 pub mod response;
+pub mod tag;
 
 pub use definition::{
     ChoiceOption, Control, ControlKind, FeatureDemand, InteractionDefinition, InteractionKind,
@@ -54,3 +55,4 @@ pub use response::{
     AssertionKind, ControlValue, ResponderProvenance, Response, SecretRef, Submission,
     RESPONSE_SCHEMA_V1,
 };
+pub use tag::{DefinitionTag, InstanceTag, ResponseTag};

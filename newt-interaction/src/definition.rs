@@ -144,13 +144,15 @@ pub struct Control {
 /// on. Carrying the name verbatim is what lets an unknown demand be
 /// refused (when required) or reported (when optional) instead of
 /// silently vanishing.
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 // See the note on `ControlId`: deserialization goes through the
 // constructor. An UNRECOGNIZED feature name is still valid — that is the
 // forward-compatibility case — but an EMPTY one is not.
 #[serde(into = "String", try_from = "String")]
 pub struct SurfaceFeature(String);
+
+#[cfg(feature = "schema")]
+crate::string_scalar_schema!(SurfaceFeature, None::<&str>);
 
 impl From<SurfaceFeature> for String {
     fn from(value: SurfaceFeature) -> Self {
@@ -230,7 +232,7 @@ pub struct FeatureDemand {
 #[serde(deny_unknown_fields)]
 pub struct InteractionDefinition {
     /// Versioned type tag; see [`DEFINITION_SCHEMA_V1`].
-    pub schema: String,
+    pub schema: crate::tag::DefinitionTag,
     /// What kind of interaction this is.
     pub kind: InteractionKind,
     /// Which revision of this definition's authoring lineage this is.
@@ -251,7 +253,7 @@ impl InteractionDefinition {
     #[must_use]
     pub fn new(kind: InteractionKind, markdown: impl Into<String>, controls: Vec<Control>) -> Self {
         Self {
-            schema: DEFINITION_SCHEMA_V1.to_string(),
+            schema: crate::tag::DefinitionTag,
             kind,
             revision: Revision::FIRST,
             markdown: markdown.into(),
@@ -269,21 +271,17 @@ impl InteractionDefinition {
         Ok(DefinitionId::from_content_id(self.content_id()?))
     }
 
-    /// Refuse a record whose schema tag this build does not know. Unknown
-    /// REQUIRED behavior fails closed (ADR law 5).
+    /// The schema tag, as a string.
     ///
-    /// # Errors
-    ///
-    /// [`ProtocolError::UnknownSchema`] when the tag is not
-    /// [`DEFINITION_SCHEMA_V1`].
-    pub fn ensure_known_schema(&self) -> Result<(), ProtocolError> {
-        if self.schema != DEFINITION_SCHEMA_V1 {
-            return Err(ProtocolError::UnknownSchema {
-                tag: self.schema.clone(),
-                expected: DEFINITION_SCHEMA_V1,
-            });
-        }
-        Ok(())
+    /// Reading it needs no check: the tag is a TYPE that deserializes from
+    /// exactly one value, so a record of this type cannot carry any other
+    /// one. What used to be a runtime `ensure_known_schema` is now a thing
+    /// the wire cannot express — and the published schema says so with a
+    /// `const`, so a foreign implementor validating against the wrong
+    /// record's schema fails instead of passing.
+    #[must_use]
+    pub fn schema_tag(&self) -> &'static str {
+        self.schema.as_str()
     }
 }
 
