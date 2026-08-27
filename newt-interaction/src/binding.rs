@@ -433,3 +433,35 @@ pub fn validate_response(
         actions,
     })
 }
+
+#[cfg(test)]
+mod model_fidelity {
+    use super::*;
+
+    /// **A third `Audience` variant would silently invalidate the formal
+    /// model, so it must not compile silently.**
+    ///
+    /// `PromptControls.tla` models two racers and a BINARY `SingleWinner`;
+    /// `Audience` is currently exactly `{Terminal, Web}`. It is
+    /// `#[non_exhaustive]`, so no downstream crate can write an
+    /// exhaustive match over it and no downstream test can notice a third
+    /// variant. This crate DEFINES it, so the match below — deliberately
+    /// without a `_` arm — is the one place that can: adding a variant
+    /// breaks compilation here, which is the prompt to revisit the model
+    /// rather than discover the gap later.
+    #[test]
+    fn the_modelled_audience_set_is_exactly_the_two_the_tla_covers() {
+        let modelled = [Audience::Terminal, Audience::Web];
+        for audience in &modelled {
+            match audience {
+                Audience::Terminal | Audience::Web => {}
+            }
+        }
+        assert_eq!(
+            modelled.len(),
+            2,
+            "PromptControls.tla's SingleWinner is binary; a third audience \
+             needs the model revisited, not just this number bumped"
+        );
+    }
+}
