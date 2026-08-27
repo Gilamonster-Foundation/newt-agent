@@ -3202,7 +3202,24 @@ impl ConversationStore {
         Ok(())
     }
 
-    fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+    /// The workspace fence this store was opened against.
+    ///
+    /// A3 (#1837) keeps its `ResolutionStore` implementation in its own
+    /// module rather than growing this file, so it needs the same fence
+    /// every table here carries.
+    pub(crate) fn workspace_fence(&self) -> &str {
+        &self.workspace_id
+    }
+
+    /// The display-only wall clock, for A3's `resolved_tick` audit column.
+    ///
+    /// Display-only on purpose: nothing in the exactly-once decision
+    /// consults it, exactly as nothing in prompt ordering does.
+    pub(crate) fn claim_tick(&self) -> i64 {
+        (self.claim_clock)()
+    }
+
+    pub(crate) fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         // A poisoned mutex means another thread panicked mid-operation; the
         // connection itself is still usable (transactions roll back), so
         // recover rather than cascade the panic.
@@ -4040,6 +4057,22 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_permission_requests_pending
              ON permission_requests (conversation_id, workspace_key, resolved);
+
+         -- A3 (#1837): exactly-once resolution of a Newt Markup interaction
+         -- offer. `instance_id` is the PRIMARY KEY, so one-offer-resolves-
+         -- at-most-once is enforced by the schema rather than by caller
+         -- discipline: the INSERT either wins or conflicts, and the
+         -- conflicting writer reads back who won. `workspace_key` is stored
+         -- for audit and fencing, but the fence is already intrinsic — an
+         -- InstanceId is a content id over a record that CONTAINS its
+         -- scope, so two workspaces cannot mint the same one.
+         CREATE TABLE IF NOT EXISTS interaction_resolutions (
+             instance_id     TEXT PRIMARY KEY,       -- canonical InstanceId
+             workspace_key   TEXT NOT NULL,          -- same fence every table carries
+             response_id     TEXT NOT NULL,          -- canonical ResponseId of the winner
+             idempotency_key TEXT NOT NULL,          -- the winner's replay key
+             resolved_tick   INTEGER NOT NULL
+         );
 
          -- Passkey enrollment staging (#1369). The WEB stages a candidate
          -- binding here; the TERMINAL promotes it to the signed credential
