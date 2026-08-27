@@ -843,19 +843,14 @@ impl ResolutionStore for InMemoryResolutions {
             None => {
                 resolved.insert(
                     key,
-                    (
-                        record.response,
-                        record.idempotency_key.as_str().to_string(),
-                    ),
+                    (record.response, record.idempotency_key.as_str().to_string()),
                 );
                 Ok(Resolution::Won)
             }
             Some((winner, used_key)) => {
                 let same_key = used_key == record.idempotency_key.as_str();
                 if winner == &record.response {
-                    Ok(Resolution::Replayed {
-                        winner: *winner,
-                    })
+                    Ok(Resolution::Replayed { winner: *winner })
                 } else if same_key {
                     Err(ResolutionError::IdempotencyConflict(Box::new(
                         newt_interaction::resolution::IdempotencyConflict {
@@ -865,9 +860,7 @@ impl ResolutionStore for InMemoryResolutions {
                         },
                     )))
                 } else {
-                    Ok(Resolution::Lost {
-                        winner: *winner,
-                    })
+                    Ok(Resolution::Lost { winner: *winner })
                 }
             }
         }
