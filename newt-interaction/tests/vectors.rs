@@ -701,3 +701,210 @@ fn the_committed_invalid_vectors_match_regeneration() {
     });
     assert_eq!(committed, generated);
 }
+
+/// **What a green schema check proves — and what it does not** (#1833).
+///
+/// The published `schema/*.json` are this project's cross-language
+/// contract, but until now nothing executed them *as schemas*.
+/// [`the_committed_vectors_match_regeneration`] proves the generator is
+/// deterministic, the `const` tag pins the record type, and A2.1's
+/// `each_schema_names_the_fields_of_its_record` proves the field sets
+/// agree — yet a document could still violate a `pattern` or a
+/// `required` that only a validator enforces. These tests close that:
+/// every committed vector is validated against its own published schema,
+/// so a divergence between what serde writes and what schemars describes
+/// fails here rather than in a foreign implementation.
+///
+/// **The boundary matters more than the coverage.** JSON Schema
+/// describes the JSON representation, and nothing else. It does not —
+/// and structurally cannot — validate:
+///
+/// - **canonical DAG-CBOR identity.** Identity is minted over the bytes
+///   in each vector's `dagcbor_hex`, whose map ordering, integer widths
+///   and definite-length encodings are the part a foreign implementation
+///   actually gets wrong. JSON has no opinion on any of them.
+/// - **tag-42 link encoding.** The fields a vector lists in `links` are
+///   CID *links* in the canonical form and plain *strings* in the JSON.
+///   Schema-green says nothing about that difference — which is the one
+///   fact `links` exists to document.
+/// - **`ContentId` derivation.** `content_id` is derived from the CBOR
+///   bytes, not from this JSON, so no amount of schema validation
+///   constrains it.
+///
+/// Those three are covered by
+/// [`a_vector_id_is_reproducible_from_its_canonical_bytes`] and
+/// [`decoding_then_encoding_reproduces_every_vector`]. **Schema-green is
+/// not identity-green**: a reader must not take a pass here as "the
+/// vectors are correct", only as "the JSON form matches the published
+/// contract".
+mod schema_conformance {
+    use super::{inconsistencies, invalid_vectors_path, vectors_path, Vector};
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    fn schema_path(record: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("schema/{record}.schema.json"))
+    }
+
+    /// Golden discipline, as everywhere else in this file: a missing
+    /// schema FAILS rather than being quietly skipped.
+    fn validator_for(record: &str) -> jsonschema::Validator {
+        let path = schema_path(record);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "{} is missing ({e}). Regenerate deliberately: \
+                 `cargo test -p newt-interaction --features schema`.",
+                path.display()
+            )
+        });
+        let schema: serde_json::Value =
+            serde_json::from_str(&text).expect("the published schema parses as JSON");
+        jsonschema::validator_for(&schema)
+            .unwrap_or_else(|e| panic!("{} is not a usable schema: {e}", path.display()))
+    }
+
+    fn load(path: &Path) -> Vec<Vector> {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("{} is missing ({e})", path.display()));
+        serde_json::from_str(&text).expect("vectors parse")
+    }
+
+    fn errors(validator: &jsonschema::Validator, document: &serde_json::Value) -> Vec<String> {
+        validator
+            .iter_errors(document)
+            .map(|e| {
+                let at = e.instance_path().to_string();
+                let at = if at.is_empty() { "/".to_string() } else { at };
+                format!("{at}: {e}")
+            })
+            .collect()
+    }
+
+    /// Every committed positive vector validates against the published
+    /// schema for its record type. The keying is the vector's own
+    /// `record` field, so a vector cannot pass by being checked against
+    /// the wrong schema.
+    #[test]
+    fn every_positive_vector_validates_against_its_published_schema() {
+        let corpus = load(&vectors_path());
+        assert!(!corpus.is_empty(), "no vectors to validate");
+
+        let mut exercised = BTreeSet::new();
+        let mut problems = Vec::new();
+        for vector in &corpus {
+            exercised.insert(vector.record.clone());
+            for message in errors(&validator_for(&vector.record), &vector.json) {
+                problems.push(format!("{} [{}] {message}", vector.name, vector.record));
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "committed vectors violate their own published schema — serde and \
+             schemars disagree about a type: {problems:#?}"
+        );
+
+        let published: BTreeSet<String> = ["definition", "instance", "response"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            exercised, published,
+            "the corpus stopped covering a published record type. Every schema \
+             we publish needs at least one vector proving it is inhabitable, or \
+             this test goes vacuous for the missing one."
+        );
+    }
+
+    /// **Anti-vacuous twin.** A validator that accepts everything reads
+    /// exactly like one that works, so perturbed documents must be
+    /// REJECTED — and rejected for a schema reason. Both cases mutate an
+    /// already-parsed [`serde_json::Value`], so there is no parse step
+    /// left to fail in: the only thing that can reject these is a schema
+    /// rule.
+    #[test]
+    fn a_perturbed_document_is_rejected_for_a_schema_reason() {
+        let corpus = load(&vectors_path());
+        let definition = corpus
+            .iter()
+            .find(|v| v.record == "definition")
+            .expect("a definition vector");
+        let validator = validator_for("definition");
+        assert!(
+            errors(&validator, &definition.json).is_empty(),
+            "the unperturbed vector must validate, or the perturbations below \
+             prove nothing"
+        );
+
+        // 1. The versioned type tag is `const`-pinned. A forward version
+        //    is the exact confusion the tag exists to prevent.
+        let mut wrong_tag = definition.json.clone();
+        wrong_tag["schema"] = serde_json::json!("newt.interaction.definition/v2");
+        let failures = errors(&validator, &wrong_tag);
+        assert!(
+            failures.iter().any(|f| f.contains("/schema")),
+            "a wrong version tag was accepted; the `const` pin is not enforced: \
+             {failures:#?}"
+        );
+
+        // 2. A scalar violating its published `pattern`. ControlId is
+        //    `^[A-Za-z0-9_-]+$`, so a space is illegal — and a consumer
+        //    minting ids from free text would produce exactly this.
+        let mut bad_scalar = definition.json.clone();
+        bad_scalar["controls"][0]["id"] = serde_json::json!("has a space");
+        let failures = errors(&validator, &bad_scalar);
+        assert!(
+            failures.iter().any(|f| f.contains("/controls/0/id")),
+            "a ControlId with a space was accepted; the published `pattern` is \
+             not enforced: {failures:#?}"
+        );
+
+        // 3. The schemas are closed. An unknown property is how a
+        //    forward-version record would otherwise slip through as v1.
+        let mut extra = definition.json.clone();
+        extra["unexpected"] = serde_json::json!(true);
+        assert!(
+            !errors(&validator, &extra).is_empty(),
+            "an unknown property was accepted; `additionalProperties: false` is \
+             not enforced"
+        );
+    }
+
+    /// **The sharp one.** The negative corpus is *structurally* valid —
+    /// every entry is a well-formed response — and invalid only against
+    /// the definition it answers. So schema validation must PASS while
+    /// the semantic checker FAILS, on every single entry.
+    ///
+    /// That is the whole point of having both layers: they catch
+    /// different classes, and neither is standing in for the other. If
+    /// this test ever fails in the schema direction, a semantic bug has
+    /// been quietly reclassified as a structural one; if it fails in the
+    /// checker direction, the checker has gone blind.
+    #[test]
+    fn the_negative_corpus_is_schema_valid_yet_semantically_rejected() {
+        let positive = load(&vectors_path());
+        let negative = load(&invalid_vectors_path());
+        assert!(!negative.is_empty(), "no negative vectors to contrast");
+
+        for entry in &negative {
+            let schema_problems = errors(&validator_for(&entry.record), &entry.json);
+            assert!(
+                schema_problems.is_empty(),
+                "`{}` is meant to be structurally valid and semantically wrong, \
+                 but the schema rejected it. Either the record shape drifted or \
+                 this negative belongs in a different corpus: {schema_problems:#?}",
+                entry.name
+            );
+
+            let mut corpus = positive.clone();
+            corpus.push(entry.clone());
+            let semantic_problems = inconsistencies(&corpus);
+            assert!(
+                !semantic_problems.is_empty(),
+                "`{}` passed BOTH layers. It is labelled invalid ({}), so the \
+                 semantic checker has a hole the schema cannot cover for it.",
+                entry.name,
+                entry.invalid_because.as_deref().unwrap_or("unlabelled")
+            );
+        }
+    }
+}
