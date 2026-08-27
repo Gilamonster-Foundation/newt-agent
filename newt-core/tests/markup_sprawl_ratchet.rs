@@ -131,6 +131,41 @@ const CATEGORIES: &[Category] = &[
                     the (future) one definition path; B0/D0 migrate these",
     },
     Category {
+        name: "interaction answer validation sites",
+        // A3 (#1837) closes a blind spot in the row above. "question
+        // construction sites" counts by OLD-type syntax (`Question{`,
+        // `Question::<`), so a validator written against the
+        // newt-interaction types constructs no Question and adds ZERO
+        // rows — the ratchet would report green while a third "is this a
+        // legitimate answer" implementation accumulated beside
+        // `Question::parse` and newt-web's `classify_decision`.
+        //
+        // Needles are type-shaped rather than name-shaped, because a
+        // second implementation would be NEWLY NAMED: any production
+        // function taking the protocol `&Response`, or returning A3's
+        // accept/refuse verdict. They must begin at an identifier
+        // boundary to be counted at all (see `count_sites`), which is why
+        // they start at the `&` and the `<` rather than at `:` or `fn`.
+        count: |f| {
+            count_any(
+                &f.squeezed,
+                &["&Response)", "&Response,", "Accepted,Refusal>"],
+            )
+        },
+        baseline: &[
+            // The ONE sanctioned implementation: `validate_response`
+            // (two `&Response` parameter sites plus its verdict type).
+            // A2 froze the records; A3 validates them in exactly one
+            // place, and B0 switches the surfaces onto it. A second file
+            // appearing here is the sprawl this category exists to catch.
+            ("newt-interaction/src/binding.rs", 3),
+        ],
+        rationale: "answer validation against the Newt Markup types belongs in \
+                    ONE place (newt-interaction::binding); a second site is a \
+                    third answer-validation implementation, which is the exact \
+                    pattern the A0 inventory baselined for the old types",
+    },
+    Category {
         name: "console ask sites",
         // Receiver-explicit: a bare `.ask(` cannot tell `console.ask(` from
         // `gate.ask(` (the PermissionGate, seven sites in tools.rs) or a
@@ -671,6 +706,76 @@ fn a_quote_in_a_char_literal_does_not_open_a_string() {
 ///
 /// Regression (#1823 review A0-4/A0-5). Counting now runs over
 /// whitespace-normalized code with explicit receivers.
+/// **Anti-vacuous twin for "interaction answer validation sites".** A
+/// category whose needles match nothing would sit at baseline forever and
+/// report green while the sprawl it names accumulated — which is exactly
+/// the blind spot this category was added to close, so it must not
+/// reproduce it. This proves the counter fires on a second validator
+/// written against the new types, survives a rustfmt line split, and does
+/// NOT fire on the near-misses that share a prefix.
+#[test]
+fn a_second_answer_validator_against_the_new_types_is_counted() {
+    let count = |src: &str| {
+        let mut squeezed = String::new();
+        for line in src.lines() {
+            squeeze_into(&mut squeezed, line);
+        }
+        let file = FileCode {
+            squeezed,
+            imports_pulldown: false,
+        };
+        (CATEGORIES
+            .iter()
+            .find(|c| c.name == "interaction answer validation sites")
+            .unwrap()
+            .count)(&file)
+    };
+
+    // A newly-named second validator — the shape the old-type needles are
+    // blind to, since it constructs no `Question`.
+    assert_eq!(
+        count("fn is_a_legitimate_answer(r: &Response) -> bool { true }"),
+        1,
+        "a second validator taking the protocol Response was not counted"
+    );
+    // Split across lines by rustfmt: still one site.
+    assert_eq!(
+        count("fn check(\n    definition: &InteractionDefinition,\n    response: &Response,\n) -> bool { true }"),
+        1
+    );
+    // The verdict type is counted wherever a second implementation
+    // returns it.
+    assert_eq!(
+        count("fn second_opinion(r: &Response) -> Result<Accepted, Refusal> { todo!() }"),
+        2,
+        "the parameter and the verdict shape are both sites"
+    );
+
+    // Near-misses that must NOT count. `validate_responses_request` is
+    // the unrelated OpenAI Responses wire gate in newt-core; the others
+    // merely share a prefix with `Response`.
+    for near_miss in [
+        "fn validate_responses_request(body: &Body) -> Result<Validated, Error> { todo!() }",
+        "fn attribute(p: &ResponderProvenance, t: &ResponseTag) -> bool { true }",
+        "fn identify(id: &ResponseId,) -> bool { true }",
+    ] {
+        assert_eq!(count(near_miss), 0, "false positive on: {near_miss}");
+    }
+
+    // And the category is armed against the real workspace: if the
+    // baseline ever drops to nothing, the count is not measuring code.
+    let counts = production_counts();
+    let live: usize = counts
+        .iter()
+        .filter(|((name, _), _)| *name == "interaction answer validation sites")
+        .map(|(_, n)| *n)
+        .sum();
+    assert!(
+        live > 0,
+        "the category matches nothing in the real workspace, so it is decoration"
+    );
+}
+
 #[test]
 fn needles_survive_a_line_split_and_name_their_receiver() {
     let code = |src: &str| {
