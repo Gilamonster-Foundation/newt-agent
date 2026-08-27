@@ -7,10 +7,10 @@
 //! at the encoding, not at the fixture.
 
 use newt_interaction::{
-    AssertionKind, Audience, Control, ControlId, ControlKind, ControlValue, IdempotencyKey,
-    InteractionDefinition, InteractionInstance, InteractionKind, Nonce, Provenance, Requirement,
-    ResponderPolicy, ResponderProvenance, Response, Revision, Scope, SemanticRole, Submission,
-    RESPONSE_SCHEMA_V1,
+    AssertionKind, Audience, ChoiceOption, Control, ControlId, ControlKind, ControlValue,
+    IdempotencyKey, InteractionDefinition, InteractionInstance, InteractionKind, Nonce, OptionId,
+    Provenance, Requirement, ResponderPolicy, ResponderProvenance, Response, Revision, Scope,
+    SemanticRole, Submission, RESPONSE_SCHEMA_V1,
 };
 
 #[must_use]
@@ -18,22 +18,25 @@ pub fn definition() -> InteractionDefinition {
     InteractionDefinition::new(
         InteractionKind::Choice,
         "⊘ run_command wants to run `bash`",
-        vec![
-            Control {
-                id: ControlId::new("allow-once").unwrap(),
-                role: SemanticRole::Allow,
-                kind: ControlKind::Choice,
-                label: "allow once".to_string(),
-                requirement: Requirement::Optional,
+        vec![Control {
+            id: ControlId::new("decision").unwrap(),
+            kind: ControlKind::Choice {
+                options: vec![
+                    ChoiceOption {
+                        id: OptionId::new("allow-once").unwrap(),
+                        role: SemanticRole::Allow,
+                        label: "allow once".to_string(),
+                    },
+                    ChoiceOption {
+                        id: OptionId::new("deny").unwrap(),
+                        role: SemanticRole::Deny,
+                        label: "deny (default)".to_string(),
+                    },
+                ],
             },
-            Control {
-                id: ControlId::new("deny").unwrap(),
-                role: SemanticRole::Deny,
-                kind: ControlKind::Choice,
-                label: "deny (default)".to_string(),
-                requirement: Requirement::Optional,
-            },
-        ],
+            label: "what should happen".to_string(),
+            requirement: Requirement::Required,
+        }],
     )
 }
 
@@ -68,9 +71,9 @@ pub fn response(def: &InteractionDefinition, inst: &InteractionInstance) -> Resp
         instance: inst.instance_id().unwrap(),
         revision: Revision::FIRST,
         values: vec![Submission {
-            control: ControlId::new("deny").unwrap(),
+            control: ControlId::new("decision").unwrap(),
             value: ControlValue::Choice {
-                option: ControlId::new("deny").unwrap(),
+                option: OptionId::new("deny").unwrap(),
             },
         }],
         idempotency_key: IdempotencyKey::new("first-try").unwrap(),

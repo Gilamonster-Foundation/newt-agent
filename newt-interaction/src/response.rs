@@ -5,7 +5,9 @@ use content_addressable::{canonical, ContentAddressable, ContentError};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ProtocolError;
-use crate::ids::{ControlId, DefinitionId, IdempotencyKey, InstanceId, ResponseId, Revision};
+use crate::ids::{
+    ControlId, DefinitionId, IdempotencyKey, InstanceId, OptionId, ResponseId, Revision,
+};
 use crate::instance::Audience;
 
 /// The versioned type tag every response carries.
@@ -70,11 +72,13 @@ impl SecretRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ControlValue {
-    /// One of the definition's controls was chosen.
+    /// One of the control's options was chosen.
     Choice {
-        /// Which control. Its charset is enforced at construction, so a
-        /// choice can never carry a sentence.
-        option: ControlId,
+        /// Which OPTION of the control named by the enclosing
+        /// [`Submission`]. A distinct id space from `ControlId`, so the
+        /// pair cannot name two things of the same kind with no rule
+        /// saying which wins.
+        option: OptionId,
     },
     /// Free text, as typed.
     Text {

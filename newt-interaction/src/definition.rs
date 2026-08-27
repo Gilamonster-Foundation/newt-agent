@@ -4,7 +4,7 @@ use content_addressable::{canonical, ContentAddressable, ContentError};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ProtocolError;
-use crate::ids::{ControlId, DefinitionId, Revision};
+use crate::ids::{ControlId, DefinitionId, OptionId, Revision};
 
 /// The versioned type tag every definition carries as its first field.
 ///
@@ -50,22 +50,6 @@ pub enum SemanticRole {
     Value,
 }
 
-/// How a control accepts input.
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-#[non_exhaustive]
-pub enum ControlKind {
-    /// One option from the definition's displayed set.
-    Choice,
-    /// Free text.
-    Text,
-    /// A boolean.
-    Toggle,
-    /// A secret: never persisted in markup or logs (ADR D1).
-    Secret,
-}
-
 /// Whether something is REQUIRED to present or answer an interaction
 /// faithfully, or merely preferred.
 ///
@@ -77,7 +61,9 @@ pub enum ControlKind {
 /// diagram.
 ///
 /// One vocabulary, deliberately: controls and surface features both use
-/// it, so a wire consumer learns the distinction once.
+/// it, so a wire consumer learns the distinction once. On a control it
+/// means "the response must answer this FIELD" — which is only coherent
+/// because a choice is one field with many options, not many fields.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -90,6 +76,48 @@ pub enum Requirement {
     Optional,
 }
 
+/// One mutually-exclusive option of a choice control.
+///
+/// The option carries the SemanticRole, not the control: a permission
+/// question has no single meaning — each of its options does. `allow once`
+/// means Allow, `deny (default)` means Deny, and they are options of one
+/// question rather than two questions.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChoiceOption {
+    /// Stable within the control; the definition commits to it.
+    pub id: OptionId,
+    /// What picking this option means.
+    pub role: SemanticRole,
+    /// Human-readable label. Labels never confer authority (ADR law 2).
+    pub label: String,
+}
+
+/// How a control accepts input.
+///
+/// `Choice` carries its options inline because they belong to it: one
+/// field, N mutually-exclusive answers. Modelling each option as its own
+/// control would make [`Requirement`] incoherent — under "the response
+/// must include this control", answering an allow would require also
+/// answering the deny.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ControlKind {
+    /// Pick exactly one of the options offered.
+    Choice {
+        /// The options, in presentation order.
+        options: Vec<ChoiceOption>,
+    },
+    /// Free text.
+    Text,
+    /// A boolean.
+    Toggle,
+    /// A secret: never persisted in markup or logs (ADR D1).
+    Secret,
+}
+
 /// One control: a stable id, what it means, and how it takes input.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,9 +125,7 @@ pub enum Requirement {
 pub struct Control {
     /// Stable within the definition; the definition commits to it.
     pub id: ControlId,
-    /// What answering with this control means.
-    pub role: SemanticRole,
-    /// How it accepts input.
+    /// How it accepts input, and — for a choice — what it offers.
     pub kind: ControlKind,
     /// Human-readable label. Labels never confer authority (ADR law 2).
     pub label: String,

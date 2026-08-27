@@ -51,6 +51,34 @@
   },
   "additionalProperties": false,
   "definitions": {
+    "ChoiceOption": {
+      "description": "One mutually-exclusive option of a choice control.\n\nThe option carries the SemanticRole, not the control: a permission question has no single meaning — each of its options does. `allow once` means Allow, `deny (default)` means Deny, and they are options of one question rather than two questions.",
+      "type": "object",
+      "required": [
+        "id",
+        "label",
+        "role"
+      ],
+      "properties": {
+        "id": {
+          "description": "Stable within the control; the definition commits to it.",
+          "type": "string"
+        },
+        "label": {
+          "description": "Human-readable label. Labels never confer authority (ADR law 2).",
+          "type": "string"
+        },
+        "role": {
+          "description": "What picking this option means.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SemanticRole"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "Control": {
       "description": "One control: a stable id, what it means, and how it takes input.",
       "type": "object",
@@ -58,8 +86,7 @@
         "id",
         "kind",
         "label",
-        "requirement",
-        "role"
+        "requirement"
       ],
       "properties": {
         "id": {
@@ -67,7 +94,7 @@
           "type": "string"
         },
         "kind": {
-          "description": "How it accepts input.",
+          "description": "How it accepts input, and — for a choice — what it offers.",
           "allOf": [
             {
               "$ref": "#/definitions/ControlKind"
@@ -85,27 +112,38 @@
               "$ref": "#/definitions/Requirement"
             }
           ]
-        },
-        "role": {
-          "description": "What answering with this control means.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/SemanticRole"
-            }
-          ]
         }
       },
       "additionalProperties": false
     },
     "ControlKind": {
-      "description": "How a control accepts input.",
+      "description": "How a control accepts input.\n\n`Choice` carries its options inline because they belong to it: one field, N mutually-exclusive answers. Modelling each option as its own control would make [`Requirement`] incoherent — under \"the response must include this control\", answering an allow would require also answering the deny.",
       "oneOf": [
         {
-          "description": "One option from the definition's displayed set.",
-          "type": "string",
-          "enum": [
+          "description": "Pick exactly one of the options offered.",
+          "type": "object",
+          "required": [
             "choice"
-          ]
+          ],
+          "properties": {
+            "choice": {
+              "type": "object",
+              "required": [
+                "options"
+              ],
+              "properties": {
+                "options": {
+                  "description": "The options, in presentation order.",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/ChoiceOption"
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
         },
         {
           "description": "Free text.",
@@ -194,7 +232,7 @@
       ]
     },
     "Requirement": {
-      "description": "Whether something is REQUIRED to present or answer an interaction faithfully, or merely preferred.\n\nThis is the axis ADR law 5 turns on: *unknown REQUIRED behavior fails closed; unknown OPTIONAL behavior degrades visibly.* Without it a consumer that cannot satisfy a demand has only one move for both cases, and whichever it picks is wrong half the time — silently dropping a mandatory secret field, or refusing a document that merely wanted a diagram.\n\nOne vocabulary, deliberately: controls and surface features both use it, so a wire consumer learns the distinction once.",
+      "description": "Whether something is REQUIRED to present or answer an interaction faithfully, or merely preferred.\n\nThis is the axis ADR law 5 turns on: *unknown REQUIRED behavior fails closed; unknown OPTIONAL behavior degrades visibly.* Without it a consumer that cannot satisfy a demand has only one move for both cases, and whichever it picks is wrong half the time — silently dropping a mandatory secret field, or refusing a document that merely wanted a diagram.\n\nOne vocabulary, deliberately: controls and surface features both use it, so a wire consumer learns the distinction once. On a control it means \"the response must answer this FIELD\" — which is only coherent because a choice is one field with many options, not many fields.",
       "oneOf": [
         {
           "description": "Must be satisfiable. If it is not, the interaction is `Unsupported` and no answer may be guessed.",

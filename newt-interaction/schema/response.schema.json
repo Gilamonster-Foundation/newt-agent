@@ -102,7 +102,7 @@
       "description": "What was submitted for one control, typed.\n\nTyped at the TYPE rather than at a downstream parser: a `String` here would make every consumer decide whether `\"TRUE\"`, `\"1\"`, and `\"yes\"` are the same toggle, which is the per-surface drift the epic exists to end. Canonicalization lives in the shape, so A3 revalidates rather than re-parses. Deliberately NOT `#[non_exhaustive]`, unlike the open vocabularies in this crate (`InteractionKind`, `SemanticRole`, `Audience`, …). This variant set is a security boundary: \"no variant can carry a secret\" is provable only by an exhaustive match, and `#[non_exhaustive]` would force every such match to end in a wildcard — after which adding a plaintext-carrying variant would compile silently everywhere. Adding a variant here SHOULD break every consumer that reasons about the set. Every variant is a STRUCT variant: serde's internally-tagged form cannot represent a newtype variant wrapping a primitive, and the named field is the clearer thing to freeze into A2.1's vectors anyway (`{\"kind\":\"toggle\",\"on\":true}`).",
       "oneOf": [
         {
-          "description": "One of the definition's controls was chosen.",
+          "description": "One of the control's options was chosen.",
           "type": "object",
           "required": [
             "kind",
@@ -116,7 +116,7 @@
               ]
             },
             "option": {
-              "description": "Which control. Its charset is enforced at construction, so a choice can never carry a sentence.",
+              "description": "Which OPTION of the control named by the enclosing [`Submission`]. A distinct id space from `ControlId`, so the pair cannot name two things of the same kind with no rule saying which wins.",
               "type": "string"
             }
           },

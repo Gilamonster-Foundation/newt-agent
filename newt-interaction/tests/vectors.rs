@@ -15,10 +15,11 @@
 
 use content_addressable::{canonical, ContentAddressable, ContentId};
 use newt_interaction::{
-    AssertionKind, Audience, Control, ControlId, ControlKind, ControlValue, FeatureDemand,
-    IdempotencyKey, InteractionDefinition, InteractionInstance, InteractionKind, Nonce, Provenance,
-    Requirement, ResponderPolicy, ResponderProvenance, Response, Revision, Scope, SecretRef,
-    SemanticRole, Submission, SurfaceFeature, INSTANCE_SCHEMA_V1, RESPONSE_SCHEMA_V1,
+    AssertionKind, Audience, ChoiceOption, Control, ControlId, ControlKind, ControlValue,
+    FeatureDemand, IdempotencyKey, InteractionDefinition, InteractionInstance, InteractionKind,
+    Nonce, OptionId, Provenance, Requirement, ResponderPolicy, ResponderProvenance, Response,
+    Revision, Scope, SecretRef, SemanticRole, Submission, SurfaceFeature, INSTANCE_SCHEMA_V1,
+    RESPONSE_SCHEMA_V1,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -79,33 +80,50 @@ fn vector<T: ContentAddressable + Serialize>(
     }
 }
 
-fn control(id: &str, role: SemanticRole, kind: ControlKind, requirement: Requirement) -> Control {
+fn choice_field(id: &str, options: &[(&str, SemanticRole, &str)]) -> Control {
     Control {
         id: ControlId::new(id).unwrap(),
-        role,
+        kind: ControlKind::Choice {
+            options: options
+                .iter()
+                .map(|(oid, role, label)| ChoiceOption {
+                    id: OptionId::new(*oid).unwrap(),
+                    role: *role,
+                    label: (*label).to_string(),
+                })
+                .collect(),
+        },
+        label: format!("{id} field"),
+        requirement: Requirement::Required,
+    }
+}
+
+fn field(id: &str, kind: ControlKind, requirement: Requirement) -> Control {
+    Control {
+        id: ControlId::new(id).unwrap(),
         kind,
-        label: format!("{id} label"),
+        label: format!("{id} field"),
         requirement,
     }
 }
 
+/// A definition with one field per control KIND, so every positive
+/// response vector answers a control whose kind matches its value.
 fn sample_definition() -> InteractionDefinition {
     let mut def = InteractionDefinition::new(
-        InteractionKind::Choice,
+        InteractionKind::Form,
         "⊘ run_command wants to run `bash`",
         vec![
-            control(
-                "allow-once",
-                SemanticRole::Allow,
-                ControlKind::Choice,
-                Requirement::Optional,
+            choice_field(
+                "decision",
+                &[
+                    ("allow-once", SemanticRole::Allow, "allow once"),
+                    ("deny", SemanticRole::Deny, "deny (default)"),
+                ],
             ),
-            control(
-                "deny",
-                SemanticRole::Deny,
-                ControlKind::Choice,
-                Requirement::Required,
-            ),
+            field("reason", ControlKind::Text, Requirement::Optional),
+            field("remember", ControlKind::Toggle, Requirement::Optional),
+            field("passphrase", ControlKind::Secret, Requirement::Optional),
         ],
     );
     def.features = vec![
@@ -146,6 +164,7 @@ fn sample_instance(def: &InteractionDefinition) -> InteractionInstance {
 fn sample_response(
     def: &InteractionDefinition,
     inst: &InteractionInstance,
+    control: ControlId,
     value: ControlValue,
 ) -> Response {
     Response {
@@ -153,10 +172,7 @@ fn sample_response(
         definition: def.definition_id().unwrap(),
         instance: inst.instance_id().unwrap(),
         revision: Revision::FIRST,
-        values: vec![Submission {
-            control: ControlId::new("deny").unwrap(),
-            value,
-        }],
+        values: vec![Submission { control, value }],
         idempotency_key: IdempotencyKey::new("first-try").unwrap(),
         responder_provenance: ResponderProvenance {
             kind: AssertionKind::SignedAssertion,
@@ -186,22 +202,28 @@ fn generate() -> Vec<Vector> {
             &inst,
         ),
     ];
-    for (name, value) in [
+    // Each response answers the control whose KIND matches its value: a
+    // corpus foreign implementations reproduce must be valid in context,
+    // not merely enum-complete.
+    for (name, control, value) in [
         (
             "choice",
+            "decision",
             ControlValue::Choice {
-                option: ControlId::new("deny").unwrap(),
+                option: OptionId::new("deny").unwrap(),
             },
         ),
         (
             "text",
+            "reason",
             ControlValue::Text {
                 text: "a typed answer".to_string(),
             },
         ),
-        ("toggle", ControlValue::Toggle { on: true }),
+        ("toggle", "remember", ControlValue::Toggle { on: true }),
         (
             "secret-by-reference",
+            "passphrase",
             ControlValue::Secret {
                 reference: SecretRef::new("vault-handle-9").unwrap(),
             },
@@ -211,7 +233,7 @@ fn generate() -> Vec<Vector> {
             &format!("response/value-{name}"),
             "response",
             &["definition", "instance"],
-            &sample_response(&def, &inst, value),
+            &sample_response(&def, &inst, ControlId::new(control).unwrap(), value),
         ));
     }
     out

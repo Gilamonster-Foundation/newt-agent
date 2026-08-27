@@ -236,7 +236,7 @@ fn every_field_a_response_claims_to_bind_moves_its_id() {
         }),
         ("revision", |r| r.revision = r.revision.next()),
         ("values.control", |r| {
-            r.values[0].control = newt_interaction::ControlId::new("allow-once").unwrap();
+            r.values[0].control = newt_interaction::ControlId::new("other-field").unwrap();
         }),
         ("values.value", |r| {
             r.values[0].value = newt_interaction::ControlValue::Text {
@@ -245,7 +245,7 @@ fn every_field_a_response_claims_to_bind_moves_its_id() {
         }),
         ("values.len", |r| {
             r.values.push(newt_interaction::Submission {
-                control: newt_interaction::ControlId::new("allow-once").unwrap(),
+                control: newt_interaction::ControlId::new("other-field").unwrap(),
                 value: newt_interaction::ControlValue::Toggle { on: true },
             });
         }),
@@ -303,12 +303,36 @@ fn every_semantic_field_of_a_definition_moves_its_id() {
         ("revision", |d| d.revision = d.revision.next()),
         ("markdown", |d| d.markdown.push('!')),
         ("controls.label", |d| d.controls[0].label.push('!')),
-        ("controls.role", |d| {
-            d.controls[0].role = SemanticRole::Cancel
-        }),
         ("controls.kind", |d| d.controls[0].kind = ControlKind::Text),
+        // The options are part of the field. A definition whose option set
+        // could change without changing its id would let an offer be
+        // re-aimed at answers its author never wrote.
+        ("controls.option.id", |d| {
+            if let ControlKind::Choice { options } = &mut d.controls[0].kind {
+                options[0].id = newt_interaction::OptionId::new("renamed-option").unwrap();
+            }
+        }),
+        ("controls.option.role", |d| {
+            if let ControlKind::Choice { options } = &mut d.controls[0].kind {
+                options[0].role = SemanticRole::Cancel;
+            }
+        }),
+        ("controls.option.label", |d| {
+            if let ControlKind::Choice { options } = &mut d.controls[0].kind {
+                options[0].label.push('!');
+            }
+        }),
+        ("controls.option.len", |d| {
+            if let ControlKind::Choice { options } = &mut d.controls[0].kind {
+                options.push(newt_interaction::ChoiceOption {
+                    id: newt_interaction::OptionId::new("extra").unwrap(),
+                    role: SemanticRole::Cancel,
+                    label: "back".to_string(),
+                });
+            }
+        }),
         ("controls.requirement", |d| {
-            d.controls[0].requirement = Requirement::Required;
+            d.controls[0].requirement = Requirement::Optional;
         }),
         ("controls.id", |d| {
             d.controls[0].id = newt_interaction::ControlId::new("renamed").unwrap();
@@ -316,9 +340,8 @@ fn every_semantic_field_of_a_definition_moves_its_id() {
         ("controls.len", |d| {
             d.controls.push(Control {
                 id: newt_interaction::ControlId::new("extra").unwrap(),
-                role: SemanticRole::Cancel,
-                kind: ControlKind::Choice,
-                label: "back".to_string(),
+                kind: ControlKind::Text,
+                label: "a second field".to_string(),
                 requirement: Requirement::Optional,
             });
         }),

@@ -98,11 +98,34 @@ content_id_newtype!(
     "response id"
 );
 
-/// A stable, author-assigned name for one control inside a definition.
+/// Shared validation for author-assigned names: non-empty, ASCII
+/// alphanumeric plus `-` and `_`.
+fn validated_name(kind: &'static str, name: String) -> Result<String, ProtocolError> {
+    if name.is_empty() {
+        return Err(ProtocolError::InvalidId {
+            kind,
+            reason: "must not be empty".to_string(),
+        });
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ProtocolError::InvalidId {
+            kind,
+            reason: format!("`{name}` has characters outside [A-Za-z0-9_-]"),
+        });
+    }
+    Ok(name)
+}
+
+/// A stable, author-assigned name for one control — one FIELD of an
+/// interaction — inside a definition.
 ///
-/// Deliberately not content-derived: a control id must survive being written
-/// by a human in a `+++` envelope, and the definition it lives in commits to
-/// it — so the definition's `ContentId` is what protects its integrity.
+/// Deliberately not content-derived: a control id must survive being
+/// written by a human in a `+++` envelope, and the definition it lives in
+/// commits to it, so the definition's `ContentId` is what protects its
+/// integrity.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -115,23 +138,39 @@ impl ControlId {
     ///
     /// [`ProtocolError::InvalidId`] when empty or outside the charset.
     pub fn new(name: impl Into<String>) -> Result<Self, ProtocolError> {
-        let name = name.into();
-        if name.is_empty() {
-            return Err(ProtocolError::InvalidId {
-                kind: "control id",
-                reason: "must not be empty".to_string(),
-            });
-        }
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            return Err(ProtocolError::InvalidId {
-                kind: "control id",
-                reason: format!("`{name}` has characters outside [A-Za-z0-9_-]"),
-            });
-        }
-        Ok(Self(name))
+        Ok(Self(validated_name("control id", name.into())?))
+    }
+
+    /// The name as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A stable, author-assigned name for one OPTION of a choice control.
+///
+/// A separate id space from [`ControlId`] on purpose. A choice is one
+/// field with many mutually-exclusive options — the shape B0's permission
+/// prompt already has: one question offering `[a]llow once`,
+/// `[s]ession allow`, `[d]eny (default)` and the rest. Giving options
+/// their own type means a submission naming a control and an option cannot
+/// name two things of the same kind with no rule saying which is
+/// authoritative; the ambiguity is gone by construction rather than by
+/// prose.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OptionId(String);
+
+impl OptionId {
+    /// Build an option id: same shape rule as a control id.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolError::InvalidId`] when empty or outside the charset.
+    pub fn new(name: impl Into<String>) -> Result<Self, ProtocolError> {
+        Ok(Self(validated_name("option id", name.into())?))
     }
 
     /// The name as written.
