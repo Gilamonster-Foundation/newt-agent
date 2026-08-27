@@ -416,3 +416,64 @@ fn the_probe_reads_a_tag_it_does_not_understand() {
         Err(ProtocolError::Malformed { .. })
     ));
 }
+
+/// **A definition's controls imply capabilities its author need not
+/// restate.**
+///
+/// `plan_presentation` used to read only `definition.features`, so a
+/// definition with a REQUIRED Secret control and no `secret-input` demand
+/// reported `is_faithful() == true` on a surface that cannot accept a
+/// secret without echoing it — the shortfall that matters most, missed
+/// silently. The shipped golden proved the mirror image: it demanded
+/// `secret-input` while declaring no secret control at all.
+///
+/// Intrinsic requirements are DERIVED from the semantic model and unioned
+/// with the explicit ones. Deriving has no wire impact, which is why it is
+/// the right fix here: validating at construction or deserialization
+/// instead would change what records are representable, and this slice
+/// freezes that.
+#[test]
+fn a_secret_control_implies_the_secret_input_capability() {
+    use newt_interaction::{Control, ControlId, ControlKind, SurfaceFeature};
+
+    let mut def = definition();
+    def.features.clear();
+    def.controls.push(Control {
+        id: ControlId::new("passphrase").unwrap(),
+        kind: ControlKind::Secret,
+        label: "passphrase".to_string(),
+        requirement: Requirement::Required,
+    });
+
+    // A surface that cannot take secrets must not be told this is faithful.
+    let err = plan_presentation(&def, &[]).unwrap_err();
+    match err {
+        ProtocolError::UnsupportedFeature { ref feature, .. } => {
+            assert_eq!(feature, SurfaceFeature::SECRET_INPUT);
+        }
+        other => panic!("expected a refusal naming secret-input, got {other:?}"),
+    }
+
+    // ...and one that can, proceeds faithfully, with nothing to report.
+    let supported = [SurfaceFeature::new(SurfaceFeature::SECRET_INPUT).unwrap()];
+    let plan = plan_presentation(&def, &supported).expect("a capable surface presents it");
+    assert!(plan.is_faithful());
+
+    // An OPTIONAL secret control degrades visibly rather than refusing:
+    // the requirement of the CONTROL carries into the capability it
+    // implies, or the derivation would be stricter than the author asked.
+    let mut optional = definition();
+    optional.features.clear();
+    optional.controls.push(Control {
+        id: ControlId::new("hint").unwrap(),
+        kind: ControlKind::Secret,
+        label: "optional secret".to_string(),
+        requirement: Requirement::Optional,
+    });
+    let degraded = plan_presentation(&optional, &[]).expect("an optional demand does not refuse");
+    assert_eq!(
+        degraded.degradations().len(),
+        1,
+        "an unmet optional secret control must be reported"
+    );
+}

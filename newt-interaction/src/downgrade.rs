@@ -16,7 +16,7 @@ use content_addressable::{canonical, ContentAddressable};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
-use crate::definition::{InteractionDefinition, Requirement, SurfaceFeature};
+use crate::definition::{FeatureDemand, InteractionDefinition, Requirement, SurfaceFeature};
 use crate::error::ProtocolError;
 use crate::instance::InteractionInstance;
 use crate::response::Response;
@@ -232,6 +232,54 @@ impl Presentation {
     }
 }
 
+/// Capabilities a definition's own controls REQUIRE, whether or not its
+/// author restated them in `features`.
+///
+/// A Secret control needs a surface that accepts secret input without
+/// echoing or persisting it — that is what makes it a secret control, not
+/// a separate claim its author might forget. Reading only the declared
+/// `features` let a definition with a required Secret control report
+/// `is_faithful() == true` on a surface that cannot handle one, which is
+/// the shortfall that matters most.
+///
+/// Derived rather than validated at construction on purpose: derivation
+/// has NO wire impact, so it stays correctable if the rule turns out
+/// wrong. Requiring authors to declare it — or refusing records that do
+/// not — would change which records are representable, and this slice
+/// freezes that.
+///
+/// The control's own [`Requirement`] carries through: an optional secret
+/// field degrades visibly rather than refusing, or the derivation would be
+/// stricter than its author asked for.
+fn intrinsic_demands(definition: &InteractionDefinition) -> Vec<FeatureDemand> {
+    let mut demands: Vec<FeatureDemand> = Vec::new();
+    for control in &definition.controls {
+        let Some(feature) = (match control.kind {
+            crate::definition::ControlKind::Secret => Some(SurfaceFeature::SECRET_INPUT),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let Ok(feature) = SurfaceFeature::new(feature) else {
+            continue;
+        };
+        // A feature demanded by two controls is one demand; the stricter
+        // requirement wins, since satisfying it satisfies both.
+        match demands.iter_mut().find(|d| d.feature == feature) {
+            Some(existing) => {
+                if control.requirement == Requirement::Required {
+                    existing.requirement = Requirement::Required;
+                }
+            }
+            None => demands.push(FeatureDemand {
+                feature,
+                requirement: control.requirement,
+            }),
+        }
+    }
+    demands
+}
+
 /// Decide what `supported` can present of `definition`.
 ///
 /// # Errors
@@ -245,7 +293,10 @@ pub fn plan_presentation(
     supported: &[SurfaceFeature],
 ) -> Result<Presentation, ProtocolError> {
     let mut degradations = Vec::new();
-    for demand in &definition.features {
+    for demand in intrinsic_demands(definition)
+        .iter()
+        .chain(definition.features.iter())
+    {
         if supported.contains(&demand.feature) {
             continue;
         }
