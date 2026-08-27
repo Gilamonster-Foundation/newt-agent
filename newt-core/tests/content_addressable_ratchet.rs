@@ -4,8 +4,17 @@
 //! Authority Register, and the `provenance-audit` skill — five places):
 //!
 //! > Every data structure that is persisted, transmitted, chained, or
-//! > identified takes its identity from `content-addressable` (v0.1.1).
+//! > identified takes its identity from `content-addressable` (v0.1.2).
 //! > Hand-rolling a hash, digest, id, or canonical encoding is a defect.
+//!
+//! Since 0.1.2 the rule has a second half, because decoding is where a
+//! canonical identity is most easily lost:
+//!
+//! > Decode canonical bytes only through `from_canonical_dagcbor_checked`
+//! > (or `ContentAddressable::from_canonical_form`). The bare
+//! > `from_canonical_dagcbor` is deprecated: it verifies neither canonical
+//! > form nor the typed round trip, so the value it hands back can carry a
+//! > different `ContentId` than the bytes it came from.
 //!
 //! # Why a test and not a sixth paragraph
 //!
@@ -40,6 +49,12 @@
 //! `ContentId` and `RawContentId` are DIFFERENT identities even when their
 //! digest bytes match — the profile is semantic, so pick by what the thing is,
 //! not by which is convenient.
+//!
+//! `RawContentId`, `MerkleNode<T>`, and `NodeStore` reach further than the
+//! frozen core this workspace pins (`Cargo.toml` takes the default features
+//! only, and merkle/store are `unstable-*`-gated), so a conversion to one of
+//! those is a dependency decision as well as a code change — raise it rather
+//! than assuming it is available.
 
 use std::collections::BTreeMap;
 
@@ -90,6 +105,14 @@ fn workspace_root() -> std::path::PathBuf {
 /// would be stronger and is the eventual goal — this is what can be enforced
 /// today without restructuring every call site first.
 fn hand_rolled_sites() -> BTreeMap<String, usize> {
+    sites_matching(|line| line.contains("blake3::hash("))
+}
+
+/// Production source lines matching `predicate`, per file.
+///
+/// One scanner for every row this file arms: a second copy would drift from
+/// the first, which is the sprawl the ratchet exists to count.
+fn sites_matching(predicate: impl Fn(&str) -> bool) -> BTreeMap<String, usize> {
     let root = workspace_root();
     let mut found: BTreeMap<String, usize> = BTreeMap::new();
     let mut stack = vec![root.clone()];
@@ -102,7 +125,11 @@ fn hand_rolled_sites() -> BTreeMap<String, usize> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if path.is_dir() {
-                if matches!(name.as_ref(), "target" | ".git" | ".claude" | "docs") {
+                // Hidden directories included: the main checkout carries
+                // gitignored worktrees under `.worktrees/` with full `src`
+                // trees, and counting a nested copy would inflate every row
+                // on a developer's machine while CI stayed green.
+                if name.starts_with('.') || matches!(name.as_ref(), "target" | "docs") {
                     continue;
                 }
                 stack.push(path);
@@ -123,7 +150,7 @@ fn hand_rolled_sites() -> BTreeMap<String, usize> {
             let n = text
                 .lines()
                 .filter(|l| !l.trim_start().starts_with("//"))
-                .filter(|l| l.contains("blake3::hash("))
+                .filter(|l| predicate(l))
                 .count();
             if n > 0 {
                 let rel = path
@@ -207,6 +234,75 @@ fn the_ratchet_can_see_the_sites_it_counts() {
 
 /// The crate is a real dependency, not an aspiration — so a conversion has
 /// somewhere to land.
+/// Bare (unchecked) decodes of canonical bytes still in production source.
+///
+/// The bare door returns a value without verifying that re-encoding it
+/// reproduces the input, so what comes back can carry a different
+/// `ContentId` than the bytes it was read from — a silently different
+/// identity, which is the failure this whole file exists to prevent.
+///
+/// EXACTLY ONE is expected, and it is not a debt to pay down: the schema-tag
+/// probe in `newt-interaction/src/downgrade.rs` reads a SUBSET of a record
+/// on purpose (the tag, to decide which decoder to open), so the checked
+/// door's guarantee is not merely unmet there but meaningless — a tag-only
+/// struct cannot re-encode to a whole record. The crate names this caller
+/// explicitly. It must carry a local `#[allow(deprecated)]`, which is what
+/// makes it visible in review rather than accidental.
+const EXPECTED_BARE_DECODES: usize = 1;
+
+#[test]
+fn no_production_code_decodes_through_the_bare_door() {
+    let sites = sites_matching(|line| {
+        line.contains("from_canonical_dagcbor(") && !line.contains("_checked(")
+    });
+    let total: usize = sites.values().sum();
+    assert_eq!(
+        total, EXPECTED_BARE_DECODES,
+        "bare canonical decodes in production changed: {sites:?}\n\
+         The bare door does not verify the typed round trip, so the value it \
+         returns can carry a different ContentId than its bytes. Use \
+         `from_canonical_dagcbor_checked`. The one sanctioned exception is \
+         the schema-tag probe, which reads a subset by design."
+    );
+
+    // ...and it is the site we think it is, carrying its justification.
+    let expected = "newt-interaction/src/downgrade.rs";
+    assert_eq!(
+        sites.keys().collect::<Vec<_>>(),
+        vec![expected],
+        "the bare decode moved: {sites:?}"
+    );
+    let text = std::fs::read_to_string(workspace_root().join(expected)).expect("the probe file");
+    assert!(
+        text.contains("#[allow(deprecated)]"),
+        "{expected} decodes through the bare door without the local \
+         `#[allow(deprecated)]` that makes the exception visible"
+    );
+}
+
+/// **Anti-vacuous twin.** A scanner that finds nothing reports success
+/// forever, and this row's expected count is small enough that a broken
+/// scanner would look exactly like a clean tree.
+#[test]
+fn the_bare_decode_scanner_sees_a_seeded_call() {
+    let seeded = "    let v: T = canonical::from_canonical_dagcbor(bytes)?;";
+    let predicate =
+        |line: &str| line.contains("from_canonical_dagcbor(") && !line.contains("_checked(");
+    assert!(predicate(seeded), "the scanner missed a seeded bare decode");
+    // ...and does not fire on the checked door, or the row would count
+    // every correct call site as a violation.
+    assert!(!predicate(
+        "    let v: T = canonical::from_canonical_dagcbor_checked(bytes)?;"
+    ));
+    // ...nor on a comment mentioning it, which the line filter drops.
+    assert!(
+        sites_matching(|l| l.contains("from_canonical_dagcbor("))
+            .values()
+            .sum::<usize>()
+            >= EXPECTED_BARE_DECODES
+    );
+}
+
 #[test]
 fn the_content_addressable_crate_is_available() {
     use content_addressable::ContentAddressable;

@@ -117,7 +117,12 @@ age = { version = "0.11", features = ["armor"] }
 # record — self-verifying identity that dissolves the allocator/reservation bug
 # class. Depend on the PUBLISHED crates.io release (never a git/path pin); the
 # frozen 0.1.x core (ContentId + ContentAddressable + canonical) is all we use.
-content-addressable = "0.1.0"
+# 0.1.2 adds the CHECKED decode — `from_canonical_dagcbor_checked` verifies
+# that re-encoding the decoded value reproduces the input bytes, and
+# deprecates the bare decoder. That is a guarantee we had hand-rolled in
+# newt-interaction; the crate now owns it, so the bare door is a warning
+# (and, under -D warnings, a build failure) rather than a choice.
+content-addressable = "0.1.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }

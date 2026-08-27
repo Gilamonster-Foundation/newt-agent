@@ -41,15 +41,10 @@ pub enum ProtocolError {
     /// they decode to — reordered map keys, a non-minimal integer, an
     /// indefinite-length string. Accepting them would mint an id different
     /// from the one their author published.
-    #[error(
-        "non-canonical encoding of {schema}: {input_len} bytes in, \
-         {decoded_len} out when re-encoded"
-    )]
+    #[error("non-canonical encoding of {schema} ({input_len} bytes)")]
     NonCanonical {
         /// The tag the record declared.
         schema: String,
-        /// Length of the canonical re-encoding.
-        decoded_len: usize,
         /// Length of the input.
         input_len: usize,
     },

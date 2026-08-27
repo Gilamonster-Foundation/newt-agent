@@ -12,9 +12,9 @@
 //! record and calling the result a v1 is the tempting failure — it yields
 //! a record that looks valid and carries an id its author never minted.
 
-use content_addressable::{canonical, ContentAddressable};
+use content_addressable::{canonical, ContentError};
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::definition::{FeatureDemand, InteractionDefinition, Requirement, SurfaceFeature};
 use crate::error::ProtocolError;
@@ -113,23 +113,31 @@ struct SchemaProbe {
 /// 3. **The bytes.** Even a record that decodes may not be the record that
 ///    was written: reordered map keys, a non-minimal integer, an
 ///    indefinite-length string all decode fine and re-encode differently.
-///    So the decoded value is re-encoded and compared byte-for-byte with
-///    the input, and any difference is a refusal.
 ///
-/// Gate 3 is not redundant with gate 2. It does not depend on how strict
-/// the CBOR decoder happens to be in the version we have locked, and
-/// decoder strictness drifts between releases — this repo has been bitten
-/// by exactly that before. The rule learned there applies here: prove a
-/// non-canonical encoding by FORWARD encoding, never by trusting a decoder
-/// to reject it.
+/// Gates 2 and 3 are now ONE call. `content-addressable` 0.1.2 added
+/// `from_canonical_dagcbor_checked`, which decodes and then verifies that
+/// re-encoding the decoded value reproduces the input — the check this
+/// module used to perform by hand, delegated to the crate that owns
+/// canonical encoding. It still does not rest on decoder strictness: the
+/// verification is a FORWARD encoding, which is the rule this repo learned
+/// the hard way (decoder strictness drifts between releases).
 fn decode<T>(bytes: &[u8], expected: &'static str) -> Result<Decoded<T>, ProtocolError>
 where
-    T: DeserializeOwned + ContentAddressable,
+    T: DeserializeOwned + Serialize,
 {
-    let probe: SchemaProbe =
-        canonical::from_canonical_dagcbor(bytes).map_err(|e| ProtocolError::Malformed {
-            reason: format!("no readable schema tag: {e}"),
-        })?;
+    // The probe reads a SUBSET of the record on purpose — the tag, and
+    // nothing else — so the checked door's guarantee (re-encoding the
+    // decoded value reproduces the input) is not merely unmet here but
+    // meaningless: a tag-only struct cannot re-encode to a whole record.
+    // The crate sanctions exactly this caller with a local
+    // `#[allow(deprecated)]` ("callers who want the value, not the codec
+    // check"). Every decode that produces a RECORD goes through the
+    // checked door below; this one only decides which door to open.
+    #[allow(deprecated)]
+    let probe: Result<SchemaProbe, _> = canonical::from_canonical_dagcbor(bytes);
+    let probe = probe.map_err(|e| ProtocolError::Malformed {
+        reason: format!("no readable schema tag: {e}"),
+    })?;
     if probe.schema != expected {
         let reason = classify_tag(&probe.schema, expected);
         return Ok(Decoded::Unknown(RawRecord {
@@ -139,28 +147,41 @@ where
         }));
     }
 
-    // Gate 2. A shape we cannot fully account for is preserved, not
-    // partially read. The probe already proved these bytes are a map with
-    // a schema string, so a failure here is "shaped like a record we do
-    // not know", not "not a record".
-    let Ok(record) = canonical::from_canonical_dagcbor::<T>(bytes) else {
-        return Ok(Decoded::Unknown(RawRecord {
+    // Gates 2 and 3, now the crate's. `from_canonical_dagcbor_checked`
+    // decodes AND verifies that re-encoding the decoded value reproduces
+    // the input bytes — the check this module used to perform by hand.
+    // Its three verdicts map onto ours:
+    match canonical::from_canonical_dagcbor_checked::<T>(bytes) {
+        Ok(record) => Ok(Decoded::Known(record)),
+        // The bytes decode but are not the canonical encoding of what they
+        // decode to. Accepting them would mint an id different from the
+        // one their author published.
+        Err(ContentError::NonCanonical) => Err(ProtocolError::NonCanonical {
             schema: probe.schema,
-            bytes: bytes.to_vec(),
-            reason: UnknownReason::Uninterpretable,
-        }));
-    };
-
-    // Gate 3.
-    let reencoded = record.canonical_form()?;
-    if reencoded != bytes {
-        return Err(ProtocolError::NonCanonical {
-            schema: probe.schema,
-            decoded_len: reencoded.len(),
             input_len: bytes.len(),
-        });
+        }),
+        // The typed round trip lost something — an unknown field, a
+        // narrowing conversion. The probe already proved these bytes are a
+        // record carrying OUR tag, so this is "shaped like a record we
+        // cannot fully account for", not "not a record", and it is
+        // preserved rather than partially read.
+        //
+        // A post-tag DecodingError lands here too, deliberately. Once the
+        // tag matched, a serde refusal (`deny_unknown_fields` firing, say)
+        // is the same fact as a lossy round trip: readable record, our
+        // version, this build cannot account for every byte. Reporting it
+        // as `Malformed` would conflate that with bytes that are not a
+        // record at all, which is the distinction the probe stage exists
+        // to draw.
+        Err(ContentError::LossyDecode | ContentError::DecodingError { .. }) => {
+            Ok(Decoded::Unknown(RawRecord {
+                schema: probe.schema,
+                bytes: bytes.to_vec(),
+                reason: UnknownReason::Uninterpretable,
+            }))
+        }
+        Err(other) => Err(ProtocolError::Identity(other)),
     }
-    Ok(Decoded::Known(record))
 }
 
 /// Which kind of schema mismatch this is.

@@ -298,7 +298,11 @@ fn non_canonical_bytes_of_a_valid_record_are_refused() {
     assert_ne!(perturbed, canonical_bytes, "the fixture perturbed nothing");
 
     // It really does still decode — otherwise this tests the decoder's
-    // strictness rather than our check.
+    // strictness rather than the canonical check. The UNCHECKED door is
+    // the point of this line, not an oversight: it is the crate's
+    // sanctioned "I want the value, not the codec check" caller, and it is
+    // what makes the refusal below attributable to the check.
+    #[allow(deprecated)]
     let lenient: InteractionDefinition =
         canonical::from_canonical_dagcbor(&perturbed).expect("perturbed bytes still decode");
     assert_eq!(
@@ -320,12 +324,14 @@ fn non_canonical_bytes_of_a_valid_record_are_refused() {
 /// The refusal above is only meaningful if the perturbed bytes would
 /// otherwise be ACCEPTED. Asserting that they decode is not enough — the
 /// real decoder could still be refusing them for some other reason. So
-/// this runs them through a copy of the real decoder with gate 3, and
-/// only gate 3, removed: same tag probe, same strict typed decode, no
-/// byte comparison. That path returns the record, which attributes the
-/// refusal to the comparison rather than to `serde_ipld_dagcbor` 0.6.4
+/// this runs them through a copy of the real decoder with the canonical
+/// verification, and only that, removed: same tag probe, same typed
+/// decode, but the crate's UNCHECKED door instead of its checked one. That path returns the record, which attributes the
+/// refusal to the canonical verification rather than to the CBOR decoder
 /// happening to be strict — a property that drifts between releases and
-/// must never be what a guarantee rests on.
+/// must never be what a guarantee rests on. Since 0.1.2 the verification
+/// is `content-addressable`'s rather than ours, which makes this twin the
+/// consumer-side proof that delegating it preserved the behavior.
 #[test]
 fn decoding_would_accept_without_the_round_trip() {
     /// The real `decode`, minus gate 3.
@@ -334,13 +340,19 @@ fn decoding_would_accept_without_the_round_trip() {
         struct Probe {
             schema: String,
         }
-        // Gate 1: the tag.
+        // Gate 1: the tag — a subset read, same as the real decoder's.
+        #[allow(deprecated)]
         let probe: Probe = canonical::from_canonical_dagcbor(bytes).expect("readable tag");
         if probe.schema != DEFINITION_SCHEMA_V1 {
             panic!("fixture should carry the v1 tag");
         }
-        // Gate 2: the shape.
-        match canonical::from_canonical_dagcbor::<InteractionDefinition>(bytes) {
+        // Gate 2: the shape — through the crate's UNCHECKED door, which is
+        // precisely the decoder minus the canonical verification. That is
+        // what makes this twin meaningful: same bytes, same decoder, one
+        // gate removed.
+        #[allow(deprecated)]
+        let decoded = canonical::from_canonical_dagcbor::<InteractionDefinition>(bytes);
+        match decoded {
             Ok(record) => Decoded::Known(record),
             Err(e) => panic!("gate 2 refused the fixture: {e}"),
         }
