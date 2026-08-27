@@ -1,5 +1,5 @@
 name = "caveat-lattice"
-defaultTargets = ["CaveatLattice", "ProjectModel", "NewtPolicy", "CompactionProvenance", "CompactionLifecycle", "CompactionSpill", "ResponsesUsage", "ResponsesWire"]
+defaultTargets = ["CaveatLattice", "ProjectModel", "NewtPolicy", "CompactionProvenance", "CompactionLifecycle", "CompactionSpill", "ResponsesUsage", "ResponsesWire", "NewtInteraction"]
 
 # Machine-checked formal specs. Self-contained: no Mathlib, so it builds from a
 # bare Lean toolchain (see lean-toolchain). `lake build` checks every theorem; a
@@ -51,3 +51,11 @@ name = "ResponsesUsage"
 # dispatchable, and only a validated request is — the make-it-unrepresentable law.
 [[lean_lib]]
 name = "ResponsesWire"
+
+# NewtInteraction — the #1803 A3 interaction-protocol kernel: the response
+# validator behind `newt-interaction/src/binding.rs::validate_response`. Proves
+# acceptance implies every binding matched, validation is atomic, an
+# unregistered action never resolves, an ineligible audience is refused, and an
+# expired offer authorizes (and synthesizes) nothing.
+[[lean_lib]]
+name = "NewtInteraction"

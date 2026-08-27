@@ -997,3 +997,177 @@ symbol = "tool_round_cap_tests::responses_proactive_no_progress_invokes_the_comp
 [[BHV-CONTEXT-004.refs.rust_tests]]
 path = "newt-core/src/agentic/mod.rs"
 symbol = "tool_round_cap_tests::responses_final_summary_is_proactively_compacted"
+
+# ── A3 interaction protocol (#1803, formal layer #1843) ────────────────────
+# The renderer-neutral interaction controller: `newt-interaction`'s response
+# validator and the exactly-once resolution CAS in newt-core. Lean models the
+# per-response decision kernel (`NewtInteraction.Binding`); TLC models the
+# surrounding lifecycle and the N-way race (`InteractionLifecycle`).
+#
+# These do NOT replace BHV-PROMPT-001..005, which remain accurate for as long as
+# `Question::parse` decides. #1842 moves that decision onto `validate_response`.
+
+[BHV-INTERACTION-001]
+description = "A response is accepted only when EVERY binding it claims matched — definition, instance, revision, digest, control set, control types, and audience — and validation is atomic: one failing control accepts nothing."
+[BHV-INTERACTION-001.status]
+lean = "proven"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-INTERACTION-001.refs.lean]]
+module = "NewtInteraction.Binding"
+symbol = "accepted_implies_every_binding_matches"
+[[BHV-INTERACTION-001.refs.lean]]
+module = "NewtInteraction.Binding"
+symbol = "validation_is_atomic"
+[[BHV-INTERACTION-001.refs.rust_tests]]
+path = "newt-interaction/tests/controller.rs"
+symbol = "binding::a_valid_response_is_accepted"
+[[BHV-INTERACTION-001.refs.rust_tests]]
+path = "newt-interaction/tests/controller.rs"
+symbol = "binding::one_bad_control_rejects_the_whole_response"
+[[BHV-INTERACTION-001.refs.rust_tests]]
+path = "newt-interaction/tests/controller.rs"
+symbol = "binding::a_digest_mismatch_is_refused"
+[[BHV-INTERACTION-001.refs.rust_tests]]
+path = "newt-interaction/tests/controller.rs"
+symbol = "binding::a_response_to_a_stale_revision_is_refused"
+[[BHV-INTERACTION-001.refs.production]]
+path = "newt-interaction/src/binding.rs"
+symbol = "validate_response"
+
+[BHV-INTERACTION-002]
+description = "An action resolves only to a caller-registered handler, and only for an audience that registration admits: an unregistered action never resolves, and an ineligible audience is refused even when the surface displayed the action."
+[BHV-INTERACTION-002.status]
+lean = "proven"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-INTERACTION-002.refs.lean]]
+module = "NewtInteraction.Binding"
+symbol = "unregistered_action_never_resolves"
+[[BHV-INTERACTION-002.refs.lean]]
+module = "NewtInteraction.Binding"
+symbol = "ineligible_audience_rejected"
+[[BHV-INTERACTION-002.refs.rust_tests]]
+path = "newt-interaction/tests/controller.rs"
+symbol = "binding::an_unknown_action_is_refused"
+[[BHV-INTERACTION-002.refs.rust_tests]]
+path = "newt-interaction/tests/controller.rs"
+symbol = "binding::an_action_not_eligible_for_this_responder_is_refused"
+[[BHV-INTERACTION-002.refs.rust_tests]]
+path = "newt-interaction/tests/controller.rs"
+symbol = "handlers::an_action_maps_only_to_a_caller_registered_handler"
+[[BHV-INTERACTION-002.refs.production]]
+path = "newt-interaction/src/binding.rs"
+symbol = "validate_response"
+
+[BHV-INTERACTION-003]
+description = "An expired offer authorizes nothing and synthesizes nothing: no response it is presented with is accepted, and expiry itself produces no decision (#1837)."
+[BHV-INTERACTION-003.status]
+lean = "proven"
+rust = "tested"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-INTERACTION-003.refs.lean]]
+module = "NewtInteraction.Binding"
+symbol = "expiry_never_authorizes"
+[[BHV-INTERACTION-003.refs.lean]]
+module = "NewtInteraction.Binding"
+symbol = "unpublished_never_authorizes"
+[[BHV-INTERACTION-003.refs.tla]]
+spec = "InteractionLifecycle"
+invariant = "ExpiryNeverAuthorizes"
+[[BHV-INTERACTION-003.refs.rust_tests]]
+path = "newt-interaction/tests/controller.rs"
+symbol = "lifecycle::an_expired_instance_refuses_every_response"
+[[BHV-INTERACTION-003.refs.rust_tests]]
+path = "newt-interaction/tests/controller.rs"
+symbol = "lifecycle::expiry_synthesizes_no_response_and_never_authorizes"
+[[BHV-INTERACTION-003.refs.production]]
+path = "newt-interaction/src/lifecycle.rs"
+symbol = "expire"
+
+[BHV-INTERACTION-004]
+description = "Exactly one response ever resolves an offer, however many responders race: the CAS picks one winner and every loser is told who won — the same terminal fact, never a stale or contradictory one."
+[BHV-INTERACTION-004.status]
+lean = "none"
+rust = "tested"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-INTERACTION-004.refs.tla]]
+spec = "InteractionLifecycle"
+invariant = "ExactlyOneResolution"
+[[BHV-INTERACTION-004.refs.tla]]
+spec = "InteractionLifecycle"
+invariant = "LoserObservesTerminal"
+[[BHV-INTERACTION-004.refs.tla]]
+spec = "InteractionLifecycle"
+invariant = "TypeOK"
+[[BHV-INTERACTION-004.refs.rust_tests]]
+path = "newt-interaction/tests/controller.rs"
+symbol = "resolution::exactly_one_of_two_valid_responses_wins"
+[[BHV-INTERACTION-004.refs.rust_tests]]
+path = "newt-interaction/tests/controller.rs"
+symbol = "resolution::the_loser_observes_the_same_terminal_state"
+[[BHV-INTERACTION-004.refs.rust_tests]]
+path = "newt-core/tests/interaction_resolution.rs"
+symbol = "resolution::separate_connections_racing_one_instance_resolve_once"
+[[BHV-INTERACTION-004.refs.rust_tests]]
+path = "newt-core/tests/interaction_resolution.rs"
+symbol = "resolution::the_store_wins_loses_and_replays_like_the_contract_says"
+[[BHV-INTERACTION-004.refs.production]]
+path = "newt-core/src/interaction_resolution.rs"
+symbol = "resolve"
+
+[BHV-INTERACTION-005]
+description = "A terminal offer is terminal: once Answered, Cancelled, Expired or Unsupported, no transition leaves that state."
+[BHV-INTERACTION-005.status]
+lean = "none"
+rust = "tested"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-INTERACTION-005.refs.tla]]
+spec = "InteractionLifecycle"
+invariant = "TerminalIsTerminal"
+[[BHV-INTERACTION-005.refs.rust_tests]]
+path = "newt-interaction/tests/controller.rs"
+symbol = "lifecycle::each_terminal_state_is_terminal"
+[[BHV-INTERACTION-005.refs.production]]
+path = "newt-interaction/src/lifecycle.rs"
+symbol = "transition"
+
+[BHV-INTERACTION-006]
+description = "An idempotency key collapses a retry rather than resolving twice, and the same key presented with a DIFFERENT response is refused rather than substituted."
+[BHV-INTERACTION-006.status]
+lean = "none"
+rust = "tested"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-INTERACTION-006.refs.tla]]
+spec = "InteractionLifecycle"
+invariant = "IdempotentRetryCollapses"
+[[BHV-INTERACTION-006.refs.tla]]
+spec = "InteractionLifecycle"
+invariant = "ConflictingKeyRefused"
+[[BHV-INTERACTION-006.refs.rust_tests]]
+path = "newt-interaction/tests/controller.rs"
+symbol = "resolution::a_replayed_response_does_not_resolve_twice"
+[[BHV-INTERACTION-006.refs.rust_tests]]
+path = "newt-interaction/tests/controller.rs"
+symbol = "resolution::an_idempotency_key_collapses_a_retry"
+[[BHV-INTERACTION-006.refs.rust_tests]]
+path = "newt-interaction/tests/controller.rs"
+symbol = "resolution::two_different_submissions_sharing_one_idempotency_key_conflict"
+[[BHV-INTERACTION-006.refs.rust_tests]]
+path = "newt-core/tests/interaction_resolution.rs"
+symbol = "resolution::the_store_refuses_a_reused_idempotency_key"
+[[BHV-INTERACTION-006.refs.production]]
+path = "newt-core/src/interaction_resolution.rs"
+symbol = "resolve"
