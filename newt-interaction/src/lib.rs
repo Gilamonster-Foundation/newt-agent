@@ -27,14 +27,21 @@
 //!
 //! This file is a manifest: composition only, no logic.
 
+pub mod binding;
 pub mod definition;
 pub mod downgrade;
 pub mod error;
 pub mod ids;
 pub mod instance;
+pub mod lifecycle;
+pub mod resolution;
 pub mod response;
 pub mod tag;
 
+pub use binding::{
+    validate_response, Accepted, HandlerId, Refusal, RegisteredAction, ResolvedAction,
+    ResponderContext,
+};
 pub use definition::{
     ChoiceOption, Control, ControlKind, FeatureDemand, InteractionDefinition, InteractionKind,
     Requirement, SemanticRole, SurfaceFeature, DEFINITION_SCHEMA_V1,
@@ -50,6 +57,10 @@ pub use ids::{
 pub use instance::{
     Audience, InteractionInstance, LifecycleState, Provenance, ResponderPolicy, Scope,
     INSTANCE_SCHEMA_V1,
+};
+pub use lifecycle::{publish, HostMint, Lifecycle, LifecycleError};
+pub use resolution::{
+    IdempotencyConflict, Resolution, ResolutionError, ResolutionRecord, ResolutionStore,
 };
 pub use response::{
     AssertionKind, ControlValue, ResponderProvenance, Response, SecretRef, Submission,
