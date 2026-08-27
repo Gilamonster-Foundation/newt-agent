@@ -7,7 +7,6 @@
 pub mod agent_identity;
 pub mod agentic;
 pub mod agents;
-pub mod answer_authz;
 pub mod api_surface;
 pub mod artifact;
 pub mod atomic_fs;
