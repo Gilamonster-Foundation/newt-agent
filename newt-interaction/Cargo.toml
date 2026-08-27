@@ -35,3 +35,4 @@ thiserror.workspace = true
 # dependency kind, not by name — see tests/guard.rs.
 serde_json.workspace = true
 toml.workspace = true
+jsonschema.workspace = true

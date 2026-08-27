@@ -128,6 +128,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 toml = "1.0"
+# JSON Schema validation, DEV-DEPENDENCY ONLY (#1833). The published
+# `newt-interaction/schema/*.json` are this project's cross-language
+# contract, and nothing asserted that a committed vector actually
+# VALIDATES against its own schema — const-pinning proves the tag and
+# byte-comparison proves the generator is deterministic, but neither
+# executes the schema as a schema. `default-features = false` is load
+# bearing: the defaults are `resolve-http` + `resolve-file` + rustls +
+# aws-lc-rs, i.e. a TLS stack and a retriever that would let a `$ref`
+# reach the network from a test. Our schemas are draft-07 with only
+# internal `#/definitions` refs, so no retriever is needed at all.
+jsonschema = { version = "0.52", default-features = false }
 regex = "1"
 # Gitignore-aware recursive filesystem walking for the embedded `find` tool
 # (#496). Pure-Rust (ripgrep's walker), no C deps → preserves the PyO3 wheel
