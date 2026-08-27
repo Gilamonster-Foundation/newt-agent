@@ -13,6 +13,12 @@ categories = ["command-line-interface"]
 
 [dependencies]
 newt-core.workspace = true
+# B0a (#1841): the permission surfaces build ONE `InteractionDefinition`
+# and render it through newt-core's A2.2 adapter. newt-tui therefore names
+# the protocol types directly. The direction is inward and allowed — the
+# guard forbids newt-interaction depending on a `newt-*` crate, never the
+# reverse.
+newt-interaction.workspace = true
 newt-git.workspace = true
 newt-identity.workspace = true
 newt-inference.workspace = true

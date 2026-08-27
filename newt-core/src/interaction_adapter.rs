@@ -57,7 +57,12 @@ pub const DECISION_CONTROL: &str = "decision";
 ///
 /// Derived from the action rather than declared, because the legacy type
 /// has no role field — the meaning was encoded in the variant all along.
-fn role_of(action: PermissionAction) -> SemanticRole {
+///
+/// Public since B0a (#1841): `newt-tui` builds the definition directly and
+/// needs the same mapping. Exposing it keeps ONE action→role table; a
+/// second copy in the policy layer is the duplication this epic deletes.
+#[must_use]
+pub fn role_of(action: PermissionAction) -> SemanticRole {
     match action {
         PermissionAction::AllowOnce
         | PermissionAction::AllowSession

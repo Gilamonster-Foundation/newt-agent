@@ -205,29 +205,266 @@ fn the_adapter_preserves_parse_semantics() {
     assert_eq!(adapted.parse("a"), shadowing.parse("a"));
 }
 
-/// **A2 must not switch production.** The adapter exists to prove
-/// losslessness while everything still runs the old path; flipping the
-/// switch is B0's slice, with its own deletion gate.
-#[test]
-fn no_production_path_uses_the_adapter_yet() {
-    let roots = common::production_roots(&common::workspace_root());
-    let mut callers = Vec::new();
-    common::for_each_production_line(&roots, &|_| false, &mut |path, code, raw| {
-        // The module's own definition is not a caller of itself.
-        if path.ends_with("interaction_adapter.rs") {
-            return;
-        }
-        for needle in ["question_to_definition(", "definition_to_question("] {
-            if code.contains(needle) {
-                callers.push(format!("{}: {}", path.display(), raw.trim()));
+mod b0a {
+    use super::common;
+    use std::path::Path;
+
+    /// One required link in the call chain: inside `caller`'s body,
+    /// `needle` must appear.
+    struct Link {
+        caller: &'static str,
+        needle: &'static str,
+        why: &'static str,
+    }
+
+    /// A path with its separators normalized to `/`.
+    ///
+    /// The shared scanner yields NATIVE paths, so on Windows this
+    /// callback sees `newt-tui\\src\\permissions.rs`. Comparing that
+    /// against a forward-slash suffix matches nothing, the scan returns
+    /// zero lines, and the guard then has an empty file to reason about —
+    /// which is why `the_definition_path_is_reached_from_both_surfaces`
+    /// asserts the line list is non-empty BEFORE it asserts anything
+    /// else. Without that check this bug would have been a silent green
+    /// on Windows rather than a failure.
+    ///
+    /// Precedent: `markup_sprawl_ratchet::rel`, which normalizes the same
+    /// way for the same reason — and is why the audience-confinement
+    /// ratchet, which compares against `rel`-keyed map entries rather
+    /// than raw paths, does not share this hazard.
+    fn normalized(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
+    /// The production lines of one file, in order, as the shared scanner
+    /// sees them (comments truncated, `#[cfg(test)]` regions skipped).
+    fn production_lines(file_suffix: &str) -> Vec<String> {
+        let roots = common::production_roots(&common::workspace_root());
+        let mut lines = Vec::new();
+        common::for_each_production_line(&roots, &|_| false, &mut |path, code, _raw| {
+            if normalized(path).ends_with(file_suffix) {
+                lines.push(code.to_string());
+            }
+        });
+        lines
+    }
+
+    /// **Regression (#1841 review): a native Windows path must still match
+    /// a forward-slash suffix.**
+    ///
+    /// CI failed on Windows — twice, not a flake — with "the scanner found
+    /// no production lines in permissions.rs", because the suffix was
+    /// compared against a backslash path. The failure was VISIBLE only
+    /// because the guard asserts non-emptiness first: with no lines there
+    /// are no missing links, so the guard would otherwise have reported
+    /// green while proving nothing.
+    #[test]
+    fn a_windows_style_path_still_matches_its_forward_slash_suffix() {
+        const SUFFIX: &str = "newt-tui/src/permissions.rs";
+        assert!(
+            normalized(Path::new(r"C:\repo\newt-tui\src\permissions.rs")).ends_with(SUFFIX),
+            "a native Windows path did not match its forward-slash suffix"
+        );
+        assert!(normalized(Path::new("/home/x/newt-tui/src/permissions.rs")).ends_with(SUFFIX));
+        // ...and it still discriminates, on both spellings.
+        assert!(!normalized(Path::new(r"C:\repo\newt-tui\src\chat.rs")).ends_with(SUFFIX));
+        assert!(!normalized(Path::new("/home/x/newt-tui/src/chat.rs")).ends_with(SUFFIX));
+    }
+
+    /// The body of `fn <name>`, delimited by BRACE DEPTH rather than by
+    /// proximity.
+    ///
+    /// Depth is counted over `strip_string_literals`, which is load
+    /// bearing here and not defensive: the policy's note strings contain
+    /// `{MODAL_CONTROL_HINT}`, so a naive brace count closes the function
+    /// early and the guard starts reading the next one's body.
+    fn function_body(lines: &[String], name: &str) -> Option<String> {
+        let anchor = format!("fn {name}(");
+        let start = lines.iter().position(|line| line.contains(&anchor))?;
+        let mut depth = 0i32;
+        let mut opened = false;
+        let mut body = String::new();
+        for line in &lines[start..] {
+            for ch in common::strip_string_literals(line).chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            body.push_str(line);
+            body.push('\n');
+            if opened && depth <= 0 {
+                break;
             }
         }
-    });
-    assert!(
-        callers.is_empty(),
-        "the adapter has production callers, so A2.2 has switched production \
-         ahead of B0: {callers:#?}"
-    );
+        opened.then_some(body)
+    }
+
+    fn missing_links(lines: &[String], links: &[Link]) -> Vec<String> {
+        let mut missing = Vec::new();
+        for link in links {
+            match function_body(lines, link.caller) {
+                None => missing.push(format!("`fn {}` not found at all", link.caller)),
+                Some(body) => {
+                    if !body.contains(link.needle) {
+                        missing.push(format!(
+                            "`fn {}` does not reach `{}` — {}",
+                            link.caller, link.needle, link.why
+                        ));
+                    }
+                }
+            }
+        }
+        missing
+    }
+
+    /// The chain each surface must walk to reach the one definition.
+    const CHAIN: &[Link] = &[
+        Link {
+            caller: "ask",
+            needle: "permission_question(",
+            why: "the terminal answer reader must be handed the built form",
+        },
+        Link {
+            caller: "permission_question",
+            needle: "question_for(",
+            why: "the TERMINAL surface must route through the definition path",
+        },
+        Link {
+            caller: "await_web_decision",
+            needle: "question_for(",
+            why: "the WEB surface must route through the definition path",
+        },
+        Link {
+            caller: "question_for",
+            needle: "definition_to_question(",
+            why: "rendering goes through the A2.2 adapter, not a second renderer",
+        },
+        Link {
+            caller: "question_for",
+            needle: "permission_definition(",
+            why: "the adapter must be fed the ONE definition both surfaces build",
+        },
+        Link {
+            caller: "permission_definition",
+            needle: "InteractionDefinition::new(",
+            why: "the definition is constructed here",
+        },
+    ];
+
+    /// **B0a's positive guard, replacing A2.2's
+    /// `no_production_path_uses_the_adapter_yet`.**
+    ///
+    /// A2.2 asserted the adapter had NO production callers. B0a switches
+    /// both surfaces onto it, so the guard inverts — but **not as a
+    /// one-line flip**. The shared scanner is per-line with no function
+    /// or call-graph knowledge, so a bare "count >= 1" would pass green
+    /// if only the web switched and the terminal quietly kept its own
+    /// builder: exactly the regression this guard names. So each link is
+    /// anchored to a NAMED function and checked inside that function's
+    /// brace-delimited body, and the two surfaces are checked SEPARATELY.
+    #[test]
+    fn the_definition_path_is_reached_from_both_surfaces() {
+        let lines = production_lines("newt-tui/src/permissions.rs");
+        assert!(
+            !lines.is_empty(),
+            "the scanner found no production lines in permissions.rs"
+        );
+        let missing = missing_links(&lines, CHAIN);
+        assert!(
+            missing.is_empty(),
+            "the definition path is not reached from both surfaces:\n{}",
+            missing.join("\n")
+        );
+
+        // ...and the surfaces must each name their OWN audience, so a
+        // switch that routed both through one hard-coded audience is a
+        // failure rather than a pass.
+        let terminal = function_body(&lines, "permission_question").expect("terminal entry point");
+        assert!(
+            terminal.contains("Audience::Terminal"),
+            "the terminal entry point does not select the Terminal audience"
+        );
+        let web = function_body(&lines, "await_web_decision").expect("web construction site");
+        assert!(
+            web.contains("Audience::Web"),
+            "the web construction site does not select the Web audience"
+        );
+
+        // The old builder is gone from the switched functions: a
+        // surviving `Question {` literal there is the duplicate string
+        // builder B0a deletes.
+        for caller in [
+            "permission_question",
+            "question_for",
+            "permission_definition",
+        ] {
+            let body = function_body(&lines, caller).expect("body");
+            assert!(
+                !body.contains("Question {"),
+                "`fn {caller}` still constructs a Question directly"
+            );
+        }
+    }
+
+    /// **Anti-vacuous twin for the anchored guard.** The failure this
+    /// guard exists to catch is a HALF switch, and a per-line "the
+    /// adapter is called somewhere" check cannot see it. Feed the same
+    /// machinery a source where only the web moved and the terminal kept
+    /// its own builder: the guard must name the terminal, and must not
+    /// be satisfied by the web's call.
+    #[test]
+    fn a_one_surface_switch_does_not_satisfy_the_guard() {
+        let half_switched: Vec<String> = [
+            "fn permission_question(req: &R, danger: &D) -> Question<PromptChoice> {",
+            "    Question {",
+            "        markdown: format!(\"{} wants\", req.tool),",
+            "        actions: vec![],",
+            "        note: None,",
+            "    }",
+            "}",
+            "fn await_web_decision(&self, req: &R) -> (PromptChoice, &'static str) {",
+            "    let question = question_for(req, &self.danger, Audience::Web);",
+            "}",
+            "fn question_for(req: &R, danger: &D, audience: Audience) -> Question<PromptChoice> {",
+            "    definition_to_question(&permission_definition(req, danger, audience)).expect(\"x\")",
+            "}",
+            "fn permission_definition(req: &R) -> InteractionDefinition {",
+            "    InteractionDefinition::new(kind, markdown, controls)",
+            "}",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let missing = missing_links(&half_switched, CHAIN);
+        assert!(
+            missing
+                .iter()
+                .any(|m| m.contains("permission_question") && m.contains("question_for(")),
+            "the guard did not notice that the TERMINAL surface never switched: {missing:#?}"
+        );
+        // The web half really is switched — so the guard is discriminating
+        // between the surfaces, not just failing on everything.
+        assert!(
+            !missing.iter().any(|m| m.contains("await_web_decision")),
+            "the guard flagged the web surface, which IS switched: {missing:#?}"
+        );
+        // And the old builder survives in the unswitched function, which
+        // the brace-depth body extraction must attribute to the right
+        // function rather than to its neighbour.
+        let terminal = function_body(&half_switched, "permission_question").expect("body");
+        assert!(terminal.contains("Question {"));
+        let web = function_body(&half_switched, "await_web_decision").expect("body");
+        assert!(
+            !web.contains("Question {"),
+            "the body extractor bled the previous function into this one"
+        );
+    }
 }
 
 /// **Anti-vacuous twin.** A scanner that sees nothing reports "no callers"
