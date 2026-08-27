@@ -7,8 +7,8 @@
 > **Experimental agentic coder.**
 
 Written in Rust. The default build ships no cloud provider — remote models are
-opt-in subprocess plugins. The scoreboard below is the claim, measured on
-Terminal-Bench, confined and unconfined.
+opt-in subprocess plugins. The scoreboard below is the claim: measured on
+Terminal-Bench, with security enabled and disabled.
 
 ## Terminal-Bench
 
@@ -35,21 +35,17 @@ _Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotoni
 | `nemotron-3-nano_30b`<br><sub>nemotron · tb-30 · ctx 65536 · v0.7.5 · 2026-07-29</sub> | 6.7% (2/30) | _pending_ |
 | `glm-4.7-flash`<br><sub>glm · tb-30 · ctx 65536 · v0.7.6 · 2026-07-31</sub> | _pending_ | 3.3% (1/30) |
 | `gpt-4.1-mini`<br><sub>openai · tb-30 · ctx 65536 · v0.8.0 · 2026-08-05</sub> | 0.0% (0/30) | 3.3% (1/30) |
-| `kimi-k2.7-code`<br><sub>kimi · queued</sub> | _queued_ | _queued_ |
-| `nemotron-3-ultra`<br><sub>nemotron · queued</sub> | _queued_ | _queued_ |
-| `ornith-1.0-397b-iq1_m`<br><sub>ornith · queued</sub> | _queued_ | _queued_ |
 
 <!-- BENCH-SCOREBOARD:END -->
 
-**Full results** — every model including those still queued, per-run provenance,
-and the harness methodology — are produced by a **separate instrument that has no
-dependency on newt**. If the ruler shipped with the thing it measures, one commit
-could move both at once. That instrument is not currently published; the numbers
-above are the part that is. For how these
-particular numbers were kept honest — including the runs thrown out — see the
-[DGX Spark capability survey](./docs/findings/2026-07-29-dgx-spark-terminal-bench-survey.md).
+**[Full results, provenance, and methodology](https://github.com/Gilamonster-Foundation/gilamonster-bench/tree/main/scoreboard)** —
+including per-run records, rejected runs, queued work, and the scoring rules — live
+in [`gilamonster-bench`](https://github.com/Gilamonster-Foundation/gilamonster-bench),
+an independent instrument with no dependency on Newt. If the ruler shipped with
+the thing it measures, one commit could move both at once. The scoreboard above is
+the concise release view; the benchmark repository is the evidence.
 
-## Quick start
+## Use Newt
 
 ```bash
 git clone https://github.com/Gilamonster-Foundation/newt-agent
@@ -86,7 +82,7 @@ Tool output renders through a bounded, tail-biased spill that `/spill` tunes
 server, doctor, config, …) — the binary is the authority on its own surface, this
 file is not. Python bindings live in [`newt-agent-py/`](./newt-agent-py/).
 
-## Why a bridle, not just a harness
+## Why Newt
 
 An agent *harness* helps the model do work; a **bridle** lets the operator
 *steer* — and prove, after the fact, exactly where the horse went. Newt is an
@@ -134,7 +130,7 @@ The invariants. Each links to the decision record that argues it.
   conversation store orders on signed per-writer ticks + content hashes. See
   [`docs/decisions/conversation_context_architecture.md`](./docs/decisions/conversation_context_architecture.md).
 
-## Field notes
+## Field notes and studies
 
 The durable output of this experiment is what building it teaches about how LLMs
 behave inside a harness.
@@ -149,7 +145,7 @@ behave inside a harness.
 | What | Where |
 |---|---|
 | Setup beyond the quick start | [`docs/guide/setup.md`](./docs/guide/setup.md) |
-| Benchmark results & methodology | the scoreboard above; the scoring instrument is maintained separately and is not currently published |
+| Benchmark results & methodology | [Terminal-Bench scoreboard](#terminal-bench) and [gilamonster-bench records](https://github.com/Gilamonster-Foundation/gilamonster-bench/tree/main/scoreboard) |
 | Forward plan | [`ROADMAP.md`](./ROADMAP.md) (issue numbers are the live state) |
 | Release history | [`CHANGELOG.md`](./CHANGELOG.md) |
 | Design docs & studies | [`docs/design/`](./docs/design/) |
