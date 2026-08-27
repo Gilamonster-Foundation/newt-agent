@@ -146,8 +146,25 @@ pub struct Control {
 /// silently vanishing.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+// See the note on `ControlId`: deserialization goes through the
+// constructor. An UNRECOGNIZED feature name is still valid — that is the
+// forward-compatibility case — but an EMPTY one is not.
+#[serde(into = "String", try_from = "String")]
 pub struct SurfaceFeature(String);
+
+impl From<SurfaceFeature> for String {
+    fn from(value: SurfaceFeature) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<String> for SurfaceFeature {
+    type Error = ProtocolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
 
 impl SurfaceFeature {
     /// The surface accepts secret input without echoing or persisting it.

@@ -22,8 +22,24 @@ pub const RESPONSE_SCHEMA_V1: &str = "newt.interaction.response/v1";
 /// persist secret values in markup or logs).
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+// See the note on `ControlId`: deserialization goes through the
+// constructor so the wire cannot carry an empty reference.
+#[serde(into = "String", try_from = "String")]
 pub struct SecretRef(String);
+
+impl From<SecretRef> for String {
+    fn from(value: SecretRef) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<String> for SecretRef {
+    type Error = ProtocolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
 
 impl SecretRef {
     /// Adopt a handle the host can resolve.
@@ -77,7 +93,8 @@ pub enum ControlValue {
         /// Which OPTION of the control named by the enclosing
         /// [`Submission`]. A distinct id space from `ControlId`, so the
         /// pair cannot name two things of the same kind with no rule
-        /// saying which wins.
+        /// saying which wins. Its charset is enforced on construction AND
+        /// on deserialization, so the guarantee holds on the wire too.
         option: OptionId,
     },
     /// Free text, as typed.

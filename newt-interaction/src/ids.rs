@@ -128,8 +128,27 @@ fn validated_name(kind: &'static str, name: String) -> Result<String, ProtocolEr
 /// integrity.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+// Deserialization goes THROUGH the constructor. A derived impl on a
+// transparent newtype builds the private field directly, so an invalid
+// value arrives intact in canonical bytes that re-encode identically —
+// invisible to the byte-equality gate, and a guarantee the type's own
+// docs would otherwise be claiming falsely.
+#[serde(into = "String", try_from = "String")]
 pub struct ControlId(String);
+
+impl From<ControlId> for String {
+    fn from(value: ControlId) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<String> for ControlId {
+    type Error = ProtocolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
 
 impl ControlId {
     /// Build a control id: non-empty, ASCII alphanumeric plus `-` and `_`.
@@ -160,8 +179,27 @@ impl ControlId {
 /// prose.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+// Deserialization goes THROUGH the constructor. A derived impl on a
+// transparent newtype builds the private field directly, so an invalid
+// value arrives intact in canonical bytes that re-encode identically —
+// invisible to the byte-equality gate, and a guarantee the type's own
+// docs would otherwise be claiming falsely.
+#[serde(into = "String", try_from = "String")]
 pub struct OptionId(String);
+
+impl From<OptionId> for String {
+    fn from(value: OptionId) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<String> for OptionId {
+    type Error = ProtocolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
 
 impl OptionId {
     /// Build an option id: same shape rule as a control id.
@@ -188,8 +226,27 @@ impl OptionId {
 /// who presented which nonce.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+// Deserialization goes THROUGH the constructor. A derived impl on a
+// transparent newtype builds the private field directly, so an invalid
+// value arrives intact in canonical bytes that re-encode identically —
+// invisible to the byte-equality gate, and a guarantee the type's own
+// docs would otherwise be claiming falsely.
+#[serde(into = "String", try_from = "String")]
 pub struct Nonce(String);
+
+impl From<Nonce> for String {
+    fn from(value: Nonce) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<String> for Nonce {
+    type Error = ProtocolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
 
 impl Nonce {
     /// Adopt a nonce minted by the host.
@@ -257,8 +314,27 @@ impl Revision {
 /// the same instance is the same submission, not a second one.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+// Deserialization goes THROUGH the constructor. A derived impl on a
+// transparent newtype builds the private field directly, so an invalid
+// value arrives intact in canonical bytes that re-encode identically —
+// invisible to the byte-equality gate, and a guarantee the type's own
+// docs would otherwise be claiming falsely.
+#[serde(into = "String", try_from = "String")]
 pub struct IdempotencyKey(String);
+
+impl From<IdempotencyKey> for String {
+    fn from(value: IdempotencyKey) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<String> for IdempotencyKey {
+    type Error = ProtocolError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
 
 impl IdempotencyKey {
     /// Adopt an idempotency key.

@@ -62,7 +62,11 @@
       "properties": {
         "id": {
           "description": "Stable within the control; the definition commits to it.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/OptionId"
+            }
+          ]
         },
         "label": {
           "description": "Human-readable label. Labels never confer authority (ADR law 2).",
@@ -91,7 +95,11 @@
       "properties": {
         "id": {
           "description": "Stable within the definition; the definition commits to it.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/ControlId"
+            }
+          ]
         },
         "kind": {
           "description": "How it accepts input, and — for a choice — what it offers.",
@@ -115,6 +123,10 @@
         }
       },
       "additionalProperties": false
+    },
+    "ControlId": {
+      "description": "A stable, author-assigned name for one control — one FIELD of an interaction — inside a definition.\n\nDeliberately not content-derived: a control id must survive being written by a human in a `+++` envelope, and the definition it lives in commits to it, so the definition's `ContentId` is what protects its integrity.",
+      "type": "string"
     },
     "ControlKind": {
       "description": "How a control accepts input.\n\n`Choice` carries its options inline because they belong to it: one field, N mutually-exclusive answers. Modelling each option as its own control would make [`Requirement`] incoherent — under \"the response must include this control\", answering an allow would require also answering the deny.",
@@ -178,7 +190,11 @@
       "properties": {
         "feature": {
           "description": "Which capability.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/SurfaceFeature"
+            }
+          ]
         },
         "requirement": {
           "description": "Required, or merely preferred.",
@@ -230,6 +246,10 @@
           ]
         }
       ]
+    },
+    "OptionId": {
+      "description": "A stable, author-assigned name for one OPTION of a choice control.\n\nA separate id space from [`ControlId`] on purpose. A choice is one field with many mutually-exclusive options — the shape B0's permission prompt already has: one question offering `[a]llow once`, `[s]ession allow`, `[d]eny (default)` and the rest. Giving options their own type means a submission naming a control and an option cannot name two things of the same kind with no rule saying which is authoritative; the ambiguity is gone by construction rather than by prose.",
+      "type": "string"
     },
     "Requirement": {
       "description": "Whether something is REQUIRED to present or answer an interaction faithfully, or merely preferred.\n\nThis is the axis ADR law 5 turns on: *unknown REQUIRED behavior fails closed; unknown OPTIONAL behavior degrades visibly.* Without it a consumer that cannot satisfy a demand has only one move for both cases, and whichever it picks is wrong half the time — silently dropping a mandatory secret field, or refusing a document that merely wanted a diagram.\n\nOne vocabulary, deliberately: controls and surface features both use it, so a wire consumer learns the distinction once. On a control it means \"the response must answer this FIELD\" — which is only coherent because a choice is one field with many options, not many fields.",
@@ -289,6 +309,10 @@
           ]
         }
       ]
+    },
+    "SurfaceFeature": {
+      "description": "A capability a surface must have to present some part of an interaction: accepting secret input without echoing it, rendering a diagram, showing more than one control at once.\n\nA named string rather than a closed enum, on purpose. This is a WIRE vocabulary: a v2 document may demand a feature this build has never heard of, and a closed enum could not even represent it — the name would be lost at parse time and law 5 would have nothing left to act on. Carrying the name verbatim is what lets an unknown demand be refused (when required) or reported (when optional) instead of silently vanishing.",
+      "type": "string"
     }
   }
 }
