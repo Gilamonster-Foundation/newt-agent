@@ -207,6 +207,7 @@ fn the_adapter_preserves_parse_semantics() {
 
 mod b0a {
     use super::common;
+    use std::path::Path;
 
     /// One required link in the call chain: inside `caller`'s body,
     /// `needle` must appear.
@@ -216,17 +217,58 @@ mod b0a {
         why: &'static str,
     }
 
+    /// A path with its separators normalized to `/`.
+    ///
+    /// The shared scanner yields NATIVE paths, so on Windows this
+    /// callback sees `newt-tui\\src\\permissions.rs`. Comparing that
+    /// against a forward-slash suffix matches nothing, the scan returns
+    /// zero lines, and the guard then has an empty file to reason about —
+    /// which is why `the_definition_path_is_reached_from_both_surfaces`
+    /// asserts the line list is non-empty BEFORE it asserts anything
+    /// else. Without that check this bug would have been a silent green
+    /// on Windows rather than a failure.
+    ///
+    /// Precedent: `markup_sprawl_ratchet::rel`, which normalizes the same
+    /// way for the same reason — and is why the audience-confinement
+    /// ratchet, which compares against `rel`-keyed map entries rather
+    /// than raw paths, does not share this hazard.
+    fn normalized(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
     /// The production lines of one file, in order, as the shared scanner
     /// sees them (comments truncated, `#[cfg(test)]` regions skipped).
     fn production_lines(file_suffix: &str) -> Vec<String> {
         let roots = common::production_roots(&common::workspace_root());
         let mut lines = Vec::new();
         common::for_each_production_line(&roots, &|_| false, &mut |path, code, _raw| {
-            if path.to_string_lossy().ends_with(file_suffix) {
+            if normalized(path).ends_with(file_suffix) {
                 lines.push(code.to_string());
             }
         });
         lines
+    }
+
+    /// **Regression (#1841 review): a native Windows path must still match
+    /// a forward-slash suffix.**
+    ///
+    /// CI failed on Windows — twice, not a flake — with "the scanner found
+    /// no production lines in permissions.rs", because the suffix was
+    /// compared against a backslash path. The failure was VISIBLE only
+    /// because the guard asserts non-emptiness first: with no lines there
+    /// are no missing links, so the guard would otherwise have reported
+    /// green while proving nothing.
+    #[test]
+    fn a_windows_style_path_still_matches_its_forward_slash_suffix() {
+        const SUFFIX: &str = "newt-tui/src/permissions.rs";
+        assert!(
+            normalized(Path::new(r"C:\repo\newt-tui\src\permissions.rs")).ends_with(SUFFIX),
+            "a native Windows path did not match its forward-slash suffix"
+        );
+        assert!(normalized(Path::new("/home/x/newt-tui/src/permissions.rs")).ends_with(SUFFIX));
+        // ...and it still discriminates, on both spellings.
+        assert!(!normalized(Path::new(r"C:\repo\newt-tui\src\chat.rs")).ends_with(SUFFIX));
+        assert!(!normalized(Path::new("/home/x/newt-tui/src/chat.rs")).ends_with(SUFFIX));
     }
 
     /// The body of `fn <name>`, delimited by BRACE DEPTH rather than by
