@@ -54,6 +54,18 @@ pub(crate) fn reason_is_model_authored(req: &newt_core::PermissionRequest) -> bo
     req.tool == "request_permissions"
 }
 
+/// How long the gate waits for a web decision before failing closed.
+///
+/// **Load bearing, and until B0b-1 untested** (#1842): this must be
+/// SHORTER than `ConversationStore::PERMISSION_REQUEST_TTL_NANOS`, or the
+/// gate could still be waiting on an offer the store has already aged out
+/// — and a decision could land against a row nothing will honour. The two
+/// numbers used to live in different crates with nothing relating them
+/// (a literal here, a constant there);
+/// `b0b::the_gate_timeout_is_shorter_than_the_store_ttl` now asserts the
+/// relationship instead of leaving it to coincidence.
+pub(crate) const WEB_DECISION_TIMEOUT: Duration = Duration::from_secs(4 * 60);
+
 /// One action this policy offers, already decided.
 ///
 /// The POLICY half hands these to the MARSHALLING half. The split is what
@@ -387,6 +399,14 @@ mod slash_prompt_tests {
 pub(crate) struct PermissionPromptState {
     /// Opt-in attach-surface decision channel; `None` uses the terminal.
     pub(crate) web_store: Option<newt_core::ConversationStore>,
+    /// The workspace fence this session is confined to (B0b-1, #1842).
+    ///
+    /// Supplied by the CALLER and compared against the fence the offer
+    /// carries, so `Refusal::WorkspaceMismatch` is a check that can fail
+    /// rather than a tautology. Empty in tests that do not exercise the
+    /// fence, which is why `authorize` compares two independently
+    /// supplied values instead of one value with itself.
+    pub(crate) workspace_key: String,
     session_grants: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     session_denials: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     /// Durable deny-only entries loaded at session start.
@@ -746,6 +766,95 @@ impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> PromptPer
         .ok();
     }
 
+    /// **The accept/deny decision** (B0b-1, #1842).
+    ///
+    /// `Question::parse` has already DECODED the operator's keystroke into
+    /// a candidate action — aliases, ambiguity denial, case-distinct keys.
+    /// It no longer authorizes. This does, through
+    /// `newt_interaction::validate_response`, against the definition the
+    /// form was rendered from and a registry of executable actions the
+    /// definition cannot influence.
+    ///
+    /// Fails CLOSED: any refusal, and any failure to mint the offer, is a
+    /// deny. There is no second opinion to consult.
+    fn authorize(
+        &self,
+        definition: &InteractionDefinition,
+        audience: Audience,
+        decoded: PromptChoice,
+    ) -> Result<PromptChoice, newt_interaction::Refusal> {
+        // Back and Exit are local CONTROLS, not decisions: they are not
+        // options of the form, they authorize nothing, and routing them
+        // through the authorizer would refuse them as unknown options and
+        // silently turn a cancellation into a denial.
+        if matches!(decoded, PromptChoice::Back | PromptChoice::Exit) {
+            return Ok(decoded);
+        }
+        let Ok((instance, lifecycle)) = newt_core::interaction_gate::mint_offer(
+            definition,
+            &self.state.workspace_key,
+            &self.conversation_id,
+            audience.clone(),
+            newt_core::interaction_gate::now_tick(),
+        ) else {
+            return Err(newt_interaction::Refusal::MissingRequiredControl {
+                control: "decision".to_string(),
+            });
+        };
+        newt_core::interaction_gate::authorize_action(
+            definition,
+            &instance,
+            &lifecycle,
+            &self.state.workspace_key,
+            &newt_core::interaction_gate::permission_registry(audience.clone()),
+            decoded,
+            audience,
+        )
+    }
+
+    /// Record an authorizer refusal, keeping the operator-facing message
+    /// the fixed-enum code produced for the cases that have one.
+    ///
+    /// The DECISION is now `validate_response`'s — a high-danger session
+    /// allow is refused because the form does not offer that option, not
+    /// because a downstream `match` arm re-checked the tier. But the
+    /// operator still gets the same sentence, and the audit record still
+    /// carries the same specific reason, because a refusal that reads as
+    /// a generic deny is a worse refusal.
+    fn note_refusal(
+        &mut self,
+        w: &PromptWindow,
+        req: &newt_core::PermissionRequest,
+        decoded: PromptChoice,
+        refusal: &newt_interaction::Refusal,
+    ) {
+        let high = self.danger.classify(req.kind, &req.target) == danger::DangerTier::High;
+        let (scope, message) = match decoded {
+            PromptChoice::AllowSession if high => (
+                "session-allow-refused-high-danger",
+                Some(format!(
+                    "session allow refused for high-danger `{}` — \
+                     allow once per op or deny (step-up is the future path)",
+                    req.target
+                )),
+            ),
+            PromptChoice::AllowPermanent if high => (
+                "permanent-allow-refused-high-danger",
+                Some(format!(
+                    "permanent allow refused for high-danger `{}`",
+                    req.target
+                )),
+            ),
+            _ => ("unauthorized", None),
+        };
+        let _ = refusal;
+        self.record(req, "deny", scope);
+        if let Some(message) = message {
+            w.notice(&newt_line(&message, self.color, self.verbose))
+                .ok();
+        }
+    }
+
     fn web_abort_choice(
         &self,
         store: &newt_core::ConversationStore,
@@ -848,8 +957,21 @@ impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> newt_core
             let (choice, scope) = match &web {
                 Some(store) => self.await_web_decision(store, &w, req),
                 None => {
-                    let choice = (self.ask_human)(&w, &permission_question(req, &self.danger));
-                    (choice, decision_scope(choice))
+                    // ONE definition: rendered to the operator, and the
+                    // authority the answer is checked against. No store is
+                    // touched — see `b0b::the_default_terminal_path_
+                    // performs_no_store_write`.
+                    let definition = permission_definition(req, &self.danger, Audience::Terminal);
+                    let form =
+                        definition_to_question(&definition).expect(WIRE_NAMES_ARE_OPTION_IDS);
+                    let decoded = (self.ask_human)(&w, &form);
+                    match self.authorize(&definition, Audience::Terminal, decoded) {
+                        Ok(choice) => (choice, decision_scope(choice)),
+                        Err(refusal) => {
+                            self.note_refusal(&w, req, decoded, &refusal);
+                            return Deny;
+                        }
+                    }
                 }
             };
             match choice {
@@ -1221,7 +1343,7 @@ mod permission_prompt_tests {
     }
 
     /// Publish a low-danger exec question and return its `request_id`.
-    fn publish_low_danger(store: &newt_core::ConversationStore, conv: &str) -> String {
+    pub(super) fn publish_low_danger(store: &newt_core::ConversationStore, conv: &str) -> String {
         let req = exec_request("bash");
         let question = question_for(&req, &danger::DangerTable::builtin(), Audience::Web);
         store
@@ -1229,7 +1351,7 @@ mod permission_prompt_tests {
             .unwrap()
     }
 
-    fn store_and_conv() -> (
+    pub(super) fn store_and_conv() -> (
         tempfile::TempDir,
         tempfile::TempDir,
         newt_core::ConversationStore,
@@ -1774,7 +1896,7 @@ mod permission_prompt_tests {
     }
 
     /// A gate whose "human" is a script of choices; counts every prompt.
-    fn scripted_gate<'a>(
+    pub(super) fn scripted_gate<'a>(
         state: &'a mut PermissionPromptState,
         base: Caveats,
         key_path: Option<std::path::PathBuf>,
@@ -3328,5 +3450,368 @@ mod b0a {
                 });
             }
         }
+    }
+}
+
+/// **B0b-1 (#1842): the accept/deny decision, on the A3 controller.**
+///
+/// `Question::parse` is KEPT and demoted to input decoding — aliases,
+/// ambiguity denial, case-distinct keys. `validate_response` authorizes.
+/// These tests pin the four facts that move, and the two that must not.
+#[cfg(test)]
+mod b0b {
+    use super::*;
+    // The store/gate fixtures already exist next door; a second copy of
+    // them would drift from the ones the pre-B0b tests use, and then the
+    // parity these tests claim would be against a different fixture.
+    use super::permission_prompt_tests::{publish_low_danger, scripted_gate, store_and_conv};
+    use newt_core::interaction_gate::{
+        authorize_action, mint_offer, now_tick, permission_registry,
+    };
+    use newt_core::{AnswerOutcome, Caveats, DenialKind, PermissionGate, PermissionRequest};
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::sync::{Arc, Barrier};
+
+    fn request() -> PermissionRequest {
+        PermissionRequest {
+            tool: "run_command".into(),
+            kind: DenialKind::Exec,
+            target: "bash".into(),
+            reason: String::new(),
+        }
+    }
+
+    fn offer(
+        audience: Audience,
+    ) -> (
+        InteractionDefinition,
+        newt_interaction::InteractionInstance,
+        newt_interaction::Lifecycle,
+    ) {
+        let definition = permission_definition(
+            &request(),
+            &danger::DangerTable::builtin(),
+            audience.clone(),
+        );
+        let (instance, lifecycle) =
+            mint_offer(&definition, "ws", "conv-1", audience, now_tick()).expect("mints");
+        (definition, instance, lifecycle)
+    }
+
+    /// The two wall clocks are now ONE relationship, asserted.
+    #[test]
+    fn the_gate_timeout_is_shorter_than_the_store_ttl() {
+        let gate_nanos = i64::try_from(WEB_DECISION_TIMEOUT.as_nanos()).expect("fits");
+        let store_ttl = newt_core::ConversationStore::PERMISSION_REQUEST_TTL_NANOS;
+        assert!(
+            gate_nanos < store_ttl,
+            "the gate must give up while the offer is still answerable: \
+             gate {gate_nanos}ns vs store TTL {store_ttl}ns"
+        );
+        // ...and an offer carries the store's number, so the two cannot
+        // drift apart again.
+        let (_d, instance, _l) = offer(Audience::Terminal);
+        assert_eq!(instance.ttl_ticks, store_ttl);
+    }
+
+    /// An offer past its TTL authorizes nothing — the fail-closed default
+    /// is a denial produced by refusing every response, never a synthesized
+    /// allow.
+    #[test]
+    fn an_expired_permission_denies_by_default() {
+        let (definition, instance, lifecycle) = offer(Audience::Terminal);
+        assert!(!newt_interaction::Lifecycle::has_elapsed(
+            &instance,
+            instance.provenance.minted_tick
+        ));
+        assert!(newt_interaction::Lifecycle::has_elapsed(
+            &instance,
+            instance.provenance.minted_tick + instance.ttl_ticks
+        ));
+
+        let expired = lifecycle.expire().expect("expires");
+        let registry = permission_registry(Audience::Terminal);
+        for action in [PromptChoice::AllowOnce, PromptChoice::AllowSession] {
+            assert!(
+                authorize_action(
+                    &definition,
+                    &instance,
+                    &expired,
+                    "ws",
+                    &registry,
+                    action,
+                    Audience::Terminal
+                )
+                .is_err(),
+                "an expired offer authorized {action:?}"
+            );
+        }
+    }
+
+    /// The registry is the CALLER's and is not derived from the form, so
+    /// an action the form offers but the gate cannot execute is refused —
+    /// and the durable grants stay terminal-only even against a form that
+    /// offered them.
+    #[test]
+    fn the_registry_is_independent_of_the_form() {
+        let (definition, instance, lifecycle) = offer(Audience::Terminal);
+        // Empty registry: nothing is executable, so nothing authorizes.
+        assert!(authorize_action(
+            &definition,
+            &instance,
+            &lifecycle,
+            "ws",
+            &[],
+            PromptChoice::AllowOnce,
+            Audience::Terminal
+        )
+        .is_err());
+
+        // The web registry refuses a durable grant even when handed a
+        // TERMINAL form that offers it.
+        let low = PermissionRequest {
+            tool: "http".into(),
+            kind: DenialKind::Net,
+            target: "https://example.com/api".into(),
+            reason: String::new(),
+        };
+        let terminal_form =
+            permission_definition(&low, &danger::DangerTable::builtin(), Audience::Terminal);
+        let (inst, life) =
+            mint_offer(&terminal_form, "ws", "conv-1", Audience::Web, now_tick()).expect("mints");
+        assert!(
+            authorize_action(
+                &terminal_form,
+                &inst,
+                &life,
+                "ws",
+                &permission_registry(Audience::Web),
+                PromptChoice::AllowPermanent,
+                Audience::Web
+            )
+            .is_err(),
+            "the web authorized a durable grant"
+        );
+    }
+
+    /// The fence is supplied by the CALLER, so a mismatch is detectable
+    /// rather than a tautology.
+    #[test]
+    fn a_foreign_workspace_cannot_authorize() {
+        let (definition, instance, lifecycle) = offer(Audience::Terminal);
+        let registry = permission_registry(Audience::Terminal);
+        assert!(authorize_action(
+            &definition,
+            &instance,
+            &lifecycle,
+            "ws",
+            &registry,
+            PromptChoice::AllowOnce,
+            Audience::Terminal
+        )
+        .is_ok());
+        assert!(
+            authorize_action(
+                &definition,
+                &instance,
+                &lifecycle,
+                "ws-elsewhere",
+                &registry,
+                PromptChoice::AllowOnce,
+                Audience::Terminal
+            )
+            .is_err(),
+            "a foreign workspace key authorized a decision"
+        );
+    }
+
+    /// **Q1's answer, pinned.** With `NEWT_WEB_DECISIONS` unset the gate
+    /// has no store, so the default terminal path performs NO store write.
+    /// The second half is the anti-vacuous twin: the same assertion must
+    /// go the other way when a store IS wired, or it would pass by
+    /// measuring nothing.
+    #[test]
+    fn the_default_terminal_path_performs_no_store_write() {
+        let (_r, _w, store, conv) = store_and_conv();
+        let prompts = Rc::new(Cell::new(0));
+        let mut state = PermissionPromptState::default();
+        {
+            let mut gate = scripted_gate(
+                &mut state,
+                Caveats::default(),
+                None,
+                None,
+                vec![PromptChoice::AllowOnce],
+                Rc::clone(&prompts),
+            );
+            gate.conversation_id = conv.clone();
+            let _ = gate.ask(&[request()]);
+        }
+        assert_eq!(prompts.get(), 1, "the terminal prompt did not run");
+        assert!(
+            store.pending_permission_request(&conv).unwrap().is_none(),
+            "the DEFAULT terminal path published to the store"
+        );
+
+        // Twin: with a store wired, the same read DOES see a row — so the
+        // assertion above is measuring something.
+        let question = question_for(&request(), &danger::DangerTable::builtin(), Audience::Web);
+        store
+            .publish_permission_question(&conv, &question, "\"high\"")
+            .unwrap();
+        assert!(
+            store.pending_permission_request(&conv).unwrap().is_some(),
+            "the pending read cannot see a published offer, so the check above is vacuous"
+        );
+    }
+
+    /// A permission resolves exactly once through the controller: the
+    /// authorization is `validate_response`'s, and the verdict is
+    /// consumable once.
+    #[test]
+    fn a_permission_resolves_exactly_once_through_the_controller() {
+        let (_r, _w, store, conv) = store_and_conv();
+        let request_id = publish_low_danger(&store, &conv);
+
+        assert_eq!(
+            store
+                .answer_permission_action(&conv, &request_id, PromptChoice::AllowOnce)
+                .unwrap(),
+            AnswerOutcome::Answered
+        );
+        // A second answer finds it already answered — never a second win.
+        assert_eq!(
+            store
+                .answer_permission_action(&conv, &request_id, PromptChoice::Deny)
+                .unwrap(),
+            AnswerOutcome::AlreadyResolved
+        );
+        // The verdict is consumable exactly once.
+        assert!(store
+            .take_permission_decision(&conv, &request_id)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .take_permission_decision(&conv, &request_id)
+            .unwrap()
+            .is_none());
+    }
+
+    /// An action the published form never offered is refused by the store
+    /// — now through `validate_response`, not through a decode.
+    #[test]
+    fn an_undisplayed_action_is_refused_by_the_controller() {
+        let (_r, _w, store, conv) = store_and_conv();
+        let request_id = publish_low_danger(&store, &conv);
+        // `bash` is high danger, so the web form offers allow_once/deny
+        // only. A session allow was never displayed.
+        assert_eq!(
+            store
+                .answer_permission_action(&conv, &request_id, PromptChoice::AllowSession)
+                .unwrap(),
+            AnswerOutcome::InvalidAction
+        );
+        // ...and the request is still open for a legitimate answer.
+        assert_eq!(
+            store
+                .answer_permission_action(&conv, &request_id, PromptChoice::AllowOnce)
+                .unwrap(),
+            AnswerOutcome::Answered
+        );
+    }
+
+    /// **The real race**: two INDEPENDENT connections, one per thread —
+    /// the shape newt-web actually produces — released together by a
+    /// `Barrier`. Two threads sharing one store would exercise the
+    /// in-process `Arc<Mutex<Connection>>` and prove nothing.
+    #[test]
+    fn separate_connections_racing_one_permission_resolve_once() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let seed = newt_core::ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+        let conv = seed.create("s", None).unwrap();
+        let request_id = publish_low_danger(&seed, &conv);
+        drop(seed);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for action in [PromptChoice::AllowOnce, PromptChoice::Deny] {
+            let root_path = root.path().to_path_buf();
+            let ws_path = ws.path().to_path_buf();
+            let conv = conv.clone();
+            let request_id = request_id.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                // A FRESH store — its own connection, exactly as a web
+                // request gets.
+                let store = newt_core::ConversationStore::new(root_path, ws_path, 100).unwrap();
+                barrier.wait();
+                (
+                    action,
+                    store.answer_permission_action(&conv, &request_id, action),
+                )
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+
+        let winners: Vec<PromptChoice> = outcomes
+            .iter()
+            .filter(|(_, r)| matches!(r, Ok(AnswerOutcome::Answered)))
+            .map(|(a, _)| *a)
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one connection must win; got {outcomes:#?}"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .any(|(_, r)| matches!(r, Ok(AnswerOutcome::AlreadyResolved))),
+            "the loser must be told it lost, not silently succeed: {outcomes:#?}"
+        );
+
+        // The loser observes the WINNER's verdict, not its own.
+        let reopened = newt_core::ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+        let observed: PromptChoice = reopened
+            .take_permission_decision(&conv, &request_id)
+            .unwrap()
+            .expect("a verdict was recorded")
+            .into();
+        assert_eq!(
+            observed, winners[0],
+            "the recorded verdict is not the winner's"
+        );
+    }
+
+    /// The loser sees the same terminal fact the winner produced — the
+    /// property `web_verdict_and_local_control_resolve_exactly_once`
+    /// pins for the local-abort race, stated for the store race.
+    #[test]
+    fn the_loser_observes_the_winners_verdict() {
+        let (_r, _w, store, conv) = store_and_conv();
+        let request_id = publish_low_danger(&store, &conv);
+        assert_eq!(
+            store
+                .answer_permission_action(&conv, &request_id, PromptChoice::AllowOnce)
+                .unwrap(),
+            AnswerOutcome::Answered
+        );
+        // A later answer loses...
+        assert_eq!(
+            store
+                .answer_permission_action(&conv, &request_id, PromptChoice::Deny)
+                .unwrap(),
+            AnswerOutcome::AlreadyResolved
+        );
+        // ...and what everyone reads afterwards is the WINNER's verdict.
+        let observed: PromptChoice = store
+            .take_permission_decision(&conv, &request_id)
+            .unwrap()
+            .expect("a verdict")
+            .into();
+        assert_eq!(observed, PromptChoice::AllowOnce);
     }
 }

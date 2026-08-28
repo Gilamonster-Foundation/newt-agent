@@ -1545,6 +1545,11 @@ fn session_body(
     if std::env::var("NEWT_WEB_DECISIONS").is_ok() {
         permission_state.web_store = conversation_store.clone();
     }
+    // B0b-1 (#1842): the fence the gate checks an answer against. Derived
+    // the same way the store derives its own, and supplied to the
+    // authorizer INDEPENDENTLY of the offer being checked.
+    permission_state.workspace_key =
+        newt_core::ConversationStore::workspace_id_for_path(workspace).unwrap_or_default();
     // Track O (#1131): load the durable OCAP policy from `~/.newt/ocap/*.toml`
     // (beside the config file). The gate consults it before prompting — a
     // durable deny refuses, a durable approve pre-answers (danger-gated). A
@@ -6889,7 +6894,7 @@ fn session_body(
                         color,
                         verbose,
                         authorization_prompts_enabled: prompt_permissions_enabled,
-                        web_decision_timeout: std::time::Duration::from_secs(4 * 60),
+                        web_decision_timeout: crate::permissions::WEB_DECISION_TIMEOUT,
                         cancel: Some(&*turn_cancel),
                         exit: Some(&turn_exit),
                         ask_human: prompt_permission_choice
