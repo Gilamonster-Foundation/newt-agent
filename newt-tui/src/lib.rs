@@ -2189,44 +2189,177 @@ fn full_access_record(conversation_id: &str) -> newt_core::PermissionRecord {
 /// Process-environment synchronization for tests.
 ///
 /// `cargo test` runs tests of this binary concurrently while the environment
-/// is process-global. Tests that *mutate* env vars (e.g. `NEWT_EXEC_PATHS`,
-/// `NEWT_VENV`) take the write guard; tests that merely *read* them via
-/// `policy_for` / `scan_cli_exec_grants` / `venv_cmd_prefix` take the read
-/// guard so a mutation can never land mid-test.
+/// is process-global. Tests that mutate env vars (e.g. `NEWT_EXEC_PATHS`,
+/// `NEWT_VENV`) or that read resolution which depends on them take a guard,
+/// so a mutation can never land mid-test.
+///
+/// **All four functions return the SAME lock** — `newt_core::process_env`'s
+/// (#1850). This module used to own a private `RwLock` while
+/// `newt_core::test_guard::GlobalSettingsGuard` owned an independent `Mutex`
+/// over the same variables; two locks over one environment serialize nothing,
+/// and the resulting race took down `tab_switch::state_machine_tests` and
+/// `helper_fn_tests` wholesale in ~30% of `--all-features` runs. The
+/// read/write and sync/async names are kept because they still document a
+/// call site's INTENT, but the lock underneath is one exclusive, reentrant
+/// lock that the production writers take as well.
 #[cfg(test)]
 pub(crate) mod test_env_guard {
-    use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+    use newt_core::process_env::{lock, EnvGuard};
 
-    static ENV_RW: RwLock<()> = RwLock::const_new(());
-
-    /// Read guard for synchronous tests (no tokio runtime on the thread).
-    pub(crate) fn env_read_guard() -> RwLockReadGuard<'static, ()> {
-        ENV_RW.blocking_read()
+    /// Guard for synchronous tests that READ env-dependent resolution.
+    pub(crate) fn env_read_guard() -> EnvGuard {
+        lock()
     }
 
-    /// Read guard for `#[tokio::test]` tests — async-aware, safe to hold
-    /// across await points (the sync `env_read_guard`'s `blocking_read`
-    /// panics inside a tokio runtime). Cross-platform, unlike
-    /// `env_write_guard_async`: the note-sink wiring tests read
-    /// HOME-dependent prompt state on every OS, so this must exist on
-    /// Windows too (and is used there, so no dead-code warning).
-    pub(crate) async fn env_read_guard_async() -> RwLockReadGuard<'static, ()> {
-        ENV_RW.read().await
+    /// Reader guard for `#[tokio::test]` tests. Kept as its own `async fn`
+    /// so call sites keep their `.await`; the lock itself is sync and needs
+    /// no runtime, which is why the old `blocking_read`-panics-in-a-runtime
+    /// hazard is gone.
+    pub(crate) async fn env_read_guard_async() -> EnvGuard {
+        lock()
     }
 
-    /// Exclusive guard for tests that mutate the process environment.
-    pub(crate) fn env_write_guard() -> RwLockWriteGuard<'static, ()> {
-        ENV_RW.blocking_write()
+    /// Guard for tests that MUTATE the process environment.
+    pub(crate) fn env_write_guard() -> EnvGuard {
+        lock()
     }
 
-    /// Exclusive guard for `#[tokio::test]` tests that mutate the process
-    /// environment — async-aware, safe to hold across await points. Gated
-    /// like `env_read_guard_async`: its only callers are the `#[cfg(unix)]`
-    /// #297 disable-ocap tests, so Windows would trip `-D warnings` on dead
-    /// code otherwise.
+    /// Writer guard for `#[tokio::test]` tests. Gated like the rest of the
+    /// #297 disable-ocap tests it serves, so Windows does not trip
+    /// `-D warnings` on dead code.
     #[cfg(unix)]
-    pub(crate) async fn env_write_guard_async() -> RwLockWriteGuard<'static, ()> {
-        ENV_RW.write().await
+    pub(crate) async fn env_write_guard_async() -> EnvGuard {
+        lock()
+    }
+}
+
+/// **#1850 regression — one lock over the process environment.**
+///
+/// The flake this pins was never a wrong assertion. It was TWO locks:
+/// `newt_core::test_guard::GlobalSettingsGuard` (a `Mutex`) and this crate's
+/// `test_env_guard` (an `RwLock`), each claiming `NEWT_PROVIDER` /
+/// `NEWT_DGX_MODEL`, neither excluding the other — plus production writers
+/// holding neither under `// SAFETY: single-threaded REPL`, a claim that is
+/// true of the REPL and false under `cargo test`.
+///
+/// The cost was ~30% of `cargo test -p newt-tui --lib --all-features` runs,
+/// with whole modules going down together: 30 `tab_switch::state_machine_tests`
+/// panicking inside a backend re-resolve, and
+/// `helper_fn_tests::resolver_default_backend_beats_the_openai_heuristic`
+/// asserting against a literal `"bound-model"` that exists nowhere but
+/// `lib_tests::env_resolution`'s fixture.
+#[cfg(test)]
+mod process_env_isolation_tests {
+    /// The two guard families are ONE lock — asserted on the CALLING thread,
+    /// which is what makes it deterministic.
+    ///
+    /// A cross-thread `try_lock` probe was the obvious formulation and is the
+    /// wrong one: a failed probe only says *somebody* holds the lock, and a
+    /// sibling test satisfies that just as well. Verified the hard way — with
+    /// the locks deliberately re-split, the probe version still PASSED in a
+    /// full run (a sibling was holding it) and only failed when run alone. A
+    /// regression test for a flake must not itself depend on scheduling, so
+    /// this asks the thread-local question instead.
+    ///
+    /// Non-vacuous: re-split `GlobalSettingsGuard` onto its own mutex and this
+    /// fails immediately, in isolation or in a full run.
+    #[test]
+    fn the_settings_guard_and_the_env_guard_are_one_lock() {
+        assert!(
+            !newt_core::process_env::held_by_current_thread(),
+            "a fresh test thread holds no environment"
+        );
+        let settings = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        assert!(
+            newt_core::process_env::held_by_current_thread(),
+            "GlobalSettingsGuard must hold the process-env lock — otherwise it \
+             is a second lock over the same variables, which is #1850"
+        );
+        drop(settings);
+        assert!(!newt_core::process_env::held_by_current_thread());
+
+        let env = crate::test_env_guard::env_write_guard();
+        assert!(
+            newt_core::process_env::held_by_current_thread(),
+            "test_env_guard must hold the SAME lock — this is the other half \
+             of the pair that raced"
+        );
+        drop(env);
+        assert!(!newt_core::process_env::held_by_current_thread());
+    }
+
+    /// …and that one lock really does exclude other threads, so the identity
+    /// above is worth something. Deterministic: we hold it, so nothing else
+    /// can, whatever the scheduler does with the rest of the suite.
+    #[test]
+    fn the_env_guard_excludes_every_other_thread() {
+        let env = crate::test_env_guard::env_write_guard();
+        let taken = std::thread::spawn(|| newt_core::process_env::try_lock().is_some())
+            .join()
+            .expect("probe thread");
+        assert!(
+            !taken,
+            "a second thread entered the process environment while the env \
+             write guard was held"
+        );
+        drop(env);
+    }
+
+    /// A guarded test may drive production code that writes the environment —
+    /// `apply_backend_choice_refuses_embedded_before_any_mutation` and
+    /// `browsing_backends_marks_no_preference_action` both do. That is why the
+    /// lock is reentrant, and this is the assertion that says so: a plain
+    /// mutex hangs here instead of failing, so a regression shows up as a
+    /// wedged suite rather than a red test — worth pinning explicitly.
+    #[test]
+    fn a_held_guard_does_not_block_the_production_writer_on_its_own_thread() {
+        let _env = crate::test_env_guard::env_write_guard();
+        let saved = std::env::var("NEWT_OPENAI_API").ok();
+        crate::apply_openai_api_env(newt_core::OpenAiApi::Responses);
+        assert_eq!(
+            std::env::var("NEWT_OPENAI_API").ok().as_deref(),
+            Some("responses"),
+            "the production writer must complete while this thread holds the lock"
+        );
+        newt_core::process_env::set_or_remove("NEWT_OPENAI_API", saved.as_deref());
+    }
+
+    /// Production env writes go through `newt_core::process_env`, never raw
+    /// `env::set_var`. A TRIPWIRE in this repo's ratchet idiom: per-file
+    /// occurrence counts that may only go DOWN. `commands/model.rs` and
+    /// `commands/settings.rs` sit at zero — they hold no test-side env writes
+    /// at all — so any reappearance there is a new unguarded production
+    /// writer. `lib.rs`'s figure is its `#[cfg(test)]` modules, which mutate
+    /// the environment legitimately while holding a guard.
+    ///
+    /// The needles are assembled with `concat!` so this test's own source,
+    /// which `include_str!` pulls in below, cannot match them. The sources are
+    /// embedded at COMPILE time, so the unit tier stays filesystem-free.
+    #[test]
+    fn production_env_writes_go_through_the_process_env_lock() {
+        const SET: &str = concat!("std::env::", "set_var(");
+        const REMOVE: &str = concat!("std::env::", "remove_var(");
+        for (name, src, baseline) in [
+            (
+                "commands/model.rs",
+                include_str!("commands/model.rs"),
+                0usize,
+            ),
+            (
+                "commands/settings.rs",
+                include_str!("commands/settings.rs"),
+                0,
+            ),
+            ("lib.rs", include_str!("lib.rs"), 15),
+        ] {
+            let found = src.matches(SET).count() + src.matches(REMOVE).count();
+            assert!(
+                found <= baseline,
+                "{name}: {found} direct env mutations, baseline {baseline} — a new \
+                 one must go through newt_core::process_env (#1850). This baseline \
+                 ratchets DOWN only; lower it in the PR that removes a site."
+            );
+        }
     }
 }
 
@@ -4913,14 +5046,16 @@ pub(crate) fn resolve_runtime_or_default() -> newt_core::ResolvedConfig {
 /// (gpt-5.6-sol, gpt-5-codex) is driven over `/v1/chat/completions` and 400s on
 /// function tools.
 pub fn apply_openai_api_env(api: newt_core::OpenAiApi) {
-    // SAFETY: single-threaded session setup; the agent loop reads this between
-    // turns, never concurrently.
-    unsafe {
+    // Published under the process-env lock (#1850). "Single-threaded session
+    // setup" was true of the REPL and false under `cargo test`, which drives
+    // this from parallel test threads.
+    newt_core::process_env::set_or_remove(
+        "NEWT_OPENAI_API",
         match api {
-            newt_core::OpenAiApi::Responses => std::env::set_var("NEWT_OPENAI_API", "responses"),
-            newt_core::OpenAiApi::ChatCompletions => std::env::remove_var("NEWT_OPENAI_API"),
-        }
-    }
+            newt_core::OpenAiApi::Responses => Some("responses"),
+            newt_core::OpenAiApi::ChatCompletions => None,
+        },
+    );
 }
 
 /// Re-resolve the active backend from `cfg` + env into the session's live wire
@@ -5081,15 +5216,14 @@ pub(crate) fn apply_persona_backend(
             return false;
         }
     };
-    // SAFETY: single-threaded REPL; the next turn's ChatCtx reads these locals.
-    match &provider {
-        Some(p) => unsafe { std::env::set_var("NEWT_PROVIDER", p) },
-        None => unsafe { std::env::remove_var("NEWT_PROVIDER") },
-    }
-    match &model {
-        // SAFETY: single-threaded REPL.
-        Some(m) => unsafe { std::env::set_var("NEWT_DGX_MODEL", m) },
-        None => unsafe { std::env::remove_var("NEWT_DGX_MODEL") },
+    // Publish the pair under ONE hold of the process-env lock (#1850), so no
+    // guarded reader can observe a half-applied route. The old justification
+    // here — "single-threaded REPL" — is true of the REPL and false under
+    // `cargo test`, which runs tests as threads of one process.
+    {
+        let _env = newt_core::process_env::lock();
+        newt_core::process_env::set_or_remove("NEWT_PROVIDER", provider.as_deref());
+        newt_core::process_env::set_or_remove("NEWT_DGX_MODEL", model.as_deref());
     }
     // Track the backend by NAME across the re-resolve: two backends can share an
     // endpoint (e.g. `sol` and `openai` both on api.openai.com), so the URL alone
@@ -5445,17 +5579,12 @@ pub(crate) fn restore_preference_pin(sw: ConversationPreferenceSwitch<'_>) -> Pi
         std::env::var("NEWT_DGX_MODEL").ok(),
     );
     if live != (provider.clone(), model.clone()) {
-        // SAFETY: single-threaded REPL; the next turn's ChatCtx reads the
-        // refreshed locals (same discipline as apply_persona_backend).
-        unsafe {
-            match &provider {
-                Some(p) => std::env::set_var("NEWT_PROVIDER", p),
-                None => std::env::remove_var("NEWT_PROVIDER"),
-            }
-            match &model {
-                Some(m) => std::env::set_var("NEWT_DGX_MODEL", m),
-                None => std::env::remove_var("NEWT_DGX_MODEL"),
-            }
+        // One hold of the process-env lock for the pair — same discipline as
+        // apply_persona_backend (#1850).
+        {
+            let _env = newt_core::process_env::lock();
+            newt_core::process_env::set_or_remove("NEWT_PROVIDER", provider.as_deref());
+            newt_core::process_env::set_or_remove("NEWT_DGX_MODEL", model.as_deref());
         }
         url_changed = refresh_backend(
             cfg,

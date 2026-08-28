@@ -43,9 +43,9 @@ pub(crate) fn dispatch(
                     verbose,
                 );
             } else {
-                // SAFETY: single-threaded REPL; the next prompt is built right
-                // after this returns.
-                unsafe { std::env::set_var("NEWT_PROMPT", template) };
+                // Under the process-env lock (#1850); the next prompt is
+                // built right after this returns.
+                newt_core::process_env::set_var("NEWT_PROMPT", template);
                 let (_t, preview) = current_prompt_and_preview(workspace);
                 print_newt(
                     &format!("prompt set for this session — preview: {preview}"),
@@ -61,8 +61,7 @@ pub(crate) fn dispatch(
         }
 
         "prompt" if matches!(arg1, "reset" | "default" | "clear") => {
-            // SAFETY: single-threaded REPL.
-            unsafe { std::env::remove_var("NEWT_PROMPT") };
+            newt_core::process_env::remove_var("NEWT_PROMPT");
             print_newt(
                 "prompt reset to your [tui] prompt / the built-in default.",
                 color,
@@ -107,9 +106,10 @@ pub(crate) fn dispatch(
             };
             match want {
                 Some(m) => {
-                    // SAFETY: single-threaded REPL; the editor is rebuilt right
-                    // after this returns, before any further input is read.
-                    unsafe { std::env::set_var("NEWT_EDIT_MODE", m) };
+                    // Under the process-env lock (#1850); the editor is
+                    // rebuilt right after this returns, before any further
+                    // input is read.
+                    newt_core::process_env::set_var("NEWT_EDIT_MODE", m);
                     print_newt(&format!("edit mode: {m}"), color, verbose);
                 }
                 None => print_newt(
@@ -122,8 +122,9 @@ pub(crate) fn dispatch(
 
         "nudge" => match arg1 {
             "off" => {
-                // SAFETY: single-threaded REPL; next turn's ChatCtx reads it.
-                unsafe { std::env::set_var("NEWT_NUDGE", "off") };
+                // Under the process-env lock (#1850); next turn's ChatCtx
+                // reads it.
+                newt_core::process_env::set_var("NEWT_NUDGE", "off");
                 print_newt(
                     "action-pressure nudges OFF for this session (narration rescue, \
                      workflow repair steering, plan pushes) — factual corrections stay on",
@@ -132,8 +133,7 @@ pub(crate) fn dispatch(
                 );
             }
             "on" => {
-                // SAFETY: single-threaded REPL.
-                unsafe { std::env::remove_var("NEWT_NUDGE") };
+                newt_core::process_env::remove_var("NEWT_NUDGE");
                 print_newt("action-pressure nudges ON (default)", color, verbose);
             }
             "" | "status" => {
@@ -152,8 +152,7 @@ pub(crate) fn dispatch(
 
         "thinking" => match arg1 {
             "on" | "off" => {
-                // SAFETY: single-threaded REPL.
-                unsafe { std::env::set_var("NEWT_THINKING", arg1) };
+                newt_core::process_env::set_var("NEWT_THINKING", arg1);
                 print_newt(&format!("thinking spinner: {arg1}"), color, verbose);
             }
             _ => print_newt("usage: /thinking <on|off>", color, verbose),

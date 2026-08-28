@@ -69,6 +69,9 @@ pub mod ocap_store;
 pub mod permission_challenge;
 pub mod plan;
 pub mod pricing;
+/// The one lock over the process environment (#1850) — every newt writer of
+/// `NEWT_*` goes through it, production and tests alike.
+pub mod process_env;
 pub mod project_map;
 pub mod project_model;
 pub mod prompt;

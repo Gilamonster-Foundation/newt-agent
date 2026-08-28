@@ -4394,6 +4394,7 @@ dependencies = [
  "newt-interaction",
  "newt-skills",
  "newt-tuner",
+ "parking_lot",
  "proptest",
  "pulldown-cmark",
  "pyo3",

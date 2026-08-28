@@ -39,6 +39,9 @@ ignore.workspace = true
 # (`libc::kill(pid, 0)`) so a conversation claimed by a crashed/rebooted
 # process is reclaimable rather than stuck claimed forever.
 libc.workspace = true
+# The one lock over the process environment (`process_env`, #1850) — see the
+# workspace-level justification for why it is reentrant.
+parking_lot.workspace = true
 # Step 19.2 (issue #248): the write-time security scan's injection-pattern
 # table (notes_scan.rs). Already a workspace dep used by newt-eval/newt-tools.
 regex.workspace = true
