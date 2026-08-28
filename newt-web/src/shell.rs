@@ -26,40 +26,86 @@ pub(crate) fn escape(s: &str) -> String {
 /// smuggle script into the cockpit. Soft line breaks become hard breaks so
 /// chat text keeps its newlines instead of Markdown-collapsing them.
 pub(crate) fn render_markdown(src: &str) -> String {
-    use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Parser, Tag, TagEnd};
-    let mut in_mermaid = false;
-    let parser =
-        Parser::new_ext(src, newt_core::markup::dialect::web_enhancement_options()).map(|ev| {
-            match ev {
-                Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) => {
-                    let is_mermaid = info
-                        .split_whitespace()
-                        .next()
-                        .is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"));
-                    if is_mermaid {
-                        in_mermaid = true;
-                        Event::Html(CowStr::Borrowed(
-                            r#"<pre class="mermaid" data-markdown-extension="mermaid">"#,
-                        ))
-                    } else {
-                        Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
-                    }
+    use pulldown_cmark::{html, CodeBlockKind, Event, Parser, Tag, TagEnd};
+
+    // SANITIZE FIRST, THEN WRAP (#1848). The extension marker is built
+    // AFTER `ammonia` has run and is never present in its input, so it
+    // cannot be forged — not merely filtered. `data-markdown-extension`
+    // and `class` are deliberately NOT allowlisted on `pre`: `ammonia`
+    // allowlists by TAG, with no way to tell newt's element from one the
+    // model typed, and raw HTML in a transcript reaches it as
+    // `Event::Html` looking identical (epic law 11).
+    let sanitize = |raw: &str| -> String {
+        ammonia::Builder::default()
+            .add_tag_attributes("code", &["class"])
+            .clean(raw)
+            .to_string()
+    };
+
+    let mut out = String::new();
+    let mut buffered: Vec<Event> = Vec::new();
+    // Nesting depth of open tags. A fence is enhanceable only at depth 0:
+    // splitting the event stream mid-list or mid-blockquote would change
+    // what the Markdown MEANS, and a diagram is not worth that.
+    let mut depth = 0usize;
+    let mut diagram: Option<String> = None;
+
+    let flush = |out: &mut String, buffered: &mut Vec<Event>| {
+        if buffered.is_empty() {
+            return;
+        }
+        let mut raw = String::new();
+        html::push_html(&mut raw, buffered.drain(..));
+        out.push_str(&sanitize(&raw));
+    };
+
+    for event in Parser::new_ext(src, newt_core::markup::dialect::web_enhancement_options()) {
+        // Collecting a diagram: its body is TEXT, kept verbatim for escaping.
+        if let Some(source) = diagram.as_mut() {
+            match event {
+                Event::Text(ref text) => {
+                    source.push_str(text);
+                    continue;
                 }
-                Event::End(TagEnd::CodeBlock) if in_mermaid => {
-                    in_mermaid = false;
-                    Event::Html(CowStr::Borrowed("</pre>"))
+                Event::End(TagEnd::CodeBlock) => {
+                    let source = diagram.take().unwrap_or_default();
+                    flush(&mut out, &mut buffered);
+                    // Built here, downstream of the sanitizer.
+                    out.push_str(r#"<pre class="mermaid" data-markdown-extension="mermaid">"#);
+                    out.push_str(&escape(&source));
+                    out.push_str("</pre>\n");
+                    continue;
                 }
-                Event::SoftBreak => Event::HardBreak,
-                other => other,
+                _ => continue,
             }
-        });
-    let mut raw = String::new();
-    html::push_html(&mut raw, parser);
-    ammonia::Builder::default()
-        .add_tag_attributes("pre", &["class", "data-markdown-extension"])
-        .add_tag_attributes("code", &["class"])
-        .clean(&raw)
-        .to_string()
+        }
+
+        match event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(ref info)))
+                if depth == 0 && is_diagram_fence(info) =>
+            {
+                diagram = Some(String::new());
+            }
+            Event::SoftBreak => buffered.push(Event::HardBreak),
+            other => {
+                match &other {
+                    Event::Start(_) => depth += 1,
+                    Event::End(_) => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                buffered.push(other);
+            }
+        }
+    }
+    flush(&mut out, &mut buffered);
+    out
+}
+
+/// Whether a fence's info string names the diagram extension.
+fn is_diagram_fence(info: &str) -> bool {
+    info.split_whitespace()
+        .next()
+        .is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"))
 }
 
 const STYLE: &str = r#"
@@ -388,6 +434,110 @@ mod tests {
             out.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
             "diagram source remains inert text: {out}"
         );
+    }
+
+    /// **#1848: the extension marker must be unforgeable.**
+    ///
+    /// The client enhances on `[data-markdown-extension="mermaid"]`
+    /// (`assets/markdown.js`). Raw HTML in the transcript passes through
+    /// pulldown-cmark as `Event::Html`, so if the sanitizer allowlists that
+    /// attribute by TAG, an element the model typed arrives at the client
+    /// indistinguishable from the one newt mints — and every bound placed
+    /// at the extension fence is routed around. Epic law 11.
+    ///
+    /// The vectors below are deliberately UNINDENTED: an indented block is
+    /// a code block, and the marker would then be inert escaped text
+    /// rather than a live attribute — which would make this test pass for
+    /// the wrong reason.
+    #[test]
+    fn authored_extension_marker_is_not_enhanced() {
+        let out = render_markdown(
+            "here is a diagram\n\n<pre class=\"mermaid\" data-markdown-extension=\"mermaid\">graph TD\nA--&gt;B</pre>\n",
+        );
+        assert!(
+            !out.contains("data-markdown-extension"),
+            "authored markup minted the extension marker: {out}"
+        );
+        assert!(
+            !out.contains(r#"<pre class="mermaid""#),
+            "authored markup kept the enhancement class: {out}"
+        );
+    }
+
+    /// The legitimate path is unbroken.
+    #[test]
+    fn a_real_mermaid_fence_still_enhances() {
+        let out = render_markdown("```mermaid\ngraph TD\n  A[x] --> B[y]\n```");
+        assert!(
+            out.contains(r#"<pre class="mermaid" data-markdown-extension="mermaid">"#),
+            "a real fence must still be marked: {out}"
+        );
+        assert!(
+            out.contains("graph TD"),
+            "the diagram source must survive: {out}"
+        );
+    }
+
+    /// `class` is allowlisted on the same line as the data attribute, so it
+    /// is the same forgery surface and gets the same treatment — the client
+    /// styles `.mermaid`, and a forged one is a rendering claim too.
+    #[test]
+    fn authored_pre_and_code_classes_cannot_forge_the_marker() {
+        let out = render_markdown(
+            "<pre class=\"mermaid\">graph TD\nA--&gt;B</pre>\n\n<code class=\"mermaid\">graph TD</code>\n",
+        );
+        assert!(
+            !out.contains("data-markdown-extension"),
+            "authored markup minted the marker: {out}"
+        );
+        assert!(
+            !out.contains(r#"<pre class="mermaid""#),
+            "authored markup kept the enhancement class on a pre: {out}"
+        );
+    }
+
+    /// **The documented degradation.** A fence nested inside a list or
+    /// blockquote is NOT enhanced: enhancing it would mean splitting the
+    /// event stream mid-container, which changes what the Markdown means.
+    /// It falls back to an ordinary code block — the source is still
+    /// readable, which is law 5's fallback rather than a silent drop.
+    #[test]
+    fn a_nested_mermaid_fence_falls_back_to_source() {
+        let out = render_markdown("- item\n\n  ```mermaid\n  graph TD\n  ```\n");
+        assert!(
+            !out.contains("data-markdown-extension"),
+            "a nested fence must not be enhanced: {out}"
+        );
+        assert!(
+            out.contains("graph TD"),
+            "but its source must still be readable: {out}"
+        );
+        assert!(out.contains("<li>"), "the list structure survives: {out}");
+    }
+
+    /// **Anti-vacuous twin.** Every assertion above is a `!contains`, which
+    /// a renderer that emitted nothing at all would satisfy. This pins that
+    /// the checks can see a marker when one is really there, and that the
+    /// authored text they are run over does still render — so they are
+    /// measuring a stripped attribute, not an empty string.
+    #[test]
+    fn the_forged_marker_check_can_fail() {
+        let seeded = format!(
+            "{}{}",
+            render_markdown("ordinary text"),
+            r#"<pre class="mermaid" data-markdown-extension="mermaid">graph TD</pre>"#
+        );
+        assert!(
+            seeded.contains("data-markdown-extension"),
+            "the check cannot see a marker even when one is present"
+        );
+        // The authored vector still RENDERS — the attribute is stripped,
+        // the content is not silently dropped.
+        let out = render_markdown(
+            "<pre class=\"mermaid\" data-markdown-extension=\"mermaid\">graph TD</pre>\n",
+        );
+        assert!(!out.contains("data-markdown-extension"), "{out}");
+        assert!(out.contains("graph TD"), "content vanished entirely: {out}");
     }
 
     #[test]
