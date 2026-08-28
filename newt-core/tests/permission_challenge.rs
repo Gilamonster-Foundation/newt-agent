@@ -104,6 +104,16 @@ fn high_danger_demands_a_terminal_echo_and_unparseable_counts_as_high() {
         "tier match is case-insensitive"
     );
     assert!(!requires_terminal_echo(r#"["low"]"#));
+    // #1836: the two forms production ACTUALLY wrote. Before the fix the
+    // reader accepted only a JSON array, so a JSON string — which is what
+    // the gate wrote — always fell through to the fail-closed default and
+    // this function could never return `false` for a real value.
+    assert!(!requires_terminal_echo(r#""low""#), "the JSON-string form");
+    assert!(requires_terminal_echo(r#""high""#));
+    // ...and the plain tier B0b-2's transport stores.
+    assert!(!requires_terminal_echo("low"), "the plain form");
+    assert!(requires_terminal_echo("high"));
+    assert!(!requires_terminal_echo("  low  "));
     assert!(!requires_terminal_echo("[]"));
 
     // Fail toward asking a human.

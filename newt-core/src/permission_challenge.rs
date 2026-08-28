@@ -94,10 +94,36 @@ impl PermissionChallenge {
 /// scroller is authoritative about *what* is being authorized, because a
 /// compromised browser can render anything it likes next to the button.
 #[must_use]
-pub fn requires_terminal_echo(danger_json: &str) -> bool {
-    serde_json::from_str::<Vec<String>>(danger_json)
-        .map(|tiers| tiers.iter().any(|t| t.eq_ignore_ascii_case("high")))
-        // A tier we cannot parse is treated as high: the failure direction that
-        // asks a human rather than the one that skips them.
-        .unwrap_or(true)
+pub fn requires_terminal_echo(danger: &str) -> bool {
+    let is_high = |t: &str| t.eq_ignore_ascii_case("high");
+    let is_low = |t: &str| t.eq_ignore_ascii_case("low");
+
+    // 1. The form B0b-2 (#1846) writes: a PLAIN tier word.
+    let trimmed = danger.trim();
+    if is_high(trimmed) {
+        return true;
+    }
+    if is_low(trimmed) {
+        return false;
+    }
+    // 2. The form the gate actually wrote before it — a JSON STRING. This
+    //    is #1836: the reader below only ever accepted an ARRAY, so every
+    //    real value fell through to the fail-closed default and the
+    //    function could not return `false` for any input production
+    //    produced, `"low"` included.
+    if let Ok(tier) = serde_json::from_str::<String>(danger) {
+        if is_high(&tier) {
+            return true;
+        }
+        if is_low(&tier) {
+            return false;
+        }
+    }
+    // 3. The form it always claimed to read.
+    if let Ok(tiers) = serde_json::from_str::<Vec<String>>(danger) {
+        return tiers.iter().any(|t| is_high(t));
+    }
+    // A tier we cannot parse is treated as high: the failure direction that
+    // asks a human rather than the one that skips them.
+    true
 }
