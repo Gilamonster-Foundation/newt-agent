@@ -324,15 +324,21 @@ mod b0a {
 
     /// The chain each surface must walk to reach the one definition.
     const CHAIN: &[Link] = &[
+        // B0b-1 (#1842) changed this link's SHAPE, not its property: the
+        // terminal branch now builds the definition inline so the same
+        // value it renders is the authority the answer is checked
+        // against, rather than calling the `permission_question` facade
+        // and losing the definition. The facade still exists and still
+        // routes through `question_for`, which the next link pins.
         Link {
             caller: "ask",
-            needle: "permission_question(",
+            needle: "permission_definition(",
             why: "the terminal answer reader must be handed the built form",
         },
         Link {
-            caller: "permission_question",
-            needle: "question_for(",
-            why: "the TERMINAL surface must route through the definition path",
+            caller: "ask",
+            needle: "definition_to_question(",
+            why: "and must render it through the adapter, not a second renderer",
         },
         Link {
             caller: "await_web_decision",
@@ -384,7 +390,7 @@ mod b0a {
         // ...and the surfaces must each name their OWN audience, so a
         // switch that routed both through one hard-coded audience is a
         // failure rather than a pass.
-        let terminal = function_body(&lines, "permission_question").expect("terminal entry point");
+        let terminal = function_body(&lines, "ask").expect("terminal entry point");
         assert!(
             terminal.contains("Audience::Terminal"),
             "the terminal entry point does not select the Terminal audience"
@@ -398,17 +404,90 @@ mod b0a {
         // The old builder is gone from the switched functions: a
         // surviving `Question {` literal there is the duplicate string
         // builder B0a deletes.
-        for caller in [
-            "permission_question",
-            "question_for",
-            "permission_definition",
-        ] {
+        for caller in ["question_for", "permission_definition"] {
             let body = function_body(&lines, caller).expect("body");
             assert!(
                 !body.contains("Question {"),
                 "`fn {caller}` still constructs a Question directly"
             );
         }
+    }
+
+    /// **B0b-1 (#1842): the ACCEPT/DENY decision is reached from both
+    /// surfaces, and lands on `validate_response`.**
+    ///
+    /// `spec/lint-behavior-map.py` already refuses a production ref whose
+    /// named symbol is absent or ambiguous (`resolve_production` +
+    /// `check_resolvable`), so the ORPHANED-ref half of the provenance
+    /// obligation was already armed before this slice. What it cannot see
+    /// is SEMANTIC drift: every symbol in BHV-PROMPT-001 still exists
+    /// after the decision moves off it. This is the half that can fire —
+    /// it pins where the decision actually goes, so moving it again
+    /// without revisiting the behavior map breaks a test rather than
+    /// silently leaving a `proven` claim over code that no longer decides.
+    #[test]
+    fn the_authorizer_is_reached_from_both_surfaces() {
+        let gate = production_lines("newt-tui/src/permissions.rs");
+        assert!(!gate.is_empty(), "no production lines in permissions.rs");
+        let missing = missing_links(
+            &gate,
+            &[
+                Link {
+                    caller: "ask",
+                    needle: "self.authorize(",
+                    why: "the TERMINAL surface must authorize its decoded answer",
+                },
+                Link {
+                    caller: "authorize",
+                    needle: "authorize_action(",
+                    why: "authorization is the controller's, not a downstream match arm's",
+                },
+            ],
+        );
+        assert!(missing.is_empty(), "{}", missing.join("\n"));
+
+        let store = production_lines("newt-core/src/store.rs");
+        assert!(!store.is_empty(), "no production lines in store.rs");
+        let missing = missing_links(
+            &store,
+            &[Link {
+                caller: "answer_permission_request_inner",
+                needle: "web_answer_is_authorized(",
+                why: "the WEB surface must authorize, not re-parse",
+            }],
+        );
+        assert!(missing.is_empty(), "{}", missing.join("\n"));
+
+        let gate_mod = production_lines("newt-core/src/interaction_gate.rs");
+        assert!(
+            !gate_mod.is_empty(),
+            "no production lines in interaction_gate.rs"
+        );
+        let missing = missing_links(
+            &gate_mod,
+            &[
+                Link {
+                    caller: "web_answer_is_authorized",
+                    needle: "authorize_action(",
+                    why: "the web path shares the one authorizer",
+                },
+                Link {
+                    caller: "authorize_action",
+                    needle: "validate_response(",
+                    why: "the decision lands on the formally-modelled validator",
+                },
+            ],
+        );
+        assert!(missing.is_empty(), "{}", missing.join("\n"));
+
+        // The store must no longer DECIDE by parsing. `Question::parse` is
+        // kept as an input decoder, but the answer transaction is not
+        // where it decides any more.
+        let answer = function_body(&store, "answer_permission_request_inner").expect("body");
+        assert!(
+            !answer.contains(".parse("),
+            "the store's answer path still decides by parsing"
+        );
     }
 
     /// **Anti-vacuous twin for the anchored guard.** The failure this
@@ -420,12 +499,15 @@ mod b0a {
     #[test]
     fn a_one_surface_switch_does_not_satisfy_the_guard() {
         let half_switched: Vec<String> = [
-            "fn permission_question(req: &R, danger: &D) -> Question<PromptChoice> {",
-            "    Question {",
+            // The TERMINAL surface never switched: `ask` still builds its
+            // own Question instead of the one definition.
+            "fn ask(&mut self, requests: &[R]) -> Decision {",
+            "    let q = Question {",
             "        markdown: format!(\"{} wants\", req.tool),",
             "        actions: vec![],",
             "        note: None,",
-            "    }",
+            "    };",
+            "    let choice = (self.ask_human)(&w, &q);",
             "}",
             "fn await_web_decision(&self, req: &R) -> (PromptChoice, &'static str) {",
             "    let question = question_for(req, &self.danger, Audience::Web);",
@@ -445,7 +527,7 @@ mod b0a {
         assert!(
             missing
                 .iter()
-                .any(|m| m.contains("permission_question") && m.contains("question_for(")),
+                .any(|m| m.contains("ask") && m.contains("permission_definition(")),
             "the guard did not notice that the TERMINAL surface never switched: {missing:#?}"
         );
         // The web half really is switched — so the guard is discriminating
@@ -457,7 +539,7 @@ mod b0a {
         // And the old builder survives in the unswitched function, which
         // the brace-depth body extraction must attribute to the right
         // function rather than to its neighbour.
-        let terminal = function_body(&half_switched, "permission_question").expect("body");
+        let terminal = function_body(&half_switched, "ask").expect("body");
         assert!(terminal.contains("Question {"));
         let web = function_body(&half_switched, "await_web_decision").expect("body");
         assert!(

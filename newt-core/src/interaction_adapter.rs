@@ -76,7 +76,12 @@ pub fn role_of(action: PermissionAction) -> SemanticRole {
 }
 
 /// Recover the action a wire name denotes.
-fn action_of(wire: &str) -> Option<PermissionAction> {
+///
+/// Public since B0b-1 (#1842): the interaction gate resolves an accepted
+/// option back to the action it authorizes, and a second copy of this
+/// table would be the duplication this epic deletes.
+#[must_use]
+pub fn action_for_option(wire: &str) -> Option<PermissionAction> {
     [
         PermissionAction::AllowOnce,
         PermissionAction::AllowSession,
@@ -163,7 +168,7 @@ pub fn definition_to_question(
 
     let mut actions = Vec::with_capacity(options.len());
     for option in options {
-        let Some(value) = action_of(option.id.as_str()) else {
+        let Some(value) = action_for_option(option.id.as_str()) else {
             return Err(invalid(format!(
                 "`{}` is not a permission action this build knows",
                 option.id.as_str()
