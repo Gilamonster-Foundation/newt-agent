@@ -643,6 +643,124 @@ mod tests {
         );
     }
 
+    /// **The DEFINITION crosses the seam, not a rendered string.**
+    ///
+    /// This is the property the slice exists for. `SurfaceRequest::ReadLine`
+    /// carries `prompt: String` — the semantic-loss point the A0 inventory
+    /// named (§7.5) — so a surface receiving it can only print it. A surface
+    /// receiving the definition can render it as plain lines, a Ratatui modal,
+    /// or an HTML form.
+    ///
+    /// A test that only checked "an outcome came back" would pass just as well
+    /// if the payload were a pre-rendered string, which is why this asserts on
+    /// the payload's structure at the far side.
+    #[test]
+    fn the_definition_crosses_the_seam_rather_than_a_rendered_string() {
+        let (to_ui, from_session) = std::sync::mpsc::sync_channel(4);
+        let served = std::thread::spawn(move || {
+            let mut seen = None;
+            for request in &from_session {
+                if let SurfaceRequest::Interact { interaction, reply } = request {
+                    seen = Some((*interaction).clone());
+                    let _ = reply.send(newt_core::HumanQuestionOutcome::Answer("ok".into()));
+                }
+            }
+            seen
+        });
+
+        let outcome = {
+            let mut surface = RemoteSurface::new(to_ui);
+            surface.present_interaction(&an_interaction())
+        };
+        assert_eq!(
+            outcome,
+            newt_core::HumanQuestionOutcome::Answer("ok".into())
+        );
+
+        let arrived = served
+            .join()
+            .expect("terminal thread")
+            .expect("an Interact arrived");
+        // The far side got the semantic model: a kind, a control it can render
+        // however it likes, and the body — none of which survive a `String`.
+        assert_eq!(
+            arrived.definition.kind,
+            newt_interaction::InteractionKind::Prompt
+        );
+        assert_eq!(arrived.definition.markdown, "? which file");
+        assert_eq!(arrived.definition.controls.len(), 1);
+        assert!(matches!(
+            arrived.definition.controls[0].kind,
+            newt_interaction::ControlKind::Text
+        ));
+        // ...and the lifecycle data the transport used to encode implicitly.
+        assert!(arrived.is_blocking());
+        assert!(arrived.wants_attention());
+    }
+
+    /// **The production session gate asks the SURFACE, not the terminal.**
+    ///
+    /// `ask_surface: None` is a legitimate state — the single-threaded CLI
+    /// entry points ARE the terminal owner — which means production silently
+    /// falling back to it would compile, pass every test above, and put the
+    /// session thread back on the terminal. This pins the one construction
+    /// site that must not.
+    #[test]
+    fn the_production_session_gate_wires_the_surface_seam() {
+        let production = production_code(include_str!("chat.rs"));
+        assert!(
+            production.contains("ask_surface:Some(&ask_surface)"),
+            "the session's permission gate does not wire the surface seam — \
+             `ask_question` would take the `None` arm and acquire the \
+             PromptWindow on the session thread"
+        );
+        // The closure it wires must reach the UI thread rather than the
+        // terminal: a `RemoteSurface` over the session's channel.
+        assert!(
+            production.contains("RemoteSurface::new(ask_to_ui.clone()).present_interaction"),
+            "the wired closure does not go through the proxy"
+        );
+    }
+
+    /// Comment lines dropped and whitespace squeezed out of token joins.
+    ///
+    /// The squeeze is not cosmetic: rustfmt split
+    /// `RemoteSurface::new(..).present_interaction(..)` across two lines the
+    /// moment it was written, and a single-line needle reported the wiring
+    /// MISSING while it was right there. A source guard that a reformat can
+    /// flip is worse than none — it teaches you to relax the guard.
+    fn production_code(source: &str) -> String {
+        source
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(str::split_whitespace)
+            .collect::<String>()
+    }
+
+    /// **Anti-vacuous twin.** The scan must report an unwired gate as
+    /// unwired, must not count a commented-out wiring, and must survive the
+    /// line split that actually happened.
+    #[test]
+    fn the_wiring_scan_notices_an_unwired_gate() {
+        let unwired = production_code("let gate = PromptPermissionGate {\n ask_surface: None,\n};");
+        assert!(!unwired.contains("ask_surface:Some(&ask_surface)"));
+
+        let commented = production_code("// ask_surface: Some(&ask_surface) would go here");
+        assert!(
+            !commented.contains("ask_surface:Some(&ask_surface)"),
+            "a commented-out wiring counted as a real one"
+        );
+
+        // The split form the formatter produces must still be seen.
+        let split = production_code(
+            "RemoteSurface::new(ask_to_ui.clone())\n    .present_interaction(interaction)",
+        );
+        assert!(
+            split.contains("RemoteSurface::new(ask_to_ui.clone()).present_interaction"),
+            "the scan cannot see a rustfmt-split call chain"
+        );
+    }
+
     /// One semantic interaction, for the seam tests.
     fn an_interaction() -> newt_core::interaction_surface::SurfaceInteraction {
         use newt_interaction::{Control, ControlId, ControlKind, InteractionKind, Requirement};
