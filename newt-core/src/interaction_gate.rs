@@ -262,55 +262,51 @@ pub fn permission_registry(audience: Audience) -> Vec<RegisteredAction> {
     registry
 }
 
-/// Whether a web-submitted action is authorized by the published form.
+/// Authorize an action against a PERSISTED offer, returning the validated
+/// [`Response`].
 ///
-/// **This is the web surface's half of the accept/deny move** (B0b-1,
-/// #1842). It used to be `question.parse(action.as_str()) == Some(action)`
-/// inside the store's answer transaction — a decode standing in for an
-/// authorization. Now the stored form is read back as the definition it
-/// is (through the A2.2 adapter, both directions of which are proven
-/// field-identical) and the submission is validated against it.
+/// B0b-2 (#1846): the transport stores the instance, so the response is
+/// validated against the offer that was actually published rather than one
+/// minted at answer time — the cross-process bound B0b-1 could not carry.
+/// The body is also what makes `answered_by` survive: it carries
+/// `responder_provenance.audience`.
 ///
-/// Fails CLOSED on every error: an unreadable form, a form the adapter
-/// cannot express, and any refusal all return `false`.
+/// # Errors
 ///
-/// The bound this does NOT yet carry: the instance is minted here rather
-/// than read back from the offer the gate published, because B0b-1 changes
-/// no schema. So the DEFINITION binding is authoritative — an action the
-/// published form does not carry is refused — while the INSTANCE binding
-/// is self-consistent rather than proof the answer reached the offer that
-/// was actually published. Persisting the instance is #1846.
-#[must_use]
-pub fn web_answer_is_authorized(
-    question_json: &str,
-    action: PermissionAction,
+/// A [`Refusal`] when any binding fails.
+pub fn authorized_response(
+    definition: &InteractionDefinition,
+    instance: &InteractionInstance,
     workspace_key: &str,
-    conversation_id: &str,
-) -> bool {
-    let Ok(question) = serde_json::from_str::<crate::Question<PermissionAction>>(question_json)
-    else {
-        return false;
-    };
-    let Ok(definition) = crate::interaction_adapter::question_to_definition(&question) else {
-        return false;
-    };
-    let Ok((instance, lifecycle)) = mint_offer(
-        &definition,
-        workspace_key,
-        conversation_id,
-        Audience::Web,
-        now_tick(),
-    ) else {
-        return false;
-    };
-    authorize_action(
-        &definition,
-        &instance,
+    action: PermissionAction,
+    audience: Audience,
+) -> Result<Response, Refusal> {
+    // Re-publishing a persisted offer is how its lifecycle is recovered,
+    // and it is not a formality: `publish` re-checks the digest and
+    // revision binding, so a stored instance that does not match its
+    // stored definition cannot be answered at all.
+    let lifecycle =
+        publish(&HostMint::assert_host_authority(), instance, definition).map_err(|e| match e {
+            LifecycleError::Protocol(p) => Refusal::Protocol(p),
+            _ => Refusal::NotPublished {
+                state: newt_interaction::LifecycleState::Draft,
+            },
+        })?;
+    let response =
+        response_for(definition, instance, action, audience.clone()).map_err(Refusal::Protocol)?;
+    newt_interaction::validate_response(
+        definition,
+        instance,
         &lifecycle,
-        workspace_key,
-        &permission_registry(Audience::Web),
-        action,
-        Audience::Web,
-    )
-    .is_ok()
+        &response,
+        &ResponderContext {
+            // The CALLER's fence, compared against the one the OFFER
+            // carries. Passing the instance's own key would make
+            // `Refusal::WorkspaceMismatch` a tautology — the same trap
+            // B0b-1 fixed on the terminal path.
+            workspace_key,
+            registered: &permission_registry(audience),
+        },
+    )?;
+    Ok(response)
 }

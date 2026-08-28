@@ -250,6 +250,15 @@ const WIRE_NAMES_ARE_OPTION_IDS: &str =
 /// Hand-writing a second renderer over `InteractionDefinition` to avoid
 /// this call would be a new duplicate string builder tracked by no
 /// baseline — the exact sprawl the epic exists to delete.
+/// The rendered form for one request, for tests that only care about the
+/// rendering.
+///
+/// B0b-2 (#1846): no longer a production path. Both surfaces need the
+/// DEFINITION as well as the rendering — the terminal to authorize against,
+/// the web to publish — so production builds `permission_definition` and
+/// adapts it, and this convenience is kept for the tests that assert only
+/// on the rendered bytes.
+#[cfg(test)]
 pub(crate) fn question_for(
     req: &newt_core::PermissionRequest,
     danger: &danger::DangerTable,
@@ -320,14 +329,6 @@ fn decision_scope(choice: PromptChoice) -> &'static str {
         PromptChoice::DenyAlways => "session",
         PromptChoice::DenyPermanent => "permanent",
         PromptChoice::Back | PromptChoice::Exit => "control",
-    }
-}
-
-fn verdict_scope(verdict: newt_core::store::Verdict) -> &'static str {
-    match verdict {
-        newt_core::store::Verdict::AllowOnce => "once",
-        newt_core::store::Verdict::AllowSession => "session",
-        newt_core::store::Verdict::Deny => "once",
     }
 }
 
@@ -552,17 +553,28 @@ impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> PromptPer
         w: &newt_core::tty::PromptWindow,
         req: &newt_core::PermissionRequest,
     ) -> (PromptChoice, &'static str) {
-        let question = question_for(req, &self.danger, Audience::Web);
-        let tier = if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
-            "\"high\""
-        } else {
-            "\"low\""
+        // B0b-2 (#1846): publish the OFFER — the definition AND the instance
+        // that binds it — so the answer is validated against the offer that
+        // was actually published, not one minted at answer time.
+        let definition = permission_definition(req, &self.danger, Audience::Web);
+        let question = match definition_to_question(&definition) {
+            Ok(question) => question,
+            Err(_) => return (PromptChoice::Deny, "web-unavailable"),
         };
-        let request_id =
-            match store.publish_permission_question(&self.conversation_id, &question, tier) {
-                Ok(id) => id,
-                Err(_) => return (PromptChoice::Deny, "web-unavailable"),
-            };
+        let tier = if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
+            newt_core::interaction_offer::OfferDanger::High
+        } else {
+            newt_core::interaction_offer::OfferDanger::Low
+        };
+        let request_id = match store.publish_interaction_offer(
+            &self.conversation_id,
+            &definition,
+            tier,
+            Audience::Web,
+        ) {
+            Ok(id) => id,
+            Err(_) => return (PromptChoice::Deny, "web-unavailable"),
+        };
         let note = question
             .note
             .as_deref()
@@ -715,22 +727,21 @@ impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> PromptPer
                 }
             }
 
-            match store.take_permission_decision(&self.conversation_id, request_id) {
-                Ok(Some(verdict)) => return (verdict.into(), verdict_scope(verdict)),
+            match store.take_interaction_decision(&self.conversation_id, request_id) {
+                Ok(Some(action)) => return (action, decision_scope(action)),
                 Ok(None) if now() >= deadline => {
-                    // Resolve through the same CAS as a TTY answer. If a web
-                    // answer won the race, consume that verdict; otherwise
-                    // the timeout is a fail-closed denial.
-                    return match store.resolve_permission_request(
-                        &self.conversation_id,
-                        request_id,
-                        "expired",
-                    ) {
+                    // Claim through the SAME CAS a web answer contends for.
+                    // If a web answer won the race, take that answer;
+                    // otherwise the timeout is a fail-closed denial. Expiry
+                    // itself synthesizes nothing — the Deny below is the
+                    // gate's fixed default, not a decision read out of the
+                    // offer.
+                    return match store.cancel_interaction_offer(&self.conversation_id, request_id) {
                         Ok(true) => (PromptChoice::Deny, "web-timeout"),
                         Ok(false) => match store
-                            .take_permission_decision(&self.conversation_id, request_id)
+                            .take_interaction_decision(&self.conversation_id, request_id)
                         {
-                            Ok(Some(verdict)) => (verdict.into(), verdict_scope(verdict)),
+                            Ok(Some(action)) => (action, decision_scope(action)),
                             Ok(None) | Err(_) => (PromptChoice::Deny, "web-timeout"),
                         },
                         Err(_) => (PromptChoice::Deny, "web-timeout"),
@@ -854,16 +865,18 @@ impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> PromptPer
         request_id: &str,
         fallback: PromptChoice,
     ) -> Option<(PromptChoice, &'static str)> {
+        // The SAME single CAS the web answer contends for: whoever flips
+        // `outcome` from NULL wins, and the loser reads the winner's answer.
         if store
-            .resolve_permission_request(conversation_id, request_id, "tty")
+            .cancel_interaction_offer(conversation_id, request_id)
             .ok()?
         {
             return Some((fallback, decision_scope(fallback)));
         }
         store
-            .take_permission_decision(conversation_id, request_id)
+            .take_interaction_decision(conversation_id, request_id)
             .ok()
-            .and_then(|verdict| verdict.map(|v| (v.into(), verdict_scope(v))))
+            .and_then(|action| action.map(|a| (a, decision_scope(a))))
     }
 
     fn apply_control(&self, action: PromptChoice) {
@@ -1176,19 +1189,20 @@ mod permission_prompt_tests {
         let answer_conv = conv.clone();
         let answerer = std::thread::spawn(move || {
             for _ in 0..500 {
-                if let Ok(Some(p)) = answerer_store.pending_permission_request(&answer_conv) {
+                if let Ok(Some(p)) = answerer_store.pending_interaction_offer(&answer_conv) {
                     answerer_store
-                        .answer_permission_action(
+                        .answer_interaction_offer(
                             &answer_conv,
-                            &p.request_id,
+                            &p.instance_id,
                             PromptChoice::AllowOnce,
+                            Audience::Web,
                         )
                         .unwrap();
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            panic!("the gate never published a permission request");
+            panic!("the gate never published an interaction offer");
         });
 
         let mut state = PermissionPromptState {
@@ -1260,7 +1274,7 @@ mod permission_prompt_tests {
         assert!(matches!(decision, newt_core::PermissionDecision::Deny));
         assert_eq!(state.decisions.len(), 1);
         assert_eq!(state.decisions[0].scope, "web-timeout");
-        assert_eq!(store.pending_permission_request(&conv).unwrap(), None);
+        assert!(store.pending_interaction_offer(&conv).unwrap().is_none());
     }
 
     #[test]
@@ -1337,9 +1351,15 @@ mod permission_prompt_tests {
     /// Publish a low-danger exec question and return its `request_id`.
     pub(super) fn publish_low_danger(store: &newt_core::ConversationStore, conv: &str) -> String {
         let req = exec_request("bash");
-        let question = question_for(&req, &danger::DangerTable::builtin(), Audience::Web);
+        let definition =
+            permission_definition(&req, &danger::DangerTable::builtin(), Audience::Web);
         store
-            .publish_permission_question(conv, &question, "\"low\"")
+            .publish_interaction_offer(
+                conv,
+                &definition,
+                newt_core::interaction_offer::OfferDanger::Low,
+                Audience::Web,
+            )
             .unwrap()
     }
 
@@ -1420,7 +1440,7 @@ mod permission_prompt_tests {
         assert_eq!(choice, PromptChoice::Back);
         assert_eq!(scope, "control");
         // The local abort resolved the request (nothing left pending).
-        assert!(store.pending_permission_request(&conv).unwrap().is_none());
+        assert!(store.pending_interaction_offer(&conv).unwrap().is_none());
     }
 
     #[test]
@@ -1430,7 +1450,7 @@ mod permission_prompt_tests {
         let (_r, _w, store, conv) = store_and_conv();
         let request_id = publish_low_danger(&store, &conv);
         store
-            .answer_permission_action(&conv, &request_id, PromptChoice::AllowOnce)
+            .answer_interaction_offer(&conv, &request_id, PromptChoice::AllowOnce, Audience::Web)
             .unwrap();
         let mut readers: VecDeque<ScriptedReader> =
             VecDeque::from([ScriptedReader(VecDeque::from([Err(broken())]))]);
@@ -1511,7 +1531,7 @@ mod permission_prompt_tests {
         let (_r1, _w1, store, conv) = store_and_conv();
         let request_id = publish_low_danger(&store, &conv);
         store
-            .answer_permission_action(&conv, &request_id, PromptChoice::AllowOnce)
+            .answer_interaction_offer(&conv, &request_id, PromptChoice::AllowOnce, Audience::Web)
             .unwrap();
         let mut readers: VecDeque<ScriptedReader> =
             VecDeque::from([ScriptedReader(VecDeque::from([Ok(Some(ModalLine::Back))]))]);
@@ -1578,9 +1598,9 @@ mod permission_prompt_tests {
         );
         assert_eq!(choice2, PromptChoice::Back, "local abort won the race");
         // The request is resolved: a later web POST finds nothing to answer.
-        assert!(store2.pending_permission_request(&conv2).unwrap().is_none());
+        assert!(store2.pending_interaction_offer(&conv2).unwrap().is_none());
         let late = store2
-            .answer_permission_action(&conv2, &request_id2, PromptChoice::AllowOnce)
+            .answer_interaction_offer(&conv2, &request_id2, PromptChoice::AllowOnce, Audience::Web)
             .unwrap();
         assert!(
             !matches!(late, newt_core::store::AnswerOutcome::Answered),
@@ -3650,18 +3670,15 @@ mod b0b {
         }
         assert_eq!(prompts.get(), 1, "the terminal prompt did not run");
         assert!(
-            store.pending_permission_request(&conv).unwrap().is_none(),
+            store.pending_interaction_offer(&conv).unwrap().is_none(),
             "the DEFAULT terminal path published to the store"
         );
 
         // Twin: with a store wired, the same read DOES see a row — so the
         // assertion above is measuring something.
-        let question = question_for(&request(), &danger::DangerTable::builtin(), Audience::Web);
-        store
-            .publish_permission_question(&conv, &question, "\"high\"")
-            .unwrap();
+        publish_low_danger(&store, &conv);
         assert!(
-            store.pending_permission_request(&conv).unwrap().is_some(),
+            store.pending_interaction_offer(&conv).unwrap().is_some(),
             "the pending read cannot see a published offer, so the check above is vacuous"
         );
     }
@@ -3676,26 +3693,38 @@ mod b0b {
 
         assert_eq!(
             store
-                .answer_permission_action(&conv, &request_id, PromptChoice::AllowOnce)
+                .answer_interaction_offer(
+                    &conv,
+                    &request_id,
+                    PromptChoice::AllowOnce,
+                    Audience::Web
+                )
                 .unwrap(),
             AnswerOutcome::Answered
         );
         // A second answer finds it already answered — never a second win.
         assert_eq!(
             store
-                .answer_permission_action(&conv, &request_id, PromptChoice::Deny)
+                .answer_interaction_offer(&conv, &request_id, PromptChoice::Deny, Audience::Web)
                 .unwrap(),
             AnswerOutcome::AlreadyResolved
         );
-        // The verdict is consumable exactly once.
-        assert!(store
-            .take_permission_decision(&conv, &request_id)
-            .unwrap()
-            .is_some());
-        assert!(store
-            .take_permission_decision(&conv, &request_id)
-            .unwrap()
-            .is_none());
+        // Reading the answer is IDEMPOTENT, and that is a deliberate
+        // change from the row this replaces. "Consume once" was an
+        // artifact of the two-phase design: answering used to leave
+        // `resolved = 0`, so the gate's poll had to finalize it. A single
+        // CAS finalizes at write time, so the answer is a stable fact
+        // afterwards rather than a token that can be spent. Exactly-once
+        // is unchanged — it is the ANSWER that happens once, asserted
+        // above, not the reading of it.
+        for _ in 0..3 {
+            assert_eq!(
+                store.take_interaction_decision(&conv, &request_id).unwrap(),
+                Some(PromptChoice::AllowOnce)
+            );
+        }
+        // ...and the offer is no longer answerable by anyone.
+        assert!(store.pending_interaction_offer(&conv).unwrap().is_none());
     }
 
     /// An action the published form never offered is refused by the store
@@ -3708,14 +3737,24 @@ mod b0b {
         // only. A session allow was never displayed.
         assert_eq!(
             store
-                .answer_permission_action(&conv, &request_id, PromptChoice::AllowSession)
+                .answer_interaction_offer(
+                    &conv,
+                    &request_id,
+                    PromptChoice::AllowSession,
+                    Audience::Web
+                )
                 .unwrap(),
             AnswerOutcome::InvalidAction
         );
         // ...and the request is still open for a legitimate answer.
         assert_eq!(
             store
-                .answer_permission_action(&conv, &request_id, PromptChoice::AllowOnce)
+                .answer_interaction_offer(
+                    &conv,
+                    &request_id,
+                    PromptChoice::AllowOnce,
+                    Audience::Web
+                )
                 .unwrap(),
             AnswerOutcome::Answered
         );
@@ -3749,7 +3788,7 @@ mod b0b {
                 barrier.wait();
                 (
                     action,
-                    store.answer_permission_action(&conv, &request_id, action),
+                    store.answer_interaction_offer(&conv, &request_id, action, Audience::Web),
                 )
             }));
         }
@@ -3776,10 +3815,9 @@ mod b0b {
         // The loser observes the WINNER's verdict, not its own.
         let reopened = newt_core::ConversationStore::new(root.path(), ws.path(), 100).unwrap();
         let observed: PromptChoice = reopened
-            .take_permission_decision(&conv, &request_id)
+            .take_interaction_decision(&conv, &request_id)
             .unwrap()
-            .expect("a verdict was recorded")
-            .into();
+            .expect("a verdict was recorded");
         assert_eq!(
             observed, winners[0],
             "the recorded verdict is not the winner's"
@@ -3795,23 +3833,27 @@ mod b0b {
         let request_id = publish_low_danger(&store, &conv);
         assert_eq!(
             store
-                .answer_permission_action(&conv, &request_id, PromptChoice::AllowOnce)
+                .answer_interaction_offer(
+                    &conv,
+                    &request_id,
+                    PromptChoice::AllowOnce,
+                    Audience::Web
+                )
                 .unwrap(),
             AnswerOutcome::Answered
         );
         // A later answer loses...
         assert_eq!(
             store
-                .answer_permission_action(&conv, &request_id, PromptChoice::Deny)
+                .answer_interaction_offer(&conv, &request_id, PromptChoice::Deny, Audience::Web)
                 .unwrap(),
             AnswerOutcome::AlreadyResolved
         );
         // ...and what everyone reads afterwards is the WINNER's verdict.
         let observed: PromptChoice = store
-            .take_permission_decision(&conv, &request_id)
+            .take_interaction_decision(&conv, &request_id)
             .unwrap()
-            .expect("a verdict")
-            .into();
+            .expect("a verdict");
         assert_eq!(observed, PromptChoice::AllowOnce);
     }
 }

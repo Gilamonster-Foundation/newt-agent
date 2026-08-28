@@ -44,6 +44,7 @@ pub mod git_hardening;
 pub mod grounding;
 pub mod interaction_adapter;
 pub mod interaction_gate;
+pub mod interaction_offer;
 pub mod interaction_resolution;
 pub mod kit;
 pub mod launch_authority;
@@ -246,10 +247,15 @@ pub use role_profile::{
 };
 pub use router::{Router, Tier};
 pub use session::SessionId;
+// B0b-2 (#1846): the audience a surface answers from. Re-exported so
+// newt-web can name it without taking a direct newt-interaction
+// dependency — it consumes the protocol through newt-core, as it does
+// every other protocol type.
+pub use interaction_offer::{OfferDanger, PendingOffer};
+pub use newt_interaction::Audience;
 pub use store::{
     sanitize_fts5_query, AnswerOutcome, ClaimOutcome, ConversationStore, InjectOutcome,
-    InjectedPrompt, LivenessFn, PendingPermission, Roadmap, RoadmapSummary, SearchHit, StoredOwner,
-    Verdict,
+    InjectedPrompt, LivenessFn, Roadmap, RoadmapSummary, SearchHit, StoredOwner, Verdict,
 };
 pub use tokens::TokenEstimation;
 pub use tty::{Action, Question};

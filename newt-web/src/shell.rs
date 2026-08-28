@@ -113,11 +113,11 @@ const STYLE: &str = r#"
 "#;
 
 /// Render exactly the Markdown and actions published by the running gate.
-pub(crate) fn pending_permission_card(id: u64, p: &newt_core::PendingPermission) -> String {
+pub(crate) fn pending_permission_card(id: u64, p: &newt_core::PendingOffer) -> String {
     let Ok(question) = p.question() else {
         return String::new();
     };
-    let rid = escape(&p.request_id);
+    let rid = escape(&p.instance_id);
     let actions = question
         .actions
         .iter()
