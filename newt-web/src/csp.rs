@@ -89,6 +89,20 @@ pub const HTMX_JS: &str = include_str!("../assets/htmx.min.js");
 /// The passkey ceremony script.
 pub const WEBAUTHN_JS: &str = include_str!("../assets/webauthn.js");
 
+/// The Markdown progressive-enhancement adapter.
+pub const MARKDOWN_JS: &str = include_str!("../assets/markdown.js");
+
+/// The live-transcript attachment script.
+///
+/// It exists as a FILE rather than inline markup for a CSP reason (#1854):
+/// the panel it drives is an HTMX fragment, and a fragment cannot carry a
+/// nonce. Kept beside the other served scripts so a tag and its SRI digest
+/// always read the same bytes.
+pub const PANEL_JS: &str = include_str!("../assets/panel.js");
+
+/// The vendored Mermaid runtime.
+pub const MERMAID_JS: &str = include_str!("../assets/mermaid.min.js");
+
 /// Security headers every cockpit page carries, alongside the CSP.
 #[must_use]
 pub fn hardening_headers() -> [(&'static str, &'static str); 4] {

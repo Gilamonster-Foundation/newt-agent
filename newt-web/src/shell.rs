@@ -218,8 +218,13 @@ pub(crate) fn transcript_fragment(snap: &Snapshot) -> String {
     msgs
 }
 
-/// One agent's panel: header, live transcript, prompt form, and the
-/// EventSource hook feeding the transcript from `/agents/{id}/events`.
+/// One agent's panel: header, live transcript, and prompt form.
+///
+/// The transcript carries its stream URL as DATA (`data-agent-stream`);
+/// `assets/panel.js` supplies the behaviour. Nothing here is inline script,
+/// which is what lets the shell page serve a nonce'd CSP at all (#1854) —
+/// a fragment cannot carry a nonce, because it is swapped into a page whose
+/// header came from an earlier response.
 pub(crate) fn agent_panel(
     id: u64,
     name: &str,
@@ -231,22 +236,9 @@ pub(crate) fn agent_panel(
         r##"<section class="agent" id="agent-{id}">
 <h2><span>{name} <small>({model})</small></span>
 <button hx-delete="/agents/{id}" hx-target="#panel" hx-swap="innerHTML">✕</button></h2>
-<div class="transcript" id="transcript-{id}">{fragment}</div>
+<div class="transcript" id="transcript-{id}" data-agent-stream="/agents/{id}/events"
+     aria-live="polite" aria-atomic="false">{fragment}</div>
 {prompt_form}
-<script>
-(function () {{
-  var es = new EventSource("/agents/{id}/events");
-  es.onmessage = function (e) {{
-    var t = document.getElementById("transcript-{id}");
-    if (t) {{
-      t.innerHTML = e.data;
-      if (window.newtEnhanceMarkdown) {{ window.newtEnhanceMarkdown(t); }}
-      t.scrollTop = t.scrollHeight;
-    }}
-    else {{ es.close(); }}
-  }};
-}})();
-</script>
 </section>"##,
         id = id,
         name = escape(name),
@@ -351,6 +343,7 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
 <script src="/assets/htmx.min.js"></script>
 <script defer src="/assets/mermaid.min.js"></script>
 <script defer src="/assets/markdown.js"></script>
+<script defer src="/assets/panel.js"></script>
 <style>{STYLE}</style>
 </head>
 <body>
@@ -548,12 +541,30 @@ mod tests {
         assert!(out.contains("graph TD"), "content vanished entirely: {out}");
     }
 
+    /// The panel declares its stream as DATA and carries no script.
+    ///
+    /// Re-enhancement after an SSE replacement still happens — it moved to
+    /// `assets/panel.js`, which is what lets the page serve a CSP (#1854).
+    /// Asserting the behaviour is still *reachable* rather than that it is
+    /// inline is the point of the move.
     #[test]
-    fn live_panel_reenhances_markdown_after_sse_updates() {
+    fn live_panel_declares_its_stream_without_inline_script() {
         let panel = agent_panel(7, "a", "m", false, &Snapshot::default());
         assert!(
-            panel.contains("window.newtEnhanceMarkdown(t)"),
-            "SSE replacement must rerun generic Markdown enhancements: {panel}"
+            panel.contains(r#"data-agent-stream="/agents/7/events""#),
+            "the panel must declare its stream as data: {panel}"
+        );
+        assert!(
+            !panel.contains("<script"),
+            "a fragment cannot carry a nonce, so it must carry no script: {panel}"
+        );
+        assert!(
+            newt_web::csp::PANEL_JS.contains("window.newtEnhanceMarkdown"),
+            "the behaviour must still exist, in the served asset"
+        );
+        assert!(
+            newt_web::csp::PANEL_JS.contains("newtAttachStreams"),
+            "the asset must expose its scan entry point"
         );
     }
 

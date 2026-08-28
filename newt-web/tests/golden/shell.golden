@@ -7,6 +7,7 @@
 <script src="/assets/htmx.min.js"></script>
 <script defer src="/assets/mermaid.min.js"></script>
 <script defer src="/assets/markdown.js"></script>
+<script defer src="/assets/panel.js"></script>
 <style>
   :root { color-scheme: light dark; }
   body { font-family: ui-monospace, monospace; margin: 0; }
