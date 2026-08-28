@@ -324,10 +324,21 @@ mod b0a {
 
     /// The chain each surface must walk to reach the one definition.
     const CHAIN: &[Link] = &[
+        // B0b-1 (#1842) changed this link's SHAPE, not its property: the
+        // terminal branch now builds the definition inline so the same
+        // value it renders is the authority the answer is checked
+        // against, rather than calling the `permission_question` facade
+        // and losing the definition. The facade still exists and still
+        // routes through `question_for`, which the next link pins.
         Link {
             caller: "ask",
-            needle: "permission_question(",
+            needle: "permission_definition(",
             why: "the terminal answer reader must be handed the built form",
+        },
+        Link {
+            caller: "ask",
+            needle: "definition_to_question(",
+            why: "and must render it through the adapter, not a second renderer",
         },
         Link {
             caller: "permission_question",
@@ -409,6 +420,83 @@ mod b0a {
                 "`fn {caller}` still constructs a Question directly"
             );
         }
+    }
+
+    /// **B0b-1 (#1842): the ACCEPT/DENY decision is reached from both
+    /// surfaces, and lands on `validate_response`.**
+    ///
+    /// `spec/lint-behavior-map.py` already refuses a production ref whose
+    /// named symbol is absent or ambiguous (`resolve_production` +
+    /// `check_resolvable`), so the ORPHANED-ref half of the provenance
+    /// obligation was already armed before this slice. What it cannot see
+    /// is SEMANTIC drift: every symbol in BHV-PROMPT-001 still exists
+    /// after the decision moves off it. This is the half that can fire —
+    /// it pins where the decision actually goes, so moving it again
+    /// without revisiting the behavior map breaks a test rather than
+    /// silently leaving a `proven` claim over code that no longer decides.
+    #[test]
+    fn the_authorizer_is_reached_from_both_surfaces() {
+        let gate = production_lines("newt-tui/src/permissions.rs");
+        assert!(!gate.is_empty(), "no production lines in permissions.rs");
+        let missing = missing_links(
+            &gate,
+            &[
+                Link {
+                    caller: "ask",
+                    needle: "self.authorize(",
+                    why: "the TERMINAL surface must authorize its decoded answer",
+                },
+                Link {
+                    caller: "authorize",
+                    needle: "authorize_action(",
+                    why: "authorization is the controller's, not a downstream match arm's",
+                },
+            ],
+        );
+        assert!(missing.is_empty(), "{}", missing.join("\n"));
+
+        let store = production_lines("newt-core/src/store.rs");
+        assert!(!store.is_empty(), "no production lines in store.rs");
+        let missing = missing_links(
+            &store,
+            &[Link {
+                caller: "answer_permission_request_inner",
+                needle: "web_answer_is_authorized(",
+                why: "the WEB surface must authorize, not re-parse",
+            }],
+        );
+        assert!(missing.is_empty(), "{}", missing.join("\n"));
+
+        let gate_mod = production_lines("newt-core/src/interaction_gate.rs");
+        assert!(
+            !gate_mod.is_empty(),
+            "no production lines in interaction_gate.rs"
+        );
+        let missing = missing_links(
+            &gate_mod,
+            &[
+                Link {
+                    caller: "web_answer_is_authorized",
+                    needle: "authorize_action(",
+                    why: "the web path shares the one authorizer",
+                },
+                Link {
+                    caller: "authorize_action",
+                    needle: "validate_response(",
+                    why: "the decision lands on the formally-modelled validator",
+                },
+            ],
+        );
+        assert!(missing.is_empty(), "{}", missing.join("\n"));
+
+        // The store must no longer DECIDE by parsing. `Question::parse` is
+        // kept as an input decoder, but the answer transaction is not
+        // where it decides any more.
+        let answer = function_body(&store, "answer_permission_request_inner").expect("body");
+        assert!(
+            !answer.contains(".parse("),
+            "the store's answer path still decides by parsing"
+        );
     }
 
     /// **Anti-vacuous twin for the anchored guard.** The failure this
