@@ -151,9 +151,10 @@ pub fn headless_capabilities() -> Vec<SurfaceFeature> {
     Vec::new()
 }
 
-/// Whether every control the definition REQUIRES could be answered by a
-/// surface that cannot take input at all — which is to say, whether the
-/// definition expects a response.
+/// Whether the definition expects a response at all.
+///
+/// True when any control is [`Requirement::Required`]. A caller asks this to
+/// tell "present it and move on" from "this needs an answer I cannot get".
 ///
 /// A [`Notice`](newt_interaction::InteractionKind::Notice) expects none, so a
 /// headless surface can present it and move on. Anything with a required
@@ -376,6 +377,68 @@ mod c0b {
             )],
         );
         assert!(expects_a_response(&required));
+    }
+
+    /// **State 3 never becomes state 2.** The module header claims headless
+    /// callers never wait; this is what makes the claim checkable rather
+    /// than aspirational. A headless path that grew a `PromptWindow`, a
+    /// `stdin` read, or an `is_terminal()` branch would be waiting — the
+    /// exact thing the epic's global acceptance criterion forbids — and it
+    /// would do so while every behavioural test above still passed.
+    ///
+    /// Comment lines are stripped before the scan, so the module's own prose
+    /// about `PromptWindow` is not a hit; the twin proves the scan still
+    /// sees a real one.
+    #[test]
+    fn the_headless_path_never_waits_on_a_terminal() {
+        let production = code_without_comments(
+            include_str!("headless.rs")
+                .split("#[cfg(test)]")
+                .next()
+                .expect("the production half"),
+        );
+        for waiting in ["PromptWindow", "stdin", "is_terminal", "read_line"] {
+            assert!(
+                !production.contains(waiting),
+                "the headless module reaches `{waiting}` — headless must never \
+                 wait for input it has nobody to receive"
+            );
+        }
+        assert!(
+            production.contains("plan_presentation"),
+            "the scan is not reading this module's code at all"
+        );
+    }
+
+    /// **Anti-vacuous twin for the no-waiting scan.**
+    #[test]
+    fn the_no_waiting_scan_sees_a_real_terminal_read() {
+        let seeded = code_without_comments(
+            "// a comment mentioning PromptWindow and stdin is not a hit\n\
+             pub fn f() { let w = PromptWindow::x(); }\n",
+        );
+        assert!(
+            seeded.contains("PromptWindow"),
+            "the scan cannot see a real terminal reference"
+        );
+        let only_prose = code_without_comments(
+            "// PromptWindow, stdin, is_terminal, read_line\npub fn f() {}\n",
+        );
+        for waiting in ["PromptWindow", "stdin", "is_terminal", "read_line"] {
+            assert!(
+                !only_prose.contains(waiting),
+                "prose was counted as code: `{waiting}`"
+            );
+        }
+    }
+
+    /// Source with `//`-comment lines removed, so prose is not a hit.
+    fn code_without_comments(source: &str) -> String {
+        source
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// **Headless capabilities are empty, and that is the point.** Stated as

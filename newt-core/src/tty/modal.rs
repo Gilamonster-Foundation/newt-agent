@@ -379,3 +379,112 @@ mod headless_line_tests {
         );
     }
 }
+
+/// **The wiring pin A0 deferred to this slice** (C0b, #1860).
+///
+/// `headless_line_tests` above exercises the pure classifier directly, and
+/// its own doc records the boundary: *"the guard that
+/// `read_prompt_window_line`'s non-TTY branch still CALLS it is the
+/// dead-code lint … The C0/C1 slice that reworks the branch inherits
+/// responsibility for re-pinning the wiring."* C0b discharges that.
+///
+/// The dead-code lint is a weak guard for this: it proves the function has
+/// SOME caller, not that the piped branch is the caller, so moving the call
+/// into a test helper would keep the lint quiet while the piped convention
+/// silently stopped applying.
+///
+/// **C0b changes nothing here.** The epic's global acceptance criterion —
+/// *"Headless/protocol modes never wait, choose defaults, or emit terminal
+/// bytes"* — and this A0 freeze do not conflict, because `!is_terminal()` is
+/// a property of a file descriptor and not a mode. This branch serves a
+/// PIPED-but-ANSWERED session (the eval harness, `printf … | newt solve`)
+/// where a writer is present and an answer is coming; the epic's criterion
+/// governs headless/protocol modes, which never construct a `PromptWindow`
+/// at all and are served by `crate::markup::headless`. The same C0 bullet
+/// that carries the criterion also says to *preserve pipe behavior*, which
+/// only coheres under that reading.
+#[cfg(test)]
+mod c0b_wiring {
+    /// The production half of this file, with the test modules removed.
+    fn production_source() -> String {
+        include_str!("modal.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the production half")
+            .to_string()
+            + include_str!("modal.rs")
+                .split("#[cfg(all(test, unix))]")
+                .next()
+                .expect("the production half")
+    }
+
+    /// The body of `fn <name>`, by brace depth.
+    fn function_body(source: &str, name: &str) -> Option<String> {
+        let anchor = format!("fn {name}(");
+        let start = source.find(&anchor)?;
+        let mut depth = 0i32;
+        let mut opened = false;
+        let mut body = String::new();
+        for ch in source[start..].chars() {
+            body.push(ch);
+            match ch {
+                '{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if opened && depth <= 0 {
+                break;
+            }
+        }
+        opened.then_some(body)
+    }
+
+    /// **The piped branch still classifies through the frozen convention.**
+    #[test]
+    fn the_non_tty_branch_still_calls_the_frozen_classifier() {
+        let source = production_source();
+        let body = function_body(&source, "read_prompt_window_line")
+            .expect("`fn read_prompt_window_line` not found at all");
+        assert!(
+            body.contains("is_terminal()"),
+            "the non-TTY branch is gone from the reader: {body}"
+        );
+        assert!(
+            body.contains("classify_headless_prompt_line(&line)"),
+            "the piped branch no longer routes through the A0-frozen \
+             classifier — the convention `newt solve`-when-piped and the eval \
+             harness rely on is silently not applying: {body}"
+        );
+        // The EOF arm stays upstream of the classifier, which is what makes
+        // an explicitly-submitted empty line distinguishable from Ctrl-D.
+        assert!(
+            body.contains("PromptLine::Eof"),
+            "the Ok(0) => Eof arm left the reader: {body}"
+        );
+    }
+
+    /// **Anti-vacuous twin.** The extractor must fail on a branch that
+    /// stopped calling the classifier, or the guard above passes on any
+    /// file it cannot parse.
+    #[test]
+    fn the_wiring_guard_notices_a_branch_that_stopped_classifying() {
+        let rewired = "fn read_prompt_window_line(w: &W, p: &str) -> R {\n\
+                       if !io::stdin().is_terminal() {\n\
+                           return Ok(PromptLine::Line(line));\n\
+                       }\n\
+                       }";
+        let body = function_body(rewired, "read_prompt_window_line").expect("body");
+        assert!(
+            !body.contains("classify_headless_prompt_line(&line)"),
+            "the twin's fixture already classifies, so it proves nothing"
+        );
+        // ...and the real one does, so the guard discriminates.
+        let real = production_source();
+        assert!(function_body(&real, "read_prompt_window_line")
+            .expect("body")
+            .contains("classify_headless_prompt_line(&line)"));
+    }
+}
