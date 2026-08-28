@@ -89,6 +89,69 @@ fn see_other(to: &str) -> axum::response::Response {
     (StatusCode::SEE_OTHER, [("location", to)]).into_response()
 }
 
+/// Reject a state-changing browser request that is cross-site or carries no
+/// matching CSRF token.
+///
+/// **Both checks, on every browser POST.** The cockpit sits behind a
+/// forward-auth proxy, so a cross-site request arrives ALREADY authenticated —
+/// the browser attaches the proxy's cookie whether or not the operator meant
+/// to send anything. Authentication answers "who", never "did they ask for
+/// this"; that is what this is for.
+///
+/// Applied only to the browser router. The machine dock API is deliberately
+/// outside it: a peer cockpit posts with `ureq`, which sends neither an
+/// `Origin` nor a cookie, and its boundary is the forward-auth gate plus the
+/// signed approved-dock registry. That exclusion is pinned by
+/// `c3b::the_machine_dock_api_is_not_behind_the_browser_gate` so it reads as a
+/// decision rather than an oversight.
+async fn require_same_origin_and_csrf(
+    State(expected_origin): State<Option<String>>,
+    req: Request,
+    next: Next,
+) -> axum::response::Response {
+    // Safe methods change nothing, so neither check applies to them.
+    if req.method() != axum::http::Method::POST {
+        return next.run(req).await;
+    }
+    let header = |parts: &axum::http::HeaderMap, name: &str| {
+        parts
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let (parts, body) = req.into_parts();
+
+    if newt_web::origin::check(
+        header(&parts.headers, "origin").as_deref(),
+        header(&parts.headers, "referer").as_deref(),
+        header(&parts.headers, "host").as_deref(),
+        expected_origin.as_deref(),
+    ) != newt_web::origin::OriginVerdict::SameOrigin
+    {
+        return (StatusCode::FORBIDDEN, "cross-site request refused").into_response();
+    }
+
+    // The token travels in the body, so the body must be read here and put
+    // back. Forms are small; the cap is what stops an unbounded read.
+    const MAX_FORM: usize = 1 << 20;
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_FORM).await else {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "form too large").into_response();
+    };
+    let submitted = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(newt_web::csrf::from_form_body)
+        .unwrap_or_default();
+    let cookie = header(&parts.headers, "cookie")
+        .and_then(|c| newt_web::csrf::from_cookie_header(&c))
+        .unwrap_or_default();
+    if !newt_web::csrf::matches(&cookie, &submitted) {
+        return (StatusCode::FORBIDDEN, "missing or mismatched CSRF token").into_response();
+    }
+
+    next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
+        .await
+}
+
 fn app() -> Router {
     app_with_auth(required_auth_header())
 }
@@ -98,44 +161,51 @@ fn app() -> Router {
 /// leaves the surface open — the loopback-dev + fully-mocked-test posture.
 fn app_with_auth(auth_header: Option<String>) -> Router {
     let reg = Arc::new(Registry::default());
-    let mut gated = Router::new()
-        .route("/", get(shell::index))
+    // Resolved ONCE, at composition, not per request — the same reason
+    // `normalized_auth_header` is pure: an env read on the hot path is a read
+    // that races whatever a parallel test is writing, and #1853's lock covers
+    // writers, not unguarded readers. A deployment behind the SSO ingress sets
+    // this because the browser's origin is the public HTTPS one and bears no
+    // relation to the pod's `Host`; unset falls back to comparing against
+    // `Host`, which is what the loopback and LAN binds need.
+    let expected_origin = normalized_auth_header(std::env::var("NEWT_WEB_ORIGIN").ok());
+    // Static assets: same-origin GETs, no state, and the SRI digests on the
+    // page are computed over exactly these bytes.
+    let assets = Router::new()
         .route(
             "/assets/htmx.min.js",
-            get(|| async {
-                (
-                    [("content-type", "text/javascript")],
-                    include_str!("../assets/htmx.min.js"),
-                )
-            }),
+            get(|| async { js(newt_web::csp::HTMX_JS) }),
         )
         .route(
             "/assets/mermaid.min.js",
-            get(|| async {
-                (
-                    [("content-type", "text/javascript")],
-                    include_str!("../assets/mermaid.min.js"),
-                )
-            }),
+            get(|| async { js(newt_web::csp::MERMAID_JS) }),
         )
         .route(
             "/assets/markdown.js",
-            get(|| async {
-                (
-                    [("content-type", "text/javascript")],
-                    include_str!("../assets/markdown.js"),
-                )
-            }),
+            get(|| async { js(newt_web::csp::MARKDOWN_JS) }),
         )
         .route(
             "/assets/panel.js",
-            get(|| async {
-                (
-                    [("content-type", "text/javascript")],
-                    include_str!("../assets/panel.js"),
-                )
-            }),
+            get(|| async { js(newt_web::csp::PANEL_JS) }),
         )
+        // Referenced by the enrollment page's SRI-bound tag. It was never
+        // routed, so that tag 404'd — one of the things an unrouted page hides.
+        .route(
+            "/assets/webauthn.js",
+            get(|| async { js(newt_web::csp::WEBAUTHN_JS) }),
+        );
+
+    // Everything a BROWSER drives. Every POST here must be same-origin and
+    // carry the double-submit token.
+    let browser = Router::new()
+        .route("/", get(shell::index))
+        // #1854 step 2: the enrollment page is routed rather than left
+        // dangling. It was unrouted, which is precisely why the missing CSP
+        // went unnoticed for so long. Its ceremony cannot COMPLETE yet — the
+        // `/enroll/finish` staging route needs a store handle that is not
+        // wired — and the page says so, fail-closed, when the relying party is
+        // unconfigured. Visible and incomplete beats invisible.
+        .route("/enroll", get(newt_web::enroll::page))
         .route("/agents", post(spawn_agent))
         .route("/follow", post(follow_session))
         .route("/agents/:id/panel", get(agent_panel_route))
@@ -144,12 +214,25 @@ fn app_with_auth(auth_header: Option<String>) -> Router {
         .route("/agents/:id/decision", post(decide_route))
         .route("/agents/:id/events", get(agent_events))
         .route("/agents/:id/delete", post(delete_agent))
-        .route("/api/sessions", get(api_sessions))
-        .route("/api/sessions/:id/transcript", get(api_transcript))
-        .route("/api/sessions/:id/inject", post(api_inject))
         .route("/dock/panel", get(dock_panel_route))
         .route("/dock/inject", post(dock_inject_route))
-        .route("/overview", get(overview_route));
+        .route("/overview", get(overview_route))
+        .layer(middleware::from_fn_with_state(
+            expected_origin,
+            require_same_origin_and_csrf,
+        ));
+
+    // The MACHINE dock API. A peer cockpit reaches this with `ureq`, which
+    // sends no Origin and holds no cookie, so the browser gate would refuse
+    // every legitimate call. Its boundary is the forward-auth gate plus the
+    // signed approved-dock registry (`dock::check_dock_approval`), and the
+    // operator kill-switch (`dock_exposure_disabled`).
+    let machine = Router::new()
+        .route("/api/sessions", get(api_sessions))
+        .route("/api/sessions/:id/transcript", get(api_transcript))
+        .route("/api/sessions/:id/inject", post(api_inject));
+
+    let mut gated = browser.merge(machine).merge(assets);
     if let Some(header) = auth_header {
         gated = gated.layer(middleware::from_fn_with_state(header, require_identity));
     }
@@ -158,6 +241,11 @@ fn app_with_auth(auth_header: Option<String>) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .merge(gated)
         .with_state(reg)
+}
+
+/// One served JavaScript asset, with the content type its SRI tag expects.
+fn js(body: &'static str) -> impl IntoResponse {
+    ([("content-type", "text/javascript")], body)
 }
 
 #[derive(serde::Deserialize)]
@@ -891,6 +979,14 @@ mod tests {
     /// assert on fragments, so they are HTMX callers — stated here once, in
     /// the header HTMX itself sends, rather than by threading a flag through
     /// forty call sites. `full` is the helper for everything else.
+    /// The fixed token these suites present as both cookie and form field.
+    ///
+    /// This does NOT weaken the gate: double-submit asks only that the cookie
+    /// and the field agree, which is exactly what a real browser produces and
+    /// exactly what a cross-site attacker cannot. `c3b::a_post_without_the_csrf_token_is_refused`
+    /// drives the other side.
+    const TEST_CSRF: &str = "test-csrf-token";
+
     async fn req(
         app: &Router,
         method: &str,
@@ -900,13 +996,23 @@ mod tests {
         let mut b = axum::http::Request::builder()
             .method(method)
             .uri(path)
-            .header("hx-request", "true");
-        let body = match form {
-            Some(f) => {
+            .header("hx-request", "true")
+            // A same-origin browser POST, which is what these suites model.
+            .header("origin", "http://127.0.0.1:8880")
+            .header("host", "127.0.0.1:8880")
+            .header("cookie", format!("newt_csrf={TEST_CSRF}"));
+        let post = method.eq_ignore_ascii_case("post");
+        let body = match (form, post) {
+            (Some(f), _) => {
                 b = b.header("content-type", "application/x-www-form-urlencoded");
-                axum::body::Body::from(f.to_string())
+                axum::body::Body::from(format!("{f}&csrf={TEST_CSRF}"))
             }
-            None => axum::body::Body::empty(),
+            // A bodyless POST still has to carry the token.
+            (None, true) => {
+                b = b.header("content-type", "application/x-www-form-urlencoded");
+                axum::body::Body::from(format!("csrf={TEST_CSRF}"))
+            }
+            (None, false) => axum::body::Body::empty(),
         };
         let resp = app.clone().oneshot(b.body(body).unwrap()).await.unwrap();
         let status = resp.status();
@@ -2156,11 +2262,23 @@ mod tests {
             }
         }
 
-        /// **The policy never permits `'unsafe-inline'`.**
+        /// **`'unsafe-inline'` appears in exactly one directive, and it is
+        /// the one where it grants nothing.**
         ///
-        /// Without this, the header guard above is satisfiable by a policy
-        /// that permits everything it exists to forbid — which #1854 calls
-        /// out as worse than no CSP, because it also looks done.
+        /// A blanket "the string does not appear" check is the wrong guard in
+        /// both directions: it fails on the measured, defensible
+        /// `style-src-attr` relaxation, and — worse — a future author who
+        /// needed it would delete the check rather than narrow it, and then
+        /// nothing would stop `script-src 'unsafe-inline'`. So this asserts
+        /// PER DIRECTIVE.
+        ///
+        /// Why `style-src-attr` is the exception, measured rather than
+        /// assumed (see `csp::policy`): Mermaid styles its generated SVG
+        /// almost entirely through per-node `style=` attributes — 49 blocked
+        /// attribute applications against 4 blocked `<style>` elements on a
+        /// real page — and ammonia's default allowlist has no `style`
+        /// attribute on any tag, so untrusted content cannot emit one. The
+        /// permission is unreachable by an attacker.
         #[serial_test::serial(newt_web_env)]
         #[tokio::test]
         async fn the_policy_never_permits_unsafe_inline() {
@@ -2178,10 +2296,99 @@ mod tests {
                 csp.contains("script-src"),
                 "no policy to check — this guard would pass vacuously"
             );
-            for forbidden in ["'unsafe-inline'", "'unsafe-eval'", "'strict-dynamic'", "*"] {
+
+            let directive = |name: &str| {
+                csp.split(';')
+                    .map(str::trim)
+                    .find(|d| d.split_whitespace().next() == Some(name))
+                    .unwrap_or("")
+                    .to_string()
+            };
+
+            // Script may never be relaxed, by any keyword.
+            let script = directive("script-src");
+            for forbidden in [
+                "'unsafe-inline'",
+                "'unsafe-eval'",
+                "'unsafe-hashes'",
+                "'strict-dynamic'",
+                "*",
+                "http:",
+                "https:",
+            ] {
                 assert!(
-                    !csp.contains(forbidden),
-                    "the shell CSP must not contain {forbidden}: {csp}"
+                    !script.contains(forbidden),
+                    "script-src must not contain {forbidden}: {script}"
+                );
+            }
+            // Nor may a style ELEMENT or the fallback, which is where style
+            // injection actually has teeth.
+            for name in ["style-src", "style-src-elem", "default-src"] {
+                let d = directive(name);
+                assert!(
+                    !d.contains("'unsafe-inline'"),
+                    "{name} must stay strict: {d}"
+                );
+            }
+            assert!(
+                directive("default-src").contains("'none'"),
+                "an unnamed fetch directive must fail closed: {csp}"
+            );
+
+            // …and the ONE relaxation is exactly where it was measured to be
+            // needed and proven unreachable. Counting occurrences is what
+            // stops a second one being added quietly.
+            assert_eq!(
+                csp.matches("'unsafe-inline'").count(),
+                1,
+                "exactly one directive may carry it: {csp}"
+            );
+            assert!(
+                directive("style-src-attr").contains("'unsafe-inline'"),
+                "…and it must be style-src-attr: {csp}"
+            );
+        }
+
+        /// **No `'unsafe-eval'`, and nothing on the page needs it.**
+        ///
+        /// Regression for a real measured violation: the prompt form carried
+        /// `hx-on::after-request="this.reset()"`, and htmx EVALUATES that
+        /// attribute's value as JavaScript — inline script wearing an
+        /// attribute, which needs `script-src 'unsafe-eval'`. It was the only
+        /// `script-src :: eval` violation on the page. The behaviour moved to
+        /// `assets/panel.js`, which needs neither eval nor a nonce.
+        ///
+        /// `hx-on:` is banned outright rather than just this one instance:
+        /// every spelling of it is an evaluated string, so a new one would
+        /// silently require the same relaxation.
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn no_markup_requires_eval() {
+            std::env::remove_var("NEWT_WEB_STATE_DIR");
+            let app = app();
+            let (_, page_headers, _) = full(&app, "GET", "/", &[], None).await;
+            let token = csrf_of(&page_headers);
+            full(
+                &app,
+                "POST",
+                "/agents",
+                &[
+                    ("origin", "http://127.0.0.1:8880"),
+                    ("host", "127.0.0.1:8880"),
+                    ("cookie", &format!("newt_csrf={token}")),
+                    ("hx-request", "true"),
+                ],
+                Some(&format!(
+                    "name=t&url=http%3A%2F%2F127.0.0.1%3A1&model=m&kind=ollama&workspace=.&csrf={token}"
+                )),
+            )
+            .await;
+            for path in ["/", "/agents/1/panel", "/overview"] {
+                let (_, _, body) = full(&app, "GET", path, &[], None).await;
+                assert!(
+                    !body.contains("hx-on:"),
+                    "{path} carries an htmx-evaluated attribute, which needs \
+                     'unsafe-eval': {body}"
                 );
             }
         }
@@ -2338,6 +2545,160 @@ mod tests {
                 "motion must be opt-out"
             );
             assert!(page.contains(":focus-visible"), "focus must be visible");
+        }
+
+        /// **A losing no-JS answer is NOT redirected as if it had won.**
+        ///
+        /// The trap this exists for: the scriptless path needs
+        /// POST-Redirect-GET because a browser with no script cannot consume a
+        /// fragment — but if that redirect is applied to EVERY outcome rather
+        /// than only success, an operator whose answer lost the race to the
+        /// terminal is sent to a normal-looking page and told, in the only
+        /// language the surface has, that they won.
+        ///
+        /// That is a silent violation of #1536's single-winner contract,
+        /// which exists precisely so a losing answer can never report success.
+        /// It survives review because the happy path looks right: the winning
+        /// case redirects correctly, and nothing about the code says the
+        /// branch is outcome-sensitive.
+        ///
+        /// **Do not "simplify" `decide_route` by redirecting unconditionally.**
+        /// The twin below is what proves this test is measuring the loss and
+        /// not merely "no-JS never redirects".
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_losing_no_js_answer_is_not_redirected_as_success() {
+            let state = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            let app = app();
+            let (store, conv, rid) =
+                seed_followed_pending_decision(&app, state.path(), ws.path()).await;
+            let (_, page_headers, _) = full(&app, "GET", "/", &[], None).await;
+            let token = csrf_of(&page_headers);
+
+            // The TERMINAL wins first (the same CAS the #1536 race tests
+            // drive). The browser's card is now stale.
+            assert!(
+                store.cancel_interaction_offer(&conv, &rid).unwrap(),
+                "the terminal resolves the live offer"
+            );
+
+            // A scriptless browser submits its now-losing answer: same origin,
+            // valid token, and crucially NO HX-Request header.
+            let (status, headers, _) = full(
+                &app,
+                "POST",
+                "/agents/1/decision",
+                &[
+                    ("origin", "http://127.0.0.1:8880"),
+                    ("host", "127.0.0.1:8880"),
+                    ("cookie", &format!("newt_csrf={token}")),
+                ],
+                Some(&format!("csrf={token}&request_id={rid}&verdict=allow_once")),
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "a losing answer must keep its honest 409, even with no script"
+            );
+            assert!(
+                !status.is_redirection(),
+                "a losing answer must NEVER be redirected: {status}"
+            );
+            assert!(
+                headers.get("location").is_none(),
+                "a losing answer must carry no Location — that is what would \
+                 tell a scriptless operator they won"
+            );
+            assert_eq!(
+                store.take_interaction_decision(&conv, &rid).unwrap(),
+                None,
+                "the losing answer recorded no authorization"
+            );
+            clear_web_env();
+        }
+
+        /// **Anti-vacuous twin for the test above.**
+        ///
+        /// The guard above is satisfied by a handler that never redirects at
+        /// all — which would break the scriptless path entirely while looking
+        /// green. This proves the redirect branch EXISTS and fires, so the
+        /// absence of a redirect in the losing case is a decision rather than
+        /// an omission. The two together pin the rule: redirect success, and
+        /// only success.
+        ///
+        /// Every non-success outcome reachable at this boundary is checked,
+        /// not just the one the sibling drives.
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_winning_no_js_answer_is_redirected_but_no_other_outcome_is() {
+            let state = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            let app = app();
+            let (store, conv, rid) =
+                seed_followed_pending_decision(&app, state.path(), ws.path()).await;
+            let (_, page_headers, _) = full(&app, "GET", "/", &[], None).await;
+            let token = csrf_of(&page_headers);
+            let browser = |body: String| {
+                let token = token.clone();
+                let app = app.clone();
+                async move {
+                    full(
+                        &app,
+                        "POST",
+                        "/agents/1/decision",
+                        &[
+                            ("origin", "http://127.0.0.1:8880"),
+                            ("host", "127.0.0.1:8880"),
+                            ("cookie", &format!("newt_csrf={token}")),
+                        ],
+                        Some(&body),
+                    )
+                    .await
+                }
+            };
+
+            // An action that was never displayed: refused, and NOT redirected.
+            let (status, headers, _) = browser(format!(
+                "csrf={token}&request_id={rid}&verdict=allow_session"
+            ))
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "a non-offered action must be refused server-side"
+            );
+            assert!(headers.get("location").is_none(), "and not redirected");
+
+            // An unknown request id: refused, and NOT redirected.
+            let (status, headers, _) = browser(format!(
+                "csrf={token}&request_id=not-a-real-id&verdict=deny"
+            ))
+            .await;
+            assert!(!status.is_success() && !status.is_redirection(), "{status}");
+            assert!(headers.get("location").is_none(), "and not redirected");
+
+            // …and the WINNING answer IS redirected, which is what makes the
+            // assertions above mean something.
+            let (status, headers, _) =
+                browser(format!("csrf={token}&request_id={rid}&verdict=allow_once")).await;
+            assert_eq!(
+                status,
+                StatusCode::SEE_OTHER,
+                "the success path must redirect, or the scriptless client is stranded"
+            );
+            assert!(
+                headers.get("location").is_some(),
+                "a redirect with no Location is not a redirect"
+            );
+            assert_eq!(
+                store.take_interaction_decision(&conv, &rid).unwrap(),
+                Some(newt_core::PermissionAction::AllowOnce),
+                "exactly the winning verdict is recorded"
+            );
+            clear_web_env();
         }
 
         /// **The machine dock API is deliberately NOT behind the browser

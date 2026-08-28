@@ -7,6 +7,7 @@
 pub mod csp;
 pub mod csrf;
 pub mod enroll;
+pub mod origin;
 pub mod webauthn;
 
 /// Minimal HTML escape for text nodes and attribute values.

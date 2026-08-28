@@ -203,6 +203,21 @@ fn every_response_gets_a_fresh_nonce() {
 }
 
 /// `script-src` must offer injected script no fallback at all.
+///
+/// **C3b narrowed this rather than deleting it.** It used to assert that
+/// `'unsafe-inline'` appears nowhere in the policy, which stopped being true
+/// when `style-src-attr 'unsafe-inline'` was added — a relaxation measured to
+/// be necessary (Mermaid styles its generated SVG through per-node `style=`
+/// attributes: 49 blocked attribute applications against 4 blocked `<style>`
+/// elements on a real page) and proven unreachable by an attacker (ammonia's
+/// default allowlist carries no `style` attribute on any tag, so untrusted
+/// markup cannot emit one).
+///
+/// Deleting the check would have been the easy move and the wrong one: it is
+/// the only thing standing between this policy and `script-src 'unsafe-inline'`.
+/// So it now asserts PER DIRECTIVE, and counts occurrences, which is strictly
+/// stronger than the blanket test it replaces — a second relaxation anywhere
+/// fails it.
 #[test]
 fn the_policy_denies_by_default_and_allows_no_unsafe_script() {
     let nonce = Nonce::fresh();
@@ -213,18 +228,51 @@ fn the_policy_denies_by_default_and_allows_no_unsafe_script() {
         p.contains(&format!("script-src 'nonce-{}'", nonce.as_str())),
         "{p}"
     );
+
+    let directive = |name: &str| {
+        p.split(';')
+            .map(str::trim)
+            .find(|d| d.split_whitespace().next() == Some(name))
+            .unwrap_or("")
+            .to_string()
+    };
+
+    // Script gets no fallback of any kind.
+    let script = directive("script-src");
     for forbidden in [
         "'unsafe-inline'",
         "'unsafe-eval'",
-        "script-src *",
+        "'unsafe-hashes'",
+        "'strict-dynamic'",
+        "*",
         "https:",
-        "data: 'self' script",
+        "data:",
     ] {
         assert!(
-            !p.contains(forbidden),
-            "policy must not contain {forbidden}: {p}"
+            !script.contains(forbidden),
+            "script-src must not contain {forbidden}: {script}"
         );
     }
+    // Neither does a style ELEMENT — the high-value target, and the one
+    // untrusted markup would reach first if the sanitizer ever regressed.
+    for name in ["style-src", "style-src-elem", "default-src"] {
+        let d = directive(name);
+        assert!(
+            !d.contains("'unsafe-inline'"),
+            "{name} must stay strict: {d}"
+        );
+    }
+    // Exactly one relaxation exists, and it is the measured one.
+    assert_eq!(
+        p.matches("'unsafe-inline'").count(),
+        1,
+        "exactly one directive may carry 'unsafe-inline': {p}"
+    );
+    assert!(
+        directive("style-src-attr").contains("'unsafe-inline'"),
+        "…and it must be style-src-attr: {p}"
+    );
+
     for required in [
         "base-uri 'none'",
         "frame-ancestors 'none'",
@@ -233,6 +281,29 @@ fn the_policy_denies_by_default_and_allows_no_unsafe_script() {
     ] {
         assert!(p.contains(required), "policy must contain {required}: {p}");
     }
+}
+
+/// C3b: the page tells the client what its own policy permits, derived from
+/// the policy TEXT so the two cannot drift.
+#[test]
+fn the_style_element_capability_is_read_off_the_policy() {
+    let nonce = Nonce::fresh();
+    assert!(
+        !newt_web::csp::permits_inline_style_elements(&policy(&nonce)),
+        "this policy blocks inline style elements, and must say so"
+    );
+    // Anti-vacuous: it reports TRUE for a policy that does permit them, so a
+    // hardcoded `false` cannot masquerade as the derivation.
+    assert!(newt_web::csp::permits_inline_style_elements(
+        "default-src 'none'; style-src-elem 'unsafe-inline'"
+    ));
+    // …and falls back to `style-src` when the element directive is absent.
+    assert!(newt_web::csp::permits_inline_style_elements(
+        "style-src 'unsafe-inline'"
+    ));
+    assert!(!newt_web::csp::permits_inline_style_elements(
+        "style-src 'self'"
+    ));
 }
 
 #[test]

@@ -109,28 +109,65 @@ test.afterAll(async () => {
   if (stateDir) await rm(stateDir, { recursive: true, force: true });
 });
 
-test("BAT: the headless cockpit progressively enhances Mermaid @bat", async ({ page }) => {
+test("BAT: the cockpit falls back to diagram source under the CSP @bat", async ({ page }) => {
   await page.goto(baseURL);
   await expect(page).toHaveTitle("newt-web");
   await expect(page.getByText("No agents yet. Spawn one above.")).toBeVisible();
 
+  // The shell serves a strict CSP (#1854). Mermaid themes its diagrams with a
+  // <style> element it injects, scoped to a per-render id, and it has no nonce
+  // support — so `style-src-elem 'nonce-…'` blocks it and there is no hash or
+  // stylesheet that could admit it.
+  //
+  // Measured: with that stylesheet blocked, BOTH node fill and text fill fall
+  // back to black, so a rendered diagram is black-on-black — unreadable, not
+  // merely unstyled, and silently so. `markdown.js` therefore feature-detects
+  // whether an injected <style> applies and, when it does not, leaves the
+  // diagram as its own source: readable, labelled, and honest (ADR law 5).
   await page.evaluate(async () => {
     const host = document.createElement("div");
     host.className = "md";
-    host.innerHTML = [
-      '<pre class="mermaid" data-markdown-extension="mermaid">flowchart LR\nA --> B</pre>',
-      '<pre class="mermaid" data-markdown-extension="mermaid">not a diagram !?</pre>',
-    ].join("");
+    host.innerHTML =
+      '<pre class="mermaid" data-markdown-extension="mermaid">flowchart LR\nA --> B</pre>';
     document.body.append(host);
     await window.newtEnhanceMarkdown(host);
   });
-  await expect(page.locator('[data-markdown-extension="mermaid"] svg')).toBeVisible();
-  const fallback = page.locator(".mermaid-error");
-  await expect(fallback).toHaveText("not a diagram !?");
-  await expect(fallback).toHaveAttribute("aria-label", "Mermaid diagram could not be rendered");
+
+  const diagram = page.locator('[data-markdown-extension="mermaid"]');
+  await expect(diagram).toHaveClass(/mermaid-error/);
+  await expect(diagram).toHaveAttribute("aria-label", /security policy/i);
+  // The source is still READABLE — the whole point of the fallback.
+  await expect(diagram).toContainText("flowchart LR");
+  await expect(page.locator('[data-markdown-extension="mermaid"] svg')).toHaveCount(0);
 });
 
-test("UAT: a phone-sized user drives a Markdown and Mermaid turn @uat", async ({ page }) => {
+test("BAT: an invalid diagram still falls back to its source @bat", async ({ page }) => {
+  await page.goto(baseURL);
+  await page.evaluate(async () => {
+    const host = document.createElement("div");
+    host.className = "md";
+    host.innerHTML =
+      '<pre class="mermaid" data-markdown-extension="mermaid">not a diagram !?</pre>';
+    document.body.append(host);
+    await window.newtEnhanceMarkdown(host);
+  });
+  const fallback = page.locator(".mermaid-error");
+  await expect(fallback).toHaveText("not a diagram !?");
+  await expect(fallback).toHaveAttribute("aria-label", /.+/);
+});
+
+test("UAT: a phone-sized user drives a Markdown turn with no CSP violations @uat", async ({ page }) => {
+  // Every CSP violation the page provokes, so a policy that silently breaks
+  // the surface cannot pass. Before C3b this page had no policy at all.
+  const violations = [];
+  await page.addInitScript(() => {
+    document.addEventListener("securitypolicyviolation", (e) =>
+      (window.__cspViolations = window.__cspViolations || []).push(
+        e.violatedDirective + " :: " + e.blockedURI,
+      ),
+    );
+  });
+
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(baseURL);
   await page.getByText("+ new scratch agent").click();
@@ -145,21 +182,23 @@ test("UAT: a phone-sized user drives a Markdown and Mermaid turn @uat", async ({
   await page.getByRole("button", { name: "send" }).click();
 
   await expect(page.locator(".transcript strong")).toHaveText("Markdown survives.");
-  const diagram = page.locator('.transcript [data-markdown-extension="mermaid"] svg');
-  await expect(diagram).toBeVisible();
-  await expect(diagram).toContainText("Harness");
+  // The diagram is present as readable source, and the injected <script> the
+  // model sent is gone.
+  const diagram = page.locator('.transcript [data-markdown-extension="mermaid"]');
+  await expect(diagram).toContainText("flowchart TD");
   await expect(page.locator(".transcript")).not.toContainText("not allowed");
 
-  const layout = await page.evaluate(() => {
-    const svg = document.querySelector('.transcript [data-markdown-extension="mermaid"] svg');
-    const host = svg.closest(".md");
-    return {
-      pageWidth: document.documentElement.scrollWidth,
-      viewportWidth: document.documentElement.clientWidth,
-      diagramWidth: svg.getBoundingClientRect().width,
-      hostWidth: host.getBoundingClientRect().width,
-    };
-  });
+  // The enhanced path also resets the prompt box — behaviour that used to live
+  // in an `hx-on::` attribute, which htmx EVALUATES and which therefore
+  // required `script-src 'unsafe-eval'`. It moved into `assets/panel.js`.
+  await expect(page.getByPlaceholder("prompt…")).toHaveValue("");
+
+  violations.push(...(await page.evaluate(() => window.__cspViolations || [])));
+  expect(violations, `CSP violations on the shell page: ${violations.join(", ")}`).toEqual([]);
+
+  const layout = await page.evaluate(() => ({
+    pageWidth: document.documentElement.scrollWidth,
+    viewportWidth: document.documentElement.clientWidth,
+  }));
   expect(layout.pageWidth).toBeLessThanOrEqual(layout.viewportWidth + 1);
-  expect(layout.diagramWidth).toBeLessThanOrEqual(layout.hostWidth + 1);
 });

