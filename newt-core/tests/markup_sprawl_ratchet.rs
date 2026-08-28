@@ -101,15 +101,20 @@ const CATEGORIES: &[Category] = &[
             }
         },
         baseline: &[
-            ("newt-core/src/agentic/markdown/mod.rs", 1),
-            ("newt-web/src/shell.rs", 1),
+            // C3a (#1857) ratcheted this from 2 sites to 1. The rows that
+            // went are `agentic/markdown/mod.rs` and `newt-web/src/shell.rs`
+            // — the two SURFACES, which no longer construct a parser at all;
+            // they call `markup::dialect::parse`. What remains is that one
+            // constructor. A row reappearing here is a surface choosing its
+            // own dialect again, which is the divergence C3a deleted.
+            ("newt-core/src/markup/dialect.rs", 1),
         ],
-        rationale: "two Markdown parsers with two option matrices (TUI dialect \
-                    vs web Options::all). A1 (#1825) named both matrices in \
-                    newt_core::markup::dialect so neither site chooses \
-                    undocumented defaults; C3's deletion gate owns removing \
-                    the second matrix. A third instantiation forks the \
-                    dialect again",
+        rationale: "one Markdown parser constructor, on one option matrix. \
+                    A1 (#1825) named both matrices in \
+                    newt_core::markup::dialect; C3a (#1857) deleted the \
+                    second (web Options::all) and made the surviving one \
+                    unreachable except through dialect::parse. A second \
+                    instantiation forks the dialect again",
     },
     Category {
         name: "question construction sites",
@@ -1191,4 +1196,135 @@ fn the_walker_never_descends_into_hidden_directories() {
         vec!["newt-core/src/lib.rs".to_string()],
         "exactly the real tree is scanned"
     );
+}
+
+/// **C3a (#1857): one dialect, one option matrix, one parser constructor.**
+///
+/// A1 (#1825) named both matrices so neither call site chose undocumented
+/// defaults; it deliberately did not unify them. C3a's deletion gate is
+/// *"remove the second independent Markdown option matrix"*, and these two
+/// guards are what make a third one unable to come back quietly.
+///
+/// They are structural on purpose. "Which extensions are enabled" is a fact
+/// about the program text, not about any value the program computes: a
+/// behavioral test can prove that *today's* two callers agree, but only a
+/// source scan can prove a *third* caller cannot appear next week choosing
+/// its own matrix. That is the failure mode the A0 inventory recorded — two
+/// parser sites, two matrices, neither documented — and it is the one this
+/// module exists to prevent recurring.
+mod c3a {
+    /// The one module allowed to name pulldown's `Options` or build a
+    /// `Parser`. Everything else asks it.
+    const DIALECT: &str = "newt-core/src/markup/dialect.rs";
+
+    /// A function returning a pulldown `Options` — i.e. an option matrix.
+    ///
+    /// Squeezed code welds `)` to `->` to `Options`, so this is the shape a
+    /// matrix definition takes regardless of how rustfmt broke the line.
+    const MATRIX_RETURN: &str = "->Options";
+
+    /// Option-matrix definitions in one file's squeezed production code.
+    fn matrix_defs(squeezed: &str) -> usize {
+        super::count_sites(squeezed, MATRIX_RETURN)
+    }
+
+    /// Pulldown `Parser` constructions in one file's squeezed production
+    /// code. Same needles the "markdown parser sites" category uses.
+    fn parser_sites(squeezed: &str) -> usize {
+        super::count_any(squeezed, &["Parser::new_ext(", "Parser::new("])
+    }
+
+    /// **Both surfaces reach the parser through one constructor.**
+    ///
+    /// Not "both pass the same options" — *neither gets to pass options at
+    /// all*. The dialect is unrepresentable at a call site, so a second
+    /// matrix is not a thing a reviewer has to catch.
+    #[test]
+    fn both_surfaces_parse_with_one_option_matrix() {
+        let code = super::production_code();
+        let mut problems = Vec::new();
+
+        // Anti-vacuous half FIRST as a fact, not an early return: an empty
+        // or mis-rooted scan must fail loudly rather than report "no strays".
+        let sanctioned = code
+            .get(DIALECT)
+            .map(|f| parser_sites(&f.squeezed))
+            .unwrap_or(0);
+        if sanctioned != 1 {
+            problems.push(format!(
+                "{DIALECT} must hold exactly ONE parser construction (the \
+                 sanctioned one); the scan saw {sanctioned}. A zero here \
+                 usually means the scan is not seeing the file at all, which \
+                 would make the stray check below vacuous."
+            ));
+        }
+
+        for (path, file) in &code {
+            if path == DIALECT || !file.imports_pulldown {
+                continue;
+            }
+            let n = parser_sites(&file.squeezed);
+            if n > 0 {
+                problems.push(format!(
+                    "{path} constructs a pulldown Parser {n}× — it must call \
+                     newt_core::markup::dialect::parse instead, so it cannot \
+                     choose its own option matrix"
+                ));
+            }
+        }
+        assert!(problems.is_empty(), "C3a: {}", problems.join("\n"));
+    }
+
+    /// **A second option matrix cannot return.**
+    ///
+    /// Exactly one function in production returns a pulldown `Options`, and
+    /// it lives in the dialect module. `web_enhancement_options` was the
+    /// second; deleting it is C3a's deletion gate, and this is what keeps
+    /// the gate shut.
+    #[test]
+    fn a_second_option_matrix_cannot_return() {
+        let code = super::production_code();
+        let mut found: Vec<(String, usize)> = code
+            .iter()
+            .filter(|(_, f)| f.imports_pulldown)
+            .map(|(path, f)| (path.clone(), matrix_defs(&f.squeezed)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        found.sort();
+
+        assert_eq!(
+            found,
+            vec![(DIALECT.to_string(), 1)],
+            "exactly one option matrix must exist, in {DIALECT}. Found: \
+             {found:?}. A second matrix is the divergence A1 froze and C3a \
+             deleted — widen the one dialect instead, in its own slice."
+        );
+    }
+
+    /// **Anti-vacuous twin.** Both guards above are "count and compare", so
+    /// a detector that silently matched nothing would report a clean repo.
+    /// These feed it source it MUST see, and source it must NOT.
+    #[test]
+    fn the_c3a_detectors_can_fail() {
+        // A matrix definition is seen, however rustfmt broke the line…
+        assert_eq!(matrix_defs("pub fn canonical_options()->Options{}"), 1);
+        assert_eq!(
+            matrix_defs("pub fn a()->Options{}pub fn b()->Options{}"),
+            2,
+            "a second matrix must be visible to the guard"
+        );
+        // …and a function returning something else is not a matrix.
+        assert_eq!(matrix_defs("pub fn name()->String{}"), 0);
+        assert_eq!(matrix_defs(""), 0);
+
+        // Parser constructions likewise.
+        assert_eq!(parser_sites("Parser::new_ext(src,opts)"), 1);
+        assert_eq!(parser_sites("Parser::new(src)"), 1);
+        assert_eq!(
+            parser_sites("MyParser::new(src)"),
+            0,
+            "a longer identifier ending in the needle is its own thing"
+        );
+        assert_eq!(parser_sites("dialect::parse(src)"), 0);
+    }
 }
