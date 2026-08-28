@@ -29,8 +29,10 @@ impl<A> Action<A> {
     }
 
     /// Attach hidden parse aliases to this action. Chainable on [`Action::new`].
-    /// Aliases are matched exactly by [`Question::parse`] and never rendered by
-    /// [`Question::terminal_text`].
+    /// Aliases are matched exactly by [`Question::parse`] and never rendered —
+    /// rendering left this type in C0a (#1856); the plain projection is
+    /// `newt_core::markup::plain::render`, and its
+    /// `tests::aliases_are_never_rendered` is BHV-PROMPT-005's ref.
     #[must_use]
     pub fn with_aliases<S: Into<String>>(mut self, aliases: impl IntoIterator<Item = S>) -> Self {
         self.aliases.extend(aliases.into_iter().map(Into::into));
@@ -77,22 +79,6 @@ impl<A: AsRef<str> + Clone> Question<A> {
             (Some(only), None) => Some(only.value.clone()),
             _ => None,
         }
-    }
-}
-
-impl<A> Question<A> {
-    pub fn terminal_text(&self) -> String {
-        let choices = self
-            .actions
-            .iter()
-            .map(|a| a.label.replacen(&a.key, &format!("[{}]", a.key), 1))
-            .collect::<Vec<_>>()
-            .join("   ");
-        [&self.markdown, self.note.as_deref().unwrap_or(""), &choices]
-            .into_iter()
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 }
 
@@ -180,12 +166,6 @@ mod tests {
         };
         assert_eq!(deny_only.parse("Y"), None);
         assert_eq!(deny_only.parse("y"), None);
-    }
-
-    #[test]
-    fn aliases_are_not_rendered_in_terminal_text() {
-        assert!(!confirm().terminal_text().contains('Y'));
-        assert!(!confirm().terminal_text().contains('N'));
     }
 
     #[test]

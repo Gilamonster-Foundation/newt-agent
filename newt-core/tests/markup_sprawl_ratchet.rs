@@ -115,12 +115,15 @@ const CATEGORIES: &[Category] = &[
         name: "question construction sites",
         count: |f| count_any(&f.squeezed, &["Question{", "Question::<"]),
         baseline: &[
-            // B0a (#1841) ratcheted this from 2 to 1. The row that went is
-            // `permission_question_for`'s literal, now built as an
-            // InteractionDefinition and rendered through the adapter. The
-            // row that REMAINS is `prompt_user_input` (:221) — a free-text
-            // form with no actions, D0's territory, not B0's.
-            ("newt-tui/src/permissions.rs", 1),
+            // B0a (#1841) ratcheted newt-tui/src/permissions.rs from 2 to 1
+            // (`permission_question_for`'s literal became an
+            // InteractionDefinition). **C0a (#1856) ratcheted it 1 -> 0 and
+            // the row is gone**: the survivor was `prompt_user_input`'s
+            // actionless free-text form, and deleting `Question::terminal_text`
+            // left it with nothing to render through, so it became an
+            // `InteractionDefinition` too. Only its RENDERING moved —
+            // migrating the free-text INTERACTION onto the controller is
+            // still D0's.
             // STAYS. `mutation_confirm_question` backs a `--yolo` confirm
             // over a plain `&str`, not a permission decision; no slice of
             // this epic deletes it.
@@ -128,15 +131,29 @@ const CATEGORIES: &[Category] = &[
             // A2.2's adapter (#1828): the one entry here that is not a
             // duplicate to migrate. It assembles a Question BY DEFINITION,
             // reconstructing the legacy type from an InteractionDefinition.
-            // As of B0a it is a PERMANENT PRODUCTION DEPENDENCY, not a
-            // proof-only artifact — `terminal_text()` lives on Question and
-            // has no counterpart in newt-interaction until C0 extracts
-            // rendering. `b0a::the_definition_path_is_reached_from_both_
-            // surfaces` (newt-core/tests/adapter.rs) now holds the line
-            // that BOTH surfaces reach it, replacing A2.2's
-            // `no_production_path_uses_the_adapter_yet`.
             //
-            // CORRECTION (B0a): the previous comment here claimed B0 would
+            // **C0a (#1856) did NOT move this row, and the reason is worth
+            // recording.** C0a's brief expected 1 -> 0 on the theory that
+            // extracting rendering would leave `definition_to_question`
+            // with no production caller. That was true when the C0
+            // inventory was taken (origin/main 24e72545); B0b-2 (#1846)
+            // then landed `interaction_offer::PendingOffer::question`,
+            // which reconstructs the legacy form so `newt-web` can build
+            // its permission card (newt-web/src/shell.rs) and decode a
+            // submitted verdict (newt-web/src/main.rs). C0a removed BOTH
+            // terminal callers; the remaining one is the WEB's model
+            // reconstruction, and deleting that is C3's named deletion
+            // gate ("remove permission-card-specific model reconstruction
+            // and the second independent Markdown option matrix"), not a
+            // rendering slice's.
+            //
+            // So this row goes to 0 in C3. Reaching 0 in C0a would have
+            // meant rewriting the web card — which is the other half of
+            // the sprawl this ratchet exists to make visible, and gaming
+            // the needle instead would be the vacuous-green shape the
+            // header warns about.
+            //
+            // CORRECTION (B0a): an earlier comment here claimed B0 would
             // delete "the two rows above". That was wrong on both counts —
             // permissions.rs goes to 1, not 0, and tools.rs does not move
             // at all.

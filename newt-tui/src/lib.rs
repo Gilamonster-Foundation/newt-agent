@@ -15058,10 +15058,11 @@ mod disable_ocap_session_tests {
             web_decision_timeout: std::time::Duration::from_secs(2),
             cancel: None,
             exit: None,
-            ask_human: |_w: &newt_core::tty::PromptWindow,
-                        _question: &newt_core::Question<PromptChoice>| {
-                PromptChoice::AllowOnce
-            },
+            ask_human:
+                |_w: &newt_core::tty::PromptWindow,
+                 _definition: &newt_interaction::InteractionDefinition| {
+                    PromptChoice::AllowOnce
+                },
         };
 
         let out = execute_tool(
@@ -15112,10 +15113,11 @@ mod disable_ocap_session_tests {
             web_decision_timeout: std::time::Duration::from_secs(2),
             cancel: None,
             exit: None,
-            ask_human: |_w: &newt_core::tty::PromptWindow,
-                        _question: &newt_core::Question<PromptChoice>| {
-                PromptChoice::AllowOnce
-            },
+            ask_human:
+                |_w: &newt_core::tty::PromptWindow,
+                 _definition: &newt_interaction::InteractionDefinition| {
+                    PromptChoice::AllowOnce
+                },
         };
         let out = execute_tool(
             "read_file",

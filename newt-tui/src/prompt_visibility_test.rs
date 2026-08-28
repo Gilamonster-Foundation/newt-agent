@@ -7,7 +7,7 @@ use tests_pty::Pty;
 
 use crate::danger;
 use crate::permissions::{
-    prompt_permission_choice, question_for, PermissionPromptState, PromptPermissionGate,
+    permission_definition, prompt_permission_choice, PermissionPromptState, PromptPermissionGate,
 };
 use newt_core::caveats::{Caveats, CountBound, Scope};
 use newt_core::tty::{LineCaps, Sink, Spinner, MODAL_INPUT_GLYPH};
@@ -86,12 +86,12 @@ fn prompt_scenario_child() {
 
     if controls {
         let window = newt_core::tty::Terminal::suspend_for_prompt();
-        let question = question_for(
+        let definition = permission_definition(
             &web_fetch_request("example.com"),
             &danger::DangerTable::builtin(),
             newt_interaction::Audience::Terminal,
         );
-        let choice = prompt_permission_choice(&window, &question);
+        let choice = prompt_permission_choice(&window, &definition);
         drop(window);
         println!("PROMPT-CONTROL:{choice:?}");
         return;
@@ -300,12 +300,14 @@ fn a_permission_prompt_is_visible_and_survives_a_live_spinner() {
         .unwrap_or_else(|| panic!("keystroke not echoed; screen={screen:?}"));
     let window = &screen[prompt_start..prompt_start + echo_rel];
 
-    let expected_prompt = question_for(
+    // C0a (#1856): the expectation is re-derived from the production
+    // renderer, so this real-PTY grounding tracks `plain::render` rather
+    // than a copy of its output.
+    let expected_prompt = newt_core::markup::plain::render(&permission_definition(
         &web_fetch_request("example.com"),
         &danger::DangerTable::builtin(),
         newt_interaction::Audience::Terminal,
-    )
-    .terminal_text();
+    ));
 
     let window_lf = window.replace("\r\n", "\n");
     assert!(
