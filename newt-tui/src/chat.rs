@@ -1548,8 +1548,7 @@ fn session_body(
     // B0b-1 (#1842): the fence the gate checks an answer against. Derived
     // the same way the store derives its own, and supplied to the
     // authorizer INDEPENDENTLY of the offer being checked.
-    permission_state.workspace_key =
-        newt_core::ConversationStore::workspace_id_for_path(workspace).unwrap_or_default();
+    permission_state.workspace_key = newt_core::workspace_key_v2(workspace).unwrap_or_default();
     // Track O (#1131): load the durable OCAP policy from `~/.newt/ocap/*.toml`
     // (beside the config file). The gate consults it before prompting — a
     // durable deny refuses, a durable approve pre-answers (danger-gated). A

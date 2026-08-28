@@ -341,11 +341,6 @@ mod b0a {
             why: "and must render it through the adapter, not a second renderer",
         },
         Link {
-            caller: "permission_question",
-            needle: "question_for(",
-            why: "the TERMINAL surface must route through the definition path",
-        },
-        Link {
             caller: "await_web_decision",
             needle: "question_for(",
             why: "the WEB surface must route through the definition path",
@@ -395,7 +390,7 @@ mod b0a {
         // ...and the surfaces must each name their OWN audience, so a
         // switch that routed both through one hard-coded audience is a
         // failure rather than a pass.
-        let terminal = function_body(&lines, "permission_question").expect("terminal entry point");
+        let terminal = function_body(&lines, "ask").expect("terminal entry point");
         assert!(
             terminal.contains("Audience::Terminal"),
             "the terminal entry point does not select the Terminal audience"
@@ -409,11 +404,7 @@ mod b0a {
         // The old builder is gone from the switched functions: a
         // surviving `Question {` literal there is the duplicate string
         // builder B0a deletes.
-        for caller in [
-            "permission_question",
-            "question_for",
-            "permission_definition",
-        ] {
+        for caller in ["question_for", "permission_definition"] {
             let body = function_body(&lines, caller).expect("body");
             assert!(
                 !body.contains("Question {"),
@@ -508,12 +499,15 @@ mod b0a {
     #[test]
     fn a_one_surface_switch_does_not_satisfy_the_guard() {
         let half_switched: Vec<String> = [
-            "fn permission_question(req: &R, danger: &D) -> Question<PromptChoice> {",
-            "    Question {",
+            // The TERMINAL surface never switched: `ask` still builds its
+            // own Question instead of the one definition.
+            "fn ask(&mut self, requests: &[R]) -> Decision {",
+            "    let q = Question {",
             "        markdown: format!(\"{} wants\", req.tool),",
             "        actions: vec![],",
             "        note: None,",
-            "    }",
+            "    };",
+            "    let choice = (self.ask_human)(&w, &q);",
             "}",
             "fn await_web_decision(&self, req: &R) -> (PromptChoice, &'static str) {",
             "    let question = question_for(req, &self.danger, Audience::Web);",
@@ -533,7 +527,7 @@ mod b0a {
         assert!(
             missing
                 .iter()
-                .any(|m| m.contains("permission_question") && m.contains("question_for(")),
+                .any(|m| m.contains("ask") && m.contains("permission_definition(")),
             "the guard did not notice that the TERMINAL surface never switched: {missing:#?}"
         );
         // The web half really is switched — so the guard is discriminating
@@ -545,7 +539,7 @@ mod b0a {
         // And the old builder survives in the unswitched function, which
         // the brace-depth body extraction must attribute to the right
         // function rather than to its neighbour.
-        let terminal = function_body(&half_switched, "permission_question").expect("body");
+        let terminal = function_body(&half_switched, "ask").expect("body");
         assert!(terminal.contains("Question {"));
         let web = function_body(&half_switched, "await_web_decision").expect("body");
         assert!(

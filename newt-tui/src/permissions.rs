@@ -250,21 +250,13 @@ const WIRE_NAMES_ARE_OPTION_IDS: &str =
 /// Hand-writing a second renderer over `InteractionDefinition` to avoid
 /// this call would be a new duplicate string builder tracked by no
 /// baseline — the exact sprawl the epic exists to delete.
-fn question_for(
+pub(crate) fn question_for(
     req: &newt_core::PermissionRequest,
     danger: &danger::DangerTable,
     audience: Audience,
 ) -> Question<PromptChoice> {
     definition_to_question(&permission_definition(req, danger, audience))
         .expect(WIRE_NAMES_ARE_OPTION_IDS)
-}
-
-/// Build the one typed form consumed by terminal and HTMX renderers.
-pub(crate) fn permission_question(
-    req: &newt_core::PermissionRequest,
-    danger: &danger::DangerTable,
-) -> Question<PromptChoice> {
-    question_for(req, danger, Audience::Terminal)
 }
 
 /// Facade P1b: the production [`danger::DangerTable`] — the built-in
@@ -1967,7 +1959,7 @@ mod permission_prompt_tests {
             (DenialKind::RemoteTool, "remote__tool", "call"),
             (DenialKind::GitWrite, "commit", "commit/stage via git"),
         ] {
-            let q = permission_question(
+            let q = question_for(
                 &PermissionRequest {
                     tool: "tool".into(),
                     kind,
@@ -1975,18 +1967,19 @@ mod permission_prompt_tests {
                     reason: String::new(),
                 },
                 &danger,
+                Audience::Terminal,
             );
             assert!(q.markdown.contains(&format!("{wording} `{target}`")));
         }
 
-        let low = permission_question(&exec_request("npm"), &danger);
+        let low = question_for(&exec_request("npm"), &danger, Audience::Terminal);
         assert!(low
             .actions
             .iter()
             .any(|a| a.value == PromptChoice::AllowSession));
         assert!(low.markdown.contains("outside the granted exec allowlist"));
 
-        let high = permission_question(
+        let high = question_for(
             &PermissionRequest {
                 tool: "request_permissions".into(),
                 kind: DenialKind::Exec,
@@ -1994,6 +1987,7 @@ mod permission_prompt_tests {
                 reason: "list the files".into(),
             },
             &danger,
+            Audience::Terminal,
         );
         assert!(!high
             .actions
@@ -2010,7 +2004,7 @@ mod permission_prompt_tests {
             assert!(text.contains(expected), "missing {expected:?}: {text}");
         }
 
-        let root = permission_question(
+        let root = question_for(
             &PermissionRequest {
                 tool: "request_permissions".into(),
                 kind: DenialKind::FsWrite,
@@ -2018,6 +2012,7 @@ mod permission_prompt_tests {
                 reason: String::new(),
             },
             &danger,
+            Audience::Terminal,
         );
         assert!(root.markdown.contains("filesystem root"));
         assert!(!root
@@ -2292,7 +2287,7 @@ mod permission_prompt_tests {
     #[test]
     fn permanent_allow_offered_for_net_only() {
         let danger = danger::DangerTable::builtin();
-        let net = permission_question(
+        let net = question_for(
             &PermissionRequest {
                 tool: "web_fetch".to_string(),
                 kind: DenialKind::Net,
@@ -2300,9 +2295,10 @@ mod permission_prompt_tests {
                 reason: String::new(),
             },
             &danger,
+            Audience::Terminal,
         )
         .terminal_text();
-        let exec = permission_question(&exec_request("npm"), &danger).terminal_text();
+        let exec = question_for(&exec_request("npm"), &danger, Audience::Terminal).terminal_text();
         assert!(
             net.contains("[A]llow permanently"),
             "net must offer it: {net}"
@@ -3415,7 +3411,11 @@ mod b0a {
         assert_eq!(adapted.parse("x"), None, "an ambiguous answer resolved");
 
         // And the real permission menu still parses its own keys.
-        let menu = permission_question(&net_low(), &danger::DangerTable::builtin());
+        let menu = question_for(
+            &net_low(),
+            &danger::DangerTable::builtin(),
+            Audience::Terminal,
+        );
         assert_eq!(menu.parse("a"), Some(PromptChoice::AllowOnce));
         assert_eq!(menu.parse("A"), Some(PromptChoice::AllowPermanent));
         assert_eq!(menu.parse("zzz"), None);
