@@ -690,10 +690,16 @@ mod tests {
             // nothing at all.
             let strike = ("~~struck~~", tui("~~struck~~"), web("~~struck~~"));
             if !strike.1.contains("\u{1b}[9m") {
-                problems.push(format!("[strikethrough] TUI did not style it:\n{}", strike.1));
+                problems.push(format!(
+                    "[strikethrough] TUI did not style it:\n{}",
+                    strike.1
+                ));
             }
             if !strike.2.contains("<del>") {
-                problems.push(format!("[strikethrough] WEB did not mark it:\n{}", strike.2));
+                problems.push(format!(
+                    "[strikethrough] WEB did not mark it:\n{}",
+                    strike.2
+                ));
             }
             let table_src = "| a | b |\n|---|---|\n| 1 | 2 |\n";
             if !tui(table_src).contains('\u{2500}') {
@@ -710,7 +716,11 @@ mod tests {
                 problems.push("[task lists] WEB left the raw marker".into());
             }
 
-            assert!(problems.is_empty(), "C3a conformance:\n{}", problems.join("\n\n"));
+            assert!(
+                problems.is_empty(),
+                "C3a conformance:\n{}",
+                problems.join("\n\n")
+            );
         }
 
         /// **The two sanctioned divergences, pinned so they cannot drift.**
@@ -965,7 +975,11 @@ mod tests {
                 "an inert scheme in a text node must not read as a leak"
             );
             // …and the corpus is not silently empty.
-            assert!(CORPUS.len() >= 30, "a corpus of {} is not a corpus", CORPUS.len());
+            assert!(
+                CORPUS.len() >= 30,
+                "a corpus of {} is not a corpus",
+                CORPUS.len()
+            );
             // Benign content in the same shapes still renders.
             for (src, want) in [
                 ("**bold**", "<strong>bold</strong>"),
