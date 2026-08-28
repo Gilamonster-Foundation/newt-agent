@@ -1827,7 +1827,14 @@ impl ConversationStore {
     }
 
     /// TTL for pending permission requests.
-    pub(crate) const PERMISSION_REQUEST_TTL_NANOS: i64 = 5 * 60 * 1_000_000_000;
+    /// How long a published permission request stays answerable.
+    ///
+    /// Public since B0b-1 (#1842): an interaction offer's `ttl_ticks` is
+    /// minted FROM this constant so the two wall clocks that used to drift
+    /// independently are one number, and
+    /// `b0b::the_gate_timeout_is_shorter_than_the_store_ttl` asserts the
+    /// gate's shorter timeout against it.
+    pub const PERMISSION_REQUEST_TTL_NANOS: i64 = 5 * 60 * 1_000_000_000;
 
     // Publish a typed permission form for the next prompt render.
     pub fn publish_permission_question(
@@ -1958,12 +1965,19 @@ impl ConversationStore {
             None => AnswerOutcome::Unknown,
             Some((_, _, created_tick, _)) if created_tick <= cutoff => AnswerOutcome::Unknown,
             Some((1, _, _, _)) | Some((_, Some(_), _, _)) => AnswerOutcome::AlreadyResolved,
+            // B0b-1 (#1842): the store's revalidation is now an
+            // AUTHORIZATION through `validate_response`, not a decode
+            // through `Question::parse`. Same fail-closed outcome for an
+            // undisplayed action; additionally refuses an action the gate
+            // never registered, and one this audience may not invoke.
             Some((_, None, _, questions_json))
                 if matches!(required_action, Some(action) if
-                    serde_json::from_str::<crate::Question<crate::PermissionAction>>(&questions_json)
-                        .ok()
-                        .and_then(|question| question.parse(action.as_str()))
-                            != Some(action)) =>
+                !crate::interaction_gate::web_answer_is_authorized(
+                    &questions_json,
+                    action,
+                    &self.workspace_id,
+                    conversation_id,
+                )) =>
             {
                 AnswerOutcome::InvalidAction
             }
