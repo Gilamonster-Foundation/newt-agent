@@ -1336,8 +1336,7 @@ mod tests {
             ],
             note: Some("High danger: session authorization is unavailable.".into()),
         };
-        let definition =
-            newt_core::interaction_adapter::question_to_definition(&question).unwrap();
+        let definition = newt_core::interaction_adapter::question_to_definition(&question).unwrap();
         let rid = store
             .publish_interaction_offer(
                 &conv,
@@ -1411,8 +1410,7 @@ mod tests {
             ],
             note: None,
         };
-        let definition =
-            newt_core::interaction_adapter::question_to_definition(&question).unwrap();
+        let definition = newt_core::interaction_adapter::question_to_definition(&question).unwrap();
         let rid = store
             .publish_interaction_offer(
                 &conv,
@@ -1491,9 +1489,7 @@ mod tests {
 
         // The terminal wins first (CAS 0->1); the browser's card is now stale.
         assert!(
-            store
-                .cancel_interaction_offer(&conv, &rid)
-                .unwrap(),
+            store.cancel_interaction_offer(&conv, &rid).unwrap(),
             "the terminal resolves the live request"
         );
 
@@ -1580,9 +1576,7 @@ mod tests {
             .await;
             assert_eq!(web, StatusCode::NO_CONTENT);
             assert!(
-                !store
-                    .cancel_interaction_offer(&conv, &rid)
-                    .unwrap(),
+                !store.cancel_interaction_offer(&conv, &rid).unwrap(),
                 "the terminal loses: the web answer already holds the verdict"
             );
             assert_eq!(
@@ -1599,9 +1593,7 @@ mod tests {
             let app = app();
             let (store, conv, rid) =
                 seed_followed_pending_decision(&app, state.path(), ws.path()).await;
-            assert!(store
-                .cancel_interaction_offer(&conv, &rid)
-                .unwrap());
+            assert!(store.cancel_interaction_offer(&conv, &rid).unwrap());
             let (web, _) = req(
                 &app,
                 "POST",
