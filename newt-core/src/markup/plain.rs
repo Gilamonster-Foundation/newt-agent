@@ -58,7 +58,7 @@
 //! default, is **C0b**. Nothing here is new behaviour: every byte this
 //! module emits is a byte the tree already emitted.
 
-use newt_interaction::{ChoiceOption, ControlKind, InteractionDefinition};
+use newt_interaction::{ChoiceOption, Control, ControlKind, InteractionDefinition};
 
 /// Options on one choices line are separated by three spaces.
 const CHOICE_SEPARATOR: &str = "   ";
@@ -75,27 +75,59 @@ pub fn render(definition: &InteractionDefinition) -> String {
         parts.push(note);
     }
 
-    // One line per choice control, in the definition's presentation order.
-    // Today every definition this renders carries exactly one, so this
-    // degenerates to the single line the predecessor produced; iterating
-    // rather than picking "the first" avoids inventing a rule about which
-    // control wins, which is a multi-control layout question and C0b's.
-    let choice_lines: Vec<String> = definition
+    // One line per control that has something to show, in the definition's
+    // presentation order. C0a emitted only `Choice`; C0b (#1860) gives every
+    // control kind a projection, because a form asking for a username
+    // rendered the operator no field at all.
+    let control_lines: Vec<String> = definition
         .controls
         .iter()
-        .filter_map(|control| match &control.kind {
-            ControlKind::Choice { options } => Some(choices_line(options)),
-            _ => None,
-        })
+        .filter_map(control_line)
         .filter(|line| !line.is_empty())
         .collect();
-    parts.extend(choice_lines.iter().map(String::as_str));
+    parts.extend(control_lines.iter().map(String::as_str));
 
     parts
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// What one control contributes to the plain form, if anything.
+///
+/// The match is EXHAUSTIVE rather than `_ => None`: a new [`ControlKind`]
+/// must fail to compile here instead of silently rendering nothing, which is
+/// the defect C0b exists to fix.
+///
+/// **An unlabelled control contributes no line**, and that rule is load
+/// bearing rather than cosmetic. Both frozen forms carry `label: ""` — the
+/// permission menu's decision control (its options carry the text) and
+/// `prompt_user_input`'s answer field (its question is the body) — so giving
+/// the other kinds an affordance cannot move A0's goldens or C0a's free-text
+/// bytes. `c0b::an_unlabelled_control_adds_no_line` pins it.
+fn control_line(control: &Control) -> Option<String> {
+    match &control.kind {
+        ControlKind::Choice { options } => Some(choices_line(options)),
+        ControlKind::Text => labelled_field(control, ""),
+        // `[y/n]`, never `[y/N]`. The house style elsewhere
+        // (`sas_confirm::confirm_prompt`) capitalizes the default, and this
+        // projection must advertise none: the epic's global acceptance
+        // criterion is that headless modes never CHOOSE A DEFAULT, and a
+        // rendered default is how one gets chosen by accident.
+        ControlKind::Toggle => labelled_field(control, " [y/n]"),
+        // A secret shows its LABEL and never its value (ADR D1). The value
+        // cannot leak here by construction — `ControlKind::Secret` carries
+        // none, and a submitted secret travels as `ControlValue::Secret {
+        // reference }` on the RESPONSE, which this renderer never sees. The
+        // marker exists so no surface treats the field as ordinary text.
+        ControlKind::Secret => labelled_field(control, " (secret, not echoed)"),
+    }
+}
+
+/// `{label}:{suffix}`, or nothing when the control has no label.
+fn labelled_field(control: &Control, suffix: &str) -> Option<String> {
+    (!control.label.is_empty()).then(|| format!("{}:{suffix}", control.label))
 }
 
 /// One control's options as a single line.
@@ -296,5 +328,203 @@ mod tests {
             },
         ]);
         assert_eq!(render(&d), "body\n[a]a\n[b]b");
+    }
+}
+
+/// **C0b (#1860): the plain projection is the conformance baseline for every
+/// interaction kind and every control kind.**
+///
+/// C0a proved ONE kind (`Choice`) byte-identical to its predecessor. These
+/// tests state the projection for the other four and for the three control
+/// kinds that previously rendered nothing, so "plain fallback" is a defined
+/// contract rather than whatever falls out of the `filter_map`.
+#[cfg(test)]
+mod c0b {
+    use super::*;
+    use newt_interaction::{
+        Control, ControlId, InteractionKind, OptionId, Requirement, SemanticRole,
+    };
+
+    fn control(id: &str, kind: ControlKind, label: &str) -> Control {
+        Control {
+            id: ControlId::new(id).expect("valid control id"),
+            kind,
+            label: label.to_string(),
+            requirement: Requirement::Required,
+        }
+    }
+
+    fn choice_of(pairs: &[(&str, &str, &str)]) -> ControlKind {
+        ControlKind::Choice {
+            options: pairs
+                .iter()
+                .map(|(id, key, label)| ChoiceOption {
+                    id: OptionId::new(*id).expect("valid option id"),
+                    role: SemanticRole::Allow,
+                    label: (*label).to_string(),
+                    key: (*key).to_string(),
+                    aliases: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn definition(
+        kind: InteractionKind,
+        body: &str,
+        controls: Vec<Control>,
+    ) -> InteractionDefinition {
+        InteractionDefinition::new(kind, body, controls)
+    }
+
+    /// **Every `InteractionKind` has a proven plain projection.**
+    ///
+    /// One representative definition per kind, asserted to exact bytes. The
+    /// kind is SEMANTIC — it does not branch the renderer (ADR: `modal` is a
+    /// view decision, not a kind) — so what this pins is that each kind's
+    /// natural shape projects to something a plain surface can print, and
+    /// that `Notice` in particular is defined rather than incidental.
+    #[test]
+    fn every_interaction_kind_has_a_plain_projection() {
+        let cases: Vec<(InteractionKind, InteractionDefinition, &str)> = vec![
+            (
+                InteractionKind::Choice,
+                definition(
+                    InteractionKind::Choice,
+                    "pick one",
+                    vec![control(
+                        "decision",
+                        choice_of(&[("a", "a", "allow once"), ("d", "d", "deny")]),
+                        "",
+                    )],
+                ),
+                "pick one\n[a]llow once   [d]eny",
+            ),
+            (
+                InteractionKind::Prompt,
+                definition(
+                    InteractionKind::Prompt,
+                    "? which file",
+                    vec![control("answer", ControlKind::Text, "path")],
+                ),
+                "? which file\npath:",
+            ),
+            (
+                InteractionKind::Confirm,
+                definition(
+                    InteractionKind::Confirm,
+                    "delete it?",
+                    vec![control("confirm", ControlKind::Toggle, "delete")],
+                ),
+                "delete it?\ndelete: [y/n]",
+            ),
+            (
+                InteractionKind::Form,
+                definition(
+                    InteractionKind::Form,
+                    "credentials",
+                    vec![
+                        control("user", ControlKind::Text, "username"),
+                        control("pass", ControlKind::Secret, "API key"),
+                    ],
+                ),
+                "credentials\nusername:\nAPI key: (secret, not echoed)",
+            ),
+            (
+                InteractionKind::Notice,
+                // A Notice carries NO controls and expects no response. Its
+                // projection is the body (and note); stated here so it is a
+                // contract rather than a consequence of an empty vector.
+                definition(InteractionKind::Notice, "the build finished", Vec::new()),
+                "the build finished",
+            ),
+        ];
+        assert_eq!(cases.len(), 5, "a kind was added without a projection");
+        for (kind, def, expected) in cases {
+            assert_eq!(render(&def), expected, "{kind:?} projected wrongly");
+        }
+    }
+
+    /// **Every `ControlKind` renders.** Before C0b only `Choice` did; `Text`,
+    /// `Toggle`, and `Secret` contributed nothing, so a form asking for a
+    /// username showed the operator no field at all.
+    #[test]
+    fn every_control_kind_renders() {
+        for (kind, expected) in [
+            (ControlKind::Text, "body\nfield:"),
+            (ControlKind::Toggle, "body\nfield: [y/n]"),
+            (ControlKind::Secret, "body\nfield: (secret, not echoed)"),
+        ] {
+            let def = definition(
+                InteractionKind::Form,
+                "body",
+                vec![control("c", kind.clone(), "field")],
+            );
+            assert_eq!(render(&def), expected);
+        }
+        // Choice is covered by the A0 goldens; asserted here too so the set
+        // is visibly exhaustive.
+        let def = definition(
+            InteractionKind::Choice,
+            "body",
+            vec![control("c", choice_of(&[("y", "y", "yes")]), "")],
+        );
+        assert_eq!(render(&def), "body\n[y]es");
+    }
+
+    /// **A `Secret` renders its LABEL and never its value**, and says so in a
+    /// form that does not invite an echo (ADR D1). The value cannot leak by
+    /// construction — `ControlKind::Secret` is a unit variant carrying no
+    /// value, and a submitted secret travels as `ControlValue::Secret {
+    /// reference }` in the RESPONSE, which this renderer never sees. This
+    /// test pins the label half and the no-echo wording.
+    #[test]
+    fn a_secret_renders_its_label_and_marks_itself_unechoed() {
+        let def = definition(
+            InteractionKind::Form,
+            "auth",
+            vec![control("k", ControlKind::Secret, "API key")],
+        );
+        let out = render(&def);
+        assert_eq!(out, "auth\nAPI key: (secret, not echoed)");
+        assert!(out.contains("API key"), "the label must be shown: {out}");
+        assert!(
+            out.contains("not echoed"),
+            "a secret field must say it is not echoed: {out}"
+        );
+    }
+
+    /// **An empty label contributes no line.** This is what keeps A0's frozen
+    /// goldens and C0a's free-text assertion byte-identical: the permission
+    /// menu's decision control and `prompt_user_input`'s answer field both
+    /// carry `label: ""`, so giving the other control kinds an affordance
+    /// cannot move either one's bytes.
+    #[test]
+    fn an_unlabelled_control_adds_no_line() {
+        for kind in [ControlKind::Text, ControlKind::Toggle, ControlKind::Secret] {
+            let def = definition(
+                InteractionKind::Prompt,
+                "? ask",
+                vec![control("c", kind, "")],
+            );
+            assert_eq!(render(&def), "? ask");
+        }
+    }
+
+    /// **The projection never implies a default.** The epic's C0 bullet says
+    /// headless "never ... chooses a default"; a rendered `[y/N]` (the
+    /// `sas_confirm` house style, where the capital marks the default) would
+    /// advertise one the model does not carry.
+    #[test]
+    fn a_toggle_advertises_no_default() {
+        let def = definition(
+            InteractionKind::Confirm,
+            "go?",
+            vec![control("c", ControlKind::Toggle, "proceed")],
+        );
+        let out = render(&def);
+        assert!(out.contains("[y/n]"), "{out}");
+        assert!(!out.contains("[y/N]"), "a default was advertised: {out}");
+        assert!(!out.contains("[Y/n]"), "a default was advertised: {out}");
     }
 }
