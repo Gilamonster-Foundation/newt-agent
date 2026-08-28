@@ -487,7 +487,17 @@ symbol = "tool_round_cap_tests::ollama_chat_malformed_xml_is_bounded_to_two_nudg
 # deliberately not referenced here.
 
 [BHV-PROMPT-001]
-description = "Only a displayed action can authorize: an action absent from the published form is rejected by the parser, the store revalidation, and the web route — and the request stays pending."
+# B0b-1 (#1842) SPLIT this claim rather than leaving it overstated. The
+# property still holds end to end, but it is now enforced in two places by
+# two different mechanisms, and only one of them is what NewtPolicy.PromptForm
+# models. `Question::parse` still runs and still refuses to SELECT an action
+# the form does not carry — that is the half these Lean theorems govern, and
+# it is still live code. The store revalidation no longer decides by parsing:
+# it authorizes through `validate_response`, which is BHV-INTERACTION-001's
+# claim, backed by NewtInteraction.Binding. The production ref to
+# `answer_permission_action` moved there accordingly, so no contract claims a
+# theorem it does not have.
+description = "Only a displayed action can be SELECTED: an action absent from the published form is rejected by the parser, and an alias never widens the action set. Authorization of the selected action is BHV-INTERACTION-001."
 [BHV-PROMPT-001.status]
 lean = "proven"
 rust = "tested"
@@ -512,9 +522,6 @@ symbol = "tests::permission_channel_publish_answer_take_race_and_fence"
 [[BHV-PROMPT-001.refs.rust_tests]]
 path = "newt-web/src/main.rs"
 symbol = "tests::attach_tab_renders_and_answers_a_danger_gated_permission_decision"
-[[BHV-PROMPT-001.refs.production]]
-path = "newt-core/src/store.rs"
-symbol = "answer_permission_action"
 [[BHV-PROMPT-001.refs.production]]
 path = "newt-core/src/tty/widgets/question.rs"
 symbol = "parse"
@@ -612,7 +619,12 @@ path = "newt-tui/src/permissions.rs"
 symbol = "permission_prompt_tests::reader_failing_until_deadline_denies_without_busy_spin"
 
 [BHV-PROMPT-005]
-description = "TUI and web render and accept decisions from ONE serialized Question form: the wire actions are the rendered actions on both surfaces; aliases parse but are never rendered and never widen the action set."
+# B0a (#1841) made both surfaces build ONE InteractionDefinition and render it
+# through the A2.2 adapter; B0b-1 (#1842) moved ACCEPTING onto the controller.
+# So the rendering half of this claim is stronger than when it was written, and
+# the accepting half now belongs to BHV-INTERACTION-001/002. Reworded rather
+# than left to read as though `Question::parse` still decides.
+description = "TUI and web render decisions from ONE definition, serialized through one Question form: the wire actions are the rendered actions on both surfaces; aliases parse but are never rendered and never widen the action set. Accepting the answer is BHV-INTERACTION-001/002."
 [BHV-PROMPT-005.status]
 lean = "none"
 rust = "tested"
@@ -1004,8 +1016,12 @@ symbol = "tool_round_cap_tests::responses_final_summary_is_proactively_compacted
 # per-response decision kernel (`NewtInteraction.Binding`); TLC models the
 # surrounding lifecycle and the N-way race (`InteractionLifecycle`).
 #
-# These do NOT replace BHV-PROMPT-001..005, which remain accurate for as long as
-# `Question::parse` decides. #1842 moves that decision onto `validate_response`.
+# As of B0b-1 (#1842) these DO carry the accept/deny claim for the live
+# permission path: `validate_response` decides on both surfaces.
+# BHV-PROMPT-001/005 were narrowed in the same slice to the properties
+# `Question::parse` still owns — decoding a keystroke to a candidate action,
+# alias and ambiguity rules, and the one-form rendering guarantee — so no
+# contract claims a theorem that no longer governs its code.
 
 [BHV-INTERACTION-001]
 description = "A response is accepted only when EVERY binding it claims matched — definition, instance, revision, digest, control set, control types, and audience — and validation is atomic: one failing control accepts nothing."
@@ -1036,6 +1052,16 @@ symbol = "binding::a_response_to_a_stale_revision_is_refused"
 [[BHV-INTERACTION-001.refs.production]]
 path = "newt-interaction/src/binding.rs"
 symbol = "validate_response"
+# B0b-1 (#1842): the live permission path. `authorize_action` expresses one
+# decoded action as a Response and accepts it only if `validate_response`
+# does; `answer_permission_action` is the web surface's call into it, and was
+# BHV-PROMPT-001's ref until this slice moved the decision.
+[[BHV-INTERACTION-001.refs.production]]
+path = "newt-core/src/interaction_gate.rs"
+symbol = "authorize_action"
+[[BHV-INTERACTION-001.refs.production]]
+path = "newt-core/src/store.rs"
+symbol = "answer_permission_action"
 
 [BHV-INTERACTION-002]
 description = "An action resolves only to a caller-registered handler, and only for an audience that registration admits: an unregistered action never resolves, and an ineligible audience is refused even when the surface displayed the action."
