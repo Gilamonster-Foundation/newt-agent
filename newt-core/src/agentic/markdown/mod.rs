@@ -26,7 +26,6 @@ mod width;
 pub use stream::MarkdownStreamWriter;
 
 use emitter::Emitter;
-use pulldown_cmark::Parser;
 
 /// Rendering inputs. `cols` is injected by the caller (the TUI passes
 /// `term_cols()`); the renderer never probes the terminal itself, keeping it
@@ -46,7 +45,7 @@ pub fn render_markdown(src: &str, opts: RenderOpts) -> String {
     if !opts.color {
         return src.to_string();
     }
-    let parser = Parser::new_ext(src, crate::markup::dialect::canonical_options());
+    let parser = crate::markup::dialect::parse(src);
     let mut em = Emitter::new(opts.cols);
     for ev in parser {
         em.handle(ev);

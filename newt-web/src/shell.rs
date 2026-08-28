@@ -17,16 +17,24 @@ pub(crate) fn escape(s: &str) -> String {
 
 /// Render message text as Markdown → sanitized HTML.
 ///
-/// Matches Scrybe's `scrybe-render` (pulldown-cmark, all extensions) so the
-/// transcript reads the way the rest of the toolchain renders Markdown — but
-/// adds the step Scrybe deliberately skips: the transcript carries UNTRUSTED
-/// model/user text, so the generated HTML is run through an `ammonia` allowlist
-/// before it reaches the page. `ammonia` drops `<script>`/`<style>`, event-
-/// handler attributes, and `javascript:`/`data:` URLs, so a model reply cannot
-/// smuggle script into the cockpit. Soft line breaks become hard breaks so
-/// chat text keeps its newlines instead of Markdown-collapsing them.
+/// Parses in the ONE Newt Markup dialect (`newt_core::markup::dialect::parse`)
+/// — the same events the ANSI scroller sees, so the two surfaces cannot drift.
+/// Before C3a (#1857) this site chose `Options::all()` to match Scrybe's
+/// `scrybe-render`; that matrix silently swallowed newt's own `+++` envelope
+/// and re-punctuated text the model is re-sent verbatim, so it is gone. See
+/// the dialect module for the full reasoning and the two sanctioned
+/// rendering-side divergences.
+///
+/// The transcript carries UNTRUSTED model, tool, and docked-peer text
+/// (epic law 11), so the generated HTML is run through an `ammonia` allowlist
+/// before it reaches the page: `<script>`/`<style>`, event-handler attributes,
+/// and `javascript:`/`data:` URLs are dropped. The corpus in
+/// `tests::c3a_xss` is what keeps that claim honest.
+///
+/// Soft line breaks become hard breaks so chat text keeps its newlines — one
+/// of the two divergences the dialect module names, not a second dialect.
 pub(crate) fn render_markdown(src: &str) -> String {
-    use pulldown_cmark::{html, CodeBlockKind, Event, Parser, Tag, TagEnd};
+    use pulldown_cmark::{html, CodeBlockKind, Event, Tag, TagEnd};
 
     // SANITIZE FIRST, THEN WRAP (#1848). The extension marker is built
     // AFTER `ammonia` has run and is never present in its input, so it
@@ -59,7 +67,7 @@ pub(crate) fn render_markdown(src: &str) -> String {
         out.push_str(&sanitize(&raw));
     };
 
-    for event in Parser::new_ext(src, newt_core::markup::dialect::web_enhancement_options()) {
+    for event in newt_core::markup::dialect::parse(src) {
         // Collecting a diagram: its body is TEXT, kept verbatim for escaping.
         if let Some(source) = diagram.as_mut() {
             match event {
@@ -558,5 +566,430 @@ mod tests {
         assert!(!out.contains("alert(3)"), "script body dropped: {out}");
         assert!(!out.contains("onerror"), "event handler stripped: {out}");
         assert!(!out.contains("javascript:"), "js url stripped: {out}");
+    }
+
+    /// **C3a (#1857): the TUI/web dialect conformance pairs.**
+    ///
+    /// The A0 inventory's §5.7 gap, closed: *"no test pins the TUI-vs-web
+    /// dialect divergence (extension set / soft-break policy)."* Both
+    /// surfaces are driven over the SAME source and the relationship
+    /// between their outputs is asserted — the parts that must agree
+    /// because they are one dialect, and the two parts that are allowed to
+    /// differ because they are one dialect projected into two media.
+    ///
+    /// This is the test that makes "one dialect" checkable rather than
+    /// aspirational. The ratchet in `newt-core/tests/markup_sprawl_ratchet.rs`
+    /// proves there is one option matrix in the SOURCE; this proves the two
+    /// surfaces actually behave like it.
+    mod c3a {
+        use super::render_markdown as web;
+
+        /// The terminal surface, at the settings the TUI uses for a reply.
+        fn tui(src: &str) -> String {
+            newt_core::agentic::render_markdown(
+                src,
+                newt_core::agentic::RenderOpts {
+                    color: true,
+                    cols: 80,
+                },
+            )
+        }
+
+        /// A construct outside the canonical extension set. Neither surface
+        /// may interpret it, and — ADR law 5 — its source text must stay
+        /// VISIBLE on both rather than being silently consumed.
+        struct Unrecognized {
+            what: &'static str,
+            src: &'static str,
+            /// Text that must survive, legibly, on both surfaces.
+            visible: &'static str,
+        }
+
+        /// Every extension `Options::all()` used to switch on for the web
+        /// and the canonical dialect does not.
+        const OUTSIDE_THE_DIALECT: &[Unrecognized] = &[
+            // The decisive pair. Newt Markup's `+++` envelope has a
+            // sanctioned grammar (`newt_core::markup::strip_newt_metadata`).
+            // pulldown's metadata-block extension is a SECOND, competing
+            // implementation of it that `push_html` renders as NOTHING
+            // (`in_non_writing_block`), so an envelope vanished from the web
+            // transcript while the terminal showed it. Silent, and
+            // disagreeing with the splitter A1 shipped.
+            Unrecognized {
+                what: "+++ envelope (pulldown's metadata block, not newt's)",
+                src: "+++\ntitle = \"pinned\"\n+++\n\nbody text\n",
+                visible: "pinned",
+            },
+            Unrecognized {
+                what: "--- envelope (YAML-style metadata block)",
+                src: "---\ntitle: pinned\n---\n\nbody text\n",
+                visible: "pinned",
+            },
+            Unrecognized {
+                what: "footnotes",
+                src: "claim[^1]\n\n[^1]: the note\n",
+                visible: "[^1]",
+            },
+            Unrecognized {
+                what: "heading attributes",
+                src: "# Title {#custom-anchor}\n",
+                visible: "{#custom-anchor}",
+            },
+            Unrecognized {
+                what: "math",
+                src: "the value $x^2 + 1$ here\n",
+                visible: "$x^2 + 1$",
+            },
+            Unrecognized {
+                what: "definition lists",
+                src: "term\n\n: the definition\n",
+                visible: ": the definition",
+            },
+        ];
+
+        /// **Extensions outside the dialect are inert on BOTH surfaces.**
+        #[test]
+        fn the_dialect_conformance_pairs_agree() {
+            let mut problems = Vec::new();
+
+            for case in OUTSIDE_THE_DIALECT {
+                let (t, w) = (tui(case.src), web(case.src));
+                if !t.contains(case.visible) {
+                    problems.push(format!(
+                        "[{}] TUI dropped {:?}:\n{t}",
+                        case.what, case.visible
+                    ));
+                }
+                if !w.contains(case.visible) {
+                    problems.push(format!(
+                        "[{}] WEB dropped {:?} — the surfaces disagree, so \
+                         this is a second dialect:\n{w}",
+                        case.what, case.visible
+                    ));
+                }
+            }
+
+            // Smart punctuation is its own case: nothing is dropped, the
+            // BYTES are rewritten. The canonical dialect excludes it for
+            // exactly that reason — the transcript is re-sent to the model
+            // verbatim, so the view must not quietly re-punctuate it.
+            let punct = "she said \"go\" -- then left...\n";
+            for (surface, out) in [("TUI", tui(punct)), ("WEB", web(punct))] {
+                for rewritten in ['\u{201c}', '\u{201d}', '\u{2013}', '\u{2026}'] {
+                    if out.contains(rewritten) {
+                        problems.push(format!(
+                            "[smart punctuation] {surface} rewrote {rewritten:?} \
+                             into the text; the canonical dialect keeps bytes:\n{out}"
+                        ));
+                    }
+                }
+            }
+
+            // The three canonical extensions ARE live on both — otherwise
+            // "they agree" could be satisfied by a renderer that interprets
+            // nothing at all.
+            let strike = ("~~struck~~", tui("~~struck~~"), web("~~struck~~"));
+            if !strike.1.contains("\u{1b}[9m") {
+                problems.push(format!(
+                    "[strikethrough] TUI did not style it:\n{}",
+                    strike.1
+                ));
+            }
+            if !strike.2.contains("<del>") {
+                problems.push(format!(
+                    "[strikethrough] WEB did not mark it:\n{}",
+                    strike.2
+                ));
+            }
+            let table_src = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+            if !tui(table_src).contains('\u{2500}') {
+                problems.push("[tables] TUI did not draw a table".into());
+            }
+            if !web(table_src).contains("<table>") {
+                problems.push("[tables] WEB did not build a table".into());
+            }
+            let task_src = "- [x] done\n";
+            if !tui(task_src).contains('\u{2713}') {
+                problems.push("[task lists] TUI did not mark the item".into());
+            }
+            if web(task_src).contains("[x]") {
+                problems.push("[task lists] WEB left the raw marker".into());
+            }
+
+            assert!(
+                problems.is_empty(),
+                "C3a conformance:\n{}",
+                problems.join("\n\n")
+            );
+        }
+
+        /// **The two sanctioned divergences, pinned so they cannot drift.**
+        ///
+        /// One dialect, two media. These are the only places the surfaces
+        /// are allowed to differ, and naming them here is what stops a
+        /// third difference appearing as "well, the web already differs".
+        #[test]
+        fn the_sanctioned_divergences_are_exactly_two() {
+            // 1. Soft breaks. CommonMark folds them; chat text uses single
+            //    newlines meaningfully, so the web keeps them as <br> while
+            //    the scroller — which has real lines — folds to a space.
+            let soft = "alpha\nbravo";
+            assert!(
+                tui(soft).contains("alpha bravo"),
+                "TUI folds a soft break: {}",
+                tui(soft)
+            );
+            assert!(
+                web(soft).contains("<br"),
+                "web keeps a soft break: {}",
+                web(soft)
+            );
+
+            // 2. Raw HTML. A scroller has no DOM, so it prints markup as
+            //    literal text and executes nothing. A page HAS a DOM, so it
+            //    must remove what it will not execute. Same event, opposite
+            //    correct handling.
+            let raw = "<script>alert(1)</script>";
+            assert!(
+                tui(raw).contains("<script>"),
+                "TUI shows raw HTML as text: {}",
+                tui(raw)
+            );
+            assert!(
+                !web(raw).contains("<script"),
+                "web sanitizes raw HTML: {}",
+                web(raw)
+            );
+        }
+    }
+
+    /// **C3a (#1857): a real XSS corpus, not one case.**
+    ///
+    /// Before this the web surface had three vectors, written twice. The
+    /// transcript carries model output, tool output, and — over a dock — a
+    /// remote peer's transcript, all of which are untrusted authored markup
+    /// (epic law 11). A sanitizer is only as good as the corpus that keeps
+    /// it honest, and a corpus of three proves almost nothing about a
+    /// tag-based allowlist.
+    ///
+    /// Every vector is run through one shared battery, so adding a vector
+    /// costs one line and inherits every check.
+    #[cfg(test)]
+    mod c3a_xss {
+        use super::render_markdown;
+
+        struct Vector {
+            what: &'static str,
+            src: &'static str,
+        }
+
+        /// Elements that must never appear in the output at all.
+        ///
+        /// A raw-substring check is already correct for these: sanitized
+        /// text nodes escape `<` to `&lt;`, so a surviving `<script` can
+        /// only be a real element.
+        const FORBIDDEN_ELEMENTS: &[&str] = &[
+            // Script execution containers.
+            "<script",
+            "<iframe",
+            "<object",
+            "<embed",
+            "<template",
+            "<noscript",
+            // Style/behaviour injection and document-level rewrites.
+            "<style",
+            "<base",
+            "<meta",
+            "<link",
+            "<form",
+            // Foreign content: the classic mXSS reparsing surface.
+            "<svg",
+            "<math",
+        ];
+
+        /// Substrings that must never appear **inside a tag**.
+        ///
+        /// Attribute position is the whole question. Text nodes are escaped
+        /// by construction, so `javascript:` sitting in prose is inert — and
+        /// checking the whole document instead is what makes two harmless
+        /// outputs look like leaks: `<javascript:alert(1)>`, whose `href`
+        /// ammonia removed leaving the scheme as inert TEXT, and any vector
+        /// quoted inside a code fence, which must stay readable (law 5).
+        ///
+        /// The pre-existing web tests check the bare scheme against the
+        /// whole page and pass only because their three vectors happen to
+        /// lose the text too. That is the weaker property; this is the one
+        /// that means "no script-bearing attribute reached the DOM".
+        const FORBIDDEN_IN_TAGS: &[&str] = &[
+            // Script-bearing URL schemes.
+            "javascript:",
+            "vbscript:",
+            "data:text/html",
+            // Event handlers, by delivery not by name.
+            "onerror=",
+            "onload=",
+            "onclick=",
+            "onfocus=",
+            "onmouseover=",
+            "ontoggle=",
+            "onanimationstart=",
+            "onbegin=",
+            "onstart=",
+            // Attribute-borne script and framing.
+            "srcdoc=",
+            "formaction=",
+            "xlink:href=",
+            // The #1848/#1855 property: authored markup may never mint the
+            // client's enhancement marker. Sanitizing is not enough — the
+            // marker is appended AFTER the sanitizer, so it is absent from
+            // its input and forgery is unrepresentable rather than filtered.
+            // This corpus keeps that true as vectors are added.
+            "data-markdown-extension",
+        ];
+
+        /// Everything between `<` and `>` — every tag's attribute region.
+        ///
+        /// Deliberately strict in the safe direction: a needle appearing in
+        /// an allowlisted *data* attribute (a `title=`, say) would be
+        /// reported. For a corpus of chosen vectors that trade is right.
+        fn tag_regions(html: &str) -> String {
+            let mut out = String::new();
+            let mut rest = html;
+            while let Some(open) = rest.find('<') {
+                rest = &rest[open..];
+                let close = rest.find('>').map_or(rest.len(), |i| i + 1);
+                out.push_str(&rest[..close]);
+                out.push('\n');
+                rest = &rest[close..];
+            }
+            out
+        }
+
+        const CORPUS: &[Vector] = &[
+            Vector { what: "bare script tag", src: "<script>alert(1)</script>" },
+            Vector { what: "case-varied script tag", src: "<ScRiPt>alert(1)</ScRiPt>" },
+            Vector { what: "img event handler", src: "<img src=x onerror=alert(1)>" },
+            Vector { what: "svg onload", src: "<svg onload=alert(1)>" },
+            Vector { what: "svg animate xlink", src: "<svg><a xlink:href=\"javascript:alert(1)\"><text>x</text></a></svg>" },
+            Vector { what: "body onload", src: "<body onload=alert(1)>" },
+            Vector { what: "details ontoggle", src: "<details open ontoggle=alert(1)>x</details>" },
+            Vector { what: "markdown link, js scheme", src: "[x](javascript:alert(1))" },
+            Vector { what: "markdown link, case-varied scheme", src: "[x](JaVaScRiPt:alert(1))" },
+            Vector { what: "markdown link, entity-encoded scheme", src: "[x](&#106;avascript:alert(1))" },
+            Vector { what: "markdown link, vbscript", src: "[x](vbscript:msgbox(1))" },
+            Vector { what: "markdown link, data html", src: "[x](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)" },
+            Vector { what: "markdown image, js scheme", src: "![x](javascript:alert(1))" },
+            Vector { what: "reference link definition", src: "[x][ref]\n\n[ref]: javascript:alert(1)\n" },
+            Vector { what: "autolink, js scheme", src: "<javascript:alert(1)>" },
+            Vector { what: "anchor with handler", src: "<a href=\"#\" onclick=\"alert(1)\">x</a>" },
+            Vector { what: "iframe srcdoc", src: "<iframe srcdoc=\"&lt;script&gt;alert(1)&lt;/script&gt;\"></iframe>" },
+            Vector { what: "object data", src: "<object data=\"javascript:alert(1)\"></object>" },
+            Vector { what: "embed src", src: "<embed src=\"javascript:alert(1)\">" },
+            Vector { what: "base href rewrite", src: "<base href=\"https://evil.test/\">" },
+            Vector { what: "meta refresh", src: "<meta http-equiv=\"refresh\" content=\"0;url=javascript:alert(1)\">" },
+            Vector { what: "stylesheet link", src: "<link rel=\"stylesheet\" href=\"https://evil.test/x.css\">" },
+            Vector { what: "style block", src: "<style>body{background:url('javascript:alert(1)')}</style>" },
+            Vector { what: "form with formaction", src: "<form action=\"https://evil.test\"><button formaction=\"javascript:alert(1)\">go</button></form>" },
+            Vector { what: "mXSS via noscript title", src: "<noscript><p title=\"</noscript><img src=x onerror=alert(1)>\">" },
+            Vector { what: "mXSS via template", src: "<template><script>alert(1)</script></template>" },
+            Vector { what: "mXSS via math mglyph", src: "<math><mtext><table><mglyph><style><![CDATA[</style><img src=x onerror=alert(1)>" },
+            Vector { what: "mXSS via svg foreignObject", src: "<svg><foreignObject><div><script>alert(1)</script></div></foreignObject></svg>" },
+            Vector { what: "comment-wrapped script", src: "<!--><script>alert(1)</script>-->" },
+            Vector { what: "forged extension marker", src: "<pre class=\"mermaid\" data-markdown-extension=\"mermaid\">graph TD</pre>" },
+            Vector { what: "forged marker inside a table cell", src: "| a |\n|---|\n| <pre data-markdown-extension=\"mermaid\">graph TD</pre> |\n" },
+            Vector { what: "forged marker via code class", src: "<code class=\"mermaid\" data-markdown-extension=\"mermaid\">x</code>" },
+            Vector { what: "handler split across a soft break", src: "<img src=x\nonerror=alert(1)>" },
+            Vector { what: "handler inside a blockquote", src: "> <img src=x onerror=alert(1)>\n" },
+            Vector { what: "handler inside a list item", src: "- <img src=x onerror=alert(1)>\n" },
+            Vector { what: "nested emphasis around a handler", src: "*<img src=x onerror=alert(1)>*" },
+        ];
+
+        /// **Every vector, one battery.**
+        #[test]
+        fn the_xss_corpus_is_sanitised() {
+            let mut problems = Vec::new();
+            for v in CORPUS {
+                let out = render_markdown(v.src);
+                let doc = out.to_ascii_lowercase();
+                let tags = tag_regions(&doc);
+                for bad in FORBIDDEN_ELEMENTS {
+                    if doc.contains(bad) {
+                        problems.push(format!("[{}] leaked element {bad:?}:\n{out}", v.what));
+                    }
+                }
+                for bad in FORBIDDEN_IN_TAGS {
+                    if tags.contains(bad) {
+                        problems.push(format!("[{}] leaked attribute {bad:?}:\n{out}", v.what));
+                    }
+                }
+            }
+            assert!(
+                problems.is_empty(),
+                "{} XSS vector(s) survived sanitation:\n{}",
+                problems.len(),
+                problems.join("\n\n")
+            );
+        }
+
+        /// **A fenced block keeps its content as inert text.**
+        ///
+        /// The corpus above asserts absence, which a renderer that dropped
+        /// everything would satisfy. Vectors that appear inside code must
+        /// still be READABLE — stripped-to-nothing is a different bug from
+        /// sanitized, and law 5 asks for a visible fallback.
+        #[test]
+        fn a_vector_inside_a_fence_stays_readable_text() {
+            let out = render_markdown("```\n<img src=x onerror=alert(1)>\n```");
+            assert!(
+                out.contains("&lt;img src=x onerror=alert(1)&gt;"),
+                "fenced source must survive as escaped text: {out}"
+            );
+            assert!(
+                !tag_regions(&out).contains("onerror="),
+                "…but never as an attribute: {out}"
+            );
+        }
+
+        /// **Anti-vacuous twin.** The battery is all `!contains`, so a
+        /// renderer returning `""` would pass every vector. This proves the
+        /// battery can see what it is looking for, and that ordinary
+        /// content is not being silently eaten alongside the attacks.
+        #[test]
+        fn the_xss_battery_can_fail() {
+            // The battery fires on a genuinely dangerous string…
+            let seeded = "<script>alert(1)</script>".to_ascii_lowercase();
+            assert!(
+                FORBIDDEN_ELEMENTS.iter().any(|bad| seeded.contains(bad)),
+                "the battery cannot see a live script tag"
+            );
+            let tags = tag_regions(&"<img src=x onerror=alert(1)>".to_ascii_lowercase());
+            assert!(
+                FORBIDDEN_IN_TAGS.iter().any(|bad| tags.contains(bad)),
+                "the battery cannot see a live event handler"
+            );
+            // …and it does NOT fire on the same bytes as inert text, which
+            // is the false positive that motivated tag_regions.
+            let inert = tag_regions("<p>javascript:alert(1)</p>");
+            assert!(
+                !FORBIDDEN_IN_TAGS.iter().any(|bad| inert.contains(bad)),
+                "an inert scheme in a text node must not read as a leak"
+            );
+            // …and the corpus is not silently empty.
+            assert!(
+                CORPUS.len() >= 30,
+                "a corpus of {} is not a corpus",
+                CORPUS.len()
+            );
+            // Benign content in the same shapes still renders.
+            for (src, want) in [
+                ("**bold**", "<strong>bold</strong>"),
+                ("[link](https://example.test/)", "https://example.test/"),
+                ("`code`", "<code>code</code>"),
+                ("| a |\n|---|\n| 1 |\n", "<table>"),
+            ] {
+                let out = render_markdown(src);
+                assert!(out.contains(want), "benign {src:?} lost {want:?}: {out}");
+            }
+        }
     }
 }
