@@ -1,8 +1,14 @@
 //! Integration tests for the `newt` CLI binary.
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use std::io::Write;
+
+// #1852: `assert_cmd::Command` is deliberately NOT imported. Every `newt` in
+// this file is built by `common::newt()`, which pins the config-discovery
+// axes. Reaching for the raw `cargo_bin` constructor here does not compile
+// until someone re-adds that import, and re-adding it trips
+// `config_isolation::newt_is_only_constructed_through_the_isolation_helper`.
+mod common;
 
 /// Ground-truth build provenance: the real binary must report the package
 /// version and the commit checked out in the real repository. This guards the
@@ -26,8 +32,7 @@ fn version_reports_package_and_source_commit() {
         "build version {:?} does not identify checked-out commit {commit}",
         newt_core::build_info::VERSION_WITH_COMMIT
     );
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .arg("--version")
         .assert()
         .success()
@@ -48,16 +53,14 @@ fn binary_help_surfaces_start_on_the_guarded_cli_stack() {
         &["dgx", "--help"][..],
         &["plan", "--help"][..],
     ] {
-        Command::cargo_bin("newt")
-            .unwrap()
+        common::newt()
             .args(args)
             .assert()
             .success()
             .stdout(predicate::str::contains("newt"));
     }
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .arg("--help")
         .assert()
         .success()
@@ -70,8 +73,7 @@ fn binary_help_surfaces_start_on_the_guarded_cli_stack() {
 /// appear in the top-level help. Fully mocked / no backend — PR tier.
 #[test]
 fn bench_subcommand_is_removed() {
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .args(["bench"])
         .assert()
         .failure()
@@ -80,8 +82,7 @@ fn bench_subcommand_is_removed() {
     // The subcommand catalog lists each command name on its own indented line;
     // no such line may be `bench`. (The word "benchmark" legitimately appears
     // in `solve`'s description — the lane the eval tooling drives.)
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .arg("--help")
         .assert()
         .success()
@@ -95,8 +96,7 @@ fn bench_subcommand_is_removed() {
 /// print help and exit 0. Fully mocked / hostile-env — PR tier.
 #[test]
 fn help_subcommand_renders_without_a_backend() {
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .env("OLLAMA_HOST", "http://127.0.0.1:1") // unreachable on purpose
         .env("NO_COLOR", "1")
         .args(["help"])
@@ -105,8 +105,7 @@ fn help_subcommand_renders_without_a_backend() {
         .stdout(predicate::str::contains("Available commands:"))
         .stdout(predicate::str::contains("/dgx status"));
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .env("OLLAMA_HOST", "http://127.0.0.1:1")
         .env("NO_COLOR", "1")
         .args(["help", "dgx"])
@@ -129,8 +128,7 @@ fn help_subcommand_is_byte_identical_to_the_plain_renderer() {
         (&["help", "/exit"], Some("exit")), // leading slash tolerated
     ];
     for (args, topic) in cases {
-        let out = Command::cargo_bin("newt")
-            .unwrap()
+        let out = common::newt()
             .env("OLLAMA_HOST", "http://127.0.0.1:1")
             .env("NO_COLOR", "1")
             .args(args)
@@ -148,8 +146,7 @@ fn help_subcommand_is_byte_identical_to_the_plain_renderer() {
 
 #[test]
 fn doctor_runs_without_crash() {
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .arg("doctor")
         .assert()
         .success()
@@ -158,8 +155,7 @@ fn doctor_runs_without_crash() {
 
 #[test]
 fn config_prints_toml() {
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .arg("config")
         .assert()
         .success()
@@ -168,8 +164,7 @@ fn config_prints_toml() {
 
 #[test]
 fn config_flag_missing_file() {
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .args(["--config", "/nonexistent/path/config.toml", "config"])
         .assert()
         .failure();
@@ -192,8 +187,7 @@ default_tier_order = ["FAST"]
     .unwrap();
     f.flush().unwrap();
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .args(["--config", f.path().to_str().unwrap(), "config"])
         .assert()
         .success()
@@ -218,8 +212,7 @@ default_tier_order = ["FAST"]
     )
     .unwrap();
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .env_remove("NEWT_CONFIG")
         .env_remove("NEWT_CONFIG_DIR")
         .arg("--config-dir")
@@ -263,8 +256,7 @@ default_tier_order = ["FAST"]
     .unwrap();
     f.flush().unwrap();
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .env_remove("NEWT_CONFIG")
         .env_remove("NEWT_CONFIG_DIR")
         .arg("--config-dir")
@@ -293,8 +285,7 @@ tiers = ["FAST"]
     )
     .unwrap();
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .env_remove("NEWT_CONFIG")
         .env_remove("NEWT_CONFIG_DIR")
         .arg("--config-dir")
@@ -323,8 +314,7 @@ default_tier_order = ["FAST"]
     .unwrap();
     f.flush().unwrap();
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .args(["--config", f.path().to_str().unwrap(), "doctor"])
         .assert()
         .success()
@@ -339,8 +329,7 @@ fn venv_and_exec_path_flags_are_accepted_by_dispatch() {
     let venv = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(venv.path().join("bin")).unwrap();
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .env_remove("VIRTUAL_ENV")
         .arg("--venv")
         .arg(venv.path())
@@ -360,8 +349,7 @@ fn activated_virtual_env_is_picked_up_without_flag() {
     // dispatch takes the env fallback path and the subcommand still works.
     let venv = tempfile::tempdir().unwrap();
 
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .env("VIRTUAL_ENV", venv.path())
         .arg("config")
         .assert()
@@ -371,8 +359,7 @@ fn activated_virtual_env_is_picked_up_without_flag() {
 
 #[test]
 fn dgx_route_review_task() {
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .args(["dgx", "route", "review this code for security bugs"])
         .assert()
         .success()
@@ -382,8 +369,7 @@ fn dgx_route_review_task() {
 
 #[test]
 fn dgx_route_complex_task() {
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .args(["dgx", "route", "refactor the entire module across services"])
         .assert()
         .success()
@@ -392,19 +378,14 @@ fn dgx_route_complex_task() {
 
 #[test]
 fn dgx_requires_subcommand() {
-    Command::cargo_bin("newt")
-        .unwrap()
-        .arg("dgx")
-        .assert()
-        .failure();
+    common::newt().arg("dgx").assert().failure();
 }
 
 #[test]
 fn dgx_status_help_lists_json_flag() {
     // Issue #709 §1: `newt dgx status` gained a memory-budget view with a
     // `--json` form and a `--node` override. Clap-surface only (no SSH/network).
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .args(["dgx", "status", "--help"])
         .assert()
         .success()
@@ -414,8 +395,7 @@ fn dgx_status_help_lists_json_flag() {
 
 #[test]
 fn dgx_pull_help_lists_flags() {
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .args(["dgx", "pull", "--help"])
         .assert()
         .success()
@@ -458,8 +438,7 @@ ssh_user = "bob"
 #[test]
 fn dgx_pull_dry_run_native_prints_plan_and_does_not_ssh() {
     let f = dgx_ssh_config();
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .env_remove("NEWT_DGX_SSH_HOST")
         .args([
             "--config",
@@ -479,8 +458,7 @@ fn dgx_pull_dry_run_native_prints_plan_and_does_not_ssh() {
 #[test]
 fn dgx_pull_without_ssh_host_fails() {
     let f = dgx_less_config();
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .env_remove("NEWT_DGX_SSH_HOST")
         .env_remove("NEWT_DGX_HOST")
         .args([
@@ -518,8 +496,7 @@ default_tier_order = ["FAST"]
 #[test]
 fn dgx_doctor_unconfigured_shows_guidance() {
     let f = dgx_less_config();
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .env_remove("NEWT_DGX_OLLAMA_URL")
         .env_remove("NEWT_DGX_OLLAMA_LB_URL")
         .env_remove("NEWT_DGX_IN_CLUSTER_URL")
@@ -535,8 +512,7 @@ fn dgx_doctor_unconfigured_shows_guidance() {
 #[test]
 fn dgx_models_unconfigured_fails() {
     let f = dgx_less_config();
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .env_remove("NEWT_DGX_OLLAMA_URL")
         .env_remove("NEWT_DGX_HOST")
         .args(["--config", f.path().to_str().unwrap(), "dgx", "models"])
@@ -551,8 +527,7 @@ fn dgx_models_uses_env_endpoint() {
     // proving env-only wiring. The dgx-less --config keeps it independent
     // of ~/.newt.
     let f = dgx_less_config();
-    Command::cargo_bin("newt")
-        .unwrap()
+    common::newt()
         .env("NEWT_DGX_OLLAMA_URL", "http://127.0.0.1:1")
         .args(["--config", f.path().to_str().unwrap(), "dgx", "models"])
         .assert()

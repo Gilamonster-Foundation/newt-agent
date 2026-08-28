@@ -2,9 +2,17 @@
 //! (issue #94), the `--allow-no-key` debug fallback, and the optional
 //! Prometheus metrics server (`NEWT_METRICS_PORT`).
 //!
-//! Every test runs with `HOME` redirected to a tempdir and the operator key
-//! path passed explicitly, so the developer's real `~/.newt/identity.pem` is
-//! never read or written.
+//! Every test runs through `common::isolate`, so the developer's real
+//! `~/.newt` is never read or written.
+//!
+//! #1852: redirecting `HOME` alone was NOT enough, and these tests are the
+//! proof. `Config::project_config_path` walks up from the cwd looking for
+//! `.newt/config.toml` and stops only when it reaches `$HOME` — so with
+//! `HOME` pointed at a tempdir the walk climbed past the real
+//! `/home/<user>`, adopted its `~/.newt/config.toml` as a PROJECT config, and
+//! read the sibling `backends/` drop-ins. The helper below pinned `HOME` and
+//! scrubbed five variables and still failed, because the cwd was never
+//! pinned.
 
 #![cfg(unix)]
 
@@ -13,6 +21,8 @@ use predicates::prelude::*;
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
+mod common;
+
 const INIT_LINE: &str = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n";
 
 /// `newt worker` isolated from the developer's environment. Stdin gets one
@@ -20,21 +30,13 @@ const INIT_LINE: &str = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"
 /// answers and exits on EOF.
 fn worker(home: &tempfile::TempDir) -> Command {
     let mut cmd = Command::cargo_bin("newt").unwrap();
-    cmd.env("HOME", home.path())
-        .env("OLLAMA_HOST", "http://127.0.0.1:1")
+    // The shared policy owns the config-discovery axes AND the selector
+    // family this helper used to scrub by hand (the hand-written list is what
+    // drifted: it never grew `NEWT_CONFIG_DIR`, and it never pinned the cwd).
+    common::isolate(&mut cmd, home.path());
+    cmd.env("OLLAMA_HOST", "http://127.0.0.1:1")
         .env("RUST_LOG", "info")
-        .env_remove("NEWT_OPERATOR_KEY")
         .env_remove("NEWT_METRICS_PORT")
-        .env_remove("NEWT_CODER")
-        // Isolate the worker from the operator's backend/provider selectors so
-        // it starts against the tempdir HOME (which has no [[backends]]
-        // defining them) rather than inheriting e.g. NEWT_PROVIDER=ollama-cloud
-        // from the shell — that leak made the worker fail with "selected
-        // backend '…' is not defined" on a developer's machine.
-        .env_remove("NEWT_PROVIDER")
-        .env_remove("NEWT_TEAM")
-        .env_remove("NEWT_CONFIG")
-        .env_remove("NEWT_BACKEND")
         .arg("worker")
         .write_stdin(INIT_LINE)
         .timeout(Duration::from_secs(30));
@@ -187,20 +189,14 @@ fn worker_metrics_server_serves_healthz_and_metrics() {
     };
 
     let newt_bin = assert_cmd::cargo::cargo_bin("newt");
-    let mut child = std::process::Command::new(&newt_bin)
-        .env("HOME", home.path())
+    let mut spawn = std::process::Command::new(&newt_bin);
+    // The SAME policy as `worker()` — this raw spawn is why the policy is a
+    // function over a trait rather than a copied list of `env_remove` calls.
+    common::isolate(&mut spawn, home.path());
+    let mut child = spawn
         .env("OLLAMA_HOST", "http://127.0.0.1:1")
         .env("RUST_LOG", "info")
         .env("NEWT_METRICS_PORT", port.to_string())
-        .env_remove("NEWT_OPERATOR_KEY")
-        // Same selector isolation as the `worker()` helper — without this the
-        // operator's NEWT_PROVIDER/NEWT_TEAM/… leaks in and the worker fails
-        // to start ("backend '…' not defined") before the metrics server binds.
-        .env_remove("NEWT_PROVIDER")
-        .env_remove("NEWT_TEAM")
-        .env_remove("NEWT_CONFIG")
-        .env_remove("NEWT_BACKEND")
-        .env_remove("NEWT_CODER")
         .args(["worker", "--operator-key-path"])
         .arg(&key)
         .stdin(std::process::Stdio::piped())
