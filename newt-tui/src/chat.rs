@@ -6899,7 +6899,7 @@ fn session_body(
                         ask_human: prompt_permission_choice
                             as fn(
                                 &newt_core::tty::PromptWindow,
-                                &newt_core::Question<PromptChoice>,
+                                &newt_interaction::InteractionDefinition,
                             ) -> PromptChoice,
                     });
                     // Per-round observation hook (Phase 20,

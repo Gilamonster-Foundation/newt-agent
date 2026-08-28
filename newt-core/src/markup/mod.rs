@@ -69,6 +69,10 @@ use std::fmt;
 
 #[cfg(feature = "markdown")]
 pub mod dialect;
+// UNCONDITIONAL, like `tty::widgets`: the canonical plain projection is what
+// the wyvern/lean tier falls back to, so it must survive
+// `--no-default-features`. It takes no Markdown dependency (C0a, #1856).
+pub mod plain;
 
 /// The envelope fence marker. Must open the document on its own line and
 /// close on its own line.

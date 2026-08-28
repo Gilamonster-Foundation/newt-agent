@@ -1670,11 +1670,24 @@ fn confirm_unrestricted_fs_mutation(
         return true;
     }
     let prompt = mutation_confirm_question(question);
+    // C0a (#1856): rendering moved off `Question`, so this reaches the ONE
+    // plain projection through the adapter. Byte-identical — the adapter is
+    // field-identical and `render` is a pure function of those fields
+    // (`mutation_confirm_renders_its_frozen_form`). What is NOT touched here
+    // is the thing D0 actually owns: this form is still flattened to a
+    // string across the free-text `ask_question` seam and re-parsed below,
+    // the one place a typed form crosses a seam as rendered text.
+    let rendered = match crate::interaction_adapter::question_to_definition(&prompt) {
+        Ok(definition) => crate::markup::plain::render(&definition),
+        // Unreachable: both wire names are valid option ids. Fail closed —
+        // a mutation is never authorized by a prompt we could not render.
+        Err(_) => return false,
+    };
     match gate {
         // ONLY an explicit answer parsed to AllowOnce authorizes the mutation.
         // Every other outcome — no operator, Esc/Ctrl-C/Ctrl-D, EOF, input
         // failure, or a non-"y" answer — fails closed (mutation denied).
-        Some(g) => match g.ask_question(&prompt.terminal_text()) {
+        Some(g) => match g.ask_question(&rendered) {
             HumanQuestionOutcome::Answer(answer) => {
                 prompt.parse(&answer) == Some(PermissionAction::AllowOnce)
             }
@@ -14717,6 +14730,31 @@ mod disable_ocap_tests {
             !ws.path().join("auto.txt").exists(),
             "yolo-confirmed delete must remove the file"
         );
+    }
+
+    /// **The `--yolo` confirm's rendered bytes, pinned** (C0a, #1856).
+    ///
+    /// A0's sweep found this form had no byte coverage at all: only the
+    /// alias-absence property and the fail-closed outcomes were tested, so
+    /// the string the operator reads was free to drift. C0a moves this
+    /// rendering from `Question::terminal_text` to `markup::plain::render`,
+    /// and changing an untested rendering path inside a byte-identity slice
+    /// is exactly the shape that slice must not have — so the gap closes
+    /// here rather than being inherited by D0.
+    #[test]
+    fn mutation_confirm_renders_its_frozen_form() {
+        let prompt = mutation_confirm_question("delete `auto.txt`?");
+        let definition =
+            crate::interaction_adapter::question_to_definition(&prompt).expect("adapts");
+        assert_eq!(
+            crate::markup::plain::render(&definition),
+            "delete `auto.txt`?\n[y] to confirm   [n] to skip"
+        );
+        // The hidden `Y`/`N` aliases parse but are never advertised
+        // (BHV-PROMPT-005).
+        let rendered = crate::markup::plain::render(&definition);
+        assert!(!rendered.contains('Y'), "alias rendered: {rendered}");
+        assert!(!rendered.contains('N'), "alias rendered: {rendered}");
     }
 
     /// Direct coverage of the fs-mutation confirm guard's parsing + fail-closed

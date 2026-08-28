@@ -624,7 +624,14 @@ symbol = "permission_prompt_tests::reader_failing_until_deadline_denies_without_
 # So the rendering half of this claim is stronger than when it was written, and
 # the accepting half now belongs to BHV-INTERACTION-001/002. Reworded rather
 # than left to read as though `Question::parse` still decides.
-description = "TUI and web render decisions from ONE definition, serialized through one Question form: the wire actions are the rendered actions on both surfaces; aliases parse but are never rendered and never widen the action set. Accepting the answer is BHV-INTERACTION-001/002."
+#
+# C0a (#1856) then took rendering off the semantic type entirely: the terminal
+# renders the definition through `markup::plain::render`, so "serialized
+# through one Question form" is no longer how the bytes are produced and the
+# description no longer says it. The web still reconstructs the legacy form to
+# build its HTML card (`interaction_offer::question`, refd below) — C3 removes
+# that. The frozen bytes did not move; that is C0a's whole acceptance criterion.
+description = "TUI and web render decisions from ONE definition: the wire actions are the rendered actions on both surfaces; aliases parse but are never rendered and never widen the action set. Accepting the answer is BHV-INTERACTION-001/002."
 [BHV-PROMPT-005.status]
 lean = "none"
 rust = "tested"
@@ -634,9 +641,12 @@ conformance = "partial"
 [[BHV-PROMPT-005.refs.rust_tests]]
 path = "newt-core/src/tty/widgets/question.rs"
 symbol = "tests::aliased_action_round_trips"
+# C0a (#1856) MOVED this ref, it did not drop it. The property — an alias
+# parses but is never advertised — is unchanged; the code that could violate
+# it moved off `Question` and into the plain renderer, so the ref follows it.
 [[BHV-PROMPT-005.refs.rust_tests]]
-path = "newt-core/src/tty/widgets/question.rs"
-symbol = "tests::aliases_are_not_rendered_in_terminal_text"
+path = "newt-core/src/markup/plain.rs"
+symbol = "tests::aliases_are_never_rendered"
 [[BHV-PROMPT-005.refs.rust_tests]]
 path = "newt-core/src/tty/widgets/question.rs"
 symbol = "tests::value_wire_name_still_matches"
@@ -649,9 +659,12 @@ symbol = "publish_interaction_offer"
 [[BHV-PROMPT-005.refs.production]]
 path = "newt-core/src/interaction_offer.rs"
 symbol = "question"
+# C0a (#1856): rendering left the semantic type — the epic's named C0
+# deletion gate. `Question::terminal_text` no longer exists; the ONE plain
+# projection both this contract's surfaces are held to is `markup::plain::render`.
 [[BHV-PROMPT-005.refs.production]]
-path = "newt-core/src/tty/widgets/question.rs"
-symbol = "terminal_text"
+path = "newt-core/src/markup/plain.rs"
+symbol = "render"
 
 # ══════════════════ Responses long-turn parity — #1528 (B2–B5) ════════════════
 # These contracts bind the merged #1528 Responses work to its machine-checked Lean

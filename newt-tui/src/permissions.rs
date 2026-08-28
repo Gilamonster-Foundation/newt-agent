@@ -9,16 +9,30 @@ use crate::danger;
 use crate::mint_operating_key;
 use newt_core::agentic::{newt_line, print_newt};
 use newt_core::interaction_adapter::{definition_to_question, role_of, DECISION_CONTROL};
+use newt_core::markup::plain;
 use newt_core::tty::{
     modal_prompt_controls, read_prompt_window_line, ControlReader, PromptLine as ModalLine,
     PromptWindow, Terminal, MODAL_CONTROL_HINT, MODAL_INPUT_GLYPH,
 };
+use newt_core::HumanQuestionOutcome;
 pub(crate) use newt_core::PermissionAction as PromptChoice;
-use newt_core::{HumanQuestionOutcome, Question};
+// C0a (#1856): production no longer names the legacy form — rendering left
+// it and the gate seam carries an `InteractionDefinition`. The type survives
+// for the tests that pin the adapter's parse semantics and the web card's
+// model reconstruction (both C3's to retire).
+#[cfg(test)]
+use newt_core::Question;
 use newt_interaction::{
     Audience, ChoiceOption, Control, ControlId, ControlKind, InteractionDefinition,
     InteractionKind, OptionId, Requirement,
 };
+
+/// The reserved control id of the free-text form's single answer field.
+///
+/// Sibling of `interaction_adapter::DECISION_CONTROL`, kept here because
+/// the free-text form is `newt-tui`'s, not the adapter's. D0 owns promoting
+/// it when `request_user_input` moves onto the controller.
+const ANSWER_CONTROL: &str = "answer";
 
 // ---------------------------------------------------------------------------
 
@@ -236,28 +250,14 @@ const WIRE_NAMES_ARE_OPTION_IDS: &str =
     "every PermissionAction wire name is a valid option id (frozen set; see \
      b0a::every_offered_action_is_a_valid_option_id)";
 
-/// Render the definition as the legacy typed form, **through the A2.2
-/// adapter**.
+/// The legacy typed form for one request, **for tests only**.
 ///
-/// `terminal_text()` lives on [`Question`] and has no counterpart in
-/// `newt-interaction`, which is pure data — extracting rendering is C0's
-/// slice, not this one. So the adapter is a PERMANENT production
-/// dependency from here on, and byte preservation holds by construction:
-/// `adapter::a_question_round_trips_through_the_definition_byte_for_byte`
-/// proves the mapping is field-identical, and `terminal_text()` is a pure
-/// function of those fields.
-///
-/// Hand-writing a second renderer over `InteractionDefinition` to avoid
-/// this call would be a new duplicate string builder tracked by no
-/// baseline — the exact sprawl the epic exists to delete.
-/// The rendered form for one request, for tests that only care about the
-/// rendering.
-///
-/// B0b-2 (#1846): no longer a production path. Both surfaces need the
-/// DEFINITION as well as the rendering — the terminal to authorize against,
-/// the web to publish — so production builds `permission_definition` and
-/// adapts it, and this convenience is kept for the tests that assert only
-/// on the rendered bytes.
+/// B0b-2 (#1846) took this off the production path; C0a (#1856) took
+/// RENDERING off it too. What remains is a convenience for the tests that
+/// assert on the adapted form — the alias/ambiguity parse properties, and
+/// the web card's model reconstruction. Production reaches
+/// `permission_definition` directly and renders it with
+/// [`plain::render`].
 #[cfg(test)]
 pub(crate) fn question_for(
     req: &newt_core::PermissionRequest,
@@ -307,17 +307,50 @@ pub fn ocap_high_danger_predicate() -> impl Fn(newt_core::ocap_store::Capability
 }
 
 /// Read a terminal form. Unknown input and I/O failure fail closed.
+///
+/// **C0a (#1856): renders through [`plain::render`], not through the
+/// semantic type.** The definition itself is what reaches the operator, so
+/// the bytes displayed and the authority the answer is checked against are
+/// the same value — there is no longer an intermediate form that could
+/// drift from it.
+///
+/// The input glyph gets its OWN final line. `tty::modal::render` repaints
+/// only the text after the last `\n`, so this composition is load bearing:
+/// it is what makes a keystroke redraw the answer row rather than the menu.
 pub(crate) fn prompt_permission_choice(
     w: &PromptWindow,
-    question: &Question<PromptChoice>,
+    definition: &InteractionDefinition,
 ) -> PromptChoice {
-    let prompt = format!("{}\n{MODAL_INPUT_GLYPH}", question.terminal_text());
+    let prompt = format!("{}\n{MODAL_INPUT_GLYPH}", plain::render(definition));
     match read_prompt_window_line(w, &prompt) {
-        Ok(ModalLine::Line(answer)) => question.parse(&answer).unwrap_or(PromptChoice::Deny),
+        Ok(ModalLine::Line(answer)) => decode_answer(definition, &answer),
         Ok(ModalLine::Back) => PromptChoice::Back,
         Ok(ModalLine::Exit) => PromptChoice::Exit,
         Ok(ModalLine::Eof) | Err(_) => PromptChoice::Deny,
     }
+}
+
+/// Decode one operator keystroke to a candidate action.
+///
+/// **Deliberately still the adapter.** C0a extracts RENDERING; decoding
+/// stays exactly where B0b-1 put it — `Question::parse`, reached through
+/// the A2.2 adapter — because that is the one implementation of the
+/// canonical-first / alias / ambiguity-denial rules, and it is the half
+/// `NewtPolicy.PromptForm`'s Lean theorems and TLA+ `AuthorizationDisplayed`
+/// actually govern (BHV-PROMPT-001). A second decoder written against
+/// `InteractionDefinition` would be a third answer-parsing implementation —
+/// the exact sprawl this epic exists to delete.
+///
+/// Fails closed on every branch: an unparseable answer denies, and so does
+/// an unadaptable definition. The latter is unreachable by construction
+/// (`b0a::every_offered_action_is_a_valid_option_id`), and it denies rather
+/// than panicking because this runs with the operator's answer already in
+/// hand — a panic here would take the session down mid-decision.
+fn decode_answer(definition: &InteractionDefinition, answer: &str) -> PromptChoice {
+    definition_to_question(definition)
+        .ok()
+        .and_then(|form| form.parse(answer))
+        .unwrap_or(PromptChoice::Deny)
 }
 
 fn decision_scope(choice: PromptChoice) -> &'static str {
@@ -333,13 +366,32 @@ fn decision_scope(choice: PromptChoice) -> &'static str {
 }
 
 pub(crate) fn prompt_user_input(w: &PromptWindow, question: &str) -> io::Result<ModalLine> {
-    let form = Question::<PromptChoice> {
-        markdown: format!("? {question}"),
-        actions: Vec::new(),
+    // C0a (#1856): the free-text form is an `InteractionDefinition` too, so
+    // it renders through the ONE plain projection rather than through a
+    // second type. Byte-identical to the actionless `Question` it replaces —
+    // a `Text` control contributes no choices line, so the rendering is
+    // body + note, exactly as before (`c0a::the_free_text_form_renders_
+    // exactly_as_it_did`). The interaction MODEL is D0's to migrate; only
+    // the rendering moved here.
+    let form = InteractionDefinition {
         note: Some(MODAL_CONTROL_HINT.into()),
+        ..InteractionDefinition::new(
+            InteractionKind::Prompt,
+            format!("? {question}"),
+            vec![Control {
+                id: ControlId::new(ANSWER_CONTROL).expect(
+                    "`answer` is a valid control id (non-empty, drawn from \
+                     [A-Za-z0-9_-]); it is a const, so this cannot vary at \
+                     runtime",
+                ),
+                kind: ControlKind::Text,
+                label: String::new(),
+                requirement: Requirement::Required,
+            }],
+        )
     };
     let result =
-        read_prompt_window_line(w, &format!("{}\n{MODAL_INPUT_GLYPH}", form.terminal_text()))?;
+        read_prompt_window_line(w, &format!("{}\n{MODAL_INPUT_GLYPH}", plain::render(&form)))?;
     let ModalLine::Line(line) = &result else {
         return Ok(result);
     };
@@ -471,7 +523,7 @@ impl PermissionPromptState {
 /// Prompts, records, and re-mints from the user root without widening the live key.
 pub(crate) struct PromptPermissionGate<
     'a,
-    F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice,
+    F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice,
 > {
     pub(crate) state: &'a mut PermissionPromptState,
     /// Enforced caveats at turn start.
@@ -500,7 +552,7 @@ pub(crate) struct PromptPermissionGate<
     pub(crate) ask_human: F,
 }
 
-impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> PromptPermissionGate<'_, F> {
+impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPermissionGate<'_, F> {
     /// Record one decision: into the session list (for `/permissions`) and
     /// appended to the durable log. A log-write failure is reported but
     /// never blocks the decision — the record is a review artifact, not a
@@ -557,10 +609,17 @@ impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> PromptPer
         // that binds it — so the answer is validated against the offer that
         // was actually published, not one minted at answer time.
         let definition = permission_definition(req, &self.danger, Audience::Web);
-        let question = match definition_to_question(&definition) {
-            Ok(question) => question,
-            Err(_) => return (PromptChoice::Deny, "web-unavailable"),
-        };
+        // The WEB builds its card by reconstructing the legacy form
+        // (`interaction_offer::PendingOffer::question`), so refuse to publish
+        // an offer it could not render — a published-but-unrenderable offer
+        // shows the operator a blank card and then times out. Unreachable by
+        // construction (`b0a::every_offered_action_is_a_valid_option_id`);
+        // fail closed anyway. C0a stopped RENDERING through the adapter; this
+        // is a renderability PRECONDITION, and it retires with C3's removal
+        // of the reconstruction.
+        if definition_to_question(&definition).is_err() {
+            return (PromptChoice::Deny, "web-unavailable");
+        }
         let tier = if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
             newt_core::interaction_offer::OfferDanger::High
         } else {
@@ -575,7 +634,7 @@ impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> PromptPer
             Ok(id) => id,
             Err(_) => return (PromptChoice::Deny, "web-unavailable"),
         };
-        let note = question
+        let note = definition
             .note
             .as_deref()
             .map_or(MODAL_CONTROL_HINT.to_string(), |note| {
@@ -891,7 +950,7 @@ impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> PromptPer
     }
 }
 
-impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> newt_core::PermissionGate
+impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> newt_core::PermissionGate
     for PromptPermissionGate<'_, F>
 {
     fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
@@ -966,10 +1025,14 @@ impl<F: FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice> newt_core
                     // authority the answer is checked against. No store is
                     // touched — see `b0b::the_default_terminal_path_
                     // performs_no_store_write`.
+                    //
+                    // C0a (#1856): the definition goes to the reader whole.
+                    // It used to be flattened to a `Question` here first,
+                    // which meant the value displayed and the value
+                    // authorized against were two objects that happened to
+                    // agree; now they are one.
                     let definition = permission_definition(req, &self.danger, Audience::Terminal);
-                    let form =
-                        definition_to_question(&definition).expect(WIRE_NAMES_ARE_OPTION_IDS);
-                    let decoded = (self.ask_human)(&w, &form);
+                    let decoded = (self.ask_human)(&w, &definition);
                     match self.authorize(&definition, Audience::Terminal, decoded) {
                         Ok(choice) => (choice, decision_scope(choice)),
                         Err(refusal) => {
@@ -1226,7 +1289,7 @@ mod permission_prompt_tests {
             cancel: None,
             exit: None,
             // Proof the TTY is bypassed when web decisions are on.
-            ask_human: |_w: &PromptWindow, _q: &Question<PromptChoice>| {
+            ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
                 panic!("the TTY must not be read when web decisions are enabled")
             },
         };
@@ -1264,7 +1327,7 @@ mod permission_prompt_tests {
             web_decision_timeout: Duration::from_millis(50),
             cancel: None,
             exit: None,
-            ask_human: |_w: &PromptWindow, _q: &Question<PromptChoice>| {
+            ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
                 panic!("the TTY must not be read when web decisions are enabled")
             },
         };
@@ -1302,7 +1365,7 @@ mod permission_prompt_tests {
             web_decision_timeout: Duration::from_millis(50),
             cancel: None,
             exit: None,
-            ask_human: |_w: &PromptWindow, _q: &Question<PromptChoice>| {
+            ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
                 panic!("the TTY must not be read when web decisions are enabled");
             },
         };
@@ -1395,7 +1458,7 @@ mod permission_prompt_tests {
                 web_decision_timeout: $timeout,
                 cancel: $cancel,
                 exit: $exit,
-                ask_human: |_w: &PromptWindow, _q: &Question<PromptChoice>| {
+                ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
                     panic!("run_web_wait must not read the TTY answer path")
                 },
             }
@@ -1891,7 +1954,7 @@ mod permission_prompt_tests {
                 web_decision_timeout: Duration::from_secs(2),
                 cancel: None,
                 exit: None,
-                ask_human: move |_w: &PromptWindow, _q: &Question<PromptChoice>| {
+                ask_human: move |_w: &PromptWindow, _d: &InteractionDefinition| {
                     PromptChoice::AllowPermanent
                 },
             };
@@ -1915,7 +1978,7 @@ mod permission_prompt_tests {
         log_path: Option<std::path::PathBuf>,
         script: Vec<PromptChoice>,
         prompts: Rc<Cell<usize>>,
-    ) -> PromptPermissionGate<'a, impl FnMut(&PromptWindow, &Question<PromptChoice>) -> PromptChoice>
+    ) -> PromptPermissionGate<'a, impl FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice>
     {
         let mut script = script.into_iter();
         PromptPermissionGate {
@@ -1934,7 +1997,7 @@ mod permission_prompt_tests {
             web_decision_timeout: Duration::from_secs(2),
             cancel: None,
             exit: None,
-            ask_human: move |_w: &PromptWindow, _question: &Question<PromptChoice>| {
+            ask_human: move |_w: &PromptWindow, _definition: &InteractionDefinition| {
                 prompts.set(prompts.get() + 1);
                 script.next().expect("script exhausted — unexpected prompt")
             },
@@ -1999,21 +2062,22 @@ mod permission_prompt_tests {
             .any(|a| a.value == PromptChoice::AllowSession));
         assert!(low.markdown.contains("outside the granted exec allowlist"));
 
-        let high = question_for(
-            &PermissionRequest {
-                tool: "request_permissions".into(),
-                kind: DenialKind::Exec,
-                target: "bash".into(),
-                reason: "list the files".into(),
-            },
-            &danger,
-            Audience::Terminal,
-        );
+        let model_authored = PermissionRequest {
+            tool: "request_permissions".into(),
+            kind: DenialKind::Exec,
+            target: "bash".into(),
+            reason: "list the files".into(),
+        };
+        let high = question_for(&model_authored, &danger, Audience::Terminal);
         assert!(!high
             .actions
             .iter()
             .any(|a| a.value == PromptChoice::AllowSession));
-        let text = high.terminal_text();
+        let text = plain::render(&permission_definition(
+            &model_authored,
+            &danger,
+            Audience::Terminal,
+        ));
         for expected in [
             "interpreter",
             "arbitrary command execution",
@@ -2256,7 +2320,7 @@ mod permission_prompt_tests {
                 web_decision_timeout: Duration::from_secs(2),
                 cancel: None,
                 exit: None,
-                ask_human: move |_w: &PromptWindow, _q: &Question<PromptChoice>| {
+                ask_human: move |_w: &PromptWindow, _d: &InteractionDefinition| {
                     script.next().expect("script exhausted")
                 },
             };
@@ -2292,7 +2356,7 @@ mod permission_prompt_tests {
                 web_decision_timeout: Duration::from_secs(2),
                 cancel: None,
                 exit: None,
-                ask_human: |_w: &PromptWindow, _q: &Question<PromptChoice>| {
+                ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
                     panic!("must NOT prompt: target was permanently denied")
                 },
             };
@@ -2307,7 +2371,7 @@ mod permission_prompt_tests {
     #[test]
     fn permanent_allow_offered_for_net_only() {
         let danger = danger::DangerTable::builtin();
-        let net = question_for(
+        let net = plain::render(&permission_definition(
             &PermissionRequest {
                 tool: "web_fetch".to_string(),
                 kind: DenialKind::Net,
@@ -2316,9 +2380,12 @@ mod permission_prompt_tests {
             },
             &danger,
             Audience::Terminal,
-        )
-        .terminal_text();
-        let exec = question_for(&exec_request("npm"), &danger, Audience::Terminal).terminal_text();
+        ));
+        let exec = plain::render(&permission_definition(
+            &exec_request("npm"),
+            &danger,
+            Audience::Terminal,
+        ));
         assert!(
             net.contains("[A]llow permanently"),
             "net must offer it: {net}"
@@ -2362,7 +2429,7 @@ mod permission_prompt_tests {
                 web_decision_timeout: Duration::from_secs(2),
                 cancel: None,
                 exit: None,
-                ask_human: move |_w: &PromptWindow, _q: &Question<PromptChoice>| {
+                ask_human: move |_w: &PromptWindow, _d: &InteractionDefinition| {
                     script.next().expect("script exhausted")
                 },
             };
@@ -3146,8 +3213,10 @@ mod permission_prompt_tests {
 /// rendering, frozen verbatim.** These strings ARE the current contract —
 /// including the deliberately DIFFERENT terminal/web action matrices (web
 /// omits every durable grant; net+low+terminal is the only permanent-allow) —
-/// and epic law 1 says a later slice must keep the plain fallback while
-/// C0 extracts `terminal_text()` out of the semantic type. An intentional
+/// and epic law 1 says a later slice must keep the plain fallback. C0a
+/// (#1856) extracted the rendering out of the semantic type and these
+/// strings did not move, which is what "extracted" is allowed to mean —
+/// they are now produced by `markup::plain::render`. An intentional
 /// rendering change updates these strings in the same PR, listed as an
 /// intentional diff (unlisted golden drift is a bug, per the epic's F0 rule).
 #[cfg(test)]
@@ -3173,9 +3242,13 @@ mod a0_freeze_goldens {
         }
     }
 
+    /// C0a (#1856): these frozen strings are now produced by
+    /// `newt_core::markup::plain::render`. The GOLDENS DID NOT MOVE — that
+    /// is the entire acceptance criterion of that slice, and this helper
+    /// changing while every string below stayed byte-identical is the proof.
     fn text(req: &PermissionRequest, audience: Audience) -> String {
         let table = danger::DangerTable::builtin();
-        question_for(req, &table, audience).terminal_text()
+        plain::render(&permission_definition(req, &table, audience))
     }
 
     #[test]
@@ -3229,6 +3302,200 @@ mod a0_freeze_goldens {
     #[test]
     fn the_modal_control_hint_is_the_frozen_control_vocabulary() {
         assert_eq!(MODAL_CONTROL_HINT, "Esc=back \u{b7} Ctrl-C/Ctrl-D=exit");
+    }
+}
+
+/// **C0a (#1856, epic #1803): the plain renderer reproduces the frozen
+/// bytes, and the operator-visible prompt is pinned for the first time.**
+///
+/// A0 froze `terminal_text()`'s output; C0a moves that rendering to
+/// `newt_core::markup::plain::render` and deletes the method. The whole
+/// proof of correctness is byte-identity, so the goldens are restated here
+/// a third time, deliberately, under A0's own duplication discipline: each
+/// copy independently catches an accidental edit to another.
+///
+/// What this copy adds that the other two do not: it pins the **composed**
+/// string `prompt_permission_choice` actually hands the terminal — the
+/// rendering plus `MODAL_INPUT_GLYPH` on its own final line. The A0 sweep
+/// recorded that nothing per-PR covered that composition (the only test
+/// that saw it end to end is the real-PTY one, `#[ignore]`d to the weekly
+/// tier), and it is exactly the shape `tty::modal::render` depends on when
+/// it repaints only the text after the last `\n`.
+#[cfg(test)]
+mod c0a {
+    use super::*;
+    use newt_core::markup::plain;
+    use newt_core::{DenialKind, PermissionRequest};
+
+    fn net_low() -> PermissionRequest {
+        PermissionRequest {
+            tool: "http".into(),
+            kind: DenialKind::Net,
+            target: "https://example.com/api".into(),
+            reason: String::new(),
+        }
+    }
+
+    fn exec_high() -> PermissionRequest {
+        PermissionRequest {
+            tool: "run_command".into(),
+            kind: DenialKind::Exec,
+            target: "bash".into(),
+            reason: "exec of \"bash\" is not within the granted authority".into(),
+        }
+    }
+
+    /// The four frozen forms, as `(request, audience, exact bytes)`.
+    fn goldens() -> Vec<(PermissionRequest, Audience, &'static str)> {
+        vec![
+            (
+                net_low(),
+                Audience::Terminal,
+                "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
+                 Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
+                 [a]llow once   [s]ession allow   [A]llow permanently (adds host to config)   [d]eny (default)   [D]eny always   [P]ermanently deny",
+            ),
+            (
+                net_low(),
+                Audience::Web,
+                "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
+                 Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
+                 [a]llow once   [s]ession allow   [d]eny (default)",
+            ),
+            (
+                exec_high(),
+                Audience::Terminal,
+                "\u{2298} run_command wants to run `bash` \u{2014} outside the granted exec allowlist.\n\
+                 \u{26a0} `bash` is an interpreter: this grants arbitrary command execution\n  \
+                 (exec of \"bash\" is not within the granted authority)\n\
+                 high-danger: session allow refused; key allow / step-up is the future path, P3\n\
+                 Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
+                 [a]llow once   [d]eny (default)   [D]eny always   [P]ermanently deny",
+            ),
+            (
+                exec_high(),
+                Audience::Web,
+                "\u{2298} run_command wants to run `bash` \u{2014} outside the granted exec allowlist.\n\
+                 \u{26a0} `bash` is an interpreter: this grants arbitrary command execution\n  \
+                 (exec of \"bash\" is not within the granted authority)\n\
+                 High danger: session authorization is unavailable.\n\
+                 Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
+                 [a]llow once   [d]eny (default)",
+            ),
+        ]
+    }
+
+    /// **The acceptance criterion.** `render()` is correct exactly when it
+    /// reproduces today's bytes — for every `(request, audience)` the
+    /// production builder can hand it.
+    #[test]
+    fn render_reproduces_every_a0_golden_byte_for_byte() {
+        let table = danger::DangerTable::builtin();
+        for (req, audience, golden) in goldens() {
+            let definition = permission_definition(&req, &table, audience.clone());
+            assert_eq!(
+                plain::render(&definition),
+                golden,
+                "the plain renderer moved frozen bytes for {:?}/{audience:?}",
+                req.tool
+            );
+
+            // ...and the string the operator actually sees. The glyph gets
+            // its OWN final line: `tty::modal::render` repaints only the
+            // text after the last `\n`, so a renderer that grew a trailing
+            // newline would repaint the wrong row on every keystroke.
+            let composed = format!("{}\n{MODAL_INPUT_GLYPH}", plain::render(&definition));
+            assert_eq!(composed, format!("{golden}\n{MODAL_INPUT_GLYPH}"));
+            assert!(
+                composed.ends_with(&format!("\n{MODAL_INPUT_GLYPH}")),
+                "the input glyph is not alone on the final line: {composed:?}"
+            );
+        }
+    }
+
+    /// **The free-text form's bytes, pinned for the first time** (A0 gap).
+    ///
+    /// `prompt_user_input` built an actionless `Question` and rendered it
+    /// with `terminal_text`; deleting that method left it nothing to render
+    /// through, so it became an `InteractionDefinition` with a `Text`
+    /// control. A0's sweep recorded that NOTHING covered these bytes — only
+    /// the `MODAL_CONTROL_HINT` constant was pinned — so the byte-identity
+    /// claim for this path had no test to rest on. It does now.
+    ///
+    /// The expectation is written out rather than derived: a `Text` control
+    /// contributes no choices line, so the form is body + note, exactly as
+    /// the actionless `Question` rendered.
+    #[test]
+    fn the_free_text_form_renders_exactly_as_it_did() {
+        let form = InteractionDefinition {
+            note: Some(MODAL_CONTROL_HINT.into()),
+            ..InteractionDefinition::new(
+                InteractionKind::Prompt,
+                format!("? {}", "which file should I edit"),
+                vec![Control {
+                    id: ControlId::new(ANSWER_CONTROL).expect("valid control id"),
+                    kind: ControlKind::Text,
+                    label: String::new(),
+                    requirement: Requirement::Required,
+                }],
+            )
+        };
+        assert_eq!(
+            plain::render(&form),
+            "? which file should I edit\nEsc=back \u{b7} Ctrl-C/Ctrl-D=exit"
+        );
+        // A text control offers nothing to pick, so no choices line appears.
+        assert!(!plain::render(&form).contains('['));
+    }
+
+    /// **The web surface is untouched by C0a.** The terminal changed how it
+    /// RENDERS; the web still publishes the same definition, offers the same
+    /// actions in the same order, and reconstructs the same legacy form for
+    /// its HTML card. A "the terminal got faster" change that quietly
+    /// widened the web's action set is the regression this catches.
+    #[test]
+    fn the_web_matrix_is_unaffected() {
+        let table = danger::DangerTable::builtin();
+
+        let low = permission_definition(&net_low(), &table, Audience::Web);
+        let ControlKind::Choice { options } = &low.controls[0].kind else {
+            panic!("the decision control is not a choice");
+        };
+        assert_eq!(
+            options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+            ["allow_once", "allow_session", "deny"],
+            "the web action matrix changed"
+        );
+
+        let high = permission_definition(&exec_high(), &table, Audience::Web);
+        let ControlKind::Choice { options } = &high.controls[0].kind else {
+            panic!("the decision control is not a choice");
+        };
+        assert_eq!(
+            options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+            ["allow_once", "deny"],
+            "the web action matrix changed for a high-danger target"
+        );
+
+        // The web card is built from the legacy form the adapter
+        // reconstructs (`interaction_offer::PendingOffer::question`), which
+        // C0a does not touch — C3 owns removing it. Prove it still round
+        // trips, so "the terminal stopped using the adapter" cannot be
+        // mistaken for "the adapter is dead".
+        for definition in [&low, &high] {
+            let question = definition_to_question(definition).expect("the web form still adapts");
+            assert_eq!(question.markdown, definition.markdown);
+            assert_eq!(question.note, definition.note);
+            let ControlKind::Choice { options } = &definition.controls[0].kind else {
+                panic!("not a choice");
+            };
+            assert_eq!(question.actions.len(), options.len());
+            for (action, option) in question.actions.iter().zip(options) {
+                assert_eq!(action.value.as_str(), option.id.as_str());
+                assert_eq!(action.key, option.key);
+                assert_eq!(action.label, option.label);
+            }
+        }
     }
 }
 
@@ -3332,9 +3599,7 @@ mod b0a {
             ]
         );
         assert_eq!(
-            definition_to_question(&definition)
-                .expect("adapts")
-                .terminal_text(),
+            plain::render(&definition),
             "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
              Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
              [a]llow once   [s]ession allow   [A]llow permanently (adds host to config)   [d]eny (default)   [D]eny always   [P]ermanently deny"
@@ -3349,9 +3614,7 @@ mod b0a {
             ["allow_once", "allow_session", "deny"]
         );
         assert_eq!(
-            definition_to_question(&definition)
-                .expect("adapts")
-                .terminal_text(),
+            plain::render(&definition),
             "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
              Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
              [a]llow once   [s]ession allow   [d]eny (default)"

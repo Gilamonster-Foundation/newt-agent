@@ -278,7 +278,7 @@ mod b0a {
     /// bearing here and not defensive: the policy's note strings contain
     /// `{MODAL_CONTROL_HINT}`, so a naive brace count closes the function
     /// early and the guard starts reading the next one's body.
-    fn function_body(lines: &[String], name: &str) -> Option<String> {
+    pub(super) fn function_body(lines: &[String], name: &str) -> Option<String> {
         let anchor = format!("fn {name}(");
         let start = lines.iter().position(|line| line.contains(&anchor))?;
         let mut depth = 0i32;
@@ -335,10 +335,22 @@ mod b0a {
             needle: "permission_definition(",
             why: "the terminal answer reader must be handed the built form",
         },
+        // C0a (#1856) MOVED this link rather than deleting it. `ask` used
+        // to adapt the definition to a `Question` and hand THAT to the
+        // reader; it now hands the definition itself, and the rendering
+        // happens at the read site. The property — "the terminal renders
+        // the one definition, not a second builder" — is unchanged, so the
+        // link follows the rendering to where it went. Deleting it instead
+        // would have left the terminal's rendering pinned by nothing.
         Link {
-            caller: "ask",
-            needle: "definition_to_question(",
-            why: "and must render it through the adapter, not a second renderer",
+            caller: "prompt_permission_choice",
+            needle: "plain::render(",
+            why: "the terminal read site must render through the ONE plain projection",
+        },
+        Link {
+            caller: "prompt_permission_choice",
+            needle: "decode_answer(",
+            why: "and decode through the one parser, not a second validator",
         },
         // B0b-2 (#1846): the web surface now PUBLISHES the definition, so
         // it builds one directly instead of going through the rendering
@@ -349,10 +361,15 @@ mod b0a {
             needle: "permission_definition(",
             why: "the WEB surface must route through the definition path",
         },
+        // Also moved by C0a: the web branch no longer adapts in order to
+        // RENDER (it takes the note off the definition directly). The
+        // adapter call that remains is a renderability precondition — the
+        // web card is still built by reconstructing the legacy form, which
+        // is C3's to remove — so the `why` says what it now guards.
         Link {
             caller: "await_web_decision",
             needle: "definition_to_question(",
-            why: "and render it through the adapter, not a second renderer",
+            why: "the web must refuse to publish an offer its card could not reconstruct",
         },
         Link {
             caller: "await_web_decision",
@@ -511,8 +528,15 @@ mod b0a {
             "}",
             "fn await_web_decision(&self, req: &R) -> (PromptChoice, &'static str) {",
             "    let definition = permission_definition(req, &self.danger, Audience::Web);",
-            "    let q = definition_to_question(&definition).expect(\"x\");",
+            "    if definition_to_question(&definition).is_err() { return deny; }",
             "    let id = store.publish_interaction_offer(&conv, &definition, tier, Audience::Web);",
+            "}",
+            // C0a: the read site, switched. Present so the twin's
+            // "the web half is NOT flagged" assertion cannot pass merely
+            // because every C0a link is missing from the fixture.
+            "fn prompt_permission_choice(w: &PromptWindow, d: &InteractionDefinition) -> PromptChoice {",
+            "    let prompt = format!(\"{}\", plain::render(d));",
+            "    decode_answer(d, &answer)",
             "}",
             "fn permission_definition(req: &R) -> InteractionDefinition {",
             "    InteractionDefinition::new(kind, markdown, controls)",
@@ -544,6 +568,180 @@ mod b0a {
         assert!(
             !web.contains("Question {"),
             "the body extractor bled the previous function into this one"
+        );
+    }
+}
+
+/// **C0a (#1856): rendering left the semantic type.**
+///
+/// The epic's named C0 deletion gate is *"semantic core types no longer
+/// expose terminal rendering"*. Two facts make that checkable, and each
+/// carries an anti-vacuous twin — a source scan that sees nothing reports
+/// "deleted" for the same reason it reports "clean", which is precisely the
+/// vacuous shape B0a's Windows path-separator bug produced (see
+/// `b0a::normalized`).
+mod c0a {
+    use super::common;
+    use std::path::Path;
+
+    fn normalized(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
+
+    /// Every production line of the workspace, as `(normalized path, code)`.
+    fn production_source() -> Vec<(String, String)> {
+        let roots = common::production_roots(&common::workspace_root());
+        let mut lines = Vec::new();
+        common::for_each_production_line(&roots, &|_| false, &mut |path, code, _raw| {
+            lines.push((normalized(path), code.to_string()));
+        });
+        lines
+    }
+
+    /// Lines of one file, by forward-slash suffix.
+    fn lines_of(file_suffix: &str) -> Vec<String> {
+        production_source()
+            .into_iter()
+            .filter(|(path, _)| path.ends_with(file_suffix))
+            .map(|(_, code)| code)
+            .collect()
+    }
+
+    /// **The deletion gate.** `terminal_text` is gone from production
+    /// source — not renamed, not `#[allow(dead_code)]`, gone.
+    #[test]
+    fn terminal_text_no_longer_exists() {
+        let source = production_source();
+        assert!(
+            source.len() > 10_000,
+            "the scanner visited only {} production lines — it is not \
+             reading the workspace, so 'not found' means nothing",
+            source.len()
+        );
+
+        let survivors: Vec<String> = source
+            .iter()
+            .filter(|(_, code)| code.contains("terminal_text"))
+            .map(|(path, code)| format!("{path}: {}", code.trim()))
+            .collect();
+        assert!(
+            survivors.is_empty(),
+            "`terminal_text` survives in production source — C0a's deletion \
+             gate is that the semantic type no longer renders:\n{}",
+            survivors.join("\n")
+        );
+    }
+
+    /// **Anti-vacuous twin for the deletion gate.** The same machinery,
+    /// pointed at a seeded definition, must find it. A scanner that cannot
+    /// see the symbol it is looking for reports every codebase clean.
+    #[test]
+    fn the_deletion_scan_would_notice_a_resurrected_terminal_text() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("alpha/src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"alpha\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            "impl Q {\n    pub fn terminal_text(&self) -> String { String::new() }\n}\n",
+        )
+        .unwrap();
+
+        let mut hits = 0usize;
+        common::for_each_production_line(
+            &common::production_roots(root.path()),
+            &|_| false,
+            &mut |_, code, _| {
+                if code.contains("terminal_text") {
+                    hits += 1;
+                }
+            },
+        );
+        assert_eq!(hits, 1, "the scanner missed a seeded `terminal_text`");
+    }
+
+    /// **The terminal reaches the NEW renderer, from the site that reads
+    /// the answer.**
+    ///
+    /// Anchored to named function bodies rather than counted per file, for
+    /// B0a's reason: a bare "`plain::render` is called somewhere" check
+    /// passes green while the read site quietly keeps rendering through the
+    /// adapter. `prompt_permission_choice` is the ONE production site that
+    /// turns a definition into bytes for an operator, so that is where the
+    /// call must be.
+    #[test]
+    fn the_terminal_reaches_the_new_renderer_from_every_ask_site() {
+        let lines = lines_of("newt-tui/src/permissions.rs");
+        assert!(
+            !lines.is_empty(),
+            "the scanner found no production lines in permissions.rs"
+        );
+
+        let body = super::b0a::function_body(&lines, "prompt_permission_choice")
+            .expect("`fn prompt_permission_choice` not found at all");
+        assert!(
+            body.contains("plain::render("),
+            "the terminal read site does not render through \
+             `newt_core::markup::plain`: {body}"
+        );
+
+        // ...and nothing in this file renders through the old path any
+        // more. The adapter survives for DECODING (`Question::parse` stays
+        // the one parser, and BHV-PROMPT-001's Lean theorems govern it) and
+        // for the WEB's model reconstruction, which C3 owns — but no
+        // production line here turns a form into display bytes.
+        let renders_via_adapter: Vec<&String> = lines
+            .iter()
+            .filter(|code| code.contains("terminal_text"))
+            .collect();
+        assert!(
+            renders_via_adapter.is_empty(),
+            "a production line still renders through the semantic type: \
+             {renders_via_adapter:#?}"
+        );
+    }
+
+    /// **Anti-vacuous twin for the reach guard.** Feed it a
+    /// `prompt_permission_choice` that never switched: the guard must name
+    /// it. And feed it one that did: the guard must be satisfied — so it is
+    /// discriminating rather than failing on everything.
+    #[test]
+    fn the_reach_guard_notices_an_unswitched_read_site() {
+        let unswitched: Vec<String> = [
+            "fn prompt_permission_choice(w: &PromptWindow, q: &Question<PromptChoice>) -> PromptChoice {",
+            "    let prompt = format!(\"{}\\n{MODAL_INPUT_GLYPH}\", q.terminal_text());",
+            "}",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let body =
+            super::b0a::function_body(&unswitched, "prompt_permission_choice").expect("body");
+        assert!(
+            !body.contains("plain::render("),
+            "the twin's fixture is already switched, so it proves nothing"
+        );
+
+        let switched: Vec<String> = [
+            "fn prompt_permission_choice(w: &PromptWindow, d: &InteractionDefinition) -> PromptChoice {",
+            "    let prompt = format!(\"{}\\n{MODAL_INPUT_GLYPH}\", plain::render(d));",
+            "}",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let body = super::b0a::function_body(&switched, "prompt_permission_choice").expect("body");
+        assert!(
+            body.contains("plain::render("),
+            "the guard rejects a correctly switched read site"
+        );
+        assert!(
+            !body.contains("terminal_text"),
+            "the switched fixture still names the deleted method"
         );
     }
 }
