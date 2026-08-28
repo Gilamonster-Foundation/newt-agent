@@ -73,6 +73,10 @@ pub mod dialect;
 // the wyvern/lean tier falls back to, so it must survive
 // `--no-default-features`. It takes no Markdown dependency (C0a, #1856).
 pub mod plain;
+// Headless/noninteractive execution of a definition (C0b, #1860): present the
+// fallback, refuse an unsupported REQUIRED control, never produce a response.
+// Unconditional for `plain`'s reasons — the wyvern tier is its main consumer.
+pub mod headless;
 
 /// The envelope fence marker. Must open the document on its own line and
 /// close on its own line.
