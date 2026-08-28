@@ -1836,217 +1836,6 @@ impl ConversationStore {
     /// gate's shorter timeout against it.
     pub const PERMISSION_REQUEST_TTL_NANOS: i64 = 5 * 60 * 1_000_000_000;
 
-    // Publish a typed permission form for the next prompt render.
-    pub fn publish_permission_question(
-        &self,
-        conversation_id: &str,
-        question: &crate::Question<crate::PermissionAction>,
-        danger_json: &str,
-    ) -> anyhow::Result<String> {
-        self.publish_permission_request(
-            conversation_id,
-            &serde_json::to_string(question)?,
-            danger_json,
-        )
-    }
-
-    fn publish_permission_request(
-        &self,
-        conversation_id: &str,
-        requests_json: &str,
-        danger_json: &str,
-    ) -> anyhow::Result<String> {
-        validate_record_id(conversation_id)?;
-        let now = (self.claim_clock)();
-        let request_id = new_conversation_id();
-        let conn = self.lock_conn();
-        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-        let owner: Option<String> = tx
-            .query_row(
-                "SELECT workspace_key FROM conversations WHERE id = ?1",
-                [conversation_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match owner.as_deref() {
-            None => anyhow::bail!(
-                "cannot publish a permission request for unknown conversation `{conversation_id}`"
-            ),
-            Some(key) if key != self.workspace_id => {
-                anyhow::bail!("conversation `{conversation_id}` belongs to another workspace")
-            }
-            _ => {}
-        }
-        tx.execute(
-            "INSERT INTO permission_requests
-               (request_id, conversation_id, workspace_key, requests_json, danger_json, resolved, created_tick)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
-            rusqlite::params![
-                request_id,
-                conversation_id,
-                self.workspace_id,
-                requests_json,
-                danger_json,
-                now,
-            ],
-        )?;
-        tx.commit()?;
-        Ok(request_id)
-    }
-
-    // Unresolved pending decision for a conversation.
-    pub fn pending_permission_request(
-        &self,
-        conversation_id: &str,
-    ) -> anyhow::Result<Option<PendingPermission>> {
-        let conn = self.lock_conn();
-        let cutoff = (self.claim_clock)().saturating_sub(Self::PERMISSION_REQUEST_TTL_NANOS);
-        conn.query_row(
-            "SELECT request_id, requests_json, danger_json FROM permission_requests
-              WHERE conversation_id = ?1 AND workspace_key = ?2 AND resolved = 0 AND verdict IS NULL
-                AND created_tick > ?3
-              ORDER BY created_tick ASC LIMIT 1",
-            rusqlite::params![conversation_id, self.workspace_id, cutoff],
-            |row| {
-                Ok(PendingPermission {
-                    request_id: row.get(0)?,
-                    requests_json: row.get(1)?,
-                    danger_json: row.get(2)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(Into::into)
-    }
-
-    // Record a displayed action for a pending request.
-    pub fn answer_permission_action(
-        &self,
-        conversation_id: &str,
-        request_id: &str,
-        action: crate::PermissionAction,
-    ) -> anyhow::Result<AnswerOutcome> {
-        let Ok(verdict) = Verdict::try_from(action) else {
-            return Ok(AnswerOutcome::InvalidAction);
-        };
-        self.answer_permission_request_inner(conversation_id, request_id, verdict, Some(action))
-    }
-
-    #[cfg(test)]
-    fn answer_permission_request(
-        &self,
-        conversation_id: &str,
-        request_id: &str,
-        verdict: Verdict,
-    ) -> anyhow::Result<AnswerOutcome> {
-        self.answer_permission_request_inner(conversation_id, request_id, verdict, None)
-    }
-
-    // Idempotent on `request_id` and workspace-fenced.
-    fn answer_permission_request_inner(
-        &self,
-        conversation_id: &str,
-        request_id: &str,
-        verdict: Verdict,
-        required_action: Option<crate::PermissionAction>,
-    ) -> anyhow::Result<AnswerOutcome> {
-        let cutoff = (self.claim_clock)().saturating_sub(Self::PERMISSION_REQUEST_TTL_NANOS);
-        let conn = self.lock_conn();
-        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-        let state: Option<(i64, Option<String>, i64, String)> = tx
-            .query_row(
-                "SELECT resolved, verdict, created_tick, requests_json FROM permission_requests
-                  WHERE request_id = ?1 AND conversation_id = ?2 AND workspace_key = ?3",
-                rusqlite::params![request_id, conversation_id, self.workspace_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
-        let outcome = match state {
-            None => AnswerOutcome::Unknown,
-            Some((_, _, created_tick, _)) if created_tick <= cutoff => AnswerOutcome::Unknown,
-            Some((1, _, _, _)) | Some((_, Some(_), _, _)) => AnswerOutcome::AlreadyResolved,
-            // B0b-1 (#1842): the store's revalidation is now an
-            // AUTHORIZATION through `validate_response`, not a decode
-            // through `Question::parse`. Same fail-closed outcome for an
-            // undisplayed action; additionally refuses an action the gate
-            // never registered, and one this audience may not invoke.
-            Some((_, None, _, questions_json))
-                if matches!(required_action, Some(action) if
-                !crate::interaction_gate::web_answer_is_authorized(
-                    &questions_json,
-                    action,
-                    &self.workspace_id,
-                    conversation_id,
-                )) =>
-            {
-                AnswerOutcome::InvalidAction
-            }
-            Some((_, None, _, _)) => {
-                tx.execute(
-                    "UPDATE permission_requests SET verdict = ?2, answered_by = 'web'
-                      WHERE request_id = ?1 AND resolved = 0 AND verdict IS NULL",
-                    rusqlite::params![request_id, verdict.as_db_str()],
-                )?;
-                AnswerOutcome::Answered
-            }
-        };
-        tx.commit()?;
-        Ok(outcome)
-    }
-
-    /// The gate's poll: if a surface has answered `request_id` and it is still
-    /// unresolved, RESOLVE it (exactly-once) and return the verdict. Returns
-    /// `Ok(None)` instantly when no answer is waiting — a bounded, non-blocking
-    /// poll the gate calls each tick while also watching the TTY.
-    pub fn take_permission_decision(
-        &self,
-        conversation_id: &str,
-        request_id: &str,
-    ) -> anyhow::Result<Option<Verdict>> {
-        let conn = self.lock_conn();
-        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-        let verdict: Option<String> = tx
-            .query_row(
-                "SELECT verdict FROM permission_requests
-                  WHERE request_id = ?1 AND conversation_id = ?2 AND workspace_key = ?3
-                    AND resolved = 0 AND verdict IS NOT NULL",
-                rusqlite::params![request_id, conversation_id, self.workspace_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        let Some(v) = verdict else {
-            tx.commit()?;
-            return Ok(None);
-        };
-        tx.execute(
-            "UPDATE permission_requests SET resolved = 1 WHERE request_id = ?1",
-            [request_id],
-        )?;
-        tx.commit()?;
-        Ok(Verdict::from_db_str(&v))
-    }
-
-    /// The gate RESOLVES a request itself (the TTY answered, or the deadline
-    /// fired) — a CAS that flips `resolved` 0→1 only if still unresolved.
-    /// Returns `true` if THIS call won (the TTY/timeout beat any web answer);
-    /// `false` means a web answer already resolved it (its verdict stands, and
-    /// the caller must discard the TTY/timeout choice). `by` is 'tty'|'expired'.
-    pub fn resolve_permission_request(
-        &self,
-        conversation_id: &str,
-        request_id: &str,
-        by: &str,
-    ) -> anyhow::Result<bool> {
-        let conn = self.lock_conn();
-        let changed = conn.execute(
-            "UPDATE permission_requests SET resolved = 1, answered_by = ?4
-              WHERE request_id = ?1 AND conversation_id = ?2 AND workspace_key = ?3
-                AND resolved = 0 AND verdict IS NULL",
-            rusqlite::params![request_id, conversation_id, self.workspace_id, by],
-        )?;
-        Ok(changed == 1)
-    }
-
     /// How long a staged enrollment candidate stays promotable. An enrollment
     /// asks a human to compare two six-word strings on two screens, so it is
     /// given the same 5 minutes as a permission decision — long enough to read
@@ -4053,25 +3842,6 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS idx_conversation_inbox_poll
              ON conversation_inbox (conversation_id, workspace_key, delivered, seq);
-         -- A4 (W6) permission-decision channel: the RUNNING gate (sole authority
-         -- minter) publishes a pending permission decision here; an ATTACH
-         -- surface renders its typed Question and writes back a listed VERDICT.
-         -- The gate resolves it exactly once. `danger_json` remains as
-         -- gate-stamped compatibility metadata for existing databases.
-         CREATE TABLE IF NOT EXISTS permission_requests (
-             request_id      TEXT PRIMARY KEY,        -- unguessable nonce (new_conversation_id)
-             conversation_id TEXT NOT NULL,
-             workspace_key   TEXT NOT NULL,           -- same fence every table carries
-             requests_json   TEXT NOT NULL,           -- serialized typed Question
-             danger_json     TEXT NOT NULL,           -- gate-stamped per-target tier
-             verdict         TEXT,                    -- NULL until a surface answers
-             answered_by     TEXT,                    -- audit: 'web' | 'tty' | 'expired'
-             resolved        INTEGER NOT NULL DEFAULT 0,
-             created_tick    INTEGER NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS idx_permission_requests_pending
-             ON permission_requests (conversation_id, workspace_key, resolved);
-
          -- A3 (#1837): exactly-once resolution of a Newt Markup interaction
          -- offer. `instance_id` is the PRIMARY KEY, so one-offer-resolves-
          -- at-most-once is enforced by the schema rather than by caller
@@ -4080,6 +3850,42 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
          -- for audit and fencing, but the fence is already intrinsic — an
          -- InstanceId is a content id over a record that CONTAINS its
          -- scope, so two workspaces cannot mint the same one.
+         -- B0b-2 (#1846): the published interaction OFFER, and its terminal
+         -- state. Replaces `permission_requests` as the offer/answer
+         -- transport.
+         --
+         -- Offer and outcome live in ONE row on purpose. The race this table
+         -- arbitrates has two kinds of winner — a surface ANSWERS, or the
+         -- local operator CANCELS — and only the first has a Response. A
+         -- single `outcome IS NULL` CAS serializes both, exactly as the old
+         -- `resolved = 0 AND verdict IS NULL` CAS did. Splitting answers into
+         -- `interaction_resolutions` (which requires a response id) and
+         -- cancellations into a second column would make the decision two
+         -- writes across two tables, and the exactly-once race is on this
+         -- epic's must-not-change list.
+         --
+         -- `response_json` is why `answered_by` survives: the winning
+         -- Response body carries `responder_provenance.audience`, so the
+         -- who-answered fact stays recoverable from this row alone.
+         --
+         -- `danger_tier` is a PLAIN 'high'|'low', not JSON. The column it
+         -- replaces (`permission_requests.danger_json`) was written as a JSON
+         -- string and read as a JSON array — #1836.
+         CREATE TABLE IF NOT EXISTS interaction_offers (
+             instance_id     TEXT PRIMARY KEY,       -- canonical InstanceId
+             conversation_id TEXT NOT NULL,
+             workspace_key   TEXT NOT NULL,          -- same fence every table carries
+             definition_json TEXT NOT NULL,          -- the InteractionDefinition
+             instance_json   TEXT NOT NULL,          -- the InteractionInstance
+             danger_tier     TEXT NOT NULL,          -- 'high' | 'low'
+             published_tick  INTEGER NOT NULL,
+             outcome         TEXT,                   -- NULL while answerable
+             response_json   TEXT,                   -- the winner's Response
+             resolved_tick   INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_interaction_offers_pending
+             ON interaction_offers (conversation_id, workspace_key, outcome, published_tick);
+
          CREATE TABLE IF NOT EXISTS interaction_resolutions (
              instance_id     TEXT PRIMARY KEY,       -- canonical InstanceId
              workspace_key   TEXT NOT NULL,          -- same fence every table carries
@@ -4822,40 +4628,16 @@ pub enum Verdict {
     Deny,
 }
 
-impl Verdict {
-    fn as_db_str(self) -> &'static str {
-        match self {
-            Self::AllowOnce => "allow_once",
-            Self::AllowSession => "allow_session",
-            Self::Deny => "deny",
-        }
-    }
-    fn from_db_str(s: &str) -> Option<Self> {
-        match s {
-            "allow_once" => Some(Self::AllowOnce),
-            "allow_session" => Some(Self::AllowSession),
-            "deny" => Some(Self::Deny),
-            _ => None,
-        }
-    }
-}
-
-/// Permission decision row returned for a pending request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingPermission {
-    /// Request nonce.
-    pub request_id: String,
-    /// Serialized `Question`.
-    pub requests_json: String,
-    /// Gate metadata.
-    pub danger_json: String,
-}
-
-impl PendingPermission {
-    pub fn question(&self) -> serde_json::Result<crate::Question<crate::PermissionAction>> {
-        serde_json::from_str(&self.requests_json)
-    }
-}
+// B0b-2 (#1846): `Verdict`'s DATABASE serialization (`as_db_str` /
+// `from_db_str`) went with the `permission_requests.verdict` column it
+// existed for. The enum itself stays — `From<Verdict> for PermissionAction`
+// is still live — but nothing persists it any more: an answer is stored as
+// the winning `Response` body in `interaction_offers`.
+//
+// The lenient-read guarantee those functions carried was RETARGETED, not
+// retired: `an_unknown_persisted_option_reads_as_none_not_error` asserts the
+// same property against the new decode path, where an unreadable stored
+// answer reads as "no answer" rather than as an error or an authorization.
 
 /// A staged passkey binding awaiting terminal confirmation
 /// ([`ConversationStore::pending_enrollment_candidate`]).
@@ -6782,208 +6564,130 @@ mod tests {
         );
     }
 
+    /// Expiry drops an offer from the pending set and synthesizes NOTHING —
+    /// retargeted from `permission_request_expires_on_created_tick_ttl`.
     #[test]
-    fn permission_request_expires_on_created_tick_ttl() {
+    fn an_expired_offer_is_not_pending() {
         let root = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
         let mut store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
-        let conv = store.create("session", None).unwrap();
-
-        store.set_claim_clock_for_test(|| 0);
-        let r1 = store
-            .publish_permission_request(&conv, "[]", r#"["low"]"#)
+        let conv = store.create("s", None).unwrap();
+        store.claim_clock = || 1_000;
+        let (definition, _instance) = test_offer(&store, &conv);
+        let id = store
+            .publish_interaction_offer(
+                &conv,
+                &definition,
+                crate::interaction_offer::OfferDanger::High,
+                newt_interaction::Audience::Web,
+            )
             .unwrap();
-        assert!(
-            store.pending_permission_request(&conv).unwrap().is_some(),
-            "a fresh request is pending"
-        );
+        assert!(store.pending_interaction_offer(&conv).unwrap().is_some());
 
-        store.set_claim_clock_for_test(|| ConversationStore::PERMISSION_REQUEST_TTL_NANOS + 1);
-        assert_eq!(
-            store.pending_permission_request(&conv).unwrap(),
-            None,
-            "an aged-out request is not surfaced"
-        );
-        assert_eq!(
-            store
-                .answer_permission_request(&conv, &r1, Verdict::AllowOnce)
-                .unwrap(),
-            AnswerOutcome::Unknown,
-            "answering an expired request is rejected as gone"
-        );
-
-        let r2 = store
-            .publish_permission_request(&conv, "[]", r#"["low"]"#)
-            .unwrap();
-        assert!(store.pending_permission_request(&conv).unwrap().is_some());
-        assert_eq!(
-            store
-                .answer_permission_request(&conv, &r2, Verdict::AllowOnce)
-                .unwrap(),
-            AnswerOutcome::Answered,
-            "a within-TTL request still answers"
-        );
+        // One tick inside the window is still answerable...
+        store.claim_clock = || 999 + ConversationStore::PERMISSION_REQUEST_TTL_NANOS;
+        assert!(store.pending_interaction_offer(&conv).unwrap().is_some());
+        // ...and AT the deadline it is gone, without anything having
+        // answered. The boundary is inherited deliberately from the row
+        // this replaces: `published_tick > now - TTL`, so an offer expires
+        // exactly at `published + TTL`.
+        store.claim_clock = || 1_000 + ConversationStore::PERMISSION_REQUEST_TTL_NANOS;
+        assert!(store.pending_interaction_offer(&conv).unwrap().is_none());
+        assert_eq!(store.take_interaction_decision(&conv, &id).unwrap(), None);
     }
 
+    /// A minimal published offer, minted under `store`'s own workspace
+    /// fence so the fence check is exercised rather than sidestepped.
+    fn test_offer(
+        store: &ConversationStore,
+        conv: &str,
+    ) -> (
+        newt_interaction::InteractionDefinition,
+        newt_interaction::InteractionInstance,
+    ) {
+        let question = crate::Question::<crate::PermissionAction> {
+            markdown: "\u{2298} run_command wants to run `bash`".to_string(),
+            actions: vec![
+                crate::Action::new(crate::PermissionAction::AllowOnce, "a", "allow once"),
+                crate::Action::new(crate::PermissionAction::Deny, "d", "deny (default)"),
+            ],
+            note: None,
+        };
+        let definition = crate::interaction_adapter::question_to_definition(&question).unwrap();
+        let (instance, _) = crate::interaction_gate::mint_offer(
+            &definition,
+            store.workspace_fence(),
+            conv,
+            newt_interaction::Audience::Web,
+            // The store's OWN clock, so the offer's TTL window is the one
+            // the store measures against rather than a fixed literal that
+            // is already ancient by wall time.
+            store.claim_tick(),
+        )
+        .unwrap();
+        (definition, instance)
+    }
+
+    /// The offer transport's core contract (B0b-2, #1846), retargeted from
+    /// `permission_channel_publish_answer_take_race_and_fence`: publish,
+    /// read back, workspace fence, answer exactly once, and a local cancel
+    /// that arrives after an answer loses to it.
     #[test]
-    fn permission_channel_publish_answer_take_race_and_fence() {
+    fn interaction_offer_publish_answer_take_race_and_fence() {
         let root = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
+        let other_ws = tempfile::tempdir().unwrap();
         let store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
-        let conv = store.create("session", None).unwrap();
+        let conv = store.create("s", None).unwrap();
+        let (definition, _instance) = test_offer(&store, &conv);
 
-        assert_eq!(store.pending_permission_request(&conv).unwrap(), None);
-
-        let r1 = store
-            .publish_permission_request(&conv, r#"[{"tool":"run_command"}]"#, r#"["low"]"#)
+        let id = store
+            .publish_interaction_offer(
+                &conv,
+                &definition,
+                crate::interaction_offer::OfferDanger::Low,
+                newt_interaction::Audience::Web,
+            )
             .unwrap();
-        let pending = store.pending_permission_request(&conv).unwrap().unwrap();
-        assert_eq!(pending.request_id, r1);
-        assert_eq!(pending.danger_json, r#"["low"]"#);
+        let pending = store.pending_interaction_offer(&conv).unwrap().unwrap();
+        assert_eq!(pending.instance_id, id);
+        assert_eq!(pending.danger, crate::interaction_offer::OfferDanger::Low);
 
-        assert_eq!(store.take_permission_decision(&conv, &r1).unwrap(), None);
+        // Another workspace cannot see it.
+        let foreign = ConversationStore::new(root.path(), other_ws.path(), 100).unwrap();
+        assert!(foreign.pending_interaction_offer(&conv).unwrap().is_none());
 
+        // Answering wins once; a second answer loses and the first stands.
         assert_eq!(
             store
-                .answer_permission_request(&conv, &r1, Verdict::AllowSession)
+                .answer_interaction_offer(
+                    &conv,
+                    &id,
+                    crate::PermissionAction::AllowOnce,
+                    newt_interaction::Audience::Web
+                )
                 .unwrap(),
             AnswerOutcome::Answered
         );
         assert_eq!(
-            store.take_permission_decision(&conv, &r1).unwrap(),
-            Some(Verdict::AllowSession)
-        );
-        assert_eq!(
-            store.take_permission_decision(&conv, &r1).unwrap(),
-            None,
-            "a resolved request yields the verdict exactly once"
-        );
-        assert_eq!(
-            store.pending_permission_request(&conv).unwrap(),
-            None,
-            "an answered request is no longer pending"
-        );
-        assert_eq!(
             store
-                .answer_permission_request(&conv, &r1, Verdict::Deny)
+                .answer_interaction_offer(
+                    &conv,
+                    &id,
+                    crate::PermissionAction::Deny,
+                    newt_interaction::Audience::Web
+                )
                 .unwrap(),
             AnswerOutcome::AlreadyResolved
         );
-        let bad_question = crate::Question {
-            markdown: "only deny".into(),
-            actions: vec![crate::Action::new(
-                crate::PermissionAction::Deny,
-                "d",
-                "deny",
-            )],
-            note: None,
-        };
-        let r_bad = store
-            .publish_permission_question(&conv, &bad_question, r#"["low"]"#)
-            .unwrap();
         assert_eq!(
-            store
-                .answer_permission_action(&conv, &r_bad, crate::PermissionAction::AllowSession)
-                .unwrap(),
-            AnswerOutcome::InvalidAction
+            store.take_interaction_decision(&conv, &id).unwrap(),
+            Some(crate::PermissionAction::AllowOnce)
         );
-        assert!(store.pending_permission_request(&conv).unwrap().is_some());
-
-        let r2 = store.publish_permission_request(&conv, "[]", "[]").unwrap();
-        assert!(
-            store.resolve_permission_request(&conv, &r2, "tty").unwrap(),
-            "the TTY resolve wins when unresolved"
-        );
-        assert!(
-            !store.resolve_permission_request(&conv, &r2, "tty").unwrap(),
-            "resolving an already-resolved request loses"
-        );
-        assert_eq!(
-            store
-                .answer_permission_request(&conv, &r2, Verdict::AllowOnce)
-                .unwrap(),
-            AnswerOutcome::AlreadyResolved,
-            "a web answer after the TTY won is a no-op"
-        );
-        assert_eq!(
-            store.take_permission_decision(&conv, &r2).unwrap(),
-            None,
-            "no web verdict applies once the TTY resolved it"
-        );
-
-        let ws_b = tempfile::tempdir().unwrap();
-        let store_b = ConversationStore::new(root.path(), ws_b.path(), 100).unwrap();
-        let r3 = store.publish_permission_request(&conv, "[]", "[]").unwrap();
-        assert!(
-            !store_b
-                .resolve_permission_request(&conv, &r3, "expired")
-                .unwrap(),
-            "a cross-workspace resolver must not win"
-        );
-        assert_eq!(
-            store
-                .answer_permission_request(&conv, &r3, Verdict::AllowOnce)
-                .unwrap(),
-            AnswerOutcome::Answered
-        );
-        let answered_by: String = store
-            .lock_conn()
-            .query_row(
-                "SELECT answered_by FROM permission_requests WHERE request_id = ?1",
-                [&r3],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(answered_by, "web");
-        assert!(
-            !store
-                .resolve_permission_request(&conv, &r3, "expired")
-                .unwrap(),
-            "timeout must not clobber a recorded web answer"
-        );
-        assert_eq!(
-            store.take_permission_decision(&conv, &r3).unwrap(),
-            Some(Verdict::AllowOnce)
-        );
-
-        let r4 = store.publish_permission_request(&conv, "[]", "[]").unwrap();
-        let r5 = store.publish_permission_request(&conv, "[]", "[]").unwrap();
-        store
-            .answer_permission_request(&conv, &r4, Verdict::AllowOnce)
-            .unwrap();
-        assert_eq!(store.take_permission_decision(&conv, &r5).unwrap(), None);
-        assert_eq!(
-            store.take_permission_decision(&conv, &r4).unwrap(),
-            Some(Verdict::AllowOnce)
-        );
-
-        assert_eq!(
-            store
-                .answer_permission_request(&conv, "no-such-id", Verdict::Deny)
-                .unwrap(),
-            AnswerOutcome::Unknown
-        );
-
-        let ws_b = tempfile::tempdir().unwrap();
-        let store_b = ConversationStore::new(root.path(), ws_b.path(), 100).unwrap();
-        assert!(
-            store_b
-                .publish_permission_request(&conv, "[]", "[]")
-                .is_err(),
-            "cross-workspace publish is rejected"
-        );
-        let r5 = store.publish_permission_request(&conv, "[]", "[]").unwrap();
-        assert_eq!(
-            store_b.pending_permission_request(&conv).unwrap(),
-            None,
-            "cross-workspace pending read sees nothing"
-        );
-        assert_eq!(
-            store_b
-                .answer_permission_request(&conv, &r5, Verdict::AllowOnce)
-                .unwrap(),
-            AnswerOutcome::Unknown
-        );
+        // ...and it is no longer pending.
+        assert!(store.pending_interaction_offer(&conv).unwrap().is_none());
+        // A local cancel after an answer LOSES: the answer stands.
+        assert!(!store.cancel_interaction_offer(&conv, &id).unwrap());
     }
 
     #[test]
@@ -7270,62 +6974,55 @@ mod tests {
             .contains("primary key (id, workspace_key)"));
     }
 
-    /// A0 freeze (#1823): `Verdict::from_db_str` is deliberately LENIENT — an
-    /// unknown persisted verdict string becomes `None`, never an error, and
-    /// the DB vocabulary is closed. (The end-to-end consequence is pinned
-    /// separately by `an_unknown_persisted_verdict_is_silently_consumed`.)
+    /// A0 freeze (#1823), retargeted (B0b-2, #1846). The old lenient read
+    /// consumed an unparseable VERDICT string as `Ok(None)`; the new decode
+    /// path is an unparseable OPTION in the stored Response. The guarantee
+    /// is the same and deliberately kept: an answer this build cannot read
+    /// is not an answer, and is never an error or an authorization.
     #[test]
-    fn unknown_persisted_verdict_string_reads_as_none_not_error() {
-        assert_eq!(Verdict::from_db_str("garbage"), None);
-        assert_eq!(Verdict::from_db_str(""), None);
-        // Wire strings round-trip exactly; the DB vocabulary is closed.
-        for v in [Verdict::AllowOnce, Verdict::AllowSession, Verdict::Deny] {
-            assert_eq!(Verdict::from_db_str(v.as_db_str()), Some(v));
-        }
-    }
-
-    /// A0 freeze (#1823), the end-to-end half: an unknown verdict string that
-    /// somehow reaches the `permission_requests` table is silently CONSUMED by
-    /// `take_permission_decision` — the row is marked resolved inside the same
-    /// transaction, the verdict is lost, and the caller sees `Ok(None)` as if
-    /// no answer existed. The A0 inventory records this as an unremarked
-    /// lenient read path; a migration slice that tightens it (error instead,
-    /// or leave the row unresolved) must list the change deliberately.
-    #[test]
-    fn an_unknown_persisted_verdict_is_silently_consumed() {
+    fn an_unknown_persisted_option_reads_as_none_not_error() {
         let root = tempfile::tempdir().unwrap();
         let ws = tempfile::tempdir().unwrap();
         let store = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
-        let conv = store.create("session", None).unwrap();
-        let r1 = store
-            .publish_permission_request(&conv, r#"[{"tool":"run_command"}]"#, r#"["low"]"#)
+        let conv = store.create("s", None).unwrap();
+        let (definition, _instance) = test_offer(&store, &conv);
+        let id = store
+            .publish_interaction_offer(
+                &conv,
+                &definition,
+                crate::interaction_offer::OfferDanger::Low,
+                newt_interaction::Audience::Web,
+            )
             .unwrap();
-
-        // Corrupt the persisted verdict the way only a foreign writer or a
-        // future vocabulary change could — the public API cannot write this.
         store
-            .lock_conn()
-            .execute(
-                "UPDATE permission_requests SET verdict = 'garbage', answered_by = 'web'
-                  WHERE request_id = ?1",
-                [&r1],
+            .answer_interaction_offer(
+                &conv,
+                &id,
+                crate::PermissionAction::AllowOnce,
+                newt_interaction::Audience::Web,
             )
             .unwrap();
 
+        // Rewrite the stored body to name an option this build does not
+        // know — the shape an older or forked writer could leave behind.
+        store
+            .lock_conn()
+            .execute(
+                "UPDATE interaction_offers SET response_json = replace(response_json, 'allow_once', 'allow_twice') WHERE instance_id = ?1",
+                [&id],
+            )
+            .unwrap();
+
+        // LENIENT, deliberately, and unchanged from the verdict path this
+        // replaces: an unreadable answer reads as "no answer", never as an
+        // error and never as an authorization. Tightening it (erroring, or
+        // treating it as a deny) is a change a later slice must list.
+        assert_eq!(store.take_interaction_decision(&conv, &id).unwrap(), None);
+        // ...and the audit fact survives regardless: the row still records
+        // WHICH surface answered.
         assert_eq!(
-            store.take_permission_decision(&conv, &r1).unwrap(),
-            None,
-            "an unknown verdict string reads as no-decision, not an error"
-        );
-        // ...and the row was consumed by that read: nothing is pending and a
-        // late web answer finds it already resolved.
-        assert_eq!(store.pending_permission_request(&conv).unwrap(), None);
-        assert_eq!(
-            store
-                .answer_permission_request(&conv, &r1, Verdict::Deny)
-                .unwrap(),
-            AnswerOutcome::AlreadyResolved,
-            "the silent consume resolved the row"
+            store.interaction_answered_by(&conv, &id).unwrap(),
+            Some(newt_interaction::Audience::Web)
         );
     }
 }
