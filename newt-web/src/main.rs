@@ -229,7 +229,7 @@ async fn pending_decision_route(
     let conv = attach.conv_id.clone();
     let pending = tokio::task::spawn_blocking(move || {
         newt_core::ConversationStore::new(&state, &attach.workspace, 1000)
-            .and_then(|s| s.pending_permission_request(&conv))
+            .and_then(|s| s.pending_interaction_offer(&conv))
             .ok()
             .flatten()
     })
@@ -286,19 +286,23 @@ fn classify_decision(
     submitted: &str,
 ) -> Result<DecideOutcome, ()> {
     let Some(pending) = store
-        .pending_permission_request(conv)
+        .pending_interaction_offer(conv)
         .map_err(|_| ())?
-        .filter(|p| p.request_id == request_id)
+        .filter(|p| p.instance_id == request_id)
     else {
         return Ok(DecideOutcome::NoLiveRequest);
     };
+    // `Question::parse` still DECODES the submitted string — aliases and
+    // ambiguity denial are presentation rules and stayed put (B0b-1). What
+    // authorizes the decoded action is `answer_interaction_offer`, against
+    // the offer as PUBLISHED.
     let question = pending.question().map_err(|_| ())?;
     let Some(action) = question.parse(submitted) else {
         return Ok(DecideOutcome::Unparsable);
     };
     Ok(DecideOutcome::Resolved(
         store
-            .answer_permission_action(conv, request_id, action)
+            .answer_interaction_offer(conv, request_id, action, newt_core::Audience::Web)
             .map_err(|_| ())?,
     ))
 }
@@ -1332,8 +1336,15 @@ mod tests {
             ],
             note: Some("High danger: session authorization is unavailable.".into()),
         };
+        let definition =
+            newt_core::interaction_adapter::question_to_definition(&question).unwrap();
         let rid = store
-            .publish_permission_question(&conv, &question, "\"high\"")
+            .publish_interaction_offer(
+                &conv,
+                &definition,
+                newt_core::OfferDanger::High,
+                newt_core::Audience::Web,
+            )
             .unwrap();
 
         // The card renders — allow-once + deny, but NOT allow-session (high).
@@ -1356,7 +1367,7 @@ mod tests {
         let (status, _) = req(&app, "POST", "/agents/1/decision", Some(&forged)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(
-            store.pending_permission_request(&conv).unwrap().is_some(),
+            store.pending_interaction_offer(&conv).unwrap().is_some(),
             "an action absent from the form must leave the decision pending"
         );
 
@@ -1365,8 +1376,8 @@ mod tests {
         let (status, _) = req(&app, "POST", "/agents/1/decision", Some(&dform)).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(
-            store.take_permission_decision(&conv, &rid).unwrap(),
-            Some(newt_core::Verdict::AllowOnce),
+            store.take_interaction_decision(&conv, &rid).unwrap(),
+            Some(newt_core::PermissionAction::AllowOnce),
             "the gate consumes the web verdict"
         );
         std::env::remove_var("NEWT_WEB_STATE_DIR");
@@ -1400,8 +1411,15 @@ mod tests {
             ],
             note: None,
         };
+        let definition =
+            newt_core::interaction_adapter::question_to_definition(&question).unwrap();
         let rid = store
-            .publish_permission_question(&conv, &question, "\"high\"")
+            .publish_interaction_offer(
+                &conv,
+                &definition,
+                newt_core::OfferDanger::High,
+                newt_core::Audience::Web,
+            )
             .unwrap();
         (store, conv, rid)
     }
@@ -1474,7 +1492,7 @@ mod tests {
         // The terminal wins first (CAS 0->1); the browser's card is now stale.
         assert!(
             store
-                .resolve_permission_request(&conv, &rid, "tty")
+                .cancel_interaction_offer(&conv, &rid)
                 .unwrap(),
             "the terminal resolves the live request"
         );
@@ -1492,7 +1510,7 @@ mod tests {
             "a stale web answer that lost to the terminal must 409, not 204"
         );
         assert_eq!(
-            store.take_permission_decision(&conv, &rid).unwrap(),
+            store.take_interaction_decision(&conv, &rid).unwrap(),
             None,
             "the losing web answer recorded no authorization"
         );
@@ -1532,8 +1550,8 @@ mod tests {
             "the second answer lost the race — 409, not a second 204"
         );
         assert_eq!(
-            store.take_permission_decision(&conv, &rid).unwrap(),
-            Some(newt_core::Verdict::AllowOnce),
+            store.take_interaction_decision(&conv, &rid).unwrap(),
+            Some(newt_core::PermissionAction::AllowOnce),
             "exactly the winning verdict is recorded; the loser did not overwrite"
         );
         clear_web_env();
@@ -1563,13 +1581,13 @@ mod tests {
             assert_eq!(web, StatusCode::NO_CONTENT);
             assert!(
                 !store
-                    .resolve_permission_request(&conv, &rid, "tty")
+                    .cancel_interaction_offer(&conv, &rid)
                     .unwrap(),
                 "the terminal loses: the web answer already holds the verdict"
             );
             assert_eq!(
-                store.take_permission_decision(&conv, &rid).unwrap(),
-                Some(newt_core::Verdict::AllowOnce),
+                store.take_interaction_decision(&conv, &rid).unwrap(),
+                Some(newt_core::PermissionAction::AllowOnce),
                 "exactly the web verdict is recorded"
             );
             clear_web_env();
@@ -1582,7 +1600,7 @@ mod tests {
             let (store, conv, rid) =
                 seed_followed_pending_decision(&app, state.path(), ws.path()).await;
             assert!(store
-                .resolve_permission_request(&conv, &rid, "tty")
+                .cancel_interaction_offer(&conv, &rid)
                 .unwrap());
             let (web, _) = req(
                 &app,
@@ -1597,7 +1615,7 @@ mod tests {
                 "the web answer lost to the terminal"
             );
             assert_eq!(
-                store.take_permission_decision(&conv, &rid).unwrap(),
+                store.take_interaction_decision(&conv, &rid).unwrap(),
                 None,
                 "no web verdict recorded: the terminal's decision is the only one"
             );
@@ -1639,8 +1657,8 @@ mod tests {
         );
         assert_eq!(loser, StatusCode::CONFLICT);
         assert_eq!(
-            store.take_permission_decision(&conv, &rid).unwrap(),
-            Some(newt_core::Verdict::Deny),
+            store.take_interaction_decision(&conv, &rid).unwrap(),
+            Some(newt_core::PermissionAction::Deny),
             "only the winning verdict stands"
         );
         clear_web_env();
