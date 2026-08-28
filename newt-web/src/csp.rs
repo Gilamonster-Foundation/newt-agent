@@ -68,7 +68,31 @@ pub fn policy(nonce: &Nonce) -> String {
     [
         "default-src 'none'".to_string(),
         format!("script-src 'nonce-{n}'"),
+        // CSP3 splits style into ELEMENT and ATTRIBUTE sources, and newt needs
+        // them split. Measured on the real page (49 `style-src-attr` blocks vs
+        // 4 `style-src-elem`): Mermaid styles the SVG it generates almost
+        // entirely through per-node `style=` attributes.
+        //
+        // `style-src-elem` stays strict — a `<style>` element or a stylesheet
+        // is where style injection has teeth, and untrusted markup reaching
+        // one would be a real finding.
+        //
+        // `style-src-attr 'unsafe-inline'` grants an attacker NOTHING here,
+        // and that is a fact about the sanitizer rather than a hope: ammonia's
+        // defaults are `generic_attributes = {"lang","title"}` and
+        // `clean_content_tags = {"script","style"}`, so `style` is not an
+        // allowed attribute on any tag and untrusted content cannot emit one.
+        // The only inline style attributes on the page are the ones our own
+        // pinned, SRI-bound Mermaid bundle generates. A style attribute also
+        // cannot execute, and `img-src 'self' data:` closes the CSS
+        // exfiltration channel that would otherwise make one interesting.
+        //
+        // `style-src` remains as the fallback for a browser that implements
+        // neither, where it fails CLOSED (attributes blocked, diagrams
+        // degrade) rather than open.
         format!("style-src 'nonce-{n}'"),
+        format!("style-src-elem 'nonce-{n}'"),
+        "style-src-attr 'unsafe-inline'".to_string(),
         // The cockpit talks only to itself: htmx posts and the SSE stream.
         "connect-src 'self'".to_string(),
         "img-src 'self' data:".to_string(),
@@ -82,12 +106,52 @@ pub fn policy(nonce: &Nonce) -> String {
     .join("; ")
 }
 
+/// Whether `policy` permits an inline `<style>` ELEMENT to apply.
+///
+/// Derived from the policy TEXT rather than restated as a constant, so the
+/// answer cannot drift from the header actually sent — it reads the same bytes.
+///
+/// The page passes this to the client as data. The alternative, letting the
+/// browser feature-detect by injecting a probe `<style>`, works but is
+/// self-defeating: the probe is itself an inline style element, so it TRIPS
+/// the very violation it is testing for, and a page that reports its own
+/// violations can then never assert it has none. The server knows its own
+/// policy; asking the browser is indirection with a side effect.
+#[must_use]
+pub fn permits_inline_style_elements(policy: &str) -> bool {
+    let directive = policy
+        .split(';')
+        .map(str::trim)
+        .find(|d| d.split_whitespace().next() == Some("style-src-elem"))
+        .or_else(|| {
+            policy
+                .split(';')
+                .map(str::trim)
+                .find(|d| d.split_whitespace().next() == Some("style-src"))
+        });
+    directive.is_some_and(|d| d.contains("'unsafe-inline'"))
+}
+
 /// The vendored htmx bundle, so both the route and its SRI digest read the
 /// same bytes. A digest computed over anything else is a lie.
 pub const HTMX_JS: &str = include_str!("../assets/htmx.min.js");
 
 /// The passkey ceremony script.
 pub const WEBAUTHN_JS: &str = include_str!("../assets/webauthn.js");
+
+/// The Markdown progressive-enhancement adapter.
+pub const MARKDOWN_JS: &str = include_str!("../assets/markdown.js");
+
+/// The live-transcript attachment script.
+///
+/// It exists as a FILE rather than inline markup for a CSP reason (#1854):
+/// the panel it drives is an HTMX fragment, and a fragment cannot carry a
+/// nonce. Kept beside the other served scripts so a tag and its SRI digest
+/// always read the same bytes.
+pub const PANEL_JS: &str = include_str!("../assets/panel.js");
+
+/// The vendored Mermaid runtime.
+pub const MERMAID_JS: &str = include_str!("../assets/mermaid.min.js");
 
 /// Security headers every cockpit page carries, alongside the CSP.
 #[must_use]

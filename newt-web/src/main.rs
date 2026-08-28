@@ -60,6 +60,98 @@ async fn require_identity(
     }
 }
 
+/// The CSRF token this request carries, for re-emission into a fragment's
+/// forms. Empty when the browser holds none — the form then renders with an
+/// empty field and is refused on submit, which is the fail-closed direction.
+fn csrf_of(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(newt_web::csrf::from_cookie_header)
+        .unwrap_or_default()
+}
+
+/// Whether the caller can consume an HTML fragment.
+///
+/// HTMX sets `HX-Request` on everything it sends. A plain browser form post
+/// does not, and cannot swap a fragment into anything — it must be sent back
+/// to a page (POST-Redirect-GET), or the operator is left staring at a
+/// fragment as a whole document.
+fn is_htmx(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key("hx-request")
+}
+
+/// POST-Redirect-GET: the scriptless answer to a successful form submission.
+///
+/// 303 specifically, so the follow-up is a GET regardless of the method that
+/// produced it, and a reload cannot resubmit the form.
+fn see_other(to: &str) -> axum::response::Response {
+    (StatusCode::SEE_OTHER, [("location", to)]).into_response()
+}
+
+/// Reject a state-changing browser request that is cross-site or carries no
+/// matching CSRF token.
+///
+/// **Both checks, on every browser POST.** The cockpit sits behind a
+/// forward-auth proxy, so a cross-site request arrives ALREADY authenticated —
+/// the browser attaches the proxy's cookie whether or not the operator meant
+/// to send anything. Authentication answers "who", never "did they ask for
+/// this"; that is what this is for.
+///
+/// Applied only to the browser router. The machine dock API is deliberately
+/// outside it: a peer cockpit posts with `ureq`, which sends neither an
+/// `Origin` nor a cookie, and its boundary is the forward-auth gate plus the
+/// signed approved-dock registry. That exclusion is pinned by
+/// `c3b::the_machine_dock_api_is_not_behind_the_browser_gate` so it reads as a
+/// decision rather than an oversight.
+async fn require_same_origin_and_csrf(
+    State(expected_origin): State<Option<String>>,
+    req: Request,
+    next: Next,
+) -> axum::response::Response {
+    // Safe methods change nothing, so neither check applies to them.
+    if req.method() != axum::http::Method::POST {
+        return next.run(req).await;
+    }
+    let header = |parts: &axum::http::HeaderMap, name: &str| {
+        parts
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let (parts, body) = req.into_parts();
+
+    if newt_web::origin::check(
+        header(&parts.headers, "origin").as_deref(),
+        header(&parts.headers, "referer").as_deref(),
+        header(&parts.headers, "host").as_deref(),
+        expected_origin.as_deref(),
+    ) != newt_web::origin::OriginVerdict::SameOrigin
+    {
+        return (StatusCode::FORBIDDEN, "cross-site request refused").into_response();
+    }
+
+    // The token travels in the body, so the body must be read here and put
+    // back. Forms are small; the cap is what stops an unbounded read.
+    const MAX_FORM: usize = 1 << 20;
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_FORM).await else {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "form too large").into_response();
+    };
+    let submitted = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(newt_web::csrf::from_form_body)
+        .unwrap_or_default();
+    let cookie = header(&parts.headers, "cookie")
+        .and_then(|c| newt_web::csrf::from_cookie_header(&c))
+        .unwrap_or_default();
+    if !newt_web::csrf::matches(&cookie, &submitted) {
+        return (StatusCode::FORBIDDEN, "missing or mismatched CSRF token").into_response();
+    }
+
+    next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
+        .await
+}
+
 fn app() -> Router {
     app_with_auth(required_auth_header())
 }
@@ -69,35 +161,51 @@ fn app() -> Router {
 /// leaves the surface open — the loopback-dev + fully-mocked-test posture.
 fn app_with_auth(auth_header: Option<String>) -> Router {
     let reg = Arc::new(Registry::default());
-    let mut gated = Router::new()
-        .route("/", get(shell::index))
+    // Resolved ONCE, at composition, not per request — the same reason
+    // `normalized_auth_header` is pure: an env read on the hot path is a read
+    // that races whatever a parallel test is writing, and #1853's lock covers
+    // writers, not unguarded readers. A deployment behind the SSO ingress sets
+    // this because the browser's origin is the public HTTPS one and bears no
+    // relation to the pod's `Host`; unset falls back to comparing against
+    // `Host`, which is what the loopback and LAN binds need.
+    let expected_origin = normalized_auth_header(std::env::var("NEWT_WEB_ORIGIN").ok());
+    // Static assets: same-origin GETs, no state, and the SRI digests on the
+    // page are computed over exactly these bytes.
+    let assets = Router::new()
         .route(
             "/assets/htmx.min.js",
-            get(|| async {
-                (
-                    [("content-type", "text/javascript")],
-                    include_str!("../assets/htmx.min.js"),
-                )
-            }),
+            get(|| async { js(newt_web::csp::HTMX_JS) }),
         )
         .route(
             "/assets/mermaid.min.js",
-            get(|| async {
-                (
-                    [("content-type", "text/javascript")],
-                    include_str!("../assets/mermaid.min.js"),
-                )
-            }),
+            get(|| async { js(newt_web::csp::MERMAID_JS) }),
         )
         .route(
             "/assets/markdown.js",
-            get(|| async {
-                (
-                    [("content-type", "text/javascript")],
-                    include_str!("../assets/markdown.js"),
-                )
-            }),
+            get(|| async { js(newt_web::csp::MARKDOWN_JS) }),
         )
+        .route(
+            "/assets/panel.js",
+            get(|| async { js(newt_web::csp::PANEL_JS) }),
+        )
+        // Referenced by the enrollment page's SRI-bound tag. It was never
+        // routed, so that tag 404'd — one of the things an unrouted page hides.
+        .route(
+            "/assets/webauthn.js",
+            get(|| async { js(newt_web::csp::WEBAUTHN_JS) }),
+        );
+
+    // Everything a BROWSER drives. Every POST here must be same-origin and
+    // carry the double-submit token.
+    let browser = Router::new()
+        .route("/", get(shell::index))
+        // #1854 step 2: the enrollment page is routed rather than left
+        // dangling. It was unrouted, which is precisely why the missing CSP
+        // went unnoticed for so long. Its ceremony cannot COMPLETE yet — the
+        // `/enroll/finish` staging route needs a store handle that is not
+        // wired — and the page says so, fail-closed, when the relying party is
+        // unconfigured. Visible and incomplete beats invisible.
+        .route("/enroll", get(newt_web::enroll::page))
         .route("/agents", post(spawn_agent))
         .route("/follow", post(follow_session))
         .route("/agents/:id/panel", get(agent_panel_route))
@@ -105,13 +213,26 @@ fn app_with_auth(auth_header: Option<String>) -> Router {
         .route("/agents/:id/pending", get(pending_decision_route))
         .route("/agents/:id/decision", post(decide_route))
         .route("/agents/:id/events", get(agent_events))
-        .route("/agents/:id", axum::routing::delete(delete_agent))
-        .route("/api/sessions", get(api_sessions))
-        .route("/api/sessions/:id/transcript", get(api_transcript))
-        .route("/api/sessions/:id/inject", post(api_inject))
+        .route("/agents/:id/delete", post(delete_agent))
         .route("/dock/panel", get(dock_panel_route))
         .route("/dock/inject", post(dock_inject_route))
-        .route("/overview", get(overview_route));
+        .route("/overview", get(overview_route))
+        .layer(middleware::from_fn_with_state(
+            expected_origin,
+            require_same_origin_and_csrf,
+        ));
+
+    // The MACHINE dock API. A peer cockpit reaches this with `ureq`, which
+    // sends no Origin and holds no cookie, so the browser gate would refuse
+    // every legitimate call. Its boundary is the forward-auth gate plus the
+    // signed approved-dock registry (`dock::check_dock_approval`), and the
+    // operator kill-switch (`dock_exposure_disabled`).
+    let machine = Router::new()
+        .route("/api/sessions", get(api_sessions))
+        .route("/api/sessions/:id/transcript", get(api_transcript))
+        .route("/api/sessions/:id/inject", post(api_inject));
+
+    let mut gated = browser.merge(machine).merge(assets);
     if let Some(header) = auth_header {
         gated = gated.layer(middleware::from_fn_with_state(header, require_identity));
     }
@@ -120,6 +241,11 @@ fn app_with_auth(auth_header: Option<String>) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .merge(gated)
         .with_state(reg)
+}
+
+/// One served JavaScript asset, with the content type its SRI tag expects.
+fn js(body: &'static str) -> impl IntoResponse {
+    ([("content-type", "text/javascript")], body)
 }
 
 #[derive(serde::Deserialize)]
@@ -135,8 +261,9 @@ struct SpawnForm {
 /// `#panel`, activating the tab) plus an out-of-band refresh of the strip.
 async fn spawn_agent(
     State(reg): State<Arc<Registry>>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<SpawnForm>,
-) -> Html<String> {
+) -> axum::response::Response {
     let kind = match form.kind.as_str() {
         "openai" => newt_core::BackendKind::Openai,
         "anthropic" => newt_core::BackendKind::Anthropic,
@@ -149,15 +276,19 @@ async fn spawn_agent(
         kind,
         workspace: form.workspace,
     });
+    if !is_htmx(&headers) {
+        return see_other(&format!("/?tab={id}"));
+    }
     let panel = shell::agent_panel(
         id,
         &form.name,
         &form.model,
         false,
         &agents::Snapshot::default(),
+        &csrf_of(&headers),
     );
     let strip = shell::tab_strip(&reg.list(), Some(id));
-    Html(format!("{panel}\n{strip}"))
+    Html(format!("{panel}\n{strip}")).into_response()
 }
 
 /// GET /agents/:id/panel — the tab body (view attach: opening a tab opens its
@@ -165,13 +296,14 @@ async fn spawn_agent(
 async fn agent_panel_route(
     State(reg): State<Arc<Registry>>,
     Path(id): Path<u64>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Html<String>, StatusCode> {
     let agents = reg.list();
     let (aid, name, model, readonly, snap) = agents
         .iter()
         .find(|(aid, ..)| *aid == id)
         .ok_or(StatusCode::NOT_FOUND)?;
-    let panel = shell::agent_panel(*aid, name, model, *readonly, snap);
+    let panel = shell::agent_panel(*aid, name, model, *readonly, snap, &csrf_of(&headers));
     let strip = shell::tab_strip(&agents, Some(id));
     Ok(Html(format!("{panel}\n{strip}")))
 }
@@ -190,8 +322,9 @@ struct PromptForm {
 async fn prompt_agent(
     State(reg): State<Arc<Registry>>,
     Path(id): Path<u64>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<PromptForm>,
-) -> StatusCode {
+) -> axum::response::Response {
     if let Some(attach) = reg.attach_of(id) {
         let (state, _) = store_paths();
         let text = form.text;
@@ -202,16 +335,16 @@ async fn prompt_agent(
         })
         .await
         .unwrap_or(false);
-        return if injected {
-            StatusCode::NO_CONTENT
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
+        return match (injected, is_htmx(&headers)) {
+            (true, true) => StatusCode::NO_CONTENT.into_response(),
+            (true, false) => see_other(&format!("/?tab={id}")),
+            (false, _) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
     }
-    if reg.prompt(id, form.text) {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
+    match (reg.prompt(id, form.text), is_htmx(&headers)) {
+        (true, true) => StatusCode::NO_CONTENT.into_response(),
+        (true, false) => see_other(&format!("/?tab={id}")),
+        (false, _) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -221,6 +354,7 @@ async fn prompt_agent(
 async fn pending_decision_route(
     State(reg): State<Arc<Registry>>,
     Path(id): Path<u64>,
+    headers: axum::http::HeaderMap,
 ) -> Html<String> {
     let Some(attach) = reg.attach_of(id) else {
         return Html(String::new());
@@ -237,7 +371,7 @@ async fn pending_decision_route(
     .ok()
     .flatten();
     Html(match pending {
-        Some(p) => shell::pending_permission_card(id, &p),
+        Some(p) => shell::pending_permission_card(id, &p, &csrf_of(&headers)),
         None => String::new(),
     })
 }
@@ -327,10 +461,11 @@ fn decision_status(outcome: DecideOutcome) -> StatusCode {
 async fn decide_route(
     State(reg): State<Arc<Registry>>,
     Path(id): Path<u64>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<DecisionForm>,
-) -> StatusCode {
+) -> axum::response::Response {
     let Some(attach) = reg.attach_of(id) else {
-        return StatusCode::NOT_FOUND;
+        return StatusCode::NOT_FOUND.into_response();
     };
     let (state, _) = store_paths();
     let conv = attach.conv_id.clone();
@@ -342,27 +477,42 @@ async fn decide_route(
         classify_decision(&store, &conv, &request_id, &submitted)
     })
     .await;
-    match result {
+    let status = match result {
         Ok(Ok(outcome)) => decision_status(outcome),
         // A join failure or a store/DB error is the only 500 path — every
         // domain outcome resolves to an explicit 2xx/4xx above.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    // A scriptless browser has nowhere to put a 204, so a WINNING answer
+    // sends it back to the page. Every losing outcome keeps its own honest
+    // code (#1536): redirecting a 409 would tell the operator their decision
+    // was accepted when the terminal actually won the race.
+    if status == StatusCode::NO_CONTENT && !is_htmx(&headers) {
+        return see_other(&format!("/?tab={id}"));
     }
+    status.into_response()
 }
 
 /// DELETE /agents/:id — shut the agent down; the response clears the panel
 /// region and refreshes the strip out-of-band.
-async fn delete_agent(State(reg): State<Arc<Registry>>, Path(id): Path<u64>) -> impl IntoResponse {
+async fn delete_agent(
+    State(reg): State<Arc<Registry>>,
+    Path(id): Path<u64>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
     if reg.remove(id) {
+        if !is_htmx(&headers) {
+            return see_other("/");
+        }
         let agents = reg.list();
         let body = format!(
             r#"<p class="empty">Agent closed. Pick a tab or spawn a new one.</p>
 {}"#,
             shell::tab_strip(&agents, None)
         );
-        (StatusCode::OK, Html(body))
+        (StatusCode::OK, Html(body)).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Html(String::new()))
+        (StatusCode::NOT_FOUND, Html(String::new())).into_response()
     }
 }
 
@@ -512,12 +662,15 @@ struct DockPanelQuery {
 /// `GET /dock/panel?peer=&conv=` — the hub side of SELECT: resolve the clicked
 /// peer, mirror its session's transcript into the shared `#panel` read-only. An
 /// unknown peer is refused (fail-closed); an unreachable one renders a notice.
-async fn dock_panel_route(Query(q): Query<DockPanelQuery>) -> impl IntoResponse {
+async fn dock_panel_route(
+    Query(q): Query<DockPanelQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
     let Some(peer) = dock::peer_by_label(&q.peer) else {
         return (StatusCode::NOT_FOUND, "unknown dock peer").into_response();
     };
     match dock::fetch_transcript(&peer, &q.conv).await {
-        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t)).into_response(),
+        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t, &csrf_of(&headers))).into_response(),
         Err(e) => Html(format!(
             r#"<p class="empty">dock unreachable: {}</p>"#,
             shell::escape(&e)
@@ -571,6 +724,7 @@ async fn api_inject(Path(id): Path<String>, Form(form): Form<InjectForm>) -> imp
 /// sees the enqueue land and the transcript catch up as the remote consumes it.
 async fn dock_inject_route(
     Query(q): Query<DockPanelQuery>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<InjectForm>,
 ) -> impl IntoResponse {
     let Some(peer) = dock::peer_by_label(&q.peer) else {
@@ -586,7 +740,7 @@ async fn dock_inject_route(
     // Re-mirror: the remote may not have consumed yet; the operator sees the ask
     // land and the transcript catches up on the next select/refresh.
     match dock::fetch_transcript(&peer, &q.conv).await {
-        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t)).into_response(),
+        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t, &csrf_of(&headers))).into_response(),
         Err(e) => Html(format!(r#"<p class="empty">{}</p>"#, shell::escape(&e))).into_response(),
     }
 }
@@ -596,23 +750,23 @@ async fn dock_inject_route(
 /// terminal-started session, or a docked peer's new turns, appear without an F5.
 /// View-only (D2). The open `#panel` is a sibling, so a refresh never disturbs
 /// the transcript the operator is reading.
-async fn overview_route() -> Html<String> {
-    Html(overview_fragment().await)
+async fn overview_route(headers: axum::http::HeaderMap) -> Html<String> {
+    Html(overview_fragment(&csrf_of(&headers)).await)
 }
 
 /// The docked + sessions sections, in the page's order.
-pub(crate) async fn overview_fragment() -> String {
+pub(crate) async fn overview_fragment(csrf: &str) -> String {
     format!(
         "{}{}",
-        dock::docked_section().await,
-        sessions_section().await
+        dock::docked_section(csrf).await,
+        sessions_section(csrf).await
     )
 }
 
 /// The "sessions on this box" section: conversations in the shared store,
 /// each followable read-only (W4). Store errors render as an empty section —
 /// the cockpit must not die because the store isn't there yet.
-pub(crate) async fn sessions_section() -> String {
+pub(crate) async fn sessions_section(csrf: &str) -> String {
     let (state, ws) = store_paths();
     // list_all spans EVERY workspace (A2) — the operator runs newt in many
     // dirs, so "my sessions" is not one workspace's. Each row carries the
@@ -642,10 +796,11 @@ pub(crate) async fn sessions_section() -> String {
             .unwrap_or_else(|| workspace.clone());
         out.push_str(&format!(
             r##"<li><span class="s-title">{title}</span> <small>({n} turns · {wsname})</small>
-<form style="display:inline" hx-post="/follow" hx-target="#panel" hx-swap="innerHTML">
-<input type="hidden" name="conv_id" value="{id}"><input type="hidden" name="title" value="{title}">
+<form class="attach" method="post" action="/follow" hx-post="/follow" hx-target="#panel" hx-swap="innerHTML">
+{csrf_field}<input type="hidden" name="conv_id" value="{id}"><input type="hidden" name="title" value="{title}">
 <input type="hidden" name="workspace" value="{workspace}">
 <button>attach</button></form></li>"##,
+            csrf_field = newt_web::csrf::hidden_field(csrf),
             title = shell::escape(&c.title),
             n = c.turn_count,
             wsname = shell::escape(&wsname),
@@ -671,8 +826,9 @@ struct FollowForm {
 /// from the session row (A2 cross-workspace attach), not the web's default.
 async fn follow_session(
     State(reg): State<Arc<Registry>>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<FollowForm>,
-) -> Html<String> {
+) -> axum::response::Response {
     let (state, _) = store_paths();
     let id = reg.spawn_follow(
         state,
@@ -680,15 +836,19 @@ async fn follow_session(
         form.conv_id,
         form.title.clone(),
     );
+    if !is_htmx(&headers) {
+        return see_other(&format!("/?tab={id}"));
+    }
     let panel = shell::agent_panel(
         id,
         &form.title,
         "follow",
         true,
         &agents::Snapshot::default(),
+        &csrf_of(&headers),
     );
     let strip = shell::tab_strip(&reg.list(), Some(id));
-    Html(format!("{panel}\n{strip}"))
+    Html(format!("{panel}\n{strip}")).into_response()
 }
 
 /// Mint a short-lived agent key for a mesh role under the operator's `UserKey`.
@@ -812,19 +972,47 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
 
+    /// A request as the ENHANCED (HTMX) client makes it.
+    ///
+    /// C3b made the surface work without script, which means a plain form post
+    /// now gets a 303 back to the page instead of a fragment. These suites all
+    /// assert on fragments, so they are HTMX callers — stated here once, in
+    /// the header HTMX itself sends, rather than by threading a flag through
+    /// forty call sites. `full` is the helper for everything else.
+    /// The fixed token these suites present as both cookie and form field.
+    ///
+    /// This does NOT weaken the gate: double-submit asks only that the cookie
+    /// and the field agree, which is exactly what a real browser produces and
+    /// exactly what a cross-site attacker cannot. `c3b::a_post_without_the_csrf_token_is_refused`
+    /// drives the other side.
+    const TEST_CSRF: &str = "test-csrf-token";
+
     async fn req(
         app: &Router,
         method: &str,
         path: &str,
         form: Option<&str>,
     ) -> (StatusCode, String) {
-        let mut b = axum::http::Request::builder().method(method).uri(path);
-        let body = match form {
-            Some(f) => {
+        let mut b = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("hx-request", "true")
+            // A same-origin browser POST, which is what these suites model.
+            .header("origin", "http://127.0.0.1:8880")
+            .header("host", "127.0.0.1:8880")
+            .header("cookie", format!("newt_csrf={TEST_CSRF}"));
+        let post = method.eq_ignore_ascii_case("post");
+        let body = match (form, post) {
+            (Some(f), _) => {
                 b = b.header("content-type", "application/x-www-form-urlencoded");
-                axum::body::Body::from(f.to_string())
+                axum::body::Body::from(format!("{f}&csrf={TEST_CSRF}"))
             }
-            None => axum::body::Body::empty(),
+            // A bodyless POST still has to carry the token.
+            (None, true) => {
+                b = b.header("content-type", "application/x-www-form-urlencoded");
+                axum::body::Body::from(format!("csrf={TEST_CSRF}"))
+            }
+            (None, false) => axum::body::Body::empty(),
         };
         let resp = app.clone().oneshot(b.body(body).unwrap()).await.unwrap();
         let status = resp.status();
@@ -1052,9 +1240,9 @@ mod tests {
         let app = app();
         let form = "name=t3&url=http%3A%2F%2F127.0.0.1%3A1&model=m&kind=ollama&workspace=.";
         req(&app, "POST", "/agents", Some(form)).await;
-        let (status, _) = req(&app, "DELETE", "/agents/1", None).await;
+        let (status, _) = req(&app, "POST", "/agents/1/delete", None).await;
         assert_eq!(status, StatusCode::OK);
-        let (status, _) = req(&app, "DELETE", "/agents/1", None).await;
+        let (status, _) = req(&app, "POST", "/agents/1/delete", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = req(&app, "POST", "/agents/1/prompt", Some("text=x")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1131,7 +1319,29 @@ mod tests {
         let (status, a) = req(&app(), "GET", "/", None).await;
         assert_eq!(status, StatusCode::OK);
         let (_, b) = req(&app(), "GET", "/", None).await;
-        assert_eq!(a, b, "shell render is nondeterministic");
+
+        // C3b: the page now carries two values that MUST differ per response —
+        // the CSP nonce and the CSRF token. A byte-identical double render
+        // would mean one of them is a reused constant, which is the exact
+        // failure `csp.rs` calls unrepresentable. So the determinism check
+        // splits in two, and is stronger for it:
+        //
+        //   1. everything EXCEPT those values is byte-deterministic, and
+        //   2. those values are genuinely fresh.
+        //
+        // Checking only (1) would let a hardcoded nonce through; checking only
+        // (2) would stop pinning the page.
+        assert_eq!(
+            scrub_volatile(&a),
+            scrub_volatile(&b),
+            "shell render is nondeterministic outside the nonce and CSRF token"
+        );
+        assert_ne!(
+            a, b,
+            "the nonce and CSRF token must be fresh per response; an identical \
+             render means one of them is a constant"
+        );
+        let a = scrub_volatile(&a);
 
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/shell.golden");
@@ -1153,6 +1363,39 @@ mod tests {
         );
         let perturbed = format!("{a}\nPERTURBED-MUST-FAIL");
         assert_ne!(expected, perturbed, "negative control failed to fail");
+    }
+
+    /// Replace the two deliberately-fresh values with fixed placeholders, so
+    /// the golden pins the page's SHAPE without pinning a secret that must
+    /// never repeat. Everything else stays byte-exact.
+    fn scrub_volatile(html: &str) -> String {
+        let mut out = String::with_capacity(html.len());
+        let mut rest = html;
+        // Both are `attr="value"` with a value from a fixed alphabet, so a
+        // scan to the closing quote is exact — no regex dependency, and no
+        // chance of swallowing markup.
+        loop {
+            let next = ["nonce=\"", "name=\"csrf\" value=\""]
+                .iter()
+                .filter_map(|marker| rest.find(marker).map(|at| (at, *marker)))
+                .min_by_key(|(at, _)| *at);
+            let Some((at, marker)) = next else {
+                out.push_str(rest);
+                return out;
+            };
+            let after = at + marker.len();
+            let Some(close) = rest[after..].find('"') else {
+                out.push_str(rest);
+                return out;
+            };
+            out.push_str(&rest[..after]);
+            out.push_str(if marker.starts_with("nonce") {
+                "{NONCE}"
+            } else {
+                "{CSRF}"
+            });
+            rest = &rest[after + close..];
+        }
     }
 
     /// W3 acceptance: two agents, two backends, concurrent turns — each
@@ -1193,7 +1436,7 @@ mod tests {
         let p2 = wait_for_path(&app, "/agents/2/panel", "REPLY-BETA").await;
         assert!(!p2.contains("REPLY-ALPHA"), "no cross-talk into panel 2");
         // Independent lifecycles: kill 1; 2 still drives.
-        let (status, _) = req(&app, "DELETE", "/agents/1", None).await;
+        let (status, _) = req(&app, "POST", "/agents/1/delete", None).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _) = req(&app, "GET", "/agents/1/panel", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "dead tab 404s");
@@ -1217,7 +1460,7 @@ mod tests {
         }
         let (_, body) = req(&app, "GET", "/", None).await;
         assert!(
-            body.contains(">one</button>") && body.contains(">two</button>"),
+            body.contains(">one</a>") && body.contains(">two</a>"),
             "strip lists both"
         );
         assert!(body.contains("agent-1"), "first agent's panel active");
@@ -1351,10 +1594,13 @@ mod tests {
         assert!(card.contains("Permission needed"), "card: {card}");
         assert!(card.contains("<code>bash</code>"), "target shown: {card}");
         assert!(
-            card.contains(r#"verdict":"allow_once"#),
-            "allow-once offered"
+            card.contains(r#"name="verdict" value="allow_once""#),
+            "allow-once offered: {card}"
         );
-        assert!(card.contains(r#"verdict":"deny"#), "deny offered");
+        assert!(
+            card.contains(r#"name="verdict" value="deny""#),
+            "deny offered: {card}"
+        );
         assert!(
             !card.contains("allow_session"),
             "high-danger must NOT offer a standing session grant: {card}"
@@ -1732,5 +1978,760 @@ mod tests {
 
     fn urlencode(s: &str) -> String {
         s.replace(':', "%3A").replace('/', "%2F")
+    }
+
+    // ── C3b (#1861, closes #1854) ──────────────────────────────────────────
+    //
+    // Red-first guards for the semantic no-JS form surface, the CSRF/Origin
+    // gate, and the shell page's Content-Security-Policy.
+
+    /// A full request: method, path, headers, optional form body — returning
+    /// status, response headers, and body. The existing helpers return only
+    /// one of those, and every C3b guard needs at least two.
+    async fn full(
+        app: &Router,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        form: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let mut b = axum::http::Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let body = match form {
+            Some(f) => {
+                b = b.header("content-type", "application/x-www-form-urlencoded");
+                axum::body::Body::from(f.to_string())
+            }
+            None => axum::body::Body::empty(),
+        };
+        let resp = app.clone().oneshot(b.body(body).unwrap()).await.unwrap();
+        let status = resp.status();
+        let hdrs = resp.headers().clone();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, hdrs, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The CSRF token the shell page issued, read from its `set-cookie`.
+    fn csrf_of(headers: &axum::http::HeaderMap) -> String {
+        headers
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find_map(|c| {
+                c.split(';')
+                    .next()?
+                    .strip_prefix("newt_csrf=")
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+    }
+
+    mod c3b {
+        use super::*;
+
+        /// **An offer is answerable with NO JavaScript.**
+        ///
+        /// The load-bearing test of this slice, and the one the issue says
+        /// must not be vacuous: it never sends `HX-Request`, never parses a
+        /// fragment, and never runs a script. It does what a browser with
+        /// scripting disabled does — GET the page, read the form out of the
+        /// HTML, and POST it — and requires that the offer is actually
+        /// resolved in the store afterwards.
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_offer_is_answerable_with_no_javascript() {
+            let state = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            let app = app();
+            let (store, conv, rid) =
+                seed_followed_pending_decision(&app, state.path(), ws.path()).await;
+
+            // 1. GET the page the way a scriptless browser does.
+            let (status, page_headers, _) = full(&app, "GET", "/", &[], None).await;
+            assert_eq!(status, StatusCode::OK);
+            let token = csrf_of(&page_headers);
+            assert!(!token.is_empty(), "the page must issue a CSRF token");
+
+            // 2. Read the offer's form straight out of the HTML — no HTMX,
+            //    no JSON, no hx-vals. A scriptless client can only submit
+            //    what the markup declares.
+            let (_, _, card) = full(&app, "GET", "/agents/1/pending", &[], None).await;
+            assert!(
+                card.contains(r#"method="post""#)
+                    && card.contains(r#"action="/agents/1/decision""#),
+                "the offer must be a real form a browser can submit unaided: {card}"
+            );
+            assert!(
+                card.contains(r#"name="verdict""#) && card.contains(r#"value="allow_once""#),
+                "the action must be a submit button's value, not a script payload: {card}"
+            );
+
+            // 3. Submit it as a browser would: form encoding, an Origin, the
+            //    cookie the page set — and NO HX-Request header.
+            let (status, _, _) = full(
+                &app,
+                "POST",
+                "/agents/1/decision",
+                &[
+                    ("origin", "http://127.0.0.1:8880"),
+                    ("host", "127.0.0.1:8880"),
+                    ("cookie", &format!("newt_csrf={token}")),
+                ],
+                Some(&format!("csrf={token}&request_id={rid}&verdict=allow_once")),
+            )
+            .await;
+
+            // 4. A scriptless client cannot swap a fragment, so the answer
+            //    must land it back on a page: POST-Redirect-GET.
+            assert_eq!(
+                status,
+                StatusCode::SEE_OTHER,
+                "a non-HTMX form post must redirect, not return a fragment"
+            );
+
+            // 5. And it must have actually resolved the offer.
+            assert_eq!(
+                store.take_interaction_decision(&conv, &rid).unwrap(),
+                Some(newt_core::PermissionAction::AllowOnce),
+                "the no-JS answer did not reach the store"
+            );
+            clear_web_env();
+        }
+
+        /// **A state-changing POST without the CSRF token is refused.**
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_post_without_the_csrf_token_is_refused() {
+            let state = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            let app = app();
+            let (store, conv, rid) =
+                seed_followed_pending_decision(&app, state.path(), ws.path()).await;
+
+            let (status, _, _) = full(
+                &app,
+                "POST",
+                "/agents/1/decision",
+                &[
+                    ("origin", "http://127.0.0.1:8880"),
+                    ("host", "127.0.0.1:8880"),
+                ],
+                Some(&format!("request_id={rid}&verdict=allow_once")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "no token must fail closed");
+            assert_eq!(
+                store.take_interaction_decision(&conv, &rid).unwrap(),
+                None,
+                "a CSRF-refused request must record nothing"
+            );
+
+            // A token that does not match the cookie is equally refused —
+            // otherwise "present" would be the whole check.
+            let (status, _, _) = full(
+                &app,
+                "POST",
+                "/agents/1/decision",
+                &[
+                    ("origin", "http://127.0.0.1:8880"),
+                    ("host", "127.0.0.1:8880"),
+                    ("cookie", "newt_csrf=the-real-one"),
+                ],
+                Some(&format!(
+                    "csrf=a-different-one&request_id={rid}&verdict=allow_once"
+                )),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "mismatched token must fail closed"
+            );
+            clear_web_env();
+        }
+
+        /// **Anti-vacuous twin:** the same request WITH a matching token is
+        /// accepted, so the guard above is measuring the token and not some
+        /// unrelated refusal.
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_same_post_with_a_matching_csrf_token_is_accepted() {
+            let state = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            let app = app();
+            let (store, conv, rid) =
+                seed_followed_pending_decision(&app, state.path(), ws.path()).await;
+            let (_, page_headers, _) = full(&app, "GET", "/", &[], None).await;
+            let token = csrf_of(&page_headers);
+
+            let (status, _, _) = full(
+                &app,
+                "POST",
+                "/agents/1/decision",
+                &[
+                    ("origin", "http://127.0.0.1:8880"),
+                    ("host", "127.0.0.1:8880"),
+                    ("cookie", &format!("newt_csrf={token}")),
+                    ("hx-request", "true"),
+                ],
+                Some(&format!("csrf={token}&request_id={rid}&verdict=allow_once")),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::NO_CONTENT,
+                "a valid token must be accepted"
+            );
+            assert_eq!(
+                store.take_interaction_decision(&conv, &rid).unwrap(),
+                Some(newt_core::PermissionAction::AllowOnce)
+            );
+            clear_web_env();
+        }
+
+        /// **A cross-site Origin is refused**, even carrying a valid token —
+        /// the two checks are independent layers, not one check spelled twice.
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_foreign_origin_is_refused() {
+            let state = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            let app = app();
+            let (store, conv, rid) =
+                seed_followed_pending_decision(&app, state.path(), ws.path()).await;
+            let (_, page_headers, _) = full(&app, "GET", "/", &[], None).await;
+            let token = csrf_of(&page_headers);
+
+            for hostile in ["https://evil.test", "http://127.0.0.1:9999", "null"] {
+                let (status, _, _) = full(
+                    &app,
+                    "POST",
+                    "/agents/1/decision",
+                    &[
+                        ("origin", hostile),
+                        ("host", "127.0.0.1:8880"),
+                        ("cookie", &format!("newt_csrf={token}")),
+                    ],
+                    Some(&format!("csrf={token}&request_id={rid}&verdict=allow_once")),
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "Origin {hostile:?} must be refused even with a valid token"
+                );
+            }
+            assert_eq!(
+                store.take_interaction_decision(&conv, &rid).unwrap(),
+                None,
+                "no cross-site request may record a verdict"
+            );
+            clear_web_env();
+        }
+
+        /// **The shell response carries a Content-Security-Policy** — #1854.
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test]
+        async fn the_shell_response_carries_a_content_security_policy() {
+            std::env::remove_var("NEWT_WEB_STATE_DIR");
+            let (status, headers, _) = full(&app(), "GET", "/", &[], None).await;
+            assert_eq!(status, StatusCode::OK);
+            let csp = headers
+                .get("content-security-policy")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                !csp.is_empty(),
+                "the page that renders untrusted model text must carry a CSP"
+            );
+            assert!(csp.contains("default-src 'none'"), "CSP: {csp}");
+            assert!(csp.contains("script-src 'nonce-"), "CSP: {csp}");
+            for (name, want) in [
+                ("x-content-type-options", "nosniff"),
+                ("x-frame-options", "DENY"),
+                ("referrer-policy", "no-referrer"),
+            ] {
+                assert_eq!(
+                    headers.get(name).and_then(|v| v.to_str().ok()),
+                    Some(want),
+                    "hardening header {name} missing"
+                );
+            }
+        }
+
+        /// **`'unsafe-inline'` appears in exactly one directive, and it is
+        /// the one where it grants nothing.**
+        ///
+        /// A blanket "the string does not appear" check is the wrong guard in
+        /// both directions: it fails on the measured, defensible
+        /// `style-src-attr` relaxation, and — worse — a future author who
+        /// needed it would delete the check rather than narrow it, and then
+        /// nothing would stop `script-src 'unsafe-inline'`. So this asserts
+        /// PER DIRECTIVE.
+        ///
+        /// Why `style-src-attr` is the exception, measured rather than
+        /// assumed (see `csp::policy`): Mermaid styles its generated SVG
+        /// almost entirely through per-node `style=` attributes — 49 blocked
+        /// attribute applications against 4 blocked `<style>` elements on a
+        /// real page — and ammonia's default allowlist has no `style`
+        /// attribute on any tag, so untrusted content cannot emit one. The
+        /// permission is unreachable by an attacker.
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test]
+        async fn the_policy_never_permits_unsafe_inline() {
+            std::env::remove_var("NEWT_WEB_STATE_DIR");
+            let (_, headers, _) = full(&app(), "GET", "/", &[], None).await;
+            let csp = headers
+                .get("content-security-policy")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            // Non-vacuity first. Every check below is a `!contains`, which an
+            // ABSENT header satisfies perfectly — so without this line the
+            // guard reports "no unsafe-inline" about a page that has no
+            // policy at all, which is the exact false green #1854 warns of.
+            assert!(
+                csp.contains("script-src"),
+                "no policy to check — this guard would pass vacuously"
+            );
+
+            let directive = |name: &str| {
+                csp.split(';')
+                    .map(str::trim)
+                    .find(|d| d.split_whitespace().next() == Some(name))
+                    .unwrap_or("")
+                    .to_string()
+            };
+
+            // Script may never be relaxed, by any keyword.
+            let script = directive("script-src");
+            for forbidden in [
+                "'unsafe-inline'",
+                "'unsafe-eval'",
+                "'unsafe-hashes'",
+                "'strict-dynamic'",
+                "*",
+                "http:",
+                "https:",
+            ] {
+                assert!(
+                    !script.contains(forbidden),
+                    "script-src must not contain {forbidden}: {script}"
+                );
+            }
+            // Nor may a style ELEMENT or the fallback, which is where style
+            // injection actually has teeth.
+            for name in ["style-src", "style-src-elem", "default-src"] {
+                let d = directive(name);
+                assert!(
+                    !d.contains("'unsafe-inline'"),
+                    "{name} must stay strict: {d}"
+                );
+            }
+            assert!(
+                directive("default-src").contains("'none'"),
+                "an unnamed fetch directive must fail closed: {csp}"
+            );
+
+            // …and the ONE relaxation is exactly where it was measured to be
+            // needed and proven unreachable. Counting occurrences is what
+            // stops a second one being added quietly.
+            assert_eq!(
+                csp.matches("'unsafe-inline'").count(),
+                1,
+                "exactly one directive may carry it: {csp}"
+            );
+            assert!(
+                directive("style-src-attr").contains("'unsafe-inline'"),
+                "…and it must be style-src-attr: {csp}"
+            );
+        }
+
+        /// **No `'unsafe-eval'`, and nothing on the page needs it.**
+        ///
+        /// Regression for a real measured violation: the prompt form carried
+        /// `hx-on::after-request="this.reset()"`, and htmx EVALUATES that
+        /// attribute's value as JavaScript — inline script wearing an
+        /// attribute, which needs `script-src 'unsafe-eval'`. It was the only
+        /// `script-src :: eval` violation on the page. The behaviour moved to
+        /// `assets/panel.js`, which needs neither eval nor a nonce.
+        ///
+        /// `hx-on:` is banned outright rather than just this one instance:
+        /// every spelling of it is an evaluated string, so a new one would
+        /// silently require the same relaxation.
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn no_markup_requires_eval() {
+            std::env::remove_var("NEWT_WEB_STATE_DIR");
+            let app = app();
+            let (_, page_headers, _) = full(&app, "GET", "/", &[], None).await;
+            let token = csrf_of(&page_headers);
+            full(
+                &app,
+                "POST",
+                "/agents",
+                &[
+                    ("origin", "http://127.0.0.1:8880"),
+                    ("host", "127.0.0.1:8880"),
+                    ("cookie", &format!("newt_csrf={token}")),
+                    ("hx-request", "true"),
+                ],
+                Some(&format!(
+                    "name=t&url=http%3A%2F%2F127.0.0.1%3A1&model=m&kind=ollama&workspace=.&csrf={token}"
+                )),
+            )
+            .await;
+            for path in ["/", "/agents/1/panel", "/overview"] {
+                let (_, _, body) = full(&app, "GET", path, &[], None).await;
+                assert!(
+                    !body.contains("hx-on:"),
+                    "{path} carries an htmx-evaluated attribute, which needs \
+                     'unsafe-eval': {body}"
+                );
+            }
+        }
+
+        /// **No fragment carries inline script.**
+        ///
+        /// This is the structural fact that MAKES the CSP correct, and the
+        /// reason #1854 could not be closed inside #1848. A fragment is
+        /// swapped into a page whose CSP header came from an earlier
+        /// response, so its inline script would need that page's nonce —
+        /// a nonce outliving its response, which `csp.rs` rightly refuses
+        /// to allow. With no inline script in any fragment, the question
+        /// does not arise.
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn no_fragment_carries_inline_script() {
+            std::env::remove_var("NEWT_WEB_STATE_DIR");
+            let app = app();
+            let form = "name=t&url=http%3A%2F%2F127.0.0.1%3A1&model=m&kind=ollama&workspace=.";
+            let (_, page_headers, _) = full(&app, "GET", "/", &[], None).await;
+            let token = csrf_of(&page_headers);
+            full(
+                &app,
+                "POST",
+                "/agents",
+                &[
+                    ("origin", "http://127.0.0.1:8880"),
+                    ("host", "127.0.0.1:8880"),
+                    ("cookie", &format!("newt_csrf={token}")),
+                    ("hx-request", "true"),
+                ],
+                Some(&format!("{form}&csrf={token}")),
+            )
+            .await;
+
+            for path in ["/agents/1/panel", "/overview", "/agents/1/pending"] {
+                let (_, _, body) = full(&app, "GET", path, &[], None).await;
+                assert!(
+                    !body.contains("<script"),
+                    "fragment {path} carries inline script, which cannot be nonced: {body}"
+                );
+                // An inline style ATTRIBUTE is governed by style-src too, and
+                // is blocked just as an inline <style> element is.
+                assert!(
+                    !body.contains(" style=\""),
+                    "fragment {path} carries an inline style attribute, which the CSP blocks: {body}"
+                );
+            }
+        }
+
+        /// **Every control is reachable without script.**
+        ///
+        /// Each state-changing control on the page is a real `<form>` with a
+        /// `method` and an `action`, so a scriptless browser can submit it.
+        /// Before C3b every one of them was an `hx-post`/`hx-delete`
+        /// attribute with no `action` at all — inert without HTMX.
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn every_control_is_reachable_without_script() {
+            std::env::remove_var("NEWT_WEB_STATE_DIR");
+            let app = app();
+            let (_, page_headers, _) = full(&app, "GET", "/", &[], None).await;
+            let token = csrf_of(&page_headers);
+            full(
+                &app,
+                "POST",
+                "/agents",
+                &[
+                    ("origin", "http://127.0.0.1:8880"),
+                    ("host", "127.0.0.1:8880"),
+                    ("cookie", &format!("newt_csrf={token}")),
+                    ("hx-request", "true"),
+                ],
+                Some(&format!(
+                    "name=t&url=http%3A%2F%2F127.0.0.1%3A1&model=m&kind=ollama&workspace=.&csrf={token}"
+                )),
+            )
+            .await;
+            let (_, _, page) = full(&app, "GET", "/", &[], None).await;
+
+            // Every <form> declares how to submit itself.
+            let mut bad = Vec::new();
+            for frag in page.split("<form").skip(1) {
+                let tag = frag.split('>').next().unwrap_or_default();
+                if !tag.contains("method=\"post\"") || !tag.contains("action=\"") {
+                    bad.push(tag.to_string());
+                }
+            }
+            assert!(
+                bad.is_empty(),
+                "forms with no no-JS submission path: {bad:?}"
+            );
+
+            // …and every form carries the CSRF field, or it would be refused
+            // the moment a scriptless browser submitted it.
+            for frag in page.split("<form").skip(1) {
+                let body = frag.split("</form>").next().unwrap_or_default();
+                assert!(
+                    body.contains(r#"name="csrf""#),
+                    "a form with no CSRF field cannot be submitted: {body}"
+                );
+            }
+        }
+
+        /// **Labels are bound to their controls, and choices are grouped.**
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn controls_carry_accessible_semantics() {
+            std::env::remove_var("NEWT_WEB_STATE_DIR");
+            let app = app();
+            // The live region belongs to a transcript, so the page must have
+            // one — asserting it on the empty shell would pass or fail for
+            // reasons that have nothing to do with accessibility.
+            let (_, page_headers, _) = full(&app, "GET", "/", &[], None).await;
+            let token = csrf_of(&page_headers);
+            full(
+                &app,
+                "POST",
+                "/agents",
+                &[
+                    ("origin", "http://127.0.0.1:8880"),
+                    ("host", "127.0.0.1:8880"),
+                    ("cookie", &format!("newt_csrf={token}")),
+                    ("hx-request", "true"),
+                ],
+                Some(&format!(
+                    "name=t&url=http%3A%2F%2F127.0.0.1%3A1&model=m&kind=ollama&workspace=.&csrf={token}"
+                )),
+            )
+            .await;
+            let (_, _, page) = full(&app, "GET", "/", &[], None).await;
+            assert!(
+                page.contains("<fieldset") && page.contains("<legend"),
+                "grouped controls need a fieldset/legend: {page}"
+            );
+            // Every label points at an id that exists on the page.
+            let mut dangling = Vec::new();
+            for frag in page.split("<label for=\"").skip(1) {
+                let target = frag.split('"').next().unwrap_or_default();
+                if !page.contains(&format!("id=\"{target}\"")) {
+                    dangling.push(target.to_string());
+                }
+            }
+            assert!(
+                dangling.is_empty(),
+                "labels pointing at nothing: {dangling:?}"
+            );
+            assert!(
+                page.contains("aria-live"),
+                "the transcript changes under the reader; it needs a live region"
+            );
+            assert!(
+                page.contains("prefers-reduced-motion"),
+                "motion must be opt-out"
+            );
+            assert!(page.contains(":focus-visible"), "focus must be visible");
+        }
+
+        /// **A losing no-JS answer is NOT redirected as if it had won.**
+        ///
+        /// The trap this exists for: the scriptless path needs
+        /// POST-Redirect-GET because a browser with no script cannot consume a
+        /// fragment — but if that redirect is applied to EVERY outcome rather
+        /// than only success, an operator whose answer lost the race to the
+        /// terminal is sent to a normal-looking page and told, in the only
+        /// language the surface has, that they won.
+        ///
+        /// That is a silent violation of #1536's single-winner contract,
+        /// which exists precisely so a losing answer can never report success.
+        /// It survives review because the happy path looks right: the winning
+        /// case redirects correctly, and nothing about the code says the
+        /// branch is outcome-sensitive.
+        ///
+        /// **Do not "simplify" `decide_route` by redirecting unconditionally.**
+        /// The twin below is what proves this test is measuring the loss and
+        /// not merely "no-JS never redirects".
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_losing_no_js_answer_is_not_redirected_as_success() {
+            let state = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            let app = app();
+            let (store, conv, rid) =
+                seed_followed_pending_decision(&app, state.path(), ws.path()).await;
+            let (_, page_headers, _) = full(&app, "GET", "/", &[], None).await;
+            let token = csrf_of(&page_headers);
+
+            // The TERMINAL wins first (the same CAS the #1536 race tests
+            // drive). The browser's card is now stale.
+            assert!(
+                store.cancel_interaction_offer(&conv, &rid).unwrap(),
+                "the terminal resolves the live offer"
+            );
+
+            // A scriptless browser submits its now-losing answer: same origin,
+            // valid token, and crucially NO HX-Request header.
+            let (status, headers, _) = full(
+                &app,
+                "POST",
+                "/agents/1/decision",
+                &[
+                    ("origin", "http://127.0.0.1:8880"),
+                    ("host", "127.0.0.1:8880"),
+                    ("cookie", &format!("newt_csrf={token}")),
+                ],
+                Some(&format!("csrf={token}&request_id={rid}&verdict=allow_once")),
+            )
+            .await;
+
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "a losing answer must keep its honest 409, even with no script"
+            );
+            assert!(
+                !status.is_redirection(),
+                "a losing answer must NEVER be redirected: {status}"
+            );
+            assert!(
+                headers.get("location").is_none(),
+                "a losing answer must carry no Location — that is what would \
+                 tell a scriptless operator they won"
+            );
+            assert_eq!(
+                store.take_interaction_decision(&conv, &rid).unwrap(),
+                None,
+                "the losing answer recorded no authorization"
+            );
+            clear_web_env();
+        }
+
+        /// **Anti-vacuous twin for the test above.**
+        ///
+        /// The guard above is satisfied by a handler that never redirects at
+        /// all — which would break the scriptless path entirely while looking
+        /// green. This proves the redirect branch EXISTS and fires, so the
+        /// absence of a redirect in the losing case is a decision rather than
+        /// an omission. The two together pin the rule: redirect success, and
+        /// only success.
+        ///
+        /// Every non-success outcome reachable at this boundary is checked,
+        /// not just the one the sibling drives.
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_winning_no_js_answer_is_redirected_but_no_other_outcome_is() {
+            let state = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            let app = app();
+            let (store, conv, rid) =
+                seed_followed_pending_decision(&app, state.path(), ws.path()).await;
+            let (_, page_headers, _) = full(&app, "GET", "/", &[], None).await;
+            let token = csrf_of(&page_headers);
+            let browser = |body: String| {
+                let token = token.clone();
+                let app = app.clone();
+                async move {
+                    full(
+                        &app,
+                        "POST",
+                        "/agents/1/decision",
+                        &[
+                            ("origin", "http://127.0.0.1:8880"),
+                            ("host", "127.0.0.1:8880"),
+                            ("cookie", &format!("newt_csrf={token}")),
+                        ],
+                        Some(&body),
+                    )
+                    .await
+                }
+            };
+
+            // An action that was never displayed: refused, and NOT redirected.
+            let (status, headers, _) = browser(format!(
+                "csrf={token}&request_id={rid}&verdict=allow_session"
+            ))
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "a non-offered action must be refused server-side"
+            );
+            assert!(headers.get("location").is_none(), "and not redirected");
+
+            // An unknown request id: refused, and NOT redirected.
+            let (status, headers, _) = browser(format!(
+                "csrf={token}&request_id=not-a-real-id&verdict=deny"
+            ))
+            .await;
+            assert!(!status.is_success() && !status.is_redirection(), "{status}");
+            assert!(headers.get("location").is_none(), "and not redirected");
+
+            // …and the WINNING answer IS redirected, which is what makes the
+            // assertions above mean something.
+            let (status, headers, _) =
+                browser(format!("csrf={token}&request_id={rid}&verdict=allow_once")).await;
+            assert_eq!(
+                status,
+                StatusCode::SEE_OTHER,
+                "the success path must redirect, or the scriptless client is stranded"
+            );
+            assert!(
+                headers.get("location").is_some(),
+                "a redirect with no Location is not a redirect"
+            );
+            assert_eq!(
+                store.take_interaction_decision(&conv, &rid).unwrap(),
+                Some(newt_core::PermissionAction::AllowOnce),
+                "exactly the winning verdict is recorded"
+            );
+            clear_web_env();
+        }
+
+        /// **The machine dock API is deliberately NOT behind the browser
+        /// CSRF/Origin gate**, and this pins that as a decision rather than
+        /// an oversight. A peer cockpit posts with `ureq`, which sends
+        /// neither an `Origin` nor a cookie; gating it would break docking
+        /// silently. Its boundary is the forward-auth gate plus the signed
+        /// approved-dock registry, not a browser token.
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_machine_dock_api_is_not_behind_the_browser_gate() {
+            let state = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            std::env::set_var("NEWT_WEB_STATE_DIR", state.path());
+            std::env::set_var("NEWT_WEB_WORKSPACE", ws.path());
+            let store = newt_core::ConversationStore::new(state.path(), ws.path(), 100).unwrap();
+            let conv = store.create("peer session", None).unwrap();
+            store.append_turn(&conv, "hi", "hello").unwrap();
+
+            let (status, _, _) = full(
+                &app(),
+                "POST",
+                &format!("/api/sessions/{conv}/inject"),
+                &[],
+                Some("text=from+a+docked+hub"),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::NO_CONTENT,
+                "a dock inject carries no Origin and no cookie by design"
+            );
+            clear_web_env();
+        }
     }
 }

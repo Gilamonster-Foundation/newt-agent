@@ -4,10 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>newt-web</title>
-<script src="/assets/htmx.min.js"></script>
-<script defer src="/assets/mermaid.min.js"></script>
-<script defer src="/assets/markdown.js"></script>
-<style>
+<!-- htmx injects a <style> for its `.htmx-indicator` helpers unless told not
+     to, and that element is blocked by a nonce-based style-src exactly as
+     Mermaid's is. This surface uses no htmx indicators, so the CSS is dead
+     weight AND a CSP violation. Declarative config, so it needs no inline
+     script of its own. -->
+<meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
+<script nonce="{NONCE}" src="/assets/htmx.min.js" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+" crossorigin="anonymous"></script>
+<script nonce="{NONCE}" defer src="/assets/markdown.js" integrity="sha384-Td8ALTYIY31WFG4vmLQRIuyB0O6d19N+cFacrbkhNNl8tqWudAmLVRljTgu79azy" crossorigin="anonymous"></script>
+<script nonce="{NONCE}" defer src="/assets/panel.js" integrity="sha384-sdGfPDxv1Ad3UJsX8wsP75syNNpCacNibfsFlPnZef9usG7DUP5qZx7seJjhi2/5" crossorigin="anonymous"></script>
+<style nonce="{NONCE}">
   :root { color-scheme: light dark; }
   body { font-family: ui-monospace, monospace; margin: 0; }
   header { padding: 0.5rem 1rem; border-bottom: 1px solid color-mix(in srgb, currentColor 25%, transparent); }
@@ -55,24 +61,51 @@
   .perm { margin: 0.5rem 0.75rem; padding: 0.5rem 0.75rem; border-radius: 6px; border: 1px solid color-mix(in srgb, currentColor 30%, transparent); display: grid; gap: 0.35rem; }
   .perm-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
   .perm-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+  .perm fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 0.35rem; }
+  .perm legend { font-weight: bold; padding: 0; }
+  form.spawn fieldset { border: 0; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; }
+  form.spawn legend { font-size: 0.75rem; padding: 0; }
+  form.close { display: inline; }
+  form.close button { background: transparent; border: 0; cursor: pointer; }
+  form.attach { display: inline; }
+  /* C3b: the inject affordance's note. Was an inline style attribute, which
+     a nonce-based style-src blocks exactly as it blocks an inline <style>. */
+  .inject-note { padding: 0.4rem 0.75rem 0; margin: 0; }
+  /* A label that a screen reader announces and a sighted user does not need:
+     the prompt box is self-evident in context but must still HAVE a name. */
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  #tabs a { padding: 0.25rem 0.75rem; border-radius: 4px 4px 0 0; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); text-decoration: none; color: inherit; }
+  #tabs a[aria-current="page"] { border-bottom-color: transparent; font-weight: bold; }
+  /* Focus must be SEEN. The browser default is easy to lose against a
+     custom control, and keyboard-only operation is the fallback this whole
+     surface exists to keep working. */
+  :focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+  /* Motion is opt-out, not opt-in: the transcript scrolls itself as tokens
+     arrive, and a vestibular trigger is not a styling preference. */
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+  }
 </style>
 </head>
-<body>
+<body data-newt-diagrams="source-only">
 <header><h1>newt-web</h1></header>
 <main id="content">
 <div id="overview" hx-get="/overview" hx-trigger="every 3s" hx-swap="innerHTML"><section class="sessions"><h2>your sessions</h2><p class="hint">Durable conversations in the store — attach from anywhere; the running session stays the writer (D2).</p><p class="empty">No sessions yet. Start one in a newt shell (SSH), or spawn a scratch agent below.</p></section></div>
 <details class="spawn-wrap">
 <summary>+ new scratch agent <small>(not saved — start durable sessions above)</small></summary>
-<form class="spawn" hx-post="/agents" hx-target="#panel" hx-swap="innerHTML">
-<label>name<input name="name" value="agent" required></label>
-<label>backend url<input name="url" value="http://127.0.0.1:11434" required></label>
-<label>model<input name="model" value="llama3.1:8b" required></label>
-<label>kind<select name="kind"><option value="ollama" selected>ollama</option><option value="openai">openai</option></select></label>
-<label>workspace<input name="workspace" value="." required></label>
+<form class="spawn" method="post" action="/agents" hx-post="/agents" hx-target="#panel" hx-swap="innerHTML">
+<input type="hidden" name="csrf" value="{CSRF}"><fieldset>
+<legend>new scratch agent</legend>
+<label for="spawn-name">name</label><input id="spawn-name" name="name" value="agent" required>
+<label for="spawn-url">backend url</label><input id="spawn-url" name="url" value="http://127.0.0.1:11434" required>
+<label for="spawn-model">model</label><input id="spawn-model" name="model" value="llama3.1:8b" required>
+<label for="spawn-kind">kind</label><select id="spawn-kind" name="kind"><option value="ollama" selected>ollama</option><option value="openai">openai</option></select>
+<label for="spawn-workspace">workspace</label><input id="spawn-workspace" name="workspace" value="." required>
 <button>spawn</button>
+</fieldset>
 </form>
 </details>
-<nav id="tabs"></nav>
+<nav id="tabs" aria-label="agents"></nav>
 <div id="panel"><p class="empty">No agents yet. Spawn one above.</p></div>
 </main>
 </body>
