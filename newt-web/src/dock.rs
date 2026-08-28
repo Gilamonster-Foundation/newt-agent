@@ -372,7 +372,12 @@ pub(crate) async fn fetch_transcript(
 /// Render a docked remote session as a panel: the transcript **mirrored**
 /// read-only, plus an **inject** form (D2 — enqueue to the remote; the remote
 /// runs it and stays sole writer).
-pub(crate) fn dock_panel(peer_label: &str, conv_id: &str, transcript: &DockedTranscript) -> String {
+pub(crate) fn dock_panel(
+    peer_label: &str,
+    conv_id: &str,
+    transcript: &DockedTranscript,
+    csrf: &str,
+) -> String {
     let snap = crate::agents::Snapshot {
         messages: transcript
             .turns
@@ -391,14 +396,16 @@ pub(crate) fn dock_panel(peer_label: &str, conv_id: &str, transcript: &DockedTra
         r##"<section class="agent dock-remote">
 <h2><span>{title} <small>· {label} · remote (mirror + inject, D2)</small></span></h2>
 <div class="transcript">{fragment}</div>
-<form class="prompt" hx-post="/dock/inject?peer={plabel}&conv={pconv}" hx-target="#panel" hx-swap="innerHTML">
-<input name="text" placeholder="prompt the remote session…" autocomplete="off" required>
+<form class="prompt" method="post" action="/dock/inject?peer={plabel}&amp;conv={pconv}" hx-post="/dock/inject?peer={plabel}&conv={pconv}" hx-target="#panel" hx-swap="innerHTML">
+{csrf_field}<label class="sr-only" for="dock-prompt">prompt the remote session</label>
+<input id="dock-prompt" name="text" placeholder="prompt the remote session…" autocomplete="off" required>
 <button>send</button></form>
 <p class="hint">Injected over the dock — the remote host runs it and stays the sole writer (D2).</p>
 </section>"##,
         title = crate::shell::escape(&transcript.title),
         label = crate::shell::escape(peer_label),
         fragment = crate::shell::transcript_fragment(&snap),
+        csrf_field = newt_web::csrf::hidden_field(csrf),
         plabel = pct(peer_label),
         pconv = pct(conv_id),
     )
@@ -407,7 +414,7 @@ pub(crate) fn dock_panel(peer_label: &str, conv_id: &str, transcript: &DockedTra
 /// Render the "docked peers" cockpit section: each configured peer with its
 /// remote sessions (read-only + selectable). An unreachable peer renders a
 /// notice, not a gap. Fetched over each peer's own transport.
-pub(crate) async fn docked_section() -> String {
+pub(crate) async fn docked_section(_csrf: &str) -> String {
     let peers = configured_peers();
     if peers.is_empty() {
         return String::new();
@@ -606,7 +613,7 @@ mod tests {
                 assistant: "STUB_REPLY ok".into(),
             }],
         };
-        let html = dock_panel("laptop-b", "conv-123", &t);
+        let html = dock_panel("laptop-b", "conv-123", &t, "tok");
         assert!(html.contains("mirror + inject"));
         assert!(html.contains("STUB_REPLY ok"));
         assert!(html.contains("hx-post=\"/dock/inject?peer=laptop-b&conv=conv-123\""));

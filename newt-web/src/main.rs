@@ -60,6 +60,35 @@ async fn require_identity(
     }
 }
 
+/// The CSRF token this request carries, for re-emission into a fragment's
+/// forms. Empty when the browser holds none — the form then renders with an
+/// empty field and is refused on submit, which is the fail-closed direction.
+fn csrf_of(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(newt_web::csrf::from_cookie_header)
+        .unwrap_or_default()
+}
+
+/// Whether the caller can consume an HTML fragment.
+///
+/// HTMX sets `HX-Request` on everything it sends. A plain browser form post
+/// does not, and cannot swap a fragment into anything — it must be sent back
+/// to a page (POST-Redirect-GET), or the operator is left staring at a
+/// fragment as a whole document.
+fn is_htmx(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key("hx-request")
+}
+
+/// POST-Redirect-GET: the scriptless answer to a successful form submission.
+///
+/// 303 specifically, so the follow-up is a GET regardless of the method that
+/// produced it, and a reload cannot resubmit the form.
+fn see_other(to: &str) -> axum::response::Response {
+    (StatusCode::SEE_OTHER, [("location", to)]).into_response()
+}
+
 fn app() -> Router {
     app_with_auth(required_auth_header())
 }
@@ -114,7 +143,7 @@ fn app_with_auth(auth_header: Option<String>) -> Router {
         .route("/agents/:id/pending", get(pending_decision_route))
         .route("/agents/:id/decision", post(decide_route))
         .route("/agents/:id/events", get(agent_events))
-        .route("/agents/:id", axum::routing::delete(delete_agent))
+        .route("/agents/:id/delete", post(delete_agent))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/:id/transcript", get(api_transcript))
         .route("/api/sessions/:id/inject", post(api_inject))
@@ -144,8 +173,9 @@ struct SpawnForm {
 /// `#panel`, activating the tab) plus an out-of-band refresh of the strip.
 async fn spawn_agent(
     State(reg): State<Arc<Registry>>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<SpawnForm>,
-) -> Html<String> {
+) -> axum::response::Response {
     let kind = match form.kind.as_str() {
         "openai" => newt_core::BackendKind::Openai,
         "anthropic" => newt_core::BackendKind::Anthropic,
@@ -158,15 +188,19 @@ async fn spawn_agent(
         kind,
         workspace: form.workspace,
     });
+    if !is_htmx(&headers) {
+        return see_other(&format!("/?tab={id}"));
+    }
     let panel = shell::agent_panel(
         id,
         &form.name,
         &form.model,
         false,
         &agents::Snapshot::default(),
+        &csrf_of(&headers),
     );
     let strip = shell::tab_strip(&reg.list(), Some(id));
-    Html(format!("{panel}\n{strip}"))
+    Html(format!("{panel}\n{strip}")).into_response()
 }
 
 /// GET /agents/:id/panel — the tab body (view attach: opening a tab opens its
@@ -174,13 +208,14 @@ async fn spawn_agent(
 async fn agent_panel_route(
     State(reg): State<Arc<Registry>>,
     Path(id): Path<u64>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Html<String>, StatusCode> {
     let agents = reg.list();
     let (aid, name, model, readonly, snap) = agents
         .iter()
         .find(|(aid, ..)| *aid == id)
         .ok_or(StatusCode::NOT_FOUND)?;
-    let panel = shell::agent_panel(*aid, name, model, *readonly, snap);
+    let panel = shell::agent_panel(*aid, name, model, *readonly, snap, &csrf_of(&headers));
     let strip = shell::tab_strip(&agents, Some(id));
     Ok(Html(format!("{panel}\n{strip}")))
 }
@@ -199,8 +234,9 @@ struct PromptForm {
 async fn prompt_agent(
     State(reg): State<Arc<Registry>>,
     Path(id): Path<u64>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<PromptForm>,
-) -> StatusCode {
+) -> axum::response::Response {
     if let Some(attach) = reg.attach_of(id) {
         let (state, _) = store_paths();
         let text = form.text;
@@ -211,16 +247,16 @@ async fn prompt_agent(
         })
         .await
         .unwrap_or(false);
-        return if injected {
-            StatusCode::NO_CONTENT
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
+        return match (injected, is_htmx(&headers)) {
+            (true, true) => StatusCode::NO_CONTENT.into_response(),
+            (true, false) => see_other(&format!("/?tab={id}")),
+            (false, _) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
     }
-    if reg.prompt(id, form.text) {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
+    match (reg.prompt(id, form.text), is_htmx(&headers)) {
+        (true, true) => StatusCode::NO_CONTENT.into_response(),
+        (true, false) => see_other(&format!("/?tab={id}")),
+        (false, _) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -230,6 +266,7 @@ async fn prompt_agent(
 async fn pending_decision_route(
     State(reg): State<Arc<Registry>>,
     Path(id): Path<u64>,
+    headers: axum::http::HeaderMap,
 ) -> Html<String> {
     let Some(attach) = reg.attach_of(id) else {
         return Html(String::new());
@@ -246,7 +283,7 @@ async fn pending_decision_route(
     .ok()
     .flatten();
     Html(match pending {
-        Some(p) => shell::pending_permission_card(id, &p),
+        Some(p) => shell::pending_permission_card(id, &p, &csrf_of(&headers)),
         None => String::new(),
     })
 }
@@ -336,10 +373,11 @@ fn decision_status(outcome: DecideOutcome) -> StatusCode {
 async fn decide_route(
     State(reg): State<Arc<Registry>>,
     Path(id): Path<u64>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<DecisionForm>,
-) -> StatusCode {
+) -> axum::response::Response {
     let Some(attach) = reg.attach_of(id) else {
-        return StatusCode::NOT_FOUND;
+        return StatusCode::NOT_FOUND.into_response();
     };
     let (state, _) = store_paths();
     let conv = attach.conv_id.clone();
@@ -351,27 +389,42 @@ async fn decide_route(
         classify_decision(&store, &conv, &request_id, &submitted)
     })
     .await;
-    match result {
+    let status = match result {
         Ok(Ok(outcome)) => decision_status(outcome),
         // A join failure or a store/DB error is the only 500 path — every
         // domain outcome resolves to an explicit 2xx/4xx above.
         _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    // A scriptless browser has nowhere to put a 204, so a WINNING answer
+    // sends it back to the page. Every losing outcome keeps its own honest
+    // code (#1536): redirecting a 409 would tell the operator their decision
+    // was accepted when the terminal actually won the race.
+    if status == StatusCode::NO_CONTENT && !is_htmx(&headers) {
+        return see_other(&format!("/?tab={id}"));
     }
+    status.into_response()
 }
 
 /// DELETE /agents/:id — shut the agent down; the response clears the panel
 /// region and refreshes the strip out-of-band.
-async fn delete_agent(State(reg): State<Arc<Registry>>, Path(id): Path<u64>) -> impl IntoResponse {
+async fn delete_agent(
+    State(reg): State<Arc<Registry>>,
+    Path(id): Path<u64>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
     if reg.remove(id) {
+        if !is_htmx(&headers) {
+            return see_other("/");
+        }
         let agents = reg.list();
         let body = format!(
             r#"<p class="empty">Agent closed. Pick a tab or spawn a new one.</p>
 {}"#,
             shell::tab_strip(&agents, None)
         );
-        (StatusCode::OK, Html(body))
+        (StatusCode::OK, Html(body)).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Html(String::new()))
+        (StatusCode::NOT_FOUND, Html(String::new())).into_response()
     }
 }
 
@@ -521,12 +574,15 @@ struct DockPanelQuery {
 /// `GET /dock/panel?peer=&conv=` — the hub side of SELECT: resolve the clicked
 /// peer, mirror its session's transcript into the shared `#panel` read-only. An
 /// unknown peer is refused (fail-closed); an unreachable one renders a notice.
-async fn dock_panel_route(Query(q): Query<DockPanelQuery>) -> impl IntoResponse {
+async fn dock_panel_route(
+    Query(q): Query<DockPanelQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
     let Some(peer) = dock::peer_by_label(&q.peer) else {
         return (StatusCode::NOT_FOUND, "unknown dock peer").into_response();
     };
     match dock::fetch_transcript(&peer, &q.conv).await {
-        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t)).into_response(),
+        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t, &csrf_of(&headers))).into_response(),
         Err(e) => Html(format!(
             r#"<p class="empty">dock unreachable: {}</p>"#,
             shell::escape(&e)
@@ -580,6 +636,7 @@ async fn api_inject(Path(id): Path<String>, Form(form): Form<InjectForm>) -> imp
 /// sees the enqueue land and the transcript catch up as the remote consumes it.
 async fn dock_inject_route(
     Query(q): Query<DockPanelQuery>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<InjectForm>,
 ) -> impl IntoResponse {
     let Some(peer) = dock::peer_by_label(&q.peer) else {
@@ -595,7 +652,7 @@ async fn dock_inject_route(
     // Re-mirror: the remote may not have consumed yet; the operator sees the ask
     // land and the transcript catches up on the next select/refresh.
     match dock::fetch_transcript(&peer, &q.conv).await {
-        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t)).into_response(),
+        Ok(t) => Html(dock::dock_panel(&q.peer, &q.conv, &t, &csrf_of(&headers))).into_response(),
         Err(e) => Html(format!(r#"<p class="empty">{}</p>"#, shell::escape(&e))).into_response(),
     }
 }
@@ -605,23 +662,23 @@ async fn dock_inject_route(
 /// terminal-started session, or a docked peer's new turns, appear without an F5.
 /// View-only (D2). The open `#panel` is a sibling, so a refresh never disturbs
 /// the transcript the operator is reading.
-async fn overview_route() -> Html<String> {
-    Html(overview_fragment().await)
+async fn overview_route(headers: axum::http::HeaderMap) -> Html<String> {
+    Html(overview_fragment(&csrf_of(&headers)).await)
 }
 
 /// The docked + sessions sections, in the page's order.
-pub(crate) async fn overview_fragment() -> String {
+pub(crate) async fn overview_fragment(csrf: &str) -> String {
     format!(
         "{}{}",
-        dock::docked_section().await,
-        sessions_section().await
+        dock::docked_section(csrf).await,
+        sessions_section(csrf).await
     )
 }
 
 /// The "sessions on this box" section: conversations in the shared store,
 /// each followable read-only (W4). Store errors render as an empty section —
 /// the cockpit must not die because the store isn't there yet.
-pub(crate) async fn sessions_section() -> String {
+pub(crate) async fn sessions_section(csrf: &str) -> String {
     let (state, ws) = store_paths();
     // list_all spans EVERY workspace (A2) — the operator runs newt in many
     // dirs, so "my sessions" is not one workspace's. Each row carries the
@@ -651,10 +708,11 @@ pub(crate) async fn sessions_section() -> String {
             .unwrap_or_else(|| workspace.clone());
         out.push_str(&format!(
             r##"<li><span class="s-title">{title}</span> <small>({n} turns · {wsname})</small>
-<form style="display:inline" hx-post="/follow" hx-target="#panel" hx-swap="innerHTML">
-<input type="hidden" name="conv_id" value="{id}"><input type="hidden" name="title" value="{title}">
+<form class="attach" method="post" action="/follow" hx-post="/follow" hx-target="#panel" hx-swap="innerHTML">
+{csrf_field}<input type="hidden" name="conv_id" value="{id}"><input type="hidden" name="title" value="{title}">
 <input type="hidden" name="workspace" value="{workspace}">
 <button>attach</button></form></li>"##,
+            csrf_field = newt_web::csrf::hidden_field(csrf),
             title = shell::escape(&c.title),
             n = c.turn_count,
             wsname = shell::escape(&wsname),
@@ -680,8 +738,9 @@ struct FollowForm {
 /// from the session row (A2 cross-workspace attach), not the web's default.
 async fn follow_session(
     State(reg): State<Arc<Registry>>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<FollowForm>,
-) -> Html<String> {
+) -> axum::response::Response {
     let (state, _) = store_paths();
     let id = reg.spawn_follow(
         state,
@@ -689,15 +748,19 @@ async fn follow_session(
         form.conv_id,
         form.title.clone(),
     );
+    if !is_htmx(&headers) {
+        return see_other(&format!("/?tab={id}"));
+    }
     let panel = shell::agent_panel(
         id,
         &form.title,
         "follow",
         true,
         &agents::Snapshot::default(),
+        &csrf_of(&headers),
     );
     let strip = shell::tab_strip(&reg.list(), Some(id));
-    Html(format!("{panel}\n{strip}"))
+    Html(format!("{panel}\n{strip}")).into_response()
 }
 
 /// Mint a short-lived agent key for a mesh role under the operator's `UserKey`.
@@ -821,13 +884,23 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::util::ServiceExt;
 
+    /// A request as the ENHANCED (HTMX) client makes it.
+    ///
+    /// C3b made the surface work without script, which means a plain form post
+    /// now gets a 303 back to the page instead of a fragment. These suites all
+    /// assert on fragments, so they are HTMX callers — stated here once, in
+    /// the header HTMX itself sends, rather than by threading a flag through
+    /// forty call sites. `full` is the helper for everything else.
     async fn req(
         app: &Router,
         method: &str,
         path: &str,
         form: Option<&str>,
     ) -> (StatusCode, String) {
-        let mut b = axum::http::Request::builder().method(method).uri(path);
+        let mut b = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("hx-request", "true");
         let body = match form {
             Some(f) => {
                 b = b.header("content-type", "application/x-www-form-urlencoded");
@@ -1061,9 +1134,9 @@ mod tests {
         let app = app();
         let form = "name=t3&url=http%3A%2F%2F127.0.0.1%3A1&model=m&kind=ollama&workspace=.";
         req(&app, "POST", "/agents", Some(form)).await;
-        let (status, _) = req(&app, "DELETE", "/agents/1", None).await;
+        let (status, _) = req(&app, "POST", "/agents/1/delete", None).await;
         assert_eq!(status, StatusCode::OK);
-        let (status, _) = req(&app, "DELETE", "/agents/1", None).await;
+        let (status, _) = req(&app, "POST", "/agents/1/delete", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = req(&app, "POST", "/agents/1/prompt", Some("text=x")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1140,7 +1213,29 @@ mod tests {
         let (status, a) = req(&app(), "GET", "/", None).await;
         assert_eq!(status, StatusCode::OK);
         let (_, b) = req(&app(), "GET", "/", None).await;
-        assert_eq!(a, b, "shell render is nondeterministic");
+
+        // C3b: the page now carries two values that MUST differ per response —
+        // the CSP nonce and the CSRF token. A byte-identical double render
+        // would mean one of them is a reused constant, which is the exact
+        // failure `csp.rs` calls unrepresentable. So the determinism check
+        // splits in two, and is stronger for it:
+        //
+        //   1. everything EXCEPT those values is byte-deterministic, and
+        //   2. those values are genuinely fresh.
+        //
+        // Checking only (1) would let a hardcoded nonce through; checking only
+        // (2) would stop pinning the page.
+        assert_eq!(
+            scrub_volatile(&a),
+            scrub_volatile(&b),
+            "shell render is nondeterministic outside the nonce and CSRF token"
+        );
+        assert_ne!(
+            a, b,
+            "the nonce and CSRF token must be fresh per response; an identical \
+             render means one of them is a constant"
+        );
+        let a = scrub_volatile(&a);
 
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/shell.golden");
@@ -1162,6 +1257,39 @@ mod tests {
         );
         let perturbed = format!("{a}\nPERTURBED-MUST-FAIL");
         assert_ne!(expected, perturbed, "negative control failed to fail");
+    }
+
+    /// Replace the two deliberately-fresh values with fixed placeholders, so
+    /// the golden pins the page's SHAPE without pinning a secret that must
+    /// never repeat. Everything else stays byte-exact.
+    fn scrub_volatile(html: &str) -> String {
+        let mut out = String::with_capacity(html.len());
+        let mut rest = html;
+        // Both are `attr="value"` with a value from a fixed alphabet, so a
+        // scan to the closing quote is exact — no regex dependency, and no
+        // chance of swallowing markup.
+        loop {
+            let next = ["nonce=\"", "name=\"csrf\" value=\""]
+                .iter()
+                .filter_map(|marker| rest.find(marker).map(|at| (at, *marker)))
+                .min_by_key(|(at, _)| *at);
+            let Some((at, marker)) = next else {
+                out.push_str(rest);
+                return out;
+            };
+            let after = at + marker.len();
+            let Some(close) = rest[after..].find('"') else {
+                out.push_str(rest);
+                return out;
+            };
+            out.push_str(&rest[..after]);
+            out.push_str(if marker.starts_with("nonce") {
+                "{NONCE}"
+            } else {
+                "{CSRF}"
+            });
+            rest = &rest[after + close..];
+        }
     }
 
     /// W3 acceptance: two agents, two backends, concurrent turns — each
@@ -1202,7 +1330,7 @@ mod tests {
         let p2 = wait_for_path(&app, "/agents/2/panel", "REPLY-BETA").await;
         assert!(!p2.contains("REPLY-ALPHA"), "no cross-talk into panel 2");
         // Independent lifecycles: kill 1; 2 still drives.
-        let (status, _) = req(&app, "DELETE", "/agents/1", None).await;
+        let (status, _) = req(&app, "POST", "/agents/1/delete", None).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _) = req(&app, "GET", "/agents/1/panel", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "dead tab 404s");
@@ -1226,7 +1354,7 @@ mod tests {
         }
         let (_, body) = req(&app, "GET", "/", None).await;
         assert!(
-            body.contains(">one</button>") && body.contains(">two</button>"),
+            body.contains(">one</a>") && body.contains(">two</a>"),
             "strip lists both"
         );
         assert!(body.contains("agent-1"), "first agent's panel active");
@@ -1360,10 +1488,13 @@ mod tests {
         assert!(card.contains("Permission needed"), "card: {card}");
         assert!(card.contains("<code>bash</code>"), "target shown: {card}");
         assert!(
-            card.contains(r#"verdict":"allow_once"#),
-            "allow-once offered"
+            card.contains(r#"name="verdict" value="allow_once""#),
+            "allow-once offered: {card}"
         );
-        assert!(card.contains(r#"verdict":"deny"#), "deny offered");
+        assert!(
+            card.contains(r#"name="verdict" value="deny""#),
+            "deny offered: {card}"
+        );
         assert!(
             !card.contains("allow_session"),
             "high-danger must NOT offer a standing session grant: {card}"
@@ -2157,10 +2288,31 @@ mod tests {
 
         /// **Labels are bound to their controls, and choices are grouped.**
         #[serial_test::serial(newt_web_env)]
-        #[tokio::test]
+        #[tokio::test(flavor = "multi_thread")]
         async fn controls_carry_accessible_semantics() {
             std::env::remove_var("NEWT_WEB_STATE_DIR");
-            let (_, _, page) = full(&app(), "GET", "/", &[], None).await;
+            let app = app();
+            // The live region belongs to a transcript, so the page must have
+            // one — asserting it on the empty shell would pass or fail for
+            // reasons that have nothing to do with accessibility.
+            let (_, page_headers, _) = full(&app, "GET", "/", &[], None).await;
+            let token = csrf_of(&page_headers);
+            full(
+                &app,
+                "POST",
+                "/agents",
+                &[
+                    ("origin", "http://127.0.0.1:8880"),
+                    ("host", "127.0.0.1:8880"),
+                    ("cookie", &format!("newt_csrf={token}")),
+                    ("hx-request", "true"),
+                ],
+                Some(&format!(
+                    "name=t&url=http%3A%2F%2F127.0.0.1%3A1&model=m&kind=ollama&workspace=.&csrf={token}"
+                )),
+            )
+            .await;
+            let (_, _, page) = full(&app, "GET", "/", &[], None).await;
             assert!(
                 page.contains("<fieldset") && page.contains("<legend"),
                 "grouped controls need a fieldset/legend: {page}"
