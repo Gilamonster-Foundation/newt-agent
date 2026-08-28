@@ -140,6 +140,16 @@ toml = "1.0"
 # internal `#/definitions` refs, so no retriever is needed at all.
 jsonschema = { version = "0.52", default-features = false }
 regex = "1"
+# Reentrant mutex for `newt_core::process_env` (#1850) — the ONE lock over the
+# process environment, held by the production `NEWT_*` writers and by both test
+# guard families. It must be REENTRANT: guarded tests legitimately hold the
+# environment still and then drive production code that writes it, which a plain
+# mutex deadlocks on. Already vendored transitively (tokio, crossterm,
+# serial_test) and already compiled in this build, so the direct dep adds no
+# build cost — the same reasoning as `rustix` above. std's `ReentrantLock` is
+# still unstable on the pinned toolchain, and hand-rolling a lock inside a fix
+# for a concurrency bug is not a trade worth making.
+parking_lot = "0.12"
 # Gitignore-aware recursive filesystem walking for the embedded `find` tool
 # (#496). Pure-Rust (ripgrep's walker), no C deps → preserves the PyO3 wheel
 # story; honours nested .gitignore / .git/info/exclude / hidden-file rules.

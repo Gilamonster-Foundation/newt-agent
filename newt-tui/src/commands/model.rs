@@ -430,19 +430,25 @@ pub(crate) fn dispatch(
 /// bare-kind fallback rows (#1667), extracted verbatim from the slash arm so
 /// the two surfaces cannot drift:
 ///
-/// - SAFETY: single-threaded REPL; the post-command re-resolve picks it up.
-///   Session-only — does NOT persist; use `/model` or a named `/backends`
-///   switch to persist a choice.
+/// - Written under the process-env lock (#1850); the post-command re-resolve
+///   picks it up. Session-only — does NOT persist; use `/model` or a named
+///   `/backends` switch to persist a choice.
 /// - Optional `model` (ollama only) → session-only override on the same axis
 ///   the loadout `model` feeds (NEWT_DGX_MODEL), consumed by the Ollama
 ///   resolution. Avoids mutating saved config on a live A/B switch.
 pub(crate) fn apply_backend_kind(kind: &str, model: &str, color: bool, verbose: bool) {
-    unsafe { std::env::set_var("NEWT_BACKEND", kind) };
-    if kind == "ollama" && !model.is_empty() {
-        unsafe { std::env::set_var("NEWT_DGX_MODEL", model) };
-        // #1668: the model half of this switch is an operator preference
-        // action. The coarse wire kind is deliberately not a pin axis.
-        newt_core::runtime::mark_model_pick(model);
+    {
+        // One hold for the whole switch, released before the re-resolve and
+        // the print: a guarded reader must not see the new wire kind beside
+        // the outgoing backend's model override.
+        let _env = newt_core::process_env::lock();
+        newt_core::process_env::set_var("NEWT_BACKEND", kind);
+        if kind == "ollama" && !model.is_empty() {
+            newt_core::process_env::set_var("NEWT_DGX_MODEL", model);
+            // #1668: the model half of this switch is an operator preference
+            // action. The coarse wire kind is deliberately not a pin axis.
+            newt_core::runtime::mark_model_pick(model);
+        }
     }
     match crate::resolve_backend_choice(&crate::resolve_runtime_or_default()) {
         Ok(choice) => print_newt(
@@ -465,8 +471,9 @@ pub(crate) fn apply_backend_kind(kind: &str, model: &str, color: bool, verbose: 
 /// there is exactly one set of switch semantics. Returns whether it applied
 /// (`false` = no such configured backend; the miss is printed).
 ///
-/// - SAFETY: single-threaded REPL. The post-command re-resolve in the session
-///   loop reads NEWT_PROVIDER and repoints the session at this named backend.
+/// - Written under the process-env lock (#1850). The post-command re-resolve
+///   in the session loop reads NEWT_PROVIDER and repoints the session at this
+///   named backend.
 ///   Clear any stale per-session model override so the named backend's own
 ///   default model applies.
 /// - Persist the choice so it sticks across runs (#545): records `provider`
@@ -493,9 +500,12 @@ pub(crate) fn apply_backend_choice(name: &str, color: bool, verbose: bool) -> bo
             );
             return false;
         }
-        unsafe {
-            std::env::set_var("NEWT_PROVIDER", name);
-            std::env::remove_var("NEWT_DGX_MODEL");
+        {
+            // One hold for the pair: a guarded reader must never see the new
+            // provider beside the outgoing backend's stale model override.
+            let _env = newt_core::process_env::lock();
+            newt_core::process_env::set_var("NEWT_PROVIDER", name);
+            newt_core::process_env::remove_var("NEWT_DGX_MODEL");
         }
         // #1668: mark only a successful named-backend pick. Listing and an
         // unknown name therefore cannot capture ambient persona routing.
@@ -592,8 +602,8 @@ pub(crate) fn apply_model_choice(name: &str, color: bool, verbose: bool) {
         }
         return;
     }
-    // SAFETY: single-threaded REPL; the post-command re-resolve reads it.
-    unsafe { std::env::set_var("NEWT_DGX_MODEL", name) };
+    // Under the process-env lock (#1850); the post-command re-resolve reads it.
+    newt_core::process_env::set_var("NEWT_DGX_MODEL", name);
     // #1668: past the #1122 gate ⇒ the pick really applied, so it is an
     // operator posture action on the MODEL axis alone. A refused pick returned
     // above and marks nothing; the backend the operator happens to be on

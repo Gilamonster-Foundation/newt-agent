@@ -9033,6 +9033,24 @@ mod tests {
     fn cli_backend_override_field_only_edits_first_backend_in_place() {
         // With no endpoint/model_path the override is a field edit, not a new
         // backend: `--backend-model` swaps only the model of the primary backend.
+        //
+        // #1850: an UNNAMED field-only edit targets "the backend the shared
+        // selection precedence picks", and that precedence reads
+        // `$NEWT_PROVIDER` (`select_backend_slot`). Sibling tests in this
+        // binary set it to `hollow`/`ghost`/`acme`, and when one of them
+        // overlaps this test the selection misses, `apply` swallows the error
+        // into a `tracing::warn!`, and the model silently stays `old`.
+        // Reproduce with `NEWT_PROVIDER=hollow cargo test -p newt-core --lib
+        // cli_backend_override_field_only_edits_first_backend_in_place`.
+        // The named-target siblings are unaffected, which is why this is the
+        // only one that needs this.
+        //
+        // The guard alone is not enough: it SERIALIZES and restores, it does
+        // not sanitize, so an operator's exported `NEWT_PROVIDER` would still
+        // reach the selection. Clear it too — the guard puts it back on drop,
+        // including through a panic.
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        crate::process_env::remove_var("NEWT_PROVIDER");
         let mut cfg = Config {
             backends: vec![BackendConfig {
                 name: "eval".into(),

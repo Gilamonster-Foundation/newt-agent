@@ -18,6 +18,16 @@
 //! Exposed (not `#[cfg(test)]`) so tests in dependent crates (`newt-tui`) share
 //! the SAME lock — a module-local mutex cannot serialize tests in other crates.
 //!
+//! ## The lock lives in [`crate::process_env`] (#1850)
+//!
+//! This guard used to own a private `Mutex`, and `newt-tui` owned a *second*,
+//! independent `RwLock` over the same variables. Two locks over one process
+//! environment serialize nothing: a test holding either one raced every test
+//! holding the other, which is what made `cargo test -p newt-tui --lib
+//! --all-features` fail ~30% of runs with whole modules going down together.
+//! Both now delegate to the single reentrant lock in [`crate::process_env`],
+//! which the production writers take too.
+//!
 //! ## What the snapshot covers, and why (audited 2026-07-31)
 //!
 //! The guard must snapshot **exactly** the mutable state that can change what
@@ -50,12 +60,9 @@
 //! resolution fn, so it is intentionally out of scope here.
 
 use crate::cognition::CognitionRuntimeSnapshot;
+use crate::process_env::EnvGuard;
 use crate::runtime::PreferenceRuntimeSnapshot;
 use crate::tenacity::TenacityRuntimeSnapshot;
-use std::sync::{Mutex, MutexGuard};
-
-/// The one lock that serializes every test touching the operator globals.
-static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
 
 /// The env vars the psyche + backend-routing paths read (and tests mutate).
 /// `NEWT_OPENAI_API` gates the cognition wire scope, so it belongs here too.
@@ -71,9 +78,10 @@ const ENV_KEYS: &[&str] = &[
 /// them on `drop` — even through a panic or assertion failure.
 #[doc(hidden)]
 pub struct GlobalSettingsGuard {
-    // Held for the guard's lifetime; a poisoned lock is recovered (a prior test
-    // that panicked mid-mutation shouldn't wedge the whole suite).
-    _lock: MutexGuard<'static, ()>,
+    // Held for the guard's lifetime. `process_env`'s lock is reentrant and
+    // unpoisoned, so a test that panics mid-mutation releases it on unwind
+    // instead of wedging the suite.
+    _lock: EnvGuard,
     // `Option` only so `Drop` can move the snapshot out into the restore fns.
     cognition: Option<CognitionRuntimeSnapshot>,
     tenacity: Option<TenacityRuntimeSnapshot>,
@@ -85,7 +93,7 @@ impl GlobalSettingsGuard {
     /// Acquire the guard, snapshotting the current settings.
     #[must_use]
     pub fn acquire() -> Self {
-        let lock = SETTINGS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let lock = crate::process_env::lock();
         let env = ENV_KEYS
             .iter()
             .map(|k| (*k, std::env::var(k).ok()))
@@ -112,14 +120,9 @@ impl Drop for GlobalSettingsGuard {
             crate::runtime::restore_runtime_state(snap);
         }
         for (k, v) in &self.env {
-            // SAFETY: the guard holds the settings lock, so no other guarded test
-            // is mutating env concurrently; restoration runs single-threaded here.
-            unsafe {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
+            // Still under this guard's own lock (it drops after us), and
+            // `set_or_remove` re-takes it reentrantly on this same thread.
+            crate::process_env::set_or_remove(k, v.as_deref());
         }
     }
 }

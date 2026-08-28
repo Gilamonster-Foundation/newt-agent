@@ -640,6 +640,12 @@ fn resolver_default_backend_beats_the_openai_heuristic() {
     // #1139 (C1): with several backends and a default_backend pointer, the
     // pointer wins; without it, the historical prefer-openai heuristic
     // applies; a sole backend is always chosen.
+    //
+    // #1850: `resolve_backend_choice` reads NEWT_PROVIDER / NEWT_DGX_MODEL, so
+    // this must hold the environment still. Without the guard it observed a
+    // sibling module's fixture and asserted `Some("bound-model")` against
+    // `None` — a string that exists nowhere in this test.
+    let _g = crate::test_env_guard::env_write_guard();
     let ollama = newt_core::BackendConfig {
         name: "gpu-runner".into(),
         endpoint: "http://gpu-runner:11434".into(),
