@@ -97,6 +97,17 @@ pub(crate) enum SurfaceRequest {
     },
     /// The turn is over: whatever Ctrl-C meant, it means nothing now.
     TurnEnded,
+    /// **C1 (#1862): present one semantic interaction and report the outcome.**
+    ///
+    /// The envelope is thread-shaped — it carries a reply channel, like every
+    /// question here. The PAYLOAD is not: `SurfaceInteraction` holds no
+    /// channel and no `Arc`, and derives `Serialize`, so the semantic half of
+    /// this exchange is the part a later slice can put on a wire. That
+    /// layering is the epic's non-goal made structural rather than stated.
+    Interact {
+        interaction: Box<newt_core::interaction_surface::SurfaceInteraction>,
+        reply: SyncSender<newt_core::HumanQuestionOutcome>,
+    },
 }
 
 impl SurfaceRequest {
@@ -106,7 +117,10 @@ impl SurfaceRequest {
     /// what keeps a turn from round-tripping to the UI thread for every status
     /// update it publishes.
     pub(crate) fn expects_reply(&self) -> bool {
-        matches!(self, Self::ReadLine { .. } | Self::Reload { .. })
+        matches!(
+            self,
+            Self::ReadLine { .. } | Self::Reload { .. } | Self::Interact { .. }
+        )
     }
 }
 
@@ -238,6 +252,23 @@ impl crate::chat::InputSurface for RemoteSurface {
     fn turn_ended(&mut self) {
         self.notify(SurfaceRequest::TurnEnded);
     }
+
+    fn present_interaction(
+        &mut self,
+        interaction: &newt_core::interaction_surface::SurfaceInteraction,
+    ) -> newt_core::HumanQuestionOutcome {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let interaction = Box::new(interaction.clone());
+        // A dead or silent UI thread means nobody can be asked — which is
+        // `Unavailable`, not a synthesized answer. Fail closed: every
+        // security-sensitive caller treats a non-`Answer` outcome as a refusal.
+        self.ask(
+            |reply| SurfaceRequest::Interact { interaction, reply },
+            rx,
+            tx,
+        )
+        .unwrap_or(newt_core::HumanQuestionOutcome::Unavailable)
+    }
 }
 
 /// Serve one session's surface requests on the thread that owns the terminal.
@@ -276,6 +307,9 @@ pub(crate) fn pump_surface(
             SurfaceRequest::SetTabs(tabs) => surface.set_tabs(tabs),
             SurfaceRequest::TurnStarted { cancel, hard } => surface.turn_started(cancel, hard),
             SurfaceRequest::TurnEnded => surface.turn_ended(),
+            SurfaceRequest::Interact { interaction, reply } => {
+                let _ = reply.send(surface.present_interaction(&interaction));
+            }
         }
     }
 }
@@ -460,9 +494,18 @@ mod tests {
     }
 
     #[test]
-    fn only_the_two_value_returning_requests_expect_a_reply() {
+    fn only_the_value_returning_requests_expect_a_reply() {
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
         assert!(SurfaceRequest::Reload { reply: tx }.expects_reply());
+        // C1 (#1862) added a THIRD. The name said "the two" and the body
+        // spot-checks rather than enumerating, so this would have kept
+        // passing while silently describing the wrong set.
+        let (itx, _irx) = std::sync::mpsc::sync_channel(1);
+        assert!(SurfaceRequest::Interact {
+            interaction: Box::new(an_interaction()),
+            reply: itx,
+        }
+        .expects_reply());
         assert!(!SurfaceRequest::SaveHistory.expects_reply());
         assert!(!SurfaceRequest::AddHistory("x".into()).expects_reply());
         assert!(!SurfaceRequest::SetBackgroundJobs(Vec::new()).expects_reply());
@@ -557,8 +600,16 @@ mod tests {
     /// one forwarding impl and the count drops — the exact failure that
     /// shipped a silent no-op the first time.
     ///
-    /// If you add a tenth method to `InputSurface`, this test fails until
+    /// If you add a further method to `InputSurface`, this test fails until
     /// the proxy forwards it. That is the point; do not relax the count.
+    ///
+    /// C1 (#1862) took it from nine to ten with `present_interaction`. That
+    /// method is REQUIRED rather than defaulted, so the silent-death case
+    /// cannot arise for it — a proxy that forgot it would not compile. This
+    /// test still covers it, because "compiles" only proves a body exists;
+    /// what must also hold is that the body reaches the FAR SIDE rather than
+    /// answering locally, which is a thing a required method can still get
+    /// wrong.
     #[test]
     fn the_proxy_forwards_every_surface_method() {
         let (to_ui, from_session) = std::sync::mpsc::sync_channel(16);
@@ -580,15 +631,33 @@ mod tests {
             let flag = || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             surface.turn_started(flag(), flag());
             surface.turn_ended();
+            surface.present_interaction(&an_interaction());
         }
 
         let seen = served.join().expect("terminal thread");
         assert_eq!(
             seen.observed(),
-            9,
+            10,
             "every InputSurface method must cross the proxy; missing: {:?}",
             seen.missing()
         );
+    }
+
+    /// One semantic interaction, for the seam tests.
+    fn an_interaction() -> newt_core::interaction_surface::SurfaceInteraction {
+        use newt_interaction::{Control, ControlId, ControlKind, InteractionKind, Requirement};
+        newt_core::interaction_surface::SurfaceInteraction::blocking(
+            newt_interaction::InteractionDefinition::new(
+                InteractionKind::Prompt,
+                "? which file",
+                vec![Control {
+                    id: ControlId::new("answer").expect("valid control id"),
+                    kind: ControlKind::Text,
+                    label: String::new(),
+                    requirement: Requirement::Required,
+                }],
+            ),
+        )
     }
 
     /// Records which surface methods the terminal was actually asked to run.
@@ -603,10 +672,11 @@ mod tests {
         tabs: usize,
         turn_started: usize,
         turn_ended: usize,
+        present_interaction: usize,
     }
 
     impl CountingSurface {
-        fn each(&self) -> [(&'static str, usize); 9] {
+        fn each(&self) -> [(&'static str, usize); 10] {
             [
                 ("read_line", self.read_line),
                 ("add_history", self.add_history),
@@ -617,6 +687,7 @@ mod tests {
                 ("set_tabs", self.tabs),
                 ("turn_started", self.turn_started),
                 ("turn_ended", self.turn_ended),
+                ("present_interaction", self.present_interaction),
             ]
         }
         fn observed(&self) -> usize {
@@ -632,6 +703,14 @@ mod tests {
     }
 
     impl crate::chat::InputSurface for CountingSurface {
+        fn present_interaction(
+            &mut self,
+            _interaction: &newt_core::interaction_surface::SurfaceInteraction,
+        ) -> newt_core::HumanQuestionOutcome {
+            self.present_interaction += 1;
+            newt_core::HumanQuestionOutcome::Answer("served".into())
+        }
+
         fn read_line(&mut self, _prompt: &str) -> anyhow::Result<ReadOutcome> {
             self.read_line += 1;
             Ok(ReadOutcome::Eof)
@@ -807,6 +886,13 @@ mod tests {
     }
 
     impl crate::chat::InputSurface for RecordingSurface {
+        fn present_interaction(
+            &mut self,
+            _interaction: &newt_core::interaction_surface::SurfaceInteraction,
+        ) -> newt_core::HumanQuestionOutcome {
+            newt_core::HumanQuestionOutcome::Unavailable
+        }
+
         fn read_line(&mut self, _prompt: &str) -> anyhow::Result<ReadOutcome> {
             Ok(ReadOutcome::Eof)
         }

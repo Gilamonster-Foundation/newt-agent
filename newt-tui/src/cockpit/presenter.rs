@@ -622,6 +622,16 @@ impl Presenter {
                 });
                 self.dirty = true;
             }
+            // C1 (#1862): the cockpit owns the terminal, so it presents the
+            // interaction itself. `suspend_for_prompt` takes the terminal from
+            // under the cockpit and restores it on drop — the path #1770 fixed
+            // and `presenter`'s own PTY test exercises.
+            SurfaceRequest::Interact { interaction, reply } => {
+                let window = newt_core::tty::Terminal::suspend_for_prompt();
+                let outcome = crate::permissions::present_on_terminal(&window, &interaction);
+                drop(window);
+                let _ = reply.send(outcome);
+            }
             SurfaceRequest::TurnEnded => {
                 self.turn = None;
                 newt_core::tty::set_interrupt_pending(false);

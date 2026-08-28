@@ -996,6 +996,28 @@ pub(crate) trait InputSurface {
     }
     /// The turn is over: whatever Ctrl-C meant, it means nothing now.
     fn turn_ended(&mut self) {}
+
+    /// **C1 (#1862): present one semantic interaction and report what the
+    /// operator did.**
+    ///
+    /// Deliberately REQUIRED — no default body. Every other method added to
+    /// this trait since #1718 has carried one, and a default body is exactly
+    /// how the `RemoteSurface` silent-death case happens: the proxy forgets
+    /// to forward, the call resolves to the default, and the feature is dead
+    /// while still compiling. A required method cannot be forgotten, so this
+    /// one sidesteps that failure mode by construction rather than relying on
+    /// `the_proxy_forwards_every_surface_method` to notice afterwards. (That
+    /// test still covers it — belt and braces, since the test also proves the
+    /// forward reaches the far side rather than merely existing.)
+    ///
+    /// The argument is a `SurfaceInteraction`, not a pre-rendered string:
+    /// which is the whole point of the slice. A surface that receives the
+    /// DEFINITION can render it as plain lines, a Ratatui modal, or an HTML
+    /// form; a surface that receives `prompt: String` can only print it.
+    fn present_interaction(
+        &mut self,
+        interaction: &newt_core::interaction_surface::SurfaceInteraction,
+    ) -> newt_core::HumanQuestionOutcome;
 }
 
 /// M (#1819): re-derive the AUTOMATIC bundle/profile pick from the CURRENT
@@ -1259,6 +1281,19 @@ fn session_body(
     let _rt_context = rt.enter();
 
     let verbose = verbose_mode();
+    // C1 (#1862): the permission gate's route to the terminal-owning thread.
+    //
+    // A fresh `RemoteSurface` per ask rather than a borrow of `surface`:
+    // `RemoteSurface` is stateless over a cloned `SyncSender`, so this costs a
+    // channel-handle clone and avoids holding `&mut surface` for the whole
+    // session while the turn loop is also using it. The gate therefore never
+    // touches the terminal — it posts a semantic interaction and parks.
+    let ask_to_ui = to_ui.clone();
+    let ask_surface = move |interaction: &newt_core::interaction_surface::SurfaceInteraction| {
+        crate::session_worker::RemoteSurface::new(ask_to_ui.clone())
+            .present_interaction(interaction)
+    };
+
     // The session's only route to the terminal.
     let mut surface: Box<dyn InputSurface> =
         Box::new(crate::session_worker::RemoteSurface::new(to_ui));
@@ -6881,6 +6916,8 @@ fn session_body(
                     // (non-interactive) still gets `None` and the honest headless
                     // response.
                     let mut permission_gate = interactive.then(|| PromptPermissionGate {
+                        // C1: ask the UI thread, never this one.
+                        ask_surface: Some(&ask_surface),
                         state: &mut permission_state,
                         base: turn_caveats.clone(),
                         key_path: key_path.clone(),
