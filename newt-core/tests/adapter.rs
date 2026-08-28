@@ -340,20 +340,24 @@ mod b0a {
             needle: "definition_to_question(",
             why: "and must render it through the adapter, not a second renderer",
         },
+        // B0b-2 (#1846): the web surface now PUBLISHES the definition, so
+        // it builds one directly instead of going through the rendering
+        // facade. Both surfaces still reach the same builder; only the web
+        // additionally persists it.
         Link {
             caller: "await_web_decision",
-            needle: "question_for(",
+            needle: "permission_definition(",
             why: "the WEB surface must route through the definition path",
         },
         Link {
-            caller: "question_for",
+            caller: "await_web_decision",
             needle: "definition_to_question(",
-            why: "rendering goes through the A2.2 adapter, not a second renderer",
+            why: "and render it through the adapter, not a second renderer",
         },
         Link {
-            caller: "question_for",
-            needle: "permission_definition(",
-            why: "the adapter must be fed the ONE definition both surfaces build",
+            caller: "await_web_decision",
+            needle: "publish_interaction_offer(",
+            why: "the web surface publishes the OFFER, not a bare question",
         },
         Link {
             caller: "permission_definition",
@@ -404,7 +408,7 @@ mod b0a {
         // The old builder is gone from the switched functions: a
         // surviving `Question {` literal there is the duplicate string
         // builder B0a deletes.
-        for caller in ["question_for", "permission_definition"] {
+        for caller in ["permission_definition", "await_web_decision"] {
             let body = function_body(&lines, caller).expect("body");
             assert!(
                 !body.contains("Question {"),
@@ -446,13 +450,16 @@ mod b0a {
         );
         assert!(missing.is_empty(), "{}", missing.join("\n"));
 
-        let store = production_lines("newt-core/src/store.rs");
-        assert!(!store.is_empty(), "no production lines in store.rs");
+        let store = production_lines("newt-core/src/interaction_offer.rs");
+        assert!(
+            !store.is_empty(),
+            "no production lines in interaction_offer.rs"
+        );
         let missing = missing_links(
             &store,
             &[Link {
-                caller: "answer_permission_request_inner",
-                needle: "web_answer_is_authorized(",
+                caller: "answer_interaction_offer",
+                needle: "authorized_response(",
                 why: "the WEB surface must authorize, not re-parse",
             }],
         );
@@ -465,25 +472,18 @@ mod b0a {
         );
         let missing = missing_links(
             &gate_mod,
-            &[
-                Link {
-                    caller: "web_answer_is_authorized",
-                    needle: "authorize_action(",
-                    why: "the web path shares the one authorizer",
-                },
-                Link {
-                    caller: "authorize_action",
-                    needle: "validate_response(",
-                    why: "the decision lands on the formally-modelled validator",
-                },
-            ],
+            &[Link {
+                caller: "authorize_action",
+                needle: "validate_response(",
+                why: "the decision lands on the formally-modelled validator",
+            }],
         );
         assert!(missing.is_empty(), "{}", missing.join("\n"));
 
         // The store must no longer DECIDE by parsing. `Question::parse` is
         // kept as an input decoder, but the answer transaction is not
         // where it decides any more.
-        let answer = function_body(&store, "answer_permission_request_inner").expect("body");
+        let answer = function_body(&store, "answer_interaction_offer").expect("body");
         assert!(
             !answer.contains(".parse("),
             "the store's answer path still decides by parsing"
@@ -510,10 +510,9 @@ mod b0a {
             "    let choice = (self.ask_human)(&w, &q);",
             "}",
             "fn await_web_decision(&self, req: &R) -> (PromptChoice, &'static str) {",
-            "    let question = question_for(req, &self.danger, Audience::Web);",
-            "}",
-            "fn question_for(req: &R, danger: &D, audience: Audience) -> Question<PromptChoice> {",
-            "    definition_to_question(&permission_definition(req, danger, audience)).expect(\"x\")",
+            "    let definition = permission_definition(req, &self.danger, Audience::Web);",
+            "    let q = definition_to_question(&definition).expect(\"x\");",
+            "    let id = store.publish_interaction_offer(&conv, &definition, tier, Audience::Web);",
             "}",
             "fn permission_definition(req: &R) -> InteractionDefinition {",
             "    InteractionDefinition::new(kind, markdown, controls)",
@@ -578,4 +577,130 @@ fn the_caller_scan_sees_a_seeded_call() {
         },
     );
     assert_eq!(seen, 1, "the scanner missed a seeded adapter call");
+}
+
+/// **The B0 deletion gate** (B0b-2, #1846).
+///
+/// #1803 says B0 is not complete while both permanent paths remain live.
+/// These tests are what make that statement checkable.
+mod b0b2 {
+    use super::common;
+
+    /// The five store methods the old transport exposed. None may exist in
+    /// production source any more — not renamed, not `#[allow(dead_code)]`,
+    /// gone.
+    const DELETED_METHODS: &[&str] = &[
+        "publish_permission_question",
+        "pending_permission_request",
+        "answer_permission_action",
+        "take_permission_decision",
+        "resolve_permission_request",
+        "PendingPermission",
+    ];
+
+    /// SQL that USES the old table. Prose that merely names it is fine and
+    /// deliberately allowed — the comments explaining what replaced what
+    /// are worth keeping, and a gate that banned the NAME would push them
+    /// out of the code that needs them.
+    const TABLE_USES: &[&str] = &[
+        "FROM permission_requests",
+        "INTO permission_requests",
+        "UPDATE permission_requests",
+        "TABLE permission_requests",
+        "permission_requests SET",
+    ];
+
+    /// Scan for `needles`, choosing the right view of each line.
+    ///
+    /// `in_strings` picks the RAW line rather than the scanner's `code`,
+    /// and that distinction is load bearing rather than defensive: the
+    /// shared scanner BLANKS string literals, and SQL lives inside string
+    /// literals. Checking SQL against `code` finds nothing, forever —
+    /// which is exactly what `the_deletion_scan_sees_a_seeded_use` caught
+    /// when this gate was first written against `code` for both classes.
+    fn offenders(needles: &[&str], in_strings: bool) -> Vec<String> {
+        let roots = common::production_roots(&common::workspace_root());
+        let mut found = Vec::new();
+        common::for_each_production_line(&roots, &|_| false, &mut |path, code, raw| {
+            let haystack = if in_strings { raw } else { code };
+            for needle in needles {
+                if haystack.contains(needle) {
+                    // Normalized per `rel()` so the message reads the same
+                    // on every platform (B0a lost a CI round to native
+                    // separators leaking into a comparison).
+                    let shown = path.to_string_lossy().replace('\\', "/");
+                    found.push(format!("{shown}: {}", raw.trim()));
+                }
+            }
+        });
+        found
+    }
+
+    /// **The deliverable.** After B0b-2 nothing in production reads, writes,
+    /// or names the old transport's API.
+    #[test]
+    fn no_production_path_reads_permission_requests() {
+        let methods = offenders(DELETED_METHODS, false);
+        assert!(
+            methods.is_empty(),
+            "the old permission transport still has production callers, so \
+             both paths are live and B0 is not complete:\n{}",
+            methods.join("\n")
+        );
+        let sql = offenders(TABLE_USES, true);
+        assert!(
+            sql.is_empty(),
+            "production SQL still uses the `permission_requests` table:\n{}",
+            sql.join("\n")
+        );
+    }
+
+    /// **Anti-vacuous twin.** A scanner that sees nothing reports "deleted"
+    /// forever, which is indistinguishable from the state the gate wants.
+    /// Seed each needle class into a synthetic workspace and require the
+    /// same machinery to find it.
+    #[test]
+    fn the_deletion_scan_sees_a_seeded_use() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("newt-cli/src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"newt-cli\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("main.rs"),
+            "fn f() {\n    let _ = store.take_permission_decision(&c, &r);\n                 let _ = conn.execute(\"DELETE FROM permission_requests\");\n}\n",
+        )
+        .unwrap();
+
+        let mut method_hits = 0usize;
+        let mut sql_hits = 0usize;
+        common::for_each_production_line(
+            &common::production_roots(root.path()),
+            &|_| false,
+            &mut |_, code, raw| {
+                if DELETED_METHODS.iter().any(|n| code.contains(n)) {
+                    method_hits += 1;
+                }
+                // Same view the real gate uses: SQL is inside a string
+                // literal, which `code` blanks.
+                if TABLE_USES.iter().any(|n| raw.contains(n)) {
+                    sql_hits += 1;
+                }
+            },
+        );
+        assert_eq!(method_hits, 1, "the scan missed a seeded method call");
+        assert_eq!(sql_hits, 1, "the scan missed a seeded SQL use");
+    }
+
+    /// The prose that explains the replacement is deliberately still
+    /// allowed, so the gate above is not quietly banning documentation.
+    #[test]
+    fn naming_the_old_table_in_prose_is_not_a_use() {
+        let explanatory = "         -- Replaces `permission_requests` as the transport.";
+        assert!(!TABLE_USES.iter().any(|n| explanatory.contains(n)));
+        assert!(!DELETED_METHODS.iter().any(|n| explanatory.contains(n)));
+    }
 }

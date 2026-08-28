@@ -518,7 +518,7 @@ path = "newt-core/src/tty/widgets/question.rs"
 symbol = "tests::an_alias_cannot_select_an_action_absent_from_the_question"
 [[BHV-PROMPT-001.refs.rust_tests]]
 path = "newt-core/src/store.rs"
-symbol = "tests::permission_channel_publish_answer_take_race_and_fence"
+symbol = "tests::interaction_offer_publish_answer_take_race_and_fence"
 [[BHV-PROMPT-001.refs.rust_tests]]
 path = "newt-web/src/main.rs"
 symbol = "tests::attach_tab_renders_and_answers_a_danger_gated_permission_decision"
@@ -589,10 +589,10 @@ path = "newt-tui/src/permissions.rs"
 symbol = "permission_prompt_tests::web_decision_timeout_resolves_and_denies_without_hanging"
 [[BHV-PROMPT-003.refs.rust_tests]]
 path = "newt-core/src/store.rs"
-symbol = "tests::permission_channel_publish_answer_take_race_and_fence"
+symbol = "tests::interaction_offer_publish_answer_take_race_and_fence"
 [[BHV-PROMPT-003.refs.production]]
-path = "newt-core/src/store.rs"
-symbol = "take_permission_decision"
+path = "newt-core/src/interaction_offer.rs"
+symbol = "take_interaction_decision"
 
 [BHV-PROMPT-004]
 description = "A transient control-reader failure neither authorizes nor resolves the prompt; recovery re-arms the local controls; the web decision path stays available while the reader retries."
@@ -644,10 +644,10 @@ symbol = "tests::value_wire_name_still_matches"
 path = "newt-web/src/main.rs"
 symbol = "tests::attach_tab_renders_and_answers_a_danger_gated_permission_decision"
 [[BHV-PROMPT-005.refs.production]]
-path = "newt-core/src/store.rs"
-symbol = "publish_permission_question"
+path = "newt-core/src/interaction_offer.rs"
+symbol = "publish_interaction_offer"
 [[BHV-PROMPT-005.refs.production]]
-path = "newt-core/src/store.rs"
+path = "newt-core/src/interaction_offer.rs"
 symbol = "question"
 [[BHV-PROMPT-005.refs.production]]
 path = "newt-core/src/tty/widgets/question.rs"
@@ -1060,8 +1060,8 @@ symbol = "validate_response"
 path = "newt-core/src/interaction_gate.rs"
 symbol = "authorize_action"
 [[BHV-INTERACTION-001.refs.production]]
-path = "newt-core/src/store.rs"
-symbol = "answer_permission_action"
+path = "newt-core/src/interaction_offer.rs"
+symbol = "answer_interaction_offer"
 
 [BHV-INTERACTION-002]
 description = "An action resolves only to a caller-registered handler, and only for an audience that registration admits: an unregistered action never resolves, and an ineligible audience is refused even when the surface displayed the action."
