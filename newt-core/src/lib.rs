@@ -43,6 +43,7 @@ pub mod git_caveats;
 pub mod git_hardening;
 pub mod grounding;
 pub mod interaction_adapter;
+pub mod interaction_form;
 pub mod interaction_gate;
 pub mod interaction_offer;
 // C1 (#1862): the SEMANTIC half of the surface seam. Deliberately separate
