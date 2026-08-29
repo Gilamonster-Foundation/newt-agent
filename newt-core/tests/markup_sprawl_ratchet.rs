@@ -56,6 +56,15 @@ struct FileCode {
     /// The file names `pulldown_cmark` — the only `Parser` this repo's
     /// dialect cares about.
     imports_pulldown: bool,
+    /// Hand-laid column rows, tallied per LINE from the raw source.
+    ///
+    /// Every other category reads `squeezed`, which comes from the shared
+    /// scanner with **string-literal contents blanked** — `"{:<28} {:<16}"`
+    /// arrives as `"________________"`. That is right for identifier needles
+    /// and it makes a format-string shape unarmable through that field, which
+    /// is why these sites stayed invisible. The scanner already passes the
+    /// raw line as its third argument; nothing had used it.
+    adhoc_sites: usize,
 }
 
 /// Non-overlapping occurrences of `needle` in `hay`, ignoring matches whose
@@ -82,6 +91,140 @@ fn count_sites(hay: &str, needle: &str) -> usize {
 
 fn count_any(hay: &str, needles: &[&str]) -> usize {
     needles.iter().map(|n| count_sites(hay, n)).sum()
+}
+
+/// `raw` with its trailing line comment removed, keeping literal contents.
+///
+/// The shared scanner hands back `code` — the same line with literals blanked
+/// and the trailing comment truncated — and `strip_string_literals` replaces
+/// each char with exactly one char, so `code`'s CHAR count is the length of
+/// the raw line's non-comment prefix. Chars, not bytes: blanking turns a
+/// multi-byte char into a one-byte `_`, so a byte index would slice a row
+/// containing `…` or a box-drawing glyph in the wrong place.
+/// `strip_string_literals_is_length_preserving` pins the invariant this rests
+/// on.
+fn uncommented(raw: &str, code: &str) -> String {
+    raw.chars().take(code.chars().count()).collect()
+}
+
+/// End index (exclusive) of a format field at `at` that pads to a WIDTH —
+/// `{:<28}`, `{name:>5.2}`, `{v:^label_w$}`, `{:width$}`, `{:9}` — or `None`
+/// when `at` does not open one.
+///
+/// A width with no explicit alignment still lays out a column, and requiring
+/// the alignment was this detector's first blind spot: `mcp_cmd.rs` writes
+/// `"{:width$}  {:9}  {:7}  SOURCE"`, two padded columns and not one arrow
+/// among them. Found by checking the scan against the A0 inventory's site
+/// list rather than trusting the scan, which is the only reason the count
+/// below is not two short.
+///
+/// What stays excluded: `{:.2}` carries no width at all, and `{:02}` /
+/// `{:04}` carry one but are zero-padded NUMBERS — without that rule a
+/// timestamp `"{:02}:{:02}"` reads as a hand-laid table row. The `0` flag is
+/// the discriminator, and only when nothing else marks the field as a
+/// column: `{:0>5}` is an explicitly aligned column and counts.
+fn width_field_end(code: &str, at: usize) -> Option<usize> {
+    let b = code.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let is_align = |c: u8| c == b'<' || c == b'>' || c == b'^';
+    let mut i = at + 1;
+    // optional argument name or index
+    while i < b.len() && (is_ident(b[i]) || b[i] == b'.') {
+        i += 1;
+    }
+    if i >= b.len() || b[i] != b':' {
+        return None;
+    }
+    i += 1;
+    // [[fill]align] — a fill char is only a fill if an align follows it
+    let has_align = if i + 1 < b.len() && is_align(b[i + 1]) {
+        i += 2;
+        true
+    } else if i < b.len() && is_align(b[i]) {
+        i += 1;
+        true
+    } else {
+        false
+    };
+    // sign / '#' / '0' flags sit between the align and the width
+    let mut zero_padded = false;
+    while i < b.len() && matches!(b[i], b'+' | b'-' | b'#' | b'0') {
+        zero_padded |= b[i] == b'0';
+        i += 1;
+    }
+    // Width is DIGITS or `name$` — never a bare identifier, which in this
+    // position is the TYPE. `{:#x}` was the second blind spot: the `x` read
+    // as a width, and four hex-dump lines in `cockpit/test_tty.rs` armed
+    // themselves as hand-laid tables. Digits first, so `{:8x}` keeps its
+    // width and hands the `x` to the tail scan.
+    if i < b.len() && b[i].is_ascii_digit() {
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+    } else {
+        let start = i;
+        while i < b.len() && is_ident(b[i]) {
+            i += 1;
+        }
+        if i == start || i >= b.len() || b[i] != b'$' {
+            return None;
+        }
+        i += 1;
+    }
+    // A zero-padded number is not a column unless it also says which way it
+    // leans — see this function's doc comment.
+    if zero_padded && !has_align {
+        return None;
+    }
+    // anything else in the spec, up to the closing brace
+    while i < b.len() && b[i] != b'}' {
+        if b[i] == b'"' || b[i] == b'{' {
+            return None;
+        }
+        i += 1;
+    }
+    (i < b.len()).then(|| i + 1)
+}
+
+/// String literals carrying TWO OR MORE width fields.
+///
+/// One padded field is a label; **two in one literal is a table row laid out
+/// by hand** — the shape the A0 inventory recorded, unarmed, as "the 22
+/// ad-hoc two-width-field `format!` call sites" (SECTION 4.1.5). Grouping by
+/// literal rather than by macro is deliberate: the same row shape appears in
+/// `format!`, `println!`, `write!`, `push_str(&format!(..))` and `eprintln!`,
+/// and a needle per macro would miss the sixth.
+///
+/// Boundaries are quotes, so two fields with no `"` between them are one
+/// site. An escaped quote inside such a literal would split one site into
+/// two — an OVER-count, which trips the ratchet rather than hiding a
+/// duplicate, and no site in this workspace has one.
+fn adhoc_column_sites(code: &str) -> usize {
+    let b = code.as_bytes();
+    let (mut sites, mut run, mut i) = (0usize, 0usize, 0usize);
+    while i < b.len() {
+        if b[i] == b'"' {
+            if run >= 2 {
+                sites += 1;
+            }
+            run = 0;
+            i += 1;
+        } else if b[i] == b'{' {
+            match width_field_end(code, i) {
+                Some(end) => {
+                    run += 1;
+                    i = end;
+                }
+                None => i += 1,
+            }
+        } else {
+            i += 1;
+        }
+    }
+    if run >= 2 {
+        sites += 1;
+    }
+    sites
 }
 
 const CATEGORIES: &[Category] = &[
@@ -272,11 +415,14 @@ const CATEGORIES: &[Category] = &[
             // `newt-eval/src/scorecard.rs` was here at 1 until D3a: its
             // bespoke fixed-width renderer is deleted, and the type now
             // supplies rows to the algorithm above through `fmt::Display`.
-            // Counts a BINDING, not an implementation: pyo3's `render_table`
-            // is `self.inner.to_string()`, one line, and A0 §4.1.4 calls it
-            // "pyo3 exposure". The needle cannot tell a binding from a
-            // renderer; a reader of this table should.
-            ("newt-eval/src/pyo3_module.rs", 1),
+            // `newt-eval/src/pyo3_module.rs` was here at 1 until D3b. It
+            // never held an implementation — the needle was counting a
+            // one-line BINDING (A0 §4.1.4, "pyo3 exposure"). Its Rust method
+            // is now `table` under `#[pyo3(name = "render_table")]`, so
+            // Python is unchanged and the file no longer DECLARES a table
+            // renderer. A real one landing there trips as a NEW site file,
+            // which is what makes dropping the row safe.
+            // `newt-eval/tests/python_surface.rs` pins the Python name.
             // Both cfg(feature) arms of the same fn — production either way.
             // A0 §4.1.2: ZERO production callers, and the decision to delete
             // or wire it must consult wyvern-agent, so D3a leaves it.
@@ -288,6 +434,41 @@ const CATEGORIES: &[Category] = &[
                     ad-hoc two-width-field format! call sites are recorded \
                     unarmed in the A0 inventory; D3 owns them); one table \
                     algorithm is the D3 exit",
+    },
+    Category {
+        name: "ad-hoc two-width-field format sites",
+        count: |f| f.adhoc_sites,
+        // Armed at 21 by SCAN, not by the inventory's "22" (D3b, #1886).
+        // Every row below was read and confirmed to be a hand-laid column
+        // row; the detector reports no site this list does not name.
+        //
+        // The three A0 §4.1.5 lines this shape deliberately EXCLUDES, each
+        // carrying exactly ONE padded field, so they are not lost:
+        //   newt-cli/src/ocap_cmd.rs         "  {:<5} {} ({}x)\n        {}\n"
+        //   newt-eval/src/bin/newt-eval.rs   "  {:<28}  {}  {}"
+        //   newt-cli/src/config_cmd.rs:52    "#   {name:<11}       {desc}"
+        // plus the two `-----` rule lines A0 notes parenthetically
+        // (tuning_cmd.rs, probe.rs). Widening to ONE field would sweep in
+        // every `{:<5}` in the workspace — status lines, log prefixes — and
+        // a tripwire that fires on everything reports nothing.
+        baseline: &[
+            ("newt-cli/src/config_cmd.rs", 1),
+            ("newt-cli/src/dgx_card.rs", 3),
+            ("newt-cli/src/dgx_status.rs", 1),
+            ("newt-cli/src/dock_cmd.rs", 2),
+            ("newt-cli/src/mcp_cmd.rs", 2),
+            ("newt-cli/src/models_cmd.rs", 2),
+            ("newt-cli/src/providers_cmd.rs", 2),
+            ("newt-cli/src/tuning_cmd.rs", 2),
+            ("newt-tui/src/chat.rs", 1),
+            ("newt-tui/src/lib.rs", 2),
+            ("newt-tui/src/probe.rs", 2),
+            ("newt-tui/src/prompt.rs", 1),
+        ],
+        rationale: "hand-laid column rows: one string literal padding two or \
+                    more fields to a width. The A0 inventory recorded these \
+                    UNARMED; D3 owns them, and a category armed at its TRUE \
+                    current count is what stops them being invisible",
     },
 ];
 
@@ -332,7 +513,7 @@ fn production_code() -> BTreeMap<String, FileCode> {
     for_each_production_line(
         &production_roots(&root),
         &no_extra_skips,
-        &mut |path, code, _| {
+        &mut |path, code, raw| {
             let name = match &last {
                 Some((p, name)) if p == path => name.clone(),
                 _ => {
@@ -344,11 +525,13 @@ fn production_code() -> BTreeMap<String, FileCode> {
             let entry = files.entry(name).or_insert_with(|| FileCode {
                 squeezed: String::new(),
                 imports_pulldown: false,
+                adhoc_sites: 0,
             });
             if code.contains("pulldown_cmark") {
                 entry.imports_pulldown = true;
             }
             squeeze_into(&mut entry.squeezed, code);
+            entry.adhoc_sites += adhoc_column_sites(&uncommented(raw, code));
         },
     );
     files
@@ -802,6 +985,7 @@ fn a_second_answer_validator_against_the_new_types_is_counted() {
         let file = FileCode {
             squeezed,
             imports_pulldown: false,
+            adhoc_sites: adhoc_column_sites(src),
         };
         (CATEGORIES
             .iter()
@@ -865,6 +1049,7 @@ fn needles_survive_a_line_split_and_name_their_receiver() {
         FileCode {
             squeezed,
             imports_pulldown: src.contains("pulldown_cmark"),
+            adhoc_sites: adhoc_column_sites(src),
         }
     };
     let count = |name: &str, src: &str| {
@@ -1447,5 +1632,107 @@ mod c3c {
         // A longer identifier ending in the needle is its own thing.
         assert_eq!(question_refs("self.my_question()"), 0);
         assert_eq!(question_refs(""), 0);
+    }
+}
+
+/// **The anti-vacuous twin for the ad-hoc column category (D3b, #1886).**
+///
+/// The category counts a SHAPE inside string literals, and every other
+/// category in this file counts identifiers in code the scanner has already
+/// blanked literals out of. A shape detector has failure modes a needle does
+/// not, and this one had two — both found by checking the scan against the A0
+/// inventory's site list instead of believing the scan.
+mod d3b {
+    use super::{adhoc_column_sites, uncommented};
+
+    #[test]
+    fn the_adhoc_detector_can_see_a_new_column_row() {
+        // Two padded fields in one literal is a hand-laid row. All three
+        // spellings in the armed baseline are recognised.
+        assert_eq!(
+            adhoc_column_sites(r#"println!("{:<20} {:<18} scope", a, b)"#),
+            1
+        );
+        assert_eq!(
+            adhoc_column_sites(r#"w!("{:width$}  {:9}  {:7}  SOURCE")"#),
+            1
+        );
+        assert_eq!(
+            adhoc_column_sites(r#"format!("{name:<11} {slash:<3}  {d}")"#),
+            1
+        );
+        // Two literals are two sites, so a file cannot hide a row by
+        // adding it next to another.
+        assert_eq!(adhoc_column_sites(r#"f("{:<3}{:<3}"); g("{:<3}{:<3}")"#), 2);
+
+        // ONE padded field is a label, not a row — the line that keeps this
+        // from firing on every status print in the workspace.
+        assert_eq!(
+            adhoc_column_sites(r#"println!("  {:<28}  {}  {}", a, b, c)"#),
+            0
+        );
+        // A precision is not a width.
+        assert_eq!(adhoc_column_sites(r#"format!("{:.2} {:.2}", a, b)"#), 0);
+        // BLIND SPOT 1 — zero-padded numbers. A clock is not a table.
+        assert_eq!(
+            adhoc_column_sites(r#"format!("{:02}:{:02}:{:02}", h, m, s)"#),
+            0
+        );
+        // BLIND SPOT 2 — `{:#x}`'s `x` is the TYPE, not a width. Four
+        // hex-dump lines in cockpit/test_tty.rs armed themselves as tables
+        // before this rule existed.
+        assert_eq!(
+            adhoc_column_sites(r#"format!("c_lflag {:#x} -> {:#x}", a, b)"#),
+            0
+        );
+        // …but an explicitly aligned zero-pad IS a column, and a width that
+        // carries a type keeps its width.
+        assert_eq!(adhoc_column_sites(r#"format!("{:0>5} {:0>5}", a, b)"#), 1);
+        assert_eq!(adhoc_column_sites(r#"format!("{:8x} {:8x}", a, b)"#), 1);
+
+        assert_eq!(adhoc_column_sites(""), 0);
+    }
+
+    /// A row shape inside a trailing comment is prose, not a site — and the
+    /// cut that removes it is measured in CHARS, because blanking a literal
+    /// turns a multi-byte char into a one-byte `_`. With byte indices this
+    /// slices the line in the wrong place and the row is lost.
+    #[test]
+    fn a_multi_byte_literal_does_not_shift_the_comment_cut() {
+        let raw = "row(\"… {:<3} {:<3}\"); // note {:<9} {:<9}";
+        let code = {
+            let mut c = crate::common::strip_string_literals(raw);
+            if let Some(i) = c.find("//") {
+                c.truncate(i);
+            }
+            c
+        };
+        let cut = uncommented(raw, &code);
+        assert!(cut.contains("{:<3} {:<3}"), "the row survives: {cut:?}");
+        assert!(!cut.contains("{:<9}"), "the comment does not: {cut:?}");
+        assert_eq!(adhoc_column_sites(&cut), 1);
+    }
+
+    /// [`uncommented`] rests on this: `strip_string_literals` replaces each
+    /// char with exactly one char. If that ever stops holding, the comment
+    /// cut silently lands in the wrong place and rows go missing — a SHRINK,
+    /// which reads as "Progress! Ratchet down" and lowers a floor that
+    /// should not move.
+    #[test]
+    fn strip_string_literals_is_length_preserving() {
+        for line in [
+            "let a = 1;",
+            "row(\"… {:<3}\")",
+            "let c = 'x'; let d = '\\n';",
+            "let s = \"a\\\"b\";",
+            "// {:<3} {:<3}",
+            "",
+        ] {
+            assert_eq!(
+                crate::common::strip_string_literals(line).chars().count(),
+                line.chars().count(),
+                "char count must be preserved: {line:?}"
+            );
+        }
     }
 }
