@@ -37,6 +37,13 @@ mod interaction_view_pty_test;
 mod line_console;
 #[cfg(feature = "live-spill")]
 mod live_spill;
+/// #1889 — the PTY acceptance proof that the operator PANELS hand the
+/// terminal back (cooked mode) on every exit path, panic included. Same tier
+/// and same reasoning as `interaction_view_pty_test`, which it is modelled on:
+/// a Drop-on-unwind restoration cannot be observed from inside the process
+/// doing the unwinding.
+#[cfg(all(test, unix, feature = "rich-tui"))]
+mod panel_raw_mode_pty_test;
 mod permissions;
 mod prompt;
 /// §6.5 — the PTY regression proof that a permission prompt stays VISIBLE when

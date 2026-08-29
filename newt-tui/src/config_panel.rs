@@ -791,6 +791,42 @@ pub(crate) fn clamp_step(i: usize, dir: i32, len: usize) -> usize {
 /// Bordered block (2) + six rows + a hint/command/status row.
 const PANEL_HEIGHT: u16 = 10;
 
+/// Restore the terminal on EVERY exit path of a panel — return, error, panic.
+///
+/// **RAII, not happy-path control flow**, and that distinction is the whole
+/// point (#1889). Both panels used to call `enable_raw_mode()` and then
+/// `disable_raw_mode()` as a STATEMENT after the loop closure. An error return
+/// reached it; a **panic unwound straight past**, leaving the operator in a
+/// shell with no echo and no line discipline — a session that looks broken,
+/// recoverable only with `reset`.
+///
+/// `SplashScreenGuard`'s doc (#1411) enumerated the crate's raw-mode pairs and
+/// called the splash "the only one with no guard at all". These two panels
+/// were not in that count. This is the conversion.
+///
+/// The guard binds BEFORE the fallible call — the ordering
+/// `AltScreenGuard::enter` pays for and `InlineGuard::enter` repeats: from that
+/// point the restore is owed regardless of what the next line does.
+///
+/// `enter_panel_raw_mode_is_the_only_way_in` pins that neither panel reaches
+/// past this type to crossterm; `panel_raw_mode_pty_test` proves the Drop
+/// against a real tty, from a parent that outlives the panicking child.
+pub(crate) struct PanelRawGuard;
+
+impl PanelRawGuard {
+    pub(crate) fn enter() -> io::Result<Self> {
+        let guard = Self;
+        enable_raw_mode()?;
+        Ok(guard)
+    }
+}
+
+impl Drop for PanelRawGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
 pub(crate) fn make_terminal(height: u16) -> io::Result<Term> {
     Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
@@ -939,59 +975,62 @@ pub(crate) fn run(
 ) -> io::Result<PanelOutcome> {
     let mut state = PanelState::new(seed);
     let mut applied = false;
-    enable_raw_mode()?;
-    let loop_result = (|| -> io::Result<()> {
-        let mut terminal = make_terminal(PANEL_HEIGHT)?;
-        terminal.clear()?;
-        loop {
-            terminal.draw(|f| draw(f, &state))?;
-            if !event::poll(Duration::from_millis(250))? {
-                continue;
-            }
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            if state.in_command() {
-                match key.code {
-                    KeyCode::Char(c) => state.command_char(c),
-                    KeyCode::Backspace => state.command_backspace(),
-                    KeyCode::Esc => state.cancel_command(),
-                    KeyCode::Enter => {
-                        if let Some(apply) = state.run_command(&mut persist) {
-                            applied = apply;
+    // Scoped so the restore lands exactly where the old bare
+    // `disable_raw_mode()` statement did — same ordering, now owed from Drop.
+    let loop_result = {
+        let _raw = PanelRawGuard::enter()?;
+        (|| -> io::Result<()> {
+            let mut terminal = make_terminal(PANEL_HEIGHT)?;
+            terminal.clear()?;
+            loop {
+                terminal.draw(|f| draw(f, &state))?;
+                if !event::poll(Duration::from_millis(250))? {
+                    continue;
+                }
+                let Event::Key(key) = event::read()? else {
+                    continue;
+                };
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                if state.in_command() {
+                    match key.code {
+                        KeyCode::Char(c) => state.command_char(c),
+                        KeyCode::Backspace => state.command_backspace(),
+                        KeyCode::Esc => state.cancel_command(),
+                        KeyCode::Enter => {
+                            if let Some(apply) = state.run_command(&mut persist) {
+                                applied = apply;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Up => state.up(),
+                        KeyCode::Down => state.down(),
+                        KeyCode::Left => state.cycle(-1),
+                        KeyCode::Right => state.cycle(1),
+                        KeyCode::Char('s') if ctrl => state.begin_command("w "),
+                        KeyCode::Char(':') => state.begin_command(""),
+                        KeyCode::Enter => {
+                            applied = true;
                             break;
                         }
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            applied = false;
+                            break;
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-            } else {
-                match key.code {
-                    KeyCode::Up => state.up(),
-                    KeyCode::Down => state.down(),
-                    KeyCode::Left => state.cycle(-1),
-                    KeyCode::Right => state.cycle(1),
-                    KeyCode::Char('s') if ctrl => state.begin_command("w "),
-                    KeyCode::Char(':') => state.begin_command(""),
-                    KeyCode::Enter => {
-                        applied = true;
-                        break;
-                    }
-                    KeyCode::Esc | KeyCode::Char('q') => {
-                        applied = false;
-                        break;
-                    }
-                    _ => {}
                 }
             }
-        }
-        terminal.clear()?;
-        Ok(())
-    })();
-    let _ = disable_raw_mode();
+            terminal.clear()?;
+            Ok(())
+        })()
+    };
     loop_result?;
 
     // Commit order (review-3 §1): the persona file was already persisted inside
@@ -1031,6 +1070,59 @@ fn close_outcome(applied: bool, state: &PanelState) -> PanelOutcome {
 
 #[cfg(test)]
 mod tests {
+    /// **The structural half of #1889.** The PTY test proves `PanelRawGuard`
+    /// restores; this proves the panels go through it.
+    ///
+    /// Without it the two tests together are still vacuous in the way that
+    /// matters: a guard can be correct and unused, which is exactly the state
+    /// these files were in before — `enable_raw_mode()` called directly, the
+    /// restore a statement a panic skips. Counted over the source because the
+    /// property is "no other path exists", and absence is not observable by
+    /// calling something.
+    #[test]
+    fn enter_panel_raw_mode_is_the_only_way_in() {
+        // PRODUCTION code only, and not merely for tidiness: this test lives
+        // IN config_panel.rs, so `include_str!` pulls in its own needles and
+        // the first run read 2 enables where there is one. Cutting at the
+        // test module is also the right scope — the property is that no
+        // production path reaches raw mode except through the guard.
+        let production = |src: &str| src.split("#[cfg(test)]").next().unwrap_or("").to_string();
+        let config = production(include_str!("config_panel.rs"));
+        let backend = production(include_str!("backend_panel.rs"));
+        // Count CALL forms, not the name: the guard's own doc comment
+        // discusses `enable_raw_mode()` and `disable_raw_mode()` in prose, and
+        // a test that counted mentions would move every time someone edited a
+        // comment — noise that trains people to adjust the number.
+        assert_eq!(
+            config.matches("enable_raw_mode()?").count(),
+            1,
+            "the ONLY enable_raw_mode call in config_panel is PanelRawGuard::enter's"
+        );
+        assert_eq!(
+            config.matches("disable_raw_mode();").count(),
+            1,
+            "the ONLY disable_raw_mode call in config_panel is the Drop impl's"
+        );
+        assert_eq!(
+            backend.matches("enable_raw_mode(").count(),
+            0,
+            "backend_panel must reach raw mode only through PanelRawGuard"
+        );
+        assert_eq!(
+            backend.matches("disable_raw_mode(").count(),
+            0,
+            "a bare disable in backend_panel means a restore that a panic skips"
+        );
+        // The guard itself must still be a Drop obligation. A guard whose
+        // restore moved into an inherent method would satisfy every count
+        // above and leak on unwind again.
+        assert!(
+            config.contains("impl Drop for PanelRawGuard"),
+            "PanelRawGuard must restore from Drop, not from a method someone \
+             has to remember to call"
+        );
+    }
+
     use super::*;
     use newt_core::test_guard::GlobalSettingsGuard;
 

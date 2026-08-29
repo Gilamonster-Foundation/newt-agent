@@ -55,12 +55,12 @@ use std::io;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use newt_core::BackendKind;
 
 use crate::config_panel::{
-    clamp_step, command_line, hint_line, make_terminal, render_panel, status_line, Dial, RowView,
+    clamp_step, command_line, hint_line, make_terminal, render_panel, status_line, Dial,
+    PanelRawGuard, RowView,
 };
 
 /// What applying a chooser pick means — a NAMED `[[backends]]` entry (the
@@ -1097,73 +1097,76 @@ pub(crate) fn run(
     }
     let mut state = PanelState::new(seed);
     let mut applied = false;
-    enable_raw_mode()?;
-    let loop_result = (|| -> io::Result<()> {
-        let mut terminal = make_terminal(PANEL_HEIGHT)?;
-        terminal.clear()?;
-        loop {
-            terminal.draw(|f| draw(f, &state))?;
-            if !event::poll(Duration::from_millis(250))? {
-                continue;
-            }
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            if state.in_command() {
-                match key.code {
-                    KeyCode::Char(c) if !ctrl => state.command_char(c),
-                    KeyCode::Backspace => state.command_backspace(),
-                    KeyCode::Esc => state.cancel_command(),
-                    KeyCode::Enter => {
-                        if let Some(apply) = state.run_command(&mut remove) {
-                            applied = apply;
+    // The same conversion as `config_panel::run` (#1889), and the same shape:
+    // this panel carried the identical bare-statement restore.
+    let loop_result = {
+        let _raw = PanelRawGuard::enter()?;
+        (|| -> io::Result<()> {
+            let mut terminal = make_terminal(PANEL_HEIGHT)?;
+            terminal.clear()?;
+            loop {
+                terminal.draw(|f| draw(f, &state))?;
+                if !event::poll(Duration::from_millis(250))? {
+                    continue;
+                }
+                let Event::Key(key) = event::read()? else {
+                    continue;
+                };
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                if state.in_command() {
+                    match key.code {
+                        KeyCode::Char(c) if !ctrl => state.command_char(c),
+                        KeyCode::Backspace => state.command_backspace(),
+                        KeyCode::Esc => state.cancel_command(),
+                        KeyCode::Enter => {
+                            if let Some(apply) = state.run_command(&mut remove) {
+                                applied = apply;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if state.in_form() {
+                    match key.code {
+                        KeyCode::Up => state.form_nav(-1),
+                        KeyCode::Down => state.form_nav(1),
+                        KeyCode::Left => state.form_cycle(-1),
+                        KeyCode::Right => state.form_cycle(1),
+                        KeyCode::Backspace => state.form_backspace(),
+                        KeyCode::Enter => {
+                            state.submit_form(&mut persist);
+                        }
+                        KeyCode::Esc => state.cancel_form(),
+                        KeyCode::Char(c) if !ctrl => state.form_input(c),
+                        _ => {}
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Left => state.cycle(-1),
+                        KeyCode::Right => state.cycle(1),
+                        KeyCode::Char('e') => state.begin_edit(),
+                        KeyCode::Char('a') => state.begin_add(),
+                        KeyCode::Char('d') => state.begin_remove(),
+                        KeyCode::Char(':') => state.begin_command(""),
+                        KeyCode::Enter => {
+                            applied = true;
                             break;
                         }
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            applied = false;
+                            break;
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-            } else if state.in_form() {
-                match key.code {
-                    KeyCode::Up => state.form_nav(-1),
-                    KeyCode::Down => state.form_nav(1),
-                    KeyCode::Left => state.form_cycle(-1),
-                    KeyCode::Right => state.form_cycle(1),
-                    KeyCode::Backspace => state.form_backspace(),
-                    KeyCode::Enter => {
-                        state.submit_form(&mut persist);
-                    }
-                    KeyCode::Esc => state.cancel_form(),
-                    KeyCode::Char(c) if !ctrl => state.form_input(c),
-                    _ => {}
-                }
-            } else {
-                match key.code {
-                    KeyCode::Left => state.cycle(-1),
-                    KeyCode::Right => state.cycle(1),
-                    KeyCode::Char('e') => state.begin_edit(),
-                    KeyCode::Char('a') => state.begin_add(),
-                    KeyCode::Char('d') => state.begin_remove(),
-                    KeyCode::Char(':') => state.begin_command(""),
-                    KeyCode::Enter => {
-                        applied = true;
-                        break;
-                    }
-                    KeyCode::Esc | KeyCode::Char('q') => {
-                        applied = false;
-                        break;
-                    }
-                    _ => {}
                 }
             }
-        }
-        terminal.clear()?;
-        Ok(())
-    })();
-    let _ = disable_raw_mode();
+            terminal.clear()?;
+            Ok(())
+        })()
+    };
     finish(loop_result, applied, &state)
 }
 
