@@ -109,51 +109,36 @@ test.afterAll(async () => {
   if (stateDir) await rm(stateDir, { recursive: true, force: true });
 });
 
-test("BAT: the cockpit falls back to diagram source under the CSP @bat", async ({ page }) => {
+test("BAT: a diagram renders server-side in the page's own ink @bat", async ({ page }) => {
   await page.goto(baseURL);
   await expect(page).toHaveTitle("newt-web");
-  await expect(page.getByText("No agents yet. Spawn one above.")).toBeVisible();
 
-  // The shell serves a strict CSP (#1854). Mermaid themes its diagrams with a
-  // <style> element it injects, scoped to a per-render id, and it has no nonce
-  // support — so `style-src-elem 'nonce-…'` blocks it and there is no hash or
-  // stylesheet that could admit it.
-  //
-  // Measured: with that stylesheet blocked, BOTH node fill and text fill fall
-  // back to black, so a rendered diagram is black-on-black — unreadable, not
-  // merely unstyled, and silently so. `markdown.js` therefore feature-detects
-  // whether an injected <style> applies and, when it does not, leaves the
-  // diagram as its own source: readable, labelled, and honest (ADR law 5).
-  await page.evaluate(async () => {
+  // E0b (#1869): diagrams are drawn server-side and arrive as SVG in the
+  // transcript. There is no client runtime to enhance them with — Mermaid
+  // could not draw under the strict CSP C3b shipped, and a blocked theme
+  // rendered black-on-black.
+  const ink = await page.evaluate(() => {
     const host = document.createElement("div");
     host.className = "md";
+    // Exactly what the server emits for a supported fence.
     host.innerHTML =
-      '<pre class="mermaid" data-markdown-extension="mermaid">flowchart LR\nA --> B</pre>';
+      '<figure class="diagram"><svg viewBox="0 0 100 50" role="img" aria-label="d">' +
+      '<rect x="1" y="1" width="40" height="20" fill="none" stroke="currentColor"/>' +
+      '<text x="20" y="14" fill="currentColor">A</text></svg></figure>';
     document.body.append(host);
-    await window.newtEnhanceMarkdown(host);
+    const page_ink = getComputedStyle(document.body).color;
+    return {
+      page_ink,
+      stroke: getComputedStyle(host.querySelector("rect")).stroke,
+      text: getComputedStyle(host.querySelector("text")).fill,
+    };
   });
 
-  const diagram = page.locator('[data-markdown-extension="mermaid"]');
-  await expect(diagram).toHaveClass(/mermaid-error/);
-  await expect(diagram).toHaveAttribute("aria-label", /security policy/i);
-  // The source is still READABLE — the whole point of the fallback.
-  await expect(diagram).toContainText("flowchart LR");
-  await expect(page.locator('[data-markdown-extension="mermaid"] svg')).toHaveCount(0);
-});
-
-test("BAT: an invalid diagram still falls back to its source @bat", async ({ page }) => {
-  await page.goto(baseURL);
-  await page.evaluate(async () => {
-    const host = document.createElement("div");
-    host.className = "md";
-    host.innerHTML =
-      '<pre class="mermaid" data-markdown-extension="mermaid">not a diagram !?</pre>';
-    document.body.append(host);
-    await window.newtEnhanceMarkdown(host);
-  });
-  const fallback = page.locator(".mermaid-error");
-  await expect(fallback).toHaveText("not a diagram !?");
-  await expect(fallback).toHaveAttribute("aria-label", /.+/);
+  // **Readability, not presence.** The diagram's ink resolves to the PAGE's
+  // own foreground colour, so it cannot be invisible against the page
+  // background — which is precisely what black-on-black was.
+  expect(ink.stroke).toBe(ink.page_ink);
+  expect(ink.text).toBe(ink.page_ink);
 });
 
 test("UAT: a phone-sized user drives a Markdown turn with no CSP violations @uat", async ({ page }) => {
@@ -182,15 +167,33 @@ test("UAT: a phone-sized user drives a Markdown turn with no CSP violations @uat
   await page.getByRole("button", { name: "send" }).click();
 
   await expect(page.locator(".transcript strong")).toHaveText("Markdown survives.");
-  // The diagram is present as readable source, and the injected <script> the
-  // model sent is gone.
-  const diagram = page.locator('.transcript [data-markdown-extension="mermaid"]');
-  await expect(diagram).toContainText("flowchart TD");
+  // The diagram is DRAWN, and drawn readably: its ink is the page's own
+  // foreground, so it cannot be invisible against the page background. This
+  // is the assertion the black-on-black regression needed — the old test
+  // asserted a diagram was PRESENT and stayed green over an unreadable one.
+  const svg = page.locator('.transcript .diagram svg');
+  await expect(svg).toBeVisible();
+  const legible = await page.evaluate(() => {
+    const rect = document.querySelector(".transcript .diagram svg rect");
+    const text = document.querySelector(".transcript .diagram svg text");
+    return {
+      page_ink: getComputedStyle(document.body).color,
+      stroke: rect ? getComputedStyle(rect).stroke : null,
+      text_fill: text ? getComputedStyle(text).fill : null,
+      label: text ? text.textContent : null,
+    };
+  });
+  expect(legible.stroke).toBe(legible.page_ink);
+  expect(legible.text_fill).toBe(legible.page_ink);
+  expect(legible.label).toBeTruthy();
+  // …and the adjacent accessible text travels with it.
+  await expect(page.locator(".transcript .diagram figcaption")).toHaveCount(1);
+  // The injected <script> the model sent is still gone.
   await expect(page.locator(".transcript")).not.toContainText("not allowed");
 
-  // The enhanced path also resets the prompt box — behaviour that used to live
-  // in an `hx-on::` attribute, which htmx EVALUATES and which therefore
-  // required `script-src 'unsafe-eval'`. It moved into `assets/panel.js`.
+  // The enhanced path still resets the prompt box — behaviour that used to
+  // live in an `hx-on::` attribute, which htmx EVALUATES and which therefore
+  // required `script-src 'unsafe-eval'`. It lives in `assets/panel.js`.
   await expect(page.getByPlaceholder("prompt…")).toHaveValue("");
 
   violations.push(...(await page.evaluate(() => window.__cspViolations || [])));

@@ -68,6 +68,7 @@
 //! here asks a surface to invert that: [`Enhancement`] carries a payload and a
 //! level, and where a surface puts its own marker is the surface's business.
 
+pub mod flowchart;
 pub mod mermaid;
 
 use std::collections::BTreeMap;
