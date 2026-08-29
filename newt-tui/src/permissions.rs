@@ -219,21 +219,33 @@ pub(crate) fn permission_definition(
         })
         .collect();
 
+    let controls = vec![Control {
+        id: ControlId::new(DECISION_CONTROL).expect(WIRE_NAMES_ARE_OPTION_IDS),
+        kind: ControlKind::Choice { options },
+        label: String::new(),
+        // A permission prompt must be answered: an unanswered one
+        // denies by default, which is a decision, not an absence.
+        requirement: Requirement::Required,
+    }];
+    // DERIVED, not hardcoded (#1912). The offered actions vary by denial kind,
+    // tier and audience, so a permission question may carry two options or
+    // five. Hardcoding `Choice` labelled every TWO-action permission as a pick
+    // from a displayed set when it is a binary decision — and the kind is
+    // bound into the definition's identity, so the label was wrong in the
+    // content-addressed record too.
+    let kind = if newt_interaction::controls_are_decision_shaped(&controls) {
+        InteractionKind::Confirm
+    } else {
+        InteractionKind::Choice
+    };
     let mut definition = InteractionDefinition::new(
-        InteractionKind::Choice,
+        kind,
         format!(
             "\u{2298} {} wants to {verb} `{}` \u{2014} {axis}.\n{blast}{reason}",
             req.tool, req.target
         )
         .trim_end(),
-        vec![Control {
-            id: ControlId::new(DECISION_CONTROL).expect(WIRE_NAMES_ARE_OPTION_IDS),
-            kind: ControlKind::Choice { options },
-            label: String::new(),
-            // A permission prompt must be answered: an unanswered one
-            // denies by default, which is a decision, not an absence.
-            requirement: Requirement::Required,
-        }],
+        controls,
     );
     definition.note = note;
     definition
@@ -3792,7 +3804,20 @@ mod b0a {
                     definition.controls[0].kind,
                     ControlKind::Choice { .. }
                 ));
-                assert_eq!(definition.kind, InteractionKind::Choice);
+                // The kind now AGREES WITH THE SHAPE rather than being a
+                // constant (#1912): this fixture offers two actions, one
+                // granting and one refusing, which is a binary decision.
+                // Asserting the derivation rather than the literal is what
+                // keeps this honest if the fixture gains a third action.
+                assert_eq!(
+                    definition.kind,
+                    if definition.is_decision_shaped() {
+                        InteractionKind::Confirm
+                    } else {
+                        InteractionKind::Choice
+                    },
+                    "the permission builder's kind must follow its controls"
+                );
                 assert_eq!(definition.controls[0].requirement, Requirement::Required);
 
                 // D0 (#1878): this compared the definition against the

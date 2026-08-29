@@ -1736,7 +1736,12 @@ fn mutation_confirm_definition(question: &str) -> newt_interaction::InteractionD
     }
     };
     InteractionDefinition::new(
-        InteractionKind::Choice,
+        // Confirm, not Choice (#1912). This is decision-shaped — one choice
+        // control, `Allow` + `Deny` — and `InteractionKind::Confirm` is the
+        // canonical kind for that. It was `Choice`, which made the kind
+        // useless as a discriminator: C0c found the same shape declared under
+        // both and had to go unconditional.
+        InteractionKind::Confirm,
         question.to_string(),
         vec![Control {
             id: ControlId::new(crate::interaction_adapter::DECISION_CONTROL)

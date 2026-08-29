@@ -43,8 +43,9 @@ pub use binding::{
     ResponderContext,
 };
 pub use definition::{
-    ChoiceOption, Control, ControlKind, FeatureDemand, InteractionDefinition, InteractionKind,
-    Requirement, SemanticRole, SurfaceFeature, DEFINITION_SCHEMA_V1,
+    controls_are_decision_shaped, ChoiceOption, Control, ControlKind, FeatureDemand,
+    InteractionDefinition, InteractionKind, Requirement, SemanticRole, SurfaceFeature,
+    DEFINITION_SCHEMA_V1,
 };
 pub use downgrade::{
     decode_definition, decode_instance, decode_response, plan_presentation, Decoded, Degradation,

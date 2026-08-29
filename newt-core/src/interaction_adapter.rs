@@ -119,18 +119,26 @@ pub fn question_to_definition(
         });
     }
 
-    let mut definition = InteractionDefinition::new(
-        InteractionKind::Choice,
-        question.markdown.clone(),
-        vec![Control {
-            id: ControlId::new(DECISION_CONTROL)?,
-            kind: ControlKind::Choice { options },
-            label: String::new(),
-            // A permission prompt must be answered: an unanswered one denies
-            // by default, which is a decision, not an absence.
-            requirement: Requirement::Required,
-        }],
-    );
+    let controls = vec![Control {
+        id: ControlId::new(DECISION_CONTROL)?,
+        kind: ControlKind::Choice { options },
+        label: String::new(),
+        // A permission prompt must be answered: an unanswered one denies
+        // by default, which is a decision, not an absence.
+        requirement: Requirement::Required,
+    }];
+    // DERIVED, not hardcoded (#1912). A legacy `Question` may carry two
+    // actions or five, and this function does not know which until it has
+    // built the options. Hardcoding `Choice` made the adapter emit
+    // decision-shaped definitions under the wrong kind for every two-action
+    // question — the same ambiguity as the two hand-written constructors, but
+    // generated at runtime from arbitrary input.
+    let kind = if newt_interaction::controls_are_decision_shaped(&controls) {
+        InteractionKind::Confirm
+    } else {
+        InteractionKind::Choice
+    };
+    let mut definition = InteractionDefinition::new(kind, question.markdown.clone(), controls);
     definition.note = question.note.clone();
     Ok(definition)
 }
