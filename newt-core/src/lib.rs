@@ -66,6 +66,9 @@ pub mod nudger;
 pub mod ocap;
 pub mod ocap_propose;
 pub mod ocap_store;
+/// Danger-tier terminal-echo policy. Was `PermissionChallenge` too, until
+/// #1839 deleted that hand-rolled encoding in favour of the definition's
+/// `ContentId`.
 pub mod permission_challenge;
 pub mod plan;
 pub mod pricing;

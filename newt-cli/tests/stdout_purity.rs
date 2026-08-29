@@ -18,6 +18,8 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+mod common;
+
 /// Initialize request — valid for both ACP (`newt worker`) and MCP
 /// (`newt mcp`). Both protocols use newline-delimited JSON-RPC 2.0
 /// and accept `initialize` with an empty params object.
@@ -46,7 +48,13 @@ async fn mcp_stdout_is_pure_json_rpc() {
 /// initialize, close stdin, collect stdout, assert every non-empty
 /// line parses as JSON.
 async fn spawn_and_assert_pure(bin: &PathBuf, args: &[&str]) {
+    // #1852: this driver inherited the developer's `~/.newt`, so a config the
+    // current build refuses made a stdout-PURITY test fail on the config
+    // error rather than on any impurity. Its sibling `mouse_*` driver below
+    // was already pinning HOME; this one never was.
+    let root = common::isolated_root();
     let mut cmd = Command::new(bin);
+    common::isolate(&mut cmd, root.path());
     cmd.args(args)
         // OLLAMA_HOST is set to an unreachable address. With the
         // verbatim contract, discover() doesn't probe — so the
@@ -189,14 +197,16 @@ async fn assert_no_mouse_capture(bin: &PathBuf, term: &str) {
     std::fs::write(home.path().join(".newt/config.toml"), "").expect("seed config");
 
     let mut cmd = Command::new(bin);
+    // Same policy as the driver above (#1852). This helper was already the
+    // better-behaved of the two — it pinned HOME and removed both config
+    // variables — but it still never pinned the cwd, which is the axis that
+    // lets the project walk climb into the real home.
+    common::isolate(&mut cmd, home.path());
     cmd.arg("--no-splash")
         .env("OLLAMA_HOST", "http://127.0.0.1:1")
         // Force the mouse opt-in ON: the TTY gate must STILL refuse.
         .env("NEWT_MOUSE", "1")
         .env("TERM", term)
-        .env("HOME", home.path())
-        .env_remove("NEWT_CONFIG")
-        .env_remove("NEWT_CONFIG_DIR")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

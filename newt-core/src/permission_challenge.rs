@@ -1,92 +1,56 @@
-//! Verdict-bound challenges for permission answers.
+//! Whether a danger tier demands a terminal echo before an answer is honoured.
 //!
-//! A presence gesture proves a human was there. It does not, by itself, prove
-//! *what* they agreed to. If the same challenge were issued for every verdict
-//! on a request, an assertion collected while the operator was denying could be
-//! replayed as an allow — the signature would verify, because it never covered
-//! the verdict.
+//! # What used to live here, and why it is gone (#1839)
 //!
-//! So the challenge binds the request digest **and** the verdict tag. A gesture
-//! is then usable for exactly one (request, verdict) pair, and swapping either
-//! side produces a challenge the signature does not match.
+//! This module was `PermissionChallenge`: a hand-rolled canonical encoding
+//! that hashed a request's fields into a `Fingerprint`, then bound that digest
+//! to a verdict tag so a gesture collected while the operator was denying
+//! could not be replayed as an allow.
 //!
-//! Everything here is pure and wall-clock-free. Expiry is evaluated against a
-//! caller-supplied `now`, so the decision is testable and the clock stays
-//! injected like everywhere else in the store.
-
-use agent_mesh_protocol::Fingerprint;
-
-use crate::wire_framing::push_field;
-use crate::Verdict;
-
-/// Domain tag for the permission-challenge preimage.
-const DOMAIN: &[u8] = b"newt/permission-challenge/v1";
-
-/// The stable tag a verdict contributes to a challenge.
-///
-/// Spelled out rather than derived from `Debug` or a discriminant: a rename or
-/// a reordering of the enum must not silently change what a signature covers.
-#[must_use]
-pub fn verdict_tag(verdict: Verdict) -> &'static [u8] {
-    match verdict {
-        Verdict::AllowOnce => b"allow_once",
-        Verdict::AllowSession => b"allow_session",
-        Verdict::Deny => b"deny",
-    }
-}
-
-/// What a human is being asked to authorize.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PermissionChallenge {
-    /// The unguessable request id the answer is bound to.
-    pub request_id: String,
-    /// The conversation the request belongs to.
-    pub conversation_id: String,
-    /// The serialized requests the operator is looking at.
-    pub requests_json: String,
-    /// The gate-stamped danger tier.
-    pub danger_json: String,
-    /// The tick the request was published at.
-    pub created_tick: i64,
-}
-
-impl PermissionChallenge {
-    /// The digest of *what is being decided*, independent of the answer.
-    #[must_use]
-    pub fn digest(&self) -> Fingerprint {
-        let mut payload = Vec::with_capacity(256);
-        payload.extend_from_slice(DOMAIN);
-        push_field(&mut payload, self.request_id.as_bytes());
-        push_field(&mut payload, self.conversation_id.as_bytes());
-        push_field(&mut payload, self.requests_json.as_bytes());
-        push_field(&mut payload, self.danger_json.as_bytes());
-        push_field(&mut payload, &self.created_tick.to_be_bytes());
-        Fingerprint::of_bytes(&payload)
-    }
-
-    /// The 32 bytes an authenticator signs for one specific verdict.
-    ///
-    /// `digest ‖ verdict_tag`, framed, then hashed — so neither the request nor
-    /// the verdict can be varied without producing a different challenge.
-    #[must_use]
-    pub fn challenge_for(&self, verdict: Verdict) -> [u8; 32] {
-        let mut payload = Vec::with_capacity(128);
-        payload.extend_from_slice(DOMAIN);
-        push_field(&mut payload, &self.digest().0);
-        push_field(&mut payload, verdict_tag(verdict));
-        Fingerprint::of_bytes(&payload).0
-    }
-
-    /// Whether this request has aged out, per the same TTL the store enforces.
-    ///
-    /// Checked explicitly at answer time rather than inferred: an assertion
-    /// over an expired request must not be honoured just because the signature
-    /// is good.
-    #[must_use]
-    pub fn is_expired(&self, now: i64, ttl_nanos: i64) -> bool {
-        now.saturating_sub(self.created_tick) >= ttl_nanos
-    }
-}
+//! The property still matters; the bespoke encoding does not. A2 gave every
+//! interaction a `DefinitionId` — a `ContentId` over the canonical dag-cbor of
+//! the whole record — so "what is being decided" already has an identity that
+//! is minted once, by the `content-addressable` crate, instead of assembled
+//! here out of length-prefixed fields. A second hand-rolled canonicalization
+//! beside it is the defect the first-principle rule names, not a feature.
+//!
+//! `PermissionChallenge` had **zero production callers** — re-verified across
+//! every crate before deletion: its only references were this crate's module
+//! declaration and its own test file. So `digest()`, `challenge_for()`,
+//! `is_expired()`, `verdict_tag()`, the struct, and
+//! `newt-core/tests/permission_challenge.rs` are deleted outright rather than
+//! carried as a compatibility arm.
+//!
+//! **`wire_framing` stays.** #1837's deletion gate paired the two and called
+//! them both callerless; that premise was false, and re-verified as false at
+//! `58afe828`. `wire_framing::push_field` has three production callers with 28
+//! call sites between them — `sas_transcript`, `dock_registry`,
+//! `credential_registry`, all security-relevant registries whose on-disk
+//! encodings it defines. Deleting it would have broken all three.
+//!
+//! # What the deletion leaves behind, stated rather than left to be found
+//!
+//! `PermissionChallenge` was the Rust half of the #1366/#1373 passkey-answer
+//! path, which was **designed but never wired** — a fact the A0 inventory
+//! already recorded independently
+//! (`docs/findings/2026-08-newt-markup-a0-inventory.md:570`: "`answer_authz` +
+//! `permission_challenge` are library-only — consumed by nothing in
+//! production … designed but unwired"). Its browser half is unwired too:
+//! `newt-web/assets/webauthn.js`'s `signVerdict` reads a `data-challenge`
+//! attribute that nothing renders, and `newtSignVerdict` has no caller outside
+//! a test asserting the string appears in the served asset.
+//!
+//! So this deletes dead code, not a live check. But it does leave a comment in
+//! `webauthn.js:142` describing a server behaviour ("the server binds
+//! digest+verdict_tag before issuing it") that now has no implementation at
+//! all. That residue belongs with #1839 part 2 — the other unwired half of the
+//! same design, which B0 owns — and is deliberately NOT patched here:
+//! `newt-web` is another slice's territory, and re-minting the binding is
+//! B0's call to make against the definition's `ContentId` rather than a
+//! resurrection of this encoding.
+//!
+//! What remains here is [`requires_terminal_echo`], which is live, is on the
+//! authorization path, and was fixed under #1836.
 
 /// Whether a danger tier demands a terminal echo before the answer is honoured.
 ///
