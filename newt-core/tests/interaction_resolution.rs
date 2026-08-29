@@ -32,7 +32,12 @@ use newt_interaction::{
 
 fn definition() -> InteractionDefinition {
     InteractionDefinition::new(
-        InteractionKind::Choice,
+        // Confirm, not Choice (#1912): one control, two options, `Allow` and
+        // `Deny`. A permission decision — a grant and a refusal — not a pick
+        // from a displayed set. A3's resolution fixtures carried the same
+        // defect C0c found in `agentic/tools.rs`, which makes it a THIRD
+        // hand-written site and not a coincidence.
+        InteractionKind::Confirm,
         "⊘ run_command wants to run `bash`",
         vec![Control {
             id: ControlId::new("decision").unwrap(),
