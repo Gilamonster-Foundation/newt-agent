@@ -4672,12 +4672,23 @@ fn codex_env_allowed(detected: &str) -> bool {
             // Headless: only a stored `always` may adopt the env.
             return CodexEnvDecision::Skip;
         }
-        eprint!(
-            "OPENAI env detected ({detected}): use it? \
-             [use/ignore/use-always/ignore-always] "
-        );
+        // Through the seal (#1909). This function returns a decision rather
+        // than a Result, so a refused or failed read falls through to the
+        // `_ =>` arm below — "ignore this session", which is what the
+        // non-interactive branch above already chooses. Fail-closed either
+        // way, and now a protocol-mode process cannot obtain a speaking
+        // window at all (#1908) rather than printing a question onto the wire.
+        //
+        // EOF (`Ok(0)`) is folded in deliberately: an operator who closes the
+        // stream has not adopted the environment, and `_ =>` is exactly that.
+        let window = newt_core::tty::Terminal::suspend_for_prompt();
         let mut line = String::new();
-        let _ = std::io::stdin().read_line(&mut line);
+        let _ = window
+            .ask(&format!(
+                "OPENAI env detected ({detected}): use it? \
+                 [use/ignore/use-always/ignore-always] "
+            ))
+            .and_then(|()| window.read_line_into(&mut line));
         let answer = line.trim().to_ascii_lowercase();
         let (decision, persist) = match answer.as_str() {
             "use" | "u" | "y" | "yes" => (CodexEnvDecision::UseIt, None),

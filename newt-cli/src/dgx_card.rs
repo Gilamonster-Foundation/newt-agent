@@ -16,7 +16,7 @@
 //! the render/validate/resolve logic is fully unit-testable fs-free (the
 //! `dgx_pull.rs` pattern).
 
-use std::io::{IsTerminal as _, Write as _};
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
 use newt_core::model_card::{load_card_file, no_hardware_leak, Backend, ModelCard, VllmProfile};
@@ -271,11 +271,22 @@ pub async fn run(cmd: CardCmd, config_path: Option<&Path>) -> anyhow::Result<()>
                      for a non-interactive stand-up (see `card list`)"
                 );
             }
-            print!("{}", render_menu(&entries));
-            print!("? Choose a card (1-{}): ", entries.len());
-            std::io::stdout().flush().ok();
+            // Through the seal (#1909). `render_menu` and `parse_selection`
+            // are already pure and stay exactly as they are — only the
+            // transport moves.
+            let window = newt_core::tty::Terminal::suspend_for_prompt();
+            window.ask(&format!(
+                "{}? Choose a card (1-{}): ",
+                render_menu(&entries),
+                entries.len()
+            ))?;
             let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
+            if window.read_line_into(&mut input)? == 0 {
+                // EOF: the operator closed the stream rather than choosing.
+                // `parse_selection` would report this as a malformed choice,
+                // which is a worse message for a thing that is not a mistake.
+                anyhow::bail!("no card chosen (input closed)");
+            }
             let idx = parse_selection(&input, entries.len()).map_err(|e| anyhow::anyhow!(e))?;
             let name = entries[idx].card.name.clone();
             setup_card(config_path, &name, model, node, backend, dry_run, force).await
