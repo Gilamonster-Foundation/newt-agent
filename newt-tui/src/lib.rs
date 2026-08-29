@@ -401,6 +401,39 @@ use crossterm::{
     },
 };
 
+/// The PRODUCTION half of a source file, for the structural guards that assert
+/// "no other path exists" (#1889, #1898).
+///
+/// Those tests live IN the file they read, so `include_str!` pulls in their own
+/// needles; cutting at the test module is both the fix and the right scope.
+///
+/// Two things this gets right that the first copy did not, both found by
+/// `rich_input.rs`:
+///
+/// * It cuts at the test MODULE, not at the first `#[cfg(test)]` anywhere.
+///   `rich_input.rs` has an inline `#[cfg(test)]` item at :360, ~700 lines
+///   above the code under test, so a first-occurrence split returned a prefix
+///   that contained none of it.
+/// * It PANICS when the marker is missing instead of returning "". An empty
+///   string satisfies every `count() == 0` assertion, so the failure mode of
+///   the convenient version is a guard that passes because it read nothing.
+///
+/// Gated with its callers, not merely with `test`: both structural guards live
+/// in `rich-tui` modules, so under the LEAN configuration this function has no
+/// caller and `-D warnings` refuses it. Caught by the lean clippy gate added in
+/// #1890 — the configuration that had no gate at all a day ago.
+#[cfg(all(test, feature = "rich-tui"))]
+pub(crate) fn production_source(src: &str) -> &str {
+    src.split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .filter(|prefix| prefix.len() < src.len())
+        .expect(
+            "the file must end in an unindented `#[cfg(test)] mod tests {` — \
+             without the marker this helper would hand back an empty string, \
+             and every count-based assertion would pass having read nothing",
+        )
+}
+
 /// Runs `restore` on every exit path of the scope holding it — normal return,
 /// `?`, or panic. Split out from [`SplashScreenGuard`] so the "it always runs"
 /// property is unit-testable without owning a real terminal: the guard proper
@@ -427,7 +460,6 @@ impl<F: FnMut()> Drop for RestoreOnDrop<F> {
 /// panic did the same. Of the three crossterm raw-mode pairs in this crate this
 /// was the only one with no guard at all (`lean_input::RawGuard` has one;
 /// `rich_input::read_turn` avoids `?` around its event loop).
-///
 /// Per the repo's "make the bug unrepresentable" rule, the fix is ownership
 /// rather than another restore call: the terminal cannot be taken without
 /// binding something that gives it back.
