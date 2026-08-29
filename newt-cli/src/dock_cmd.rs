@@ -257,16 +257,54 @@ fn run_list(operator_key_path: Option<PathBuf>, config: Option<&Path>) -> anyhow
         println!("no approved docks");
         return Ok(0);
     }
-    println!("{:<20} {:<18} scope", "LABEL", "PEER-FP");
-    for dock in docks {
-        println!(
-            "{:<20} {:<18} {}",
-            dock.peer_label,
-            &dock.peer_agent_fingerprint[..16.min(dock.peer_agent_fingerprint.len())],
-            dock.scope.as_wire(),
+    let rows: Vec<[String; 3]> = docks
+        .iter()
+        .map(|dock| {
+            [
+                dock.peer_label.clone(),
+                dock.peer_agent_fingerprint[..16.min(dock.peer_agent_fingerprint.len())]
+                    .to_string(),
+                dock.scope.as_wire().to_string(),
+            ]
+        })
+        .collect();
+    print!("{}", dock_table(&rows));
+    Ok(0)
+}
+
+/// Render the `newt dock list` listing.
+///
+/// Extracted so the exact bytes are testable without a dock registry (#1916).
+/// Byte-identical to the `println!`s it replaces.
+pub(crate) fn dock_table(rows: &[[String; 3]]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "{:<20} {:<18} scope", "LABEL", "PEER-FP");
+    for r in rows {
+        let _ = writeln!(out, "{:<20} {:<18} {}", r[0], r[1], r[2]);
+    }
+    out
+}
+
+#[cfg(test)]
+mod d3c {
+    /// **The byte golden for `newt dock list` as it ships today** (#1916).
+    /// Captured from the shipping renderer — see `models_cmd::d3c`.
+    #[test]
+    fn the_dock_listing_is_byte_exact() {
+        let rows = [[
+            "laptop-b".to_string(),
+            "abcdef0123456789".to_string(),
+            "mirror-inject".to_string(),
+        ]];
+        assert_eq!(
+            super::dock_table(&rows),
+            concat!(
+                "LABEL                PEER-FP            scope\n",
+                "laptop-b             abcdef0123456789   mirror-inject\n",
+            )
         );
     }
-    Ok(0)
 }
 
 #[cfg(test)]

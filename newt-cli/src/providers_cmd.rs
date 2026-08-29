@@ -54,13 +54,32 @@ pub fn run(cmd: ProvidersCmd) -> anyhow::Result<()> {
 // `newt providers list`
 // ---------------------------------------------------------------------------
 
-fn list() -> anyhow::Result<()> {
-    let roster = resolve_presets(None);
-    let builtins = builtin_presets();
-    println!(
+/// Render the `newt providers` listing.
+///
+/// Extracted from `list` so the exact bytes are testable without a live
+/// preset roster (#1916). Byte-identical to the `println!`s it replaces.
+pub(crate) fn providers_table(rows: &[[String; 5]]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
         "{:<16} {:<26} {:<20} {:<16} ENDPOINT",
         "NAME", "LABEL", "WIRE", "SOURCE"
     );
+    for r in rows {
+        let _ = writeln!(
+            out,
+            "{:<16} {:<26} {:<20} {:<16} {}",
+            r[0], r[1], r[2], r[3], r[4]
+        );
+    }
+    out
+}
+
+fn list() -> anyhow::Result<()> {
+    let roster = resolve_presets(None);
+    let builtins = builtin_presets();
+    let mut rows: Vec<[String; 5]> = Vec::new();
     for p in &roster {
         // Value equality against the builtin entry detects a same-named
         // drop-in that actually changes something.
@@ -73,15 +92,15 @@ fn list() -> anyhow::Result<()> {
             PresetSupport::Supported { endpoint, .. } => endpoint,
             PresetSupport::Unsupported { reason } => format!("(unavailable: {reason})"),
         };
-        println!(
-            "{:<16} {:<26} {:<20} {:<16} {}",
-            p.name,
-            p.label(),
-            providers_import::serde_name(&p.api_mode),
-            source,
-            availability
-        );
+        rows.push([
+            p.name.clone(),
+            p.label().to_string(),
+            providers_import::serde_name(&p.api_mode).clone(),
+            source.to_string(),
+            availability,
+        ]);
     }
+    print!("{}", providers_table(&rows));
     Ok(())
 }
 
@@ -333,5 +352,28 @@ mod tests {
         assert_eq!(filename_slug("weird__name..x"), "weird-name-x");
         assert_eq!(filename_slug("---"), "provider");
         assert_eq!(filename_slug(""), "provider");
+    }
+}
+
+#[cfg(test)]
+mod d3c {
+    /// **The byte golden for `newt providers` as it ships today** (#1916).
+    /// Captured from the shipping renderer — see `models_cmd::d3c`.
+    #[test]
+    fn the_providers_listing_is_byte_exact() {
+        let rows = [[
+            "openai".to_string(),
+            "OpenAI".to_string(),
+            "responses".to_string(),
+            "builtin".to_string(),
+            "https://api.openai.com/v1".to_string(),
+        ]];
+        assert_eq!(
+            super::providers_table(&rows),
+            concat!(
+                "NAME             LABEL                      WIRE                 SOURCE           ENDPOINT\n",
+                "openai           OpenAI                     responses            builtin          https://api.openai.com/v1\n",
+            )
+        );
     }
 }

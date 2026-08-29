@@ -90,26 +90,55 @@ fn resolve(alias: Option<&str>) -> anyhow::Result<&'static MiniModel> {
     }
 }
 
-fn list() -> anyhow::Result<()> {
-    println!(
+/// One row of `newt models`, as data.
+struct ModelRow {
+    alias: String,
+    ram_gb: f32,
+    arch: String,
+    installed: &'static str,
+    note: String,
+}
+
+/// Render the `newt models` listing.
+///
+/// Extracted from `list` so the exact bytes are testable without a model
+/// palette on disk (#1916). Byte-identical to the `println!`s it replaces —
+/// the migration onto `markup::table` is the NEXT commit, so the golden below
+/// pins what shipped before either change.
+fn models_table(rows: &[ModelRow]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
         "{:<16} {:>6}  {:<8} {:<9} note",
         "alias", "RAM", "arch", "installed"
     );
-    for m in palette::palette() {
-        let installed = if palette::resolve_local(m.name).is_some() {
-            "yes"
-        } else {
-            "no"
-        };
-        println!(
+    for r in rows {
+        let _ = writeln!(
+            out,
             "{:<16} {:>5.1}G  {:<8} {:<9} {}",
-            m.name,
-            m.approx_ram_gb,
-            format!("{:?}", m.arch),
-            installed,
-            m.note
+            r.alias, r.ram_gb, r.arch, r.installed, r.note
         );
     }
+    out
+}
+
+fn list() -> anyhow::Result<()> {
+    let rows: Vec<ModelRow> = palette::palette()
+        .iter()
+        .map(|m| ModelRow {
+            alias: m.name.to_string(),
+            ram_gb: m.approx_ram_gb,
+            arch: format!("{:?}", m.arch),
+            installed: if palette::resolve_local(m.name).is_some() {
+                "yes"
+            } else {
+                "no"
+            },
+            note: m.note.to_string(),
+        })
+        .collect();
+    print!("{}", models_table(&rows));
     println!(
         "\nSummarizer default: {}   (fetch with: newt models pull [alias])",
         palette::default_model().name
@@ -405,3 +434,58 @@ overloads it and can stall the turn (#979). A small CPU model decouples them.
 
 See docs/decisions/embedded_inference.md and issues #639 / #661 / #979.
 ";
+
+#[cfg(test)]
+mod d3c {
+    use super::{models_table, ModelRow};
+
+    fn rows() -> Vec<ModelRow> {
+        vec![
+            ModelRow {
+                alias: "qwen2.5-coder".into(),
+                ram_gb: 4.7,
+                arch: "Qwen2".into(),
+                installed: "yes",
+                note: "default summarizer".into(),
+            },
+            ModelRow {
+                alias: "llama3.1".into(),
+                ram_gb: 12.0,
+                arch: "Llama".into(),
+                installed: "no",
+                note: String::new(),
+            },
+        ]
+    }
+
+    /// **The byte golden for `newt models` as it ships today** (#1916).
+    ///
+    /// Captured from the shipping renderer, which is the correct method for a
+    /// characterization golden: it pins what an operator sees NOW, so the
+    /// migration onto `markup::table` has to declare its diff instead of
+    /// sliding one past.
+    #[test]
+    fn the_models_listing_is_byte_exact() {
+        assert_eq!(
+            models_table(&rows()),
+            concat!(
+                "alias               RAM  arch     installed note\n",
+                "qwen2.5-coder      4.7G  Qwen2    yes       default summarizer\n",
+                "llama3.1          12.0G  Llama    no        \n",
+            )
+        );
+    }
+
+    /// The fixed-width renderer pads the LAST column, so a row with an empty
+    /// note ends in trailing spaces. Named because it is one of the things the
+    /// GFM migration changes, and an unnamed change is the kind F0 calls a bug.
+    #[test]
+    fn a_row_with_an_empty_last_field_ends_in_padding() {
+        let out = models_table(&rows());
+        let last = out.lines().nth(2).expect("two data rows");
+        assert!(
+            last.ends_with("no        "),
+            "expected trailing pad, got {last:?}"
+        );
+    }
+}

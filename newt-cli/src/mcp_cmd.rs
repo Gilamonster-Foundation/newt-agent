@@ -2136,6 +2136,29 @@ mod tests {
         );
     }
 
+    /// **The byte golden for `newt mcp list` as it ships today** (#1916).
+    /// Captured from the shipping renderer — see `models_cmd::d3c`.
+    #[test]
+    fn the_mcp_listing_is_byte_exact() {
+        let rows = merged_rows(
+            &[stdio_entry("scrybe", Some("scrybe-mcp-server"))],
+            &[stdio_entry("brokenout", Some("bo-mcp"))],
+            &[stdio_entry("broken", None)],
+            &[],
+        );
+        let mut out = Vec::new();
+        render_rows(&rows, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            concat!(
+                "NAME       TRANSPORT  ENABLED  SOURCE\n",
+                "scrybe     stdio      yes      newt config\n",
+                "brokenout  stdio      yes      newt mcp.toml\n",
+                "broken     stdio      yes      claude-code (user)  (invalid \u{2014} dropped at discovery; fix or remove it)\n",
+            )
+        );
+    }
+
     #[test]
     fn render_rows_empty_view_points_at_add_and_install() {
         let mut out = Vec::new();
