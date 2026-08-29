@@ -7,7 +7,7 @@
 //! explicit HTTPS URL (HTTP only for loopback) so a bearer token is never
 //! broadcast across guessed ports or sent over implicit plaintext transport.
 //!
-//! The console I/O is abstracted behind the [`Console`] trait so the whole
+//! Operator I/O goes through C1's seam ([`Operator`]) so the whole
 //! flow can be driven by scripted answers in tests (against a `wiremock`
 //! endpoint) without a real TTY. The pure config-building and URL-normalising
 //! helpers are unit-tested directly.
@@ -32,6 +32,7 @@
 
 mod commit;
 pub(crate) mod credentials;
+mod operator;
 
 use commit::*;
 
@@ -46,7 +47,6 @@ pub(crate) use commit::{
     inline_backend_names, panel_backend_file_names, persist_panel_backend, remove_panel_backend,
 };
 
-use crate::line_console::{is_yes, Console, StdinConsole};
 use newt_core::agent_identity::Secret;
 use newt_core::backend_probe::{EndpointProbeResult, GenerationCheck};
 use newt_core::config::Discovery;
@@ -57,6 +57,7 @@ use newt_core::provider_preset::{
 };
 use newt_core::{BackendConfig, BackendKind, Config, EndpointKind, OpenAiApi, Tier};
 use newt_interaction::InteractionDefinition;
+use operator::Operator;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
@@ -78,7 +79,7 @@ fn setup_http_client() -> anyhow::Result<reqwest::Client> {
 
 /// Run the interactive setup wizard, writing to `~/.newt/config.toml`.
 pub fn run(_color: bool) -> anyhow::Result<()> {
-    wizard_entry(&mut StdinConsole, Flow::Setup)
+    wizard_entry(&Operator::terminal(), Flow::Setup)
 }
 
 /// The first-run variant ([`crate::wizard::maybe_run`]): driven through
@@ -86,20 +87,18 @@ pub fn run(_color: bool) -> anyhow::Result<()> {
 /// falls back to probe-and-write defaults), and the overwrite guard is
 /// skipped (the caller already proved no config exists).
 pub(crate) fn run_first_run(_color: bool) -> anyhow::Result<()> {
-    wizard_entry(&mut crate::line_console::FirstRunConsole, Flow::FirstRun)
+    // `FirstRunConsole` is gone: it existed so Esc/Ctrl-C surfaced as
+    // catchable errors instead of SIGINT, and the seam reports those as
+    // outcomes for every operator now.
+    wizard_entry(&Operator::terminal(), Flow::FirstRun)
 }
 
-fn wizard_entry(console: &mut dyn Console, flow: Flow) -> anyhow::Result<()> {
+fn wizard_entry(op: &Operator<'_>, flow: Flow) -> anyhow::Result<()> {
     let config_path =
         Config::user_config_path().unwrap_or_else(|| std::path::PathBuf::from("newt.toml"));
     let client = setup_http_client()?;
     tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(run_with_flow(
-            console,
-            &client,
-            &config_path,
-            flow,
-        ))
+        tokio::runtime::Handle::current().block_on(run_with_flow(op, &client, &config_path, flow))
     })
 }
 
@@ -135,9 +134,9 @@ pub async fn run_target(
         Discovery::default()
     };
     let client = setup_http_client()?;
-    let mut console = StdinConsole;
+    let op = Operator::terminal();
     run_target_with(
-        &mut console,
+        &op,
         &client,
         &config_path,
         TargetSetupRequest {
@@ -162,14 +161,14 @@ struct TargetSetupRequest<'a> {
 }
 
 async fn run_target_with(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     client: &reqwest::Client,
     config_path: &Path,
     request: TargetSetupRequest<'_>,
     discovery: &Discovery,
 ) -> anyhow::Result<()> {
     run_target_with_persist(
-        console,
+        op,
         client,
         config_path,
         request,
@@ -182,7 +181,7 @@ async fn run_target_with(
 }
 
 async fn run_target_with_persist(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     client: &reqwest::Client,
     config_path: &Path,
     request: TargetSetupRequest<'_>,
@@ -207,7 +206,7 @@ async fn run_target_with_persist(
     let candidates = candidate_endpoints(target, discovery)?;
     let token_file = token_file.map(std::fs::canonicalize).transpose()?;
     let api_key = resolve_setup_token(token_env, token_file.as_deref())?;
-    console.say(&format!(
+    op.say(&format!(
         "Probing {} candidate endpoint{} for Ollama or OpenAI-compatible APIs...",
         candidates.len(),
         if candidates.len() == 1 { "" } else { "s" }
@@ -217,7 +216,7 @@ async fn run_target_with_persist(
         probe_candidates_concurrently(client, &candidates, api_key.as_deref()).await?;
     if hits.is_empty() {
         for failure in failures {
-            console.say(&format!("  {failure}"));
+            op.say(&format!("  {failure}"));
         }
         anyhow::bail!(
             "no supported inference API found for `{target}`; tried {}",
@@ -226,34 +225,34 @@ async fn run_target_with_persist(
     }
 
     let (hits, generation_failures) =
-        verify_target_hits(console, client, hits, model, api_key.as_deref()).await;
+        verify_target_hits(op, client, hits, model, api_key.as_deref()).await;
     failures.extend(generation_failures);
     if hits.is_empty() {
         for failure in failures {
-            console.say(&format!("  {failure}"));
+            op.say(&format!("  {failure}"));
         }
         anyhow::bail!("no inference backend passed a minimal generation check for `{target}`");
     }
 
     if !failures.is_empty() {
-        console.say(&format!(
+        op.say(&format!(
             "Skipped {} candidate endpoint{}:",
             failures.len(),
             if failures.len() == 1 { "" } else { "s" }
         ));
         for failure in failures {
-            console.say(&format!("  {failure}"));
+            op.say(&format!("  {failure}"));
         }
     }
 
-    console.say(&format!(
+    op.say(&format!(
         "Detected {} inference backend{}:",
         hits.len(),
         if hits.len() == 1 { "" } else { "s" }
     ));
     for hit in &hits {
         let backend = backend_from_verified_probe(hit, token_env, token_file.as_deref())?;
-        console.say(&format!(
+        op.say(&format!(
             "  {} ({:?}, {}, {} model{})",
             backend.name,
             backend.kind,
@@ -263,22 +262,28 @@ async fn run_target_with_persist(
         ));
     }
 
-    if !yes {
-        let answer = console.ask(&format!(
-            "Write backend files and update {}? [Y/n] ",
-            config_path.display()
-        ))?;
-        if !is_yes(&answer, true) {
-            console.say("Aborted. Nothing written.");
-            return Ok(());
-        }
+    if !yes
+        && !decide(
+            op,
+            &interaction_form::confirm(
+                format!("Write backend files and update {}?", config_path.display()),
+                "",
+                "yes, write them",
+                "no, stop here",
+            ),
+            // Writes files: blank must not consent.
+            None,
+        )?
+    {
+        op.say("Aborted. Nothing written.");
+        return Ok(());
     }
 
     let written = persist(config_path, &hits, token_env, token_file.as_deref())?;
     for path in &written {
-        console.say(&format!("Wrote {}.", path.display()));
+        op.say(&format!("Wrote {}.", path.display()));
     }
-    console.say(&format!(
+    op.say(&format!(
         "Configuration ready at {}.",
         config_path.display()
     ));
@@ -296,7 +301,7 @@ struct VerifiedTargetHit {
 }
 
 async fn verify_target_hits(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     client: &reqwest::Client,
     hits: Vec<EndpointProbeResult>,
     requested_model: Option<&str>,
@@ -316,7 +321,7 @@ async fn verify_target_hits(
             ));
             continue;
         };
-        console.say(&format!(
+        op.say(&format!(
             "Testing a minimal generation at {} with {model}…",
             hit.endpoint
         ));
@@ -331,7 +336,7 @@ async fn verify_target_hits(
         .await
         {
             GenerationCheck::Accepted(api) => {
-                console.say("  ✓ generation accepted");
+                op.say("  ✓ generation accepted");
                 hit.models = vec![model.clone()];
                 hit.warm = vec![model];
                 verified.push(VerifiedTargetHit { probe: hit, api });
@@ -354,7 +359,7 @@ async fn verify_target_hits(
 }
 
 // ---------------------------------------------------------------------------
-// Driver (fully testable: scripted Console + wiremock client)
+// Driver (fully testable: a scripted Operator + wiremock client)
 // ---------------------------------------------------------------------------
 
 /// Which door the wizard was entered through.
@@ -379,14 +384,14 @@ struct PendingWizardToken {
 }
 
 fn persist_interactive_backend(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     config_path: &Path,
     cfg: &Config,
     backend: &BackendConfig,
     pending_token: Option<&PendingWizardToken>,
 ) -> anyhow::Result<PathBuf> {
     persist_interactive_backend_with(
-        console,
+        op,
         config_path,
         cfg,
         backend,
@@ -427,7 +432,7 @@ fn run_setup_commit(
 }
 
 fn persist_interactive_backend_with(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     config_path: &Path,
     cfg: &Config,
     backend: &BackendConfig,
@@ -567,26 +572,26 @@ fn persist_interactive_backend_with(
         return Err(error);
     }
     if let Some(reference) = token_reference {
-        console.say(&format!("  → stored encrypted at {reference}"));
+        op.say(&format!("  → stored encrypted at {reference}"));
     }
     Ok(logical_backend_path)
 }
 
 type ConfiguredBackend = (Config, BackendConfig, Option<PendingWizardToken>);
 
-/// The wizard flow, parameterised over its console and HTTP client so it can be
+/// The wizard flow, parameterised over its operator and HTTP client so it can be
 /// exercised end-to-end in tests (production enters via [`run_with_flow`]).
 #[cfg(test)]
 async fn run_with(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     client: &reqwest::Client,
     config_path: &Path,
 ) -> anyhow::Result<()> {
-    run_with_flow(console, client, config_path, Flow::Setup).await
+    run_with_flow(op, client, config_path, Flow::Setup).await
 }
 
 async fn run_with_flow(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     client: &reqwest::Client,
     config_path: &Path,
     flow: Flow,
@@ -594,18 +599,28 @@ async fn run_with_flow(
     // First run already printed the branded crawl header; only a standalone
     // `newt setup` announces itself.
     if flow == Flow::Setup {
-        console.say(&format!("newt v{} — interactive setup", crate::VERSION));
+        op.say(&format!("newt v{} — interactive setup", crate::VERSION));
     }
 
-    if flow == Flow::Setup && config_path.exists() {
-        let ans = console.ask(&format!(
-            "A config already exists at {}. Overwrite? [y/N] ",
-            config_path.display()
-        ))?;
-        if !is_yes(&ans, false) {
-            console.say("Keeping the existing config. Nothing written.");
-            return Ok(());
-        }
+    if flow == Flow::Setup
+        && config_path.exists()
+        && !decide(
+            op,
+            &interaction_form::confirm(
+                format!(
+                    "A config already exists at {}. Overwrite?",
+                    config_path.display()
+                ),
+                "",
+                "yes, overwrite it",
+                "no, keep it",
+            ),
+            // Blank keeps the existing config — the no-op.
+            Some(false),
+        )?
+    {
+        op.say("Keeping the existing config. Nothing written.");
+        return Ok(());
     }
 
     // Multi-backend loop: each pass configures + writes ONE backend, then
@@ -614,37 +629,44 @@ async fn run_with_flow(
     // the end (until then, each committed setup round selects its backend).
     let mut written: Vec<String> = Vec::new();
     loop {
-        let (cfg, backend, pending_token) = match choose_backend(console)? {
-            BackendChoice::LocalOllama => configure_ollama(console, client).await?,
-            BackendChoice::CustomHost => {
-                configure_custom_host(console, client, config_path).await?
-            }
-            BackendChoice::HostedProvider => configure_hosted(console, client, config_path).await?,
+        let (cfg, backend, pending_token) = match choose_backend(op)? {
+            BackendChoice::LocalOllama => configure_ollama(op, client).await?,
+            BackendChoice::CustomHost => configure_custom_host(op, client, config_path).await?,
+            BackendChoice::HostedProvider => configure_hosted(op, client, config_path).await?,
         };
 
         // Preview before committing anything to disk: the backend drop-in is
         // the interesting file; config.toml just points at it.
         let preview = toml::to_string_pretty(&backend)
             .unwrap_or_else(|e| format!("# (could not render preview: {e})"));
-        console.say(&format!("\nbackends/{}.toml:\n", backend.name));
-        console.say(&preview);
+        op.say(&format!("\nbackends/{}.toml:\n", backend.name));
+        op.say(&preview);
 
-        let ans = console.ask(&format!("Write to {}? [Y/n] ", config_path.display()))?;
-        if !is_yes(&ans, true) {
+        if !decide(
+            op,
+            &interaction_form::confirm(
+                format!("Write to {}?", config_path.display()),
+                "",
+                "yes, write it",
+                "no, skip this one",
+            ),
+            // Writes files: blank must not consent.
+            None,
+        )? {
             if written.is_empty() {
-                console.say("Aborted. Nothing written.");
+                op.say("Aborted. Nothing written.");
                 return Ok(());
             }
-            console.say("Skipped this one.");
+            op.say("Skipped this one.");
         } else {
             let dropin = persist_interactive_backend(
-                console,
+                op,
                 config_path,
                 &cfg,
                 &backend,
                 pending_token.as_ref(),
             )?;
-            console.say(&format!(
+            op.say(&format!(
                 "Wrote {} and {}.",
                 config_path.display(),
                 dropin.display()
@@ -652,27 +674,38 @@ async fn run_with_flow(
             written.push(backend.name.clone());
         }
 
-        let more = console.ask("Add another backend? [y/N] ")?;
-        if !is_yes(&more, false) {
+        if !decide(
+            op,
+            &interaction_form::confirm(
+                "Add another backend?",
+                "",
+                "yes, add one",
+                "no, that is all",
+            ),
+            // Blank ends the loop. A pipe that has run out has said all it
+            // is going to; requiring an explicit `n` would fail a setup
+            // that had otherwise completed.
+            Some(false),
+        )? {
             break;
         }
     }
 
     if written.len() > 1 {
-        console.say("\nWhich backend should sessions start on?");
-        let idx = select_row(console, &written, "backends")?;
+        op.say("\nWhich backend should sessions start on?");
+        let idx = select_row(op, &written, "backends")?;
         let chosen = &written[idx];
         // Rewrite ONLY default_backend, preserving the config's other keys
         // and comments (the same comment-preserving editor `newt setup
         // <target>` uses).
         persist_default_backend(config_path, chosen)?;
-        console.say(&format!(
+        op.say(&format!(
             "Default backend: {chosen} (/backends switches per session)."
         ));
     }
 
-    console.say("Edit those files (or re-run `newt setup`) to change anything.");
-    offer_identity(console);
+    op.say("Edit those files (or re-run `newt setup`) to change anything.");
+    offer_identity(op);
     Ok(())
 }
 
@@ -703,7 +736,94 @@ enum BackendChoice {
 /// Consecutive unusable answers at one decision before setup gives up.
 const DECISION_ATTEMPTS: usize = 3;
 
-/// Ask a yes/no decision and re-ask an unusable answer rather than guessing.
+/// Present a choice and return the id of the option the operator picked.
+///
+/// `blank` is what an EMPTY answer means, and the distinction it encodes is
+/// the one D1a and D1b-2 settled:
+///
+/// * `Some(id)` — the menu displays a default (`[1]`), and Enter accepts what
+///   is on screen. That is the operator's own displayed value, not the
+///   machine deciding, and it is how every numbered picker in the wizard has
+///   always behaved.
+/// * `None` — a DECISION. Nothing is offered for free; blank re-asks. This is
+///   the arm `decide` uses, because `is_yes(&ans, true)` reading blank as yes
+///   is what let a short pipe answer a write confirm on the operator's
+///   behalf.
+///
+/// An UNRECOGNISED answer always re-asks, in both arms. `parse_choice(&ans,
+/// n).unwrap_or(1)` used to fold garbage into option 1 silently — the same
+/// defect as `is_yes("maybe", true)`, one menu over.
+///
+/// Capped, because under a pipe an unusable answer is re-asked against the
+/// same exhausted input and an uncapped loop is a hang.
+///
+/// # Errors
+///
+/// The read failure, or a bail after [`DECISION_ATTEMPTS`] unusable answers.
+fn choose(
+    op: &Operator<'_>,
+    definition: &InteractionDefinition,
+    blank: Option<&str>,
+) -> anyhow::Result<String> {
+    for _ in 0..DECISION_ATTEMPTS {
+        let answer = op.ask(definition)?;
+        let answer = answer.trim();
+        if answer.is_empty() {
+            if let Some(default) = blank {
+                return Ok(default.to_string());
+            }
+        }
+        if let Some(picked) = interaction_form::resolve(definition, answer) {
+            return Ok(picked.as_str().to_string());
+        }
+        op.say(&format!(
+            "  not one of the choices — enter {}",
+            keys(definition)
+        ));
+    }
+    anyhow::bail!("no usable answer after {DECISION_ATTEMPTS} attempts")
+}
+
+/// The accelerators a definition offers, for a retry message that stays
+/// true to what was actually displayed.
+///
+/// Derived rather than written: a hardcoded "answer y or n" was right for the
+/// two confirms it was written for and wrong for every menu, and it would
+/// have gone stale the moment an option was added.
+fn keys(definition: &InteractionDefinition) -> String {
+    definition
+        .controls
+        .iter()
+        .filter_map(|control| match &control.kind {
+            newt_interaction::ControlKind::Choice { options } => Some(options),
+            _ => None,
+        })
+        .flatten()
+        .map(|option| option.key.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Ask a yes/no decision.
+///
+/// **`blank` may DECLINE; it may never COMMIT.** That is the rule D1a found
+/// the hard way and this slice had to state precisely, because `[Y/n]` and
+/// `[y/N]` were both spelled `is_yes(&ans, _)` and only one of them was
+/// dangerous:
+///
+/// * `None` — blank re-asks. For every confirm whose "yes" DOES something
+///   irreversible: writes a file, overwrites a config, adopts a credential.
+///   `is_yes(&ans, true)` reading an EOF-induced empty answer as consent is
+///   what let a short pipe write the crew file in D1a.
+/// * `Some(false)` — blank declines. For a confirm whose "no" is the no-op:
+///   *Overwrite?*, *Add another backend?*. Running out of input genuinely
+///   means "no more", and forcing an explicit `n` would turn a completed
+///   piped setup into a failure at its last prompt — `newt setup` over SSH
+///   and through a pipe are both real.
+///
+/// It is a PARAMETER rather than a rule inside the function so the choice is
+/// visible at every call site and a reviewer can check which way each default
+/// falls without reading this doc.
 ///
 /// **No advertised default, deliberately.** `is_yes(&ans, true)` — which both
 /// call sites used — read blank AND every unrecognised word as YES. D1a found
@@ -721,33 +841,38 @@ const DECISION_ATTEMPTS: usize = 3;
 /// # Errors
 ///
 /// The read failure, or a bail after [`DECISION_ATTEMPTS`] unusable answers.
-fn decide(console: &mut dyn Console, definition: &InteractionDefinition) -> anyhow::Result<bool> {
-    for _ in 0..DECISION_ATTEMPTS {
-        let answer = console.ask_definition(definition)?;
-        match interaction_form::resolve(definition, answer.trim())
-            .as_ref()
-            .map(newt_interaction::OptionId::as_str)
-        {
-            Some(YES) => return Ok(true),
-            Some(NO) => return Ok(false),
-            _ => console.say("  answer y or n"),
-        }
-    }
-    anyhow::bail!("no usable answer after {DECISION_ATTEMPTS} attempts")
+fn decide(
+    op: &Operator<'_>,
+    definition: &InteractionDefinition,
+    blank: Option<bool>,
+) -> anyhow::Result<bool> {
+    let blank = blank.map(|yes| if yes { YES } else { NO });
+    Ok(choose(op, definition, blank)? == YES)
 }
 
-fn choose_backend(console: &mut dyn Console) -> anyhow::Result<BackendChoice> {
-    console.say("\nWhere does your model run?");
-    console.say("  1) Ollama on this machine   (http://127.0.0.1:11434)");
-    console.say(
-        "  2) Another machine          (hostname or URL — newt probes for Ollama / llama.cpp / vLLM)",
-    );
-    console
-        .say("  3) A hosted provider        (OpenAI, Anthropic, OpenRouter, NVIDIA, … — API key)");
-    let ans = console.ask("Choose [1]: ")?;
-    Ok(match parse_choice(&ans, 3).unwrap_or(1) {
-        2 => BackendChoice::CustomHost,
-        3 => BackendChoice::HostedProvider,
+fn choose_backend(op: &Operator<'_>) -> anyhow::Result<BackendChoice> {
+    let picked = choose(
+        op,
+        &interaction_form::menu(
+            "\nWhere does your model run?",
+            "",
+            &[
+                ("1", "Ollama on this machine (http://127.0.0.1:11434)"),
+                (
+                    "2",
+                    "Another machine (hostname or URL — newt probes Ollama / llama.cpp / vLLM)",
+                ),
+                (
+                    "3",
+                    "A hosted provider (OpenAI, Anthropic, OpenRouter, NVIDIA, … — API key)",
+                ),
+            ],
+        ),
+        Some("1"),
+    )?;
+    Ok(match picked.as_str() {
+        "2" => BackendChoice::CustomHost,
+        "3" => BackendChoice::HostedProvider,
         _ => BackendChoice::LocalOllama,
     })
 }
@@ -757,11 +882,11 @@ fn choose_backend(console: &mut dyn Console) -> anyhow::Result<BackendChoice> {
 // ---------------------------------------------------------------------------
 
 async fn configure_ollama(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     client: &reqwest::Client,
 ) -> anyhow::Result<ConfiguredBackend> {
     let default_url = "http://127.0.0.1:11434";
-    let raw = console.ask_definition(&interaction_form::text_field(
+    let raw = op.ask(&interaction_form::text_field(
         "Ollama host",
         format!("[{default_url}] — Enter keeps it"),
     ))?;
@@ -771,7 +896,7 @@ async fn configure_ollama(
         11434,
     );
 
-    let model = pick_model(console, client, &url).await?;
+    let model = pick_model(op, client, &url).await?;
     let (config, backend) = build_ollama_config(
         Config::default(),
         "default",
@@ -831,18 +956,18 @@ fn order_models_warm_first(models: &[String], warm: &[String]) -> Vec<String> {
 /// Auth-required endpoints get one hidden-input key prompt + re-probe;
 /// pasted keys go through the encrypted store like every other wizard token.
 async fn configure_custom_host(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     client: &reqwest::Client,
     config_path: &Path,
 ) -> anyhow::Result<ConfiguredBackend> {
     loop {
-        let raw = console.ask_definition(&interaction_form::text_field(
+        let raw = op.ask(&interaction_form::text_field(
             "Host name or URL",
             "e.g. gpu-box, 10.0.0.5:8000, https://llm.example.net",
         ))?;
         let target = raw.trim().to_string();
         if target.is_empty() {
-            console.say("  A host is required.");
+            op.say("  A host is required.");
             continue;
         }
         let discovery = if config_path.is_file() {
@@ -855,11 +980,11 @@ async fn configure_custom_host(
         let candidates = match candidate_endpoints(&target, &discovery) {
             Ok(c) => c,
             Err(e) => {
-                console.say(&format!("  {e}"));
+                op.say(&format!("  {e}"));
                 continue;
             }
         };
-        console.say(&format!("Probing {}…", candidates.join(", ")));
+        op.say(&format!("Probing {}…", candidates.join(", ")));
         let (mut hits, mut failures) =
             probe_candidates_concurrently(client, &candidates, None).await?;
 
@@ -873,7 +998,7 @@ async fn configure_custom_host(
                 .any(|f| f.contains("authentication required"))
         {
             if let Some(key) =
-                credentials::ask_secret(console, "API key (echoes as *, Enter to skip): ")?
+                credentials::ask_secret(op, "API key (echoes as *, Enter to skip): ")?
             {
                 validate_authenticated_target(&target)?;
                 let (h, f) =
@@ -886,19 +1011,28 @@ async fn configure_custom_host(
 
         if hits.is_empty() {
             for failure in &failures {
-                console.say(&format!("  {failure}"));
+                op.say(&format!("  {failure}"));
             }
-            console.say(&format!(
+            op.say(&format!(
                 "\nNo inference API answered at {target} (tried {}).",
                 candidates.join(", ")
             ));
-            console.say("  1) Try a different host");
-            console.say("  2) Enter endpoint and model by hand (generation-tested)");
-            console.say("  3) Cancel setup");
-            let ans = console.ask("Choose [1]: ")?;
-            match parse_choice(&ans, 3).unwrap_or(1) {
-                2 => return manual_backend_entry(console, client, config_path).await,
-                3 => {
+            let picked = choose(
+                op,
+                &interaction_form::menu(
+                    "",
+                    "",
+                    &[
+                        ("1", "Try a different host"),
+                        ("2", "Enter endpoint and model by hand (generation-tested)"),
+                        ("3", "Cancel setup"),
+                    ],
+                ),
+                Some("1"),
+            )?;
+            match picked.as_str() {
+                "2" => return manual_backend_entry(op, client, config_path).await,
+                "3" => {
                     // Interrupted, not a plain bail: first run maps this to
                     // its defaults fallback (`wizard::is_abort`).
                     return Err(anyhow::Error::from(io::Error::new(
@@ -910,27 +1044,31 @@ async fn configure_custom_host(
             }
         }
 
-        console.say(&format!(
+        op.say(&format!(
             "\nFound {} endpoint{}:",
             hits.len(),
             if hits.len() == 1 { "" } else { "s" }
         ));
-        for (i, hit) in hits.iter().enumerate() {
-            console.say(&format!("  {}) {}", i + 1, format_endpoint_row(hit)));
-        }
-        let ans = console.ask("Endpoint [1]: ")?;
-        let idx = parse_choice(&ans, hits.len()).map(|n| n - 1).unwrap_or(0);
+        let rows: Vec<(String, String)> = hits
+            .iter()
+            .enumerate()
+            .map(|(i, hit)| ((i + 1).to_string(), format_endpoint_row(hit)))
+            .collect();
+        let entries: Vec<(&str, &str)> =
+            rows.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let picked = choose(op, &interaction_form::menu("", "", &entries), Some("1"))?;
+        let idx = picked.parse::<usize>().unwrap_or(1) - 1;
         let hit = &hits[idx];
 
         let ordered = order_models_warm_first(&hit.models, &hit.warm);
         let model = if ordered.is_empty() {
-            ask_model_name(console)?
+            ask_model_name(op)?
         } else {
-            select_model(console, &ordered)?
+            select_model(op, &ordered)?
         };
 
         let (api_key, api) =
-            verify_custom_chat_with_retries(console, client, hit, &model, api_key).await?;
+            verify_custom_chat_with_retries(op, client, hit, &model, api_key).await?;
 
         let mut backend = backend_from_probe(hit, None, None)?;
         backend.model = Some(model);
@@ -938,7 +1076,7 @@ async fn configure_custom_host(
             backend.api = api;
         }
         let pending_token = if let Some(key) = api_key {
-            let pending = collect_wizard_token(console, &key, config_path, &backend.name)?;
+            let pending = collect_wizard_token(op, &key, config_path, &backend.name)?;
             backend.api_key_file = Some(pending.reference.handle().to_string());
             Some(pending)
         } else {
@@ -954,7 +1092,7 @@ async fn configure_custom_host(
 }
 
 async fn verify_custom_chat_with_retries(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     client: &reqwest::Client,
     hit: &EndpointProbeResult,
     model: &str,
@@ -967,7 +1105,7 @@ async fn verify_custom_chat_with_retries(
         {
             validate_authenticated_target(&hit.endpoint)?;
         }
-        console.say(&format!(
+        op.say(&format!(
             "Testing a minimal generation against {}…",
             hit.endpoint
         ));
@@ -982,7 +1120,7 @@ async fn verify_custom_chat_with_retries(
         .await
         {
             GenerationCheck::Accepted(api) => {
-                console.say("  ✓ generation accepted");
+                op.say("  ✓ generation accepted");
                 // A tool-free chat proves generation/authentication, but it
                 // cannot prove that agent tool calls work on Chat Completions.
                 // Leave Chat unpinned so the runtime tool-capability probe can
@@ -992,20 +1130,20 @@ async fn verify_custom_chat_with_retries(
                 return Ok((api_key, api));
             }
             GenerationCheck::Rejected(code) => {
-                console.say(&format!("  ✗ authentication rejected (HTTP {code})"));
+                op.say(&format!("  ✗ authentication rejected (HTTP {code})"));
                 if attempt + 1 == GENERATION_CHECK_ATTEMPTS {
                     break;
                 }
                 validate_authenticated_target(&hit.endpoint)?;
                 let Some(key) =
-                    credentials::ask_secret(console, "API key (echoes as *, Enter to cancel): ")?
+                    credentials::ask_secret(op, "API key (echoes as *, Enter to cancel): ")?
                 else {
                     anyhow::bail!("setup cancelled after authentication rejection");
                 };
                 api_key = Some(key);
             }
             GenerationCheck::Unverified(reason) => {
-                console.say(&format!("  Could not verify generation ({reason})."));
+                op.say(&format!("  Could not verify generation ({reason})."));
                 anyhow::bail!("setup cancelled because generation verification did not pass");
             }
         }
@@ -1016,12 +1154,12 @@ async fn verify_custom_chat_with_retries(
 /// Nothing answered but the operator knows the endpoint: collect the wire and
 /// model, then require a real generation before returning a writable backend.
 async fn manual_backend_entry(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     client: &reqwest::Client,
     config_path: &Path,
 ) -> anyhow::Result<ConfiguredBackend> {
     let url = loop {
-        let raw = console.ask_definition(&interaction_form::text_field(
+        let raw = op.ask(&interaction_form::text_field(
             "Endpoint URL",
             "e.g. http://host:8080",
         ))?;
@@ -1032,17 +1170,28 @@ async fn manual_backend_entry(
                 .next()
                 .expect("an explicit URL produces one candidate");
         }
-        console.say("  An endpoint URL is required (e.g. http://host:8080).");
+        op.say("  An endpoint URL is required (e.g. http://host:8080).");
     };
-    console.say("\nWire protocol:");
-    console.say("  1) ollama            (POST /api/chat)");
-    console.say("  2) openai-compatible (POST /v1/chat/completions — llama.cpp, vLLM, gateways)");
-    let ans = console.ask("Choose [1]: ")?;
-    let kind = match parse_choice(&ans, 2) {
-        Some(2) => BackendKind::Openai,
+    let picked = choose(
+        op,
+        &interaction_form::menu(
+            "\nWire protocol:",
+            "",
+            &[
+                ("1", "ollama            (POST /api/chat)"),
+                (
+                    "2",
+                    "openai-compatible (POST /v1/chat/completions — llama.cpp, vLLM, gateways)",
+                ),
+            ],
+        ),
+        Some("1"),
+    )?;
+    let kind = match picked.as_str() {
+        "2" => BackendKind::Openai,
         _ => BackendKind::Ollama,
     };
-    let model = ask_model_name(console)?;
+    let model = ask_model_name(op)?;
     let name = backend_name(&url)?;
     let serving = match kind {
         BackendKind::Openai => newt_core::Serving::Instance,
@@ -1056,12 +1205,11 @@ async fn manual_backend_entry(
         engine: None,
         warm: vec![],
     };
-    let (api_key, api) =
-        verify_custom_chat_with_retries(console, client, &hit, &model, None).await?;
+    let (api_key, api) = verify_custom_chat_with_retries(op, client, &hit, &model, None).await?;
     let (config, mut backend) =
         build_backend_pair(&name, &url, &model, kind, serving, None, "manual");
     let pending_token = if let Some(key) = api_key {
-        let pending = collect_wizard_token(console, &key, config_path, &backend.name)?;
+        let pending = collect_wizard_token(op, &key, config_path, &backend.name)?;
         backend.api_key_file = Some(pending.reference.handle().to_string());
         Some(pending)
     } else {
@@ -1080,17 +1228,17 @@ async fn manual_backend_entry(
 /// The "hosted provider" door: resolve the roster (builtin + drop-ins,
 /// incl. copied Hermes YAML), pick one, configure it.
 async fn configure_hosted(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     client: &reqwest::Client,
     config_path: &Path,
 ) -> anyhow::Result<ConfiguredBackend> {
     let presets = provider_preset::resolve_presets(None);
-    match select_hosted_provider(console, &presets)? {
+    match select_hosted_provider(op, &presets)? {
         HostedProviderChoice::Preset(preset) => {
-            configure_preset(console, client, &preset, config_path).await
+            configure_preset(op, client, &preset, config_path).await
         }
         HostedProviderChoice::CustomEndpoint => {
-            configure_custom_host(console, client, config_path).await
+            configure_custom_host(op, client, config_path).await
         }
     }
 }
@@ -1105,7 +1253,7 @@ enum HostedProviderChoice {
 }
 
 fn select_hosted_provider(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     presets: &[ProviderPreset],
 ) -> anyhow::Result<HostedProviderChoice> {
     let mut available: Vec<(&ProviderPreset, String)> = Vec::new();
@@ -1119,24 +1267,25 @@ fn select_hosted_provider(
         }
     }
     for (label, reason) in &unavailable {
-        console.say(&format!("  (unavailable: {label} — {reason})"));
+        op.say(&format!("  (unavailable: {label} — {reason})"));
     }
     if available.is_empty() {
-        console.say("\nAvailable providers:");
-        console.say("  0) I have a URL (custom endpoint)");
-        let _ = console.ask("Choose [0]: ")?;
+        let _ = choose(
+            op,
+            &interaction_form::menu(
+                "\nAvailable providers:",
+                "",
+                &[("0", "I have a URL (custom endpoint)")],
+            ),
+            Some("0"),
+        )?;
         return Ok(HostedProviderChoice::CustomEndpoint);
     }
     let rows: Vec<String> = available
         .iter()
         .map(|(p, endpoint)| format!("{:<24}{}", p.label(), endpoint))
         .collect();
-    match select_row_with_zero(
-        console,
-        &rows,
-        "providers",
-        "I have a URL (custom endpoint)",
-    )? {
+    match select_row_with_zero(op, &rows, "providers", "I have a URL (custom endpoint)")? {
         Some(idx) => Ok(HostedProviderChoice::Preset(Box::new(
             available[idx].0.clone(),
         ))),
@@ -1150,21 +1299,21 @@ fn select_hosted_provider(
 /// model pick probed through the preset's own catalog. An empty `env_vars`
 /// (LM Studio) skips the credential step entirely.
 async fn configure_preset(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     client: &reqwest::Client,
     preset: &ProviderPreset,
     config_path: &Path,
 ) -> anyhow::Result<ConfiguredBackend> {
-    console.say(&format!("\n{} — {}", preset.label(), preset.base_url));
+    op.say(&format!("\n{} — {}", preset.label(), preset.base_url));
     if let Some(description) = &preset.description {
-        console.say(description);
+        op.say(description);
     }
     if let Some(signup) = &preset.signup_url {
-        console.say(&format!("Create an API key at {signup}"));
+        op.say(&format!("Create an API key at {signup}"));
     }
     if !preset.default_headers.is_empty() {
         // Limitation L1 (docs/provider-presets.md): carried, not sent.
-        console.say(&format!(
+        op.say(&format!(
             "  Note: {} suggests extra request headers; newt does not send custom headers yet.",
             preset.label()
         ));
@@ -1186,13 +1335,15 @@ async fn configure_preset(
         });
         if let Some((var, value)) = exported {
             let use_it = decide(
-                console,
+                op,
                 &interaction_form::confirm(
                     format!("${var} is set in this shell. Use it?"),
                     "",
                     "yes, use it",
                     "no, paste a key instead",
                 ),
+                // Adopts a credential: blank must not consent.
+                None,
             )?;
             if use_it {
                 // Record the var that actually resolved, not [0].
@@ -1203,10 +1354,10 @@ async fn configure_preset(
                     pending_token: None,
                 }
             } else {
-                preset_pasted_key(console, preset, config_path)?
+                preset_pasted_key(op, preset, config_path)?
             }
         } else {
-            preset_pasted_key(console, preset, config_path)?
+            preset_pasted_key(op, preset, config_path)?
         }
     };
 
@@ -1217,22 +1368,22 @@ async fn configure_preset(
         validate_authenticated_target(&endpoint)?;
     }
 
-    console.say(&format!(
+    op.say(&format!(
         "Probing {} for available models…",
         preset.base_url
     ));
     let models =
         list_models_for_preset(client, preset, cred.probe_key.as_ref().map(Secret::expose)).await;
     let model = match models {
-        Ok(m) if !m.is_empty() => select_model(console, &m)?,
+        Ok(m) if !m.is_empty() => select_model(op, &m)?,
         Ok(_) | Err(_) => {
-            console.say("  Could not list models (endpoint unreachable or key not yet usable).");
+            op.say("  Could not list models (endpoint unreachable or key not yet usable).");
             // Fallback ladder: curated list → single default → free entry.
             match preset.fallback_models.len() {
-                0 => ask_model_name(console)?,
+                0 => ask_model_name(op)?,
                 1 => {
                     let default = &preset.fallback_models[0];
-                    let raw = console.ask_definition(&interaction_form::text_field(
+                    let raw = op.ask(&interaction_form::text_field(
                         "Model name",
                         format!("[{default}] — Enter keeps it"),
                     ))?;
@@ -1242,7 +1393,7 @@ async fn configure_preset(
                         raw.trim().to_string()
                     }
                 }
-                _ => select_model(console, &preset.fallback_models)?,
+                _ => select_model(op, &preset.fallback_models)?,
             }
         }
     };
@@ -1251,7 +1402,7 @@ async fn configure_preset(
     // aren't uniformly auth-gated) and only 401 on the first real message.
     // Test the credential NOW, with re-entry on rejection.
     let (cred, verified_api) =
-        verify_key_with_retries(console, client, preset, config_path, &model, cred).await?;
+        verify_key_with_retries(op, client, preset, config_path, &model, cred).await?;
 
     let mut backend = provider_preset::backend_from_preset(
         preset,
@@ -1285,7 +1436,7 @@ struct WizardCred {
 /// credential re-entries on 401/403. A public model catalog is never treated
 /// as authentication evidence.
 async fn verify_key_with_retries(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     client: &reqwest::Client,
     preset: &ProviderPreset,
     config_path: &Path,
@@ -1308,7 +1459,7 @@ async fn verify_key_with_retries(
         {
             validate_authenticated_target(&endpoint)?;
         }
-        console.say(&format!(
+        op.say(&format!(
             "Testing a minimal generation against {}…",
             preset.base_url
         ));
@@ -1323,27 +1474,30 @@ async fn verify_key_with_retries(
         .await
         {
             GenerationCheck::Accepted(api) => {
-                console.say("  ✓ generation accepted");
+                op.say("  ✓ generation accepted");
                 let api = api.filter(|surface| *surface == newt_core::config::OpenAiApi::Responses);
                 return Ok((cred, api));
             }
             GenerationCheck::Rejected(code) => {
-                console.say(&format!("  ✗ authentication rejected (HTTP {code})"));
+                op.say(&format!("  ✗ authentication rejected (HTTP {code})"));
                 if attempt + 1 == GENERATION_CHECK_ATTEMPTS {
                     break;
                 }
                 if !decide(
-                    console,
+                    op,
                     &interaction_form::confirm(
                         "Re-enter the key?",
                         "",
                         "yes, re-enter it",
                         "no, cancel setup",
                     ),
+                    // Cancelling aborts setup; neither way is a no-op, so
+                    // the operator says which.
+                    None,
                 )? {
                     anyhow::bail!("setup cancelled after authentication rejection");
                 }
-                cred = preset_pasted_key(console, preset, config_path)?;
+                cred = preset_pasted_key(op, preset, config_path)?;
             }
             GenerationCheck::Unverified(reason) => {
                 anyhow::bail!("minimal generation verification failed: {reason}");
@@ -1358,18 +1512,18 @@ async fn verify_key_with_retries(
 /// encrypted store. Returns (api_key_env, api_key_file, probe key).
 #[allow(clippy::type_complexity)]
 fn preset_pasted_key(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     preset: &ProviderPreset,
     config_path: &Path,
 ) -> anyhow::Result<WizardCred> {
-    let key = credentials::ask_secret(console, "API key (echoes as *, Enter to skip): ")?;
+    let key = credentials::ask_secret(op, "API key (echoes as *, Enter to skip): ")?;
     let Some(key) = key else {
         let var = preset
             .env_vars
             .first()
             .cloned()
             .unwrap_or_else(|| provider_preset::synthesized_env_var(&preset.name));
-        console.say(&format!(
+        op.say(&format!(
             "  No key — writing the backend anyway; export ${var} before use."
         ));
         return Ok(WizardCred {
@@ -1379,7 +1533,7 @@ fn preset_pasted_key(
             pending_token: None,
         });
     };
-    let pending = collect_wizard_token(console, &key, config_path, &preset.name)?;
+    let pending = collect_wizard_token(op, &key, config_path, &preset.name)?;
     let reference = pending.reference.handle().to_string();
     Ok(WizardCred {
         api_key_env: None,
@@ -1390,15 +1544,15 @@ fn preset_pasted_key(
 }
 
 fn collect_wizard_token(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     token: &Secret,
     config_path: &Path,
     name: &str,
 ) -> anyhow::Result<PendingWizardToken> {
-    console.say("Protect the stored key with a passphrase? Enter uses a machine-local key.");
+    op.say("Protect the stored key with a passphrase? Enter uses a machine-local key.");
     // An empty passphrase is a real choice — it selects the machine-local
     // identity — so `None` here means "no passphrase", not "read failed".
-    let passphrase = credentials::ask_secret(console, "Passphrase (echoes as *): ")?
+    let passphrase = credentials::ask_secret(op, "Passphrase (echoes as *): ")?
         .map(|pass| newt_core::secrets::SecretString::from(pass.expose().to_string()));
     let path = versioned_wizard_token_path(config_path, name)?;
     let reference = credentials::SealedSecret::new(&collapse_home(&path))?;
@@ -1424,7 +1578,7 @@ fn versioned_wizard_token_path(config_path: &Path, name: &str) -> anyhow::Result
 
 #[cfg(test)]
 fn persist_wizard_token(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     _config_path: &Path,
     _name: &str,
     pending: &PendingWizardToken,
@@ -1438,7 +1592,7 @@ fn persist_wizard_token(
     )
     .map_err(|e| anyhow::anyhow!(e))?;
     let reference = pending.reference.handle().to_string();
-    console.say(&format!("  → stored encrypted at {reference}"));
+    op.say(&format!("  → stored encrypted at {reference}"));
     Ok(reference)
 }
 
@@ -1450,16 +1604,17 @@ fn persist_wizard_token(
 /// `Name <email>`; saves via [`newt_core::AgentIdentity::save`] — the ONE
 /// sanctioned writer (never open-code a second). Non-fatal: the backend
 /// config already landed, so failures here only print.
-fn offer_identity(console: &mut dyn Console) {
+fn offer_identity(op: &Operator<'_>) {
     let Some(path) = newt_core::AgentIdentity::user_identity_path() else {
         return;
     };
     if path.exists() {
         return; // already configured — don't nag on re-runs
     }
-    let raw = match console
-        .ask("Attribution for agent commits — \"Name <email>\" (Enter to keep the default): ")
-    {
+    let raw = match op.ask(&interaction_form::text_field(
+        "Attribution for agent commits",
+        "\"Name <email>\" — Enter keeps the default",
+    )) {
         Ok(raw) => raw,
         Err(_) => return, // Esc here must not undo a completed setup
     };
@@ -1468,7 +1623,7 @@ fn offer_identity(console: &mut dyn Console) {
         return;
     }
     let Some((name, email)) = parse_identity_line(raw) else {
-        console.say("  Expected \"Name <email>\" — skipped (set later with `newt identity set`).");
+        op.say("  Expected \"Name <email>\" — skipped (set later with `newt identity set`).");
         return;
     };
     let identity = newt_core::AgentIdentity {
@@ -1477,8 +1632,8 @@ fn offer_identity(console: &mut dyn Console) {
         ..Default::default()
     };
     match identity.save(&path) {
-        Ok(()) => console.say(&format!("  Wrote {}.", path.display())),
-        Err(e) => console.say(&format!("  Could not write identity ({e}) — skipped.")),
+        Ok(()) => op.say(&format!("  Wrote {}.", path.display())),
+        Err(e) => op.say(&format!("  Could not write identity ({e}) — skipped.")),
     }
 }
 
@@ -1516,26 +1671,26 @@ fn collapse_home(path: &Path) -> String {
 // ---------------------------------------------------------------------------
 
 async fn pick_model(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     client: &reqwest::Client,
     url: &str,
 ) -> anyhow::Result<String> {
-    console.say(&format!("Probing {url} for installed models…"));
+    op.say(&format!("Probing {url} for installed models…"));
     let models = fetch_ollama_models(client, url).await;
 
     let models = match models {
         Ok(m) if !m.is_empty() => m,
         Ok(_) => {
-            console.say("  Endpoint answered but listed no models.");
-            return ask_model_name(console);
+            op.say("  Endpoint answered but listed no models.");
+            return ask_model_name(op);
         }
         Err(e) => {
-            console.say(&format!("  Could not reach the endpoint ({e})."));
-            return ask_model_name(console);
+            op.say(&format!("  Could not reach the endpoint ({e})."));
+            return ask_model_name(op);
         }
     };
 
-    select_model(console, &models)
+    select_model(op, &models)
 }
 
 /// Above this many models, a flat numbered list stops being a menu and starts
@@ -1545,13 +1700,13 @@ const FILTER_THRESHOLD: usize = 9;
 
 /// Choose one entry from `models`, filtering first when the list is long.
 ///
-/// Deliberately built on the line-based [`Console`] rather than a raw-mode
+/// Deliberately built on the line-based seam rather than a raw-mode
 /// arrow-key widget: setup frequently runs over SSH, piped, or with stdin
 /// redirected, and a raw-mode picker would either hang or have to be bypassed
 /// in exactly those cases. Filtering gets the same "find it among 36" result
 /// while staying pipe-safe and unit-testable.
-fn select_model(console: &mut dyn Console, models: &[String]) -> anyhow::Result<String> {
-    let idx = select_row(console, models, "models")?;
+fn select_model(op: &Operator<'_>, models: &[String]) -> anyhow::Result<String> {
+    let idx = select_row(op, models, "models")?;
     Ok(models[idx].clone())
 }
 
@@ -1559,12 +1714,12 @@ fn select_model(console: &mut dyn Console, models: &[String]) -> anyhow::Result<
 /// `select_hosted_provider` share: same threshold, same blank-filter and
 /// no-match-falls-back-to-all semantics, same pipe-safety. Returns the
 /// index into the ORIGINAL `rows` slice.
-fn select_row(console: &mut dyn Console, rows: &[String], noun: &str) -> anyhow::Result<usize> {
-    Ok(select_row_with_zero(console, rows, noun, "")?.expect("no zero choice was offered"))
+fn select_row(op: &Operator<'_>, rows: &[String], noun: &str) -> anyhow::Result<usize> {
+    Ok(select_row_with_zero(op, rows, noun, "")?.expect("no zero choice was offered"))
 }
 
 fn select_row_with_zero(
-    console: &mut dyn Console,
+    op: &Operator<'_>,
     rows: &[String],
     noun: &str,
     zero: &str,
@@ -1572,13 +1727,13 @@ fn select_row_with_zero(
     let mut pool: Vec<(usize, &String)> = rows.iter().enumerate().collect();
 
     if pool.len() > FILTER_THRESHOLD {
-        console.say(&format!("\n{} {noun} available.", pool.len()));
-        let prompt = if zero.is_empty() {
-            "Filter (blank = show all): ".to_string()
+        op.say(&format!("\n{} {noun} available.", pool.len()));
+        let hint = if zero.is_empty() {
+            "blank = show all".to_string()
         } else {
-            format!("Filter (blank = show all, 0 = {zero}): ")
+            format!("blank = show all, 0 = {zero}")
         };
-        let needle = console.ask(&prompt)?;
+        let needle = op.ask(&interaction_form::text_field("Filter", hint))?;
         if !zero.is_empty() && needle.trim() == "0" {
             return Ok(None);
         }
@@ -1592,31 +1747,42 @@ fn select_row_with_zero(
             // A filter that matches nothing falls back to the full list rather
             // than dead-ending the operator in an empty menu.
             if matched.is_empty() {
-                console.say(&format!("  No match for {needle:?}; showing all."));
+                op.say(&format!("  No match for {needle:?}; showing all."));
             } else {
                 pool = matched;
             }
         }
     }
 
-    console.say(&format!("\nAvailable {noun}:"));
+    let mut rows: Vec<(String, String)> = Vec::with_capacity(pool.len() + 1);
     if !zero.is_empty() {
-        console.say(&format!("  0) {zero}"));
+        rows.push(("0".to_string(), zero.to_string()));
     }
-    for (i, (_, row)) in pool.iter().enumerate() {
-        console.say(&format!("  {}) {row}", i + 1));
-    }
-    let ans = console.ask("Choose [1]: ")?;
-    if !zero.is_empty() && ans.trim() == "0" {
+    rows.extend(
+        pool.iter()
+            .enumerate()
+            .map(|(i, (_, row))| ((i + 1).to_string(), (*row).clone())),
+    );
+    let entries: Vec<(&str, &str)> = rows.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let picked = choose(
+        op,
+        &interaction_form::menu(format!("\nAvailable {noun}:"), "", &entries),
+        Some("1"),
+    )?;
+    // The zero entry, when offered, means "none of these".
+    if !zero.is_empty() && picked == "0" {
         return Ok(None);
     }
-    let picked = parse_choice(&ans, pool.len()).map(|n| n - 1).unwrap_or(0);
-    Ok(Some(pool[picked].0))
+    let index = picked.parse::<usize>().unwrap_or(1) - 1;
+    Ok(Some(pool[index].0))
 }
 
-fn ask_model_name(console: &mut dyn Console) -> anyhow::Result<String> {
+fn ask_model_name(op: &Operator<'_>) -> anyhow::Result<String> {
     let default = "llama3.1:8b";
-    let raw = console.ask(&format!("Model name [{default}]: "))?;
+    let raw = op.ask(&interaction_form::text_field(
+        "Model name",
+        format!("[{default}] — Enter keeps it"),
+    ))?;
     Ok(if raw.is_empty() {
         default.to_string()
     } else {
@@ -1636,18 +1802,6 @@ use newt_core::backend_probe::fetch_ollama_models;
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested directly)
 // ---------------------------------------------------------------------------
-
-/// Parse a 1-based menu answer into its 1-based number when it's a valid digit
-/// in `1..=max`. Empty or out-of-range input returns `None` so the caller can
-/// apply its own default.
-fn parse_choice(input: &str, max: usize) -> Option<usize> {
-    let n: usize = input.trim().parse().ok()?;
-    if (1..=max).contains(&n) {
-        Some(n)
-    } else {
-        None
-    }
-}
 
 /// Normalise a user-typed endpoint into a full `scheme://host:port` URL.
 ///

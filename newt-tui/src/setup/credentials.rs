@@ -38,6 +38,7 @@
 //! that reference. A fresh handle scheme would have been a third mechanism
 //! for one idea.
 
+use super::operator::Operator;
 use newt_core::agent_identity::Secret;
 use newt_interaction::{
     Control, ControlId, ControlKind, ControlValue, InteractionDefinition, InteractionKind,
@@ -105,11 +106,8 @@ pub(crate) fn secret_prompt(label: &str) -> InteractionDefinition {
 /// # Errors
 ///
 /// Propagates the read failure: cancelled, EOF, or no operator.
-pub(super) fn ask_secret(
-    console: &mut dyn crate::line_console::Console,
-    label: &str,
-) -> std::io::Result<Option<Secret>> {
-    let typed = console.ask_secret(label)?;
+pub(super) fn ask_secret(op: &Operator<'_>, label: &str) -> std::io::Result<Option<Secret>> {
+    let typed = op.ask(&secret_prompt(label))?;
     let typed = typed.trim();
     Ok((!typed.is_empty()).then(|| Secret::new(typed)))
 }
@@ -324,18 +322,13 @@ mod contract {
     /// and written as if it were real.
     #[test]
     fn an_empty_answer_is_a_skip_not_an_empty_secret() {
-        struct Scripted(&'static str);
-        impl crate::line_console::Console for Scripted {
-            fn ask(&mut self, _: &str) -> std::io::Result<String> {
-                Ok(self.0.to_string())
-            }
-            fn say(&mut self, _: &str) {}
-        }
-        assert!(ask_secret(&mut Scripted(""), "API key").unwrap().is_none());
-        assert!(ask_secret(&mut Scripted("   "), "API key")
-            .unwrap()
-            .is_none());
-        let got = ask_secret(&mut Scripted(PLANTED), "API key")
+        use crate::setup::operator::Script;
+        let blank = Script::new(&[""]);
+        assert!(ask_secret(&blank.operator(), "API key").unwrap().is_none());
+        let spaces = Script::new(&["   "]);
+        assert!(ask_secret(&spaces.operator(), "API key").unwrap().is_none());
+        let real = Script::new(&[PLANTED]);
+        let got = ask_secret(&real.operator(), "API key")
             .unwrap()
             .expect("a real key is returned");
         assert_eq!(got.expose(), PLANTED, "and it is returned intact");
