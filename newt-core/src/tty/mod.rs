@@ -40,6 +40,10 @@ pub mod arbiter;
 pub mod caps;
 pub mod frames;
 mod modal;
+/// D2a (#1864): the terminal renderer for `crate::progress`. Present and
+/// tested, deliberately NOT wired — dual-publish keeps the old path
+/// authoritative until each family's cutover PR.
+pub mod progress_sink;
 /// Real-resource (PTY) proof that a notice emitted from outside the lease
 /// damages nothing. Unix-only: it needs a real pty pair.
 #[cfg(all(test, unix))]
@@ -58,6 +62,7 @@ pub use modal::{
     modal_prompt_controls, read_prompt_window_line, ControlReader, PromptControlReader, PromptLine,
     MODAL_CONTROL_HINT, MODAL_INPUT_GLYPH,
 };
+pub use progress_sink::TerminalProgressSink;
 pub use spinner::{interrupt_pending, set_interrupt_pending, with_spinner, Spinner};
 pub use widgets::{Action, Level, Notice, Question};
 pub use width::{ch_width, str_width, wrap_line};
