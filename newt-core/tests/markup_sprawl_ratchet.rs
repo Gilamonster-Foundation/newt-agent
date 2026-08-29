@@ -355,7 +355,13 @@ const CATEGORIES: &[Category] = &[
             // `[Y/n]` decisions now build `InteractionDefinition`s and go out
             // through `Console::ask_definition`, which is armed separately
             // below rather than being allowed to vanish on a rename.
-            ("newt-tui/src/setup/mod.rs", 13),
+            // `newt-tui/src/setup/mod.rs` was here at 23, then 19, then 13.
+            // D1b-3 took it to ZERO: every wizard prompt is an
+            // `InteractionDefinition` presented through C1's seam, and the
+            // `Console` trait it used to arrive on is deleted.
+            // `newt-tui/src/setup/credentials.rs` (1) went with it — the
+            // console call inside `ask_secret` was the test injection point,
+            // and the injection point is now a scripted `Operator`.
             // **A funnel, not a duplicate** — the justification the category
             // asks for. Four hidden prompts became one
             // `credentials::ask_secret`, which builds a `ControlKind::Secret`
@@ -364,7 +370,6 @@ const CATEGORIES: &[Category] = &[
             // and it goes out through `present_on_terminal` like every other
             // prompt. It reaches 0 when D1b-2/3 thread the seam and the
             // `Console` trait goes.
-            ("newt-tui/src/setup/credentials.rs", 1),
             // D1a (#1885) ratcheted `newt-tui/src/crew_form.rs` off this
             // table entirely: its 7 `console.ask(` sites became one
             // `InteractionDefinition` state machine driven through C1's
@@ -417,7 +422,13 @@ const CATEGORIES: &[Category] = &[
         // and the terminal adapter derives `Echo` from the controls. It is
         // the typed path, reached through a trait that has not gone yet.
         count: |f| count_sites(&f.squeezed, "console.ask_definition("),
-        baseline: &[("newt-tui/src/setup/mod.rs", 5)],
+        // EMPTY, and left armed rather than deleted — the same shape D0 used
+        // for "question construction sites". The bridge existed for exactly
+        // one slice: D1b-2 put five prompts on it so they could carry
+        // definitions while the `Console` trait still delivered them, and
+        // D1b-3 deleted the trait. An empty baseline is the stronger floor,
+        // because any reappearance trips as a NEW site file.
+        baseline: &[],
         rationale: "the D1b migration bridge: prompts already modelled as \
                     definitions, still delivered through the `Console` trait. \
                     It reaches 0 when D1b-3 retires the trait for C1's seam — \
@@ -448,8 +459,11 @@ const CATEGORIES: &[Category] = &[
             )
         },
         baseline: &[
-            // D1b-3's, with the `Console` retirement. Not this slice's.
-            ("newt-tui/src/line_console.rs", 2),
+            // `newt-tui/src/line_console.rs` held 2 until D1b-3 deleted the
+            // module. `StdinConsole::ask`'s cooked read and `read_line_raw`'s
+            // `cooked_read` fallback are gone with it, and so is the
+            // `Echo::Stars` reader D1b-1 had already stripped of its last
+            // production caller.
             // NOT MIGRATED, DELIBERATELY (#1909), and left COUNTED rather than
             // moved so the decision stays visible and reversible.
             //
@@ -1833,63 +1847,114 @@ mod d3b {
     }
 }
 
-/// **D1a (#1885): the crew form asks through the semantic seam, and only it.**
+/// **D1b-3 (#1913): the line console is gone, and nothing reaches for it.**
 ///
-/// The flow used to be parameterised over `line_console::Console` — a private
-/// ask/say I/O path that could only ever reach a cooked terminal. It is now
-/// `InteractionDefinition` state driven through `SurfaceInteraction`, so the
-/// same form renders on the plain projection and the rich TUI without a
-/// form-specific implementation of either.
+/// This test was `the_crew_form_carries_no_private_console_path` — D1a's
+/// guard that the crew form had stopped naming `line_console`, with a twin
+/// asserting the module still EXISTED, because deleting it then would have
+/// made the guard trivially true while `setup.rs` still needed it.
 ///
-/// Keyed on the whole `crew_form` module rather than one file: the slice
-/// split it into `mod.rs` + `state.rs`, and a gate that named the old path
-/// would have reported success while the console came back next door.
+/// D1b-3 deleted it deliberately: setup is off it, crew was off it since
+/// D1a, and the module ended with zero references. So the guard's subject
+/// changed, and it now says the stronger thing — no file anywhere names it —
+/// which subsumes the crew-form version.
+///
+/// The remaining direct read in `lean_input.rs` does NOT block this and was
+/// not migrated. It never referenced `line_console`: it is
+/// `LeanSurface::read_piped`, one branch of a raw-mode line editor that is a
+/// PEER of `PromptWindow` rather than a caller of it (#1911 recorded that
+/// decision when it migrated the other five). Deleting this module cannot
+/// break it, so its row stands alone.
 #[test]
-fn the_crew_form_carries_no_private_console_path() {
+fn the_line_console_is_gone_and_nothing_reaches_for_it() {
     let files = production_code();
-    let crew: Vec<&String> = files
-        .keys()
-        .filter(|p| p.starts_with("newt-tui/src/crew_form"))
-        .collect();
     assert!(
-        crew.len() >= 2,
-        "expected the crew_form module's files, found {crew:?}"
+        !files.contains_key("newt-tui/src/line_console.rs"),
+        "the module is back"
     );
-    for path in &crew {
+    for (path, code) in &files {
         assert!(
-            !files[*path].squeezed.contains("line_console"),
-            "{path} reaches for the line console again — the crew form asks \
-             through SurfaceInteraction (C1) and nothing else"
+            !code.squeezed.contains("line_console"),
+            "{path} reaches for the deleted line console"
         );
     }
 
-    // ANTI-VACUOUS TWIN. Two ways this guard could pass while proving
-    // nothing, both closed here:
-    //
-    // 1. The needle finds nothing anywhere (a typo, a renamed module). It
-    //    must still fire where the console genuinely IS used.
-    // 2. `line_console` was DELETED rather than retired from this flow.
-    //    D1a's scope is the crew form; `setup.rs` still needs the module and
-    //    is D1b's to migrate, so removing it here would be out of scope AND
-    //    would make the assertion above trivially true.
+    // ANTI-VACUOUS TWIN. Every assertion above is an absence, which is what a
+    // scan over an empty file set also reports. So the scan must be seeing
+    // the code that REPLACED it: `setup/operator.rs`, whose `Operator` is the
+    // wizard's only route to a human.
+    let operator = &files["newt-tui/src/setup/operator.rs"];
     assert!(
-        files.contains_key("newt-tui/src/line_console.rs"),
-        "the line console module itself must survive D1a — setup.rs (D1b) \
-         still uses it"
+        operator.squeezed.contains("present_on_terminal(&window,"),
+        "the scan is not looking at the replacement"
     );
-    // Keyed on the setup MODULE, not one path. D1b-0 (#1892) split
-    // `setup.rs` into `setup/{mod,commit,tests}.rs` and this assertion —
-    // written against the old path — failed by panicking on a missing index
-    // key. It did its job (it noticed), but it should notice a CONSOLE
-    // coming back, not a file being renamed. Both halves of the twin now
-    // name modules, matching the crew_form side above.
+}
+
+/// **The replacement carries no reader of its own** (D1b-3, #1913).
+///
+/// D1b-1 moved secret masking into the shared terminal adapter precisely so
+/// `line_console::read_line_raw` could die. The way that gets undone is a
+/// replacement injection point that accepts a READER — a test double offering
+/// "just a simpler way to read a line" — after which one flow reads without
+/// the adapter, its echo policy is whatever that reader does, and nothing
+/// notices.
+///
+/// So the whole `setup` module may not name a reader or a raw-mode guard. It
+/// asks through `Operator`, whose terminal constructor is the same
+/// `suspend_for_prompt` + `present_on_terminal` pair every other surface
+/// uses, and whose test constructor takes ANSWERS rather than a way of
+/// obtaining them.
+#[test]
+fn the_setup_wizard_owns_no_reader() {
+    let files = production_code();
+    let setup: Vec<&String> = files
+        .keys()
+        .filter(|p| p.starts_with("newt-tui/src/setup"))
+        .collect();
     assert!(
-        files
-            .iter()
-            .any(|(path, code)| path.starts_with("newt-tui/src/setup")
-                && code.squeezed.contains("line_console")),
-        "the needle no longer matches the setup module, which DOES use the \
-         line console — the guard above is passing vacuously"
+        setup.len() >= 4,
+        "expected the setup module, found {setup:?}"
+    );
+    // Each needle is paired with the file that PROVES it can still match, so
+    // the absences below are absences of something real. `read_line_raw(` is
+    // deliberately unpaired: D1b-3 deleted that function, so it matches
+    // nowhere by design and guards only against resurrection by name.
+    let paired = [
+        ("read_line(", "newt-core/src/tty/arbiter.rs"),
+        ("event::read(", "newt-core/src/tty/modal.rs"),
+        // `Echo::` is spelled where the POLICY is decided, not where the
+        // enum lives — `modal.rs` writes `Self::Chars` inside its own impl.
+        ("Echo::", "newt-tui/src/permissions.rs"),
+        ("enable_raw_mode(", "newt-core/src/tty/modal.rs"),
+    ];
+    for path in &setup {
+        for (forbidden, _) in paired {
+            assert!(
+                !files[*path].squeezed.contains(forbidden),
+                "{path} reaches for `{forbidden}` — the wizard must ask \
+                 through the shared adapter, which derives masking from the \
+                 definition"
+            );
+        }
+        assert!(
+            !files[*path].squeezed.contains("read_line_raw("),
+            "{path} resurrected the private raw reader D1b-3 deleted"
+        );
+    }
+
+    // ANTI-VACUOUS TWIN.
+    for (needle, lives_in) in paired {
+        assert!(
+            files[lives_in].squeezed.contains(needle),
+            "`{needle}` no longer matches {lives_in}, so forbidding it in \
+             the wizard proves nothing"
+        );
+    }
+    assert!(
+        !files
+            .values()
+            .any(|code| code.squeezed.contains("fn read_line_raw(")),
+        "read_line_raw came back somewhere"
     );
 }
 
