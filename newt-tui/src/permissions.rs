@@ -12,7 +12,7 @@ use newt_core::interaction_adapter::{action_for_option, role_of, DECISION_CONTRO
 use newt_core::interaction_surface::SurfaceInteraction;
 use newt_core::markup::plain;
 use newt_core::tty::{
-    modal_prompt_controls, read_prompt_window_line, ControlReader, PromptLine as ModalLine,
+    modal_prompt_controls, read_prompt_window_line, ControlReader, Echo, PromptLine as ModalLine,
     PromptWindow, Terminal, MODAL_CONTROL_HINT, MODAL_INPUT_GLYPH,
 };
 use newt_core::HumanQuestionOutcome;
@@ -345,7 +345,8 @@ pub(crate) fn prompt_permission_choice(
     definition: &InteractionDefinition,
 ) -> PromptChoice {
     let prompt = format!("{}\n{MODAL_INPUT_GLYPH}", plain::render(definition));
-    match read_prompt_window_line(w, &prompt) {
+    // A permission menu offers visible options; there is nothing to mask.
+    match read_prompt_window_line(w, &prompt, Echo::Chars) {
         Ok(ModalLine::Line(answer)) => decode_answer(definition, &answer),
         Ok(ModalLine::Back) => PromptChoice::Back,
         Ok(ModalLine::Exit) => PromptChoice::Exit,
@@ -459,6 +460,31 @@ pub(crate) fn present_on_terminal(
     }
 }
 
+/// **The echo policy is DERIVED, never passed in** (D1b, #1892).
+///
+/// A caller that had to remember "this one is a secret" would eventually
+/// forget, and the failure is silent and permanent: the key lands in the
+/// scrollback. The definition already says which controls are secret, so it
+/// decides — and the one terminal adapter cannot be asked to echo a secret
+/// because nothing offers it the choice.
+///
+/// **Any** secret control masks the whole read, rather than only a
+/// definition whose sole control is secret. The adapter reads ONE line for
+/// the whole definition, so a form mixing a username and a password would
+/// otherwise echo the line that contains both. Fail closed: mask when a
+/// secret is anywhere in the form.
+fn echo_for(definition: &InteractionDefinition) -> Echo {
+    if definition
+        .controls
+        .iter()
+        .any(|control| matches!(control.kind, ControlKind::Secret))
+    {
+        Echo::Stars
+    } else {
+        Echo::Chars
+    }
+}
+
 /// Render and read, with the slash-command back-out applied.
 fn read_interaction_line(
     w: &PromptWindow,
@@ -470,6 +496,7 @@ fn read_interaction_line(
             "{}\n{MODAL_INPUT_GLYPH}",
             plain::render(&interaction.definition)
         ),
+        echo_for(&interaction.definition),
     )?;
     let ModalLine::Line(line) = &result else {
         return Ok(result);
@@ -492,6 +519,86 @@ fn read_interaction_line(
 /// intent, not an answer to hand to the model. Pure, so it's unit-testable.
 fn is_slash_command_at_prompt(answer: &str) -> bool {
     answer.trim_start().starts_with('/')
+}
+
+#[cfg(test)]
+mod d1b_echo {
+    use super::{echo_for, free_text_form};
+    use newt_core::tty::Echo;
+    use newt_interaction::{
+        ChoiceOption, Control, ControlId, ControlKind, InteractionDefinition, InteractionKind,
+        OptionId, Requirement, SemanticRole,
+    };
+
+    fn control(kind: ControlKind) -> Control {
+        Control {
+            id: ControlId::new("field").expect("valid"),
+            kind,
+            label: "API key".to_string(),
+            requirement: Requirement::Required,
+        }
+    }
+
+    fn form(controls: Vec<Control>) -> InteractionDefinition {
+        InteractionDefinition::new(InteractionKind::Form, "credentials", controls)
+    }
+
+    /// A secret control masks the read, and nothing else does.
+    #[test]
+    fn a_secret_control_masks_the_read() {
+        assert_eq!(
+            echo_for(&form(vec![control(ControlKind::Secret)])),
+            Echo::Stars
+        );
+    }
+
+    /// **The anti-vacuous twin.** If `echo_for` returned `Stars`
+    /// unconditionally the test above would pass while every ordinary prompt
+    /// silently stopped echoing — a prompt that shows nothing reads as a hung
+    /// terminal, which is the defect `Echo::Stars` documents avoiding.
+    #[test]
+    fn an_ordinary_control_still_echoes() {
+        for kind in [
+            ControlKind::Text,
+            ControlKind::Toggle,
+            ControlKind::Choice {
+                options: vec![ChoiceOption {
+                    id: OptionId::new("yes").expect("valid"),
+                    role: SemanticRole::Allow,
+                    label: "yes".to_string(),
+                    key: "y".to_string(),
+                    aliases: vec![],
+                }],
+            },
+        ] {
+            assert_eq!(
+                echo_for(&form(vec![control(kind.clone())])),
+                Echo::Chars,
+                "{kind:?} is not a secret and must echo"
+            );
+        }
+        // The production free-text form is an ordinary prompt.
+        assert_eq!(echo_for(&free_text_form("what model?")), Echo::Chars);
+        // A form with NO controls has nothing to hide.
+        assert_eq!(echo_for(&form(vec![])), Echo::Chars);
+    }
+
+    /// **Fail closed on a mixed form.** The adapter reads ONE line for the
+    /// whole definition, so a form pairing a username with a password would
+    /// echo the line carrying both if the policy keyed on "the only control".
+    #[test]
+    fn a_secret_anywhere_masks_the_whole_form() {
+        let mixed = form(vec![
+            control(ControlKind::Text),
+            control(ControlKind::Secret),
+        ]);
+        assert_eq!(echo_for(&mixed), Echo::Stars, "secret last");
+        let mixed = form(vec![
+            control(ControlKind::Secret),
+            control(ControlKind::Text),
+        ]);
+        assert_eq!(echo_for(&mixed), Echo::Stars, "secret first");
+    }
 }
 
 #[cfg(test)]

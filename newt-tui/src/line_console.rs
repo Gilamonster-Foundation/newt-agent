@@ -52,15 +52,12 @@ pub fn is_yes(input: &str, default: bool) -> bool {
     }
 }
 
-/// Whether a raw-mode line read shows the characters typed. `Stars` echoes
-/// one `*` per character — a secret still gets keystroke feedback (a fully
-/// silent prompt reads as a hung terminal, per field testing) without ever
-/// showing the value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Echo {
-    Chars,
-    Stars,
-}
+/// **One `Echo`, in the lower layer** (D1b, #1892). This was a byte-identical
+/// twin of `newt_core::tty::Echo`; the terminal adapter needed the same policy
+/// for `ControlKind::Secret`, and a second copy beside it is how `is_yes`
+/// became three. Shared behaviour moves DOWN, so the definition lives in
+/// newt-core and this module uses it until the module itself goes (D1b-3).
+pub use newt_core::tty::Echo;
 
 /// What one key event does to a raw-mode line read. Pure — unit-tested
 /// without a terminal.
