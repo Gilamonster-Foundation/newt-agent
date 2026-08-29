@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::danger;
 use crate::mint_operating_key;
 use newt_core::agentic::{newt_line, print_newt};
-use newt_core::interaction_adapter::{definition_to_question, role_of, DECISION_CONTROL};
+use newt_core::interaction_adapter::{action_for_option, role_of, DECISION_CONTROL};
 use newt_core::interaction_surface::SurfaceInteraction;
 use newt_core::markup::plain;
 use newt_core::tty::{
@@ -17,12 +17,12 @@ use newt_core::tty::{
 };
 use newt_core::HumanQuestionOutcome;
 pub(crate) use newt_core::PermissionAction as PromptChoice;
-// C0a (#1856): production no longer names the legacy form — rendering left
-// it and the gate seam carries an `InteractionDefinition`. The type survives
-// for the tests that pin the adapter's parse semantics and the web card's
-// model reconstruction (both C3's to retire).
-#[cfg(test)]
-use newt_core::Question;
+// D0 (#1878): the legacy form is not named here at all any more. C0a moved
+// rendering off it; C3c removed the web card's reconstruction; D0 moved the
+// decode onto `newt_interaction::binding::resolve_typed` and deleted the
+// reverse adapter. The `#[cfg(test)]` that stood here belonged to the
+// `newt_core::Question` import beside it — both are gone, and these protocol
+// types are production imports.
 use newt_interaction::{
     Audience, ChoiceOption, Control, ControlId, ControlKind, InteractionDefinition,
     InteractionKind, OptionId, Requirement,
@@ -259,14 +259,36 @@ const WIRE_NAMES_ARE_OPTION_IDS: &str =
 /// the web card's model reconstruction. Production reaches
 /// `permission_definition` directly and renders it with
 /// [`plain::render`].
+/// The actions a definition offers, in presentation order.
 #[cfg(test)]
-pub(crate) fn question_for(
-    req: &newt_core::PermissionRequest,
-    danger: &danger::DangerTable,
-    audience: Audience,
-) -> Question<PromptChoice> {
-    definition_to_question(&permission_definition(req, danger, audience))
-        .expect(WIRE_NAMES_ARE_OPTION_IDS)
+pub(crate) fn offered_actions(definition: &InteractionDefinition) -> Vec<PromptChoice> {
+    definition
+        .controls
+        .iter()
+        .find_map(|c| match &c.kind {
+            ControlKind::Choice { options } => Some(options),
+            _ => None,
+        })
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(|o| action_for_option(o.id.as_str()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a definition offers `action`, by wire id.
+///
+/// D0 (#1878): replaces the `question_for` test helper, which reconstructed a
+/// legacy `Question` through the now-deleted reverse adapter purely so a test
+/// could ask "is this action offered". The definition answers that directly.
+#[cfg(test)]
+pub(crate) fn offers(definition: &InteractionDefinition, action: PromptChoice) -> bool {
+    definition.controls.iter().any(|c| match &c.kind {
+        ControlKind::Choice { options } => options.iter().any(|o| o.id.as_str() == action.as_str()),
+        _ => false,
+    })
 }
 
 /// Facade P1b: the production [`danger::DangerTable`] — the built-in
@@ -335,22 +357,35 @@ pub(crate) fn prompt_permission_choice(
 ///
 /// **Deliberately still the adapter.** C0a extracts RENDERING; decoding
 /// stays exactly where B0b-1 put it — `Question::parse`, reached through
-/// the A2.2 adapter — because that is the one implementation of the
-/// canonical-first / alias / ambiguity-denial rules, and it is the half
+/// `newt_interaction::binding::resolve_typed` — the ONE implementation of the
+/// canonical-first / alias / ambiguity-denial rules, and the half
 /// `NewtPolicy.PromptForm`'s Lean theorems and TLA+ `AuthorizationDisplayed`
-/// actually govern (BHV-PROMPT-001). A second decoder written against
-/// `InteractionDefinition` would be a third answer-parsing implementation —
-/// the exact sprawl this epic exists to delete.
+/// govern (BHV-PROMPT-001).
 ///
-/// Fails closed on every branch: an unparseable answer denies, and so does
-/// an unadaptable definition. The latter is unreachable by construction
-/// (`b0a::every_offered_action_is_a_valid_option_id`), and it denies rather
-/// than panicking because this runs with the operator's answer already in
-/// hand — a panic here would take the session down mid-decision.
+/// D0 (#1878) moved that resolution out of `Question::parse` and into the
+/// binding module rather than writing a second decoder against
+/// `InteractionDefinition` — which would have been the third answer-parser
+/// this slice's deletion gate exists to prevent. The rules did not change;
+/// only where they live did, and now one place holds them.
+///
+/// **Fails closed with a CONSTANT, not with a role.** An unresolvable answer
+/// denies, and the deny is `PromptChoice::Deny` written here — never an option
+/// picked out of the definition by looking for `role == Deny`. A definition can
+/// come from untrusted markup and `role` is author-assigned, so deriving the
+/// failure mode from it would hand the author the failure mode (A3).
+///
+/// It denies rather than panicking because this runs with the operator's
+/// answer already in hand; a panic here would take the session down
+/// mid-decision.
 fn decode_answer(definition: &InteractionDefinition, answer: &str) -> PromptChoice {
-    definition_to_question(definition)
-        .ok()
-        .and_then(|form| form.parse(answer))
+    let Some(options) = definition.controls.iter().find_map(|c| match &c.kind {
+        newt_core::ControlKind::Choice { options } => Some(options),
+        _ => None,
+    }) else {
+        return PromptChoice::Deny;
+    };
+    newt_interaction::binding::resolve_typed(options, answer)
+        .and_then(|option| action_for_option(option.as_str()))
         .unwrap_or(PromptChoice::Deny)
 }
 
@@ -665,17 +700,13 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
         // that binds it — so the answer is validated against the offer that
         // was actually published, not one minted at answer time.
         let definition = permission_definition(req, &self.danger, Audience::Web);
-        // The WEB builds its card by reconstructing the legacy form
-        // (`interaction_offer::PendingOffer::question`), so refuse to publish
-        // an offer it could not render — a published-but-unrenderable offer
-        // shows the operator a blank card and then times out. Unreachable by
-        // construction (`b0a::every_offered_action_is_a_valid_option_id`);
-        // fail closed anyway. C0a stopped RENDERING through the adapter; this
-        // is a renderability PRECONDITION, and it retires with C3's removal
-        // of the reconstruction.
-        if definition_to_question(&definition).is_err() {
-            return (PromptChoice::Deny, "web-unavailable");
-        }
+        // D0 (#1878): the renderability precondition that stood here is GONE,
+        // on the authority of its own comment — "this is a renderability
+        // PRECONDITION, and it retires with C3's removal of the
+        // reconstruction". C3c (#1870) removed that reconstruction: the web
+        // builds its card from the `InteractionDefinition` directly, so there
+        // is no longer a legacy form it could fail to reconstruct. The check
+        // was guarding a rendering path that no longer exists.
         let tier = if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
             newt_core::interaction_offer::OfferDanger::High
         } else {
@@ -2116,7 +2147,7 @@ mod permission_prompt_tests {
             (DenialKind::RemoteTool, "remote__tool", "call"),
             (DenialKind::GitWrite, "commit", "commit/stage via git"),
         ] {
-            let q = question_for(
+            let q = permission_definition(
                 &PermissionRequest {
                     tool: "tool".into(),
                     kind,
@@ -2129,11 +2160,8 @@ mod permission_prompt_tests {
             assert!(q.markdown.contains(&format!("{wording} `{target}`")));
         }
 
-        let low = question_for(&exec_request("npm"), &danger, Audience::Terminal);
-        assert!(low
-            .actions
-            .iter()
-            .any(|a| a.value == PromptChoice::AllowSession));
+        let low = permission_definition(&exec_request("npm"), &danger, Audience::Terminal);
+        assert!(offers(&low, PromptChoice::AllowSession));
         assert!(low.markdown.contains("outside the granted exec allowlist"));
 
         let model_authored = PermissionRequest {
@@ -2142,11 +2170,8 @@ mod permission_prompt_tests {
             target: "bash".into(),
             reason: "list the files".into(),
         };
-        let high = question_for(&model_authored, &danger, Audience::Terminal);
-        assert!(!high
-            .actions
-            .iter()
-            .any(|a| a.value == PromptChoice::AllowSession));
+        let high = permission_definition(&model_authored, &danger, Audience::Terminal);
+        assert!(!offers(&high, PromptChoice::AllowSession));
         let text = plain::render(&permission_definition(
             &model_authored,
             &danger,
@@ -2162,7 +2187,7 @@ mod permission_prompt_tests {
             assert!(text.contains(expected), "missing {expected:?}: {text}");
         }
 
-        let root = question_for(
+        let root = permission_definition(
             &PermissionRequest {
                 tool: "request_permissions".into(),
                 kind: DenialKind::FsWrite,
@@ -2173,30 +2198,31 @@ mod permission_prompt_tests {
             Audience::Terminal,
         );
         assert!(root.markdown.contains("filesystem root"));
-        assert!(!root
-            .actions
-            .iter()
-            .any(|a| a.value == PromptChoice::AllowSession));
+        assert!(!offers(&root, PromptChoice::AllowSession));
 
-        let web_low = question_for(&exec_request("npm"), &danger, Audience::Web);
+        let web_low = permission_definition(&exec_request("npm"), &danger, Audience::Web);
         assert_eq!(
-            web_low.actions.iter().map(|a| a.value).collect::<Vec<_>>(),
+            offered_actions(&web_low),
             [
                 PromptChoice::AllowOnce,
                 PromptChoice::AllowSession,
                 PromptChoice::Deny
             ]
         );
+        // D0 (#1878): the wire round trip is the DEFINITION's now — the
+        // legacy `Question` is no longer what the web publishes. A0's frozen
+        // `Question` wire shape is still pinned, in
+        // `markup_sprawl_ratchet::the_question_wire_shape_is_frozen`.
         assert_eq!(
-            serde_json::from_str::<Question<PromptChoice>>(
+            serde_json::from_str::<InteractionDefinition>(
                 &serde_json::to_string(&web_low).unwrap()
             )
             .unwrap(),
             web_low
         );
-        let web_high = question_for(&exec_request("bash"), &danger, Audience::Web);
+        let web_high = permission_definition(&exec_request("bash"), &danger, Audience::Web);
         assert_eq!(
-            web_high.actions.iter().map(|a| a.value).collect::<Vec<_>>(),
+            offered_actions(&web_high),
             [PromptChoice::AllowOnce, PromptChoice::Deny]
         );
     }
@@ -3554,23 +3580,21 @@ mod c0a {
             "the web action matrix changed for a high-danger target"
         );
 
-        // The web card is built from the legacy form the adapter
-        // reconstructs (`interaction_offer::PendingOffer::question`), which
-        // C0a does not touch — C3 owns removing it. Prove it still round
-        // trips, so "the terminal stopped using the adapter" cannot be
-        // mistaken for "the adapter is dead".
+        // D0 (#1878): the web card is no longer built by reconstructing a
+        // legacy form — C3c made it read the definition directly, and the
+        // reverse adapter is deleted. What this test is FOR survives: that
+        // the web matrix is what policy says, independent of the terminal's.
         for definition in [&low, &high] {
-            let question = definition_to_question(definition).expect("the web form still adapts");
-            assert_eq!(question.markdown, definition.markdown);
-            assert_eq!(question.note, definition.note);
             let ControlKind::Choice { options } = &definition.controls[0].kind else {
                 panic!("not a choice");
             };
-            assert_eq!(question.actions.len(), options.len());
-            for (action, option) in question.actions.iter().zip(options) {
-                assert_eq!(action.value.as_str(), option.id.as_str());
-                assert_eq!(action.key, option.key);
-                assert_eq!(action.label, option.label);
+            assert!(!options.is_empty(), "a web offer must offer something");
+            for option in options {
+                assert!(
+                    action_for_option(option.id.as_str()).is_some(),
+                    "every offered option names an action this build knows: {}",
+                    option.id.as_str()
+                );
             }
         }
     }
@@ -3591,8 +3615,7 @@ mod c0a {
 #[cfg(test)]
 mod b0a {
     use super::*;
-    use newt_core::interaction_adapter::question_to_definition;
-    use newt_core::{Action, DenialKind, PermissionRequest};
+    use newt_core::{DenialKind, PermissionRequest};
 
     fn net_low() -> PermissionRequest {
         PermissionRequest {
@@ -3643,13 +3666,15 @@ mod b0a {
                 assert_eq!(definition.kind, InteractionKind::Choice);
                 assert_eq!(definition.controls[0].requirement, Requirement::Required);
 
-                // The rendered form is the adapter's output for exactly
-                // this definition — not a second renderer that happens to
-                // agree.
-                let via_adapter = definition_to_question(&definition).expect("adapts");
+                // D0 (#1878): this compared the definition against the
+                // adapter's reconstruction of it. The reconstruction is
+                // deleted, so the property is stated directly: the ONE
+                // builder is what both surfaces call, and calling it twice
+                // for the same inputs is the same definition.
                 assert_eq!(
-                    question_for(&req, &danger::DangerTable::builtin(), audience.clone()),
-                    via_adapter
+                    permission_definition(&req, &danger::DangerTable::builtin(), audience.clone()),
+                    definition,
+                    "the builder is not a pure function of its inputs"
                 );
             }
         }
@@ -3743,45 +3768,74 @@ mod b0a {
     /// round trip.
     #[test]
     fn an_alias_still_resolves_and_an_ambiguous_answer_is_still_denied() {
-        let with_alias = Question::<PromptChoice> {
-            markdown: "confirm".to_string(),
-            actions: vec![
-                Action::new(PromptChoice::AllowOnce, "y", "yes").with_aliases(["Y"]),
-                Action::new(PromptChoice::Deny, "n", "no").with_aliases(["N"]),
-            ],
-            note: None,
+        // D0 (#1878): asserted through `newt_interaction::binding::resolve_typed`,
+        // which now owns the canonical-first / alias / ambiguity-denial rules.
+        // The general cases live with it (`resolve_typed_tests`); this is the
+        // PERMISSION-surface instance, kept here because it is this surface's
+        // fail-closed behaviour that matters.
+        let opt = |wire: &str, role, key: &str, alias: &str| newt_interaction::ChoiceOption {
+            id: newt_interaction::OptionId::new(wire).expect("valid"),
+            role,
+            label: wire.to_string(),
+            key: key.to_string(),
+            aliases: vec![alias.to_string()],
         };
-        let adapted = definition_to_question(&question_to_definition(&with_alias).expect("adapts"))
-            .expect("back");
-        assert_eq!(adapted.parse("Y"), Some(PromptChoice::AllowOnce));
-        assert_eq!(adapted.parse("n"), Some(PromptChoice::Deny));
+        let with_alias = vec![
+            opt(
+                "allow_once",
+                newt_interaction::SemanticRole::Allow,
+                "y",
+                "Y",
+            ),
+            opt("deny", newt_interaction::SemanticRole::Deny, "n", "N"),
+        ];
+        assert_eq!(
+            newt_interaction::binding::resolve_typed(&with_alias, "Y")
+                .and_then(|o| action_for_option(o.as_str())),
+            Some(PromptChoice::AllowOnce)
+        );
+        assert_eq!(
+            newt_interaction::binding::resolve_typed(&with_alias, "n")
+                .and_then(|o| action_for_option(o.as_str())),
+            Some(PromptChoice::Deny)
+        );
 
-        // Ambiguity still denies: two actions sharing one alias resolve to
+        // Ambiguity still denies: two options sharing one alias resolve to
         // nothing, and the caller's fail-closed default stands.
-        let ambiguous = Question::<PromptChoice> {
-            markdown: "confirm".to_string(),
-            actions: vec![
-                Action::new(PromptChoice::AllowOnce, "y", "yes").with_aliases(["x"]),
-                Action::new(PromptChoice::Deny, "n", "no").with_aliases(["x"]),
-            ],
-            note: None,
-        };
-        let adapted = definition_to_question(&question_to_definition(&ambiguous).expect("adapts"))
-            .expect("back");
-        assert_eq!(adapted.parse("x"), None, "an ambiguous answer resolved");
+        let ambiguous = vec![
+            opt(
+                "allow_once",
+                newt_interaction::SemanticRole::Allow,
+                "y",
+                "x",
+            ),
+            opt("deny", newt_interaction::SemanticRole::Deny, "n", "x"),
+        ];
+        assert_eq!(
+            newt_interaction::binding::resolve_typed(&ambiguous, "x"),
+            None,
+            "an ambiguous answer resolved"
+        );
 
         // And the real permission menu still parses its own keys.
-        let menu = question_for(
+        let menu = permission_definition(
             &net_low(),
             &danger::DangerTable::builtin(),
             Audience::Terminal,
         );
-        assert_eq!(menu.parse("a"), Some(PromptChoice::AllowOnce));
-        assert_eq!(menu.parse("A"), Some(PromptChoice::AllowPermanent));
-        assert_eq!(menu.parse("zzz"), None);
+        let resolve = |input: &str| {
+            let ControlKind::Choice { options } = &menu.controls[0].kind else {
+                panic!("not a choice");
+            };
+            newt_interaction::binding::resolve_typed(options, input)
+                .and_then(|o| action_for_option(o.as_str()))
+        };
+        assert_eq!(resolve("a"), Some(PromptChoice::AllowOnce));
+        assert_eq!(resolve("A"), Some(PromptChoice::AllowPermanent));
+        assert_eq!(resolve("zzz"), None);
     }
 
-    /// The `expect`s in `permission_definition` and `question_for` are
+    /// The `expect`s in `permission_definition` are
     /// unreachable rather than merely unlikely: every combination this
     /// policy can produce builds and adapts.
     #[test]
@@ -3805,9 +3859,19 @@ mod b0a {
                 };
                 let definition = definition_of(&req, audience.clone());
                 assert!(!offered(&definition).is_empty());
-                definition_to_question(&definition).unwrap_or_else(|e| {
-                    panic!("{kind:?}/{target}/{audience:?} did not adapt: {e}")
-                });
+                // D0 (#1878): "does it adapt" became "does every offered
+                // option name an action this build knows" — the property the
+                // adapter's error arm actually stood for, asserted without it.
+                let ControlKind::Choice { options } = &definition.controls[0].kind else {
+                    panic!("{kind:?}/{target}/{audience:?} is not a choice");
+                };
+                for option in options {
+                    assert!(
+                        action_for_option(option.id.as_str()).is_some(),
+                        "{kind:?}/{target}/{audience:?} offers unknown option {}",
+                        option.id.as_str()
+                    );
+                }
             }
         }
     }
