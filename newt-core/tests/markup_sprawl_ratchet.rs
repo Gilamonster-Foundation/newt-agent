@@ -350,7 +350,12 @@ const CATEGORIES: &[Category] = &[
             //
             // D1b then took it 23 -> 19: the four `console.ask_secret` sites
             // are gone, funnelled into the ONE below.
-            ("newt-tui/src/setup/mod.rs", 19),
+            //
+            // D1b-2 (#1903) took it 19 -> 13: four free-text prompts and two
+            // `[Y/n]` decisions now build `InteractionDefinition`s and go out
+            // through `Console::ask_definition`, which is armed separately
+            // below rather than being allowed to vanish on a rename.
+            ("newt-tui/src/setup/mod.rs", 13),
             // **A funnel, not a duplicate** — the justification the category
             // asks for. Four hidden prompts became one
             // `credentials::ask_secret`, which builds a `ControlKind::Secret`
@@ -375,6 +380,25 @@ const CATEGORIES: &[Category] = &[
         rationale: "interactive ask/answer call sites outside the typed \
                     Question path; D0/D1 fold these into controller-backed \
                     forms",
+    },
+    Category {
+        name: "definition-bridge asks",
+        // `console.ask_definition(` does NOT match the needles above — the
+        // `_` after `ask` stops `console.ask(` matching — so a site that
+        // migrates to it drops out of "console ask sites" silently. That
+        // would let a rename read as progress, which is gaming the gate, so
+        // the bridge is armed here instead of disappearing.
+        //
+        // It is a genuinely different thing from the row above: a caller of
+        // this has ALREADY modelled its prompt as an `InteractionDefinition`
+        // and the terminal adapter derives `Echo` from the controls. It is
+        // the typed path, reached through a trait that has not gone yet.
+        count: |f| count_sites(&f.squeezed, "console.ask_definition("),
+        baseline: &[("newt-tui/src/setup/mod.rs", 5)],
+        rationale: "the D1b migration bridge: prompts already modelled as \
+                    definitions, still delivered through the `Console` trait. \
+                    It reaches 0 when D1b-3 retires the trait for C1's seam — \
+                    these sites then pass a `SurfaceInteraction` directly",
     },
     Category {
         name: "prompt confirm helpers",
