@@ -22,26 +22,33 @@ pub const DEFINITION_SCHEMA_V1: &str = "newt.interaction.definition/v1";
 pub enum InteractionKind {
     /// Pick one of a fixed, displayed set — today's `Question<A>`.
     ///
-    /// NOT a two-option yes/no: that is [`InteractionKind::Confirm`], and the
-    /// boundary is enforced rather than described — see
-    /// [`InteractionDefinition::is_decision_shaped`].
+    /// Not a two-option yes/no: that is [`InteractionKind::Confirm`].
     Choice,
     /// Free text.
     Prompt,
-    /// A yes/no decision: one choice control, two options, one granting and
-    /// one refusing or backing out.
+    // WHY THIS EXISTS BESIDE `Choice`, and why the boundary is enforced
+    // (#1912). A `//` comment, not a doc comment, DELIBERATELY: these docs are
+    // rendered into `schema/definition.schema.json` by schemars and read by
+    // non-Rust consumers, so the published description should state the
+    // contract and not this repo's incident history.
+    //
+    // Until the guard existed, the tree declared the same decision-shaped
+    // interaction under both kinds — `agentic::tools`'s mutation confirm and
+    // `interaction_adapter` and the permission builder as `Choice`,
+    // `interaction_form::confirm` as `Confirm`. C0c was the first slice to try
+    // to vary behaviour by the kind and had to go unconditional instead.
+    //
+    // `Confirm` is NOT redundant with `Choice`: a lone `ControlKind::Toggle`
+    // is a yes/no, and `Choice` means "pick one of a fixed, DISPLAYED set",
+    // which a toggle has none of. Two shapes, one intent, and the kind is what
+    // unifies them. See `InteractionDefinition::is_decision_shaped` for which
+    // direction is enforceable and why the other is not.
+    /// A yes/no decision — proceed or not.
     ///
-    /// **This is the canonical form, and the boundary with [`Choice`] is a
-    /// GUARD, not a convention (#1912).** Until it was, the tree declared the
-    /// same decision-shaped interaction under both kinds —
-    /// `agentic::tools`'s mutation confirm as `Choice`,
-    /// `interaction_form::confirm` as `Confirm` — which made the kind useless
-    /// as a discriminator. C0c was the first slice to try to vary behaviour by
-    /// it and had to go unconditional instead.
-    ///
-    /// The rule keys on ROLES, not on the option count: `python | rust` is a
-    /// two-option choice and is not a decision; `Allow` + `Deny` is one
-    /// whatever its labels say.
+    /// Carried either by a single toggle, or by one choice control offering
+    /// exactly two options where one grants and the other refuses or backs
+    /// out. The distinction from [`InteractionKind::Choice`] is the ROLES the
+    /// options carry, never how many there are.
     Confirm,
     /// A multi-field form.
     Form,
