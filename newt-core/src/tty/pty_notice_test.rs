@@ -145,6 +145,61 @@ fn legacy_notice_under_prompt_window_child() {
     drop(spinner);
 }
 
+/// **#1866, in vivo.** A real process in protocol mode reaching a real
+/// prompt on a real terminal.
+///
+/// This scenario cannot be written in-process. `enter_protocol_mode` is
+/// documented as "idempotent and one-way — there is no leaving it", and the
+/// flag is process-global, so setting it in a unit test would veto every
+/// sibling test's notice and lease for the rest of the binary. A child is not
+/// a convenience here; it is the only place the real flag can be set.
+///
+/// The child asserts the refusals it gets. The parent asserts the two halves
+/// of the epic criterion the child cannot see: that NOTHING reached the
+/// terminal, and that the process did not WAIT.
+#[test]
+#[ignore = "child process of the notice/arbiter regression test"]
+fn protocol_mode_prompt_child() {
+    if std::env::var_os("NEWT_NOTICE_PTY_CHILD").as_deref() != Some("protocol".as_ref()) {
+        return;
+    }
+    super::caps::enter_protocol_mode();
+
+    let window = Terminal::suspend_for_prompt();
+
+    // Deliberately NOT asserted yet. Asserting here would short-circuit the
+    // child on the very mutation this test exists to catch, and the parent
+    // would never reach the half that matters: with the veto removed, `ask`
+    // succeeds, and the read below BLOCKS on a pty nobody will ever type into.
+    // Ordering the read first is what makes the parent's `exited` assertion
+    // load-bearing rather than decorative.
+    let asked = window.ask(QUESTION);
+
+    // The half that would HANG. It must come back immediately, and as an error
+    // rather than the `Ok(0)` that would forge a deliberate empty answer.
+    let mut buf = String::new();
+    let read = window.read_line_into(&mut buf);
+
+    assert!(
+        asked.is_err(),
+        "ask must refuse in protocol mode rather than report a question it \
+         never put on screen"
+    );
+    assert!(read.is_err(), "read must refuse, not return EOF: {read:?}");
+    assert!(
+        buf.is_empty(),
+        "nothing may be written into the caller's buffer"
+    );
+
+    // A notice is informational and is dropped silently — `Notice::emit`'s
+    // documented protocol-mode behaviour, and the reason `ask` and `notice`
+    // deliberately differ.
+    window
+        .notice(NOTICE_TEXT)
+        .expect("a dropped notice is not an error");
+    drop(window);
+}
+
 // ---------------------------------------------------------------------------
 // The parent: allocate the pty, drive a child, read the screen.
 // ---------------------------------------------------------------------------
@@ -304,5 +359,85 @@ fn the_legacy_unleased_notice_did_overwrite_the_question() {
         window.contains("\x1b[K"),
         "the control no longer reproduces the bug, so the migrated path's \
          assertion proves nothing.\n\nwindow:\n{window:?}"
+    );
+}
+// ---------------------------------------------------------------------------
+// (c) #1866 — the protocol-mode veto, proved in vivo
+// ---------------------------------------------------------------------------
+
+/// Drive a scenario with a BOUNDED wait, so "the child blocked" is a failure
+/// rather than a hung suite. Returns the screen and whether it exited in time.
+fn run_scenario_bounded(scenario: &str, child_test: &str, budget: Duration) -> (String, bool) {
+    let pty = Pty::open();
+    let mut child = std::process::Command::new(
+        std::env::current_exe().expect("the test binary re-invokes itself"),
+    )
+    .args(["--exact", child_test, "--ignored", "--nocapture"])
+    .env("NEWT_NOTICE_PTY_CHILD", scenario)
+    .stdin(pty.slave_stdio())
+    .stdout(pty.slave_stdio())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .expect("spawn the pty child");
+
+    let deadline = std::time::Instant::now() + budget;
+    let mut screen = String::new();
+    let exited = loop {
+        screen.push_str(&pty.screen());
+        match child.try_wait().expect("poll the pty child") {
+            Some(status) => {
+                assert!(
+                    status.success(),
+                    "the {scenario} scenario child failed.\n\nscreen:\n{screen:?}"
+                );
+                break true;
+            }
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    screen.push_str(&pty.screen());
+    (screen, exited)
+}
+
+/// **The #1866 proof.** Epic #1803: headless/protocol modes never wait, choose
+/// defaults, or emit terminal bytes. A prompt is all three, so this asserts
+/// both observable halves against a real terminal.
+///
+/// The CONTROL is `a_notice_emitted_under_a_prompt_window_does_not_overwrite_the_question`
+/// above, which drives the SAME `suspend_for_prompt` -> `ask(QUESTION)` path with
+/// flag unset and asserts the question DOES reach the pty. Without it, "the
+/// question is absent" would be satisfied by a build where prompts never
+/// worked at all — and asserting today's behaviour is exactly the vacuity this
+/// issue is about, since today's behaviour is already correct for the wrong
+/// reason (no protocol-mode caller happens to reach a prompt).
+/// Serial and un-ignored, like every other parent in this module: it drives
+/// the process-global arbiter through a child, and #1866's whole complaint is
+/// that nothing checked this per-PR.
+#[serial_test::serial(tty_arbiter)]
+#[test]
+fn protocol_mode_emits_no_prompt_bytes_and_does_not_wait() {
+    let (screen, exited) = run_scenario_bounded(
+        "protocol",
+        "tty::pty_notice_test::protocol_mode_prompt_child",
+        Duration::from_secs(20),
+    );
+
+    assert!(
+        exited,
+        "the protocol-mode child BLOCKED. `read_line` waited for an operator \
+         who cannot exist on a JSON-RPC wire.\n\nscreen:\n{screen:?}"
+    );
+    assert!(
+        !screen.contains(QUESTION),
+        "the question reached a machine protocol channel.\n\nscreen:\n{screen:?}"
+    );
+    assert!(
+        !screen.contains(NOTICE_TEXT),
+        "a notice reached a machine protocol channel.\n\nscreen:\n{screen:?}"
     );
 }
