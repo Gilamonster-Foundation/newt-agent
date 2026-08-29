@@ -308,14 +308,22 @@ const CATEGORIES: &[Category] = &[
         },
         baseline: &[
             // THE one table algorithm (D3a, #1874) — the destination, listed
-            // deliberately rather than named around the needle. A migrating
+            // deliberately rather than named around the needle. A migrated
             // family's row disappears from this table; this row is what it
             // migrates ONTO, and it is the row that must stay at exactly 1.
             ("newt-core/src/markup/table.rs", 1),
             ("newt-core/src/agentic/markdown/table.rs", 1),
-            ("newt-eval/src/scorecard.rs", 1),
+            // `newt-eval/src/scorecard.rs` was here at 1 until D3a: its
+            // bespoke fixed-width renderer is deleted, and the type now
+            // supplies rows to the algorithm above through `fmt::Display`.
+            // Counts a BINDING, not an implementation: pyo3's `render_table`
+            // is `self.inner.to_string()`, one line, and A0 §4.1.4 calls it
+            // "pyo3 exposure". The needle cannot tell a binding from a
+            // renderer; a reader of this table should.
             ("newt-eval/src/pyo3_module.rs", 1),
             // Both cfg(feature) arms of the same fn — production either way.
+            // A0 §4.1.2: ZERO production callers, and the decision to delete
+            // or wire it must consult wyvern-agent, so D3a leaves it.
             ("newt-core/src/agentic/mod.rs", 2),
             ("newt-tui/src/config_panel.rs", 1),
             ("newt-web/src/shell.rs", 1),

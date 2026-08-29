@@ -4,9 +4,11 @@
 //! They are deliberately Plain Old Data — `Serialize` so a CI run can dump
 //! them as JSON, `Debug` for `cargo test` output.
 
+use std::fmt;
 use std::path::PathBuf;
 
 use newt_acp_worker::TaskReply;
+use newt_core::markup::table::{render_table, Align, Column};
 use serde::{Deserialize, Serialize};
 
 use crate::cases::TestCase;
@@ -108,43 +110,59 @@ impl Scorecard {
         !self.cases.is_empty() && self.cases.iter().all(CaseScorecard::all_passed)
     }
 
-    /// Render a fixed-width text table suitable for stdout. The output is
-    /// deterministic so snapshot tests can use it.
-    pub fn render_table(&self) -> String {
-        let mut out = String::new();
-        out.push_str("case                          evaluator         pass  score  details\n");
-        out.push_str("----------------------------  ----------------  ----  -----  -------\n");
-        for case in &self.cases {
-            for r in &case.results {
-                let case_name = truncate(&case.case_name, 28);
-                let ev = truncate(&r.evaluator, 16);
-                let pass = if r.passed { "ok" } else { "FAIL" };
-                let details = truncate(&r.details.replace('\n', " "), 60);
-                out.push_str(&format!(
-                    "{case_name:<28}  {ev:<16}  {pass:<4}  {:>5.2}  {details}\n",
-                    r.score
-                ));
-            }
-        }
-        if self.cases.is_empty() {
-            out.push_str("(no cases)\n");
-        }
-        out
+    /// The scorecard's rows — one per (case, evaluator) result.
+    ///
+    /// DATA, not presentation: [`fmt::Display`] hands these to the one table
+    /// algorithm. Keeping the two separable is what stops a second
+    /// scorecard-shaped renderer growing beside this one (epic #1803, law 10).
+    fn table_rows(&self) -> Vec<Vec<String>> {
+        self.cases
+            .iter()
+            .flat_map(|case| {
+                case.results.iter().map(move |r| {
+                    vec![
+                        case.case_name.clone(),
+                        r.evaluator.clone(),
+                        if r.passed { "ok" } else { "FAIL" }.to_string(),
+                        format!("{:.2}", r.score),
+                        r.details.clone(),
+                    ]
+                })
+            })
+            .collect()
     }
 }
 
-/// Truncate `s` to at most `max` characters (NOT bytes), appending `…`
-/// when truncation happens. Operates on chars to avoid slicing inside a
-/// multi-byte codepoint (which would panic).
-fn truncate(s: &str, max: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max {
-        return s.to_string();
+/// The scorecard's columns.
+///
+/// The caps are content policy, not layout — a 200-character evaluator detail
+/// is not worth a 200-cell column — and they are the SAME caps the hand-rolled
+/// renderer carried (28 / 16 / 60), now counted in display CELLS instead of
+/// chars. That is the fix, not a side effect: the old `truncate` capped by
+/// char and the `{:<28}` pad that followed measured the same string a third
+/// way, so a CJK case name overflowed the column it had just been cut to fit.
+fn table_columns() -> Vec<Column> {
+    vec![
+        Column::new("case").max_width(28),
+        Column::new("evaluator").max_width(16),
+        Column::new("pass"),
+        Column::new("score").align(Align::Right),
+        Column::new("details").max_width(60),
+    ]
+}
+
+impl fmt::Display for Scorecard {
+    /// A GFM pipe table through the one table algorithm (D3a, #1874).
+    ///
+    /// This replaced a bespoke fixed-width renderer. The byte diff is
+    /// intentional and pinned by `the_scorecard_table_is_byte_exact_gfm`.
+    /// Still deterministic, so snapshot tests can use it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.cases.is_empty() {
+            return writeln!(f, "(no cases)");
+        }
+        f.write_str(&render_table(&table_columns(), &self.table_rows()))
     }
-    let keep = max.saturating_sub(1);
-    let mut out: String = s.chars().take(keep).collect();
-    out.push('…');
-    out
 }
 
 #[cfg(test)]
@@ -239,6 +257,65 @@ mod tests {
         assert!(!s.all_passed());
     }
 
+    /// **The intentional diff (D3a, #1874).** The scorecard was a bespoke
+    /// fixed-width table; it is now a GFM pipe table from the one algorithm.
+    /// These are the exact new bytes — the old ones are quoted in the PR body.
+    #[test]
+    fn the_scorecard_table_is_byte_exact_gfm() {
+        let mut s = Scorecard::new();
+        s.push(CaseScorecard {
+            case_name: "001-foo".into(),
+            results: vec![EvalResult::pass("diff_nonempty", "all good")],
+        });
+        s.push(CaseScorecard {
+            case_name: "002-bar".into(),
+            results: vec![EvalResult::fail("diff_nonempty", "boom")],
+        });
+        assert_eq!(
+            s.to_string(),
+            "\
+| case    | evaluator     | pass | score | details  |
+| ------- | ------------- | ---- | ----: | -------- |
+| 001-foo | diff_nonempty | ok   |  1.00 | all good |
+| 002-bar | diff_nonempty | FAIL |  0.00 | boom     |
+"
+        );
+    }
+
+    /// A detail string carrying a shell pipeline used to be pasted into a
+    /// fixed-width row, where a `|` was just a character. In a pipe table an
+    /// unescaped `|` FORGES A COLUMN — the row still renders, with the wrong
+    /// data in the wrong columns. Reachable from any evaluator that quotes a
+    /// command it ran.
+    #[test]
+    fn a_pipe_in_a_detail_cannot_forge_a_column() {
+        let mut s = Scorecard::new();
+        s.push(CaseScorecard {
+            case_name: "c".into(),
+            results: vec![EvalResult::fail("ev", "ran `grep x | wc -l`")],
+        });
+        let table = s.to_string();
+        assert!(
+            table.contains("`grep x \\| wc -l`"),
+            "the pipe must be escaped: {table:?}"
+        );
+        // An escaped pipe is CONTENT: it must not be counted as a column
+        // boundary, which is exactly the confusion the escape prevents.
+        let unescaped_pipes = |line: &str| {
+            let b = line.as_bytes();
+            (0..b.len())
+                .filter(|&i| b[i] == b'|' && (i == 0 || b[i - 1] != b'\\'))
+                .count()
+        };
+        for line in table.lines() {
+            assert_eq!(
+                unescaped_pipes(line),
+                6,
+                "five columns means six boundaries, escaped pipes aside: {line:?}"
+            );
+        }
+    }
+
     #[test]
     fn render_table_has_header_and_rows() {
         let mut s = Scorecard::new();
@@ -246,7 +323,7 @@ mod tests {
             case_name: "001-foo".into(),
             results: vec![EvalResult::pass("diff_nonempty", "all good")],
         });
-        let table = s.render_table();
+        let table = s.to_string();
         assert!(table.contains("case "));
         assert!(table.contains("001-foo"));
         assert!(table.contains("diff_nonempty"));
@@ -256,7 +333,7 @@ mod tests {
     #[test]
     fn render_table_empty() {
         let s = Scorecard::new();
-        let table = s.render_table();
+        let table = s.to_string();
         assert!(table.contains("(no cases)"));
     }
 
@@ -273,7 +350,7 @@ mod tests {
             )],
         });
         // Must not panic.
-        let _ = s.render_table();
+        let _ = s.to_string();
     }
 
     #[test]
@@ -283,7 +360,7 @@ mod tests {
             case_name: "x".repeat(50),
             results: vec![EvalResult::pass("evaluator", "details")],
         });
-        let table = s.render_table();
+        let table = s.to_string();
         // The first column is capped at 28 chars + ellipsis.
         assert!(table.contains("…"));
     }

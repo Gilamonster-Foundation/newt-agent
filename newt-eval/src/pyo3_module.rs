@@ -304,7 +304,7 @@ impl PyScorecard {
     }
 
     fn render_table(&self) -> String {
-        self.inner.render_table()
+        self.inner.to_string()
     }
 
     #[getter]

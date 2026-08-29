@@ -263,7 +263,7 @@ fn grade_command(args: GradeArgs) -> Result<RunOutcomeStatus> {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&scorecard)?);
     } else {
-        print!("{}", scorecard.render_table());
+        print!("{scorecard}");
     }
     Ok(if scorecard.all_passed() {
         RunOutcomeStatus::AllPassed
@@ -443,7 +443,7 @@ async fn run_command(args: RunArgs) -> Result<RunOutcomeStatus> {
         });
     }
 
-    print!("{}", scorecard.render_table());
+    print!("{scorecard}");
     Ok(classify_outcome(&scorecard, legacy_exit_codes))
 }
 
