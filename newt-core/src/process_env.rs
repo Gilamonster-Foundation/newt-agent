@@ -191,6 +191,25 @@ mod tests {
     }
 
     /// …and excludes every other thread, which is the half that fixes #1850.
+    ///
+    /// Deterministic: THIS thread holds the lock, so no other one can take it,
+    /// whatever the scheduler does with the rest of the suite.
+    ///
+    /// There is deliberately **no** `drop(held)` + "another thread can get in
+    /// now" probe. It reads as the obvious second half and it is unassertable
+    /// here (#1872): between the drop and the probe, any sibling holding the
+    /// process-wide lock — `test_guard::GlobalSettingsGuard`, or any test
+    /// driving a production writer — makes `try_lock` return `None`, and the
+    /// assertion fails for a reason with nothing to do with this module.
+    /// Measured on `main`: 0/40 runs at the default thread count, 6/20 at
+    /// `--test-threads=128`, **11/15 at 256** — sibling contention, dialled.
+    ///
+    /// Release is covered instead by `the_lock_is_reentrant_on_one_thread`,
+    /// thread-locally and without a race. That leaves exactly one sliver: the
+    /// inner `parking_lot` guard leaking while `DEPTH` still decrements. It is
+    /// not worth a probe — reached only by deliberately suppressing the drop
+    /// glue, and it wedges the whole test binary (verified: 9s run, still hung
+    /// at 90s) rather than passing silently.
     #[test]
     fn the_lock_excludes_other_threads() {
         let held = lock();
@@ -199,10 +218,6 @@ mod tests {
             .expect("probe thread");
         assert!(!taken, "another thread must not enter the environment");
         drop(held);
-        let taken = std::thread::spawn(|| try_lock().is_some())
-            .join()
-            .expect("probe thread");
-        assert!(taken, "and must get in once the holder releases");
     }
 
     /// `set_or_remove` is the two arms as one call, so they cannot drift.
