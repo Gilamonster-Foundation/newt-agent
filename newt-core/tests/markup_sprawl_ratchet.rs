@@ -342,12 +342,24 @@ const CATEGORIES: &[Category] = &[
         },
         baseline: &[
             // D1b-0 (#1892) split `setup.rs` into `setup/{mod,commit,tests}.rs`.
-            // This row is REPOINTED, not lowered: all 23 sites moved intact to
+            // The row was REPOINTED, not lowered: all 23 sites moved intact to
             // `mod.rs` (the extracted transaction engine has no console at
             // all). The ratchet reported the old path as "Progress! Remove its
             // baseline row" — it cannot tell a rename from a deletion, and
             // taking that advice would have dropped a floor that never moved.
-            ("newt-tui/src/setup/mod.rs", 23),
+            //
+            // D1b then took it 23 -> 19: the four `console.ask_secret` sites
+            // are gone, funnelled into the ONE below.
+            ("newt-tui/src/setup/mod.rs", 19),
+            // **A funnel, not a duplicate** — the justification the category
+            // asks for. Four hidden prompts became one
+            // `credentials::ask_secret`, which builds a `ControlKind::Secret`
+            // definition and reads it through C1's seam; the console call that
+            // remains is the TEST INJECTION POINT the scripted wizard drives,
+            // and it goes out through `present_on_terminal` like every other
+            // prompt. It reaches 0 when D1b-2/3 thread the seam and the
+            // `Console` trait goes.
+            ("newt-tui/src/setup/credentials.rs", 1),
             // D1a (#1885) ratcheted `newt-tui/src/crew_form.rs` off this
             // table entirely: its 7 `console.ask(` sites became one
             // `InteractionDefinition` state machine driven through C1's
