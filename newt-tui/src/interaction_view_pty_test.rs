@@ -33,7 +33,7 @@
 
 use std::time::{Duration, Instant};
 
-use tests_pty::Pty;
+use tests_pty::{signal_winch, Pty};
 
 use crate::interaction_view::InlineGuard;
 use crate::prompt_visibility_test::wait_for_child;
@@ -106,8 +106,253 @@ fn interaction_view_child() {
             } // inner drops here; the OUTER frame is still up.
             hold();
         }
+        // **The real renderer, not a bare guard.** `present` owns the inline
+        // viewport, polls events, redraws on resize, and answers on an
+        // accelerator — so resize and narrow-width are exercised against the
+        // production loop rather than against a fixture that merely holds
+        // raw mode.
+        "present" => {
+            let interaction = fixture_interaction();
+            let outcome =
+                crate::interaction_view::present(&interaction).expect("the frame runs and returns");
+            // Printed AFTER the guard has dropped and erased the region, so
+            // the parent can distinguish "answered" from "still drawing".
+            println!("OUTCOME:{outcome:?}");
+        }
         other => panic!("unknown child mode {other:?}"),
     }
+}
+
+/// A permission-shaped interaction with labels long enough that a narrow
+/// terminal must wrap them.
+fn fixture_interaction() -> newt_core::interaction_surface::SurfaceInteraction {
+    use newt_interaction::{
+        ChoiceOption, Control, ControlId, ControlKind, InteractionDefinition, InteractionKind,
+        OptionId, Requirement, SemanticRole,
+    };
+    let option = |id: &str, key: &str, label: &str| ChoiceOption {
+        id: OptionId::new(id).expect("valid option id"),
+        role: SemanticRole::Allow,
+        label: label.to_string(),
+        key: key.to_string(),
+        aliases: Vec::new(),
+    };
+    let mut definition = InteractionDefinition::new(
+        InteractionKind::Choice,
+        "\u{2298} run_command wants to run `bash` \u{2014} outside the granted exec allowlist.",
+        vec![Control {
+            id: ControlId::new("decision").expect("valid control id"),
+            kind: ControlKind::Choice {
+                options: vec![
+                    option("allow_once", "a", "allow once"),
+                    option("deny", "d", "deny (default)"),
+                ],
+            },
+            label: String::new(),
+            requirement: Requirement::Required,
+        }],
+    );
+    definition.note = Some("Esc=back \u{b7} Ctrl-C/Ctrl-D=exit".into());
+    newt_core::interaction_surface::SurfaceInteraction::blocking(definition)
+}
+
+/// Answer a Device Status Report if the child asked for one.
+///
+/// `ratatui`'s `Viewport::Inline` asks the terminal where the cursor is
+/// (`ESC[6n`) so it knows which rows it may own, and it waits for the reply.
+/// A bare pty has no emulator behind it, so nothing answers and the frame
+/// never initialises — which is precisely the class of thing only a real-PTY
+/// test finds. The parent holds the master fd, so answering is its job.
+/// `answered` counts the replies already sent FOR THIS SEGMENT, and each
+/// segment's buffer starts empty — so it must be reset per segment. A
+/// cumulative counter compared against a per-segment count silently stops
+/// answering: the post-resize query then goes unanswered and the child dies
+/// with "The cursor position could not be read within a normal duration",
+/// which is how this was found.
+fn answer_cursor_report(pty: &Pty, screen: &str, answered: &mut usize) {
+    // EVERY query, not just the first: a resize makes the viewport re-ask,
+    // and a latch that answered once left the frame waiting forever on the
+    // second.
+    let asked = screen.matches("\u{1b}[6n").count();
+    while *answered < asked {
+        // Row 1, column 1: the frame is entered at a known-clean row because
+        // `suspend_for_prompt` has erased every ephemeral writer first.
+        pty.type_in("\u{1b}[1;1R");
+        *answered += 1;
+    }
+}
+
+/// Lines libtest itself printed, which share the pty with the frame.
+///
+/// The child runs under `--nocapture` so its `OUTCOME:` marker reaches the
+/// parent, and libtest's own progress lines come with it. A width assertion
+/// that measured those would be testing libtest's formatting, not the frame's
+/// — and would fail for a reason that has nothing to do with the property.
+fn is_harness_noise(line: &str) -> bool {
+    let t = line.trim();
+    t.is_empty()
+        || t.starts_with("running ")
+        || t.starts_with("test ")
+        || t.starts_with("test result:")
+        || t.starts_with("failures")
+        || t.starts_with("OUTCOME:")
+        || t.starts_with("interaction_view_pty_test::")
+        || t.starts_with("note: ")
+        || t.starts_with("thread '")
+}
+
+/// The screen as a GRID, by applying cursor positioning rather than stripping it.
+///
+/// This exists because the first cut of the width assertion was wrong in a way
+/// worth recording: `ratatui` does not emit padding, it MOVES the cursor
+/// (`ESC[1;3H`) and prints a fragment. Stripping escapes therefore
+/// concatenates every fragment onto one line — `⊘run_commandwantstorun…` —
+/// and a width check over that measures nothing about the screen. Only by
+/// honouring `CUP` does "no line exceeds the terminal width" become a claim
+/// about what the operator sees.
+///
+/// Deliberately tiny: `CUP`, `\r`, `\n`, and printable text. Anything else is
+/// consumed and ignored, which is sound here because the assertions are about
+/// WHERE text lands, not how it is coloured.
+fn screen_grid(screen: &str) -> Vec<String> {
+    let mut grid: Vec<Vec<char>> = Vec::new();
+    let (mut row, mut col) = (0usize, 0usize);
+    let put = |grid: &mut Vec<Vec<char>>, row: usize, col: usize, ch: char| {
+        while grid.len() <= row {
+            grid.push(Vec::new());
+        }
+        let line = &mut grid[row];
+        while line.len() <= col {
+            line.push(' ');
+        }
+        line[col] = ch;
+    };
+    let mut chars = screen.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' => {
+                row += 1;
+                col = 0;
+            }
+            '\r' => col = 0,
+            '\u{1b}' => match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    let mut params = String::new();
+                    let mut final_byte = '\0';
+                    for f in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&f) {
+                            final_byte = f;
+                            break;
+                        }
+                        params.push(f);
+                    }
+                    if final_byte == 'H' {
+                        // CUP is 1-based, and an omitted parameter is 1.
+                        let mut it = params.split(';');
+                        let r: usize = it.next().unwrap_or("").parse().unwrap_or(1);
+                        let c2: usize = it.next().unwrap_or("").parse().unwrap_or(1);
+                        row = r.saturating_sub(1);
+                        col = c2.saturating_sub(1);
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(f) = chars.next() {
+                        if f == '\u{7}' || (f == '\u{1b}' && chars.peek() == Some(&'\\')) {
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            },
+            printable if !printable.is_control() => {
+                put(&mut grid, row, col, printable);
+                col += 1;
+            }
+            _ => {}
+        }
+    }
+    grid.into_iter()
+        .map(|l| l.into_iter().collect::<String>().trim_end().to_string())
+        .collect()
+}
+
+/// Visible text with CSI/OSC sequences removed, one entry per screen line.
+///
+/// Used only where POSITION does not matter (presence of a marker). Width
+/// assertions use [`screen_grid`] instead — see its doc for why.
+#[allow(dead_code)]
+fn visible_lines(screen: &str) -> Vec<String> {
+    let mut out = String::new();
+    let mut chars = screen.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            // CSI: parameters/intermediates, then a final byte in @..~
+            Some('[') => {
+                chars.next();
+                for f in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&f) {
+                        break;
+                    }
+                }
+            }
+            // OSC: runs to BEL or ST
+            Some(']') => {
+                chars.next();
+                while let Some(f) = chars.next() {
+                    if f == '\u{7}' || (f == '\u{1b}' && chars.peek() == Some(&'\\')) {
+                        break;
+                    }
+                }
+            }
+            _ => {
+                chars.next();
+            }
+        }
+    }
+    out.replace('\r', "\n")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Spawn the child in `mode`, with fd 0/1 on `pty`.
+///
+/// **The ONE spawn site in this file, deliberately.** Three drivers need a
+/// child (a simple lifecycle, a nested one, and the real `present` loop) and
+/// each began as its own spawn call. That is three copies of one trust
+/// decision, and `docs/security/spawn-inventory.toml` counts occurrences per
+/// file — so it would have been three things to justify and three places for
+/// them to drift apart. One helper keeps the inventory entry at a count of
+/// one and makes the justification cover exactly one shape:
+///
+/// (Note for whoever edits this doc: `scripts/spawn_inventory.py` matches its
+/// needle over raw file text without stripping comments, so writing the
+/// spawn-constructor's name in prose here counts as a second site and fails
+/// the gate. Bumping the allowlist to accommodate a comment would be the
+/// wrong fix — it would reserve room for a real spawn nobody reviewed.)
+///
+/// re-execute THIS test binary (`std::env::current_exe`) with an `--exact`
+/// filter so the child runs one ignored `#[test]` with fd 0/1 on a pty. Fixed
+/// argv, no shell, no attacker- or model-controlled input; the child is the
+/// binary cargo just built, so it cannot be stale or foreign.
+fn spawn_child(pty: &Pty, mode: &str) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().expect("the test binary re-invokes itself"))
+        .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
+        .env("NEWT_INTERACTION_PTY_CHILD", mode)
+        .env("TERM", "xterm-256color")
+        .stdin(pty.slave_stdio())
+        .stdout(pty.slave_stdio())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the pty child")
 }
 
 /// Everything the parent needs to judge one lifecycle.
@@ -121,16 +366,7 @@ struct Outcome {
 
 fn drive(mode: &str) -> Outcome {
     let pty = Pty::open();
-    let mut child = std::process::Command::new(
-        std::env::current_exe().expect("the test binary re-invokes itself"),
-    )
-    .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
-    .env("NEWT_INTERACTION_PTY_CHILD", mode)
-    .stdin(pty.slave_stdio())
-    .stdout(pty.slave_stdio())
-    .stderr(std::process::Stdio::null())
-    .spawn()
-    .expect("spawn the pty child");
+    let mut child = spawn_child(&pty, mode);
 
     // There is no alternate-screen byte to poll for — this surface
     // deliberately never enters one — so the reach condition IS the kernel
@@ -186,16 +422,7 @@ struct NestedOutcome {
 /// Drive the nested lifecycle, sampling in the window between the two drops.
 fn drive_nested() -> NestedOutcome {
     let pty = Pty::open();
-    let mut child = std::process::Command::new(
-        std::env::current_exe().expect("the test binary re-invokes itself"),
-    )
-    .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
-    .env("NEWT_INTERACTION_PTY_CHILD", "nested")
-    .stdin(pty.slave_stdio())
-    .stdout(pty.slave_stdio())
-    .stderr(std::process::Stdio::null())
-    .spawn()
-    .expect("spawn the pty child");
+    let mut child = spawn_child(&pty, "nested");
 
     let raw_during_outer = {
         let deadline = Instant::now() + REACH_TIMEOUT;
@@ -338,4 +565,183 @@ fn a_nested_frame_does_not_restore_the_terminal_early() {
         !out.raw_after_all,
         "both frames are gone and the terminal is still RAW"
     );
+}
+
+/// One `present` lifecycle, captured in PHASES.
+///
+/// `Pty::screen()` DRAINS the master, so capturing per phase gives the output
+/// produced *in that phase* rather than a running transcript. That matters:
+/// the grid has no model of erase sequences, so a cumulative capture would
+/// still hold the pre-resize frame drawn at the old width and a
+/// "nothing exceeds the new width" assertion would fail on history rather
+/// than on what the operator can see.
+struct Frames {
+    /// The first frame, before any resize and before the answer key.
+    first: String,
+    /// Output produced after the resize (empty when there was none).
+    after_resize: String,
+    /// Everything from the answer key onwards, including the child's marker.
+    tail: String,
+    raw_during: bool,
+    raw_after: bool,
+}
+
+/// Drain for `ticks` x 20ms, answering every cursor-report query that appears
+/// in THIS segment.
+fn collect(pty: &Pty, ticks: usize) -> String {
+    let mut out = String::new();
+    let mut answered = 0usize;
+    for _ in 0..ticks {
+        out.push_str(&pty.screen());
+        answer_cursor_report(pty, &out, &mut answered);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    out
+}
+
+/// Drive the real `present` frame on a pty of the given size, optionally
+/// resizing once the frame is up, then answer with `key`.
+fn drive_present(rows: u16, cols: u16, resize_to: Option<(u16, u16)>, key: &str) -> Frames {
+    let pty = Pty::open();
+    pty.resize(rows, cols);
+    let mut child = spawn_child(&pty, "present");
+
+    let mut first = String::new();
+    let mut answered = 0usize;
+    let raw_during = {
+        let deadline = Instant::now() + REACH_TIMEOUT;
+        loop {
+            first.push_str(&pty.screen());
+            answer_cursor_report(&pty, &first, &mut answered);
+            if pty.is_raw() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    // Let the first frame land. `collect` owns its own reply counter, and
+    // `first` keeps accumulating, so hand it the running one for this segment.
+    for _ in 0..30 {
+        first.push_str(&pty.screen());
+        answer_cursor_report(&pty, &first, &mut answered);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let after_resize = match resize_to {
+        Some((r, c)) => {
+            pty.resize(r, c);
+            // A `slave_stdio()` child has no controlling terminal, so
+            // TIOCSWINSZ alone delivers no signal — the explicit SIGWINCH is
+            // what makes the resize observable rather than merely configured.
+            signal_winch(child.id());
+            // A FRESH segment, so a fresh reply counter — the viewport
+            // re-queries the cursor after a resize and will hang without it.
+            collect(&pty, 35)
+        }
+        None => String::new(),
+    };
+
+    pty.type_in(key);
+    let mut tail = String::new();
+    let _ = std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| wait_for_child(&mut child, EXIT_TIMEOUT));
+        while !waiter.is_finished() {
+            tail.push_str(&pty.screen());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        waiter.join().expect("child reaper thread")
+    });
+    std::thread::sleep(Duration::from_millis(120));
+    tail.push_str(&pty.screen());
+
+    Frames {
+        first,
+        after_resize,
+        tail,
+        raw_during,
+        raw_after: pty.is_raw(),
+    }
+}
+
+/// Frame lines wider than `width`, with libtest's own output excluded.
+fn overflowing(segment: &str, width: usize) -> Vec<String> {
+    screen_grid(segment)
+        .into_iter()
+        .filter(|l| !is_harness_noise(l) && l.chars().count() > width)
+        .collect()
+}
+
+/// **Resize: the frame reflows to the new width and the terminal is still
+/// handed back.**
+///
+/// Two different failures live here, so both are asserted: a frame that
+/// ignores SIGWINCH keeps drawing at the old width and corrupts the display,
+/// and a frame that handles it but loses its guard leaves the terminal raw.
+/// Passing one says nothing about the other.
+///
+/// The width claim is made on the output produced AFTER the resize, because
+/// that is the only segment that describes the resized terminal.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_resize_reflows_the_frame_and_still_restores_the_terminal() {
+    const NARROW: usize = 46;
+    let f = drive_present(24, 100, Some((12, NARROW as u16)), "d");
+    assert!(
+        f.raw_during,
+        "the pty was never raw — nothing was exercised"
+    );
+    assert!(!f.raw_after, "the terminal was left RAW after a resize");
+    // The frame survived the resize rather than wedging: a frame that died on
+    // SIGWINCH would never read the key.
+    assert!(
+        f.tail.contains("OUTCOME:"),
+        "the frame did not answer after the resize; tail={:?}",
+        f.tail
+    );
+    assert!(
+        !f.after_resize.trim().is_empty(),
+        "the frame drew nothing after SIGWINCH — it did not notice the resize"
+    );
+    let over = overflowing(&f.after_resize, NARROW);
+    assert!(
+        over.is_empty(),
+        "after resizing to {NARROW} columns the frame still drew wider: {over:#?}"
+    );
+}
+
+/// **Narrow width: content degrades legibly rather than corrupting the frame.**
+///
+/// Asserted on the GRID — cursor positioning applied — because `ratatui`
+/// positions text rather than padding it, so a check over stripped escapes
+/// would concatenate fragments and measure nothing.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_narrow_terminal_wraps_rather_than_overflowing() {
+    const COLS: usize = 28;
+    let f = drive_present(20, COLS as u16, None, "d");
+    assert!(
+        f.raw_during,
+        "the pty was never raw — nothing was exercised"
+    );
+    assert!(!f.raw_after, "the terminal was left RAW");
+
+    let over = overflowing(&f.first, COLS);
+    assert!(
+        over.is_empty(),
+        "the frame overflowed a {COLS}-column terminal: {over:#?}"
+    );
+    // Degrading LEGIBLY means the content is still there, wrapped — not
+    // truncated away. Without this, a frame that drew nothing at all would
+    // satisfy "nothing overflows".
+    let flat = screen_grid(&f.first).join(" ");
+    assert!(
+        flat.contains("run_command") || flat.contains("bash"),
+        "the body vanished at {COLS} columns rather than wrapping: {flat:?}"
+    );
+    assert!(f.tail.contains("OUTCOME:"), "the frame did not answer");
 }
