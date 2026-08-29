@@ -272,11 +272,14 @@ const CATEGORIES: &[Category] = &[
             // `newt-eval/src/scorecard.rs` was here at 1 until D3a: its
             // bespoke fixed-width renderer is deleted, and the type now
             // supplies rows to the algorithm above through `fmt::Display`.
-            // Counts a BINDING, not an implementation: pyo3's `render_table`
-            // is `self.inner.to_string()`, one line, and A0 §4.1.4 calls it
-            // "pyo3 exposure". The needle cannot tell a binding from a
-            // renderer; a reader of this table should.
-            ("newt-eval/src/pyo3_module.rs", 1),
+            // `newt-eval/src/pyo3_module.rs` was here at 1 until D3b. It
+            // never held an implementation — the needle was counting a
+            // one-line BINDING (A0 §4.1.4, "pyo3 exposure"). Its Rust method
+            // is now `table` under `#[pyo3(name = "render_table")]`, so
+            // Python is unchanged and the file no longer DECLARES a table
+            // renderer. A real one landing there trips as a NEW site file,
+            // which is what makes dropping the row safe.
+            // `newt-eval/tests/python_surface.rs` pins the Python name.
             // Both cfg(feature) arms of the same fn — production either way.
             // A0 §4.1.2: ZERO production callers, and the decision to delete
             // or wire it must consult wyvern-agent, so D3a leaves it.

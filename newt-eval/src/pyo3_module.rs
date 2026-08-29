@@ -303,7 +303,21 @@ impl PyScorecard {
         self.inner.all_passed()
     }
 
-    fn render_table(&self) -> String {
+    /// Python keeps `render_table`; Rust calls it `table`.
+    ///
+    /// D3a migrated the scorecard onto `newt_core::markup::table` and left
+    /// this row armed in the sprawl ratchet at 1. The needle is
+    /// `fn render_table(`, and it cannot tell a table RENDERER from a
+    /// one-line binding to one — A0 §4.1.4 calls this "pyo3 exposure". There
+    /// was never an implementation here to migrate, so the honest fix is for
+    /// the file to stop DECLARING that name while the Python API keeps it.
+    ///
+    /// The rename is the whole change; the bytes Python receives are the
+    /// same `Scorecard` Display. If a real `fn render_table(` ever lands in
+    /// this file the ratchet sees a NEW site file and trips, which is the
+    /// property that made removing the row safe.
+    #[pyo3(name = "render_table")]
+    fn table(&self) -> String {
         self.inner.to_string()
     }
 
