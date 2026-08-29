@@ -1119,6 +1119,16 @@ pub(crate) fn run_chat(
     // `?` returns included.
     let _herdr = crate::herdr::session_guard(workspace);
 
+    // D2a (#1864) dual-publish: the SAME lifecycle events also reach the typed
+    // progress contract, so it is exercised by real turns rather than only by
+    // its own fixtures. Collect-only — the collector owns no writer, so this
+    // adds no byte to what the operator sees; the old paths above and below
+    // stay authoritative until each family's cutover PR.
+    //
+    // Dropped with the session, like `_herdr`, so the subscription cannot
+    // outlive the run that installed it.
+    let _progress = newt_core::progress::collect_all();
+
     // Header line — one-time print, then normal scroll from here.
     if color {
         execute!(
