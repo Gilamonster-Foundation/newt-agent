@@ -629,8 +629,10 @@ symbol = "permission_prompt_tests::reader_failing_until_deadline_denies_without_
 # renders the definition through `markup::plain::render`, so "serialized
 # through one Question form" is no longer how the bytes are produced and the
 # description no longer says it. The web still reconstructs the legacy form to
-# build its HTML card (`interaction_offer::question`, refd below) — C3 removes
-# that. The frozen bytes did not move; that is C0a's whole acceptance criterion.
+# build its HTML card (`interaction_offer::question`) — C3c (#1867) removed
+# that, and the production ref below moved to the web renderer that replaced
+# it. The frozen bytes did not move; that is C0a's whole acceptance criterion,
+# and C3c re-verified the A0 permission goldens byte-identical.
 description = "TUI and web render decisions from ONE definition: the wire actions are the rendered actions on both surfaces; aliases parse but are never rendered and never widen the action set. Accepting the answer is BHV-INTERACTION-001/002."
 [BHV-PROMPT-005.status]
 lean = "none"
@@ -653,12 +655,30 @@ symbol = "tests::value_wire_name_still_matches"
 [[BHV-PROMPT-005.refs.rust_tests]]
 path = "newt-web/src/main.rs"
 symbol = "tests::attach_tab_renders_and_answers_a_danger_gated_permission_decision"
+# C3c (#1867): the web renders each offered option from the definition's own
+# Choice control — wire id as the submitted value, label as the text — with no
+# legacy form in between.
+[[BHV-PROMPT-005.refs.rust_tests]]
+path = "newt-web/src/shell.rs"
+symbol = "tests::c3c::the_card_renders_from_the_definition"
+# …and answers by those wire ids ONLY. `Question::parse` also matched an
+# action's hotkey, which no button on this surface renders; the wire actions
+# being the rendered actions is precisely this contract.
+[[BHV-PROMPT-005.refs.rust_tests]]
+path = "newt-web/src/main.rs"
+symbol = "tests::c3c::the_web_answers_by_wire_id_and_not_by_hotkey"
 [[BHV-PROMPT-005.refs.production]]
 path = "newt-core/src/interaction_offer.rs"
 symbol = "publish_interaction_offer"
+# C3c (#1867): `interaction_offer::question` is GONE — the ref moved with the
+# behaviour rather than being dropped. The web no longer reconstructs a legacy
+# `Question` to build its card; `pending_permission_card` reads the
+# `InteractionDefinition` directly, so the web half of "render from ONE
+# definition" is now that symbol. This is the removal the C0a note below
+# predicted ("C3 removes that").
 [[BHV-PROMPT-005.refs.production]]
-path = "newt-core/src/interaction_offer.rs"
-symbol = "question"
+path = "newt-web/src/shell.rs"
+symbol = "pending_permission_card"
 # C0a (#1856): rendering left the semantic type — the epic's named C0
 # deletion gate. `Question::terminal_text` no longer exists; the ONE plain
 # projection both this contract's surfaces are held to is `markup::plain::render`.

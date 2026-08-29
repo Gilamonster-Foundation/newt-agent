@@ -192,33 +192,53 @@ const STYLE: &str = r#"
 
 /// Render exactly the Markdown and actions published by the running gate.
 ///
-/// **A native form, submittable with scripting disabled.** Each offered action
-/// is a submit button carrying `name="verdict"`, so the browser itself encodes
-/// which one was pressed — no `hx-vals`, no JSON, no script. `hx-post` is left
-/// alongside `action` purely as enhancement: HTMX answers in place, and a
-/// scriptless browser posts the same fields to the same route.
+/// **Reads the `InteractionDefinition` directly (C3c, #1867).** It used to
+/// round-trip through `PendingOffer::question`, rebuilding a legacy
+/// `Question<PermissionAction>` purely so this function could read it — the
+/// "permission-card-specific model reconstruction" C3's deletion gate names.
+/// The definition already carries everything a card needs, so the round trip
+/// bought nothing but a second model of the same offer.
 ///
-/// The action set is still NOT authority. The server re-validates the
-/// submitted verdict against the offer it published, inside the store's own
-/// transaction, so a hand-crafted POST naming an action that was never
-/// displayed is refused exactly as it was before.
+/// **A native form, submittable with scripting disabled.** Each offered option
+/// is a submit button carrying `name="verdict"` and the option's WIRE ID as
+/// its value, so the browser itself encodes which one was pressed — no
+/// hx-vals, no JSON, no script. `hx-post` is left alongside `action` purely as
+/// enhancement.
+///
+/// The rendered set is NOT authority. `answer_interaction_offer` re-validates
+/// the submitted action against the offer as published — through
+/// `newt_interaction::validate_response`, inside its own immediate transaction
+/// — so a hand-crafted POST naming an option that was never offered is refused
+/// whatever this renders. A view is a projection; it authorizes nothing.
 pub(crate) fn pending_permission_card(id: u64, p: &newt_core::PendingOffer, csrf: &str) -> String {
-    let Ok(question) = p.question() else {
+    use newt_core::ControlKind;
+
+    let Ok(definition) = p.definition() else {
         return String::new();
     };
+    // One choice control, which is what an adapted permission offer is. A
+    // definition shaped otherwise is not something this card can present
+    // faithfully, so it presents nothing — the same fail-closed direction the
+    // reconstruction took when the adapter refused it.
+    let Some(options) = definition.controls.iter().find_map(|c| match &c.kind {
+        ControlKind::Choice { options } => Some(options),
+        _ => None,
+    }) else {
+        return String::new();
+    };
+
     let rid = escape(&p.instance_id);
-    let actions = question
-        .actions
+    let actions = options
         .iter()
-        .map(|action| {
+        .map(|option| {
             format!(
                 r#"<button type="submit" name="verdict" value="{}">{}</button>"#,
-                escape(action.value.as_str()),
-                escape(&action.label)
+                escape(option.id.as_str()),
+                escape(&option.label)
             )
         })
         .collect::<String>();
-    let note = question
+    let note = definition
         .note
         .as_deref()
         .map(render_markdown)
@@ -233,7 +253,7 @@ pub(crate) fn pending_permission_card(id: u64, p: &newt_core::PendingOffer, csrf
 </fieldset>
 </form>"##,
         csrf_field = newt_web::csrf::hidden_field(csrf),
-        body = render_markdown(&question.markdown),
+        body = render_markdown(&definition.markdown),
     )
 }
 
@@ -729,6 +749,80 @@ mod tests {
     /// aspirational. The ratchet in `newt-core/tests/markup_sprawl_ratchet.rs`
     /// proves there is one option matrix in the SOURCE; this proves the two
     /// surfaces actually behave like it.
+    /// **C3c (#1867): the card renders from the InteractionDefinition.**
+    ///
+    /// No round trip through `Question`. The definition's one Choice control
+    /// carries the options; each option's `id` is the wire value the browser
+    /// submits and its `label` is what the operator reads.
+    mod c3c {
+        use super::*;
+
+        fn high_danger_offer() -> newt_core::PendingOffer {
+            let question = newt_core::Question {
+                markdown: "⊘ run_command wants to run `bash`.".into(),
+                note: Some("High danger.".into()),
+                actions: vec![
+                    newt_core::Action::new(
+                        newt_core::PermissionAction::AllowOnce,
+                        "a",
+                        "allow once",
+                    ),
+                    newt_core::Action::new(newt_core::PermissionAction::Deny, "d", "deny"),
+                ],
+            };
+            let definition =
+                newt_core::interaction_adapter::question_to_definition(&question).unwrap();
+            newt_core::PendingOffer {
+                instance_id: "inst-1".into(),
+                definition_json: serde_json::to_string(&definition).unwrap(),
+                // The card reads the DEFINITION and the instance id; it never
+                // parses the instance, which is what makes rendering a pure
+                // projection of what was published.
+                instance_json: String::new(),
+                danger: newt_core::OfferDanger::High,
+            }
+        }
+
+        #[test]
+        fn the_card_renders_from_the_definition() {
+            let card = pending_permission_card(1, &high_danger_offer(), "tok");
+            // The prompt and note, rendered as Markdown.
+            assert!(card.contains("<code>bash</code>"), "prompt: {card}");
+            assert!(card.contains("High danger."), "note: {card}");
+            // Each offered option, by WIRE ID and label.
+            assert!(
+                card.contains(r#"name="verdict" value="allow_once""#),
+                "allow_once offered: {card}"
+            );
+            assert!(card.contains(">allow once</button>"), "label: {card}");
+            assert!(
+                card.contains(r#"name="verdict" value="deny""#),
+                "deny offered: {card}"
+            );
+            // A high-danger offer never carries a durable grant.
+            assert!(
+                !card.contains("allow_session") && !card.contains("allow_permanent"),
+                "no durable grant on a high-danger card: {card}"
+            );
+            // And C3b's form contract survives.
+            assert!(
+                card.contains(r#"method="post""#),
+                "still a real form: {card}"
+            );
+            assert!(card.contains(r#"name="csrf""#), "still CSRF-bound: {card}");
+        }
+
+        /// A definition the card cannot express renders NOTHING rather than a
+        /// partial form — the same fail-closed behaviour the reconstruction
+        /// had when the adapter refused.
+        #[test]
+        fn an_unrenderable_definition_yields_no_card() {
+            let mut offer = high_danger_offer();
+            offer.definition_json = "{not json".into();
+            assert!(pending_permission_card(1, &offer, "tok").is_empty());
+        }
+    }
+
     mod c3a {
         use super::render_markdown as web;
 

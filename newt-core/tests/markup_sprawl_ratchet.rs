@@ -152,11 +152,38 @@ const CATEGORIES: &[Category] = &[
             // and the second independent Markdown option matrix"), not a
             // rendering slice's.
             //
-            // So this row goes to 0 in C3. Reaching 0 in C0a would have
-            // meant rewriting the web card — which is the other half of
-            // the sprawl this ratchet exists to make visible, and gaming
-            // the needle instead would be the vacuous-green shape the
-            // header warns about.
+            // **CORRECTION (C3c, #1867): this row does NOT go to 0 in C3,
+            // and the belief that it would was inherited twice.**
+            //
+            // C3c deleted `PendingOffer::question` and both web consumers —
+            // the card and the verdict decode now read the
+            // `InteractionDefinition` directly, which IS C3's named deletion
+            // gate and is done. The row still cannot move, because what it
+            // counts is the `Question{` literal at
+            // `interaction_adapter.rs:185`, inside `definition_to_question`,
+            // and that function still has PRODUCTION callers in newt-tui:
+            //
+            //   newt-tui/src/permissions.rs:350  `decode_answer`
+            //   newt-tui/src/permissions.rs:620  `await_web_decision`
+            //
+            // (Verified against origin/main 46b43321 with this crate's own
+            // brace-depth `#[cfg(test)]` rule, not by eye — `:267` is a third
+            // hit and IS test-only, which is exactly the kind of miscount that
+            // produced the claim above.)
+            //
+            // The sentence "C0a removed BOTH terminal callers" was therefore
+            // wrong when it was written. `decode_answer` deliberately round
+            // trips, and its own doc says why: "a second decoder written
+            // against `InteractionDefinition` would be a third answer-parsing
+            // implementation — the exact sprawl this epic exists to delete."
+            // That reasoning is sound, so the row is held open by a CORRECT
+            // design decision, not by a missed deletion.
+            //
+            // This row goes to 0 when the terminal decode moves onto the
+            // controller — D-family work, not C3's. Until then it stays at 1.
+            // Editing the baseline to match a slice's expectation, rather than
+            // editing the code to match the baseline, is the failure mode the
+            // whole mechanism exists to prevent.
             //
             // CORRECTION (B0a): an earlier comment here claimed B0 would
             // delete "the two rows above". That was wrong on both counts —
@@ -1343,5 +1370,96 @@ mod c3a {
             "a longer identifier ending in the needle is its own thing"
         );
         assert_eq!(parser_sites("dialect::parse(src)"), 0);
+    }
+}
+
+/// **C3c (#1867): the web surface reconstructs no legacy `Question`.**
+///
+/// C3's deletion gate is *"remove permission-card-specific model
+/// reconstruction and the second independent Markdown option matrix"*. C3a
+/// took the option matrix; this is the other half, armed so it cannot come
+/// back.
+///
+/// Structural rather than behavioural on purpose: a behavioural test proves
+/// today's card renders without a `Question`, but only a source scan proves a
+/// future card cannot quietly reintroduce one — which is exactly how the
+/// reconstruction arrived in the first place (B0b-2 added
+/// `PendingOffer::question` as a convenience for a renderer).
+mod c3c {
+    /// The crate that must be free of the legacy type.
+    const WEB: &str = "newt-web/src/";
+
+    /// Reconstructions of a legacy `Question` in one file's squeezed
+    /// production code.
+    ///
+    /// The needles are the two ways the web can reach one, and both are
+    /// METHOD/function calls rather than the type name. That distinction cost
+    /// this guard a vacuous green on its first run: the reconstruction is
+    /// invoked as `p.question()` and bound with an inferred type, so the word
+    /// `Question` never appears in the web crate at all and a type-name needle
+    /// matched nothing while the reconstruction sat right there.
+    ///
+    /// * `question()` — `PendingOffer::question`, the round trip C3c deletes.
+    ///   Counted with the shared identifier-boundary rule, so the `.` before
+    ///   it is a boundary and `my_question()` is not a hit.
+    /// * `definition_to_question(` — the adapter underneath it. Banning only
+    ///   the wrapper would leave the web free to call the adapter directly and
+    ///   rebuild exactly what was removed.
+    fn question_refs(squeezed: &str) -> usize {
+        super::count_any(squeezed, &["question()", "definition_to_question("])
+    }
+
+    #[test]
+    fn the_web_surface_reconstructs_no_legacy_question() {
+        let code = super::production_code();
+        let mut offenders: Vec<String> = code
+            .iter()
+            .filter(|(path, _)| path.starts_with(WEB))
+            .filter_map(|(path, f)| {
+                let n = question_refs(&f.squeezed);
+                (n > 0).then(|| format!("{path} names the legacy Question type {n}×"))
+            })
+            .collect();
+        offenders.sort();
+
+        // Anti-vacuous: the scan must actually be seeing the web crate. A
+        // mis-rooted scan would report "no offenders" about nothing at all.
+        let seen = code.keys().filter(|p| p.starts_with(WEB)).count();
+        assert!(
+            seen >= 4,
+            "the scan saw only {seen} file(s) under {WEB} — it is not reading \
+             the web crate, which would make the check below vacuous"
+        );
+
+        assert!(
+            offenders.is_empty(),
+            "C3c: the web renders and decodes from the InteractionDefinition \
+             directly; reconstructing a Question is the model reconstruction \
+             C3's deletion gate removes.\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// **Anti-vacuous twin.** The guard is a `!contains`, which a detector
+    /// that matched nothing would satisfy perfectly.
+    #[test]
+    fn the_c3c_detector_can_see_a_reconstruction() {
+        // Both routes to a reconstruction are visible…
+        assert_eq!(question_refs("let q = p.question()?;"), 1);
+        assert_eq!(question_refs("definition_to_question(&d)"), 1);
+        assert_eq!(
+            question_refs("let a = p.question()?;let b = definition_to_question(&d);"),
+            2
+        );
+        // …and the TYPE NAME alone is not, which is the blind spot that gave
+        // this guard a vacuous green before the needles were fixed.
+        assert_eq!(
+            question_refs("let q: Question<PermissionAction> = x;"),
+            0,
+            "the type name is not how the web reaches a reconstruction"
+        );
+        // A longer identifier ending in the needle is its own thing.
+        assert_eq!(question_refs("self.my_question()"), 0);
+        assert_eq!(question_refs(""), 0);
     }
 }
