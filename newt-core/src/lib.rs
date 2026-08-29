@@ -50,6 +50,10 @@ pub mod interaction_offer;
 // `Arc`s and can never cross a process (epic non-goal).
 pub mod interaction_resolution;
 pub mod interaction_surface;
+// C2 (#1876): the interaction VIEW MODEL. Here rather than in `newt-tui`
+// because `newt-core` has no ratatui dependency, so "no renderer type in the
+// model" is a compile error instead of a source scan.
+pub mod interaction_view;
 pub mod kit;
 pub mod launch_authority;
 pub mod lazy_emission;

@@ -1528,14 +1528,34 @@ impl MountedEditor {
 }
 
 impl InputSurface for RichSurface {
-    /// **The terminal adapter** (C1, #1862). This surface owns the terminal,
-    /// so it — and not the session — acquires the sealed `PromptWindow`.
+    /// **The terminal adapter** (C1, #1862), rendering natively (C2, #1876).
+    ///
+    /// This surface owns the terminal, so it — and not the session —
+    /// acquires the sealed `PromptWindow`. Suspending first is load bearing
+    /// rather than tidy: it erases every registered ephemeral writer and
+    /// takes stdin, so the inline frame is not drawn under a live spinner.
+    ///
+    /// The transient frame is erased before the canonical text is committed,
+    /// which is the plain-scroller contract for every TTY-only projection —
+    /// scrollback ends up holding the same canonical projection a piped run
+    /// would have printed, on either surface.
+    ///
+    /// A rich draw that fails falls back to the plain path rather than
+    /// failing the interaction: the operator is mid-turn and owed a prompt,
+    /// and `plain::render` is the conformance baseline C0b established.
     fn present_interaction(
         &mut self,
         interaction: &newt_core::interaction_surface::SurfaceInteraction,
     ) -> newt_core::HumanQuestionOutcome {
         let window = newt_core::tty::Terminal::suspend_for_prompt();
-        crate::permissions::present_on_terminal(&window, interaction)
+        let (outcome, canonical) = match crate::interaction_view::present(interaction) {
+            Ok(pair) => pair,
+            Err(_) => return crate::permissions::present_on_terminal(&window, interaction),
+        };
+        // The frame is gone by now (the guard erased it on drop); commit the
+        // canonical projection so scrollback holds what a piped run would.
+        let _ = window.notice(&canonical);
+        outcome
     }
 
     fn read_line(&mut self, _prompt: &str) -> anyhow::Result<ReadOutcome> {
