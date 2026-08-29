@@ -189,6 +189,16 @@ check:
     # ownership underneath them.
     cargo test -p newt-agent --no-default-features || rc=1
     cargo test -p newt-tui || rc=1
+    # PIPELINE PARITY: mirrors the "clippy (newt-core lean tier, no default
+    # features)" step in ci.yml's lean job. #1890 — the lean `-p newt-agent`
+    # line above is clean and always was, so newt-core's OWN lean config had no
+    # gate and had stopped COMPILING (an unresolved `markup::spans` import, not
+    # a lint). The wyvern tier depends on this configuration; it is why
+    # `markup::plain` and `markup::table` are unconditional. Clippy only — see
+    # the ci.yml step's comment: the lean tests are the same ungated tests the
+    # workspace run already covers, and they include a real-file-lock test
+    # (dock_registry) seen failing under load.
+    cargo clippy -p newt-core --no-default-features --all-targets -- -D warnings || rc=1
     # PIPELINE PARITY: mirrors the "test (newt-interaction, inward protocol
     # layer)" step in .github/workflows/ci.yml's lean job. newt-interaction
     # (#1828) is the inward protocol layer and must build with no feature at

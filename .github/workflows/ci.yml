@@ -144,6 +144,32 @@ jobs:
       - name: test (lean cli, no default features)
         if: always()
         run: cargo test -p newt-agent --no-default-features
+      # HOOK PARITY: mirrored by the `check` recipe in justfile.
+      #
+      # #1890 — THE GAP THIS CLOSES. `-p newt-agent --no-default-features` is
+      # clean and always has been, so `newt-core`'s OWN lean configuration had
+      # no gate anywhere. It had stopped compiling: `interaction_view` is built
+      # on the `markdown`-gated `markup::spans` and carried no gate itself, so
+      # the lean build failed on an unresolved import — not a lint, a hard
+      # error — plus an unused `FADE_CT` re-export. Nothing noticed, because
+      # nothing ran it.
+      #
+      # The wyvern tier depends on exactly this configuration: it is why
+      # `markup::plain` and `markup::table` are compiled unconditionally.
+      #
+      # CLIPPY ONLY, DELIBERATELY. A matching `cargo test -p newt-core
+      # --no-default-features` step is NOT added, for two reasons. The lean
+      # tests are the SAME tests the workspace job already runs — `dock_registry`
+      # and friends are ungated — so a second execution buys coverage of the
+      # feature wiring, which clippy already proves, at the cost of ~2800 more
+      # tests per PR. And that set includes at least one real-resource lock
+      # test (`dock_registry::tests::concurrent_approvals_do_not_lost_update`,
+      # six threads onto a real file lock) observed failing under load on the
+      # dev box while passing 4/4 on a quiet one. A gate that fails when the
+      # runner is busy is how #1872 trained everyone to re-run.
+      - name: clippy (newt-core lean tier, no default features)
+        if: always()
+        run: cargo clippy -p newt-core --no-default-features --all-targets -- -D warnings
       - name: test (newt-tui, rich-tui + live-spill stripped)
         if: always()
         run: cargo test -p newt-tui
