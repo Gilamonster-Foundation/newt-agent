@@ -101,6 +101,11 @@ mod workspace_state;
 // and headless/wyvern builds never compile it in — newt stays amphibious.
 #[cfg(feature = "rich-tui")]
 mod rich_input;
+/// #1898 — the PTY acceptance proof that a rich TURN hands back BOTH raw mode
+/// and bracketed paste on every exit path, panic included. #1411 had recorded
+/// this site as safe; it was safe against the error path only.
+#[cfg(all(test, unix, feature = "rich-tui"))]
+mod rich_input_pty_test;
 // The harness config panel (#14) — a severable, TTY-only overlay for the psyche
 // operator dials. Gated with the other rich TTY surfaces so wyvern/lean strip it.
 #[cfg(feature = "rich-tui")]
@@ -401,6 +406,39 @@ use crossterm::{
     },
 };
 
+/// The PRODUCTION half of a source file, for the structural guards that assert
+/// "no other path exists" (#1889, #1898).
+///
+/// Those tests live IN the file they read, so `include_str!` pulls in their own
+/// needles; cutting at the test module is both the fix and the right scope.
+///
+/// Two things this gets right that the first copy did not, both found by
+/// `rich_input.rs`:
+///
+/// * It cuts at the test MODULE, not at the first `#[cfg(test)]` anywhere.
+///   `rich_input.rs` has an inline `#[cfg(test)]` item at :360, ~700 lines
+///   above the code under test, so a first-occurrence split returned a prefix
+///   that contained none of it.
+/// * It PANICS when the marker is missing instead of returning "". An empty
+///   string satisfies every `count() == 0` assertion, so the failure mode of
+///   the convenient version is a guard that passes because it read nothing.
+///
+/// Gated with its callers, not merely with `test`: both structural guards live
+/// in `rich-tui` modules, so under the LEAN configuration this function has no
+/// caller and `-D warnings` refuses it. Caught by the lean clippy gate added in
+/// #1890 — the configuration that had no gate at all a day ago.
+#[cfg(all(test, feature = "rich-tui"))]
+pub(crate) fn production_source(src: &str) -> &str {
+    src.split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .filter(|prefix| prefix.len() < src.len())
+        .expect(
+            "the file must end in an unindented `#[cfg(test)] mod tests {` — \
+             without the marker this helper would hand back an empty string, \
+             and every count-based assertion would pass having read nothing",
+        )
+}
+
 /// Runs `restore` on every exit path of the scope holding it — normal return,
 /// `?`, or panic. Split out from [`SplashScreenGuard`] so the "it always runs"
 /// property is unit-testable without owning a real terminal: the guard proper
@@ -427,6 +465,22 @@ impl<F: FnMut()> Drop for RestoreOnDrop<F> {
 /// panic did the same. Of the three crossterm raw-mode pairs in this crate this
 /// was the only one with no guard at all (`lean_input::RawGuard` has one;
 /// `rich_input::read_turn` avoids `?` around its event loop).
+///
+/// **CORRECTION (#1898).** That last clearance was wrong, and it stood for
+/// long enough to matter. "Avoids `?` around its event loop" is true and
+/// covers the ERROR path only — a PANIC inside `event_loop` unwound past both
+/// `DisableBracketedPaste` and `disable_raw_mode()`. `read_turn` now owns
+/// `rich_input::RawPasteGuard`, which restores both from `Drop`.
+///
+/// The lesson is about this comment, not that function: a site recorded as
+/// SAFE is worse than one nobody has looked at, because nobody looks twice.
+/// The audit that found it (#1897) re-read every raw-mode pair in the
+/// workspace rather than trusting this list. As of #1898 every pair is
+/// Drop-guarded: `SplashScreenGuard`, `lean_input::RawGuard`,
+/// `line_console::RawGuard`, `newt_core::tty::modal::RawGuard`,
+/// `transcript_pager::AltScreenGuard`, `interaction_view::InlineGuard`,
+/// `config_panel::PanelRawGuard` (both panels, #1889),
+/// `rich_input::RawPasteGuard`, and `cockpit/presenter` via `RestoreOnDrop`.
 ///
 /// Per the repo's "make the bug unrepresentable" rule, the fix is ownership
 /// rather than another restore call: the terminal cannot be taken without

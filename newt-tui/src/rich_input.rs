@@ -1062,6 +1062,62 @@ pub(crate) struct RichSurface {
     session: String,
 }
 
+/// RAII owner of the rich surface's terminal modes: raw mode **and** bracketed
+/// paste.
+///
+/// **#1898 — this site was recorded as SAFE and was not.** #1411 enumerated the
+/// crate's raw-mode pairs and cleared `read_turn` because it "avoids `?` around
+/// its event loop". That is true, and it covers the ERROR path only: the loop's
+/// result was bound to a variable, so no `?` could jump the teardown. A **panic**
+/// inside `event_loop` unwound straight past both restores, leaving the operator
+/// raw with bracketed paste still on. A site that has been checked and cleared is
+/// worse than one nobody looked at, because nobody looks twice.
+///
+/// # Teardown is the exact reverse of setup, and that is not incidental
+///
+/// Enter takes raw mode, then bracketed paste. Drop releases bracketed paste,
+/// then raw mode. Mirroring is the rule a nested pair of guards would give for
+/// free, and it is written out here rather than left to drop order because the
+/// two modes are not independent: bracketed paste is a terminal INPUT mode, so
+/// releasing raw mode first would hand line discipline back while paste markers
+/// were still armed, and a paste landing in that window would deliver a literal
+/// `ESC[200~` into whatever reads next. `the_guard_releases_paste_before_raw_mode`
+/// pins the order against a future edit that reshuffles the Drop body.
+///
+/// The guard binds BEFORE the fallible call — the ordering `AltScreenGuard::enter`
+/// pays for, `InlineGuard::enter` repeats and `PanelRawGuard::enter` repeats
+/// again: from that point the restore is owed regardless of what the next line
+/// does. `disable_raw_mode` on a terminal that never went raw is a no-op, which
+/// is the cheap half of that trade.
+///
+/// `pub(crate)` solely for `rich_input_pty_test`, which drops it mid-unwind in a
+/// child process to prove the claim above against a real tty.
+pub(crate) struct RawPasteGuard;
+
+impl RawPasteGuard {
+    pub(crate) fn enter() -> io::Result<Self> {
+        let guard = Self;
+        enable_raw_mode()?;
+        // Bracketed paste: the terminal wraps a paste in escape markers and
+        // delivers it as ONE `Event::Paste(text)` instead of a stream of key
+        // presses. Without it, a multi-line paste arrives as Char…Enter…Char…
+        // and every embedded Enter submits a line. See the `Event::Paste` arm.
+        //
+        // Best-effort exactly as before: a terminal that does not support it
+        // is not a reason to refuse the turn.
+        let _ = crossterm::execute!(io::stdout(), EnableBracketedPaste);
+        Ok(guard)
+    }
+}
+
+impl Drop for RawPasteGuard {
+    fn drop(&mut self) {
+        // REVERSE OF `enter`. See the type's doc comment before reordering.
+        let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
+        let _ = disable_raw_mode();
+    }
+}
+
 impl RichSurface {
     pub(crate) fn new(history_path: Option<PathBuf>) -> anyhow::Result<Self> {
         Ok(Self {
@@ -1079,20 +1135,14 @@ impl RichSurface {
         })
     }
 
-    /// Run the inline event loop for a single turn. Raw mode is enabled for the
-    /// duration and disabled before returning, so model output between turns
-    /// prints normally into scrollback.
+    /// Run the inline event loop for a single turn. The terminal is taken for
+    /// the duration and handed back before returning, so model output between
+    /// turns prints normally into scrollback — and so `newt crew --edit` and
+    /// the slash commands run against a cooked terminal (see
+    /// `commands/crew.rs` and `commands/setup.rs`, which say so).
     fn read_turn(&self) -> io::Result<ReadOutcome> {
-        enable_raw_mode()?;
-        // Bracketed paste: the terminal wraps a paste in escape markers and
-        // delivers it as ONE `Event::Paste(text)` instead of a stream of key
-        // presses. Without it, a multi-line paste arrives as Char…Enter…Char…
-        // and every embedded Enter submits a line. See the `Event::Paste` arm.
-        let _ = crossterm::execute!(io::stdout(), EnableBracketedPaste);
-        let outcome = self.event_loop();
-        let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
-        let _ = disable_raw_mode();
-        outcome
+        let _guard = RawPasteGuard::enter()?;
+        self.event_loop()
     }
 
     /// The chrome the header/tab bar/background row draw from — everything
@@ -1631,6 +1681,73 @@ impl InputSurface for RichSurface {
 
 #[cfg(test)]
 mod tests {
+    /// PRODUCTION source of this file — see [`crate::production_source`] for
+    /// why the cut is at the test MODULE and why a missing marker panics.
+    fn production() -> &'static str {
+        crate::production_source(include_str!("rich_input.rs"))
+    }
+
+    /// **The structural half of #1898.** The PTY test proves the guard
+    /// restores; it cannot prove `read_turn` uses it, because driving the
+    /// event loop needs a real interactive turn. A guard that is correct and
+    /// unused is exactly the state this file was in — the restore existed, it
+    /// just was not owed from anywhere a panic respects.
+    #[test]
+    fn raw_and_paste_are_owned_by_one_guard() {
+        let src = production();
+        assert_eq!(
+            src.matches("enable_raw_mode()?").count(),
+            1,
+            "the ONLY enable_raw_mode call is RawPasteGuard::enter's"
+        );
+        assert_eq!(
+            src.matches("disable_raw_mode();").count(),
+            1,
+            "the ONLY disable_raw_mode call is the Drop impl's"
+        );
+        assert_eq!(
+            src.matches("EnableBracketedPaste)").count(),
+            1,
+            "bracketed paste is enabled in exactly one place"
+        );
+        assert_eq!(
+            src.matches("DisableBracketedPaste)").count(),
+            1,
+            "…and disabled in exactly one place"
+        );
+        assert!(
+            src.contains("impl Drop for RawPasteGuard"),
+            "the restore must be a Drop obligation, not a method someone has \
+             to remember to call — which is what #1411 cleared this site for"
+        );
+    }
+
+    /// **The ordering the issue asks to settle explicitly.** Teardown mirrors
+    /// setup: paste off, then raw off. Bracketed paste is a terminal INPUT
+    /// mode, so releasing raw mode first would hand line discipline back with
+    /// paste markers still armed. Pinned here because a Drop body is exactly
+    /// the kind of two-line block someone reorders while tidying.
+    #[test]
+    fn the_guard_releases_paste_before_raw_mode() {
+        let src = production();
+        let drop_impl = src
+            .split_once("impl Drop for RawPasteGuard")
+            .expect("the guard must restore from Drop")
+            .1;
+        let body = &drop_impl[..drop_impl.find("\n}").unwrap_or(drop_impl.len())];
+        let paste = body
+            .find("DisableBracketedPaste")
+            .expect("Drop must release bracketed paste");
+        let raw = body
+            .find("disable_raw_mode")
+            .expect("Drop must release raw mode");
+        assert!(
+            paste < raw,
+            "Drop must release bracketed paste BEFORE raw mode — the exact \
+             reverse of `enter`. See RawPasteGuard's doc comment."
+        );
+    }
+
     use super::*;
 
     #[test]

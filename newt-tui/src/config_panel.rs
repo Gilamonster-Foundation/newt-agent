@@ -1086,9 +1086,13 @@ mod tests {
         // the first run read 2 enables where there is one. Cutting at the
         // test module is also the right scope — the property is that no
         // production path reaches raw mode except through the guard.
-        let production = |src: &str| src.split("#[cfg(test)]").next().unwrap_or("").to_string();
-        let config = production(include_str!("config_panel.rs"));
-        let backend = production(include_str!("backend_panel.rs"));
+        //
+        // #1898 hardened the cut: the version that shipped here split at the
+        // FIRST `#[cfg(test)]` anywhere and fell back to "" when it found
+        // none. `rich_input.rs` has an inline one 700 lines early, and "" makes
+        // every `count() == 0` assertion pass having read nothing.
+        let config = crate::production_source(include_str!("config_panel.rs"));
+        let backend = crate::production_source(include_str!("backend_panel.rs"));
         // Count CALL forms, not the name: the guard's own doc comment
         // discusses `enable_raw_mode()` and `disable_raw_mode()` in prose, and
         // a test that counted mentions would move every time someone edited a
