@@ -23,6 +23,41 @@ pub trait Console {
     fn say(&mut self, line: &str);
 }
 
+/// **Secret input goes through the one terminal adapter** (D1b, #1892).
+///
+/// Both consoles share this, and neither reaches `read_line_raw` for it any
+/// more. The prompt becomes a `ControlKind::Secret` definition, and
+/// `present_on_terminal` derives the masking from that definition — so what
+/// hides the key is the SEMANTIC fact that it is a secret, not a call site
+/// remembering to pass `Echo::Stars`.
+///
+/// It also means the piped path is the shared one: `read_prompt_window_line`
+/// branches on `is_terminal()` itself, so a scripted `newt setup` keeps
+/// working and echoes nothing either way.
+///
+/// The `String` is the trimmed line as typed. Callers in `setup::credentials`
+/// wrap it in `Secret` immediately; this signature is the `Console` trait's
+/// and outlives only until the trait does (D1b-3).
+fn ask_secret_through_the_seam(prompt: &str) -> io::Result<String> {
+    let window = newt_core::tty::Terminal::suspend_for_prompt();
+    let definition = crate::setup::credentials::secret_prompt(prompt);
+    let interaction = newt_core::interaction_surface::SurfaceInteraction::blocking(definition);
+    match crate::permissions::present_on_terminal(&window, &interaction) {
+        newt_core::HumanQuestionOutcome::Answer(line) => Ok(line.trim().to_string()),
+        newt_core::HumanQuestionOutcome::Cancelled
+        | newt_core::HumanQuestionOutcome::ExitRequested => {
+            Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+        }
+        newt_core::HumanQuestionOutcome::InputClosed => {
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"))
+        }
+        newt_core::HumanQuestionOutcome::Unavailable
+        | newt_core::HumanQuestionOutcome::InputFailed => Err(io::Error::other(
+            "no operator available for a secret prompt",
+        )),
+    }
+}
+
 pub struct StdinConsole;
 impl Console for StdinConsole {
     fn ask(&mut self, prompt: &str) -> io::Result<String> {
@@ -36,7 +71,7 @@ impl Console for StdinConsole {
         Ok(buf.trim().to_string())
     }
     fn ask_secret(&mut self, prompt: &str) -> io::Result<String> {
-        read_line_raw(prompt, Echo::Stars)
+        ask_secret_through_the_seam(prompt)
     }
     fn say(&mut self, line: &str) {
         println!("{line}");
@@ -174,7 +209,7 @@ impl Console for FirstRunConsole {
         read_line_raw(prompt, Echo::Chars)
     }
     fn ask_secret(&mut self, prompt: &str) -> io::Result<String> {
-        read_line_raw(prompt, Echo::Stars)
+        ask_secret_through_the_seam(prompt)
     }
     fn say(&mut self, line: &str) {
         println!("{line}");

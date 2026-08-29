@@ -242,7 +242,7 @@ async fn preset_retry_path_revalidates_transport_before_sending_a_key() {
     let cred = WizardCred {
         api_key_env: None,
         api_key_file: None,
-        probe_key: Some("replacement-secret".into()),
+        probe_key: Some(Secret::new("replacement-secret")),
         pending_token: None,
     };
     let mut console = ScriptedConsole::new(&[]);
@@ -336,7 +336,7 @@ async fn setup_never_renders_provider_error_refusal_or_bearer_material() {
         &reqwest::Client::new(),
         &hit,
         "model",
-        Some(BEARER_SENTINEL.into()),
+        Some(Secret::new(BEARER_SENTINEL)),
     )
     .await
     .unwrap_err();
@@ -412,7 +412,7 @@ async fn preset_authentication_retry_does_not_collect_an_untested_final_key() {
     let cred = WizardCred {
         api_key_env: None,
         api_key_file: None,
-        probe_key: Some("initial-key".into()),
+        probe_key: Some(Secret::new("initial-key")),
         pending_token: None,
     };
     let mut console =
@@ -476,10 +476,10 @@ fn late_setup_write_failure_retains_a_coherent_backend_tuple() {
         ..Default::default()
     };
     let pending = PendingWizardToken {
-        token: "new-secret".into(),
+        token: Secret::new("new-secret"),
         passphrase: Some(newt_core::secrets::SecretString::from("test-passphrase")),
         path: versioned_token.clone(),
-        reference: versioned_reference,
+        reference: credentials::SealedSecret::new(&versioned_reference).unwrap(),
     };
     let mut console = ScriptedConsole::new(&[]);
     let result = persist_interactive_backend_with(
@@ -542,10 +542,10 @@ fn backend_post_commit_sync_failure_retains_its_credential() {
         ..Default::default()
     };
     let pending = PendingWizardToken {
-        token: "new-secret".into(),
+        token: Secret::new("new-secret"),
         passphrase: Some(newt_core::secrets::SecretString::from("test-passphrase")),
         path: versioned_token.clone(),
-        reference: token_reference,
+        reference: credentials::SealedSecret::new(&token_reference).unwrap(),
     };
 
     let error = persist_interactive_backend_with(
@@ -614,10 +614,10 @@ fn successful_rotation_retains_the_previous_credential_for_live_readers() {
         ..Default::default()
     };
     let pending = PendingWizardToken {
-        token: "new-secret".into(),
+        token: Secret::new("new-secret"),
         passphrase: Some(newt_core::secrets::SecretString::from("test-passphrase")),
         path: new_token,
-        reference: new_reference,
+        reference: credentials::SealedSecret::new(&new_reference).unwrap(),
     };
     let cfg = Config {
         default_backend: Some("example".into()),
@@ -2723,7 +2723,8 @@ fn a_token_reference_is_recorded_even_when_home_is_unset() {
     let path = dir.path().join("config.toml");
     // passphrase=<Enter: machine key>
     let mut console = ScriptedConsole::new(&[""]);
-    let pending = collect_wizard_token(&mut console, "a-secret", &path, "example").unwrap();
+    let pending =
+        collect_wizard_token(&mut console, &Secret::new("a-secret"), &path, "example").unwrap();
     let recorded = persist_wizard_token(&mut console, &path, "example", &pending)
         .expect("a supplied key must always be recorded, home dir or not");
 

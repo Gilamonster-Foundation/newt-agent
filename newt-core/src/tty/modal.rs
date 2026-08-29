@@ -222,9 +222,14 @@ pub enum Echo {
 impl Echo {
     /// What to DISPLAY for `value` under this policy.
     ///
+    /// Public because the property worth testing is "the value never appears
+    /// in what is shown", and that belongs to callers who ask for secrets —
+    /// `newt-tui`'s credential contract asserts it over the real planted key.
+    ///
     /// Counts characters, not bytes: a multi-byte key would otherwise draw
     /// more stars than it has characters and leak its byte length.
-    fn display(self, value: &str) -> String {
+    #[must_use]
+    pub fn display(self, value: &str) -> String {
         match self {
             Self::Chars => value.to_string(),
             Self::Stars => "*".repeat(value.chars().count()),

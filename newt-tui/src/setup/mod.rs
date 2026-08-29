@@ -31,6 +31,7 @@
 //! into that same path — do not open-code a second writer here.
 
 mod commit;
+pub(crate) mod credentials;
 
 use commit::*;
 
@@ -46,6 +47,7 @@ pub(crate) use commit::{
 };
 
 use crate::line_console::{is_yes, Console, StdinConsole};
+use newt_core::agent_identity::Secret;
 use newt_core::backend_probe::{EndpointProbeResult, GenerationCheck};
 use newt_core::config::Discovery;
 use newt_core::provider_preset::{
@@ -363,10 +365,15 @@ enum Flow {
 }
 
 struct PendingWizardToken {
-    token: String,
+    /// The plaintext, wrapped. `Secret` redacts its `Debug` and is not
+    /// `Serialize`, so this record cannot reach a log line or a config file
+    /// even through a `{:?}` on a panic path.
+    token: Secret,
     passphrase: Option<newt_core::secrets::SecretString>,
     path: PathBuf,
-    reference: String,
+    /// Where the key lives, as the type that cannot be empty and cannot hold
+    /// the key. See `credentials::SealedSecret`.
+    reference: credentials::SealedSecret,
 }
 
 fn persist_interactive_backend(
@@ -445,7 +452,7 @@ fn persist_interactive_backend_with(
     let token_destination = pending_token
         .map(|pending| setup_config_destination(&pending.path))
         .transpose()?;
-    let token_reference = pending_token.map(|pending| pending.reference.clone());
+    let token_reference = pending_token.map(|pending| pending.reference.handle().to_string());
     if let Some(reference) = token_reference.as_deref() {
         if backend.api_key_file.as_deref() != Some(reference) {
             anyhow::bail!("internal token-reference mismatch for {}", backend.name);
@@ -486,14 +493,14 @@ fn persist_interactive_backend_with(
                     }
                     newt_core::secrets::store_token_at_resolved(
                         destination,
-                        &pending.token,
+                        pending.token.expose(),
                         pending.passphrase.as_ref(),
                     )
                     .map_err(|error| anyhow::anyhow!(error))?;
                     guard.created.push(destination.as_path().to_path_buf());
                     let resolved = newt_core::secrets::resolve_token_file(destination.as_path())
                         .map_err(|error| anyhow::anyhow!(error))?;
-                    if resolved.as_deref() != pending_token.map(|pending| pending.token.as_str()) {
+                    if resolved.as_deref() != pending_token.map(|pending| pending.token.expose()) {
                         anyhow::bail!("stored token verification failed for {}", backend.name);
                     }
                 }
@@ -816,17 +823,18 @@ async fn configure_custom_host(
         // Authentication-required endpoints (the typed probe error): offer one
         // hidden key prompt and re-probe. The https/loopback transport rule
         // applies before any token leaves this process.
-        let mut api_key: Option<String> = None;
+        let mut api_key: Option<Secret> = None;
         if hits.is_empty()
             && failures
                 .iter()
                 .any(|f| f.contains("authentication required"))
         {
-            let key = console.ask_secret("API key (echoes as *, Enter to skip): ")?;
-            let key = key.trim().to_string();
-            if !key.is_empty() {
+            if let Some(key) =
+                credentials::ask_secret(console, "API key (echoes as *, Enter to skip): ")?
+            {
                 validate_authenticated_target(&target)?;
-                let (h, f) = probe_candidates_concurrently(client, &candidates, Some(&key)).await?;
+                let (h, f) =
+                    probe_candidates_concurrently(client, &candidates, Some(key.expose())).await?;
                 hits = h;
                 failures = f;
                 api_key = Some(key);
@@ -888,7 +896,7 @@ async fn configure_custom_host(
         }
         let pending_token = if let Some(key) = api_key {
             let pending = collect_wizard_token(console, &key, config_path, &backend.name)?;
-            backend.api_key_file = Some(pending.reference.clone());
+            backend.api_key_file = Some(pending.reference.handle().to_string());
             Some(pending)
         } else {
             None
@@ -907,10 +915,13 @@ async fn verify_custom_chat_with_retries(
     client: &reqwest::Client,
     hit: &EndpointProbeResult,
     model: &str,
-    mut api_key: Option<String>,
-) -> anyhow::Result<(Option<String>, Option<newt_core::config::OpenAiApi>)> {
+    mut api_key: Option<Secret>,
+) -> anyhow::Result<(Option<Secret>, Option<newt_core::config::OpenAiApi>)> {
     for attempt in 0..GENERATION_CHECK_ATTEMPTS {
-        if api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+        if api_key
+            .as_ref()
+            .is_some_and(|key| !key.expose().trim().is_empty())
+        {
             validate_authenticated_target(&hit.endpoint)?;
         }
         console.say(&format!(
@@ -923,7 +934,7 @@ async fn verify_custom_chat_with_retries(
             None,
             &hit.endpoint,
             model,
-            api_key.as_deref(),
+            api_key.as_ref().map(Secret::expose),
         )
         .await
         {
@@ -943,11 +954,11 @@ async fn verify_custom_chat_with_retries(
                     break;
                 }
                 validate_authenticated_target(&hit.endpoint)?;
-                let key = console.ask_secret("API key (echoes as *, Enter to cancel): ")?;
-                let key = key.trim().to_string();
-                if key.is_empty() {
+                let Some(key) =
+                    credentials::ask_secret(console, "API key (echoes as *, Enter to cancel): ")?
+                else {
                     anyhow::bail!("setup cancelled after authentication rejection");
-                }
+                };
                 api_key = Some(key);
             }
             GenerationCheck::Unverified(reason) => {
@@ -1005,7 +1016,7 @@ async fn manual_backend_entry(
         build_backend_pair(&name, &url, &model, kind, serving, None, "manual");
     let pending_token = if let Some(key) = api_key {
         let pending = collect_wizard_token(console, &key, config_path, &backend.name)?;
-        backend.api_key_file = Some(pending.reference.clone());
+        backend.api_key_file = Some(pending.reference.handle().to_string());
         Some(pending)
     } else {
         None
@@ -1134,7 +1145,7 @@ async fn configure_preset(
                 WizardCred {
                     api_key_env: Some(var),
                     api_key_file: None,
-                    probe_key: Some(value),
+                    probe_key: Some(Secret::new(value)),
                     pending_token: None,
                 }
             } else {
@@ -1156,7 +1167,8 @@ async fn configure_preset(
         "Probing {} for available models…",
         preset.base_url
     ));
-    let models = list_models_for_preset(client, preset, cred.probe_key.as_deref()).await;
+    let models =
+        list_models_for_preset(client, preset, cred.probe_key.as_ref().map(Secret::expose)).await;
     let model = match models {
         Ok(m) if !m.is_empty() => select_model(console, &m)?,
         Ok(_) | Err(_) => {
@@ -1206,7 +1218,9 @@ async fn configure_preset(
 struct WizardCred {
     api_key_env: Option<String>,
     api_key_file: Option<String>,
-    probe_key: Option<String>,
+    /// Held only to live-test the key before anything is written. Wrapped,
+    /// so the one place that needs the bytes has to say `expose()`.
+    probe_key: Option<Secret>,
     pending_token: Option<PendingWizardToken>,
 }
 
@@ -1232,8 +1246,8 @@ async fn verify_key_with_retries(
     for attempt in 0..GENERATION_CHECK_ATTEMPTS {
         if cred
             .probe_key
-            .as_deref()
-            .is_some_and(|key| !key.trim().is_empty())
+            .as_ref()
+            .is_some_and(|key| !key.expose().trim().is_empty())
         {
             validate_authenticated_target(&endpoint)?;
         }
@@ -1247,7 +1261,7 @@ async fn verify_key_with_retries(
             api,
             &endpoint,
             model,
-            cred.probe_key.as_deref(),
+            cred.probe_key.as_ref().map(Secret::expose),
         )
         .await
         {
@@ -1284,9 +1298,8 @@ fn preset_pasted_key(
     preset: &ProviderPreset,
     config_path: &Path,
 ) -> anyhow::Result<WizardCred> {
-    let key = console.ask_secret("API key (echoes as *, Enter to skip): ")?;
-    let key = key.trim().to_string();
-    if key.is_empty() {
+    let key = credentials::ask_secret(console, "API key (echoes as *, Enter to skip): ")?;
+    let Some(key) = key else {
         let var = preset
             .env_vars
             .first()
@@ -1301,9 +1314,9 @@ fn preset_pasted_key(
             probe_key: None,
             pending_token: None,
         });
-    }
+    };
     let pending = collect_wizard_token(console, &key, config_path, &preset.name)?;
-    let reference = pending.reference.clone();
+    let reference = pending.reference.handle().to_string();
     Ok(WizardCred {
         api_key_env: None,
         api_key_file: Some(reference),
@@ -1314,20 +1327,19 @@ fn preset_pasted_key(
 
 fn collect_wizard_token(
     console: &mut dyn Console,
-    token: &str,
+    token: &Secret,
     config_path: &Path,
     name: &str,
 ) -> anyhow::Result<PendingWizardToken> {
     console.say("Protect the stored key with a passphrase? Enter uses a machine-local key.");
-    let pass = console.ask_secret("Passphrase (echoes as *): ")?;
-    let passphrase = {
-        let trimmed = pass.trim();
-        (!trimmed.is_empty()).then(|| newt_core::secrets::SecretString::from(trimmed.to_string()))
-    };
+    // An empty passphrase is a real choice — it selects the machine-local
+    // identity — so `None` here means "no passphrase", not "read failed".
+    let passphrase = credentials::ask_secret(console, "Passphrase (echoes as *): ")?
+        .map(|pass| newt_core::secrets::SecretString::from(pass.expose().to_string()));
     let path = versioned_wizard_token_path(config_path, name)?;
-    let reference = collapse_home(&path);
+    let reference = credentials::SealedSecret::new(&collapse_home(&path))?;
     Ok(PendingWizardToken {
-        token: token.to_string(),
+        token: token.clone(),
         passphrase,
         path,
         reference,
@@ -1353,9 +1365,15 @@ fn persist_wizard_token(
     _name: &str,
     pending: &PendingWizardToken,
 ) -> anyhow::Result<String> {
-    newt_core::secrets::store_token_at(&pending.path, &pending.token, pending.passphrase.as_ref())
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let reference = pending.reference.clone();
+    // The single point of use that genuinely needs the bytes: the age
+    // encryptor. `expose()` is called here and its result is never stored.
+    newt_core::secrets::store_token_at(
+        &pending.path,
+        pending.token.expose(),
+        pending.passphrase.as_ref(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let reference = pending.reference.handle().to_string();
     console.say(&format!("  → stored encrypted at {reference}"));
     Ok(reference)
 }
