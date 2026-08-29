@@ -22,6 +22,18 @@ mod completed_spill;
 mod danger;
 pub mod dgx_probe;
 pub mod herdr;
+// C2 (#1876): the RichTUI renderer for one interaction. Rich-only — the pure
+// view model it draws lives in `newt_core::interaction_view`, where ratatui is
+// not a dependency, so "no renderer in the model" is a compile error.
+#[cfg(feature = "rich-tui")]
+mod interaction_view;
+/// C2 (#1876) — the PTY acceptance proof that the inline INTERACTION frame
+/// hands the terminal back on every exit path: clean close, panic, and error
+/// return. Same tier and same reasoning as the pager's, and it additionally
+/// pins that this surface never enters the alternate screen, which the
+/// plain-scroller carve-out does not permit during a turn.
+#[cfg(all(test, unix, feature = "rich-tui"))]
+mod interaction_view_pty_test;
 mod line_console;
 #[cfg(feature = "live-spill")]
 mod live_spill;
