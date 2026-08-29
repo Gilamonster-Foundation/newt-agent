@@ -48,6 +48,10 @@ pub mod progress_sink;
 /// damages nothing. Unix-only: it needs a real pty pair.
 #[cfg(all(test, unix))]
 mod pty_notice_test;
+// C2b (#1891): the ONE raw-mode guard, promoted out of `modal` when a second
+// surface needed it. Saving termios rather than using crossterm's global is
+// what makes nested frames compose.
+pub mod raw_mode;
 pub mod spinner;
 pub mod widgets;
 pub mod width;

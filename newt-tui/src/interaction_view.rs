@@ -37,8 +37,9 @@ mod terminal {
     use newt_core::markup::spans::Emphasis;
 
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
+    use crossterm::terminal::{Clear, ClearType};
     use newt_core::interaction_surface::SurfaceInteraction;
+    use newt_core::tty::raw_mode::RawModeGuard;
     use newt_core::HumanQuestionOutcome;
     use ratatui::backend::CrosstermBackend;
     use ratatui::style::{Modifier, Style};
@@ -66,27 +67,39 @@ mod terminal {
     /// The guard is bound BEFORE the fallible call, the ordering
     /// `AltScreenGuard::enter` pays for: from that point the restore is owed
     /// regardless of what the next line does.
-    pub(crate) struct InlineGuard;
+    pub(crate) struct InlineGuard {
+        /// Restores EXACTLY the mode this frame found — see below.
+        _raw: RawModeGuard,
+    }
 
     impl InlineGuard {
         pub(crate) fn enter() -> io::Result<Self> {
-            let guard = Self;
-            enable_raw_mode()?;
-            Ok(guard)
+            // **Not `crossterm::enable_raw_mode`**, and C2b (#1891) paid for
+            // the difference. crossterm keeps ONE process-global "mode prior
+            // to raw", so under nesting the inner `enter` is a no-op and the
+            // inner `drop` restores GLOBALLY: the outer frame is still drawn
+            // while the terminal is already cooked, its keyboard
+            // line-buffered and kernel-echoed. `RawModeGuard` saves the
+            // termios, so each frame restores what IT found and nesting
+            // composes. `a_nested_frame_does_not_restore_the_terminal_early`
+            // is the PTY test that caught this version doing it wrong.
+            Ok(Self {
+                _raw: RawModeGuard::enter()?,
+            })
         }
     }
 
     impl Drop for InlineGuard {
         fn drop(&mut self) {
             // Erase the reserved region before handing the terminal back, or
-            // the next committed line prints over a live widget frame.
+            // the next committed line prints over a live widget frame. The
+            // raw-mode restore is `_raw`'s Drop, which runs after this body.
             let mut out = io::stdout();
             let _ = crossterm::execute!(
                 out,
                 crossterm::cursor::MoveToColumn(0),
                 Clear(ClearType::FromCursorDown)
             );
-            let _ = disable_raw_mode();
         }
     }
 

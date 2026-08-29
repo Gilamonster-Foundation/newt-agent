@@ -91,6 +91,21 @@ fn interaction_view_child() {
             }
             assert!(inner().is_err(), "the fixture must take the error path");
         }
+        // **Nested modals.** An interaction frame opened over a frame that is
+        // already up — the shape `modal.rs::RawGuard` was written for
+        // (#1770). The child holds TWICE so the parent can sample the tty in
+        // the window BETWEEN the inner drop and the outer one, which is the
+        // only moment the defect is visible: if the inner guard restores
+        // globally, the outer frame is still drawn but the terminal is
+        // already cooked, so its keyboard is line-buffered and echoing.
+        "nested" => {
+            let _outer = InlineGuard::enter().expect("enter raw mode (outer)");
+            {
+                let _inner = InlineGuard::enter().expect("enter raw mode (inner)");
+                hold();
+            } // inner drops here; the OUTER frame is still up.
+            hold();
+        }
         other => panic!("unknown child mode {other:?}"),
     }
 }
@@ -154,6 +169,72 @@ fn drive(mode: &str) -> Outcome {
         raw_after: pty.is_raw(),
         raw_during,
         screen,
+    }
+}
+
+/// What the parent observed across a NESTED lifecycle.
+struct NestedOutcome {
+    /// Raw once the outer guard was up? (The control.)
+    raw_during_outer: bool,
+    /// Raw in the window after the INNER guard dropped but while the OUTER
+    /// frame is still live? **This is the property.**
+    raw_after_inner_drop: bool,
+    /// Cooked once both are gone?
+    raw_after_all: bool,
+}
+
+/// Drive the nested lifecycle, sampling in the window between the two drops.
+fn drive_nested() -> NestedOutcome {
+    let pty = Pty::open();
+    let mut child = std::process::Command::new(
+        std::env::current_exe().expect("the test binary re-invokes itself"),
+    )
+    .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
+    .env("NEWT_INTERACTION_PTY_CHILD", "nested")
+    .stdin(pty.slave_stdio())
+    .stdout(pty.slave_stdio())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .expect("spawn the pty child");
+
+    let raw_during_outer = {
+        let deadline = Instant::now() + REACH_TIMEOUT;
+        loop {
+            if pty.is_raw() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    // Release the INNER hold. The child drops the inner guard and parks on
+    // the second hold with the outer frame still up.
+    pty.type_in("x");
+    // Give the inner Drop time to run before sampling. Sampling too early
+    // would read the pre-drop state and pass vacuously.
+    std::thread::sleep(Duration::from_millis(250));
+    let raw_after_inner_drop = pty.is_raw();
+
+    // Release the OUTER hold and let the child exit.
+    pty.type_in("x");
+    let _ = std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| wait_for_child(&mut child, EXIT_TIMEOUT));
+        while !waiter.is_finished() {
+            let _ = pty.screen();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        waiter.join().expect("child reaper thread")
+    });
+    std::thread::sleep(Duration::from_millis(80));
+    let _ = pty.screen();
+
+    NestedOutcome {
+        raw_during_outer,
+        raw_after_inner_drop,
+        raw_after_all: pty.is_raw(),
     }
 }
 
@@ -221,4 +302,40 @@ fn a_panic_while_the_frame_is_up_still_restores_the_terminal() {
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn an_error_return_while_the_frame_is_up_still_restores_the_terminal() {
     assert_restored("error", &drive("error"));
+}
+
+/// **A nested frame must not hand the terminal back while the outer one is
+/// still up.**
+///
+/// The failure this catches is not a leak but its mirror: an over-eager
+/// restore. `crossterm::enable_raw_mode` keeps ONE process-global "mode prior
+/// to raw" and makes a second call a no-op, so a guard built on it sees the
+/// inner `enter` do nothing and the inner `drop` restore GLOBALLY. The outer
+/// frame is still drawn, but the terminal is already cooked — keys
+/// line-buffered until Enter and echoed by the kernel over the frame, which
+/// is exactly the "prompt that looked hung" `modal.rs::RawGuard` documents
+/// from #1770.
+///
+/// Observable only from outside, and only in the window between the two
+/// drops, which is why the child holds twice.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_nested_frame_does_not_restore_the_terminal_early() {
+    let out = drive_nested();
+    assert!(
+        out.raw_during_outer,
+        "the pty was never raw — the test proved nothing, because it never \
+         observed the state that must be preserved"
+    );
+    assert!(
+        out.raw_after_inner_drop,
+        "the INNER frame's drop handed the terminal back while the OUTER \
+         frame was still up: raw mode was lost mid-modal, so the outer \
+         frame's keyboard is line-buffered and kernel-echoed (#1770)"
+    );
+    assert!(
+        !out.raw_after_all,
+        "both frames are gone and the terminal is still RAW"
+    );
 }
