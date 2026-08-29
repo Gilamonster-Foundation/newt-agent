@@ -431,12 +431,24 @@ const CATEGORIES: &[Category] = &[
             ("newt-cli/src/mcp_probe_cmd.rs", 1),
             ("newt-cli/src/dgx_card.rs", 1),
             ("newt-cli/src/dgx.rs", 2),
-            // The ONE sanctioned blocking read: the sealed PromptWindow path
-            // under the line arbiter. It stays at exactly one.
+            // THE ONE SANCTIONED READ, and the rationale below is corrected to
+            // say so (#1909). This is `PromptWindow::read_line_into`'s own
+            // body — the seal's implementation, not something the seal is
+            // meant to replace. The old rationale said this category counted
+            // reads "outside the sealed PromptWindow", which excluded the very
+            // row it listed.
+            //
+            // Kept here rather than split into its own category: two
+            // categories cannot share needles, because a file with hits
+            // matches EVERY category whose count returns > 0 — verified, it
+            // reports each file under both. So the definition is fixed instead
+            // of the membership, and the ceiling is stated on the row.
             ("newt-core/src/tty/arbiter.rs", 1),
         ],
-        rationale: "synchronous stdin reads outside the sealed PromptWindow; \
-                    C0/C1 route these through the semantic request seam",
+        rationale: "synchronous stdin reads; every one is a site to route \
+                    through the semantic request seam EXCEPT the single \
+                    sanctioned read inside the sealed PromptWindow, which is \
+                    that seam's own implementation and stays at exactly one",
     },
     Category {
         name: "table renderer implementations",
