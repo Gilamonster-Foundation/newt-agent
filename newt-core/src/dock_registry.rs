@@ -1098,11 +1098,29 @@ mod tests {
         }
     }
 
+    /// Six concurrent approvals must all survive — the LOST-UPDATE property.
+    ///
+    /// Without the write lock, N concurrent `newt dock approve` processes each
+    /// read the same bundle and the last writer clobbers the rest. The lock
+    /// serializes the read-modify-write, so every distinct approval survives.
+    ///
+    /// **The workers RETRY on contention, and that is the fix for #1871.** This
+    /// test used to `unwrap()` in every worker, which asserted something it is
+    /// not named for: that all six writers win the lock inside
+    /// `acquire_lock`'s ambient budget (100 polls x 20ms). A writer that is
+    /// refused and told "try again" has NOT lost an update — it has been
+    /// correctly serialized, and it wrote nothing, because `approve_dock`
+    /// takes the lock with `?` before it reads. The property under test is the
+    /// FINAL CONTENTS, so the workers honour the contract the error states and
+    /// the assertion stays on the merged result.
+    ///
+    /// Verified by mutation rather than by argument: with the budget cut to 2
+    /// polls the old shape fails with the exact CI signature while this shape
+    /// passes with all six records — the failure was acquisition, not loss.
+    /// And with the `acquire_lock` line deleted from `approve_dock`, this
+    /// shape fails on the count, so retrying did not make it vacuous.
     #[test]
     fn concurrent_approvals_do_not_lost_update() {
-        // Without the write lock, N concurrent `newt dock approve` processes each
-        // read the same bundle and the last writer clobbers the rest. The lock
-        // serializes the read-modify-write, so every distinct approval survives.
         let root = UserKey::generate();
         let dir = TempDir::new().unwrap();
         let config = dir.path().join("config.toml");
@@ -1114,16 +1132,36 @@ mod tests {
                 let config = config.clone();
                 let identity = identity.clone();
                 std::thread::spawn(move || {
-                    approve_dock_with_identity(
-                        &config,
-                        &identity,
-                        &agent_fingerprint_of_pubkey(&[s; 32]),
-                        &format!("peer-{s}"),
-                        &format!("{s:02x}").repeat(32),
-                        DockScope::MirrorInject,
-                        "tx",
-                    )
-                    .unwrap();
+                    // Generous, and it bounds a hang rather than a race: the
+                    // loop only continues while the registry is actively
+                    // telling us someone else holds the lock.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    loop {
+                        match approve_dock_with_identity(
+                            &config,
+                            &identity,
+                            &agent_fingerprint_of_pubkey(&[s; 32]),
+                            &format!("peer-{s}"),
+                            &format!("{s:02x}").repeat(32),
+                            DockScope::MirrorInject,
+                            "tx",
+                        ) {
+                            Ok(_) => return,
+                            Err(error) if crate::atomic_fs::is_lock_contended(&error) => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "peer-{s} never acquired the lock in 60s — \
+                                     that is a stuck lock, not contention: {error:#}"
+                                );
+                                std::thread::yield_now();
+                            }
+                            // Anything else is a real failure and must not be
+                            // retried into a timeout that hides it.
+                            Err(error) => {
+                                panic!("peer-{s} failed for a non-contention reason: {error:#}")
+                            }
+                        }
+                    }
                 })
             })
             .collect();
