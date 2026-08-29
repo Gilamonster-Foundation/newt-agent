@@ -44,7 +44,7 @@ use newt_interaction::{
     OptionId, ProtocolError, Requirement, SemanticRole,
 };
 
-use crate::tty::{Action, Question};
+use crate::tty::Question;
 use crate::PermissionAction;
 
 /// The single control every adapted question carries.
@@ -131,60 +131,4 @@ pub fn question_to_definition(
     );
     definition.note = question.note.clone();
     Ok(definition)
-}
-
-/// Recover the permission question a definition expresses.
-///
-/// # Errors
-///
-/// [`ProtocolError::InvalidId`] when the definition is not one this adapter
-/// produced: no decision control, a control of another kind, or an option
-/// naming an action this build does not know. Fail closed rather than
-/// returning a question missing an action — a prompt that silently lost an
-/// option would offer the operator a choice its author did not write.
-pub fn definition_to_question(
-    definition: &InteractionDefinition,
-) -> Result<Question<PermissionAction>, ProtocolError> {
-    let invalid = |reason: String| ProtocolError::InvalidId {
-        kind: "adapted definition",
-        reason,
-    };
-
-    let [control] = definition.controls.as_slice() else {
-        return Err(invalid(format!(
-            "expected exactly one control, found {}",
-            definition.controls.len()
-        )));
-    };
-    if control.id.as_str() != DECISION_CONTROL {
-        return Err(invalid(format!(
-            "expected the `{DECISION_CONTROL}` control, found `{}`",
-            control.id.as_str()
-        )));
-    }
-    let ControlKind::Choice { options } = &control.kind else {
-        return Err(invalid("the decision control is not a choice".to_string()));
-    };
-
-    let mut actions = Vec::with_capacity(options.len());
-    for option in options {
-        let Some(value) = action_for_option(option.id.as_str()) else {
-            return Err(invalid(format!(
-                "`{}` is not a permission action this build knows",
-                option.id.as_str()
-            )));
-        };
-        actions.push(Action {
-            value,
-            key: option.key.clone(),
-            label: option.label.clone(),
-            aliases: option.aliases.clone(),
-        });
-    }
-
-    Ok(Question {
-        markdown: definition.markdown.clone(),
-        actions,
-        note: definition.note.clone(),
-    })
 }

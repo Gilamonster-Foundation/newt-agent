@@ -19,7 +19,7 @@ use super::prompt_read::{execute_prompt_read_silent, PromptReadContext};
 use super::recall::{execute_recall, recall_tool_definition, RecallSource};
 use super::report::{execute_render_report, render_report_tool_definition};
 use crate::caveats::CaveatsExt as _;
-use crate::{Action, PermissionAction, Question};
+use crate::PermissionAction;
 #[cfg(test)]
 use output_budget::DEFAULT_MAX_OUTPUT_TOKENS;
 #[cfg(test)]
@@ -1669,27 +1669,32 @@ fn confirm_unrestricted_fs_mutation(
     if ocap_disabled() {
         return true;
     }
-    let prompt = mutation_confirm_question(question);
-    // C0a (#1856): rendering moved off `Question`, so this reaches the ONE
-    // plain projection through the adapter. Byte-identical — the adapter is
-    // field-identical and `render` is a pure function of those fields
-    // (`mutation_confirm_renders_its_frozen_form`). What is NOT touched here
-    // is the thing D0 actually owns: this form is still flattened to a
-    // string across the free-text `ask_question` seam and re-parsed below,
-    // the one place a typed form crosses a seam as rendered text.
-    let rendered = match crate::interaction_adapter::question_to_definition(&prompt) {
-        Ok(definition) => crate::markup::plain::render(&definition),
-        // Unreachable: both wire names are valid option ids. Fail closed —
-        // a mutation is never authorized by a prompt we could not render.
-        Err(_) => return false,
-    };
+    // D0 (#1878): the definition is built DIRECTLY. C0a moved the rendering
+    // here but left the model behind, and said so — "this form is still
+    // flattened to a string across the free-text `ask_question` seam and
+    // re-parsed below, the one place a typed form crosses a seam as rendered
+    // text". The flattening stays (the free-text seam is D1's), but the
+    // legacy `Question` round trip on either side of it is gone.
+    let definition = mutation_confirm_definition(question);
+    let rendered = crate::markup::plain::render(&definition);
     match gate {
-        // ONLY an explicit answer parsed to AllowOnce authorizes the mutation.
-        // Every other outcome — no operator, Esc/Ctrl-C/Ctrl-D, EOF, input
-        // failure, or a non-"y" answer — fails closed (mutation denied).
+        // ONLY an explicit answer resolving to AllowOnce authorizes the
+        // mutation. Every other outcome — no operator, Esc/Ctrl-C/Ctrl-D,
+        // EOF, input failure, an ambiguous answer, or a non-"y" answer —
+        // fails closed (mutation denied).
         Some(g) => match g.ask_question(&rendered) {
             HumanQuestionOutcome::Answer(answer) => {
-                prompt.parse(&answer) == Some(PermissionAction::AllowOnce)
+                // The ONE resolver (D0), and a fail-closed CONSTANT: the deny
+                // is the absence of an AllowOnce, never an option picked out
+                // of the definition by role. `role` is author-assigned, so
+                // deriving the failure mode from it would hand the author the
+                // failure mode (A3).
+                confirm_choice_options(&definition)
+                    .and_then(|options| newt_interaction::binding::resolve_typed(options, &answer))
+                    .and_then(|option| {
+                        crate::interaction_adapter::action_for_option(option.as_str())
+                    })
+                    == Some(PermissionAction::AllowOnce)
             }
             _ => false,
         },
@@ -1697,15 +1702,69 @@ fn confirm_unrestricted_fs_mutation(
     }
 }
 
-fn mutation_confirm_question(question: &str) -> Question<PermissionAction> {
-    Question {
-        markdown: question.to_string(),
-        actions: vec![
-            Action::new(PermissionAction::AllowOnce, "y", "y to confirm").with_aliases(["Y"]),
-            Action::new(PermissionAction::Deny, "n", "n to skip").with_aliases(["N"]),
-        ],
-        note: None,
+/// The choice control's options, if this definition has one.
+fn confirm_choice_options(
+    definition: &newt_interaction::InteractionDefinition,
+) -> Option<&Vec<newt_interaction::ChoiceOption>> {
+    definition.controls.iter().find_map(|c| match &c.kind {
+        newt_interaction::ControlKind::Choice { options } => Some(options),
+        _ => None,
+    })
+}
+
+/// The `--yolo` mutation confirm, as an `InteractionDefinition`.
+///
+/// Field-identical to what `question_to_definition(&mutation_confirm_question(..))`
+/// produced, so `markup::plain::render` emits the same bytes it always has
+/// (`mutation_confirm_renders_its_frozen_form`). What changed is that there is
+/// no longer a legacy `Question` in the middle: this was the last production
+/// construction of one, and the last caller of `Question::parse`.
+fn mutation_confirm_definition(question: &str) -> newt_interaction::InteractionDefinition {
+    use newt_interaction::{
+        ChoiceOption, Control, ControlId, ControlKind, InteractionDefinition, InteractionKind,
+        OptionId, Requirement, SemanticRole,
+    };
+    let option = |wire: &str, role, key: &str, label: &str, alias: &str| {
+        ChoiceOption {
+        id: OptionId::new(wire).expect(
+            "the confirm wire names are consts drawn from [A-Za-z0-9_-]; this              cannot vary at runtime",
+        ),
+        role,
+        label: label.to_string(),
+        key: key.to_string(),
+        aliases: vec![alias.to_string()],
     }
+    };
+    InteractionDefinition::new(
+        InteractionKind::Choice,
+        question.to_string(),
+        vec![Control {
+            id: ControlId::new(crate::interaction_adapter::DECISION_CONTROL)
+                .expect("`decision` is a valid control id; it is a const"),
+            kind: ControlKind::Choice {
+                options: vec![
+                    option(
+                        PermissionAction::AllowOnce.as_str(),
+                        SemanticRole::Allow,
+                        "y",
+                        "y to confirm",
+                        "Y",
+                    ),
+                    option(
+                        PermissionAction::Deny.as_str(),
+                        SemanticRole::Deny,
+                        "n",
+                        "n to skip",
+                        "N",
+                    ),
+                ],
+            },
+            label: String::new(),
+            // A mutation confirm must be answered: an unanswered one denies,
+            // which is a decision and not an absence.
+            requirement: Requirement::Required,
+        }],
+    )
 }
 
 /// Run the configured build-check command in `workspace` and return a compact
@@ -14743,9 +14802,11 @@ mod disable_ocap_tests {
     /// here rather than being inherited by D0.
     #[test]
     fn mutation_confirm_renders_its_frozen_form() {
-        let prompt = mutation_confirm_question("delete `auto.txt`?");
-        let definition =
-            crate::interaction_adapter::question_to_definition(&prompt).expect("adapts");
+        // D0 (#1878): built directly, no legacy `Question` in the middle. The
+        // FROZEN BYTES below are unchanged, which is the whole point — this
+        // test is what proves the migration moved the construction without
+        // moving what the operator reads.
+        let definition = mutation_confirm_definition("delete `auto.txt`?");
         assert_eq!(
             crate::markup::plain::render(&definition),
             "delete `auto.txt`?\n[y] to confirm   [n] to skip"

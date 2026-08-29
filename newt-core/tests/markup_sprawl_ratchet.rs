@@ -119,78 +119,34 @@ const CATEGORIES: &[Category] = &[
     Category {
         name: "question construction sites",
         count: |f| count_any(&f.squeezed, &["Question{", "Question::<"]),
-        baseline: &[
-            // B0a (#1841) ratcheted newt-tui/src/permissions.rs from 2 to 1
-            // (`permission_question_for`'s literal became an
-            // InteractionDefinition). **C0a (#1856) ratcheted it 1 -> 0 and
-            // the row is gone**: the survivor was `prompt_user_input`'s
-            // actionless free-text form, and deleting `Question::terminal_text`
-            // left it with nothing to render through, so it became an
-            // `InteractionDefinition` too. Only its RENDERING moved —
-            // migrating the free-text INTERACTION onto the controller is
-            // still D0's.
-            // STAYS. `mutation_confirm_question` backs a `--yolo` confirm
-            // over a plain `&str`, not a permission decision; no slice of
-            // this epic deletes it.
-            ("newt-core/src/agentic/tools.rs", 1),
-            // A2.2's adapter (#1828): the one entry here that is not a
-            // duplicate to migrate. It assembles a Question BY DEFINITION,
-            // reconstructing the legacy type from an InteractionDefinition.
-            //
-            // **C0a (#1856) did NOT move this row, and the reason is worth
-            // recording.** C0a's brief expected 1 -> 0 on the theory that
-            // extracting rendering would leave `definition_to_question`
-            // with no production caller. That was true when the C0
-            // inventory was taken (origin/main 24e72545); B0b-2 (#1846)
-            // then landed `interaction_offer::PendingOffer::question`,
-            // which reconstructs the legacy form so `newt-web` can build
-            // its permission card (newt-web/src/shell.rs) and decode a
-            // submitted verdict (newt-web/src/main.rs). C0a removed BOTH
-            // terminal callers; the remaining one is the WEB's model
-            // reconstruction, and deleting that is C3's named deletion
-            // gate ("remove permission-card-specific model reconstruction
-            // and the second independent Markdown option matrix"), not a
-            // rendering slice's.
-            //
-            // **CORRECTION (C3c, #1867): this row does NOT go to 0 in C3,
-            // and the belief that it would was inherited twice.**
-            //
-            // C3c deleted `PendingOffer::question` and both web consumers —
-            // the card and the verdict decode now read the
-            // `InteractionDefinition` directly, which IS C3's named deletion
-            // gate and is done. The row still cannot move, because what it
-            // counts is the `Question{` literal at
-            // `interaction_adapter.rs:185`, inside `definition_to_question`,
-            // and that function still has PRODUCTION callers in newt-tui:
-            //
-            //   newt-tui/src/permissions.rs:350  `decode_answer`
-            //   newt-tui/src/permissions.rs:620  `await_web_decision`
-            //
-            // (Verified against origin/main 46b43321 with this crate's own
-            // brace-depth `#[cfg(test)]` rule, not by eye — `:267` is a third
-            // hit and IS test-only, which is exactly the kind of miscount that
-            // produced the claim above.)
-            //
-            // The sentence "C0a removed BOTH terminal callers" was therefore
-            // wrong when it was written. `decode_answer` deliberately round
-            // trips, and its own doc says why: "a second decoder written
-            // against `InteractionDefinition` would be a third answer-parsing
-            // implementation — the exact sprawl this epic exists to delete."
-            // That reasoning is sound, so the row is held open by a CORRECT
-            // design decision, not by a missed deletion.
-            //
-            // This row goes to 0 when the terminal decode moves onto the
-            // controller — D-family work, not C3's. Until then it stays at 1.
-            // Editing the baseline to match a slice's expectation, rather than
-            // editing the code to match the baseline, is the failure mode the
-            // whole mechanism exists to prevent.
-            //
-            // CORRECTION (B0a): an earlier comment here claimed B0 would
-            // delete "the two rows above". That was wrong on both counts —
-            // permissions.rs goes to 1, not 0, and tools.rs does not move
-            // at all.
-            ("newt-core/src/interaction_adapter.rs", 1),
-        ],
+        // **EMPTY — the category is closed (D0, #1878).** Not removed: an
+        // empty baseline is the strongest form this row can take, because any
+        // NEW site trips it. The needles and their anti-vacuous twin below
+        // still run, so this is a live "never again" guard rather than a
+        // deleted one.
+        //
+        // What went, and why each was the last of its kind:
+        //
+        // * `newt-core/src/agentic/tools.rs` — `mutation_confirm_question`
+        //   built a legacy `Question` for the `--yolo` confirm; D0 builds the
+        //   `InteractionDefinition` directly. The comment that stood here said
+        //   "STAYS ... no slice of this epic deletes it", written before D0's
+        //   scope named generic mutation confirmation. Corrected, not worked
+        //   around.
+        // * `newt-core/src/interaction_adapter.rs` — the `Question {` literal
+        //   inside `definition_to_question`, whose last two production callers
+        //   were `decode_answer` (now resolving through
+        //   `newt_interaction::binding::resolve_typed`) and a renderability
+        //   precondition in `await_web_decision` that its OWN comment said
+        //   "retires with C3's removal of the reconstruction" — which C3c did.
+        // * `newt-tui/src/permissions.rs` — `prompt_user_input`'s free-text
+        //   form, already an `InteractionDefinition` since C0a; the row was
+        //   stale rather than newly emptied, which only the scan revealed.
+        //
+        // Three consecutive slices predicted the adapter row would reach 0
+        // "when the terminal decode moves onto the controller". It has, and so
+        // did the other two.
+        baseline: &[],
         rationale: "every place a user-facing Question is assembled outside \
                     the (future) one definition path; B0/D0 migrate these",
     },
@@ -626,11 +582,28 @@ fn the_question_wire_shape_is_frozen() {
         r#"{"markdown":"m","actions":[{"value":"deny","key":"d","label":"deny"}]}"#,
     )
     .expect("pre-aliases payloads must keep deserializing");
-    assert_eq!(legacy.parse("d"), Some(PermissionAction::Deny));
+    // D0 (#1878): the resolution moved to `newt_interaction::binding::resolve_typed`,
+    // so the property is asserted through the path that now holds it. The WIRE
+    // SHAPE above is what this test freezes and it has not moved; what changed
+    // is which code answers "does this payload authorize the displayed action".
+    let options = newt_core::interaction_adapter::question_to_definition(&legacy)
+        .expect("a legacy payload still adapts")
+        .controls
+        .iter()
+        .find_map(|c| match &c.kind {
+            newt_interaction::ControlKind::Choice { options } => Some(options.clone()),
+            _ => None,
+        })
+        .expect("the decision control is a choice");
     assert_eq!(
-        legacy.parse("a"),
+        newt_interaction::binding::resolve_typed(&options, "d")
+            .and_then(|o| newt_core::interaction_adapter::action_for_option(o.as_str())),
+        Some(PermissionAction::Deny)
+    );
+    assert_eq!(
+        newt_interaction::binding::resolve_typed(&options, "a"),
         None,
-        "an undisplayed action never parses"
+        "an undisplayed action never resolves"
     );
 
     // Every wire name, so a rename cannot hide behind an unchanged count.

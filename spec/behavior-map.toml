@@ -513,18 +513,27 @@ symbol = "hidden_action_rejected"
 [[BHV-PROMPT-001.refs.tla]]
 spec = "PromptControls"
 invariant = "AuthorizationDisplayed"
+# D0 (#1878) MOVED this ref, it did not drop it. The canonical-first / alias /
+# ambiguity-denial rules left `Question::parse` for
+# `newt_interaction::binding::resolve_typed`, so a second decoder would not
+# have to be written against `InteractionDefinition`; the coverage moved with
+# the rule, under the same name.
 [[BHV-PROMPT-001.refs.rust_tests]]
-path = "newt-core/src/tty/widgets/question.rs"
-symbol = "tests::an_alias_cannot_select_an_action_absent_from_the_question"
+path = "newt-interaction/src/binding.rs"
+symbol = "resolve_typed_tests::an_alias_cannot_select_an_action_absent_from_the_question"
 [[BHV-PROMPT-001.refs.rust_tests]]
 path = "newt-core/src/store.rs"
 symbol = "tests::interaction_offer_publish_answer_take_race_and_fence"
 [[BHV-PROMPT-001.refs.rust_tests]]
 path = "newt-web/src/main.rs"
 symbol = "tests::attach_tab_renders_and_answers_a_danger_gated_permission_decision"
+# D0 (#1878): `Question::parse` is DELETED — it was the second of the two
+# answer-validation implementations this epic's deletion gate names, and its
+# last production caller (`decode_answer`) now resolves through the binding
+# module. The production symbol backing this contract is the rule's new home.
 [[BHV-PROMPT-001.refs.production]]
-path = "newt-core/src/tty/widgets/question.rs"
-symbol = "parse"
+path = "newt-interaction/src/binding.rs"
+symbol = "resolve_typed"
 
 [BHV-PROMPT-002]
 description = "Local prompt controls are immediate and distinct: Esc cancels back to chat without a decision; Ctrl-C/Ctrl-D exit; no control ever authorizes an action."
@@ -649,9 +658,11 @@ symbol = "tests::aliased_action_round_trips"
 [[BHV-PROMPT-005.refs.rust_tests]]
 path = "newt-core/src/markup/plain.rs"
 symbol = "tests::aliases_are_never_rendered"
+# D0 (#1878): moved with the rule, same name — the stable wire name resolves
+# as well as the accelerator, now asserted where resolution lives.
 [[BHV-PROMPT-005.refs.rust_tests]]
-path = "newt-core/src/tty/widgets/question.rs"
-symbol = "tests::value_wire_name_still_matches"
+path = "newt-interaction/src/binding.rs"
+symbol = "resolve_typed_tests::value_wire_name_still_matches"
 [[BHV-PROMPT-005.refs.rust_tests]]
 path = "newt-web/src/main.rs"
 symbol = "tests::attach_tab_renders_and_answers_a_danger_gated_permission_decision"
