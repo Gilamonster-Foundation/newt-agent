@@ -11,8 +11,7 @@
      script of its own. -->
 <meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
 <script nonce="{NONCE}" src="/assets/htmx.min.js" integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+" crossorigin="anonymous"></script>
-<script nonce="{NONCE}" defer src="/assets/markdown.js" integrity="sha384-Td8ALTYIY31WFG4vmLQRIuyB0O6d19N+cFacrbkhNNl8tqWudAmLVRljTgu79azy" crossorigin="anonymous"></script>
-<script nonce="{NONCE}" defer src="/assets/panel.js" integrity="sha384-sdGfPDxv1Ad3UJsX8wsP75syNNpCacNibfsFlPnZef9usG7DUP5qZx7seJjhi2/5" crossorigin="anonymous"></script>
+<script nonce="{NONCE}" defer src="/assets/panel.js" integrity="sha384-aOZDZFMtSrnaDr3KFSLgbkAD13xG3NAIPXsEyxIE46jxqGfBrzoqLNpqC869zHJm" crossorigin="anonymous"></script>
 <style nonce="{NONCE}">
   :root { color-scheme: light dark; }
   body { font-family: ui-monospace, monospace; margin: 0; }
@@ -48,9 +47,11 @@
   .md code { background: color-mix(in srgb, currentColor 10%, transparent); padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.9em; }
   .md pre { background: color-mix(in srgb, currentColor 10%, transparent); padding: 0.6rem; border-radius: 6px; overflow-x: auto; }
   .md pre code { background: none; padding: 0; }
-  .md .mermaid { box-sizing: border-box; max-width: 100%; text-align: center; }
-  .md .mermaid svg { display: block; height: auto; max-width: 100%; margin-inline: auto; }
-  .md .mermaid-error { text-align: left; border: 1px solid #d9534f; white-space: pre-wrap; }
+  /* E0b: a server-rendered diagram. `currentColor` strokes mean it inherits
+     the page's own ink, so it cannot disagree with the theme. */
+  .md .diagram { box-sizing: border-box; max-width: 100%; margin: 0.4rem 0; text-align: center; }
+  .md .diagram svg { display: block; height: auto; max-width: 100%; margin-inline: auto; }
+  .md .diagram-source { white-space: pre-wrap; border-left: 3px solid color-mix(in srgb, currentColor 30%, transparent); }
   .md blockquote { margin: 0.3rem 0; padding-left: 0.75rem; border-left: 3px solid color-mix(in srgb, currentColor 25%, transparent); opacity: 0.85; }
   .md table { border-collapse: collapse; display: block; overflow-x: auto; }
   .md th, .md td { border: 1px solid color-mix(in srgb, currentColor 20%, transparent); padding: 0.2rem 0.5rem; }
@@ -87,7 +88,7 @@
   }
 </style>
 </head>
-<body data-newt-diagrams="source-only">
+<body>
 <header><h1>newt-web</h1></header>
 <main id="content">
 <div id="overview" hx-get="/overview" hx-trigger="every 3s" hx-swap="innerHTML"><section class="sessions"><h2>your sessions</h2><p class="hint">Durable conversations in the store — attach from anywhere; the running session stays the writer (D2).</p><p class="empty">No sessions yet. Start one in a newt shell (SSH), or spawn a scratch agent below.</p></section></div>

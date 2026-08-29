@@ -262,15 +262,12 @@ fn the_policy_denies_by_default_and_allows_no_unsafe_script() {
             "{name} must stay strict: {d}"
         );
     }
-    // Exactly one relaxation exists, and it is the measured one.
+    // E0b: none at all. C3b's single `style-src-attr` relaxation is retired
+    // with the client runtime that needed it.
     assert_eq!(
         p.matches("'unsafe-inline'").count(),
-        1,
-        "exactly one directive may carry 'unsafe-inline': {p}"
-    );
-    assert!(
-        directive("style-src-attr").contains("'unsafe-inline'"),
-        "…and it must be style-src-attr: {p}"
+        0,
+        "no directive may carry 'unsafe-inline': {p}"
     );
 
     for required in [
@@ -283,27 +280,47 @@ fn the_policy_denies_by_default_and_allows_no_unsafe_script() {
     }
 }
 
-/// C3b: the page tells the client what its own policy permits, derived from
-/// the policy TEXT so the two cannot drift.
+/// **E0b (#1869): `'unsafe-inline'` is gone from the policy entirely.**
+///
+/// C3b admitted exactly one, on `style-src-attr`, because Mermaid styled its
+/// generated SVG through per-node `style=` attributes. E0b renders diagrams
+/// server-side with SVG PRESENTATION attributes, which no `style-src*`
+/// directive governs, and deletes the client runtime — so the need is gone and
+/// the permission goes with it.
+///
+/// This replaces `the_style_element_capability_is_read_off_the_policy`, which
+/// tested a capability flag that no longer exists: with no client-side diagram
+/// code there is nothing to advertise, which is the stronger version of "the
+/// advertised capability cannot drift from the policy".
 #[test]
-fn the_style_element_capability_is_read_off_the_policy() {
+fn the_policy_permits_no_unsafe_inline_at_all() {
     let nonce = Nonce::fresh();
-    assert!(
-        !newt_web::csp::permits_inline_style_elements(&policy(&nonce)),
-        "this policy blocks inline style elements, and must say so"
+    let p = policy(&nonce);
+    assert_eq!(
+        p.matches("'unsafe-inline'").count(),
+        0,
+        "no directive may carry it any more: {p}"
     );
-    // Anti-vacuous: it reports TRUE for a policy that does permit them, so a
-    // hardcoded `false` cannot masquerade as the derivation.
-    assert!(newt_web::csp::permits_inline_style_elements(
-        "default-src 'none'; style-src-elem 'unsafe-inline'"
-    ));
-    // …and falls back to `style-src` when the element directive is absent.
-    assert!(newt_web::csp::permits_inline_style_elements(
-        "style-src 'unsafe-inline'"
-    ));
-    assert!(!newt_web::csp::permits_inline_style_elements(
-        "style-src 'self'"
-    ));
+    // Both style directives are nonce-only, so an inline style ELEMENT and an
+    // inline style ATTRIBUTE are now equally refused.
+    for directive in ["style-src", "style-src-elem"] {
+        let d = p
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.split_whitespace().next() == Some(directive))
+            .unwrap_or_default();
+        assert!(
+            d.contains(&format!("'nonce-{}'", nonce.as_str())),
+            "{directive} must be nonce-only: {d}"
+        );
+    }
+    // Anti-vacuous: the counter sees one when one is really there.
+    assert_eq!(
+        format!("{p}; style-src-attr 'unsafe-inline'")
+            .matches("'unsafe-inline'")
+            .count(),
+        1
+    );
 }
 
 #[test]

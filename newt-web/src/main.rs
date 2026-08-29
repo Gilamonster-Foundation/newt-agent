@@ -177,14 +177,6 @@ fn app_with_auth(auth_header: Option<String>) -> Router {
             get(|| async { js(newt_web::csp::HTMX_JS) }),
         )
         .route(
-            "/assets/mermaid.min.js",
-            get(|| async { js(newt_web::csp::MERMAID_JS) }),
-        )
-        .route(
-            "/assets/markdown.js",
-            get(|| async { js(newt_web::csp::MARKDOWN_JS) }),
-        )
-        .route(
             "/assets/panel.js",
             get(|| async { js(newt_web::csp::PANEL_JS) }),
         )
@@ -1170,23 +1162,26 @@ mod tests {
         assert!(body.contains("htmx"), "vendored htmx served");
     }
 
+    /// **E0b (#1869): the diagram runtime is no longer served, because there
+    /// is none.**
+    ///
+    /// Mermaid (≈500 KB) and its adapter are deleted: they could not draw
+    /// under the strict CSP, and diagrams are rendered server-side now. A
+    /// route that still served them would be shipping a runtime nothing runs.
     #[tokio::test]
-    async fn markdown_enrichment_assets_are_served_locally() {
+    async fn the_deleted_diagram_runtime_is_not_served() {
         let app = app();
-        let (status, mermaid) = req(&app, "GET", "/assets/mermaid.min.js", None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(mermaid.contains("mermaid"), "vendored Mermaid served");
-
-        let (status, enhancer) = req(&app, "GET", "/assets/markdown.js", None).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(
-            enhancer.contains("newtEnhanceMarkdown"),
-            "generic Markdown enhancement hook served"
-        );
-        assert!(
-            enhancer.contains(r#"securityLevel: "strict""#),
-            "untrusted diagrams must use Mermaid strict mode"
-        );
+        for gone in ["/assets/mermaid.min.js", "/assets/markdown.js"] {
+            let (status, _) = req(&app, "GET", gone, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{gone} should be gone");
+        }
+        // …and the assets that DO remain are still served, or the above passes
+        // because routing is broken rather than because the runtime went.
+        for kept in ["/assets/htmx.min.js", "/assets/panel.js"] {
+            let (status, body) = req(&app, "GET", kept, None).await;
+            assert_eq!(status, StatusCode::OK, "{kept} must still be served");
+            assert!(!body.is_empty());
+        }
     }
 
     /// The W2 acceptance: spawn → prompt → a full mocked turn lands in the
@@ -2360,17 +2355,22 @@ mod tests {
                 "an unnamed fetch directive must fail closed: {csp}"
             );
 
-            // …and the ONE relaxation is exactly where it was measured to be
-            // needed and proven unreachable. Counting occurrences is what
-            // stops a second one being added quietly.
+            // E0b (#1869): NONE at all. C3b admitted exactly one, on
+            // `style-src-attr`, for Mermaid's per-node `style=` attributes.
+            // Diagrams now render server-side with SVG presentation
+            // attributes — which no `style-src*` directive governs — so the
+            // need is gone and the permission went with it.
             assert_eq!(
                 csp.matches("'unsafe-inline'").count(),
-                1,
-                "exactly one directive may carry it: {csp}"
+                0,
+                "no directive may carry it: {csp}"
             );
-            assert!(
-                directive("style-src-attr").contains("'unsafe-inline'"),
-                "…and it must be style-src-attr: {csp}"
+            // Anti-vacuous: the counter can see one.
+            assert_eq!(
+                format!("{csp}; style-src-attr 'unsafe-inline'")
+                    .matches("'unsafe-inline'")
+                    .count(),
+                1
             );
         }
 

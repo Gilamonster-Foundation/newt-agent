@@ -78,10 +78,12 @@ pub(crate) fn render_markdown(src: &str) -> String {
                 Event::End(TagEnd::CodeBlock) => {
                     let source = diagram.take().unwrap_or_default();
                     flush(&mut out, &mut buffered);
-                    // Built here, downstream of the sanitizer.
-                    out.push_str(r#"<pre class="mermaid" data-markdown-extension="mermaid">"#);
-                    out.push_str(&escape(&source));
-                    out.push_str("</pre>\n");
+                    // Built here, downstream of the transcript's sanitizer —
+                    // the #1848 shape, unchanged. Whether this becomes a
+                    // drawing or the source, it is spliced in AFTER the
+                    // transcript has been cleaned, so authored markup never
+                    // reaches ammonia carrying a marker or an `<svg>`.
+                    out.push_str(&present_diagram(&source));
                     continue;
                 }
                 _ => continue,
@@ -109,11 +111,124 @@ pub(crate) fn render_markdown(src: &str) -> String {
     out
 }
 
-/// Whether a fence's info string names the diagram extension.
+/// Whether a fence's info string names a registered extension.
 fn is_diagram_fence(info: &str) -> bool {
     info.split_whitespace()
         .next()
-        .is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"))
+        .is_some_and(|lang| lang.eq_ignore_ascii_case(newt_core::markup::extension::mermaid::INFO))
+}
+
+/// The registry this surface presents fenced extensions through (E0a, #1863).
+fn registry() -> newt_core::markup::extension::Registry {
+    newt_core::markup::extension::Registry::new()
+        .with(&newt_core::markup::extension::mermaid::MERMAID)
+}
+
+/// Sanitize a generated SVG against a NARROW, SVG-only allowlist.
+///
+/// **A separate pass from the transcript's, deliberately.** `ammonia`
+/// allowlists by TAG with no way to tell newt's element from one the model
+/// typed (#1848's whole finding), so adding `<svg>` to the TRANSCRIPT's
+/// allowlist would let authored markup emit one. It does not: this pass runs
+/// only over a payload the pure renderer produced, and its result is spliced
+/// in after the transcript pass — the same sanitize-then-wrap shape #1848
+/// established.
+///
+/// Narrow to exactly what `flowchart::svg` emits. `style` is NOT admitted on
+/// any element: the renderer emits presentation attributes only, so a `style`
+/// attribute could not have come from it.
+fn sanitize_svg(raw: &str) -> String {
+    use std::collections::{HashMap, HashSet};
+    let tags: HashSet<&str> = ["svg", "title", "rect", "line", "polygon", "text"]
+        .into_iter()
+        .collect();
+    let mut attrs: HashMap<&str, HashSet<&str>> = HashMap::new();
+    attrs.insert(
+        "svg",
+        ["xmlns", "viewBox", "width", "height", "role", "aria-label"]
+            .into_iter()
+            .collect(),
+    );
+    attrs.insert(
+        "rect",
+        [
+            "x",
+            "y",
+            "width",
+            "height",
+            "rx",
+            "fill",
+            "stroke",
+            "stroke-width",
+        ]
+        .into_iter()
+        .collect(),
+    );
+    attrs.insert(
+        "line",
+        ["x1", "y1", "x2", "y2", "stroke", "stroke-width"]
+            .into_iter()
+            .collect(),
+    );
+    attrs.insert("polygon", ["points", "fill"].into_iter().collect());
+    attrs.insert(
+        "text",
+        ["x", "y", "fill", "font-size", "text-anchor"]
+            .into_iter()
+            .collect(),
+    );
+    ammonia::Builder::empty()
+        .tags(tags)
+        .tag_attributes(attrs)
+        .clean(raw)
+        .to_string()
+}
+
+/// Present one fenced extension block: a drawing when the registry produced
+/// one, the source otherwise.
+///
+/// Both arms emit the source-bearing markup — E0a's contract guarantees the
+/// `Presentation` always carries it, so there is no path here that can lose
+/// it. A fallback is labelled so the reader knows what they are looking at;
+/// C3b's black-on-black diagram was invisible precisely because nothing said
+/// "this is not what you think".
+fn present_diagram(source: &str) -> String {
+    use newt_core::markup::extension::{Capabilities, Stopwatch, SupportLevel};
+
+    struct Wall(std::time::Instant);
+    impl Stopwatch for Wall {
+        fn read_nanos(&self) -> u128 {
+            self.0.elapsed().as_nanos()
+        }
+    }
+
+    let presentation = registry().present(
+        newt_core::markup::extension::mermaid::INFO,
+        source,
+        Capabilities {
+            highest: SupportLevel::Graphics,
+        },
+        &Wall(std::time::Instant::now()),
+    );
+
+    if let Some(enhancement) = presentation.enhancement() {
+        let svg = sanitize_svg(enhancement.payload());
+        // Non-empty only if the narrow allowlist admitted it. An empty result
+        // means the sanitizer rejected our own output, which is a bug in the
+        // renderer — and the honest response is still the source.
+        if !svg.trim().is_empty() {
+            return format!(
+                r#"<figure class="diagram" data-markdown-extension="mermaid">{svg}<figcaption class="sr-only">{}</figcaption></figure>
+"#,
+                escape(enhancement.accessible_text())
+            );
+        }
+    }
+    format!(
+        r#"<pre class="diagram-source" data-markdown-extension="mermaid" aria-label="Diagram shown as source">{}</pre>
+"#,
+        escape(presentation.source())
+    )
 }
 
 const STYLE: &str = r#"
@@ -151,9 +266,11 @@ const STYLE: &str = r#"
   .md code { background: color-mix(in srgb, currentColor 10%, transparent); padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.9em; }
   .md pre { background: color-mix(in srgb, currentColor 10%, transparent); padding: 0.6rem; border-radius: 6px; overflow-x: auto; }
   .md pre code { background: none; padding: 0; }
-  .md .mermaid { box-sizing: border-box; max-width: 100%; text-align: center; }
-  .md .mermaid svg { display: block; height: auto; max-width: 100%; margin-inline: auto; }
-  .md .mermaid-error { text-align: left; border: 1px solid #d9534f; white-space: pre-wrap; }
+  /* E0b: a server-rendered diagram. `currentColor` strokes mean it inherits
+     the page's own ink, so it cannot disagree with the theme. */
+  .md .diagram { box-sizing: border-box; max-width: 100%; margin: 0.4rem 0; text-align: center; }
+  .md .diagram svg { display: block; height: auto; max-width: 100%; margin-inline: auto; }
+  .md .diagram-source { white-space: pre-wrap; border-left: 3px solid color-mix(in srgb, currentColor 30%, transparent); }
   .md blockquote { margin: 0.3rem 0; padding-left: 0.75rem; border-left: 3px solid color-mix(in srgb, currentColor 25%, transparent); opacity: 0.85; }
   .md table { border-collapse: collapse; display: block; overflow-x: auto; }
   .md th, .md td { border: 1px solid color-mix(in srgb, currentColor 20%, transparent); padding: 0.2rem 0.5rem; }
@@ -426,17 +543,13 @@ pub(crate) async fn index(
     let csrf = token.as_str().to_string();
     let nonce = newt_web::csp::Nonce::fresh();
     let n = nonce.as_str().to_string();
-    // Tell the client what this page's OWN policy permits, read off the policy
-    // text so it cannot drift from the header. Under a strict `style-src-elem`
-    // Mermaid's per-render theme stylesheet is blocked, and a blocked theme
-    // renders black-on-black — unreadable, silently. `markdown.js` uses this
-    // to fall back to the diagram SOURCE instead (ADR law 5).
+    // E0b (#1869): there is no client-side diagram code any more, so there is
+    // no capability to advertise. C3b derived `data-newt-diagrams` from the
+    // policy text so the flag could not drift from the header; the flag is now
+    // gone entirely, which is the stronger version of the same guarantee — a
+    // capability that cannot be stated cannot be misstated. Diagrams are
+    // rendered server-side and depend on no CSP directive at all.
     let policy = newt_web::csp::policy(&nonce);
-    let diagrams = if newt_web::csp::permits_inline_style_elements(&policy) {
-        "render"
-    } else {
-        "source-only"
-    };
 
     let agents = reg.list();
     // A scriptless tab switch arrives as `?tab=`; otherwise the first agent.
@@ -468,11 +581,10 @@ pub(crate) async fn index(
      script of its own. -->
 <meta name="htmx-config" content='{{"includeIndicatorStyles":false}}'>
 <script nonce="{n}" src="/assets/htmx.min.js" integrity="{htmx_sri}" crossorigin="anonymous"></script>
-{mermaid_tag}<script nonce="{n}" defer src="/assets/markdown.js" integrity="{markdown_sri}" crossorigin="anonymous"></script>
 <script nonce="{n}" defer src="/assets/panel.js" integrity="{panel_sri}" crossorigin="anonymous"></script>
 <style nonce="{n}">{STYLE}</style>
 </head>
-<body data-newt-diagrams="{diagrams}">
+<body>
 <header><h1>newt-web</h1></header>
 <main id="content">
 <div id="overview" hx-get="/overview" hx-trigger="every 3s" hx-swap="innerHTML">{docked}{sessions}</div>
@@ -497,22 +609,8 @@ pub(crate) async fn index(
 </html>
 "##,
         STYLE = STYLE,
-        diagrams = diagrams,
-        // Only ship the diagram runtime when it can actually be used. Under a
-        // strict `style-src-elem` Mermaid injects blocked stylesheets merely
-        // by LOADING, so a page that will fall back to source would take three
-        // CSP violations and half a megabyte for nothing.
-        mermaid_tag = if diagrams == "render" {
-            format!(
-                "<script nonce=\"{n}\" defer src=\"/assets/mermaid.min.js\" integrity=\"{}\" crossorigin=\"anonymous\"></script>\n",
-                newt_web::csp::sri(newt_web::csp::MERMAID_JS.as_bytes())
-            )
-        } else {
-            String::new()
-        },
         csrf_field = newt_web::csrf::hidden_field(&csrf),
         htmx_sri = newt_web::csp::sri(newt_web::csp::HTMX_JS.as_bytes()),
-        markdown_sri = newt_web::csp::sri(newt_web::csp::MARKDOWN_JS.as_bytes()),
         panel_sri = newt_web::csp::sri(newt_web::csp::PANEL_JS.as_bytes()),
         url = escape(&default_url),
         model = escape(&default_model),
@@ -557,21 +655,40 @@ mod tests {
         );
     }
 
+    /// **E0b (#1869): a diagram fence renders, server-side, to SVG.**
+    ///
+    /// It used to become a `<pre class="mermaid">` for a browser runtime to
+    /// enhance. That runtime is gone: it could not draw under the strict CSP
+    /// C3b shipped, and a blocked theme rendered black-on-black.
     #[test]
-    fn markdown_marks_mermaid_fences_for_progressive_enhancement() {
+    fn a_diagram_fence_renders_to_svg_server_side() {
         let out = render_markdown(
-            "before\n\n```mermaid\ngraph TD\n  A[Markdown] --> B[Web or TUI]\n```\n\nafter",
+            "before\n\n```mermaid\nflowchart TD\n  A[Markdown] --> B[Web or TUI]\n```\n\nafter",
         );
-        assert!(
-            out.contains(r#"<pre class="mermaid" data-markdown-extension="mermaid">graph TD"#),
-            "Mermaid fence becomes an enrichment hook: {out}"
-        );
-        assert!(
-            !out.contains(r#"class="language-mermaid""#),
-            "Mermaid must not remain an ordinary code fence: {out}"
-        );
+        assert!(out.contains("<svg"), "rendered server-side: {out}");
+        assert!(out.contains("Markdown"), "node label present: {out}");
+        assert!(out.contains("Web or TUI"), "node label present: {out}");
+        // It inherits the page's ink, so it cannot be black-on-black.
+        assert!(out.contains(r#"stroke="currentColor""#), "page ink: {out}");
+        // Adjacent accessible text travels with it.
+        assert!(out.contains("<figcaption"), "accessible text: {out}");
+        assert!(out.contains("aria-label"), "labelled: {out}");
         assert!(out.contains("<p>before</p>"), "surrounding Markdown: {out}");
         assert!(out.contains("<p>after</p>"), "surrounding Markdown: {out}");
+    }
+
+    /// Syntax the renderer declines still shows its SOURCE — E0a's contract,
+    /// visible on the web surface.
+    #[test]
+    fn an_undrawable_diagram_shows_its_source() {
+        let out = render_markdown("```mermaid\nsequenceDiagram\n  A->>B: hi\n```");
+        assert!(!out.contains("<svg"), "must not draw what it cannot: {out}");
+        assert!(out.contains("diagram-source"), "labelled as source: {out}");
+        assert!(
+            out.contains("sequenceDiagram"),
+            "the source is readable: {out}"
+        );
+        assert!(out.contains("aria-label"), "and announced: {out}");
     }
 
     #[test]
@@ -625,15 +742,12 @@ mod tests {
     /// The legitimate path is unbroken.
     #[test]
     fn a_real_mermaid_fence_still_enhances() {
-        let out = render_markdown("```mermaid\ngraph TD\n  A[x] --> B[y]\n```");
+        let out = render_markdown("```mermaid\nflowchart TD\n  A[x] --> B[y]\n```");
         assert!(
-            out.contains(r#"<pre class="mermaid" data-markdown-extension="mermaid">"#),
+            out.contains(r#"data-markdown-extension="mermaid""#),
             "a real fence must still be marked: {out}"
         );
-        assert!(
-            out.contains("graph TD"),
-            "the diagram source must survive: {out}"
-        );
+        assert!(out.contains("<svg"), "and drawn server-side: {out}");
     }
 
     /// `class` is allowlisted on the same line as the data attribute, so it
@@ -716,12 +830,14 @@ mod tests {
             "a fragment cannot carry a nonce, so it must carry no script: {panel}"
         );
         assert!(
-            newt_web::csp::PANEL_JS.contains("window.newtEnhanceMarkdown"),
-            "the behaviour must still exist, in the served asset"
-        );
-        assert!(
             newt_web::csp::PANEL_JS.contains("newtAttachStreams"),
             "the asset must expose its scan entry point"
+        );
+        // E0b: there is no client-side Markdown enhancement left to re-run —
+        // diagrams arrive already drawn.
+        assert!(
+            !newt_web::csp::PANEL_JS.contains("newtEnhanceMarkdown"),
+            "the enhancement hook should be gone with the runtime"
         );
     }
 

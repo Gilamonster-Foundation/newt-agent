@@ -39,10 +39,9 @@
         source.close();
         return;
       }
+      // E0b: diagrams arrive already drawn, server-side. There is no
+      // client-side enhancement left to re-run after a swap.
       node.innerHTML = event.data;
-      if (window.newtEnhanceMarkdown) {
-        window.newtEnhanceMarkdown(node);
-      }
       node.scrollTop = node.scrollHeight;
     };
     source.onerror = function () {
