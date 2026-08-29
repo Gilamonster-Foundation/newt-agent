@@ -14809,7 +14809,7 @@ mod disable_ocap_tests {
         let definition = mutation_confirm_definition("delete `auto.txt`?");
         assert_eq!(
             crate::markup::plain::render(&definition),
-            "delete `auto.txt`?\n[y] to confirm   [n] to skip"
+            "delete `auto.txt`?\n[y] to confirm\n[n] to skip"
         );
         // The hidden `Y`/`N` aliases parse but are never advertised
         // (BHV-PROMPT-005).
@@ -14973,8 +14973,8 @@ mod disable_ocap_tests {
         assert_eq!(
             gate.questions,
             vec![
-                "Write this file? [y/N]\n[y] to confirm   [n] to skip".to_string(),
-                "Delete this file? [y/N]\n[y] to confirm   [n] to skip".to_string(),
+                "Write this file? [y/N]\n[y] to confirm\n[n] to skip".to_string(),
+                "Delete this file? [y/N]\n[y] to confirm\n[n] to skip".to_string(),
             ]
         );
     }

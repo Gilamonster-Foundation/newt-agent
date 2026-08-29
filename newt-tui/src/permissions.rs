@@ -3467,7 +3467,12 @@ mod a0_freeze_goldens {
             text(&net_low(), Audience::Terminal),
             "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
              Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
-             [a]llow once   [s]ession allow   [A]llow permanently (adds host to config)   [d]eny (default)   [D]eny always   [P]ermanently deny"
+             [a]llow once\n\
+             [s]ession allow\n\
+             [A]llow permanently (adds host to config)\n\
+             [d]eny (default)\n\
+             [D]eny always\n\
+             [P]ermanently deny"
         );
     }
 
@@ -3477,7 +3482,9 @@ mod a0_freeze_goldens {
             text(&net_low(), Audience::Web),
             "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
              Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
-             [a]llow once   [s]ession allow   [d]eny (default)"
+             [a]llow once\n\
+             [s]ession allow\n\
+             [d]eny (default)"
         );
     }
 
@@ -3490,7 +3497,10 @@ mod a0_freeze_goldens {
              (exec of \"bash\" is not within the granted authority)\n\
              high-danger: session allow refused; key allow / step-up is the future path, P3\n\
              Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
-             [a]llow once   [d]eny (default)   [D]eny always   [P]ermanently deny"
+             [a]llow once\n\
+             [d]eny (default)\n\
+             [D]eny always\n\
+             [P]ermanently deny"
         );
     }
 
@@ -3503,7 +3513,8 @@ mod a0_freeze_goldens {
              (exec of \"bash\" is not within the granted authority)\n\
              High danger: session authorization is unavailable.\n\
              Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
-             [a]llow once   [d]eny (default)"
+             [a]llow once\n\
+             [d]eny (default)"
         );
     }
 
@@ -3563,14 +3574,21 @@ mod c0a {
                 Audience::Terminal,
                 "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
                  Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
-                 [a]llow once   [s]ession allow   [A]llow permanently (adds host to config)   [d]eny (default)   [D]eny always   [P]ermanently deny",
+                 [a]llow once\n\
+             [s]ession allow\n\
+             [A]llow permanently (adds host to config)\n\
+             [d]eny (default)\n\
+             [D]eny always\n\
+             [P]ermanently deny",
             ),
             (
                 net_low(),
                 Audience::Web,
                 "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
                  Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
-                 [a]llow once   [s]ession allow   [d]eny (default)",
+                 [a]llow once\n\
+             [s]ession allow\n\
+             [d]eny (default)",
             ),
             (
                 exec_high(),
@@ -3580,7 +3598,10 @@ mod c0a {
                  (exec of \"bash\" is not within the granted authority)\n\
                  high-danger: session allow refused; key allow / step-up is the future path, P3\n\
                  Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
-                 [a]llow once   [d]eny (default)   [D]eny always   [P]ermanently deny",
+                 [a]llow once\n\
+             [d]eny (default)\n\
+             [D]eny always\n\
+             [P]ermanently deny",
             ),
             (
                 exec_high(),
@@ -3590,7 +3611,8 @@ mod c0a {
                  (exec of \"bash\" is not within the granted authority)\n\
                  High danger: session authorization is unavailable.\n\
                  Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
-                 [a]llow once   [d]eny (default)",
+                 [a]llow once\n\
+             [d]eny (default)",
             ),
         ]
     }
@@ -3811,7 +3833,12 @@ mod b0a {
             plain::render(&definition),
             "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
              Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
-             [a]llow once   [s]ession allow   [A]llow permanently (adds host to config)   [d]eny (default)   [D]eny always   [P]ermanently deny"
+             [a]llow once\n\
+             [s]ession allow\n\
+             [A]llow permanently (adds host to config)\n\
+             [d]eny (default)\n\
+             [D]eny always\n\
+             [P]ermanently deny"
         );
     }
 
@@ -3826,7 +3853,9 @@ mod b0a {
             plain::render(&definition),
             "\u{2298} http wants to reach `https://example.com/api` \u{2014} outside the granted net allowlist.\n\
              Esc=back \u{b7} Ctrl-C/Ctrl-D=exit\n\
-             [a]llow once   [s]ession allow   [d]eny (default)"
+             [a]llow once\n\
+             [s]ession allow\n\
+             [d]eny (default)"
         );
     }
 
