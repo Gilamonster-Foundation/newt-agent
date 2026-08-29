@@ -1,10 +1,12 @@
 //! **`mermaid` — the first registrant.**
 //!
-//! Holds the info string, the budgets, and the pre-scan. It renders NOTHING:
-//! `newt-core` has no diagram renderer and should not grow one, so
-//! [`Mermaid::render`] returns `None` and every presentation from this crate
-//! falls back to source. That is the correct answer for the plain and headless
-//! tiers, which have no graphics at all.
+//! Holds the info string, the budgets, the pre-scan, and — since E0b (#1869)
+//! — the render itself, through the pure [`super::flowchart`] renderer.
+//!
+//! E0a said this crate should not grow a renderer. E0b is why it did: the
+//! BROWSER cannot draw under the strict CSP C3b shipped, so drawing moved to
+//! where there is no CSS to block. A surface that cannot present graphics
+//! still gets source, because it asks for a level this declines to exceed.
 //!
 //! The value it carries is the part a second implementation would otherwise
 //! duplicate: **what the info string is, what the bounds are, and how the
@@ -131,14 +133,22 @@ impl Extension for Mermaid {
         measure(source)
     }
 
-    /// Always `None`. `newt-core` renders no diagrams.
+    /// Render the flowchart subset, or decline.
     ///
-    /// Not a stub awaiting an implementation — a statement that this crate has
-    /// no graphics tier. A surface that CAN draw registers its own renderer
-    /// for [`INFO`] over these same budgets; a surface that cannot gets the
-    /// source, which is the right answer and not a missing feature.
-    fn render(&self, _source: &str, _level: SupportLevel) -> Option<Enhancement> {
-        None
+    /// E0b (#1869): `newt-core` grew a renderer after all, and deliberately —
+    /// a PURE one. C3b measured that the browser path cannot draw under the
+    /// strict CSP (no `cspNonce`, a per-render-scoped stylesheet no hash can
+    /// admit, and a blocked theme rendering black-on-black), so drawing moved
+    /// here where there is no CSS to block.
+    ///
+    /// Declines anything outside the subset, and declining is a first-class
+    /// answer: E0a's contract turns it into the readable source.
+    fn render(&self, source: &str, level: SupportLevel) -> Option<Enhancement> {
+        if level < SupportLevel::Graphics {
+            return None;
+        }
+        let (svg, alt) = super::flowchart::render(source)?;
+        Enhancement::graphics(svg, alt)
     }
 }
 
@@ -160,17 +170,53 @@ mod tests {
         }
     }
 
-    /// `newt-core` renders no diagrams, so a registered mermaid block still
-    /// presents as source — and says that is because the handler had nothing,
-    /// not because something failed.
+    /// A supported flowchart renders; the source rides along regardless.
     #[test]
-    fn newt_core_presents_mermaid_as_source_and_says_why() {
+    fn a_supported_flowchart_renders_and_keeps_its_source() {
         let reg = Registry::new().with(&MERMAID);
-        let src = "graph TD\n  A --> B";
+        let src = "flowchart TD\n  A[Start] --> B[Finish]";
         let p = reg.present("mermaid", src, graphics(), &Frozen);
+        assert_eq!(p.source(), src, "the source rides along even when drawn");
+        let e = p.enhancement().expect("this subset renders");
+        assert_eq!(e.level(), SupportLevel::Graphics);
+        assert!(e.payload().starts_with("<svg"), "payload: {}", e.payload());
+        assert!(
+            e.accessible_text().contains("Start"),
+            "alt: {}",
+            e.accessible_text()
+        );
+    }
+
+    /// Syntax outside the subset declines, and declining is source — not an
+    /// error, and never a half-drawn picture.
+    #[test]
+    fn syntax_outside_the_subset_falls_back_to_source() {
+        let reg = Registry::new().with(&MERMAID);
+        for src in [
+            "sequenceDiagram\n  A->>B: hi",
+            "flowchart TD\n  subgraph one\n    A --> B\n  end",
+            "flowchart TD\n  A --> B\n  click A callback",
+            "flowchart XX\n  A --> B",
+            "gantt\n  title X",
+            "not a diagram at all",
+        ] {
+            let p = reg.present("mermaid", src, graphics(), &Frozen);
+            assert!(p.enhancement().is_none(), "should decline: {src:?}");
+            assert_eq!(p.source(), src, "and keep the source: {src:?}");
+            assert_eq!(p.fallback(), Some(FallbackReason::HandlerDeclined));
+        }
+    }
+
+    /// A surface that cannot draw gets source even for a diagram that would
+    /// have rendered — the C3b runtime case, where the page's own policy
+    /// blocks graphics.
+    #[test]
+    fn a_source_only_surface_gets_source_for_a_renderable_diagram() {
+        let reg = Registry::new().with(&MERMAID);
+        let src = "flowchart TD\n  A --> B";
+        let p = reg.present("mermaid", src, Capabilities::source_only(), &Frozen);
+        assert!(p.enhancement().is_none());
         assert_eq!(p.source(), src);
-        assert!(p.enhancement().is_none(), "this crate draws nothing");
-        assert_eq!(p.fallback(), Some(FallbackReason::HandlerDeclined));
     }
 
     /// The pre-scan counts arrows longest-first, so one arrow is one edge.
