@@ -59,8 +59,8 @@ pub use arbiter::{
 pub use caps::{enter_protocol_mode, protocol_mode, LineCaps};
 pub use frames::{format_spinner, SPINNER_FRAMES};
 pub use modal::{
-    modal_prompt_controls, read_prompt_window_line, ControlReader, PromptControlReader, PromptLine,
-    MODAL_CONTROL_HINT, MODAL_INPUT_GLYPH,
+    modal_prompt_controls, read_prompt_window_line, ControlReader, Echo, PromptControlReader,
+    PromptLine, MODAL_CONTROL_HINT, MODAL_INPUT_GLYPH,
 };
 pub use progress_sink::TerminalProgressSink;
 pub use spinner::{interrupt_pending, set_interrupt_pending, with_spinner, Spinner};

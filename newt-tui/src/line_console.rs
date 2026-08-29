@@ -23,6 +23,41 @@ pub trait Console {
     fn say(&mut self, line: &str);
 }
 
+/// **Secret input goes through the one terminal adapter** (D1b, #1892).
+///
+/// Both consoles share this, and neither reaches `read_line_raw` for it any
+/// more. The prompt becomes a `ControlKind::Secret` definition, and
+/// `present_on_terminal` derives the masking from that definition — so what
+/// hides the key is the SEMANTIC fact that it is a secret, not a call site
+/// remembering to pass `Echo::Stars`.
+///
+/// It also means the piped path is the shared one: `read_prompt_window_line`
+/// branches on `is_terminal()` itself, so a scripted `newt setup` keeps
+/// working and echoes nothing either way.
+///
+/// The `String` is the trimmed line as typed. Callers in `setup::credentials`
+/// wrap it in `Secret` immediately; this signature is the `Console` trait's
+/// and outlives only until the trait does (D1b-3).
+fn ask_secret_through_the_seam(prompt: &str) -> io::Result<String> {
+    let window = newt_core::tty::Terminal::suspend_for_prompt();
+    let definition = crate::setup::credentials::secret_prompt(prompt);
+    let interaction = newt_core::interaction_surface::SurfaceInteraction::blocking(definition);
+    match crate::permissions::present_on_terminal(&window, &interaction) {
+        newt_core::HumanQuestionOutcome::Answer(line) => Ok(line.trim().to_string()),
+        newt_core::HumanQuestionOutcome::Cancelled
+        | newt_core::HumanQuestionOutcome::ExitRequested => {
+            Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+        }
+        newt_core::HumanQuestionOutcome::InputClosed => {
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"))
+        }
+        newt_core::HumanQuestionOutcome::Unavailable
+        | newt_core::HumanQuestionOutcome::InputFailed => Err(io::Error::other(
+            "no operator available for a secret prompt",
+        )),
+    }
+}
+
 pub struct StdinConsole;
 impl Console for StdinConsole {
     fn ask(&mut self, prompt: &str) -> io::Result<String> {
@@ -36,7 +71,7 @@ impl Console for StdinConsole {
         Ok(buf.trim().to_string())
     }
     fn ask_secret(&mut self, prompt: &str) -> io::Result<String> {
-        read_line_raw(prompt, Echo::Stars)
+        ask_secret_through_the_seam(prompt)
     }
     fn say(&mut self, line: &str) {
         println!("{line}");
@@ -52,15 +87,12 @@ pub fn is_yes(input: &str, default: bool) -> bool {
     }
 }
 
-/// Whether a raw-mode line read shows the characters typed. `Stars` echoes
-/// one `*` per character — a secret still gets keystroke feedback (a fully
-/// silent prompt reads as a hung terminal, per field testing) without ever
-/// showing the value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Echo {
-    Chars,
-    Stars,
-}
+/// **One `Echo`, in the lower layer** (D1b, #1892). This was a byte-identical
+/// twin of `newt_core::tty::Echo`; the terminal adapter needed the same policy
+/// for `ControlKind::Secret`, and a second copy beside it is how `is_yes`
+/// became three. Shared behaviour moves DOWN, so the definition lives in
+/// newt-core and this module uses it until the module itself goes (D1b-3).
+pub use newt_core::tty::Echo;
 
 /// What one key event does to a raw-mode line read. Pure — unit-tested
 /// without a terminal.
@@ -177,7 +209,7 @@ impl Console for FirstRunConsole {
         read_line_raw(prompt, Echo::Chars)
     }
     fn ask_secret(&mut self, prompt: &str) -> io::Result<String> {
-        read_line_raw(prompt, Echo::Stars)
+        ask_secret_through_the_seam(prompt)
     }
     fn say(&mut self, line: &str) {
         println!("{line}");

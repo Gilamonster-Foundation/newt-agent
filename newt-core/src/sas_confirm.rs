@@ -21,7 +21,7 @@ use base64::Engine as _;
 
 use crate::enrollment::EnrollmentCandidate;
 use crate::sas_transcript::{sas_words, TranscriptInputs, SAS_WORD_COUNT};
-use crate::tty::{read_prompt_window_line, PromptLine, PromptWindow};
+use crate::tty::{read_prompt_window_line, Echo, PromptLine, PromptWindow};
 
 /// What the terminal concluded about a staged candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +127,8 @@ pub fn confirm_enrollment(
     let Some(words) = recompute_sas(candidate, issuer, subject) else {
         return SasVerdict::TranscriptMismatch;
     };
-    match read_prompt_window_line(window, &confirm_prompt(&words)) {
+    // The SAS words are shown, not typed secretly — an ordinary echo.
+    match read_prompt_window_line(window, &confirm_prompt(&words), Echo::Chars) {
         Ok(PromptLine::Line(answer)) => answer_verdict(Some(&answer)),
         Ok(PromptLine::Eof | PromptLine::Back | PromptLine::Exit) | Err(_) => SasVerdict::Declined,
     }

@@ -94,8 +94,17 @@ fn classify_headless_prompt_line(line: &str) -> PromptLine {
     }
 }
 
-/// Read a line while `window` exclusively owns the terminal.
-pub fn read_prompt_window_line(window: &PromptWindow, prompt: &str) -> io::Result<PromptLine> {
+/// Read a line while `window` exclusively owns the terminal, showing what is
+/// typed according to `echo`.
+///
+/// The piped branch below echoes NOTHING either way, so `echo` is a
+/// TTY-branch policy: a pipe never renders the value, and a secret read from
+/// one is as safe as an ordinary answer.
+pub fn read_prompt_window_line(
+    window: &PromptWindow,
+    prompt: &str,
+    echo: Echo,
+) -> io::Result<PromptLine> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         window.ask(prompt)?;
         let mut line = String::new();
@@ -114,7 +123,7 @@ pub fn read_prompt_window_line(window: &PromptWindow, prompt: &str) -> io::Resul
                 Event::Key(key) if key.kind != KeyEventKind::Release => key,
                 Event::Paste(text) => {
                     value.extend(text.chars().filter(|ch| !ch.is_control()));
-                    window.ask(&render(prompt, &value, false)?)?;
+                    window.ask(&render(prompt, &echo.display(&value), false)?)?;
                     continue;
                 }
                 _ => continue,
@@ -126,14 +135,14 @@ pub fn read_prompt_window_line(window: &PromptWindow, prompt: &str) -> io::Resul
                 KeyCode::Enter => break PromptLine::Line(value),
                 KeyCode::Backspace => {
                     value.pop();
-                    window.ask(&render(prompt, &value, false)?)?;
+                    window.ask(&render(prompt, &echo.display(&value), false)?)?;
                 }
                 KeyCode::Char(ch)
                     if !key.modifiers.contains(KeyModifiers::ALT)
                         && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     value.push(ch);
-                    window.ask(&render(prompt, &value, false)?)?;
+                    window.ask(&render(prompt, &echo.display(&value), false)?)?;
                 }
                 _ => {}
             }
@@ -188,6 +197,43 @@ fn prompt_control(key: &KeyEvent) -> Option<PromptLine> {
         KeyCode::Char(ch) if ctrl && matches!(ch, 'c' | 'd') => Some(PromptLine::Exit),
         KeyCode::Esc => Some(PromptLine::Back),
         _ => None,
+    }
+}
+
+/// What a modal read SHOWS of what has been typed.
+///
+/// A required parameter of [`read_prompt_window_line`], not a default and not
+/// a `bool`. A secret prompt that echoes is not a cosmetic defect — the key
+/// lands in the scrollback, and from there in whatever captured it. Making
+/// the policy unspellable-by-omission is the cheapest way to keep that from
+/// being one forgotten argument away, and the interaction path never spells
+/// it by hand at all: `present_on_terminal` derives it from the definition,
+/// so a `ControlKind::Secret` masks itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Echo {
+    /// Show the characters typed. Every ordinary prompt.
+    Chars,
+    /// Show one `*` per character. A secret still gets keystroke feedback —
+    /// a fully silent prompt reads as a hung terminal, per field testing —
+    /// without ever showing the value.
+    Stars,
+}
+
+impl Echo {
+    /// What to DISPLAY for `value` under this policy.
+    ///
+    /// Public because the property worth testing is "the value never appears
+    /// in what is shown", and that belongs to callers who ask for secrets —
+    /// `newt-tui`'s credential contract asserts it over the real planted key.
+    ///
+    /// Counts characters, not bytes: a multi-byte key would otherwise draw
+    /// more stars than it has characters and leak its byte length.
+    #[must_use]
+    pub fn display(self, value: &str) -> String {
+        match self {
+            Self::Chars => value.to_string(),
+            Self::Stars => "*".repeat(value.chars().count()),
+        }
     }
 }
 
@@ -486,5 +532,46 @@ mod c0b_wiring {
         assert!(function_body(&real, "read_prompt_window_line")
             .expect("body")
             .contains("classify_headless_prompt_line(&line)"));
+    }
+}
+
+#[cfg(test)]
+mod echo_policy {
+    use super::Echo;
+
+    /// A masked read shows one `*` per CHARACTER, never per byte.
+    ///
+    /// Byte-counting would leak the key's length — a 20-character key with
+    /// a multi-byte character in it would draw more stars than it has
+    /// characters, and the difference is information about the secret.
+    #[test]
+    fn stars_mask_by_character_and_never_reveal_the_value() {
+        assert_eq!(Echo::Stars.display("sk-live-abc"), "***********");
+        assert_eq!(Echo::Stars.display(""), "");
+        // Multi-byte: 3 chars, 3 stars — not 7 bytes, 7 stars.
+        assert_eq!(Echo::Stars.display("é☃x"), "***");
+        // The value itself never appears in what is displayed.
+        for secret in ["sk-live-abc", "é☃x", "hunter2"] {
+            let shown = Echo::Stars.display(secret);
+            assert!(
+                !shown.contains(secret),
+                "the value leaked into the masked display: {shown:?}"
+            );
+        }
+    }
+
+    /// **The anti-vacuous twin.** If `display` always returned stars — or
+    /// always returned the empty string — the assertions above would pass
+    /// while the ordinary prompt drew nothing. `Chars` must be verbatim.
+    #[test]
+    fn chars_show_the_value_verbatim() {
+        assert_eq!(Echo::Chars.display("sk-live-abc"), "sk-live-abc");
+        assert_eq!(Echo::Chars.display("é☃x"), "é☃x");
+        assert_eq!(Echo::Chars.display(""), "");
+        assert_ne!(
+            Echo::Chars.display("hunter2"),
+            Echo::Stars.display("hunter2"),
+            "the two policies must actually differ"
+        );
     }
 }
