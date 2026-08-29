@@ -34,7 +34,6 @@ mod interaction_view;
 /// plain-scroller carve-out does not permit during a turn.
 #[cfg(all(test, unix, feature = "rich-tui"))]
 mod interaction_view_pty_test;
-mod line_console;
 #[cfg(feature = "live-spill")]
 mod live_spill;
 /// #1889 — the PTY acceptance proof that the operator PANELS hand the
@@ -477,7 +476,7 @@ impl<F: FnMut()> Drop for RestoreOnDrop<F> {
 /// The audit that found it (#1897) re-read every raw-mode pair in the
 /// workspace rather than trusting this list. As of #1898 every pair is
 /// Drop-guarded: `SplashScreenGuard`, `lean_input::RawGuard`,
-/// `line_console::RawGuard`, `newt_core::tty::modal::RawGuard`,
+/// `newt_core::tty::modal::RawGuard`,
 /// `transcript_pager::AltScreenGuard`, `interaction_view::InlineGuard`,
 /// `config_panel::PanelRawGuard` (both panels, #1889),
 /// `rich_input::RawPasteGuard`, and `cockpit/presenter` via `RestoreOnDrop`.

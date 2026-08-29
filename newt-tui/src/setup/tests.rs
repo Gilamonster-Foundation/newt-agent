@@ -1,5 +1,4 @@
 use super::*;
-use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -44,23 +43,11 @@ impl Drop for EnvVarGuard {
     }
 }
 
-/// Scripted console: pops answers in order, records what was said.
-struct ScriptedConsole {
-    answers: VecDeque<String>,
-    output: Vec<String>,
-}
-
-impl ScriptedConsole {
-    fn new(answers: &[&str]) -> Self {
-        Self {
-            answers: answers.iter().map(|s| s.to_string()).collect(),
-            output: Vec::new(),
-        }
-    }
-    fn transcript(&self) -> String {
-        self.output.join("\n")
-    }
-}
+// D1b-3 (#1913): the scripted console went with the `Console` trait.
+// `setup::operator::Script` replaces it — same answers-in-order, same
+// recorded output — and it hands out an `Operator` instead of
+// implementing a trait, so a test cannot supply a reader of its own.
+use super::operator::Script as ScriptedConsole;
 
 /// Read the backend drop-in `<config dir>/backends/<name>.toml` the new
 /// writer (#1140) produces beside the config file.
@@ -106,36 +93,7 @@ async fn mount_ollama_chat(server: &MockServer) {
         .await;
 }
 
-impl Console for ScriptedConsole {
-    fn ask(&mut self, _prompt: &str) -> io::Result<String> {
-        Ok(self.answers.pop_front().unwrap_or_default())
-    }
-    fn say(&mut self, line: &str) {
-        self.output.push(line.to_string());
-    }
-}
-
 // --- pure helpers -----------------------------------------------------
-
-#[test]
-fn parse_choice_valid_and_out_of_range() {
-    assert_eq!(parse_choice("1", 2), Some(1));
-    assert_eq!(parse_choice("2", 2), Some(2));
-    assert_eq!(parse_choice("3", 2), None); // out of range
-    assert_eq!(parse_choice("", 2), None); // empty
-    assert_eq!(parse_choice("abc", 2), None); // non-numeric
-    assert_eq!(parse_choice("0", 2), None); // zero is not 1-based
-}
-
-#[test]
-fn is_yes_respects_default() {
-    assert!(is_yes("", true));
-    assert!(!is_yes("", false));
-    assert!(is_yes("y", false));
-    assert!(is_yes("YES", false));
-    assert!(!is_yes("n", true));
-    assert!(!is_yes("nope", true));
-}
 
 #[test]
 fn normalize_url_bare_host_gets_scheme_and_port() {
@@ -245,9 +203,9 @@ async fn preset_retry_path_revalidates_transport_before_sending_a_key() {
         probe_key: Some(Secret::new("replacement-secret")),
         pending_token: None,
     };
-    let mut console = ScriptedConsole::new(&[]);
+    let console = ScriptedConsole::new(&[]);
     let result = verify_key_with_retries(
-        &mut console,
+        &console.operator(),
         &reqwest::Client::new(),
         &preset,
         Path::new("config.toml"),
@@ -274,11 +232,16 @@ async fn tool_free_chat_verification_does_not_pin_chat_completions() {
         engine: None,
         warm: vec![],
     };
-    let mut console = ScriptedConsole::new(&[]);
-    let (_, api) =
-        verify_custom_chat_with_retries(&mut console, &reqwest::Client::new(), &hit, "model", None)
-            .await
-            .unwrap();
+    let console = ScriptedConsole::new(&[]);
+    let (_, api) = verify_custom_chat_with_retries(
+        &console.operator(),
+        &reqwest::Client::new(),
+        &hit,
+        "model",
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(api, None, "runtime tool-capability probe must choose Chat");
 }
 
@@ -329,10 +292,10 @@ async fn setup_never_renders_provider_error_refusal_or_bearer_material() {
         engine: None,
         warm: vec![],
     };
-    let mut console = ScriptedConsole::new(&[]);
+    let console = ScriptedConsole::new(&[]);
 
     let error = verify_custom_chat_with_retries(
-        &mut console,
+        &console.operator(),
         &reqwest::Client::new(),
         &hit,
         "model",
@@ -352,6 +315,7 @@ async fn setup_never_renders_provider_error_refusal_or_bearer_material() {
     }
     assert!(console
         .output
+        .borrow()
         .iter()
         .all(|line| !line.chars().any(char::is_control)));
     assert!(!rendered_error.chars().any(char::is_control));
@@ -374,12 +338,17 @@ async fn authentication_retry_does_not_collect_an_untested_final_key() {
         engine: None,
         warm: vec![],
     };
-    let mut console = ScriptedConsole::new(&["first-key", "second-key", "must-remain"]);
+    let console = ScriptedConsole::new(&["first-key", "second-key", "must-remain"]);
 
-    let error =
-        verify_custom_chat_with_retries(&mut console, &reqwest::Client::new(), &hit, "model", None)
-            .await
-            .unwrap_err();
+    let error = verify_custom_chat_with_retries(
+        &console.operator(),
+        &reqwest::Client::new(),
+        &hit,
+        "model",
+        None,
+    )
+    .await
+    .unwrap_err();
 
     assert!(
         error
@@ -388,7 +357,7 @@ async fn authentication_retry_does_not_collect_an_untested_final_key() {
         "{error:#}"
     );
     assert_eq!(
-        console.answers.front().map(String::as_str),
+        console.next_answer().as_deref(),
         Some("must-remain"),
         "the final rejection must not prompt for a key setup cannot test"
     );
@@ -415,11 +384,11 @@ async fn preset_authentication_retry_does_not_collect_an_untested_final_key() {
         probe_key: Some(Secret::new("initial-key")),
         pending_token: None,
     };
-    let mut console =
+    let console =
         ScriptedConsole::new(&["Y", "first-key", "", "Y", "second-key", "", "must-remain"]);
 
     let result = verify_key_with_retries(
-        &mut console,
+        &console.operator(),
         &reqwest::Client::new(),
         &preset,
         Path::new("/unused/config.toml"),
@@ -439,7 +408,7 @@ async fn preset_authentication_retry_does_not_collect_an_untested_final_key() {
         "{error:#}"
     );
     assert_eq!(
-        console.answers.front().map(String::as_str),
+        console.next_answer().as_deref(),
         Some("must-remain"),
         "the preset flow must not collect a final untested key"
     );
@@ -481,9 +450,9 @@ fn late_setup_write_failure_retains_a_coherent_backend_tuple() {
         path: versioned_token.clone(),
         reference: credentials::SealedSecret::new(&versioned_reference).unwrap(),
     };
-    let mut console = ScriptedConsole::new(&[]);
+    let console = ScriptedConsole::new(&[]);
     let result = persist_interactive_backend_with(
-        &mut console,
+        &console.operator(),
         &config,
         &cfg,
         &backend,
@@ -549,7 +518,7 @@ fn backend_post_commit_sync_failure_retains_its_credential() {
     };
 
     let error = persist_interactive_backend_with(
-        &mut ScriptedConsole::new(&[]),
+        &ScriptedConsole::new(&[]).operator(),
         &config,
         &cfg,
         &backend,
@@ -624,7 +593,7 @@ fn successful_rotation_retains_the_previous_credential_for_live_readers() {
         ..Default::default()
     };
     persist_interactive_backend(
-        &mut ScriptedConsole::new(&[]),
+        &ScriptedConsole::new(&[]).operator(),
         &config,
         &cfg,
         &replacement,
@@ -656,10 +625,10 @@ fn interactive_setup_lock_rejects_a_concurrent_writer_before_staging() {
         default_backend: Some("example".into()),
         ..Default::default()
     };
-    let mut console = ScriptedConsole::new(&[]);
+    let console = ScriptedConsole::new(&[]);
 
     let error = persist_interactive_backend_with(
-        &mut console,
+        &console.operator(),
         &config,
         &cfg,
         &backend,
@@ -1163,7 +1132,7 @@ fn setup_symlink_retarget_cannot_escape_the_locked_destination() {
     };
 
     persist_interactive_backend_with(
-        &mut ScriptedConsole::new(&[]),
+        &ScriptedConsole::new(&[]).operator(),
         &config,
         &cfg,
         &backend,
@@ -1605,10 +1574,10 @@ async fn bat_public_catalog_auth_rejection_never_calls_persistence() {
         .mount(&server)
         .await;
     let persistence_called = std::cell::Cell::new(false);
-    let mut console = ScriptedConsole::new(&[]);
+    let console = ScriptedConsole::new(&[]);
 
     let error = run_target_with_persist(
-        &mut console,
+        &console.operator(),
         &reqwest::Client::new(),
         Path::new("unused/config.toml"),
         TargetSetupRequest {
@@ -1666,10 +1635,10 @@ async fn target_flow_probes_multiple_ports_and_writes_each_live_endpoint() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     let client = reqwest::Client::new();
-    let mut console = ScriptedConsole::new(&[]);
+    let console = ScriptedConsole::new(&[]);
 
     run_target_with(
-        &mut console,
+        &console.operator(),
         &client,
         &config_path,
         TargetSetupRequest {
@@ -1725,10 +1694,10 @@ async fn target_flow_reports_auth_failure_alongside_a_successful_probe() {
     };
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    let mut console = ScriptedConsole::new(&[]);
+    let console = ScriptedConsole::new(&[]);
 
     run_target_with(
-        &mut console,
+        &console.operator(),
         &reqwest::Client::new(),
         &config_path,
         TargetSetupRequest {
@@ -1763,10 +1732,10 @@ async fn target_flow_decline_writes_nothing() {
     mount_openai_chat(&server).await;
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
-    let mut console = ScriptedConsole::new(&["n"]);
+    let console = ScriptedConsole::new(&["n"]);
 
     run_target_with(
-        &mut console,
+        &console.operator(),
         &reqwest::Client::new(),
         &config_path,
         TargetSetupRequest {
@@ -1806,10 +1775,10 @@ async fn target_flow_requires_an_explicit_endpoint_before_sending_a_token() {
     let dir = tempfile::tempdir().unwrap();
     let token_path = dir.path().join("token");
     std::fs::write(&token_path, "secret-value\n").unwrap();
-    let mut console = ScriptedConsole::new(&[]);
+    let console = ScriptedConsole::new(&[]);
 
     let error = run_target_with(
-        &mut console,
+        &console.operator(),
         &reqwest::Client::new(),
         &dir.path().join("config.toml"),
         TargetSetupRequest {
@@ -1847,10 +1816,10 @@ async fn target_flow_uses_token_file_for_probe_without_echoing_it() {
     std::fs::write(&token_path, "secret-value\n").unwrap();
     let config_path = dir.path().join("config.toml");
     let client = reqwest::Client::new();
-    let mut console = ScriptedConsole::new(&[]);
+    let console = ScriptedConsole::new(&[]);
 
     run_target_with(
-        &mut console,
+        &console.operator(),
         &client,
         &config_path,
         TargetSetupRequest {
@@ -1885,10 +1854,10 @@ async fn target_flow_failure_is_actionable_and_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     let client = reqwest::Client::new();
-    let mut console = ScriptedConsole::new(&[]);
+    let console = ScriptedConsole::new(&[]);
 
     let err = run_target_with(
-        &mut console,
+        &console.operator(),
         &client,
         &config_path,
         TargetSetupRequest {
@@ -1922,10 +1891,10 @@ async fn target_flow_rejects_an_endpoint_with_no_served_models() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     let client = reqwest::Client::new();
-    let mut console = ScriptedConsole::new(&[]);
+    let console = ScriptedConsole::new(&[]);
 
     let error = run_target_with(
-        &mut console,
+        &console.operator(),
         &client,
         &config_path,
         TargetSetupRequest {
@@ -2038,8 +2007,8 @@ async fn ollama_flow_writes_config() {
     let path = dir.path().join("config.toml");
     let client = reqwest::Client::new();
     // backend=1 (Ollama), host=<mock>, model=2 (qwen), write=Y
-    let mut console = ScriptedConsole::new(&["1", &server.uri(), "2", "y"]);
-    run_with(&mut console, &client, &path).await.unwrap();
+    let console = ScriptedConsole::new(&["1", &server.uri(), "2", "y"]);
+    run_with(&console.operator(), &client, &path).await.unwrap();
 
     let cfg = Config::load(&path).unwrap();
     assert!(cfg.dgx.is_none(), "no legacy [dgx] block (#1140)");
@@ -2097,8 +2066,14 @@ async fn bad_pasted_key_is_caught_by_the_live_test_and_reentered() {
     };
     // paste bad key → blank passphrase → model 1 → re-enter? Y →
     // paste good key → blank passphrase.
-    let mut console = ScriptedConsole::new(&["bad-key", "", "1", "Y", "good-key", ""]);
-    let result = configure_preset(&mut console, &reqwest::Client::new(), &preset, &cfg_path).await;
+    let console = ScriptedConsole::new(&["bad-key", "", "1", "Y", "good-key", ""]);
+    let result = configure_preset(
+        &console.operator(),
+        &reqwest::Client::new(),
+        &preset,
+        &cfg_path,
+    )
+    .await;
     let (_cfg, backend, _pending) = result.unwrap();
     let t = console.transcript();
     assert!(t.contains("✗ authentication rejected (HTTP 401)"), "{t}");
@@ -2134,7 +2109,7 @@ async fn two_backends_in_one_sitting_with_default_pick() {
     let host2_name = format!("127-0-0-1-{}", s2.address().port());
     // ollama door → write → add another → custom host door → write →
     // stop → pick backend 2 as the default.
-    let mut console = ScriptedConsole::new(&[
+    let console = ScriptedConsole::new(&[
         "1",
         &s1.uri(),
         "1",
@@ -2148,7 +2123,9 @@ async fn two_backends_in_one_sitting_with_default_pick() {
         "n",
         "2",
     ]);
-    run_with(&mut console, &client, &cfg_path).await.unwrap();
+    run_with(&console.operator(), &client, &cfg_path)
+        .await
+        .unwrap();
 
     assert!(cfg_path
         .with_file_name("backends")
@@ -2184,8 +2161,8 @@ async fn custom_host_flow_detects_openai_backend() {
     let path = dir.path().join("config.toml");
     let client = reqwest::Client::new();
     // custom host=2, host=<mock url>, endpoint=1, model=1, write=Y
-    let mut console = ScriptedConsole::new(&["2", &server.uri(), "1", "1", "y"]);
-    run_with(&mut console, &client, &path).await.unwrap();
+    let console = ScriptedConsole::new(&["2", &server.uri(), "1", "1", "y"]);
+    run_with(&console.operator(), &client, &path).await.unwrap();
 
     let name = format!("127-0-0-1-{}", server.address().port());
     let cfg = Config::load(&path).unwrap();
@@ -2224,8 +2201,8 @@ async fn custom_host_adopts_the_warm_model_as_the_enter_default() {
     let path = dir.path().join("config.toml");
     let client = reqwest::Client::new();
     // custom host=2, host, endpoint=1, model=<Enter> (default = warm), write=Y
-    let mut console = ScriptedConsole::new(&["2", &server.uri(), "1", "", "y"]);
-    run_with(&mut console, &client, &path).await.unwrap();
+    let console = ScriptedConsole::new(&["2", &server.uri(), "1", "", "y"]);
+    run_with(&console.operator(), &client, &path).await.unwrap();
 
     let name = format!("127-0-0-1-{}", server.address().port());
     assert_eq!(
@@ -2247,13 +2224,13 @@ async fn manual_model_when_endpoint_unreachable() {
         .build()
         .unwrap();
     // Ollama, an unroutable host → probe fails → manual model name → write.
-    let mut console = ScriptedConsole::new(&[
+    let console = ScriptedConsole::new(&[
         "1",
         "http://127.0.0.1:1", // connection refused
         "phi3:mini",
         "y",
     ]);
-    run_with(&mut console, &client, &path).await.unwrap();
+    run_with(&console.operator(), &client, &path).await.unwrap();
     let cfg = Config::load(&path).unwrap();
     assert_eq!(cfg.default_backend.as_deref(), Some("default"));
     assert_eq!(
@@ -2270,8 +2247,8 @@ async fn decline_overwrite_keeps_existing() {
     std::fs::write(&path, "# sentinel\n").unwrap();
     let client = reqwest::Client::new();
     // Overwrite? → N (default).
-    let mut console = ScriptedConsole::new(&["n"]);
-    run_with(&mut console, &client, &path).await.unwrap();
+    let console = ScriptedConsole::new(&["n"]);
+    run_with(&console.operator(), &client, &path).await.unwrap();
     // Untouched.
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "# sentinel\n");
 }
@@ -2291,8 +2268,8 @@ async fn decline_final_write_leaves_no_file() {
     let path = dir.path().join("config.toml");
     let client = reqwest::Client::new();
     // Ollama, host, model=1, write=n → nothing written.
-    let mut console = ScriptedConsole::new(&["1", &server.uri(), "1", "n"]);
-    run_with(&mut console, &client, &path).await.unwrap();
+    let console = ScriptedConsole::new(&["1", &server.uri(), "1", "n"]);
+    run_with(&console.operator(), &client, &path).await.unwrap();
     assert!(!path.exists());
 }
 
@@ -2362,8 +2339,8 @@ fn select_hosted_provider_lists_available_and_notes_unavailable_rows() {
     // 9 available rows == FILTER_THRESHOLD → straight numbered list
     // (no filter prompt); row 4 is OpenRouter in roster order. The
     // filter path itself is pinned by select_row_filter_maps_back….
-    let mut console = ScriptedConsole::new(&["4"]);
-    let picked = select_hosted_provider(&mut console, &presets).unwrap();
+    let console = ScriptedConsole::new(&["4"]);
+    let picked = select_hosted_provider(&console.operator(), &presets).unwrap();
     assert!(matches!(
         picked,
         HostedProviderChoice::Preset(preset) if preset.name == "openrouter"
@@ -2387,14 +2364,16 @@ fn select_hosted_provider_lists_available_and_notes_unavailable_rows() {
 #[test]
 fn select_hosted_provider_accepts_custom_endpoint() {
     let presets = newt_core::provider_preset::builtin_presets();
-    let mut console = ScriptedConsole::new(&["0"]);
+    let console = ScriptedConsole::new(&["0"]);
 
-    let picked = select_hosted_provider(&mut console, &presets).unwrap();
+    let picked = select_hosted_provider(&console.operator(), &presets).unwrap();
 
     assert_eq!(picked, HostedProviderChoice::CustomEndpoint);
+    // C0c renders options as `[0] label`, one per line, where the wizard
+    // used to `say` a hand-numbered "  0) label".
     assert!(console
         .transcript()
-        .contains("0) I have a URL (custom endpoint)"));
+        .contains("[0] I have a URL (custom endpoint)"));
 }
 
 #[test]
@@ -2402,18 +2381,18 @@ fn select_row_filter_maps_back_to_original_indices() {
     let rows: Vec<String> = (1..=12).map(|i| format!("row-{i}")).collect();
     // Filter to "row-1" matches row-1, row-10..12; pick 2 → "row-10"
     // (original index 9) — the picker must return ORIGINAL indices.
-    let mut console = ScriptedConsole::new(&["row-1", "2"]);
-    let idx = select_row(&mut console, &rows, "rows").unwrap();
+    let console = ScriptedConsole::new(&["row-1", "2"]);
+    let idx = select_row(&console.operator(), &rows, "rows").unwrap();
     assert_eq!(idx, 9);
 }
 
 #[test]
 fn zero_choice_is_available_before_filtering_a_large_roster() {
     let rows: Vec<String> = (1..=12).map(|i| format!("provider-{i}")).collect();
-    let mut console = ScriptedConsole::new(&["0"]);
+    let console = ScriptedConsole::new(&["0"]);
 
     let picked = select_row_with_zero(
-        &mut console,
+        &console.operator(),
         &rows,
         "providers",
         "I have a URL (custom endpoint)",
@@ -2460,7 +2439,7 @@ async fn hosted_provider_custom_endpoint_uses_supplied_base_url() {
     let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, dir.path());
     newt_core::secrets::session().reset_for_test();
     let server_with_v1 = format!("{}/v1/", server.uri());
-    let mut console = ScriptedConsole::new(&[
+    let console = ScriptedConsole::new(&[
         "3",
         "0",
         &server_with_v1,
@@ -2471,9 +2450,14 @@ async fn hosted_provider_custom_endpoint_uses_supplied_base_url() {
         "y",
     ]);
 
-    run_with_flow(&mut console, &reqwest::Client::new(), &path, Flow::FirstRun)
-        .await
-        .unwrap();
+    run_with_flow(
+        &console.operator(),
+        &reqwest::Client::new(),
+        &path,
+        Flow::FirstRun,
+    )
+    .await
+    .unwrap();
 
     let name = format!("127-0-0-1-{}", server.address().port());
     let dropin = read_dropin(&path, &name);
@@ -2535,9 +2519,9 @@ async fn custom_host_auth_required_stores_the_token_encrypted() {
     let server_with_v1 = format!("{}/v1", server.uri());
     // custom host=2, host (with /v1 — stripped), key (hidden), endpoint=1,
     // model=1, passphrase=<Enter: machine key>, write=Y
-    let mut console =
+    let console =
         ScriptedConsole::new(&["2", &server_with_v1, "test-remote-key", "1", "1", "", "y"]);
-    run_with(&mut console, &client, &path).await.unwrap();
+    run_with(&console.operator(), &client, &path).await.unwrap();
 
     let name = format!("127-0-0-1-{}", server.address().port());
     let dropin = read_dropin(&path, &name);
@@ -2598,8 +2582,8 @@ async fn preset_skip_key_records_the_env_reference() {
     let path = dir.path().join("config.toml");
     let client = reqwest::Client::new();
     // key=<Enter: skip>, model=1
-    let mut console = ScriptedConsole::new(&["", "1"]);
-    let (_cfg, backend, _pending) = configure_preset(&mut console, &client, &preset, &path)
+    let console = ScriptedConsole::new(&["", "1"]);
+    let (_cfg, backend, _pending) = configure_preset(&console.operator(), &client, &preset, &path)
         .await
         .unwrap();
     assert_eq!(backend.api_key_env.as_deref(), Some("NEWT_TEST_PRESET_KEY"));
@@ -2649,8 +2633,8 @@ async fn preset_pasted_token_is_stored_encrypted_with_a_passphrase() {
     newt_core::secrets::session().reset_for_test();
     let client = reqwest::Client::new();
     // key (hidden), passphrase, model=1
-    let mut console = ScriptedConsole::new(&["sk-preset-secret", "open sesame", "1"]);
-    let (_cfg, backend, pending) = configure_preset(&mut console, &client, &preset, &path)
+    let console = ScriptedConsole::new(&["sk-preset-secret", "open sesame", "1"]);
+    let (_cfg, backend, pending) = configure_preset(&console.operator(), &client, &preset, &path)
         .await
         .unwrap();
     assert!(backend.api_key_env.is_none());
@@ -2660,7 +2644,7 @@ async fn preset_pasted_token_is_stored_encrypted_with_a_passphrase() {
     assert_eq!(backend.effective_model(), Some("gated-model"));
     let pending = pending.expect("token is held until final write");
     assert_eq!(
-        persist_wizard_token(&mut console, &path, "gatedcloud", &pending).unwrap(),
+        persist_wizard_token(&console.operator(), &path, "gatedcloud", &pending).unwrap(),
         token_ref
     );
     let body = std::fs::read_to_string(&pending.path).unwrap();
@@ -2702,8 +2686,8 @@ async fn preset_uses_an_exported_env_var_without_storing_anything() {
     // read blank as YES. Adopting a credential from the environment is a
     // decision, and the wizard no longer makes it for the operator; see
     // `an_empty_answer_does_not_adopt_the_exported_key` below.
-    let mut console = ScriptedConsole::new(&["y", "1"]);
-    let (_cfg, backend, _pending) = configure_preset(&mut console, &client, &preset, &path)
+    let console = ScriptedConsole::new(&["y", "1"]);
+    let (_cfg, backend, _pending) = configure_preset(&console.operator(), &client, &preset, &path)
         .await
         .unwrap();
     assert_eq!(backend.api_key_env.as_deref(), Some("NEWT_TEST_PRESET_KEY"));
@@ -2737,12 +2721,13 @@ async fn an_empty_answer_does_not_adopt_the_exported_key() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     // An exhausted script answers "" forever — a short pipe.
-    let mut console = ScriptedConsole::new(&[]);
+    let console = ScriptedConsole::new(&[]);
     // `let Err(..) else` rather than `expect_err`: the success type contains
     // `PendingWizardToken`, which deliberately has no `Debug` (it holds a
     // key). Reaching for `expect_err` would mean deriving `Debug` on a
     // secret-carrying record to satisfy a test, which is backwards.
-    let Err(err) = configure_preset(&mut console, &reqwest::Client::new(), &preset, &path).await
+    let Err(err) =
+        configure_preset(&console.operator(), &reqwest::Client::new(), &preset, &path).await
     else {
         panic!("a blank answer must not adopt the key");
     };
@@ -2751,7 +2736,11 @@ async fn an_empty_answer_does_not_adopt_the_exported_key() {
         "gave up rather than guessing: {err}"
     );
     assert!(
-        console.output.iter().any(|l| l.contains("answer y or n")),
+        console
+            .output
+            .borrow()
+            .iter()
+            .any(|l| l.contains("not one of the choices — enter y, n")),
         "and said why: {:?}",
         console.output
     );
@@ -2777,11 +2766,12 @@ async fn an_explicit_no_declines_the_exported_key_and_asks_for_one() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     // n = do not use the exported key; then Enter skips the paste prompt.
-    let mut console = ScriptedConsole::new(&["n", ""]);
-    let _ = configure_preset(&mut console, &reqwest::Client::new(), &preset, &path).await;
+    let console = ScriptedConsole::new(&["n", ""]);
+    let _ = configure_preset(&console.operator(), &reqwest::Client::new(), &preset, &path).await;
     assert!(
         console
             .output
+            .borrow()
             .iter()
             .any(|l| l.contains("export $NEWT_TEST_PRESET_KEY")),
         "declining routed to the paste path, which skipped: {:?}",
@@ -2805,10 +2795,15 @@ fn a_token_reference_is_recorded_even_when_home_is_unset() {
 
     let path = dir.path().join("config.toml");
     // passphrase=<Enter: machine key>
-    let mut console = ScriptedConsole::new(&[""]);
-    let pending =
-        collect_wizard_token(&mut console, &Secret::new("a-secret"), &path, "example").unwrap();
-    let recorded = persist_wizard_token(&mut console, &path, "example", &pending)
+    let console = ScriptedConsole::new(&[""]);
+    let pending = collect_wizard_token(
+        &console.operator(),
+        &Secret::new("a-secret"),
+        &path,
+        "example",
+    )
+    .unwrap();
+    let recorded = persist_wizard_token(&console.operator(), &path, "example", &pending)
         .expect("a supplied key must always be recorded, home dir or not");
 
     assert!(
@@ -2830,8 +2825,11 @@ fn a_token_reference_is_recorded_even_when_home_is_unset() {
 #[test]
 fn a_short_list_is_shown_directly_with_no_filter_prompt() {
     let models: Vec<String> = (1..=3).map(|i| format!("model-{i}")).collect();
-    let mut console = ScriptedConsole::new(&["2"]);
-    assert_eq!(select_model(&mut console, &models).unwrap(), "model-2");
+    let console = ScriptedConsole::new(&["2"]);
+    assert_eq!(
+        select_model(&console.operator(), &models).unwrap(),
+        "model-2"
+    );
     // Asking to filter three items would be pure ceremony.
     assert!(
         !console.transcript().contains("Filter"),
@@ -2848,9 +2846,9 @@ fn a_long_list_filters_then_picks_by_number() {
 
     // Type a fragment, then choose from the two matches — the operator
     // never types the full id.
-    let mut console = ScriptedConsole::new(&["qwen", "2"]);
+    let console = ScriptedConsole::new(&["qwen", "2"]);
     assert_eq!(
-        select_model(&mut console, &models).unwrap(),
+        select_model(&console.operator(), &models).unwrap(),
         "qwen3-coder_30b"
     );
     let seen = console.transcript();
@@ -2862,8 +2860,11 @@ fn a_long_list_filters_then_picks_by_number() {
 fn the_filter_is_case_insensitive_and_matches_substrings() {
     let mut models: Vec<String> = (1..=20).map(|i| format!("filler-{i}")).collect();
     models.push("Qwen3-Coder".into());
-    let mut console = ScriptedConsole::new(&["CODER", "1"]);
-    assert_eq!(select_model(&mut console, &models).unwrap(), "Qwen3-Coder");
+    let console = ScriptedConsole::new(&["CODER", "1"]);
+    assert_eq!(
+        select_model(&console.operator(), &models).unwrap(),
+        "Qwen3-Coder"
+    );
 }
 
 /// A filter that matches nothing must not dead-end the operator in an empty
@@ -2871,16 +2872,22 @@ fn the_filter_is_case_insensitive_and_matches_substrings() {
 #[test]
 fn a_filter_matching_nothing_falls_back_to_the_full_list() {
     let models: Vec<String> = (1..=20).map(|i| format!("model-{i}")).collect();
-    let mut console = ScriptedConsole::new(&["zzz-no-such-model", "3"]);
-    assert_eq!(select_model(&mut console, &models).unwrap(), "model-3");
+    let console = ScriptedConsole::new(&["zzz-no-such-model", "3"]);
+    assert_eq!(
+        select_model(&console.operator(), &models).unwrap(),
+        "model-3"
+    );
     assert!(console.transcript().contains("showing all"));
 }
 
 #[test]
 fn a_blank_filter_shows_everything() {
     let models: Vec<String> = (1..=15).map(|i| format!("model-{i}")).collect();
-    let mut console = ScriptedConsole::new(&["", "15"]);
-    assert_eq!(select_model(&mut console, &models).unwrap(), "model-15");
+    let console = ScriptedConsole::new(&["", "15"]);
+    assert_eq!(
+        select_model(&console.operator(), &models).unwrap(),
+        "model-15"
+    );
 }
 
 /// An out-of-range or unparseable choice takes the first entry rather than
@@ -2889,8 +2896,8 @@ fn a_blank_filter_shows_everything() {
 fn an_invalid_choice_falls_back_to_the_first_entry() {
     let models: Vec<String> = vec!["a".into(), "b".into()];
     for answer in ["", "99", "nonsense", "0", "-1"] {
-        let mut console = ScriptedConsole::new(&[answer]);
-        assert_eq!(select_model(&mut console, &models).unwrap(), "a");
+        let console = ScriptedConsole::new(&[answer]);
+        assert_eq!(select_model(&console.operator(), &models).unwrap(), "a");
     }
 }
 
@@ -2910,8 +2917,8 @@ async fn custom_host_requires_a_host() {
     let path = dir.path().join("config.toml");
     let client = reqwest::Client::new();
     // custom host, empty host (reprompt), then real host, endpoint=1, model=1, write=Y
-    let mut console = ScriptedConsole::new(&["2", "", &server.uri(), "1", "1", "y"]);
-    run_with(&mut console, &client, &path).await.unwrap();
+    let console = ScriptedConsole::new(&["2", "", &server.uri(), "1", "1", "y"]);
+    run_with(&console.operator(), &client, &path).await.unwrap();
     let name = format!("127-0-0-1-{}", server.address().port());
     let cfg = Config::load(&path).unwrap();
     assert_eq!(cfg.default_backend.as_deref(), Some(name.as_str()));
