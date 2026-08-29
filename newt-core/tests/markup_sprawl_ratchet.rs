@@ -1842,3 +1842,54 @@ fn the_crew_form_carries_no_private_console_path() {
          line console — the guard above is passing vacuously"
     );
 }
+
+/// **C0c (#1907): the plain projection consults no ambient width.**
+///
+/// C0c made every choice option take its own line. The rule it did NOT take
+/// was "one per line when the row would exceed N columns", and the reason is
+/// the property this test pins: a layout that reads the TERMINAL renders the
+/// same definition two different ways for two operators, and neither of them
+/// can tell. A layout that reads only the definition cannot.
+///
+/// So `markup::plain` must reach for no width source, no environment, and no
+/// terminal — which is also what keeps it the wyvern tier's fallback. Stated
+/// as a source scan rather than a unit test because the guarantee is "this
+/// module never learns the width", and a unit test can only sample the widths
+/// it thought to try.
+#[test]
+fn the_plain_projection_reads_no_ambient_width() {
+    let files = production_code();
+    let plain = &files["newt-core/src/markup/plain.rs"].squeezed;
+    for forbidden in [
+        "str_width(",
+        "ch_width(",
+        "wrap_line(",
+        "terminal_size(",
+        "env::var(",
+        "COLUMNS",
+        "is_terminal(",
+    ] {
+        assert!(
+            !plain.contains(forbidden),
+            "markup::plain reached for `{forbidden}` — its layout must be a \
+             function of the definition alone, or the same definition renders \
+             differently for two operators"
+        );
+    }
+
+    // ANTI-VACUOUS TWIN. Every assertion above is a `!contains`, which passes
+    // against an empty haystack, a renamed module, or a typo'd needle. The
+    // file must actually be there with its projection in it...
+    assert!(
+        plain.contains("fn render(") && plain.contains("CHOICE_SEPARATOR"),
+        "the scan is not looking at the plain projection at all"
+    );
+    // ...and the needles must match where a width IS consulted. `tty::width`
+    // is D3a's one width model and the place a fifth metric would go.
+    let width = &files["newt-core/src/tty/width.rs"].squeezed;
+    assert!(
+        width.contains("str_width(") && width.contains("ch_width("),
+        "the width needles no longer match the module that DOES measure — \
+         the guard above is passing vacuously"
+    );
+}
