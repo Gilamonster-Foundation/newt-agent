@@ -279,6 +279,20 @@ impl Drop for LineLease {
 /// looked right", but "no prompt was ever constructed".
 static SUSPENSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether a prompt may reach a human at all (#1866).
+///
+/// A pure predicate for the same reason [`super::caps::probe`] is one: protocol
+/// mode is a process-global that `enter_protocol_mode` makes **irreversible on
+/// purpose**, so a test that set it would poison every sibling test in the
+/// binary. The policy is decided here where it can be table-tested, and read
+/// once at the seam. The in-vivo half — that a real protocol-mode process
+/// reaching a real prompt emits nothing — needs a child process, and lives in
+/// `pty_notice_test`.
+#[must_use]
+pub(crate) fn prompts_permitted(protocol: bool) -> bool {
+    !protocol
+}
+
 /// The number of prompt windows constructed so far — see [`SUSPENSIONS`].
 ///
 /// Unconditionally public, NOT behind `test-util`. It is a read-only counter
@@ -419,10 +433,33 @@ impl Terminal {
     /// **THE seam.** Erase and quiesce every registered ephemeral, take stdin,
     /// and hand back the only object that can talk to a human. Restores on drop.
     ///
+    /// **In protocol mode this hands back a VETOED window** (#1866). Epic
+    /// #1803's global acceptance is that headless/protocol modes never wait,
+    /// choose defaults, or emit terminal bytes, and a prompt is all three: this
+    /// function alone takes stdin (which blocks), erases every ephemeral (which
+    /// writes), and hands out the capability to write a question and read an
+    /// answer. `Notice::emit` has consulted [`super::caps::protocol_mode`]
+    /// since it was written; this did not, and held only because no
+    /// protocol-mode entry point happened to reach a prompt. That is
+    /// reachability, not construction — the next entry point that reached one
+    /// would have broken the invariant silently, because nothing checked.
+    ///
+    /// The veto lands HERE rather than in [`PromptWindow::ask`] because `ask`
+    /// is only one of the three violations. A check there would still leave
+    /// this function seizing stdin and erasing the screen before anyone could
+    /// refuse.
+    ///
     /// Everything after this point is guaranteed a clean bottom row, and the
     /// shared ticker paints nothing until the returned window is dropped.
     pub fn suspend_for_prompt() -> PromptWindow {
+        // Counted before the veto ON PURPOSE: a protocol-mode caller reaching
+        // this seam is exactly what an operator would want to see in
+        // `prompt_windows_constructed`, and silently not counting the attempt
+        // would hide the misbehaving caller this veto exists to contain.
         SUSPENSIONS.fetch_add(1, Ordering::SeqCst);
+        if !prompts_permitted(super::caps::protocol_mode()) {
+            return PromptWindow::vetoed();
+        }
         // 1. Take stdin FIRST and block until the turn watcher's read finishes,
         //    so we never erase the screen and then wait to be allowed to ask.
         let stdin = StdinToken::acquire();
@@ -449,6 +486,7 @@ impl Terminal {
             stdin: Some(stdin),
             resume: live,
             live: true,
+            vetoed: false,
         }
     }
 }
@@ -583,15 +621,53 @@ pub struct PromptWindow {
     /// `false` for the test stub: it arbitrates nothing and must not clear the
     /// process-wide suspend flag on drop.
     live: bool,
+    /// Protocol mode (#1866): fd 1 may be a JSON-RPC wire, so this window
+    /// emits zero bytes and refuses to read. Distinct from `live` — the test
+    /// stub arbitrates nothing but is still allowed to speak.
+    vetoed: bool,
 }
 
 impl PromptWindow {
+    /// A window that arbitrates nothing and may not speak — protocol mode.
+    ///
+    /// PRIVATE, and it must stay private: the seal is the capability. The
+    /// trybuild proofs under `tests/ui/` pin that there is no public
+    /// constructor, that the struct cannot be literaled, and that `test_stub`
+    /// is not reachable from outside. This adds a third *internal* shape, not
+    /// a fourth door.
+    fn vetoed() -> Self {
+        Self {
+            _seal: Seal,
+            stdin: None,
+            resume: Vec::new(),
+            live: false,
+            vetoed: true,
+        }
+    }
+
+    /// The refusal a vetoed window returns. `NotConnected` because that is
+    /// what is true: there is no operator on the other end of a JSON-RPC wire.
+    fn no_operator(action: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!(
+                "refusing to {action} in protocol mode — fd 1 is a machine                  protocol channel and there is no operator to answer"
+            ),
+        )
+    }
+
     /// The ONLY sanctioned way to write a question.
     ///
     /// Guarantees a clean row. The bottom line has just been erased and the
     /// cursor parked at column 0, so the question starts where the operator is
     /// looking rather than appended to spinner chrome.
     pub fn ask(&self, text: &str) -> io::Result<()> {
+        // LOUDLY, unlike `notice` below. A question that cannot be asked must
+        // not report success: a caller that believed it had asked would go on
+        // to block for an answer that is never coming.
+        if self.vetoed {
+            return Err(Self::no_operator("ask"));
+        }
         let mut out = io::stdout();
         write!(out, "{text}")?;
         out.flush()
@@ -611,6 +687,14 @@ impl PromptWindow {
     /// Ctrl-D, a deliberate empty answer) from a genuine read error (no human at
     /// all) need the byte count, not just the string.
     pub fn read_line_into(&self, buf: &mut String) -> io::Result<usize> {
+        // An ERROR, not `Ok(0)`. This method's own contract is that EOF means
+        // "the operator pressed Ctrl-D, a deliberate empty answer" and an error
+        // means "no human at all". Protocol mode is the second, and returning
+        // EOF here would synthesise an answer nobody gave — which A3 settled
+        // is not what failing closed means.
+        if self.vetoed {
+            return Err(Self::no_operator("read an answer"));
+        }
         io::stdin().read_line(buf)
     }
 
@@ -618,6 +702,12 @@ impl PromptWindow {
     /// Routed through the window so it lands on the clean rows below the
     /// question rather than racing the ticker.
     pub fn notice(&self, text: &str) -> io::Result<()> {
+        // SILENTLY, unlike `ask` above, and for `Notice::emit`'s reason: a
+        // notice is informational and dropping it is the documented protocol-
+        // mode behaviour. Nobody is waiting on its return value.
+        if self.vetoed {
+            return Ok(());
+        }
         let mut out = io::stdout();
         writeln!(out, "{text}")?;
         out.flush()
@@ -633,6 +723,7 @@ impl PromptWindow {
             stdin: None,
             resume: Vec::new(),
             live: false,
+            vetoed: false,
         }
     }
 }
@@ -669,6 +760,74 @@ fn notify_prompt_observer(open: bool) {
 
 #[cfg(test)]
 mod tests {
+    /// **The policy (#1866)**, in the shape `progress_sink`'s
+    /// `protocol_mode_vetoes_rendering_from_every_capability` uses, and for the
+    /// same reason: `enter_protocol_mode` is documented as one-way, so a test
+    /// that set the real flag would veto every sibling test in this binary for
+    /// the rest of the run.
+    #[test]
+    fn protocol_mode_vetoes_every_prompt() {
+        assert!(
+            !super::prompts_permitted(true),
+            "fd 1 may be a JSON-RPC wire; no prompt may reach it"
+        );
+    }
+
+    /// The anti-vacuous twin: without it `prompts_permitted` could be `false`
+    /// always and the test above would still pass. Exactly one shape prompts,
+    /// and this names it.
+    #[test]
+    fn and_a_process_outside_protocol_mode_may_prompt() {
+        assert!(
+            super::prompts_permitted(false),
+            "an ordinary terminal session is the ONE shape that prompts — if \
+             this fails the veto test above is vacuous"
+        );
+    }
+
+    /// The veto as the CALLER meets it: a vetoed window refuses, and refuses in
+    /// the two different ways the three methods deliberately chose.
+    ///
+    /// Reaches `PromptWindow::vetoed()` because this module is the seal's
+    /// inside. Nothing here widens it — the constructor is private, and the
+    /// trybuild proofs under `tests/ui/` still pin that no public constructor
+    /// exists, the struct cannot be literaled, and `test_stub` is unreachable
+    /// from outside.
+    #[test]
+    fn a_vetoed_window_refuses_to_ask_or_read_and_drops_notices() {
+        let window = super::PromptWindow::vetoed();
+
+        assert!(
+            window.ask("question > ").is_err(),
+            "ask must refuse rather than report a question it never wrote"
+        );
+
+        let mut buf = String::new();
+        let read = window.read_line_into(&mut buf);
+        assert!(
+            read.is_err(),
+            "read must ERROR, not return Ok(0) — EOF is a deliberate empty \
+             answer from a human, and forging one is not failing closed: {read:?}"
+        );
+        assert!(buf.is_empty(), "nothing may land in the caller's buffer");
+
+        assert!(
+            window.notice("fyi").is_ok(),
+            "a notice is informational and is dropped silently, which is why \
+             it differs from ask"
+        );
+    }
+
+    /// …and the twin for THAT: an unvetoed window is not refused, so the
+    /// assertions above are about protocol mode rather than about every
+    /// window being inert.
+    #[test]
+    fn and_an_unvetoed_window_is_not_refused() {
+        let window = super::PromptWindow::test_stub();
+        assert!(window.ask("").is_ok(), "an ordinary window may ask");
+        assert!(window.notice("").is_ok(), "an ordinary window may narrate");
+    }
+
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
