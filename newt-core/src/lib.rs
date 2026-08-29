@@ -53,6 +53,12 @@ pub mod interaction_surface;
 // C2 (#1876): the interaction VIEW MODEL. Here rather than in `newt-tui`
 // because `newt-core` has no ratatui dependency, so "no renderer type in the
 // model" is a compile error instead of a source scan.
+// C2a (#1876). Built on `markup::spans`, which is `markdown`-gated because it
+// rides the one parser — so this module must carry the same gate. It did not,
+// and `--no-default-features` therefore did not COMPILE (#1890): an unresolved
+// `crate::markup::spans`, not merely a lint. The wyvern tier falls back to
+// `markup::plain`, which stays unconditional for exactly this reason.
+#[cfg(feature = "markdown")]
 pub mod interaction_view;
 pub mod kit;
 pub mod launch_authority;

@@ -16,8 +16,15 @@ use std::io::{self, Write};
 // curated re-export list, and *that privacy was the mechanical cause* of the
 // duplicate frame sets and open-coded erase escapes elsewhere in the workspace.
 // Re-exported here so every call site in `agentic` is unchanged.
+pub(crate) use crate::tty::term_cols;
 pub use crate::tty::NEWT_ORANGE_CT;
-pub(crate) use crate::tty::{term_cols, FADE_CT};
+// `FADE_CT`'s only consumer is `agentic::markdown::emitter`, which is itself
+// `markdown`-gated — so under `--no-default-features` this re-export is unused
+// and `-D warnings` refuses it (#1890). Gated with its consumer rather than
+// deleted, because the curated re-export list above is the deliberate design:
+// every `agentic` call site names `display`, not `tty`.
+#[cfg(feature = "markdown")]
+pub(crate) use crate::tty::FADE_CT;
 
 // The multi-line wrapper moved up to `tty::width::wrap_line` with the rest of
 // the width model (`docs/decisions/tty_widget_suite.md` §3.0). Aliased under its
