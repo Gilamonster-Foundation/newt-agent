@@ -369,6 +369,16 @@ impl LeanSurface {
 }
 
 impl InputSurface for LeanSurface {
+    /// **The terminal adapter** (C1, #1862). This surface owns the terminal,
+    /// so it — and not the session — acquires the sealed `PromptWindow`.
+    fn present_interaction(
+        &mut self,
+        interaction: &newt_core::interaction_surface::SurfaceInteraction,
+    ) -> newt_core::HumanQuestionOutcome {
+        let window = newt_core::tty::Terminal::suspend_for_prompt();
+        crate::permissions::present_on_terminal(&window, interaction)
+    }
+
     fn read_line(&mut self, prompt: &str) -> anyhow::Result<ReadOutcome> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Ok(self.read_piped(prompt)?);

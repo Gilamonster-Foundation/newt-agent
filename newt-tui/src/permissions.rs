@@ -9,6 +9,7 @@ use crate::danger;
 use crate::mint_operating_key;
 use newt_core::agentic::{newt_line, print_newt};
 use newt_core::interaction_adapter::{definition_to_question, role_of, DECISION_CONTROL};
+use newt_core::interaction_surface::SurfaceInteraction;
 use newt_core::markup::plain;
 use newt_core::tty::{
     modal_prompt_controls, read_prompt_window_line, ControlReader, PromptLine as ModalLine,
@@ -365,7 +366,11 @@ fn decision_scope(choice: PromptChoice) -> &'static str {
     }
 }
 
-pub(crate) fn prompt_user_input(w: &PromptWindow, question: &str) -> io::Result<ModalLine> {
+/// The free-text form for one question, as a definition.
+///
+/// Split out by C1 (#1862) so the SESSION can build the semantic form while
+/// the TERMINAL renders it — the two now happen on different threads.
+pub(crate) fn free_text_form(question: &str) -> InteractionDefinition {
     // C0a (#1856): the free-text form is an `InteractionDefinition` too, so
     // it renders through the ONE plain projection rather than through a
     // second type. Byte-identical to the actionless `Question` it replaces —
@@ -373,7 +378,7 @@ pub(crate) fn prompt_user_input(w: &PromptWindow, question: &str) -> io::Result<
     // body + note, exactly as before (`c0a::the_free_text_form_renders_
     // exactly_as_it_did`). The interaction MODEL is D0's to migrate; only
     // the rendering moved here.
-    let form = InteractionDefinition {
+    InteractionDefinition {
         note: Some(MODAL_CONTROL_HINT.into()),
         ..InteractionDefinition::new(
             InteractionKind::Prompt,
@@ -389,9 +394,48 @@ pub(crate) fn prompt_user_input(w: &PromptWindow, question: &str) -> io::Result<
                 requirement: Requirement::Required,
             }],
         )
-    };
-    let result =
-        read_prompt_window_line(w, &format!("{}\n{MODAL_INPUT_GLYPH}", plain::render(&form)))?;
+    }
+}
+
+/// **The terminal adapter** (C1, #1862): render one semantic interaction on
+/// the terminal and report what the operator did.
+///
+/// This is the ONLY place a `PromptWindow` is turned into a rendered prompt
+/// and a read. It runs on whichever thread owns the terminal — under the
+/// two-thread split that is the UI thread, never the session — and it renders
+/// through `markup::plain::render`, the one plain projection (C0a/C0b).
+///
+/// Pure of gate state on purpose: the Back/Exit CONTROL side effects
+/// (cancelling the turn, requesting exit) belong to the session, so this
+/// returns the typed outcome and the session applies them.
+pub(crate) fn present_on_terminal(
+    w: &PromptWindow,
+    interaction: &SurfaceInteraction,
+) -> HumanQuestionOutcome {
+    match read_interaction_line(w, interaction) {
+        // A submitted line (including an explicitly empty one) is an answer.
+        Ok(ModalLine::Line(answer)) => HumanQuestionOutcome::Answer(answer),
+        // EOF is the input stream closing — NOT an empty human answer.
+        Ok(ModalLine::Eof) => HumanQuestionOutcome::InputClosed,
+        Ok(ModalLine::Back) => HumanQuestionOutcome::Cancelled,
+        Ok(ModalLine::Exit) => HumanQuestionOutcome::ExitRequested,
+        // A read error is distinct from a missing operator.
+        Err(_) => HumanQuestionOutcome::InputFailed,
+    }
+}
+
+/// Render and read, with the slash-command back-out applied.
+fn read_interaction_line(
+    w: &PromptWindow,
+    interaction: &SurfaceInteraction,
+) -> io::Result<ModalLine> {
+    let result = read_prompt_window_line(
+        w,
+        &format!(
+            "{}\n{MODAL_INPUT_GLYPH}",
+            plain::render(&interaction.definition)
+        ),
+    )?;
     let ModalLine::Line(line) = &result else {
         return Ok(result);
     };
@@ -550,6 +594,18 @@ pub(crate) struct PromptPermissionGate<
     pub(crate) cancel: Option<&'a AtomicBool>,
     pub(crate) exit: Option<&'a AtomicBool>,
     pub(crate) ask_human: F,
+    /// **C1 (#1862): how this gate reaches the surface that owns the terminal.**
+    ///
+    /// `Some` under the two-thread split (`run_chat`): the session asks the UI
+    /// thread, which acquires the `PromptWindow`. `None` where the gate IS on
+    /// the terminal-owning thread — the single-threaded CLI entry points —
+    /// and may take it directly. Those are two situations, not two
+    /// implementations of one situation: the rendering and the read happen in
+    /// `present_on_terminal` either way.
+    ///
+    /// `&dyn Fn` rather than a second generic parameter, so adding the seam
+    /// does not propagate a type parameter through every construction site.
+    pub(crate) ask_surface: Option<&'a dyn Fn(&SurfaceInteraction) -> HumanQuestionOutcome>,
 }
 
 impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPermissionGate<'_, F> {
@@ -1178,29 +1234,41 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> newt_core:
     }
 
     fn ask_question(&mut self, question: &str) -> HumanQuestionOutcome {
-        // Blocking on the operator's decision surfaces to the cockpit through
-        // the lifecycle seam: `Terminal::suspend_for_prompt` routes through the
-        // tty arbiter, which emits Blocked/Unblocked. No surface-specific wiring.
-        let w = Terminal::suspend_for_prompt();
-        match prompt_user_input(&w, question) {
-            // A submitted line (including an explicitly empty one) is an answer.
-            Ok(ModalLine::Line(answer)) => HumanQuestionOutcome::Answer(answer),
-            // EOF is the input stream closing — NOT an empty human answer.
-            Ok(ModalLine::Eof) => HumanQuestionOutcome::InputClosed,
+        // C1 (#1862): the SESSION builds the semantic form; whichever surface
+        // owns the terminal renders and reads it. Previously this thread called
+        // `Terminal::suspend_for_prompt` itself — taking stdin and writing
+        // prompt bytes from the session thread, which is what
+        // `session_worker`'s law 1 ("a worker never writes terminal bytes")
+        // forbids and what the cockpit made observable.
+        //
+        // Blocking on the operator still surfaces to the cockpit through the
+        // tty arbiter's Blocked/Unblocked, because `suspend_for_prompt` still
+        // happens — just on the other side of the seam.
+        let interaction = SurfaceInteraction::blocking(free_text_form(question));
+        let outcome = match self.ask_surface {
+            Some(ask) => ask(&interaction),
+            None => {
+                let w = Terminal::suspend_for_prompt();
+                present_on_terminal(&w, &interaction)
+            }
+        };
+        // The CONTROL side effects are the session's, not the terminal's: only
+        // this side owns the turn's cancel/exit flags. `present_on_terminal`
+        // reports what happened and applies nothing.
+        match outcome {
             // Esc / slash-command back-out: cancel the turn, report Cancelled
-            // (never "headless"). `prompt_user_input` rewrites a slash command
-            // into `Back`, so a typed `/cmd` also lands here and backs out.
-            Ok(ModalLine::Back) => {
+            // (never "headless"). The adapter rewrites a typed `/cmd` into a
+            // back-out, so that lands here too.
+            HumanQuestionOutcome::Cancelled => {
                 self.apply_control(PromptChoice::Back);
                 HumanQuestionOutcome::Cancelled
             }
             // Ctrl-C / Ctrl-D: cancel the turn AND request exit.
-            Ok(ModalLine::Exit) => {
+            HumanQuestionOutcome::ExitRequested => {
                 self.apply_control(PromptChoice::Exit);
                 HumanQuestionOutcome::ExitRequested
             }
-            // A read error is distinct from a missing operator.
-            Err(_) => HumanQuestionOutcome::InputFailed,
+            other => other,
         }
     }
 }
@@ -1289,6 +1357,7 @@ mod permission_prompt_tests {
             cancel: None,
             exit: None,
             // Proof the TTY is bypassed when web decisions are on.
+            ask_surface: None,
             ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
                 panic!("the TTY must not be read when web decisions are enabled")
             },
@@ -1327,6 +1396,7 @@ mod permission_prompt_tests {
             web_decision_timeout: Duration::from_millis(50),
             cancel: None,
             exit: None,
+            ask_surface: None,
             ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
                 panic!("the TTY must not be read when web decisions are enabled")
             },
@@ -1365,6 +1435,7 @@ mod permission_prompt_tests {
             web_decision_timeout: Duration::from_millis(50),
             cancel: None,
             exit: None,
+            ask_surface: None,
             ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
                 panic!("the TTY must not be read when web decisions are enabled");
             },
@@ -1458,6 +1529,7 @@ mod permission_prompt_tests {
                 web_decision_timeout: $timeout,
                 cancel: $cancel,
                 exit: $exit,
+                ask_surface: None,
                 ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
                     panic!("run_web_wait must not read the TTY answer path")
                 },
@@ -1954,6 +2026,7 @@ mod permission_prompt_tests {
                 web_decision_timeout: Duration::from_secs(2),
                 cancel: None,
                 exit: None,
+                ask_surface: None,
                 ask_human: move |_w: &PromptWindow, _d: &InteractionDefinition| {
                     PromptChoice::AllowPermanent
                 },
@@ -1997,6 +2070,7 @@ mod permission_prompt_tests {
             web_decision_timeout: Duration::from_secs(2),
             cancel: None,
             exit: None,
+            ask_surface: None,
             ask_human: move |_w: &PromptWindow, _definition: &InteractionDefinition| {
                 prompts.set(prompts.get() + 1);
                 script.next().expect("script exhausted — unexpected prompt")
@@ -2320,6 +2394,7 @@ mod permission_prompt_tests {
                 web_decision_timeout: Duration::from_secs(2),
                 cancel: None,
                 exit: None,
+                ask_surface: None,
                 ask_human: move |_w: &PromptWindow, _d: &InteractionDefinition| {
                     script.next().expect("script exhausted")
                 },
@@ -2356,6 +2431,7 @@ mod permission_prompt_tests {
                 web_decision_timeout: Duration::from_secs(2),
                 cancel: None,
                 exit: None,
+                ask_surface: None,
                 ask_human: |_w: &PromptWindow, _d: &InteractionDefinition| {
                     panic!("must NOT prompt: target was permanently denied")
                 },
@@ -2429,6 +2505,7 @@ mod permission_prompt_tests {
                 web_decision_timeout: Duration::from_secs(2),
                 cancel: None,
                 exit: None,
+                ask_surface: None,
                 ask_human: move |_w: &PromptWindow, _d: &InteractionDefinition| {
                     script.next().expect("script exhausted")
                 },

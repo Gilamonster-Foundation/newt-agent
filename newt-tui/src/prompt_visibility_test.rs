@@ -135,6 +135,7 @@ fn prompt_scenario_child() {
                 web_decision_timeout: std::time::Duration::from_secs(30),
                 cancel: Some(cancel.as_ref()),
                 exit: Some(exit.as_ref()),
+                ask_surface: None,
                 ask_human: prompt_permission_choice,
             };
             let _decision = gate.ask(std::slice::from_ref(&request));
@@ -171,6 +172,7 @@ fn prompt_scenario_child() {
             web_decision_timeout: std::time::Duration::from_secs(2),
             cancel: None,
             exit: None,
+            ask_surface: None,
             ask_human: prompt_permission_choice,
         };
         let _decision = gate.ask(std::slice::from_ref(&request));

@@ -15043,6 +15043,7 @@ mod disable_ocap_session_tests {
         // record count IS the prompt count — zero after the exec call proves
         // the gate was never reached.
         let mut gate = PromptPermissionGate {
+            ask_surface: None,
             state: &mut state,
             base: caveats.clone(),
             key_path: None,
@@ -15098,6 +15099,7 @@ mod disable_ocap_session_tests {
         // fs prompting is unaffected: an out-of-fence read consults the gate
         // and the allow-once answer turns the denial into the real contents.
         let mut gate = PromptPermissionGate {
+            ask_surface: None,
             state: &mut state,
             base: caveats.clone(),
             key_path: None,
