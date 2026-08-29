@@ -307,6 +307,11 @@ const CATEGORIES: &[Category] = &[
             )
         },
         baseline: &[
+            // THE one table algorithm (D3a, #1874) — the destination, listed
+            // deliberately rather than named around the needle. A migrating
+            // family's row disappears from this table; this row is what it
+            // migrates ONTO, and it is the row that must stay at exactly 1.
+            ("newt-core/src/markup/table.rs", 1),
             ("newt-core/src/agentic/markdown/table.rs", 1),
             ("newt-eval/src/scorecard.rs", 1),
             ("newt-eval/src/pyo3_module.rs", 1),
