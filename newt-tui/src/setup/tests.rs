@@ -2696,14 +2696,97 @@ async fn preset_uses_an_exported_env_var_without_storing_anything() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let client = reqwest::Client::new();
-    // use exported?=<Enter: yes>, model=1
-    let mut console = ScriptedConsole::new(&["", "1"]);
+    // use exported?=y, model=1.
+    //
+    // D1b-2 (#1903): this said `""` — Enter — because `is_yes(&ans, true)`
+    // read blank as YES. Adopting a credential from the environment is a
+    // decision, and the wizard no longer makes it for the operator; see
+    // `an_empty_answer_does_not_adopt_the_exported_key` below.
+    let mut console = ScriptedConsole::new(&["y", "1"]);
     let (_cfg, backend, _pending) = configure_preset(&mut console, &client, &preset, &path)
         .await
         .unwrap();
     assert_eq!(backend.api_key_env.as_deref(), Some("NEWT_TEST_PRESET_KEY"));
     assert!(backend.api_key_file.is_none(), "env reference only");
     assert_eq!(backend.effective_model(), Some("env-model"));
+}
+
+/// **Regression (D1b-2, #1903): a blank answer does not adopt an exported
+/// credential.**
+///
+/// Before this slice the prompt was `"${var} is set in this shell. Use it?
+/// [Y/n] "` resolved by `is_yes(&ans, true)`, so BOTH an empty answer and
+/// every unrecognised word meant yes. Adopting a key from the environment is
+/// a decision — one with a security consequence, since the adopted key is
+/// what the backend then authenticates with — and the wizard no longer makes
+/// it for the operator. Blank re-asks, and an input with nothing left to give
+/// fails rather than choosing.
+// Mutates the process environment, so it shares the sibling's serial
+// lane (issue #514 / the #1872 env-race class): two tests setting and
+// restoring the same var in parallel see each other's writes.
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn an_empty_answer_does_not_adopt_the_exported_key() {
+    let _preset_env = EnvVarGuard::set("NEWT_TEST_PRESET_KEY", "sk-from-env");
+    let preset = ProviderPreset {
+        name: "envcloud".into(),
+        base_url: "http://127.0.0.1:1/v1".into(),
+        env_vars: vec!["NEWT_TEST_PRESET_KEY".into()],
+        ..Default::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    // An exhausted script answers "" forever — a short pipe.
+    let mut console = ScriptedConsole::new(&[]);
+    // `let Err(..) else` rather than `expect_err`: the success type contains
+    // `PendingWizardToken`, which deliberately has no `Debug` (it holds a
+    // key). Reaching for `expect_err` would mean deriving `Debug` on a
+    // secret-carrying record to satisfy a test, which is backwards.
+    let Err(err) = configure_preset(&mut console, &reqwest::Client::new(), &preset, &path).await
+    else {
+        panic!("a blank answer must not adopt the key");
+    };
+    assert!(
+        err.to_string().contains("no usable answer"),
+        "gave up rather than guessing: {err}"
+    );
+    assert!(
+        console.output.iter().any(|l| l.contains("answer y or n")),
+        "and said why: {:?}",
+        console.output
+    );
+}
+
+/// **The anti-vacuous twin.** If `decide` refused everything — or if the
+/// prompt never resolved at all — the test above would pass while the wizard
+/// became unusable. An explicit `n` must still be heard, and must take the
+/// paste branch rather than the env branch.
+// Mutates the process environment, so it shares the sibling's serial
+// lane (issue #514 / the #1872 env-race class): two tests setting and
+// restoring the same var in parallel see each other's writes.
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn an_explicit_no_declines_the_exported_key_and_asks_for_one() {
+    let _preset_env = EnvVarGuard::set("NEWT_TEST_PRESET_KEY", "sk-from-env");
+    let preset = ProviderPreset {
+        name: "envcloud".into(),
+        base_url: "http://127.0.0.1:1/v1".into(),
+        env_vars: vec!["NEWT_TEST_PRESET_KEY".into()],
+        ..Default::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    // n = do not use the exported key; then Enter skips the paste prompt.
+    let mut console = ScriptedConsole::new(&["n", ""]);
+    let _ = configure_preset(&mut console, &reqwest::Client::new(), &preset, &path).await;
+    assert!(
+        console
+            .output
+            .iter()
+            .any(|l| l.contains("export $NEWT_TEST_PRESET_KEY")),
+        "declining routed to the paste path, which skipped: {:?}",
+        console.output
+    );
 }
 
 /// Regression heir: the old plaintext writer used `var_os("HOME")?`, so

@@ -50,11 +50,13 @@ use crate::line_console::{is_yes, Console, StdinConsole};
 use newt_core::agent_identity::Secret;
 use newt_core::backend_probe::{EndpointProbeResult, GenerationCheck};
 use newt_core::config::Discovery;
+use newt_core::interaction_form::{self, NO, YES};
 use newt_core::provider_preset::{
     self, list_models_for_preset, preset_support,
     validate_authenticated_url as validate_authenticated_target, PresetSupport, ProviderPreset,
 };
 use newt_core::{BackendConfig, BackendKind, Config, EndpointKind, OpenAiApi, Tier};
+use newt_interaction::InteractionDefinition;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
@@ -698,6 +700,42 @@ enum BackendChoice {
     HostedProvider,
 }
 
+/// Consecutive unusable answers at one decision before setup gives up.
+const DECISION_ATTEMPTS: usize = 3;
+
+/// Ask a yes/no decision and re-ask an unusable answer rather than guessing.
+///
+/// **No advertised default, deliberately.** `is_yes(&ans, true)` — which both
+/// call sites used — read blank AND every unrecognised word as YES. D1a found
+/// that was not a style question: paired with a reader that returned `""` at
+/// EOF, a short pipe answered a write confirm on the operator's behalf.
+/// `interaction_form::confirm` offers `yes`/`no` as real options and
+/// advertises neither; `resolve_typed` refuses anything else.
+///
+/// Capped for the same reason `CrewForm` caps its retries: under a pipe an
+/// unusable answer is re-asked against the same exhausted input, so an
+/// uncapped loop is a hang. Giving up is an ERROR rather than a guess — these
+/// callers are deciding whether to adopt a credential or cancel setup, and
+/// neither may be chosen for them.
+///
+/// # Errors
+///
+/// The read failure, or a bail after [`DECISION_ATTEMPTS`] unusable answers.
+fn decide(console: &mut dyn Console, definition: &InteractionDefinition) -> anyhow::Result<bool> {
+    for _ in 0..DECISION_ATTEMPTS {
+        let answer = console.ask_definition(definition)?;
+        match interaction_form::resolve(definition, answer.trim())
+            .as_ref()
+            .map(newt_interaction::OptionId::as_str)
+        {
+            Some(YES) => return Ok(true),
+            Some(NO) => return Ok(false),
+            _ => console.say("  answer y or n"),
+        }
+    }
+    anyhow::bail!("no usable answer after {DECISION_ATTEMPTS} attempts")
+}
+
 fn choose_backend(console: &mut dyn Console) -> anyhow::Result<BackendChoice> {
     console.say("\nWhere does your model run?");
     console.say("  1) Ollama on this machine   (http://127.0.0.1:11434)");
@@ -723,7 +761,10 @@ async fn configure_ollama(
     client: &reqwest::Client,
 ) -> anyhow::Result<ConfiguredBackend> {
     let default_url = "http://127.0.0.1:11434";
-    let raw = console.ask(&format!("Ollama host [{default_url}]: "))?;
+    let raw = console.ask_definition(&interaction_form::text_field(
+        "Ollama host",
+        format!("[{default_url}] — Enter keeps it"),
+    ))?;
     let url = normalize_url(
         if raw.is_empty() { default_url } else { &raw },
         "http",
@@ -795,8 +836,10 @@ async fn configure_custom_host(
     config_path: &Path,
 ) -> anyhow::Result<ConfiguredBackend> {
     loop {
-        let raw = console
-            .ask("Host name or URL (e.g. gpu-box, 10.0.0.5:8000, https://llm.example.net): ")?;
+        let raw = console.ask_definition(&interaction_form::text_field(
+            "Host name or URL",
+            "e.g. gpu-box, 10.0.0.5:8000, https://llm.example.net",
+        ))?;
         let target = raw.trim().to_string();
         if target.is_empty() {
             console.say("  A host is required.");
@@ -978,7 +1021,10 @@ async fn manual_backend_entry(
     config_path: &Path,
 ) -> anyhow::Result<ConfiguredBackend> {
     let url = loop {
-        let raw = console.ask("Endpoint URL: ")?;
+        let raw = console.ask_definition(&interaction_form::text_field(
+            "Endpoint URL",
+            "e.g. http://host:8080",
+        ))?;
         if !raw.trim().is_empty() {
             let normalized = normalize_url(raw.trim(), "http", 11434);
             break candidate_endpoints(&normalized, &Discovery::default())?
@@ -1139,8 +1185,16 @@ async fn configure_preset(
                 .map(|v| (var.clone(), v))
         });
         if let Some((var, value)) = exported {
-            let ans = console.ask(&format!("${var} is set in this shell. Use it? [Y/n] "))?;
-            if is_yes(&ans, true) {
+            let use_it = decide(
+                console,
+                &interaction_form::confirm(
+                    format!("${var} is set in this shell. Use it?"),
+                    "",
+                    "yes, use it",
+                    "no, paste a key instead",
+                ),
+            )?;
+            if use_it {
                 // Record the var that actually resolved, not [0].
                 WizardCred {
                     api_key_env: Some(var),
@@ -1178,7 +1232,10 @@ async fn configure_preset(
                 0 => ask_model_name(console)?,
                 1 => {
                     let default = &preset.fallback_models[0];
-                    let raw = console.ask(&format!("Model name [{default}]: "))?;
+                    let raw = console.ask_definition(&interaction_form::text_field(
+                        "Model name",
+                        format!("[{default}] — Enter keeps it"),
+                    ))?;
                     if raw.trim().is_empty() {
                         default.clone()
                     } else {
@@ -1275,8 +1332,15 @@ async fn verify_key_with_retries(
                 if attempt + 1 == GENERATION_CHECK_ATTEMPTS {
                     break;
                 }
-                let ans = console.ask("Re-enter the key? [Y/n] ")?;
-                if !is_yes(&ans, true) {
+                if !decide(
+                    console,
+                    &interaction_form::confirm(
+                        "Re-enter the key?",
+                        "",
+                        "yes, re-enter it",
+                        "no, cancel setup",
+                    ),
+                )? {
                     anyhow::bail!("setup cancelled after authentication rejection");
                 }
                 cred = preset_pasted_key(console, preset, config_path)?;
