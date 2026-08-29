@@ -27,7 +27,7 @@
 
 use std::path::Path;
 
-use std::io::{IsTerminal as _, Write as _};
+use std::io::IsTerminal as _;
 
 use clap::Subcommand;
 use newt_core::dgx::{DgxConfig, DgxNode, EndpointKind};
@@ -631,12 +631,20 @@ fn setup(
     print!("{text}");
 
     if !yes {
-        print!("\nWrite? [y/N] ");
-        std::io::stdout().flush()?;
+        // Through the seal (#1909), like `ocap_cmd` and `dock_cmd`: the
+        // capability, not a flag. Since #1908 a protocol-mode process cannot
+        // obtain a speaking window at all, so `ask` errors here instead of
+        // printing a question onto a JSON-RPC wire and blocking for an answer
+        // that is never coming.
+        let window = newt_core::tty::Terminal::suspend_for_prompt();
+        window.ask("\nWrite? [y/N] ")?;
         let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if !matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-            println!("Aborted.");
+        // EOF is not consent. `read_line_into` reports it as `Ok(0)`, and a
+        // read ERROR is a different thing again — neither may be mistaken for
+        // a typed "y".
+        let read = window.read_line_into(&mut input)?;
+        if read == 0 || !matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            window.notice("Aborted.")?;
             return Ok(());
         }
     }
@@ -2440,11 +2448,21 @@ async fn adopt_cmd(
             println!("  node:   {live_kind} : {live_model}");
             let is_tty = std::io::stdin().is_terminal();
             let answer = if !adopt && !enforce && is_tty {
-                print!("Adopt the node's state into config [a], enforce config onto the node [e], or cancel [c]? ");
-                std::io::stdout().flush().ok();
+                // NOT a "press enter to continue" pause: this is a three-way
+                // choice whose answer `reconcile_action` consumes below. The
+                // `.ok()` this replaces discarded the io::Result, not the
+                // response — so a read ERROR arrived at the resolver as an
+                // empty line, indistinguishable from the operator pressing
+                // enter. Both land on `Report` (change nothing), so it was
+                // fail-closed but not honest. `None` now means "no answer",
+                // for either reason, and says so in one place.
+                let window = newt_core::tty::Terminal::suspend_for_prompt();
                 let mut line = String::new();
-                std::io::stdin().read_line(&mut line).ok();
-                Some(line)
+                window
+                    .ask("Adopt the node's state into config [a], enforce config onto the node [e], or cancel [c]? ")
+                    .and_then(|()| window.read_line_into(&mut line))
+                    .ok()
+                    .and_then(|read| (read > 0).then_some(line))
             } else {
                 None
             };

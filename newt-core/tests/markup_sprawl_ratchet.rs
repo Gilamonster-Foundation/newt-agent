@@ -372,6 +372,29 @@ const CATEGORIES: &[Category] = &[
             // `line_console` itself is still here.
             ("newt-cli/src/dock_cmd.rs", 3),
             ("newt-cli/src/ocap_cmd.rs", 1),
+            // ADDED BY #1909, and the justification the category header asks
+            // for. These five are NOT a new path. They are five prompts that
+            // were already outside the typed path and already owed a typed
+            // migration — they were merely counted in "direct blocking reads"
+            // instead, because they reached the operator through a raw
+            // `stdin().read_line` rather than through the seal.
+            //
+            // Routing them onto `PromptWindow` moved them between categories.
+            // The number of un-typed interactive sites is UNCHANGED; the
+            // number of unsanctioned stdin reads is five lower, and each one
+            // now inherits #1908's protocol-mode veto and the EOF-is-not-an-
+            // error distinction it cannot get from a bare `read_line`.
+            //
+            // Same shape as the D1b-0 note above: the ratchet cannot tell a
+            // migration BETWEEN categories from a new duplicate, and taking
+            // its advice literally in either direction misreports the work.
+            // The typed step (`ask_definition` / `InteractionDefinition`) is
+            // still owed on all five, and is the reason they are armed here
+            // rather than allowed to disappear.
+            ("newt-cli/src/dgx.rs", 2),
+            ("newt-cli/src/dgx_card.rs", 1),
+            ("newt-cli/src/mcp_probe_cmd.rs", 1),
+            ("newt-tui/src/lib.rs", 1),
             // The shared modal/prompt-window implementation itself — the
             // common path the other rows are duplicates BESIDE, pinned so the
             // shared layer does not quietly grow ask-shaped surface either.
@@ -425,12 +448,27 @@ const CATEGORIES: &[Category] = &[
             )
         },
         baseline: &[
+            // D1b-3's, with the `Console` retirement. Not this slice's.
             ("newt-tui/src/line_console.rs", 2),
+            // NOT MIGRATED, DELIBERATELY (#1909), and left COUNTED rather than
+            // moved so the decision stays visible and reversible.
+            //
+            // `lean_input::read_piped` is the lean input surface reading the
+            // operator's TURN when stdin is a pipe. Its twin `read_tty` is a
+            // raw-mode line editor that does not go through the window either:
+            // the two branches are ONE surface, a peer of `PromptWindow`
+            // rather than a caller of it. Routing only the piped branch
+            // through the seal would make the surface internally inconsistent,
+            // and routing both would mean rebuilding a raw-mode editor on a
+            // capability designed for one-line questions. The surface is also
+            // scheduled to move to wyvern-agent (CLAUDE.md, 2026-08-17), so
+            // this would relocate code across a crate boundary on its way out.
+            //
+            // `newt-tui/src/lib.rs`, `newt-cli/src/mcp_probe_cmd.rs`,
+            // `newt-cli/src/dgx_card.rs` and `newt-cli/src/dgx.rs` (2) were
+            // here until #1909 routed all five through
+            // `Terminal::suspend_for_prompt`.
             ("newt-tui/src/lean_input.rs", 1),
-            ("newt-tui/src/lib.rs", 1),
-            ("newt-cli/src/mcp_probe_cmd.rs", 1),
-            ("newt-cli/src/dgx_card.rs", 1),
-            ("newt-cli/src/dgx.rs", 2),
             // THE ONE SANCTIONED READ, and the rationale below is corrected to
             // say so (#1909). This is `PromptWindow::read_line_into`'s own
             // body — the seal's implementation, not something the seal is

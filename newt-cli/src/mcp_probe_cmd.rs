@@ -23,7 +23,7 @@
 //! `--json` stays machine-parseable.
 
 use std::collections::BTreeMap;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
@@ -428,10 +428,20 @@ fn confirm_or_bail(question: &str, action: &str, yes: bool) -> anyhow::Result<()
     if !io::stdin().is_terminal() {
         bail!("`newt mcp probe` needs confirmation on a terminal for {action}; pass --yes for non-interactive use");
     }
-    eprint!("{question} [Y/n] ");
-    io::stderr().flush()?;
+    // Through the seal (#1909). `consent_given` already takes the BYTE COUNT
+    // rather than just the string, which is the same EOF-is-not-an-answer
+    // distinction `read_line_into` documents — so the resolver is unchanged and
+    // only the transport moves.
+    //
+    // The question moves from stderr to the window, which writes stdout. That
+    // is the intentional diff: the seal owns one channel, and a question split
+    // across two of them cannot be arbitrated against the ephemeral rows the
+    // window just erased. The `is_terminal` bail above still fires first for
+    // the piped case, so nothing that used to reach stderr now goes missing.
+    let window = newt_core::tty::Terminal::suspend_for_prompt();
+    window.ask(&format!("{question} [Y/n] "))?;
     let mut buf = String::new();
-    let bytes_read = io::stdin().read_line(&mut buf)?;
+    let bytes_read = window.read_line_into(&mut buf)?;
     if consent_given(bytes_read, &buf) {
         Ok(())
     } else {
