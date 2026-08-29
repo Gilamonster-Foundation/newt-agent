@@ -83,6 +83,10 @@ pub mod pricing;
 /// The one lock over the process environment (#1850) — every newt writer of
 /// `NEWT_*` goes through it, production and tests alike.
 pub mod process_env;
+/// D2a (#1864): the typed progress/lifecycle contract and its
+/// renderer-neutral sink. Deliberately separate from the interaction
+/// request/reply path — a spinner tick is not an offer.
+pub mod progress;
 pub mod project_map;
 pub mod project_model;
 pub mod prompt;
