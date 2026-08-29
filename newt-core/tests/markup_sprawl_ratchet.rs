@@ -341,7 +341,13 @@ const CATEGORIES: &[Category] = &[
             )
         },
         baseline: &[
-            ("newt-tui/src/setup.rs", 23),
+            // D1b-0 (#1892) split `setup.rs` into `setup/{mod,commit,tests}.rs`.
+            // This row is REPOINTED, not lowered: all 23 sites moved intact to
+            // `mod.rs` (the extracted transaction engine has no console at
+            // all). The ratchet reported the old path as "Progress! Remove its
+            // baseline row" — it cannot tell a rename from a deletion, and
+            // taking that advice would have dropped a floor that never moved.
+            ("newt-tui/src/setup/mod.rs", 23),
             // D1a (#1885) ratcheted `newt-tui/src/crew_form.rs` off this
             // table entirely: its 7 `console.ask(` sites became one
             // `InteractionDefinition` state machine driven through C1's
@@ -684,8 +690,8 @@ fn action_model_registry_is_exact() {
         ("newt-core/src/tty/modal.rs", "PromptLine", 1),
         ("newt-core/src/sas_confirm.rs", "SasVerdict", 1),
         ("newt-tui/src/vi.rs", "Confirm", 1),
-        ("newt-tui/src/setup.rs", "BackendChoice", 1),
-        ("newt-tui/src/setup.rs", "HostedProviderChoice", 1),
+        ("newt-tui/src/setup/mod.rs", "BackendChoice", 1),
+        ("newt-tui/src/setup/mod.rs", "HostedProviderChoice", 1),
         ("newt-cli/src/dgx.rs", "ReconcileAction", 1),
     ];
     let root = workspace_root();
@@ -1785,11 +1791,18 @@ fn the_crew_form_carries_no_private_console_path() {
         "the line console module itself must survive D1a — setup.rs (D1b) \
          still uses it"
     );
+    // Keyed on the setup MODULE, not one path. D1b-0 (#1892) split
+    // `setup.rs` into `setup/{mod,commit,tests}.rs` and this assertion —
+    // written against the old path — failed by panicking on a missing index
+    // key. It did its job (it noticed), but it should notice a CONSOLE
+    // coming back, not a file being renamed. Both halves of the twin now
+    // name modules, matching the crew_form side above.
     assert!(
-        files["newt-tui/src/setup.rs"]
-            .squeezed
-            .contains("line_console"),
-        "the needle no longer matches a file that DOES use the line console \
-         — the guard above is passing vacuously"
+        files
+            .iter()
+            .any(|(path, code)| path.starts_with("newt-tui/src/setup")
+                && code.squeezed.contains("line_console")),
+        "the needle no longer matches the setup module, which DOES use the \
+         line console — the guard above is passing vacuously"
     );
 }
