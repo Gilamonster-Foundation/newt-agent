@@ -56,7 +56,8 @@
 //! | [`Notice`] emitted directly | `tty::widgets::notice` | [`Durable::Note`] with that same [`Level`] + glyph |
 //! | `Spinner` frames + stage labels | `tty::spinner` | [`Frame`] |
 //! | `Spinner` char/step counters | `tty::spinner` | [`Durable::Snapshot`] |
-//! | `TurnDriver` submit / poll-terminal / cancel | `agentic::driver` | [`Durable::Started`] / [`Durable::Finished`] |
+//! | `lifecycle::LifecycleEvent` turn facts | `newt_core::lifecycle` | [`Durable::Started`] / [`Durable::Finished`], via [`from_lifecycle`] |
+//! | `lifecycle::LifecycleEvent::Thinking` / `ToolActivity` | `newt_core::lifecycle` | [`Frame`] — a caller's choice, never automatic |
 //!
 //! Two rows are deliberately strict. A spinner's *stage label* is a [`Frame`]
 //! even though it changes rarely — it is view state, and "rarely" is not a
@@ -64,6 +65,19 @@
 //! spinner renders it inside an animated row: the same number is transient in
 //! the row and durable in scrollback, which is exactly the distinction this
 //! contract carries.
+//!
+//! # This does not compete with `lifecycle` — it reads from it
+//!
+//! `newt_core::lifecycle` already owns the vocabulary for what a turn is doing
+//! (`TurnStarted`, `TurnCompleted`, `TurnFailed`, `TurnCancelled`), with the
+//! same push/inline/unbuffered delivery, already emitted by `newt-tui` and
+//! already consumed by `herdr`. Publishing a second set of those facts would
+//! be the third abstraction D0's gate forbids — so [`from_lifecycle`] adapts
+//! the existing events instead, and nothing here emits.
+//!
+//! What this module adds is what `lifecycle` has no vocabulary for and should
+//! not grow one for: a [`Measure`] and its monotonicity, a [`Note`]'s level and
+//! glyph, [`Frame`]'s transience, and the commit boundary between them.
 //!
 //! # Push, synchronous, and unbuffered — on purpose
 //!
@@ -377,6 +391,63 @@ impl Scrollback {
     }
 }
 
+/// Translate an existing [`LifecycleEvent`] into the durable progress it
+/// implies, or `None` when it implies none.
+///
+/// **This is the dual-publish seam, and it is an adapter on purpose.**
+///
+/// `newt_core::lifecycle` already owns the vocabulary for what a turn is doing
+/// — `TurnStarted`, `TurnCompleted`, `TurnFailed`, `TurnCancelled` — with the
+/// same push/inline/unbuffered delivery this module chose, and `newt-tui`
+/// already emits it and `herdr` already consumes it. A first cut of D2a had
+/// `TurnDriver` publish its own `Started`/`Finished` beside all that, which is
+/// a **second vocabulary for facts that already have one** — exactly the third
+/// abstraction D0's deletion gate forbids. It was reverted.
+///
+/// So progress does not compete with the lifecycle seam; it reads from it. An
+/// integration subscribes where integrations already subscribe, maps through
+/// here, and feeds a [`ProgressSink`]. Nothing new emits, nothing changes what
+/// an existing observer sees, and the contract is still exercised by real
+/// events — which is what dual-publish is supposed to mean.
+///
+/// What this module adds *on top of* lifecycle is what lifecycle has no
+/// vocabulary for and should not grow one for: a [`Measure`] and its
+/// monotonicity, a [`Note`]'s level and glyph, [`Frame`]'s transience, and the
+/// commit boundary that separates the last two.
+///
+/// [`LifecycleEvent`]: crate::lifecycle::LifecycleEvent
+#[must_use]
+pub fn from_lifecycle(event: &crate::lifecycle::LifecycleEvent) -> Option<Durable> {
+    use crate::lifecycle::LifecycleEvent as L;
+    match event {
+        L::TurnStarted => Some(Durable::Started {
+            label: "turn".to_string(),
+        }),
+        L::TurnCompleted => Some(Durable::Finished(Outcome::Completed)),
+        L::TurnFailed { .. } => Some(Durable::Finished(Outcome::Failed)),
+        L::TurnCancelled => Some(Durable::Finished(Outcome::Cancelled)),
+        // Everything else is either session-scoped bookkeeping or a state a
+        // renderer shows transiently. `Thinking` and `ToolActivity` in
+        // particular are FRAME material, not durable: committing a line every
+        // time the agent starts thinking is the scrollback noise this contract
+        // exists to prevent. A caller that wants them animated builds a
+        // `Frame`; this adapter will not decide that for it.
+        L::SessionStarted { .. }
+        | L::Waiting
+        | L::Thinking
+        | L::ToolActivity { .. }
+        | L::Blocked
+        | L::Unblocked
+        | L::SessionEnded => None,
+        // Deliberately exhaustive, with no catch-all. `LifecycleEvent` is
+        // `#[non_exhaustive]`, but that binds only downstream crates — inside
+        // `newt-core` this match is total, so adding a variant BREAKS THE BUILD
+        // here and whoever adds it has to decide whether it is durable. A
+        // `_ => None` would have made every future variant silently transient,
+        // which is the wrong default to pick on someone else's behalf.
+    }
+}
+
 /// Recording a stream is itself a sink: this is the observation-only consumer
 /// D2a dual-publishes into.
 ///
@@ -614,6 +685,99 @@ mod tests {
             (*at, frame.label.as_str()),
             (9_999, "f9999"),
             "the coalescing sink keeps the NEWEST frame, not the oldest"
+        );
+    }
+
+    /// **Dual-publish by reuse.** The four turn facts that already have a
+    /// vocabulary map onto durable progress; nothing else does.
+    #[test]
+    fn the_lifecycle_seam_maps_onto_durable_progress() {
+        use crate::lifecycle::LifecycleEvent as L;
+        assert_eq!(
+            from_lifecycle(&L::TurnStarted),
+            Some(Durable::Started {
+                label: "turn".into()
+            })
+        );
+        assert_eq!(
+            from_lifecycle(&L::TurnCompleted),
+            Some(Durable::Finished(Outcome::Completed))
+        );
+        assert_eq!(
+            from_lifecycle(&L::TurnFailed { reason: None }),
+            Some(Durable::Finished(Outcome::Failed))
+        );
+        assert_eq!(
+            from_lifecycle(&L::TurnCancelled),
+            Some(Durable::Finished(Outcome::Cancelled))
+        );
+    }
+
+    /// The half that matters more: a high-rate or transient lifecycle state is
+    /// **not** durable. Committing a scrollback line every time the agent
+    /// starts thinking, or every tool call, is the noise this contract exists
+    /// to prevent — those are frame material, and this adapter refuses to
+    /// decide otherwise on a caller's behalf.
+    #[test]
+    fn transient_lifecycle_states_are_not_durable_progress() {
+        use crate::lifecycle::LifecycleEvent as L;
+        for e in [
+            L::Thinking,
+            L::ToolActivity {
+                tool: "run_command".into(),
+            },
+            L::Waiting,
+            L::Blocked,
+            L::Unblocked,
+            L::SessionStarted {
+                session_id: "s".into(),
+            },
+            L::SessionEnded,
+        ] {
+            assert_eq!(from_lifecycle(&e), None, "{e:?} must not commit");
+        }
+    }
+
+    /// End to end through the adapter: a real lifecycle stream, replayed into
+    /// a sink, commits the lifecycle story and nothing else — no line per
+    /// `Thinking`, no line per tool call.
+    #[test]
+    fn a_replayed_lifecycle_stream_commits_only_the_turn_story() {
+        use crate::lifecycle::LifecycleEvent as L;
+        let mut sb = Scrollback::new();
+        let stream = [
+            L::SessionStarted {
+                session_id: "s".into(),
+            },
+            L::TurnStarted,
+            L::Thinking,
+            L::ToolActivity {
+                tool: "read_file".into(),
+            },
+            L::Thinking,
+            L::ToolActivity {
+                tool: "edit_file".into(),
+            },
+            L::Blocked,
+            L::Unblocked,
+            L::Thinking,
+            L::TurnCompleted,
+            L::Waiting,
+        ];
+        for (i, e) in stream.iter().enumerate() {
+            if let Some(d) = from_lifecycle(e) {
+                sb.record(TASK, i as u64, &d);
+            }
+        }
+        assert_eq!(
+            sb.committed(),
+            &[
+                Commit::Started {
+                    label: "turn".into()
+                },
+                Commit::Finished(Outcome::Completed),
+            ],
+            "eleven lifecycle events, two committed lines"
         );
     }
 
