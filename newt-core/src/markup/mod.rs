@@ -81,6 +81,10 @@ pub mod plain;
 // fallback, refuse an unsupported REQUIRED control, never produce a response.
 // Unconditional for `plain`'s reasons — the wyvern tier is its main consumer.
 pub mod headless;
+// The ONE table algorithm (D3a, #1874): tabular data -> a GFM pipe table.
+// Unconditional for `plain`'s reasons, and it takes no Markdown dependency —
+// it PRODUCES Markdown source rather than parsing any.
+pub mod table;
 
 /// The envelope fence marker. Must open the document on its own line and
 /// close on its own line.

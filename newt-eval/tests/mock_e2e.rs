@@ -92,7 +92,6 @@ async fn all_bundled_cases_pass_in_mock_mode() {
                 Scorecard {
                     cases: vec![cs.clone()],
                 }
-                .render_table()
             );
             eprintln!(
                 "[{}] worker captured diff was:\n{}",
@@ -102,7 +101,7 @@ async fn all_bundled_cases_pass_in_mock_mode() {
         scorecard.push(cs);
     }
 
-    let table = scorecard.render_table();
+    let table = scorecard.to_string();
     println!("\n{table}");
     assert!(
         scorecard.all_passed(),

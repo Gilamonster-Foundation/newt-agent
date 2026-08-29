@@ -39,8 +39,14 @@ pub fn str_width(s: &str) -> usize {
 /// display must show the FULL command/path so the operator can audit exactly
 /// what ran — truncating a `grep … | grep …` with `…` hid it. Wraps on
 /// whitespace when possible; a single token longer than `width` is hard-split
-/// so nothing is ever dropped. Width counted in `char`s (this path is ASCII
-/// commands/paths). Returns at least one line (possibly empty for empty input).
+/// so nothing is ever dropped.
+///
+/// Width is counted in display CELLS, like the rest of this module. It counted
+/// `char`s until D3a (#1874) — a second metric inside the module that claims
+/// the title, logged as such by the A0 inventory (§4.2.2). For the ASCII
+/// commands and paths this was written for a cell IS a char, so those wraps are
+/// byte-unmoved; see `wrap_line_is_byte_identical_for_ascii`. Returns at least
+/// one line (possibly empty for empty input).
 pub fn wrap_line(s: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
@@ -48,7 +54,7 @@ pub fn wrap_line(s: &str, width: usize) -> Vec<String> {
         let mut cur = String::new();
         let mut cur_len = 0usize;
         for word in logical.split_inclusive(' ') {
-            let wlen = word.chars().count();
+            let wlen = str_width(word);
             if cur_len + wlen > width && cur_len > 0 {
                 lines.push(std::mem::take(&mut cur));
                 cur_len = 0;
@@ -56,12 +62,17 @@ pub fn wrap_line(s: &str, width: usize) -> Vec<String> {
             // A single word wider than the line: hard-split it so nothing is lost.
             if wlen > width {
                 for ch in word.chars() {
-                    if cur_len == width {
+                    let cw = ch_width(ch);
+                    // `cur_len > 0` keeps a char wider than the whole budget
+                    // from flushing an empty line ahead of itself. For ASCII
+                    // this is exactly the old `cur_len == width`, since a cell
+                    // is a char and `cur_len` never passes `width`.
+                    if cur_len + cw > width && cur_len > 0 {
                         lines.push(std::mem::take(&mut cur));
                         cur_len = 0;
                     }
                     cur.push(ch);
-                    cur_len += 1;
+                    cur_len += cw;
                 }
             } else {
                 cur.push_str(word);
@@ -75,7 +86,51 @@ pub fn wrap_line(s: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ch_width, str_width};
+    use super::{ch_width, str_width, wrap_line};
+
+    /// **The twin for the cell migration.** For ASCII a cell IS a char, so
+    /// every path this function was actually written for — commands, paths,
+    /// prose — must be byte-unmoved. These goldens were captured from the
+    /// char-counting implementation BEFORE the change, over the shapes its
+    /// own doc comment names.
+    #[test]
+    fn wrap_line_is_byte_identical_for_ascii() {
+        assert_eq!(
+            wrap_line("cargo build --release", 11),
+            ["cargo ", "build ", "--release"]
+        );
+        assert_eq!(
+            wrap_line("grep -rn foo /very/long/path/that/keeps/going", 20),
+            ["grep -rn foo ", "/very/long/path/that", "/keeps/going"]
+        );
+        assert_eq!(
+            wrap_line("aaaaaaaaaaaaaaaaaaaaaaaaa", 10),
+            ["aaaaaaaaaa", "aaaaaaaaaa", "aaaaa"]
+        );
+        assert_eq!(wrap_line("a\nb", 40), ["a", "b"]);
+        assert_eq!(wrap_line("", 5), [""]);
+        assert_eq!(
+            wrap_line("one two three four", 9),
+            ["one two ", "three ", "four"]
+        );
+    }
+
+    /// The module is titled "the ONE width model" and `wrap_line` counted
+    /// CHARS — the A0 inventory logged it as a separate metric living inside
+    /// the module that claims the title (§4.2.2). Four ideographs are 4 chars
+    /// and **8 cells**: the char rule emitted one 8-cell line for a 4-column
+    /// budget, overflowing every caller that trusted the width.
+    #[test]
+    fn wrap_line_wraps_by_cells_not_chars() {
+        assert_eq!(wrap_line("日本語版", 4), ["日本", "語版"]);
+    }
+
+    /// A combining mark occupies no cell, so it rides along with its base
+    /// rather than forcing a break — the char rule counted it as one column.
+    #[test]
+    fn a_combining_mark_costs_no_column() {
+        assert_eq!(wrap_line("e\u{0301}xy", 3), ["e\u{0301}xy"]);
+    }
 
     /// The reason the promotion is worth doing at all: a `char` count and a
     /// byte count both get this wrong (2 and 6 respectively), and every width
