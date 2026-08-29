@@ -204,10 +204,33 @@ pub fn acquire_lock(lock_path: &Path) -> anyhow::Result<LockGuard> {
             lock_path.display()
         );
     }
-    anyhow::bail!(
-        "could not acquire {} — another live process appears to be writing it; try again",
-        lock_path.display()
-    )
+    anyhow::bail!("could not acquire {} — {CONTENDED}", lock_path.display())
+}
+
+/// The refusal [`acquire_lock`] returns when another LIVE owner holds the lock
+/// and the retry budget ran out.
+///
+/// One constant, so the message a human reads and the predicate a caller
+/// branches on cannot drift apart.
+const CONTENDED: &str = "another live process appears to be writing it; try again";
+
+/// Whether `error` is [`acquire_lock`] reporting CONTENTION — the one failure
+/// it invites the caller to retry.
+///
+/// Until #1871 "try again" was advice in PROSE. A caller that wanted to act on
+/// it had to match the message itself, so none did, and the test that most
+/// needed to — six concurrent approvals racing one lock — `unwrap()`ed instead.
+/// That made a correctly serialized refusal indistinguishable from a lost
+/// update, which is the whole of that flake: the registry was right and the
+/// assertion was wrong.
+///
+/// Deliberately NOT true for the permission-denied refusal. That one is a
+/// misconfigured lock directory; retrying it just fails slower.
+#[must_use]
+pub fn is_lock_contended(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains(CONTENDED))
 }
 
 /// Attempt one stale-generation takeover while holding a kernel advisory lock
@@ -686,6 +709,49 @@ pub fn unique_suffix() -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// **The twin for [`is_lock_contended`] (#1871).**
+    ///
+    /// The positive case is produced END TO END — the lock is really held and
+    /// a second thread really runs `acquire_lock` to exhaustion. Nothing here
+    /// writes the message by hand: a predicate checked against a hand-copied
+    /// copy of the string it matches would pass no matter how far the two had
+    /// drifted, which is the failure this whole slice is about.
+    ///
+    /// The negative cases are the discriminating half. "Did `acquire_lock`
+    /// fail?" is NOT the question — the permission refusal is also a failure
+    /// from the same function, and retrying it just fails slower.
+    ///
+    /// Costs the full retry budget (~2s) by construction: exhausting it is the
+    /// event under test.
+    #[test]
+    fn contention_is_recognised_and_nothing_else_is() {
+        let dir = TempDir::new().unwrap();
+        let lock = dir.path().join("peers.toml.lock");
+        let _held = acquire_lock(&lock).expect("take the lock");
+
+        let refused = std::thread::scope(|scope| {
+            scope
+                .spawn(|| acquire_lock(&lock).expect_err("the lock is held"))
+                .join()
+                .expect("probe thread")
+        });
+        assert!(
+            is_lock_contended(&refused),
+            "a live holder must read as retryable contention: {refused:#}"
+        );
+
+        assert!(
+            !is_lock_contended(&anyhow::anyhow!(
+                "could not acquire /x — permission denied; check the lock directory permissions"
+            )),
+            "a permission refusal is not retryable — the predicate must not \
+             simply mean `acquire_lock failed`"
+        );
+        assert!(!is_lock_contended(&anyhow::anyhow!(
+            "no space left on device"
+        )));
+    }
 
     #[test]
     fn atomic_write_replaces_and_leaves_no_tmp() {
