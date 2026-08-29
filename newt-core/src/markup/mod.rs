@@ -73,6 +73,12 @@ pub mod dialect;
 /// a block's source is never lost. Compiled unconditionally — the lean and
 /// headless tiers present source only, and that IS the contract's floor.
 pub mod extension;
+// C2 (#1876): a renderer-neutral SPAN projection of the same canonical
+// dialect, for views that can style. Gated with `dialect` because it is built
+// on the one parser; the plain projection below stays unconditional and is
+// the fallback whenever this is unavailable or a view cannot use it.
+#[cfg(feature = "markdown")]
+pub mod spans;
 // UNCONDITIONAL, like `tty::widgets`: the canonical plain projection is what
 // the wyvern/lean tier falls back to, so it must survive
 // `--no-default-features`. It takes no Markdown dependency (C0a, #1856).
