@@ -342,7 +342,11 @@ const CATEGORIES: &[Category] = &[
         },
         baseline: &[
             ("newt-tui/src/setup.rs", 23),
-            ("newt-tui/src/crew_form.rs", 7),
+            // D1a (#1885) ratcheted `newt-tui/src/crew_form.rs` off this
+            // table entirely: its 7 `console.ask(` sites became one
+            // `InteractionDefinition` state machine driven through C1's
+            // `SurfaceInteraction` seam. `setup.rs` is D1b's, which is why
+            // `line_console` itself is still here.
             ("newt-cli/src/dock_cmd.rs", 3),
             ("newt-cli/src/ocap_cmd.rs", 1),
             // The shared modal/prompt-window implementation itself — the
@@ -1735,4 +1739,57 @@ mod d3b {
             );
         }
     }
+}
+
+/// **D1a (#1885): the crew form asks through the semantic seam, and only it.**
+///
+/// The flow used to be parameterised over `line_console::Console` — a private
+/// ask/say I/O path that could only ever reach a cooked terminal. It is now
+/// `InteractionDefinition` state driven through `SurfaceInteraction`, so the
+/// same form renders on the plain projection and the rich TUI without a
+/// form-specific implementation of either.
+///
+/// Keyed on the whole `crew_form` module rather than one file: the slice
+/// split it into `mod.rs` + `state.rs`, and a gate that named the old path
+/// would have reported success while the console came back next door.
+#[test]
+fn the_crew_form_carries_no_private_console_path() {
+    let files = production_code();
+    let crew: Vec<&String> = files
+        .keys()
+        .filter(|p| p.starts_with("newt-tui/src/crew_form"))
+        .collect();
+    assert!(
+        crew.len() >= 2,
+        "expected the crew_form module's files, found {crew:?}"
+    );
+    for path in &crew {
+        assert!(
+            !files[*path].squeezed.contains("line_console"),
+            "{path} reaches for the line console again — the crew form asks \
+             through SurfaceInteraction (C1) and nothing else"
+        );
+    }
+
+    // ANTI-VACUOUS TWIN. Two ways this guard could pass while proving
+    // nothing, both closed here:
+    //
+    // 1. The needle finds nothing anywhere (a typo, a renamed module). It
+    //    must still fire where the console genuinely IS used.
+    // 2. `line_console` was DELETED rather than retired from this flow.
+    //    D1a's scope is the crew form; `setup.rs` still needs the module and
+    //    is D1b's to migrate, so removing it here would be out of scope AND
+    //    would make the assertion above trivially true.
+    assert!(
+        files.contains_key("newt-tui/src/line_console.rs"),
+        "the line console module itself must survive D1a — setup.rs (D1b) \
+         still uses it"
+    );
+    assert!(
+        files["newt-tui/src/setup.rs"]
+            .squeezed
+            .contains("line_console"),
+        "the needle no longer matches a file that DOES use the line console \
+         — the guard above is passing vacuously"
+    );
 }
