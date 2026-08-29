@@ -21,10 +21,34 @@ pub const DEFINITION_SCHEMA_V1: &str = "newt.interaction.definition/v1";
 #[non_exhaustive]
 pub enum InteractionKind {
     /// Pick one of a fixed, displayed set — today's `Question<A>`.
+    ///
+    /// Not a two-option yes/no: that is [`InteractionKind::Confirm`].
     Choice,
     /// Free text.
     Prompt,
-    /// A yes/no decision.
+    // WHY THIS EXISTS BESIDE `Choice`, and why the boundary is enforced
+    // (#1912). A `//` comment, not a doc comment, DELIBERATELY: these docs are
+    // rendered into `schema/definition.schema.json` by schemars and read by
+    // non-Rust consumers, so the published description should state the
+    // contract and not this repo's incident history.
+    //
+    // Until the guard existed, the tree declared the same decision-shaped
+    // interaction under both kinds — `agentic::tools`'s mutation confirm and
+    // `interaction_adapter` and the permission builder as `Choice`,
+    // `interaction_form::confirm` as `Confirm`. C0c was the first slice to try
+    // to vary behaviour by the kind and had to go unconditional instead.
+    //
+    // `Confirm` is NOT redundant with `Choice`: a lone `ControlKind::Toggle`
+    // is a yes/no, and `Choice` means "pick one of a fixed, DISPLAYED set",
+    // which a toggle has none of. Two shapes, one intent, and the kind is what
+    // unifies them. See `InteractionDefinition::is_decision_shaped` for which
+    // direction is enforceable and why the other is not.
+    /// A yes/no decision — proceed or not.
+    ///
+    /// Carried either by a single toggle, or by one choice control offering
+    /// exactly two options where one grants and the other refuses or backs
+    /// out. The distinction from [`InteractionKind::Choice`] is the ROLES the
+    /// options carry, never how many there are.
     Confirm,
     /// A multi-field form.
     Form,
@@ -274,11 +298,68 @@ pub struct InteractionDefinition {
     pub note: Option<String>,
 }
 
+/// Whether `controls` can ONLY be a binary decision — see
+/// [`InteractionDefinition::is_decision_shaped`], which delegates here.
+///
+/// Free-standing so a caller that is still ASSEMBLING a definition can pick
+/// the kind from the controls it has just built, without duplicating the rule.
+/// `interaction_adapter` is that caller: it converts a legacy `Question` whose
+/// action count it does not know in advance, and hardcoding a kind there is
+/// what made the adapter emit decision-shaped definitions labelled `Choice`
+/// (#1912). One rule, two callers, and the guard in
+/// [`InteractionDefinition::new`] holds them to it.
+#[must_use]
+pub fn controls_are_decision_shaped(controls: &[Control]) -> bool {
+    let [control] = controls else {
+        return false;
+    };
+    let ControlKind::Choice { options } = &control.kind else {
+        return false;
+    };
+    let [a, b] = options.as_slice() else {
+        return false;
+    };
+    let decides = |r: SemanticRole| matches!(r, SemanticRole::Deny | SemanticRole::Cancel);
+    (a.role == SemanticRole::Allow && decides(b.role))
+        || (b.role == SemanticRole::Allow && decides(a.role))
+}
+
 impl InteractionDefinition {
+    /// Whether this definition can ONLY be a binary decision: one
+    /// [`ControlKind::Choice`] control offering exactly two options, one
+    /// granting and the other refusing or backing out.
+    ///
+    /// Keys on [`SemanticRole`], never on the option count. `Allow` + `Deny`
+    /// is a decision, `Allow` + `Cancel` is a decision that offers a way out,
+    /// and `Value` + `Value` is a two-way pick and not a decision at all.
+    ///
+    /// **Deliberately narrower than "is a yes/no", and the gap is the point.**
+    /// A lone [`ControlKind::Toggle`] is also a yes/no — and it is the case
+    /// that settles #1912, because [`InteractionKind::Choice`] means "pick one
+    /// of a fixed, DISPLAYED set" and a toggle displays no set, so `Choice`
+    /// cannot describe it and `Confirm` is not redundant with it.
+    ///
+    /// But a lone toggle is ALSO a one-field form — "remember this? [ ]" — and
+    /// nothing in the shape says which. So the toggle case is admitted by
+    /// [`InteractionKind::Confirm`] and never *required* of it. This predicate
+    /// reports only what a shape can prove, which is why the guard in
+    /// [`InteractionDefinition::new`] enforces one direction and not both.
+    #[must_use]
+    pub fn is_decision_shaped(&self) -> bool {
+        controls_are_decision_shaped(&self.controls)
+    }
+
+    /// Whether a lone [`ControlKind::Toggle`] carries this definition — the
+    /// other shape [`InteractionKind::Confirm`] may take.
+    #[must_use]
+    fn is_lone_toggle(&self) -> bool {
+        matches!(self.controls.as_slice(), [c] if matches!(c.kind, ControlKind::Toggle))
+    }
+
     /// Build a definition carrying the current schema tag.
     #[must_use]
     pub fn new(kind: InteractionKind, markdown: impl Into<String>, controls: Vec<Control>) -> Self {
-        Self {
+        let built = Self {
             schema: crate::tag::DefinitionTag,
             kind,
             revision: Revision::FIRST,
@@ -286,7 +367,46 @@ impl InteractionDefinition {
             controls,
             features: Vec::new(),
             note: None,
-        }
+        };
+        // **THE GUARD (#1912).** A doc comment saying "use Confirm for yes/no"
+        // is not a guard — that is exactly what the tree had, and it drifted
+        // in the one direction nobody was watching. This fires in every debug
+        // build, so a SECOND constructor cannot reintroduce the ambiguity
+        // without a test going red the first time it runs.
+        //
+        // `debug_assert` rather than a `Result`: the pairing is a property of
+        // the code that constructs the definition, fixable at the call site
+        // and never at runtime. Making `new` fallible would push a
+        // `.expect()` onto ~15 infallible call sites to catch a bug none of
+        // them can have in production.
+        // The direction #1912 is about: a decision-shaped definition declared
+        // as anything else is the ambiguity itself.
+        debug_assert!(
+            !built.is_decision_shaped() || kind == InteractionKind::Confirm,
+            "a binary decision — one Toggle, or one Choice control offering \
+             two options where one grants and the other refuses — is \
+             InteractionKind::Confirm. See that variant's doc. Got kind \
+             {kind:?} for controls {:?}",
+            built.controls
+        );
+        // And the converse, SCOPED TO DEFINITIONS THAT HAVE CONTROLS. The
+        // unscoped form looked tidier and was wrong: it fired immediately on
+        // control-less `Confirm` fixtures across four newt-interaction tests,
+        // which are building a definition to exercise something else and are
+        // not claiming a shape at all. Policing an empty definition's kind is
+        // not this guard's business; policing a populated one that is NOT a
+        // yes/no still is — a five-option `Confirm` is mislabelled too.
+        debug_assert!(
+            kind != InteractionKind::Confirm
+                || built.controls.is_empty()
+                || built.is_decision_shaped()
+                || built.is_lone_toggle(),
+            "InteractionKind::Confirm carries a binary decision (a Toggle, or \
+             two options one of which grants) or no controls at all; got \
+             controls {:?}",
+            built.controls
+        );
+        built
     }
 
     /// This definition's identity, which is also its exact form digest.

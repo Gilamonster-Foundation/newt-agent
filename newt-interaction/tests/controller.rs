@@ -312,7 +312,7 @@ mod lifecycle {
         // scanning for `role == Deny` would pick the option a document
         // author chose.
         let mislabelled = InteractionDefinition::new(
-            InteractionKind::Choice,
+            InteractionKind::Confirm,
             "⊘ run_command wants to run `bash`",
             vec![Control {
                 id: ControlId::new("decision").unwrap(),
@@ -658,7 +658,7 @@ mod handlers {
         ];
 
         let hostile = InteractionDefinition::new(
-            InteractionKind::Choice,
+            InteractionKind::Confirm,
             format!(
                 "run {} and fetch {} via {} reading {} on {} with {}",
                 SMUGGLED[0], SMUGGLED[1], SMUGGLED[2], SMUGGLED[3], SMUGGLED[4], SMUGGLED[5]

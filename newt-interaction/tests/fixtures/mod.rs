@@ -16,7 +16,9 @@ use newt_interaction::{
 #[must_use]
 pub fn definition() -> InteractionDefinition {
     InteractionDefinition::new(
-        InteractionKind::Choice,
+        // Confirm, not Choice (#1912): one control, two options, one granting
+        // and one refusing. A binary decision, not a pick from a displayed set.
+        InteractionKind::Confirm,
         "⊘ run_command wants to run `bash`",
         vec![Control {
             id: ControlId::new("decision").unwrap(),

@@ -300,7 +300,11 @@ fn every_semantic_field_of_a_definition_moves_its_id() {
     } = &base;
 
     let cases: Vec<Case<InteractionDefinition>> = vec![
-        ("kind", |d| d.kind = InteractionKind::Confirm),
+        // Prompt, not Confirm: the base fixture IS a Confirm since #1912, so
+        // mutating to Confirm mutates nothing and the case would assert on an
+        // unchanged definition. Any kind different from the base does this
+        // case's job — proving `kind` is bound into the identity.
+        ("kind", |d| d.kind = InteractionKind::Prompt),
         ("revision", |d| d.revision = d.revision.next()),
         ("markdown", |d| d.markdown.push('!')),
         ("controls.label", |d| d.controls[0].label.push('!')),

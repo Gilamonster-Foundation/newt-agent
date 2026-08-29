@@ -238,7 +238,7 @@
       "description": "What kind of interaction this is. The kind is semantic, never a renderer choice: `modal` is a view decision (ADR C1), not a kind.",
       "oneOf": [
         {
-          "description": "Pick one of a fixed, displayed set — today's `Question<A>`.",
+          "description": "Pick one of a fixed, displayed set — today's `Question<A>`.\n\nNot a two-option yes/no: that is [`InteractionKind::Confirm`].",
           "type": "string",
           "enum": [
             "choice"
@@ -252,7 +252,7 @@
           ]
         },
         {
-          "description": "A yes/no decision.",
+          "description": "A yes/no decision — proceed or not.\n\nCarried either by a single toggle, or by one choice control offering exactly two options where one grants and the other refuses or backs out. The distinction from [`InteractionKind::Choice`] is the ROLES the options carry, never how many there are.",
           "type": "string",
           "enum": [
             "confirm"
