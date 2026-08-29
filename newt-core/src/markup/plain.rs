@@ -33,10 +33,10 @@
 //!    is byte-identity or it is nothing.
 //! 2. `definition.note` — the subordinate line (control hint, danger
 //!    warning). Itself possibly multi-line; emitted verbatim.
-//! 3. One choices line per [`ControlKind::Choice`] control: each option
+//! 3. One line per option of each [`ControlKind::Choice`] control: each
 //!    rendered as `label` with the FIRST occurrence of its `key` bracketed
-//!    (`allow once` + key `a` ⇒ `[a]llow once`), options joined by THREE
-//!    spaces.
+//!    (`allow once` + key `a` ⇒ `[a]llow once`). C0c (#1907) gave every
+//!    option its own line; they used to share one, joined by three spaces.
 //!
 //! Aliases are never rendered — they are hidden parse affordances, and
 //! rendering one would advertise an input that the displayed set does not
@@ -60,8 +60,27 @@
 
 use newt_interaction::{ChoiceOption, Control, ControlKind, InteractionDefinition};
 
-/// Options on one choices line are separated by three spaces.
-const CHOICE_SEPARATOR: &str = "   ";
+/// **Each option gets its own line** (C0c, #1907).
+///
+/// Options used to be joined by three spaces onto one row. That was written
+/// for a short permission menu and did not survive contact with a variable
+/// list: `newt setup`'s endpoint and provider pickers carry ten or more
+/// options, and its backend menu carries three labels with URLs in them.
+///
+/// It did not really survive the permission menu either. Six options at
+/// **130 display columns** wrap on any terminal narrower than that — which is
+/// most of them — and they wrap *mid-option*: at 80 columns the break lands
+/// inside `[d]eny (default)`, tearing the fail-closed choice of the most
+/// security-sensitive prompt in the product across a line boundary with no
+/// alignment. The frozen bytes preserved that; they did not prevent it.
+///
+/// **Unconditional, and that is the point.** Every conditional rule
+/// considered was either a cliff or read a field that must not decide
+/// behaviour — see this module's `c0c` tests and the PR that introduced
+/// them. A rule that changes layout when a label crosses N characters means
+/// one more character silently renders a different prompt, and nothing fails
+/// at the moment it happens.
+const CHOICE_SEPARATOR: &str = "\n";
 
 /// Render `definition` as canonical plain text.
 ///
@@ -108,7 +127,7 @@ pub fn render(definition: &InteractionDefinition) -> String {
 /// bytes. `c0b::an_unlabelled_control_adds_no_line` pins it.
 fn control_line(control: &Control) -> Option<String> {
     match &control.kind {
-        ControlKind::Choice { options } => Some(choices_line(options)),
+        ControlKind::Choice { options } => Some(choice_lines(options)),
         ControlKind::Text => labelled_field(control, ""),
         // `[y/n]`, never `[y/N]`. The house style elsewhere
         // (`sas_confirm::confirm_prompt`) capitalizes the default, and this
@@ -130,8 +149,8 @@ fn labelled_field(control: &Control, suffix: &str) -> Option<String> {
     (!control.label.is_empty()).then(|| format!("{}:{suffix}", control.label))
 }
 
-/// One control's options as a single line.
-fn choices_line(options: &[ChoiceOption]) -> String {
+/// One control's options, one per line.
+fn choice_lines(options: &[ChoiceOption]) -> String {
     options
         .iter()
         .map(bracket_key)
@@ -161,13 +180,13 @@ fn bracket_key(option: &ChoiceOption) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use newt_interaction::{
         Control, ControlId, InteractionKind, OptionId, Requirement, SemanticRole,
     };
 
-    fn option(id: &str, key: &str, label: &str) -> ChoiceOption {
+    pub(super) fn option(id: &str, key: &str, label: &str) -> ChoiceOption {
         ChoiceOption {
             id: OptionId::new(id).expect("valid option id"),
             role: SemanticRole::Allow,
@@ -177,7 +196,7 @@ mod tests {
         }
     }
 
-    fn choice(options: Vec<ChoiceOption>) -> Control {
+    pub(super) fn choice(options: Vec<ChoiceOption>) -> Control {
         Control {
             id: ControlId::new("decision").expect("valid control id"),
             kind: ControlKind::Choice { options },
@@ -186,7 +205,7 @@ mod tests {
         }
     }
 
-    fn definition(controls: Vec<Control>) -> InteractionDefinition {
+    pub(super) fn definition(controls: Vec<Control>) -> InteractionDefinition {
         InteractionDefinition::new(InteractionKind::Choice, "body", controls)
     }
 
@@ -197,7 +216,7 @@ mod tests {
             option("deny", "d", "deny (default)"),
         ])]);
         d.note = Some("hint".to_string());
-        assert_eq!(render(&d), "body\nhint\n[a]llow once   [d]eny (default)");
+        assert_eq!(render(&d), "body\nhint\n[a]llow once\n[d]eny (default)");
     }
 
     #[test]
@@ -238,15 +257,19 @@ mod tests {
         assert_eq!(render(&d), "body");
     }
 
+    /// **C0c (#1907): every option gets its own line.** This test used to be
+    /// `options_are_separated_by_exactly_three_spaces` and asserted
+    /// `"body\n[a]a   [b]b   [c]c"`. The change is deliberate and is
+    /// documented with its old and new bytes in the amendment commit.
     #[test]
-    fn options_are_separated_by_exactly_three_spaces() {
+    fn options_get_one_line_each() {
         let d = definition(vec![choice(vec![
             option("a", "a", "aa"),
             option("b", "b", "bb"),
             option("c", "c", "cc"),
         ])]);
-        assert_eq!(render(&d), "body\n[a]a   [b]b   [c]c");
-        assert_eq!(CHOICE_SEPARATOR.len(), 3);
+        assert_eq!(render(&d), "body\n[a]a\n[b]b\n[c]c");
+        assert_eq!(CHOICE_SEPARATOR, "\n");
     }
 
     #[test]
@@ -398,7 +421,7 @@ mod c0b {
                         "",
                     )],
                 ),
-                "pick one\n[a]llow once   [d]eny",
+                "pick one\n[a]llow once\n[d]eny",
             ),
             (
                 InteractionKind::Prompt,
@@ -526,5 +549,119 @@ mod c0b {
         assert!(out.contains("[y/n]"), "{out}");
         assert!(!out.contains("[y/N]"), "a default was advertised: {out}");
         assert!(!out.contains("[Y/n]"), "a default was advertised: {out}");
+    }
+}
+
+/// **C0c (#1907): one option per line, unconditionally.**
+///
+/// The rule is uniform because every conditional version considered was
+/// either a cliff or read a field that must not decide layout. Those are
+/// design arguments; these are the assertions that keep the code matching
+/// them.
+#[cfg(test)]
+mod c0c {
+    use super::render;
+    use super::tests::{choice, definition, option};
+
+    fn menu(labels: &[&str]) -> String {
+        let options = labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let key = (b'1' + u8::try_from(i).expect("small")) as char;
+                option(
+                    &key.to_string(),
+                    &key.to_string(),
+                    &format!("{key} {label}"),
+                )
+            })
+            .collect();
+        render(&definition(vec![choice(options)]))
+    }
+
+    /// **No size makes the layout join.** Two short options and nine long
+    /// ones project the same way, so there is no count and no label length at
+    /// which the rendering silently becomes something else.
+    ///
+    /// This is the assertion that distinguishes C0c's rule from the width
+    /// threshold rejected in #1906: a threshold is defined by the value at
+    /// which it flips, and this has none to test.
+    #[test]
+    fn the_rule_is_unconditional_and_has_no_threshold() {
+        let short = menu(&["a", "b"]);
+        assert_eq!(short, "body\n[1] a\n[2] b");
+
+        let long = menu(&[
+            "Ollama on this machine (http://127.0.0.1:11434)",
+            "Custom host or URL (llama.cpp, vLLM, a gateway)",
+            "A hosted provider (OpenAI, Anthropic, OpenRouter, NVIDIA)",
+            "d",
+            "e",
+            "f",
+            "g",
+            "h",
+            "i",
+        ]);
+        assert_eq!(long.lines().count(), 10, "body plus one line per option");
+        assert!(
+            long.lines().skip(1).all(|l| l.starts_with('[')),
+            "each option starts its own line: {long}"
+        );
+    }
+
+    /// **The anti-vacuous twin.** Every assertion above is satisfied by a
+    /// renderer that emits one line per option — and also by one that emits
+    /// nothing but the body, since `lines().skip(1)` over an empty tail is
+    /// vacuously all-`starts_with`. So: the option count must actually drive
+    /// the line count, and the old joined form must be distinguishable from
+    /// the new one rather than merely absent.
+    #[test]
+    fn the_option_count_drives_the_line_count() {
+        for n in 1..6 {
+            let labels: Vec<String> = (0..n).map(|i| format!("opt{i}")).collect();
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            assert_eq!(
+                menu(&refs).lines().count(),
+                n + 1,
+                "{n} options must render {n} lines under the body"
+            );
+        }
+        // The shape this replaced is genuinely different, not a formatting
+        // nicety: joined-on-one-line and one-per-line disagree byte for byte.
+        let rendered = menu(&["a", "b"]);
+        assert_ne!(rendered, "body\n[1] a   [2] b");
+        assert!(!rendered.contains("   "), "no three-space join survives");
+    }
+
+    /// **The defect the frozen bytes preserved.** Six options at 130 display
+    /// columns wrap on any narrower terminal, and at 80 the break lands
+    /// inside `[d]eny (default)` — tearing the fail-closed choice of the
+    /// permission prompt across a line boundary. Each option now owns a line,
+    /// so no option can be split by a terminal narrower than itself.
+    #[test]
+    fn no_option_is_torn_by_a_narrow_terminal() {
+        let rendered = render(&definition(vec![choice(vec![
+            option("allow-once", "a", "allow once"),
+            option("session-allow", "s", "session allow"),
+            option(
+                "allow-permanent",
+                "A",
+                "Allow permanently (adds host to config)",
+            ),
+            option("deny", "d", "deny (default)"),
+            option("deny-always", "D", "Deny always"),
+            option("deny-permanent", "P", "Permanently deny"),
+        ])]));
+        assert_eq!(rendered.lines().count(), 7, "body plus six options");
+        assert!(
+            rendered.lines().any(|l| l == "[d]eny (default)"),
+            "the fail-closed option is whole, on its own line: {rendered}"
+        );
+        // The widest option is 41 columns, so every line fits a terminal that
+        // could not fit the old 130-column row.
+        assert!(
+            rendered.lines().skip(1).all(|l| l.chars().count() <= 41),
+            "no option line exceeds the widest option: {rendered}"
+        );
     }
 }

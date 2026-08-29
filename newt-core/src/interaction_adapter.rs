@@ -10,8 +10,10 @@
 //! # The shape
 //!
 //! A `Question<A>` is a prompt plus `Vec<Action>` — ONE question offering N
-//! mutually-exclusive actions, which A0's frozen golden renders as a single
-//! line: `[a]llow once   [s]ession allow   [d]eny (default)`. Under A2.1's
+//! mutually-exclusive actions, rendered one per line
+//! (`[a]llow once` / `[s]ession allow` / `[d]eny (default)`). A0's golden
+//! joined them onto a single row until C0c (#1907) gave each its own. Under
+//! A2.1's
 //! model that is exactly ONE [`Control`] of kind
 //! [`ControlKind::Choice`], with one [`ChoiceOption`] per action and the
 //! action's meaning carried on the option.
