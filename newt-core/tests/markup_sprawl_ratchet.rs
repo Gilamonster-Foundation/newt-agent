@@ -152,11 +152,38 @@ const CATEGORIES: &[Category] = &[
             // and the second independent Markdown option matrix"), not a
             // rendering slice's.
             //
-            // So this row goes to 0 in C3. Reaching 0 in C0a would have
-            // meant rewriting the web card — which is the other half of
-            // the sprawl this ratchet exists to make visible, and gaming
-            // the needle instead would be the vacuous-green shape the
-            // header warns about.
+            // **CORRECTION (C3c, #1867): this row does NOT go to 0 in C3,
+            // and the belief that it would was inherited twice.**
+            //
+            // C3c deleted `PendingOffer::question` and both web consumers —
+            // the card and the verdict decode now read the
+            // `InteractionDefinition` directly, which IS C3's named deletion
+            // gate and is done. The row still cannot move, because what it
+            // counts is the `Question{` literal at
+            // `interaction_adapter.rs:185`, inside `definition_to_question`,
+            // and that function still has PRODUCTION callers in newt-tui:
+            //
+            //   newt-tui/src/permissions.rs:350  `decode_answer`
+            //   newt-tui/src/permissions.rs:620  `await_web_decision`
+            //
+            // (Verified against origin/main 46b43321 with this crate's own
+            // brace-depth `#[cfg(test)]` rule, not by eye — `:267` is a third
+            // hit and IS test-only, which is exactly the kind of miscount that
+            // produced the claim above.)
+            //
+            // The sentence "C0a removed BOTH terminal callers" was therefore
+            // wrong when it was written. `decode_answer` deliberately round
+            // trips, and its own doc says why: "a second decoder written
+            // against `InteractionDefinition` would be a third answer-parsing
+            // implementation — the exact sprawl this epic exists to delete."
+            // That reasoning is sound, so the row is held open by a CORRECT
+            // design decision, not by a missed deletion.
+            //
+            // This row goes to 0 when the terminal decode moves onto the
+            // controller — D-family work, not C3's. Until then it stays at 1.
+            // Editing the baseline to match a slice's expectation, rather than
+            // editing the code to match the baseline, is the failure mode the
+            // whole mechanism exists to prevent.
             //
             // CORRECTION (B0a): an earlier comment here claimed B0 would
             // delete "the two rows above". That was wrong on both counts —
