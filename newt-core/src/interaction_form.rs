@@ -144,6 +144,58 @@ pub fn confirm(
     }
 }
 
+/// A numbered menu: pick one of N displayed entries.
+///
+/// Each entry is `(key, text)` and renders as `[key] text` on its own line —
+/// C0c (#1907) gave every option a line, which is what made this builder
+/// possible at all. Joined onto one row, a ten-endpoint picker was unreadable
+/// and a three-option backend menu with URLs in it ran to ~180 columns.
+///
+/// The caller supplies the keys rather than having them generated, because
+/// the numbering is part of what the operator sees and not every menu starts
+/// at 1: the hosted-provider picker offers `0` for "I have a URL". A
+/// generated sequence would have needed a second entry point for that, or a
+/// flag, and the caller already knows.
+///
+/// The label carries its own key (`"1 Ollama on this machine"`), because
+/// `markup::plain` brackets the FIRST occurrence of the key IN the label. An
+/// entry whose text does not contain its key would render no bracket and
+/// advertise an accelerator the operator cannot see, so the builder puts it
+/// there rather than trusting the caller to.
+///
+/// Every option carries [`SemanticRole::Value`]: a menu supplies a value, it
+/// does not decide. Nothing reads that role — it is what the option MEANS,
+/// and A3 keeps role out of behaviour — but recording it wrongly would
+/// mislabel the whole menu on any surface that shows meaning.
+#[must_use]
+pub fn menu(
+    body: impl Into<String>,
+    hint: impl Into<String>,
+    entries: &[(&str, &str)],
+) -> InteractionDefinition {
+    let options = entries
+        .iter()
+        .filter_map(|(key, text)| {
+            Some(ChoiceOption {
+                id: OptionId::new(*key).ok()?,
+                role: SemanticRole::Value,
+                label: format!("{key} {text}"),
+                key: (*key).to_string(),
+                aliases: Vec::new(),
+            })
+        })
+        .collect();
+    let hint = hint.into();
+    InteractionDefinition {
+        note: (!hint.is_empty()).then_some(hint),
+        ..InteractionDefinition::new(
+            InteractionKind::Choice,
+            body,
+            vec![field(ControlKind::Choice { options })],
+        )
+    }
+}
+
 /// Resolve a typed answer against a single-field definition's options.
 ///
 /// A thin, honest convenience over [`newt_interaction::binding::resolve_typed`]
@@ -170,7 +222,7 @@ pub fn resolve(definition: &InteractionDefinition, answer: &str) -> Option<Optio
 
 #[cfg(test)]
 mod d1b2 {
-    use super::{confirm, resolve, secret_field, text_field, FIELD_CONTROL, NO, YES};
+    use super::{confirm, menu, resolve, secret_field, text_field, FIELD_CONTROL, NO, YES};
     use crate::markup::plain;
     use newt_interaction::{ControlKind, InteractionKind, Requirement};
 
@@ -243,6 +295,80 @@ mod d1b2 {
         // ...and it DOES find something when a choice is present, so the two
         // negatives above are real.
         assert!(resolve(&confirm("Use it?", "", "yes", "no"), "y").is_some());
+    }
+
+    /// A menu renders one entry per line, each advertising its accelerator.
+    #[test]
+    fn a_menu_shows_every_entry_with_its_key_bracketed() {
+        let d = menu(
+            "Where does your model run?",
+            "",
+            &[
+                ("1", "Ollama on this machine (http://127.0.0.1:11434)"),
+                ("2", "Custom host or URL"),
+                ("3", "A hosted provider"),
+            ],
+        );
+        assert_eq!(
+            plain::render(&d),
+            "Where does your model run?\n\
+             [1] Ollama on this machine (http://127.0.0.1:11434)\n\
+             [2] Custom host or URL\n\
+             [3] A hosted provider"
+        );
+        assert_eq!(d.kind, InteractionKind::Choice);
+    }
+
+    /// A menu need not start at 1 — the hosted-provider picker offers `0`
+    /// for "I have a URL" — and double-digit keys resolve unambiguously
+    /// against their single-digit prefixes.
+    #[test]
+    fn menu_keys_are_the_callers_and_resolve_exactly() {
+        let entries: Vec<(String, String)> = (0..12)
+            .map(|i| (i.to_string(), format!("entry {i}")))
+            .collect();
+        let refs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let d = menu("pick", "", &refs);
+        assert_eq!(plain::render(&d).lines().count(), 13, "body plus 12");
+        for key in ["0", "1", "9", "10", "11"] {
+            assert_eq!(
+                resolve(&d, key)
+                    .as_ref()
+                    .map(newt_interaction::OptionId::as_str),
+                Some(key),
+                "{key} must resolve to exactly its own entry"
+            );
+        }
+        // Nothing offered resolves to nothing — the caller re-asks or
+        // applies its own displayed default.
+        for miss in ["", "12", "x", " "] {
+            assert!(resolve(&d, miss).is_none(), "{miss:?}");
+        }
+    }
+
+    /// **The anti-vacuous twin for the menu.** `a_menu_shows_every_entry...`
+    /// is an equality against a hand-written string, which passes if the
+    /// builder and the expectation are wrong in the same way. This asserts
+    /// the properties independently: every entry appears, every key is
+    /// bracketed, and the count is driven by the input.
+    #[test]
+    fn every_menu_entry_reaches_the_operator() {
+        let entries = [("1", "alpha"), ("2", "beta"), ("3", "gamma")];
+        let rendered = plain::render(&menu("pick", "", &entries));
+        for (key, text) in entries {
+            assert!(
+                rendered.contains(&format!("[{key}] {text}")),
+                "{key}/{text} missing from {rendered}"
+            );
+        }
+        assert_eq!(rendered.lines().count(), entries.len() + 1);
+        // An entry whose key is not a valid option id is DROPPED rather than
+        // silently mislabelled; nothing in this tree passes one, and the
+        // count above is what would catch it if something started to.
+        assert_eq!(plain::render(&menu("pick", "", &[])), "pick");
     }
 
     /// A secret field says it is one, and carries nowhere to put a value.
