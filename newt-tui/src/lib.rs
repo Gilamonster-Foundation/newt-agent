@@ -101,6 +101,11 @@ mod workspace_state;
 // and headless/wyvern builds never compile it in — newt stays amphibious.
 #[cfg(feature = "rich-tui")]
 mod rich_input;
+/// #1898 — the PTY acceptance proof that a rich TURN hands back BOTH raw mode
+/// and bracketed paste on every exit path, panic included. #1411 had recorded
+/// this site as safe; it was safe against the error path only.
+#[cfg(all(test, unix, feature = "rich-tui"))]
+mod rich_input_pty_test;
 // The harness config panel (#14) — a severable, TTY-only overlay for the psyche
 // operator dials. Gated with the other rich TTY surfaces so wyvern/lean strip it.
 #[cfg(feature = "rich-tui")]
@@ -460,6 +465,23 @@ impl<F: FnMut()> Drop for RestoreOnDrop<F> {
 /// panic did the same. Of the three crossterm raw-mode pairs in this crate this
 /// was the only one with no guard at all (`lean_input::RawGuard` has one;
 /// `rich_input::read_turn` avoids `?` around its event loop).
+///
+/// **CORRECTION (#1898).** That last clearance was wrong, and it stood for
+/// long enough to matter. "Avoids `?` around its event loop" is true and
+/// covers the ERROR path only — a PANIC inside `event_loop` unwound past both
+/// `DisableBracketedPaste` and `disable_raw_mode()`. `read_turn` now owns
+/// `rich_input::RawPasteGuard`, which restores both from `Drop`.
+///
+/// The lesson is about this comment, not that function: a site recorded as
+/// SAFE is worse than one nobody has looked at, because nobody looks twice.
+/// The audit that found it (#1897) re-read every raw-mode pair in the
+/// workspace rather than trusting this list. As of #1898 every pair is
+/// Drop-guarded: `SplashScreenGuard`, `lean_input::RawGuard`,
+/// `line_console::RawGuard`, `newt_core::tty::modal::RawGuard`,
+/// `transcript_pager::AltScreenGuard`, `interaction_view::InlineGuard`,
+/// `config_panel::PanelRawGuard` (both panels, #1889),
+/// `rich_input::RawPasteGuard`, and `cockpit/presenter` via `RestoreOnDrop`.
+///
 /// Per the repo's "make the bug unrepresentable" rule, the fix is ownership
 /// rather than another restore call: the terminal cannot be taken without
 /// binding something that gives it back.
