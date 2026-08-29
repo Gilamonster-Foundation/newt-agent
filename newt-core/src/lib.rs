@@ -256,6 +256,16 @@ pub use session::SessionId;
 // every other protocol type.
 pub use interaction_offer::{OfferDanger, PendingOffer};
 pub use newt_interaction::Audience;
+/// Re-exported for the views that PROJECT a definition rather than adapt it.
+///
+/// `Audience` has been re-exported here since B0b for exactly this reason:
+/// newt-web is a view, and a view reads the semantic model. C3c (#1867) adds
+/// `ControlKind` because the web card now renders an offer's options straight
+/// from its `InteractionDefinition` instead of round-tripping it back into a
+/// legacy `Question`. Re-exporting beside `Audience` keeps one import path in
+/// the consumer; reaching past `newt-core` for half the vocabulary and through
+/// it for the other half is how two spellings of the same model start.
+pub use newt_interaction::ControlKind;
 pub use store::{
     sanitize_fts5_query, AnswerOutcome, ClaimOutcome, ConversationStore, InjectOutcome,
     InjectedPrompt, LivenessFn, Roadmap, RoadmapSummary, SearchHit, StoredOwner, Verdict,

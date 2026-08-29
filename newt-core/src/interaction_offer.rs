@@ -31,7 +31,6 @@
 //! validated against the offer that was actually published — the
 //! cross-process bound B0b-1 explicitly did not carry.
 
-use anyhow::Context;
 use rusqlite::{OptionalExtension, TransactionBehavior};
 
 use newt_interaction::{Audience, InteractionDefinition, InteractionInstance, Lifecycle, Response};
@@ -104,22 +103,6 @@ impl PendingOffer {
     /// A deserialization failure.
     pub fn instance(&self) -> serde_json::Result<InteractionInstance> {
         serde_json::from_str(&self.instance_json)
-    }
-
-    /// The legacy typed form, for rendering.
-    ///
-    /// Goes through the A2.2 adapter — the same call both surfaces render
-    /// through since B0a — so a renderer sees exactly the bytes it saw
-    /// before this transport existed.
-    ///
-    /// # Errors
-    ///
-    /// A deserialization failure, or a definition the adapter cannot
-    /// express.
-    pub fn question(&self) -> anyhow::Result<crate::Question<PermissionAction>> {
-        let definition = self.definition().context("offer definition")?;
-        crate::interaction_adapter::definition_to_question(&definition)
-            .map_err(|e| anyhow::anyhow!("offer is not an adapted definition: {e}"))
     }
 }
 

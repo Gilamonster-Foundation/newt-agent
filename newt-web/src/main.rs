@@ -419,19 +419,44 @@ fn classify_decision(
     request_id: &str,
     submitted: &str,
 ) -> Result<DecideOutcome, ()> {
-    let Some(pending) = store
+    // Is the offer this answer names still the live one? A stale card whose
+    // offer the terminal already resolved must LOSE here rather than be
+    // handed to the store, so the browser is told 409 and not 204 (#1536).
+    // The store would refuse it too; this is what makes the refusal legible
+    // as a lost race rather than an invalid action.
+    if store
         .pending_interaction_offer(conv)
         .map_err(|_| ())?
         .filter(|p| p.instance_id == request_id)
-    else {
+        .is_none()
+    {
         return Ok(DecideOutcome::NoLiveRequest);
-    };
-    // `Question::parse` still DECODES the submitted string — aliases and
-    // ambiguity denial are presentation rules and stayed put (B0b-1). What
-    // authorizes the decoded action is `answer_interaction_offer`, against
-    // the offer as PUBLISHED.
-    let question = pending.question().map_err(|_| ())?;
-    let Some(action) = question.parse(submitted) else {
+    }
+    // C3c (#1867): name the action, and let the STORE decide whether it was
+    // offered.
+    //
+    // This used to reconstruct a `Question` and call `Question::parse` — a
+    // SECOND opinion on a question `answer_interaction_offer` already answers
+    // authoritatively. That call runs `interaction_gate::authorized_response`
+    // → the one `newt_interaction::validate_response`, with
+    // `permission_registry(Audience::Web)`, inside its own immediate
+    // transaction and before the CAS. Membership, audience scoping (the web is
+    // registered for no durable grant), digest and revision binding, the
+    // workspace fence and expiry are all decided there. Removing the web's
+    // pre-check deletes a duplicate, not a check.
+    //
+    // `action_for_option` is the shared wire-name table B0b-1 made public for
+    // exactly this ("the interaction gate resolves an accepted option back to
+    // the action it authorizes, and a second copy of this table would be the
+    // duplication this epic deletes"). It is a lookup, not a parser: there is
+    // deliberately no third answer-validation implementation here.
+    //
+    // NARROWING, stated: `Question::parse` also matched an action's hotkey
+    // (`a`) and its aliases — affordances for a terminal, where a keystroke is
+    // the input. Every button this surface renders carries the full wire id,
+    // so a hotkey could only arrive from something that was not our form.
+    // `c3c::the_web_answers_by_wire_id_and_not_by_hotkey` pins that.
+    let Some(action) = newt_core::interaction_adapter::action_for_option(submitted) else {
         return Ok(DecideOutcome::Unparsable);
     };
     Ok(DecideOutcome::Resolved(
@@ -2731,6 +2756,160 @@ mod tests {
                 StatusCode::NO_CONTENT,
                 "a dock inject carries no Origin and no cookie by design"
             );
+            clear_web_env();
+        }
+    }
+
+    /// **C3c (#1867): the decode path, with the duplicate membership
+    /// test deleted.**
+    mod c3c {
+        use super::*;
+
+        /// **An unoffered action is refused by the STORE, not by a web
+        /// pre-check.**
+        ///
+        /// C3c deletes the web's own membership test. That is a deletion of a
+        /// DUPLICATE, not of a check: `answer_interaction_offer` runs
+        /// `interaction_gate::authorized_response` — the one
+        /// `newt_interaction::validate_response` — against the offer as
+        /// PUBLISHED, inside its own immediate transaction, before the CAS.
+        /// The web's `Question::parse` was a second opinion on a question the
+        /// store already answers authoritatively.
+        ///
+        /// This pins that removing it changed nothing an attacker can reach:
+        /// a hand-crafted POST naming a high-danger session grant is still
+        /// refused, still with 400, and the offer is still pending afterwards.
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_unoffered_action_is_refused_by_the_store_not_a_web_precheck() {
+            let state = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            let app = app();
+            let (store, conv, rid) =
+                seed_followed_pending_decision(&app, state.path(), ws.path()).await;
+            let (_, page_headers, _) = full(&app, "GET", "/", &[], None).await;
+            let token = csrf_of(&page_headers);
+
+            // `allow_session` is a real PermissionAction wire name, so it
+            // survives the shared action table — the store is what refuses it,
+            // because a HIGH-danger offer never registered it for this
+            // audience.
+            let (status, _, _) = full(
+                &app,
+                "POST",
+                "/agents/1/decision",
+                &[
+                    ("origin", "http://127.0.0.1:8880"),
+                    ("host", "127.0.0.1:8880"),
+                    ("cookie", &format!("newt_csrf={token}")),
+                    ("hx-request", "true"),
+                ],
+                Some(&format!(
+                    "csrf={token}&request_id={rid}&verdict=allow_session"
+                )),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "an action the offer never published must be refused"
+            );
+            assert!(
+                store.pending_interaction_offer(&conv).unwrap().is_some(),
+                "a refused action must leave the offer PENDING — otherwise the \
+                 refusal consumed the operator's decision"
+            );
+            assert_eq!(
+                store.take_interaction_decision(&conv, &rid).unwrap(),
+                None,
+                "and it must record no authorization"
+            );
+
+            // Anti-vacuous: the same route DOES accept an offered action, so
+            // the refusal above is about membership and not about the route
+            // being broken.
+            let (status, _, _) = full(
+                &app,
+                "POST",
+                "/agents/1/decision",
+                &[
+                    ("origin", "http://127.0.0.1:8880"),
+                    ("host", "127.0.0.1:8880"),
+                    ("cookie", &format!("newt_csrf={token}")),
+                    ("hx-request", "true"),
+                ],
+                Some(&format!("csrf={token}&request_id={rid}&verdict=allow_once")),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::NO_CONTENT,
+                "an offered action is accepted"
+            );
+            assert_eq!(
+                store.take_interaction_decision(&conv, &rid).unwrap(),
+                Some(newt_core::PermissionAction::AllowOnce)
+            );
+            clear_web_env();
+        }
+
+        /// **The web answers with the wire ids it rendered, and nothing else.**
+        ///
+        /// A deliberate, stated NARROWING. `Question::parse` also matched an
+        /// action's single-character HOTKEY (`a`, `d`) and its aliases —
+        /// presentation affordances for a terminal, where a keystroke is the
+        /// input. A browser has no keystroke to submit: every button this
+        /// surface renders carries the option's full wire id as its value, so
+        /// a hotkey could only ever arrive from something that was not our
+        /// form.
+        ///
+        /// Accepting only what was rendered is the tighter contract, and it is
+        /// the one the store enforces anyway.
+        #[serial_test::serial(newt_web_env)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_web_answers_by_wire_id_and_not_by_hotkey() {
+            let state = tempfile::tempdir().unwrap();
+            let ws = tempfile::tempdir().unwrap();
+            let app = app();
+            let (store, conv, rid) =
+                seed_followed_pending_decision(&app, state.path(), ws.path()).await;
+            let (_, page_headers, _) = full(&app, "GET", "/", &[], None).await;
+            let token = csrf_of(&page_headers);
+            let answer = |verdict: &str| {
+                let (token, app) = (token.clone(), app.clone());
+                let body = format!("csrf={token}&request_id={rid}&verdict={verdict}");
+                async move {
+                    full(
+                        &app,
+                        "POST",
+                        "/agents/1/decision",
+                        &[
+                            ("origin", "http://127.0.0.1:8880"),
+                            ("host", "127.0.0.1:8880"),
+                            ("cookie", &format!("newt_csrf={token}")),
+                            ("hx-request", "true"),
+                        ],
+                        Some(&body),
+                    )
+                    .await
+                    .0
+                }
+            };
+
+            // The hotkey the terminal would accept is not an answer here.
+            assert_eq!(answer("a").await, StatusCode::BAD_REQUEST, "hotkey refused");
+            assert_eq!(answer("").await, StatusCode::BAD_REQUEST, "empty refused");
+            assert_eq!(
+                answer("banana").await,
+                StatusCode::BAD_REQUEST,
+                "nonsense refused"
+            );
+            assert!(
+                store.pending_interaction_offer(&conv).unwrap().is_some(),
+                "none of those may consume the offer"
+            );
+            // The wire id it rendered IS.
+            assert_eq!(answer("allow_once").await, StatusCode::NO_CONTENT);
             clear_web_env();
         }
     }
