@@ -120,6 +120,10 @@
 //!
 //! [`Notice`]: crate::tty::widgets::Notice
 
+pub mod collector;
+
+pub use collector::{collect_all, collect_session, LifecycleCollector, TURN_TASK};
+
 use crate::tty::widgets::Level;
 
 /// Which unit of work an event is about.
@@ -631,8 +635,11 @@ mod tests {
             concat!("Frame)", " -> Option<Commit>"),
         ];
         for (name, src) in [
-            ("progress.rs", include_str!("progress.rs")),
-            ("tty/progress_sink.rs", include_str!("tty/progress_sink.rs")),
+            ("progress/mod.rs", include_str!("mod.rs")),
+            (
+                "tty/progress_sink.rs",
+                include_str!("../tty/progress_sink.rs"),
+            ),
         ] {
             for needle in forbidden {
                 assert!(
