@@ -124,6 +124,8 @@ pub mod collector;
 
 pub use collector::{collect_all, collect_session, LifecycleCollector, TURN_TASK};
 
+use std::time::Duration;
+
 use crate::tty::widgets::Level;
 
 /// Which unit of work an event is about.
@@ -195,25 +197,72 @@ pub struct Note {
     pub text: String,
 }
 
-/// **Transient view state.** One tick of animation.
+/// **Transient view state.** One tick of work, as measurable facts.
 ///
 /// This type is the scrollback boundary. It has no conversion to [`Commit`],
 /// [`Scrollback::offer`] will not accept it, and nothing in this module or its
 /// renderer can turn one into a committed line. A spinner frame in an
 /// operator's history is a defect, so the defect is not representable.
+///
+/// # Facts, not a rendering (D2b, #1895)
+///
+/// A frame carries **what is true**, never how it looks. It does not carry a
+/// formatted line and it does not carry a glyph index, and both omissions are
+/// load-bearing:
+///
+/// - **No formatted string.** Fitting text presumes a column count, and a
+///   producer cannot fit a line for a surface it does not know. The web surface
+///   has no columns; a terminal that resizes mid-turn cannot re-fit a string it
+///   was handed. The next consumer would have to re-parse a rendering to
+///   recover what it meant, which is the sprawl this epic deletes. `markup::spans`
+///   already settled this shape one layer up: it emits emphasis ROLES and
+///   deliberately not styles, because mapping a role onto a style belongs to
+///   whichever view is drawing.
+/// - **No glyph index.** The glyph cycle *is* the animation, and the epic's rule
+///   is that transient animation stays view state. A producer that emitted which
+///   glyph would put the animation in the producer, force its cadence on every
+///   consumer, and foreclose a view that would rather show a bar, a percentage,
+///   or nothing. **The view cycles its own glyph off its own clock.**
+///
+/// The view composes these facts and fits them through the ONE width model
+/// ([`crate::tty::width`]).
+///
+/// [`elapsed`](Self::elapsed) is a [`Duration`], never a rendered `"3.2s"`, and
+/// it is supplied by the producer — this module still reads no clock.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
-    /// What the ephemeral row should currently read.
+    /// What is happening, e.g. `"compressing context…"`.
     pub label: String,
+    /// How long this unit of work has been running.
+    pub elapsed: Duration,
+    /// Units of progress observed so far — the spinner's `· N chars` tail.
+    /// `0` means "nothing produced yet", which a view may render as absence.
+    pub units: u64,
 }
 
 impl Frame {
-    /// A frame showing `label`.
+    /// A frame for work that has just begun and produced nothing.
     #[must_use]
     pub fn new(label: impl Into<String>) -> Self {
         Self {
             label: label.into(),
+            elapsed: Duration::ZERO,
+            units: 0,
         }
+    }
+
+    /// The elapsed time this frame reports.
+    #[must_use]
+    pub fn after(mut self, elapsed: Duration) -> Self {
+        self.elapsed = elapsed;
+        self
+    }
+
+    /// The units of progress this frame reports.
+    #[must_use]
+    pub fn with_units(mut self, units: u64) -> Self {
+        self.units = units;
+        self
     }
 }
 
@@ -665,6 +714,54 @@ mod tests {
         assert_eq!(
             sb_offer(&mut sb, Durable::Note(note.clone())),
             Some(Commit::Note(note))
+        );
+    }
+
+    /// **A frame carries facts, not a rendering** (D2b, #1895).
+    ///
+    /// Pins the two omissions, because without a test they are a comment. A
+    /// frame must not carry a pre-fitted line (the producer cannot fit for a
+    /// surface it does not know) and must not carry a glyph (the glyph cycle
+    /// IS the animation, and animation is view state).
+    ///
+    /// Scans this module's own source at COMPILE time; needles use `concat!`
+    /// so this test cannot match itself. Anti-vacuous twin below.
+    #[test]
+    fn a_frame_carries_no_rendering_and_no_glyph() {
+        let src = include_str!("mod.rs");
+        let decl_start = src
+            .find(concat!("pub struct ", "Frame {"))
+            .expect("Frame is declared here");
+        let decl = &src[decl_start..decl_start + src[decl_start..].find('}').unwrap()];
+        for banned in ["glyph", "frame_index", "rendered", "fitted", "ansi", "cols"] {
+            assert!(
+                !decl.contains(banned),
+                "Frame declares `{banned}` — a frame carries measurable facts, \
+                 never how they look. The view composes and fits (#1895)."
+            );
+        }
+        // And the facts it DOES carry are the measurable ones.
+        for fact in ["label", "elapsed", "units"] {
+            assert!(decl.contains(fact), "Frame must still carry `{fact}`");
+        }
+    }
+
+    /// The twin: the scan is looking at the real declaration, so the test above
+    /// cannot pass by examining an empty slice.
+    #[test]
+    fn and_the_frame_declaration_scan_is_looking_at_something() {
+        let src = include_str!("mod.rs");
+        let decl_start = src.find(concat!("pub struct ", "Frame {")).unwrap();
+        let decl = &src[decl_start..decl_start + src[decl_start..].find('}').unwrap()];
+        assert!(
+            decl.len() > 80,
+            "the scanned declaration is implausibly short ({} bytes) — the \
+             omission test above would be vacuous",
+            decl.len()
+        );
+        assert!(
+            decl.contains("Duration"),
+            "elapsed is a Duration, not a string"
         );
     }
 
