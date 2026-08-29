@@ -39,13 +39,12 @@
 //! prompt. Keeping what is on screen is not the machine deciding.
 
 use newt_core::config::{Crew, CrewBudgets};
-use newt_interaction::{
-    ChoiceOption, Control, ControlId, ControlKind, InteractionDefinition, InteractionKind,
-    OptionId, Requirement, SemanticRole,
-};
-
-/// The reserved control id every crew-form prompt answers.
-pub(crate) const FIELD_CONTROL: &str = "field";
+// D1b-2 (#1903): the field builders this module grew in D1a now live in
+// `newt_core::interaction_form`, because the setup wizard needs the same two
+// and a second spelling of "a free-text field with a default" is how `is_yes`
+// became three implementations. Same shapes, one owner.
+use newt_core::interaction_form::{self, NO, YES};
+use newt_interaction::InteractionDefinition;
 
 /// Consecutive unusable answers at one step before the form gives up.
 ///
@@ -145,7 +144,7 @@ impl CrewForm {
             } else {
                 body.to_string()
             };
-            Some(text_field(body, self.note(hint)))
+            Some(interaction_form::text_field(body, self.note(hint)))
         };
         match self.step {
             Step::Done => None,
@@ -173,7 +172,7 @@ impl CrewForm {
                 "review-gate topics",
                 csv_hint(&self.budgets.require_human_review_on),
             ),
-            Step::Confirm => Some(confirm_field(&self.label, &self.preview(), self.retry)),
+            Step::Confirm => Some(self.write_confirm()),
         }
     }
 
@@ -294,15 +293,30 @@ impl CrewForm {
     /// rather than authored, but reading a role to decide what an answer
     /// MEANS is the habit that breaks where the definition is not ours.
     fn resolve_confirm(&self, answer: &str) -> Option<bool> {
-        let definition = confirm_field(&self.label, &self.preview(), self.retry);
-        let ControlKind::Choice { options } = &definition.controls.first()?.kind else {
-            return None;
-        };
-        match newt_interaction::binding::resolve_typed(options, answer)?.as_str() {
-            "yes" => Some(true),
-            "no" => Some(false),
+        match interaction_form::resolve(&self.write_confirm(), answer)?.as_str() {
+            YES => Some(true),
+            NO => Some(false),
             _ => None,
         }
+    }
+
+    /// The write confirm: the destination, the exact bytes, and a real
+    /// choice. Built in one place so `prompt` and `resolve_confirm` cannot
+    /// offer and resolve two different option sets.
+    ///
+    /// **Not named `confirm_prompt`**, which is the ratchet's needle for a
+    /// BESPOKE confirm builder beside the shared path (`sas_confirm` and
+    /// `rich_input` each hold one). This is the opposite: it delegates to
+    /// `interaction_form::confirm` and adds only this form's body. Taking a
+    /// baseline row would have recorded a third bespoke builder that does
+    /// not exist.
+    fn write_confirm(&self) -> InteractionDefinition {
+        interaction_form::confirm(
+            format!("# {}\n{}\nWrite it?", self.label, self.preview()),
+            self.retry.unwrap_or_default(),
+            "yes, write it",
+            "no, leave it alone",
+        )
     }
 }
 
@@ -349,62 +363,12 @@ fn csv_hint(cur: &[String]) -> String {
     )
 }
 
-/// A free-text field: body, hint, and an unlabelled `Text` control.
-///
-/// Unlabelled on purpose — `markup::plain` gives a labelled control its own
-/// `label:` line, and the body already says what is being asked. This is the
-/// same shape `permissions::free_text_form` uses.
-fn text_field(body: String, hint: String) -> InteractionDefinition {
-    InteractionDefinition {
-        note: (!hint.is_empty()).then_some(hint),
-        ..InteractionDefinition::new(
-            InteractionKind::Prompt,
-            body,
-            vec![control(ControlKind::Text)],
-        )
-    }
-}
-
-/// The write confirm: the destination, the exact bytes, and a real choice.
-fn confirm_field(label: &str, preview: &str, retry: Option<&str>) -> InteractionDefinition {
-    let option = |wire: &str, role, key: &str, text: &str, alias: &str| ChoiceOption {
-        id: OptionId::new(wire).expect("`yes`/`no` are valid option ids; they are consts"),
-        role,
-        label: text.to_string(),
-        key: key.to_string(),
-        aliases: vec![alias.to_string()],
-    };
-    InteractionDefinition {
-        note: retry.map(str::to_string),
-        ..InteractionDefinition::new(
-            InteractionKind::Confirm,
-            format!("# {label}\n{preview}\nWrite it?"),
-            vec![control(ControlKind::Choice {
-                options: vec![
-                    option("yes", SemanticRole::Allow, "y", "yes, write it", "Y"),
-                    option("no", SemanticRole::Cancel, "n", "no, leave it alone", "N"),
-                ],
-            })],
-        )
-    }
-}
-
-fn control(kind: ControlKind) -> Control {
-    Control {
-        id: ControlId::new(FIELD_CONTROL)
-            .expect("`field` is a valid control id (non-empty, [A-Za-z0-9_-]); it is a const"),
-        kind,
-        label: String::new(),
-        requirement: Requirement::Required,
-    }
-}
-
 /// The crew-name prompt: which crew the form is about to edit.
 ///
 /// Built here rather than in the driver so EVERY definition this flow
 /// presents comes from one module.
 pub(crate) fn name_prompt(body: String) -> InteractionDefinition {
-    text_field(body, String::new())
+    interaction_form::text_field(body, String::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +380,7 @@ pub(crate) fn name_prompt(body: String) -> InteractionDefinition {
 mod d1a {
     use super::*;
     use newt_core::markup::plain;
+    use newt_interaction::ControlKind;
 
     const LABEL: &str = "crews/home.toml (crew 'home')";
 
@@ -600,15 +565,15 @@ mod d1a {
     /// falling back. `is_yes` had neither.
     #[test]
     fn the_confirm_resolves_through_the_one_resolver() {
-        let definition = confirm_field(LABEL, "preview", None);
+        let definition = form_for(&Crew::default()).write_confirm();
         let ControlKind::Choice { options } = &definition.controls[0].kind else {
             panic!("the confirm is a choice control");
         };
         use newt_interaction::binding::resolve_typed;
-        assert_eq!(resolve_typed(options, "y").unwrap().as_str(), "yes");
-        assert_eq!(resolve_typed(options, "no").unwrap().as_str(), "no");
-        assert!(resolve_typed(options, "").is_none());
-        assert!(resolve_typed(options, "sure").is_none());
+        assert_eq!(resolve_typed(&options[..], "y").unwrap().as_str(), "yes");
+        assert_eq!(resolve_typed(&options[..], "no").unwrap().as_str(), "no");
+        assert!(resolve_typed(&options[..], "").is_none());
+        assert!(resolve_typed(&options[..], "sure").is_none());
     }
 
     /// Fail-closed against an input with nothing left to give: an unusable
@@ -661,7 +626,7 @@ mod d1a {
     /// style is `[y]es`/`[n]o`, never a capitalised `[Y/n]`.
     #[test]
     fn the_confirm_renders_no_default() {
-        let shown = plain::render(&confirm_field(LABEL, "preview", None));
+        let shown = plain::render(&form_for(&Crew::default()).write_confirm());
         assert!(
             shown.contains("[y]es") && shown.contains("[n]o"),
             "both options are offered: {shown}"

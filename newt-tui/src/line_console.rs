@@ -10,10 +10,35 @@
 //! echo, and Esc/Ctrl-C surfacing as catchable events (so first-run setup can
 //! fall back to defaults instead of the process dying mid-wizard).
 
+use newt_core::markup::plain;
+use newt_core::tty::MODAL_INPUT_GLYPH;
+use newt_interaction::InteractionDefinition;
 use std::io::{self, Write};
 
 pub trait Console {
     fn ask(&mut self, prompt: &str) -> io::Result<String>;
+    /// Ask a semantic [`InteractionDefinition`] rather than a pre-rendered
+    /// string (D1b-2, #1903).
+    ///
+    /// The migration bridge. A wizard step that calls this has already
+    /// modelled its prompt — body, hint, and (for a choice) the options a
+    /// resolver can act on — so the definition is what reaches the terminal
+    /// adapter, and `present_on_terminal` derives its `Echo` from the
+    /// controls exactly as it does for `ask_secret`.
+    ///
+    /// The default body renders through the ONE plain projection and
+    /// delegates to [`ask`](Console::ask), so a scripted test console answers
+    /// a definition like any other prompt without knowing this method exists.
+    ///
+    /// It disappears with the trait: D1b-3 retires `Console` in favour of
+    /// C1's seam, at which point every caller of this already passes a
+    /// definition and only the transport changes.
+    fn ask_definition(&mut self, definition: &InteractionDefinition) -> io::Result<String> {
+        self.ask(&format!(
+            "{}\n{MODAL_INPUT_GLYPH}",
+            plain::render(definition)
+        ))
+    }
     /// Ask without echoing the answer (tokens, passphrases). Default:
     /// delegate to [`ask`](Console::ask) so scripted test consoles answer
     /// secrets like any other prompt.
@@ -39,8 +64,17 @@ pub trait Console {
 /// wrap it in `Secret` immediately; this signature is the `Console` trait's
 /// and outlives only until the trait does (D1b-3).
 fn ask_secret_through_the_seam(prompt: &str) -> io::Result<String> {
+    through_the_seam(&crate::setup::credentials::secret_prompt(prompt))
+}
+
+/// Present one definition on the terminal and return the submitted line.
+///
+/// The single place this module reaches the terminal adapter, shared by the
+/// secret path and [`Console::ask_definition`], so there is one mapping from
+/// `HumanQuestionOutcome` to `io::Result` rather than one per prompt kind.
+fn through_the_seam(definition: &InteractionDefinition) -> io::Result<String> {
     let window = newt_core::tty::Terminal::suspend_for_prompt();
-    let definition = crate::setup::credentials::secret_prompt(prompt);
+    let definition = definition.clone();
     let interaction = newt_core::interaction_surface::SurfaceInteraction::blocking(definition);
     match crate::permissions::present_on_terminal(&window, &interaction) {
         newt_core::HumanQuestionOutcome::Answer(line) => Ok(line.trim().to_string()),
@@ -72,6 +106,9 @@ impl Console for StdinConsole {
     }
     fn ask_secret(&mut self, prompt: &str) -> io::Result<String> {
         ask_secret_through_the_seam(prompt)
+    }
+    fn ask_definition(&mut self, definition: &InteractionDefinition) -> io::Result<String> {
+        through_the_seam(definition)
     }
     fn say(&mut self, line: &str) {
         println!("{line}");
@@ -210,6 +247,9 @@ impl Console for FirstRunConsole {
     }
     fn ask_secret(&mut self, prompt: &str) -> io::Result<String> {
         ask_secret_through_the_seam(prompt)
+    }
+    fn ask_definition(&mut self, definition: &InteractionDefinition) -> io::Result<String> {
+        through_the_seam(definition)
     }
     fn say(&mut self, line: &str) {
         println!("{line}");
