@@ -119,6 +119,34 @@ fn interaction_view_child() {
             // the parent can distinguish "answered" from "still drawing".
             println!("OUTCOME:{outcome:?}");
         }
+        // **An interaction arriving mid-turn.** A spinner owns the bottom row
+        // and repaints ~10x/second; the frame must open over a CLEAN region
+        // and must not be painted back over. This is #1312's defect class —
+        // "a permission prompt rendered invisibly underneath a spinner that
+        // overwrote it ~8x/second" — for the rich frame rather than the plain
+        // prompt, which `prompt_visibility_test` already covers.
+        //
+        // The suspend is the mechanism under test: `suspend_for_prompt`
+        // erases every registered ephemeral writer and holds them quiesced
+        // for the window's lifetime. `RichSurface::present_interaction` does
+        // exactly this pair; it is spelled out here rather than constructing
+        // a whole RichSurface, which would drag in an editor and a config.
+        "active_turn" => {
+            use newt_core::tty::{LineCaps, Sink, Spinner, Terminal};
+            let spinner = Spinner::start_with_caps(LineCaps::Own, "thinking…", Sink::Stdout, true)
+                .expect("the pty is a real terminal, so the spinner takes the line");
+            // Let it paint a few frames, so the test is about a LIVE writer
+            // rather than one that never started.
+            std::thread::sleep(Duration::from_millis(400));
+
+            let interaction = fixture_interaction();
+            let outcome = {
+                let _window = Terminal::suspend_for_prompt();
+                crate::interaction_view::present(&interaction).expect("the frame runs")
+            };
+            drop(spinner);
+            println!("OUTCOME:{outcome:?}");
+        }
         other => panic!("unknown child mode {other:?}"),
     }
 }
@@ -744,4 +772,143 @@ fn a_narrow_terminal_wraps_rather_than_overflowing() {
         "the body vanished at {COLS} columns rather than wrapping: {flat:?}"
     );
     assert!(f.tail.contains("OUTCOME:"), "the frame did not answer");
+}
+
+/// Drive the active-turn lifecycle: spinner up, then the frame opens over it.
+///
+/// Returns (whole stream, index where the frame began, tail, raw-during,
+/// raw-after). The caller asserts on the stream AFTER the frame began, which
+/// is the only window in which a spinner glyph means anything: before it, the
+/// spinner is *supposed* to be painting.
+fn drive_active_turn(key: &str) -> (String, usize, String, bool, bool) {
+    let pty = Pty::open();
+    pty.resize(24, 100);
+    let mut child = spawn_child(&pty, "active_turn");
+
+    // Wait for the SPINNER first — braille frames on the wire mean a live
+    // ephemeral writer, which is the precondition this scenario needs. Waiting
+    // for raw mode instead would race: the frame takes raw only later.
+    let mut all = String::new();
+    let saw_spinner = {
+        let deadline = Instant::now() + REACH_TIMEOUT;
+        loop {
+            all.push_str(&pty.screen());
+            if all.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert!(
+        saw_spinner,
+        "no spinner frames appeared — the scenario never had a live writer to \
+         be interrupted by, so it would prove nothing; screen={all:?}"
+    );
+
+    // Keep draining (and answering the viewport's cursor query) until the
+    // child has answered and exited.
+    let mut answered = 0usize;
+    let mut raw_during = false;
+    let deadline = Instant::now() + REACH_TIMEOUT;
+    while Instant::now() < deadline {
+        all.push_str(&pty.screen());
+        answer_cursor_report(&pty, &all, &mut answered);
+        if pty.is_raw() {
+            raw_during = true;
+        }
+        // The frame is up once it has queried the cursor AND drawn.
+        if raw_during && all.contains("\u{1b}[6n") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Let the frame settle, so the window under test contains real frames
+    // rather than only the instant of its first draw.
+    for _ in 0..25 {
+        all.push_str(&pty.screen());
+        answer_cursor_report(&pty, &all, &mut answered);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The frame BEGINS at its cursor query: `suspend_for_prompt` has already
+    // erased and quiesced every ephemeral writer by then, so any spinner glyph
+    // from here on is a writer that woke up and painted over the frame.
+    let frame_start = all.find("\u{1b}[6n").expect("the frame queried the cursor");
+
+    pty.type_in(key);
+    let mut tail = String::new();
+    let _ = std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| wait_for_child(&mut child, EXIT_TIMEOUT));
+        while !waiter.is_finished() {
+            tail.push_str(&pty.screen());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        waiter.join().expect("child reaper thread")
+    });
+    std::thread::sleep(Duration::from_millis(120));
+    tail.push_str(&pty.screen());
+    (all, frame_start, tail, raw_during, pty.is_raw())
+}
+
+/// **An interaction arriving mid-turn is not painted over by the turn.**
+///
+/// #1312 measured what this costs: a permission prompt rendered invisibly
+/// underneath a spinner that overwrote it ~8x/second, and an operator with no
+/// way to see what they were being asked. `prompt_visibility_test` pins it for
+/// the plain prompt; this pins it for the rich frame, whose failure mode is
+/// worse — a widget frame half-overwritten by braille is not merely hidden,
+/// it is unreadable.
+///
+/// The assertion is the same one that tier established: **no spinner glyph
+/// may appear once the frame is up.** `suspend_for_prompt` erases every
+/// registered ephemeral writer and holds them quiesced for the window's
+/// lifetime, so a single braille character after that point means a writer
+/// woke up and painted over the frame.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_frame_opened_mid_turn_is_not_painted_over_by_the_spinner() {
+    let (all, frame_start, tail, raw_during, raw_after) = drive_active_turn("d");
+
+    assert!(raw_during, "the frame never took raw mode");
+    assert!(!raw_after, "the terminal was left RAW");
+    assert!(
+        tail.contains("OUTCOME:"),
+        "the frame never answered; tail={tail:?}"
+    );
+
+    // The window under test: everything the terminal was shown from the
+    // frame's first cursor query onward. Before that point the spinner is
+    // SUPPOSED to be painting, so including it would fail every run.
+    let window = &all[frame_start..];
+
+    // The frame is actually THERE — without this, a run where the frame never
+    // drew would satisfy "no spinner glyphs" trivially.
+    let grid = screen_grid(window).join(" ");
+    assert!(
+        grid.contains("run_command") || grid.contains("allow once"),
+        "the frame did not draw over the spinner: {grid:?}"
+    );
+    // ...and the spinner really was running before it, or there was nothing
+    // to be interrupted by.
+    assert!(
+        all[..frame_start]
+            .chars()
+            .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+        "no spinner ran before the frame opened; the scenario is vacuous"
+    );
+
+    let intruders: Vec<char> = window
+        .chars()
+        .filter(|c| ('\u{2800}'..='\u{28FF}').contains(c))
+        .collect();
+    assert!(
+        intruders.is_empty(),
+        "a spinner frame painted over the interaction frame after it opened — \
+         the #1312 failure, where the operator cannot read what they are being \
+         asked; intruders={intruders:?}"
+    );
 }
