@@ -10,9 +10,12 @@
 //! `transcript_id` is used only as a cross-check that must agree.
 //!
 //! Everything here is default-deny. A [`PromptWindow`] cannot be forged — the
-//! only ways to hold one are [`crate::tty::Terminal::suspend_for_prompt`] and
-//! the test stub — so a headless session has no way to reach a confirmation,
-//! and [`confirm_enrollment`] returns [`SasVerdict::NoTerminal`] rather than
+//! only production ways to hold one are
+//! [`crate::tty::Terminal::suspend_for_prompt`] and
+//! [`crate::tty::Terminal::suspend_for_prompt_to`], plus the test stub under
+//! `cfg(test)`. Both production paths share the same sealed suspension helper,
+//! so a headless session has no way to reach a confirmation, and
+//! [`confirm_enrollment`] returns [`SasVerdict::NoTerminal`] rather than
 //! defaulting to yes.
 
 use agent_mesh_protocol::Fingerprint;

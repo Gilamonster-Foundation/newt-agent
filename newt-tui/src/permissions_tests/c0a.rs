@@ -109,29 +109,19 @@ fn render_reproduces_every_a0_golden_byte_for_byte() {
 /// claim for this path had no test to rest on. It does now.
 ///
 /// The expectation is written out rather than derived: a `Text` control
-/// contributes no choices line, so the form is body + note, exactly as
-/// the actionless `Question` rendered.
+/// contributes no choices line, so the form is body + note. The surface is
+/// named in words because a bare leading `?` looked like stray punctuation,
+/// especially when the question itself already ended in `?`.
 #[test]
-fn the_free_text_form_renders_exactly_as_it_did() {
-    let form = InteractionDefinition {
-        note: Some(MODAL_CONTROL_HINT.into()),
-        ..InteractionDefinition::new(
-            InteractionKind::Prompt,
-            format!("? {}", "which file should I edit"),
-            vec![Control {
-                id: ControlId::new(ANSWER_CONTROL).expect("valid control id"),
-                kind: ControlKind::Text,
-                label: String::new(),
-                requirement: Requirement::Required,
-            }],
-        )
-    };
+fn the_free_text_form_renders_with_a_clear_modal_identity() {
+    let form = free_text_form("which file should I edit?");
     assert_eq!(
         plain::render(&form),
-        "? which file should I edit\nEsc=back \u{b7} Ctrl-C/Ctrl-D=exit"
+        "Prompt — which file should I edit?\nEsc=back \u{b7} Ctrl-C/Ctrl-D=exit"
     );
     // A text control offers nothing to pick, so no choices line appears.
     assert!(!plain::render(&form).contains('['));
+    assert!(!form.markdown.starts_with("? "));
 }
 
 /// **The web surface is untouched by C0a.** The terminal changed how it

@@ -82,6 +82,19 @@ pub const NEWT_ORANGE_CT: CtColor = CtColor::Rgb {
     b: 20,
 };
 
+/// The high-luminance accent for whichever input surface currently owns the
+/// operator's keyboard. Deliberately distinct from [`NEWT_ORANGE_CT`]: that
+/// darker brand orange works for small identity marks, while an active prompt
+/// must remain legible against a black terminal background.
+///
+/// There should be exactly one of these on screen. A modal takes the accent
+/// while it owns input; the chat prompt recedes until the modal closes.
+pub const ACTIVE_INPUT_CT: CtColor = CtColor::Rgb {
+    r: 255,
+    g: 165,
+    b: 90,
+};
+
 /// Dimmer-than-DarkGrey hue for the soft "fade" tail on a truncated status
 /// line — the last couple of cells before the `…` dissolve toward the
 /// background so the cut reads as "there's more here", not a hard chop.

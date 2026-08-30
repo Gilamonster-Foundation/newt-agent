@@ -66,10 +66,11 @@ use crossterm::event::{
     KeyModifiers,
 };
 use newt_core::tty::raw_mode::RawModeGuard;
+use newt_core::tty::str_width;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Block, Paragraph, Widget};
 use ratatui::Frame;
 use tui_textarea::{CursorMove, TextArea};
 
@@ -577,29 +578,199 @@ fn header_line(
     Line::from(spans)
 }
 
+/// Command rows use the same high-contrast dark slab live and in scrollback.
+/// The marker color carries the command family; the body stays neutral so a
+/// shell command remains easy to audit character-for-character.
+const COMMAND_BG: Color = Color::Rgb(82, 82, 82);
+/// A command draft stays recognizable behind a blocking modal, but no longer
+/// competes with the modal for visual focus.
+const INACTIVE_COMMAND_BG: Color = Color::Rgb(45, 45, 45);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandKind {
+    Bang,
+    Ex,
+}
+
+impl CommandKind {
+    fn marker(self) -> char {
+        match self {
+            Self::Bang => '!',
+            Self::Ex => ':',
+        }
+    }
+
+    fn marker_style(self) -> Style {
+        self.marker_style_with_focus(true)
+    }
+
+    fn marker_style_with_focus(self, focused: bool) -> Style {
+        let color = if focused {
+            match self {
+                Self::Bang => Color::LightMagenta,
+                Self::Ex => Color::LightYellow,
+            }
+        } else {
+            Color::DarkGray
+        };
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    }
+}
+
+fn command_line(kind: CommandKind, tail: &str) -> Line<'static> {
+    command_line_with_focus(kind, tail, true)
+}
+
+fn command_line_with_focus(kind: CommandKind, tail: &str, focused: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            kind.marker().to_string(),
+            kind.marker_style_with_focus(focused),
+        ),
+        Span::styled(
+            tail.to_string(),
+            Style::default().fg(if focused {
+                Color::White
+            } else {
+                Color::DarkGray
+            }),
+        ),
+    ])
+}
+
+fn command_background(focused: bool) -> Color {
+    if focused {
+        COMMAND_BG
+    } else {
+        INACTIVE_COMMAND_BG
+    }
+}
+
+fn is_bang_escape(body: &str) -> bool {
+    // Keep this display classifier on the exact dispatch rule. In particular,
+    // bare `!` is ordinary model text and a colon is never promoted here.
+    crate::bang_command(body.trim()).is_some()
+}
+
+/// Number of characters hidden behind the live `!` prompt marker. The chat
+/// dispatcher trims before applying `bang_command`, so leading whitespace is
+/// projected away here too; the underlying editor buffer remains untouched.
+fn bang_prefix_chars(body: &str) -> Option<usize> {
+    if !is_bang_escape(body) {
+        return None;
+    }
+    let marker = body.chars().position(|c| !c.is_whitespace())?;
+    (body.chars().nth(marker) == Some('!')).then_some(marker + 1)
+}
+
+fn cursor_offset(lines: &[String], cursor: (usize, usize)) -> usize {
+    lines
+        .iter()
+        .take(cursor.0)
+        .map(|line| line.chars().count() + 1)
+        .sum::<usize>()
+        + cursor.1
+}
+
+fn cursor_at_offset(lines: &[String], mut offset: usize) -> (usize, usize) {
+    for (row, line) in lines.iter().enumerate() {
+        let width = line.chars().count();
+        if offset <= width {
+            return (row, offset);
+        }
+        offset = offset.saturating_sub(width + 1);
+    }
+    let row = lines.len().saturating_sub(1);
+    (row, lines.get(row).map_or(0, |line| line.chars().count()))
+}
+
+/// A render-only textarea with the bang (and any dispatch-trimmed leading
+/// whitespace) removed. Editing and submission still use the original buffer;
+/// only the projection changes, so shell routing and exact command bytes do not.
+struct BangView<'a> {
+    textarea: TextArea<'a>,
+    /// The source caret is on whitespace or `!` hidden by this projection.
+    /// Render it on the visible marker instead of after that marker.
+    cursor_on_marker: bool,
+}
+
+fn bang_view<'a>(textarea: &TextArea<'a>) -> Option<BangView<'a>> {
+    let body = textarea.lines().join("\n");
+    let hidden = bang_prefix_chars(&body)?;
+    // The projection below cannot faithfully show a selection that crosses
+    // characters hidden behind the marker. Production input normalizes that
+    // state before and after every edit; refuse to fabricate a deselected
+    // clone if a caller violates the invariant.
+    if textarea.is_selecting() {
+        return None;
+    }
+    let original_offset = cursor_offset(textarea.lines(), textarea.cursor());
+    let mut view = textarea.clone();
+    view.move_cursor(CursorMove::Jump(0, 0));
+    for _ in 0..hidden {
+        view.delete_next_char();
+    }
+    let cursor = cursor_at_offset(view.lines(), original_offset.saturating_sub(hidden));
+    view.move_cursor(CursorMove::Jump(cursor.0 as u16, cursor.1 as u16));
+    Some(BangView {
+        textarea: view,
+        cursor_on_marker: original_offset < hidden,
+    })
+}
+
+/// A bang row is rendered manually after hiding its source `!`, so it cannot
+/// expose `tui-textarea`'s selection highlight. Do not leave an invisible
+/// selection armed: typing into one would otherwise replace text the operator
+/// cannot see as selected. Keeping both the source and projection unselected
+/// is the smallest behavior that makes displayed and editing state agree.
+fn cancel_hidden_bang_selection(textarea: &mut TextArea<'_>) {
+    if textarea.is_selecting() && is_bang_escape(&textarea.lines().join("\n")) {
+        textarea.cancel_selection();
+    }
+}
+
 /// The input-row indicator (below [`header_line`]): `❯ ` for input/INSERT, a bold
 /// bright `: ` for vi NORMAL, `:cmd` for an open ex-line, or the `[y/N]`
 /// confirmation. The input begins right after it, so the cursor anchors here and
 /// the dim mode hint (drawn by `draw_overhang` on an empty line) sits after it.
 fn prompt_line(editor: &Editor, ex_inline: bool) -> Line<'static> {
+    prompt_line_with_focus(editor, ex_inline, true)
+}
+
+/// The input-row indicator with explicit keyboard focus. A blocking modal
+/// temporarily leaves the mounted chat editor visible underneath it; dimming
+/// this marker makes the modal's accented chevron the only active prompt.
+fn prompt_line_with_focus(editor: &Editor, ex_inline: bool, focused: bool) -> Line<'static> {
     if let Some(question) = editor.confirm_prompt() {
         // A pending [y/N] confirmation replaces the input-row prompt until answered.
         return Line::from(Span::styled(
             question.to_string(),
             Style::default()
-                .fg(Color::LightYellow)
+                .fg(if focused {
+                    Color::LightYellow
+                } else {
+                    Color::DarkGray
+                })
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    let accent = Color::Rgb(255, 165, 90);
+    let accent = if focused {
+        Color::from(newt_core::tty::ACTIVE_INPUT_CT)
+    } else {
+        Color::DarkGray
+    };
     let bold_hi = Style::default()
-        .fg(Color::LightYellow)
+        .fg(if focused {
+            Color::LightYellow
+        } else {
+            Color::DarkGray
+        })
         .add_modifier(Modifier::BOLD);
     // An open ex-line is inline only on a single-line buffer; a multi-line
     // `:`-command moves to its own bottom row (#531; see `draw`).
     if ex_inline {
         if let Some(ex) = editor.ex() {
-            return Line::from(Span::styled(format!(":{ex}"), bold_hi));
+            return command_line_with_focus(CommandKind::Ex, ex, focused);
         }
     }
     if editor.is_vi_normal() {
@@ -667,6 +838,9 @@ struct RichStatus<'a> {
     /// #1669 PR-B: the open tabs. Fewer than two → **no bar row at all**, so a
     /// single-conversation session is byte-identical to the pre-bar surface.
     tabs: &'a [crate::tab_bar::TabCell],
+    /// A blocking modal owns the keyboard while the mounted chat editor stays
+    /// visible underneath it. Only the marker recedes; the draft remains.
+    chat_inactive: bool,
 }
 
 fn draw(
@@ -677,6 +851,16 @@ fn draw(
     status: RichStatus<'_>,
 ) {
     let area = f.area();
+    let input_focused = !status.chat_inactive;
+    // A wide-gutter TextArea paints its own reversed cursor cell. Neutralize
+    // that projection while a modal owns the keyboard, just as the overhang
+    // path below suppresses the real terminal cursor.
+    let inactive_textarea = status.chat_inactive.then(|| {
+        let mut view = textarea.clone();
+        view.set_cursor_style(Style::default());
+        view
+    });
+    let textarea = inactive_textarea.as_ref().unwrap_or(textarea);
     // "active" = the line has content, so the header mode word brightens and the
     // dim mode hint clears as you type. The hint shows only on an empty line.
     let empty = buffer_is_empty(textarea);
@@ -749,30 +933,79 @@ fn draw(
     if let Some(ex) = ex_bottom_line(editor, textarea) {
         let [msg_area, ex_area] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(input_area);
-        let prompt = prompt_line(editor, false);
+        let prompt = prompt_line_with_focus(editor, false, input_focused);
         if g >= GUTTER_W {
             let [gutter_area, input] =
                 Layout::horizontal([Constraint::Length(g), Constraint::Min(1)]).areas(msg_area);
             f.render_widget(Paragraph::new(prompt), gutter_area);
             f.render_widget(textarea, input);
         } else {
-            draw_overhang(f, msg_area, &prompt, textarea, g, None);
+            draw_overhang(f, msg_area, &prompt, textarea, g, None, input_focused);
         }
-        let bold_hi = Style::default()
-            .fg(Color::LightYellow)
-            .add_modifier(Modifier::BOLD);
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(format!(":{ex}"), bold_hi))),
+            Block::default().style(Style::default().bg(command_background(input_focused))),
             ex_area,
         );
-        let cx = ex_area.x + 1 + ex.chars().count() as u16;
-        if cx <= ex_area.right().saturating_sub(1) {
+        f.render_widget(
+            Paragraph::new(command_line_with_focus(CommandKind::Ex, &ex, input_focused)),
+            ex_area,
+        );
+        let tail_width = u16::try_from(str_width(&ex)).unwrap_or(u16::MAX);
+        let cx = ex_area.x.saturating_add(1).saturating_add(tail_width);
+        if input_focused && cx <= ex_area.right().saturating_sub(1) {
             f.set_cursor_position((cx, ex_area.y));
         }
         return;
     }
 
-    let prompt = prompt_line(editor, true);
+    // A single-line ex command owns the input row. The draft is still held in
+    // the textarea for `:w`, but it must not be concatenated after `:cmd`.
+    if let Some(ex) = editor.ex() {
+        f.render_widget(
+            Block::default().style(Style::default().bg(command_background(input_focused))),
+            input_area,
+        );
+        f.render_widget(
+            Paragraph::new(command_line_with_focus(CommandKind::Ex, ex, input_focused)),
+            input_area,
+        );
+        let tail_width = u16::try_from(str_width(ex)).unwrap_or(u16::MAX);
+        let cx = input_area.x.saturating_add(1).saturating_add(tail_width);
+        if input_focused && cx <= input_area.right().saturating_sub(1) {
+            f.set_cursor_position((cx, input_area.y));
+        }
+        return;
+    }
+
+    // `!` is a prompt marker while the line is a real shell escape, not a chat
+    // character after `❯`. The render-only view removes it from the textarea so
+    // it appears exactly once; the original buffer is what dispatch receives.
+    let bang = bang_view(textarea);
+    let shown = bang.as_ref().map_or(textarea, |view| &view.textarea);
+    if let Some(bang) = bang.as_ref() {
+        f.render_widget(
+            Block::default().style(Style::default().bg(command_background(input_focused))),
+            input_area,
+        );
+        let prompt = command_line_with_focus(CommandKind::Bang, "", input_focused);
+        // Command syntax owns the row, so it never inherits the chat surface's
+        // optional 19-column gutter. The marker and body stay adjacent at every
+        // configured gutter width.
+        draw_overhang(
+            f,
+            input_area,
+            &prompt,
+            shown,
+            1,
+            None,
+            input_focused && !bang.cursor_on_marker,
+        );
+        if input_focused && bang.cursor_on_marker && input_area.width > 0 && input_area.height > 0 {
+            f.set_cursor_position((input_area.x, input_area.y));
+        }
+        return;
+    }
+    let prompt = prompt_line_with_focus(editor, true, input_focused);
     let hint = empty.then(|| editor.mode_hint());
     if g >= GUTTER_W {
         // Wide gutter (opt-in): prompt in a fixed left column, input to its
@@ -780,11 +1013,11 @@ fn draw(
         let [gutter_area, input] =
             Layout::horizontal([Constraint::Length(g), Constraint::Min(1)]).areas(input_area);
         f.render_widget(Paragraph::new(prompt), gutter_area);
-        f.render_widget(textarea, input);
+        f.render_widget(shown, input);
     } else {
         // Overhang (the default): the prompt prefixes the FIRST input row inline
         // (`❯ this`); continuation rows hang-indent by `g` columns (default 1).
-        draw_overhang(f, input_area, &prompt, textarea, g, hint);
+        draw_overhang(f, input_area, &prompt, shown, g, hint, input_focused);
     }
 }
 
@@ -805,13 +1038,26 @@ fn wrap_segments(text: &str, first_w: usize, cont_w: usize) -> Vec<(usize, Strin
     let mut start = 0;
     while start < chars.len() {
         let avail = if segs.is_empty() { first_w } else { cont_w }.max(1);
-        if chars.len() - start <= avail {
+        let mut hard_end = start;
+        while hard_end < chars.len() {
+            // Width is contextual for emoji presentation selectors and ZWJ
+            // sequences, so summing scalar widths is not equivalent to the
+            // terminal width of the candidate substring.
+            let candidate: String = chars[start..=hard_end].iter().collect();
+            if str_width(&candidate) > avail && hard_end > start {
+                break;
+            }
+            // Always take at least one scalar so a glyph wider than a
+            // one-column budget cannot stall the wrapper. Zero-width combining
+            // marks naturally stay with the preceding cell.
+            hard_end += 1;
+        }
+        if hard_end == chars.len() {
             segs.push((start, chars[start..].iter().collect()));
             break;
         }
-        let hard_end = start + avail;
         // Prefer breaking just after the last space in range (word wrap); else
-        // hard-break at the width. Force ≥1 char of progress.
+        // hard-break at the cell budget. Force ≥1 char of progress.
         let break_at = (start..hard_end)
             .rev()
             .find(|&i| chars[i] == ' ')
@@ -875,7 +1121,10 @@ fn overhang_rows(
                 let last = s + 1 == n;
                 if (ccol >= seg_start && ccol < seg_end) || (last && ccol >= seg_end) {
                     cy = rows.len() as u16;
-                    cx = indent + (ccol.saturating_sub(seg_start)) as u16;
+                    let cursor_chars = ccol.saturating_sub(seg_start);
+                    let cursor_prefix: String = seg_text.chars().take(cursor_chars).collect();
+                    let cursor_cells = str_width(&cursor_prefix);
+                    cx = indent + cursor_cells as u16;
                 }
             }
             rows.push(line);
@@ -897,6 +1146,7 @@ fn draw_overhang(
     textarea: &TextArea,
     g: u16,
     hint: Option<&str>,
+    show_cursor: bool,
 ) {
     let (rows, cx, cy) = overhang_rows(
         prompt,
@@ -918,7 +1168,10 @@ fn draw_overhang(
     // the end of the dim hint.
     let cur_x = area.x + cx;
     let cur_y = area.y + cy - scroll_y;
-    if cur_x <= area.right().saturating_sub(1) && cur_y <= area.bottom().saturating_sub(1) {
+    if show_cursor
+        && cur_x <= area.right().saturating_sub(1)
+        && cur_y <= area.bottom().saturating_sub(1)
+    {
         f.set_cursor_position((cur_x, cur_y));
     }
 }
@@ -945,7 +1198,7 @@ fn echo_body_rows(body: &str, hang: usize, width: usize) -> Vec<EchoRow> {
     // logical line's first row wears the `›` chevron; later logical lines and
     // wrapped continuations hang-indent by `hang`. Reserving that marker from the
     // wrap width guarantees no rendered row overruns the terminal.
-    let chevron = ECHO_CHEVRON.chars().count();
+    let chevron = str_width(ECHO_CHEVRON);
     let cont_w = width.saturating_sub(hang).max(1);
     let mut rows = Vec::new();
     for (li, logical) in body.lines().enumerate() {
@@ -968,6 +1221,69 @@ fn echo_body_rows(body: &str, hang: usize, width: usize) -> Vec<EchoRow> {
         });
     }
     rows
+}
+
+/// Wrap the text after a command marker. Unlike a chat echo, the marker itself
+/// owns the first cell; continuation rows hang two cells beneath the command
+/// body. `command` may retain leading whitespace from the editor — dispatch
+/// trims it, so the projection does too.
+fn command_body_rows(command: &str, kind: CommandKind, width: usize) -> Vec<EchoRow> {
+    let shown = command.trim_start();
+    let tail = shown.strip_prefix(kind.marker()).unwrap_or(shown);
+    let first_w = width.saturating_sub(1).max(1);
+    let cont_w = width.saturating_sub(2).max(1);
+    let mut rows = Vec::new();
+    for (li, logical) in tail.lines().enumerate() {
+        let line_first_w = if li == 0 { first_w } else { cont_w };
+        for (si, (_, seg)) in wrap_segments(logical, line_first_w, cont_w)
+            .into_iter()
+            .enumerate()
+        {
+            rows.push(EchoRow {
+                lead: li == 0 && si == 0,
+                text: seg,
+            });
+        }
+    }
+    if rows.is_empty() {
+        rows.push(EchoRow {
+            lead: true,
+            text: String::new(),
+        });
+    }
+    rows
+}
+
+fn command_echo_lines(command: &str, kind: CommandKind, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let dim = Style::default().fg(Color::DarkGray);
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut lines = vec![Line::from(Span::styled(format!("[{stamp}]"), dim))];
+    for row in command_body_rows(command, kind, width) {
+        let prefix = if row.lead {
+            Span::styled(
+                kind.marker().to_string(),
+                kind.marker_style().bg(COMMAND_BG),
+            )
+        } else {
+            Span::styled("  ", Style::default().bg(COMMAND_BG))
+        };
+        let used = if row.lead { 1 } else { 2 } + str_width(&row.text);
+        lines.push(Line::from(vec![
+            prefix,
+            Span::styled(row.text, Style::default().fg(Color::White).bg(COMMAND_BG)),
+            Span::styled(
+                " ".repeat(width.saturating_sub(used)),
+                Style::default().bg(COMMAND_BG),
+            ),
+        ]));
+    }
+    lines
+}
+
+fn echo_command(sink: &mut dyn ScrollbackSink, command: &str, kind: CommandKind) -> io::Result<()> {
+    let width = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80) as usize;
+    sink.insert(command_echo_lines(command, kind, width))
 }
 
 /// Wrap a scrollback note (`:command` output) to `width`, carrying long lines
@@ -997,6 +1313,9 @@ fn echo_submitted(
     body: &str,
     gutter: Option<u16>,
 ) -> io::Result<()> {
+    if is_bang_escape(body) {
+        return echo_command(sink, body, CommandKind::Bang);
+    }
     let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let width = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80);
     let hang_cols = resolve_gutter(gutter, width) as usize;
@@ -1246,7 +1565,7 @@ impl RichSurface {
                 terminal.clear()?;
                 cur_h = want;
             }
-            terminal.draw(|f| me.draw(f, self.chrome()))?;
+            terminal.draw(|f| me.draw(f, self.chrome(), false))?;
 
             // 250ms timeout drives the live clock when idle.
             if !event::poll(Duration::from_millis(250))? {
@@ -1329,6 +1648,10 @@ pub(crate) struct MountedEditor {
     gutter: Option<u16>,
     textarea: TextArea<'static>,
     editor: Editor,
+    /// The exact `:wq`/`:x` spelling held while its confirmation is visible.
+    /// The vi state machine consumes the ex line before the answer arrives, but
+    /// durable scrollback must commit it only after an affirmative answer.
+    pending_ex_echo: Option<String>,
     /// ↑/↓ history recall (the rustyline behavior the rich surface had
     /// dropped): oldest first. `hist_pos == len` means "the fresh line"; `↑`
     /// walks backward into older entries, `↓` forward, restoring the stashed
@@ -1367,6 +1690,7 @@ impl MountedEditor {
             gutter,
             textarea,
             editor: Editor::new(edit),
+            pending_ex_echo: None,
             history,
             hist_pos,
             stash: String::new(),
@@ -1406,15 +1730,36 @@ impl MountedEditor {
         // is one row per logical line.
         // #531: a multi-line `:`-command reserves an extra bottom row.
         let ex_extra = u16::from(ex_bottom_line(&self.editor, &self.textarea).is_some());
-        let rows = if resolve_gutter(self.gutter, term_w) >= GUTTER_W {
-            self.textarea.lines().len() as u16
+        let single_line_ex = self.editor.ex().is_some() && ex_extra == 0;
+        let bang = self
+            .editor
+            .ex()
+            .is_none()
+            .then(|| bang_view(&self.textarea))
+            .flatten();
+        let shown = bang.as_ref().map_or(&self.textarea, |view| &view.textarea);
+        let rows = if single_line_ex {
+            1
+        } else if bang.is_some() {
+            overhang_rows(
+                &command_line(CommandKind::Bang, ""),
+                shown.lines(),
+                shown.cursor(),
+                1,
+                term_w,
+                None,
+            )
+            .0
+            .len() as u16
+        } else if resolve_gutter(self.gutter, term_w) >= GUTTER_W {
+            shown.lines().len() as u16
         } else {
-            let empty = buffer_is_empty(&self.textarea);
+            let empty = buffer_is_empty(shown);
             let prompt = prompt_line(&self.editor, ex_extra == 0);
             overhang_rows(
                 &prompt,
-                self.textarea.lines(),
-                self.textarea.cursor(),
+                shown.lines(),
+                shown.cursor(),
                 resolve_gutter(self.gutter, term_w),
                 term_w,
                 empty.then(|| self.editor.mode_hint()),
@@ -1443,7 +1788,7 @@ impl MountedEditor {
         (base + pal_rows as u16).min(term_h.max(1))
     }
 
-    pub(crate) fn draw(&self, f: &mut Frame, chrome: Chrome<'_>) {
+    pub(crate) fn draw(&self, f: &mut Frame, chrome: Chrome<'_>, chat_inactive: bool) {
         draw(
             f,
             &self.textarea,
@@ -1457,6 +1802,7 @@ impl MountedEditor {
                 session: chrome.session,
                 background_jobs: chrome.background_jobs,
                 palette: Some(&self.palette),
+                chat_inactive,
             },
         );
     }
@@ -1474,8 +1820,10 @@ impl MountedEditor {
         // paste from any platform lands as clean `\n` lines.
         if let Event::Paste(text) = evt {
             let before = self.textarea.lines().join("\n");
+            cancel_hidden_bang_selection(&mut self.textarea);
             let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
             self.textarea.insert_str(normalized);
+            cancel_hidden_bang_selection(&mut self.textarea);
             // A paste can open the palette only as a literal lone `/`;
             // pasting anything into an open palette re-filters or (multi-
             // line / slash gone) closes it.
@@ -1489,6 +1837,10 @@ impl MountedEditor {
         if key.kind != KeyEventKind::Press {
             return Ok(None);
         }
+        // A bang row has no visible selection projection. Clear any lingering
+        // selection before the key can destructively replace hidden text, then
+        // normalize again after Shift-based motions below.
+        cancel_hidden_bang_selection(&mut self.textarea);
         // #1674: the palette sees every key FIRST (before history recall,
         // so ↑/↓ move the highlight, not the history). The decision is
         // the pure `palette_step` — the loop only acts on its verdict, so
@@ -1535,7 +1887,36 @@ impl MountedEditor {
             }
         }
         let before = self.textarea.lines().join("\n");
+        // Capture the ex-line before `Enter` consumes it. It is UI control, not
+        // model text, so commit it with command chrome before any resulting
+        // note or submitted draft. Colon text typed in INSERT never populates
+        // `editor.ex()` and therefore cannot enter this path.
+        let executed_ex = (key.code == KeyCode::Enter
+            && !key.modifiers.contains(KeyModifiers::SHIFT))
+        .then(|| self.editor.ex().map(str::to_string))
+        .flatten();
+        let confirmation_was_pending = self.editor.confirm_prompt().is_some();
         let step = self.editor.input(key, &mut self.textarea);
+        cancel_hidden_bang_selection(&mut self.textarea);
+        if let Some(ex) = executed_ex {
+            // `:wq`/`:x` has only requested confirmation at this point; it has
+            // not executed yet. Do not put an unconfirmed command in durable
+            // scrollback. Immediate ex commands (including help, write and
+            // quit) are committed before any note or submitted draft.
+            if self.editor.confirm_prompt().is_none() {
+                echo_command(sink, &format!(":{ex}"), CommandKind::Ex)?;
+            } else {
+                self.pending_ex_echo = Some(format!(":{ex}"));
+            }
+        }
+        if confirmation_was_pending && self.editor.confirm_prompt().is_none() {
+            let pending = self.pending_ex_echo.take();
+            if step == Step::SubmitQuit {
+                if let Some(ex) = pending {
+                    echo_command(sink, &ex, CommandKind::Ex)?;
+                }
+            }
+        }
         // A command (e.g. `:jumps`) may have queued a note to print above the
         // input region, into real scrollback.
         if let Some(note) = self.editor.take_msg() {
@@ -1584,6 +1965,7 @@ impl MountedEditor {
     fn reset_after_submit(&mut self) {
         self.textarea = new_textarea(self.edit);
         self.editor = Editor::new(self.edit);
+        self.pending_ex_echo = None;
         self.hist_pos = self.history.len();
         self.stash.clear();
         self.palette = PaletteState::from_corpus();
@@ -1812,6 +2194,507 @@ mod tests {
 
     use super::*;
 
+    #[derive(Default)]
+    struct RecordingSink {
+        batches: Vec<Vec<Line<'static>>>,
+    }
+
+    impl ScrollbackSink for RecordingSink {
+        fn insert(&mut self, lines: Vec<Line<'static>>) -> io::Result<()> {
+            self.batches.push(lines);
+            Ok(())
+        }
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn rendered_row(
+        textarea: &TextArea,
+        editor: &Editor,
+        width: u16,
+        height: u16,
+        row: u16,
+    ) -> (String, Vec<Style>) {
+        rendered_row_with(textarea, editor, width, height, row, Some(1), false)
+    }
+
+    fn rendered_row_with(
+        textarea: &TextArea,
+        editor: &Editor,
+        width: u16,
+        height: u16,
+        row: u16,
+        gutter: Option<u16>,
+        chat_inactive: bool,
+    ) -> (String, Vec<Style>) {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                textarea,
+                editor,
+                gutter,
+                RichStatus {
+                    chat_inactive,
+                    ..RichStatus::default()
+                },
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let text = (0..width)
+            .map(|x| buf.cell((x, row)).unwrap().symbol().to_string())
+            .collect::<String>();
+        let styles = (0..width)
+            .map(|x| buf.cell((x, row)).unwrap().style())
+            .collect();
+        (text, styles)
+    }
+
+    fn rendered_cursor_with(
+        textarea: &TextArea,
+        editor: &Editor,
+        width: u16,
+        height: u16,
+        gutter: Option<u16>,
+    ) -> (u16, u16) {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| {
+            draw(f, textarea, editor, gutter, RichStatus::default());
+        })
+        .unwrap();
+        let cursor = term.get_cursor_position().unwrap();
+        (cursor.x, cursor.y)
+    }
+
+    #[test]
+    fn special_command_rendering_live_bang_replaces_the_chat_chevron() {
+        let editor = emacs_editor();
+        let textarea = TextArea::new(vec!["! date".to_string()]);
+
+        let (row, styles) = rendered_row(&textarea, &editor, 40, 2, 1);
+
+        assert!(
+            row.starts_with("! date"),
+            "bang owns the prompt cell: {row:?}"
+        );
+        assert!(
+            !row.contains('❯'),
+            "no chat chevron on a shell escape: {row:?}"
+        );
+        assert!(
+            styles[0].bg.is_some(),
+            "the live command row is visually distinct from chat"
+        );
+    }
+
+    #[test]
+    fn special_command_rendering_bang_never_inherits_the_chat_gutter() {
+        let editor = emacs_editor();
+        let textarea = TextArea::new(vec!["! date".to_string()]);
+
+        for gutter in [None, Some(30)] {
+            let (row, _) = rendered_row_with(&textarea, &editor, 80, 2, 1, gutter, false);
+            assert!(
+                row.starts_with("! date"),
+                "gutter {gutter:?} split the marker from its command: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn special_command_rendering_bang_height_uses_command_geometry_for_every_gutter() {
+        let chrome = Chrome {
+            model: "",
+            endpoint: "",
+            gauge: None,
+            session: "",
+            background_jobs: &[],
+            tabs: &[],
+        };
+
+        // 153 exposes a non-1 continuation indent; 159 exposes gutter=0.
+        // Both expose the wide-gutter logical-line shortcut at 80 columns.
+        for tail_len in [153, 159] {
+            for gutter in [None, Some(0), Some(1), Some(7), Some(30)] {
+                let body = format!("!{}", "x".repeat(tail_len));
+                let mut mounted = MountedEditor::new(Edit::Emacs, gutter, Vec::new(), &body);
+                let shown = bang_view(&mounted.textarea).expect("a real bang escape");
+                let prompt = command_line(CommandKind::Bang, "");
+                let drawn_rows = overhang_rows(
+                    &prompt,
+                    shown.textarea.lines(),
+                    shown.textarea.cursor(),
+                    1,
+                    80,
+                    None,
+                )
+                .0
+                .len() as u16;
+                let expected = drawn_rows.clamp(1, MAX_INPUT_ROWS) + 1;
+
+                assert_eq!(
+                    mounted.wanted_rows(80, 30, &chrome),
+                    expected,
+                    "tail={tail_len}, gutter={gutter:?}: allocation must match draw_overhang(g=1)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn special_command_rendering_bang_cursor_uses_the_marker_for_hidden_prefix() {
+        let editor = emacs_editor();
+        let mut textarea = TextArea::new(vec!["  ! date".to_string()]);
+
+        for hidden_col in 0..3 {
+            textarea.move_cursor(CursorMove::Jump(0, hidden_col));
+            assert_eq!(
+                rendered_cursor_with(&textarea, &editor, 40, 2, Some(30)),
+                (0, 1),
+                "cursor on hidden prefix column {hidden_col} belongs on the visible ! marker"
+            );
+        }
+        textarea.move_cursor(CursorMove::Jump(0, 3));
+        assert_eq!(
+            rendered_cursor_with(&textarea, &editor, 40, 2, Some(30)),
+            (1, 1),
+            "cursor immediately after the source ! belongs after the visible marker"
+        );
+    }
+
+    #[test]
+    fn special_command_rendering_recedes_bang_and_ex_behind_a_modal() {
+        let bang_editor = emacs_editor();
+        let bang_textarea = TextArea::new(vec!["! date".to_string()]);
+        let (_, bang_styles) =
+            rendered_row_with(&bang_textarea, &bang_editor, 40, 2, 1, Some(1), true);
+        assert_eq!(bang_styles[0].fg, Some(Color::DarkGray));
+        assert_eq!(bang_styles[0].bg, Some(INACTIVE_COMMAND_BG));
+
+        let mut ex_editor = vi_editor();
+        let mut ex_textarea = TextArea::default();
+        ex_editor.input(special(KeyCode::Esc), &mut ex_textarea);
+        ex_editor.input(key(':'), &mut ex_textarea);
+        type_chars(&mut ex_editor, &mut ex_textarea, "help");
+        let (_, ex_styles) = rendered_row_with(&ex_textarea, &ex_editor, 40, 2, 1, Some(1), true);
+        assert_eq!(ex_styles[0].fg, Some(Color::DarkGray));
+        assert_eq!(ex_styles[0].bg, Some(INACTIVE_COMMAND_BG));
+    }
+
+    #[test]
+    fn special_command_rendering_committed_bang_uses_a_command_marker() {
+        let mut sink = RecordingSink::default();
+        echo_submitted(&mut sink, "! date", Some(1)).unwrap();
+
+        let command = &sink.batches[0][1];
+        let text = line_text(command);
+        assert!(text.starts_with("! date"), "command echo: {text:?}");
+        assert!(
+            !text.contains(ECHO_CHEVRON),
+            "a shell escape is not a chat turn: {text:?}"
+        );
+        assert!(
+            command.spans.iter().all(|span| span.style.bg.is_some()),
+            "the whole committed command row carries command chrome"
+        );
+    }
+
+    #[test]
+    fn special_command_rendering_wide_echoes_fit_cells_without_losing_text() {
+        let width = 10;
+        for (kind, command, tail) in [
+            (CommandKind::Bang, "!日本語版確認用", "日本語版確認用"),
+            (CommandKind::Ex, ":日本語版確認用", "日本語版確認用"),
+        ] {
+            let rows = command_body_rows(command, kind, width);
+            for row in &rows {
+                let prefix = if row.lead { 1 } else { 2 };
+                assert!(
+                    prefix + str_width(&row.text) <= width,
+                    "{kind:?} row escaped {width} terminal cells: {row:?}"
+                );
+            }
+            assert_eq!(
+                rows.iter().map(|row| row.text.as_str()).collect::<String>(),
+                tail,
+                "{kind:?} wrapping must preserve every source character"
+            );
+
+            let lines = command_echo_lines(command, kind, width);
+            for line in &lines[1..] {
+                assert_eq!(
+                    line.width(),
+                    width,
+                    "{kind:?} slab must be padded to exactly {width} cells: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn special_command_rendering_contextual_emoji_echoes_fit_cells() {
+        for command in ["!❤️a", "!👩\u{200D}💻a"] {
+            let rows = command_body_rows(command, CommandKind::Bang, 3);
+            for row in &rows {
+                let prefix = if row.lead { 1 } else { 2 };
+                assert!(
+                    prefix + str_width(&row.text) <= 3,
+                    "emoji row escaped three terminal cells: {row:?}"
+                );
+            }
+            assert_eq!(
+                rows.iter().map(|row| row.text.as_str()).collect::<String>(),
+                command.trim_start_matches('!'),
+                "emoji wrapping must preserve every source scalar"
+            );
+        }
+    }
+
+    #[test]
+    fn special_command_rendering_cancels_an_invisible_bang_selection_before_editing() {
+        let mut mounted = MountedEditor::new(Edit::Emacs, Some(1), Vec::new(), "! date");
+        let mut sink = RecordingSink::default();
+        mounted.textarea.move_cursor(CursorMove::Jump(0, 2));
+        mounted.textarea.start_selection();
+        mounted.textarea.move_cursor(CursorMove::End);
+        assert!(mounted.textarea.is_selecting());
+        assert!(
+            bang_view(&mounted.textarea).is_none(),
+            "the renderer must not fabricate an unselected bang projection"
+        );
+
+        mounted.on_event(Event::Key(key('X')), &mut sink).unwrap();
+
+        assert_eq!(mounted.textarea.lines(), ["! dateX"]);
+        assert!(
+            !mounted.textarea.is_selecting(),
+            "display and editing state both remain unselected"
+        );
+        assert!(
+            bang_view(&mounted.textarea).is_some(),
+            "normal bang chrome resumes after selection normalization"
+        );
+    }
+
+    #[test]
+    fn special_command_rendering_vi_ex_echoes_before_its_output() {
+        let mut mounted = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "");
+        let mut sink = RecordingSink::default();
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char(':'),
+            KeyCode::Char('h'),
+            KeyCode::Char('e'),
+            KeyCode::Char('l'),
+            KeyCode::Char('p'),
+            KeyCode::Enter,
+        ] {
+            mounted
+                .on_event(Event::Key(special(code)), &mut sink)
+                .unwrap();
+        }
+
+        assert_eq!(sink.batches.len(), 2, "command, then its output");
+        let command = line_text(&sink.batches[0][1]);
+        let output: Vec<String> = sink.batches[1].iter().map(line_text).collect();
+        assert!(
+            command.trim_end().starts_with(":help"),
+            "the executed ex command is committed first: {command:?}"
+        );
+        assert!(
+            output.iter().any(|line| line.contains("vi  Esc=NORMAL")),
+            "the command output follows: {output:?}"
+        );
+        assert!(
+            !command.contains(ECHO_CHEVRON),
+            "true ex command has no chat chevron: {command:?}"
+        );
+    }
+
+    #[test]
+    fn special_command_rendering_shift_enter_does_not_echo_an_open_ex_line() {
+        let mut mounted = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "");
+        let mut sink = RecordingSink::default();
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char(':'),
+            KeyCode::Char('h'),
+            KeyCode::Char('e'),
+            KeyCode::Char('l'),
+            KeyCode::Char('p'),
+        ] {
+            mounted
+                .on_event(Event::Key(special(code)), &mut sink)
+                .unwrap();
+        }
+
+        mounted
+            .on_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+                &mut sink,
+            )
+            .unwrap();
+
+        assert!(sink.batches.is_empty(), "Shift-Enter executes nothing");
+        assert_eq!(mounted.editor.ex(), Some("help"));
+        assert_eq!(mounted.textarea.lines().len(), 2, "it inserts a newline");
+    }
+
+    #[test]
+    fn special_command_rendering_does_not_commit_an_unconfirmed_ex_command() {
+        let mut mounted = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "draft");
+        let mut sink = RecordingSink::default();
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char(':'),
+            KeyCode::Char('w'),
+            KeyCode::Char('q'),
+            KeyCode::Enter,
+        ] {
+            mounted
+                .on_event(Event::Key(special(code)), &mut sink)
+                .unwrap();
+        }
+
+        assert!(mounted.editor.confirm_prompt().is_some());
+        assert!(
+            sink.batches.is_empty(),
+            "requesting confirmation is not executing :wq"
+        );
+        mounted
+            .on_event(Event::Key(special(KeyCode::Char('n'))), &mut sink)
+            .unwrap();
+        assert!(sink.batches.is_empty(), "a cancelled :wq stays ephemeral");
+    }
+
+    #[test]
+    fn special_command_rendering_confirmed_ex_preserves_and_echoes_its_spelling() {
+        for command in ["wq", "x"] {
+            let mut mounted = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "draft");
+            let mut sink = RecordingSink::default();
+            mounted
+                .on_event(Event::Key(special(KeyCode::Esc)), &mut sink)
+                .unwrap();
+            mounted
+                .on_event(Event::Key(special(KeyCode::Char(':'))), &mut sink)
+                .unwrap();
+            for c in command.chars() {
+                mounted
+                    .on_event(Event::Key(special(KeyCode::Char(c))), &mut sink)
+                    .unwrap();
+            }
+            mounted
+                .on_event(Event::Key(special(KeyCode::Enter)), &mut sink)
+                .unwrap();
+
+            assert!(mounted.editor.confirm_prompt().is_some());
+            assert!(sink.batches.is_empty(), "confirmation is still ephemeral");
+            assert_eq!(
+                mounted
+                    .on_event(Event::Key(special(KeyCode::Char('y'))), &mut sink)
+                    .unwrap(),
+                Some(EditorOutcome::LineThenQuit("draft".to_string()))
+            );
+
+            assert_eq!(
+                sink.batches.len(),
+                2,
+                "confirmed command, then submitted draft"
+            );
+            let command_echo = line_text(&sink.batches[0][1]);
+            assert!(
+                command_echo.trim_end().starts_with(&format!(":{command}")),
+                "confirmed spelling survives until execution: {command_echo:?}"
+            );
+            assert!(
+                line_text(&sink.batches[1][1]).starts_with(ECHO_CHEVRON),
+                "the submitted draft remains an ordinary model turn"
+            );
+        }
+    }
+
+    #[test]
+    fn special_command_rendering_insert_colon_remains_chat() {
+        let mut mounted = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "");
+        let mut sink = RecordingSink::default();
+        for code in [
+            KeyCode::Char(':'),
+            KeyCode::Char('h'),
+            KeyCode::Char('e'),
+            KeyCode::Char('l'),
+            KeyCode::Char('p'),
+        ] {
+            assert_eq!(
+                mounted
+                    .on_event(Event::Key(special(code)), &mut sink)
+                    .unwrap(),
+                None
+            );
+        }
+        let outcome = mounted
+            .on_event(Event::Key(special(KeyCode::Enter)), &mut sink)
+            .unwrap();
+
+        assert_eq!(outcome, Some(EditorOutcome::Line(":help".to_string())));
+        let text = line_text(&sink.batches[0][1]);
+        assert!(
+            text.starts_with(ECHO_CHEVRON),
+            "INSERT-mode colon text stays a model turn: {text:?}"
+        );
+    }
+
+    #[test]
+    fn special_command_rendering_single_line_ex_hides_the_draft() {
+        let mut editor = vi_editor();
+        let mut textarea = TextArea::new(vec!["draft".to_string()]);
+        editor.input(special(KeyCode::Esc), &mut textarea);
+        editor.input(key(':'), &mut textarea);
+        type_chars(&mut editor, &mut textarea, "help");
+
+        let (row, styles) = rendered_row(&textarea, &editor, 40, 2, 1);
+        assert!(row.starts_with(":help"), "ex command owns the row: {row:?}");
+        assert!(
+            !row.contains("draft"),
+            "the hidden draft is not concatenated to the command: {row:?}"
+        );
+        assert!(
+            styles[0].bg.is_some(),
+            "the live ex row is visually distinct from chat"
+        );
+    }
+
+    #[test]
+    fn special_command_rendering_vi_ex_cursor_uses_terminal_cells() {
+        for (lines, height, expected_y) in [
+            (vec!["draft".to_string()], 2, 1),
+            (vec!["draft".to_string(), "second".to_string()], 3, 2),
+        ] {
+            let mut editor = vi_editor();
+            let mut textarea = TextArea::new(lines);
+            editor.input(special(KeyCode::Esc), &mut textarea);
+            editor.input(key(':'), &mut textarea);
+            type_chars(&mut editor, &mut textarea, "日本");
+
+            assert_eq!(
+                rendered_cursor_with(&textarea, &editor, 40, height, Some(1)),
+                (5, expected_y),
+                "the ':' marker plus two double-cell characters place the cursor at column five"
+            );
+        }
+    }
+
     #[test]
     fn wrap_segments_empty_and_fitting() {
         assert_eq!(wrap_segments("", 10, 10), vec![(0, String::new())]);
@@ -1834,6 +2717,37 @@ mod tests {
         // Concatenating the segments reproduces the line exactly.
         let joined: String = segs.iter().map(|(_, s)| s.as_str()).collect();
         assert_eq!(joined, "hello world foo");
+    }
+
+    #[test]
+    fn wrap_segments_uses_contextual_emoji_widths() {
+        for text in ["❤️a", "👩\u{200D}💻a"] {
+            assert_eq!(str_width(text), 3, "fixture must occupy three cells");
+            let segs = wrap_segments(text, 2, 2);
+            assert_eq!(segs.len(), 2, "{text:?} must wrap before the trailing a");
+            assert_eq!(segs[1].1, "a");
+            assert!(
+                segs.iter().all(|(_, segment)| str_width(segment) <= 2),
+                "every contextual-width segment must fit its two-cell budget: {segs:?}"
+            );
+            assert_eq!(
+                segs.iter()
+                    .map(|(_, segment)| segment.as_str())
+                    .collect::<String>(),
+                text,
+                "wrapping must preserve the presentation and joiner scalars"
+            );
+        }
+    }
+
+    #[test]
+    fn overhang_rows_cursor_uses_contextual_emoji_widths() {
+        let prompt = Line::from("!");
+        for (text, cursor_col) in [("❤️a", 2), ("👩\u{200D}💻a", 3)] {
+            let (_, cx, cy) =
+                overhang_rows(&prompt, &[text.to_string()], (0, cursor_col), 1, 4, None);
+            assert_eq!((cx, cy), (3, 0), "cursor follows the two-cell emoji");
+        }
     }
 
     #[test]
@@ -2486,6 +3400,20 @@ mod tests {
         // mode word, and model @ endpoint (two-line layout, #527).
         let editor = vi_editor();
         assert!(row_text(&editor).contains('❯'), "insert indicator");
+    }
+
+    #[test]
+    fn blocking_modal_recedes_the_chat_chevron_without_changing_its_shape() {
+        let editor = vi_editor();
+        let active = prompt_line_with_focus(&editor, true, true);
+        let inactive = prompt_line_with_focus(&editor, true, false);
+
+        assert_eq!(active.spans[0].content, inactive.spans[0].content);
+        assert_eq!(
+            active.spans[0].style.fg,
+            Some(Color::from(newt_core::tty::ACTIVE_INPUT_CT))
+        );
+        assert_eq!(inactive.spans[0].style.fg, Some(Color::DarkGray));
     }
 
     #[test]

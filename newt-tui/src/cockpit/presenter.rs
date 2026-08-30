@@ -41,7 +41,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::style::{Attribute, Color as CColor, ResetColor, SetAttribute, SetForegroundColor};
+use crossterm::style::{
+    Attribute, Color as CColor, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+};
 use crossterm::terminal::{Clear, ClearType, DisableLineWrap, EnableLineWrap};
 use crossterm::{execute, queue};
 use ratatui::backend::CrosstermBackend;
@@ -87,6 +89,55 @@ struct Screen {
     queued: usize,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ModalReservation {
+    start: u16,
+    rows: u16,
+    chat_visible: bool,
+}
+
+fn plan_modal_reservation(block_top: u16, screen_rows: u16, requested: u16) -> ModalReservation {
+    if requested <= block_top {
+        ModalReservation {
+            start: block_top - requested,
+            rows: requested,
+            chat_visible: true,
+        }
+    } else {
+        // The dialog and chat block cannot both fit. Give the blocking surface
+        // the whole screen; hiding the inactive chat box is preferable to
+        // letting the dialog scroll through a still-live ratatui viewport.
+        ModalReservation {
+            start: 0,
+            rows: screen_rows,
+            chat_visible: false,
+        }
+    }
+}
+
+/// Physical terminal rows occupied by the canonical plain modal body.
+///
+/// The cockpit normally disables terminal autowrap because all of its own
+/// rows are pre-wrapped. The width-aware core terminal adapter applies this
+/// same shared wrapper to the canonical plain body while leaving the editable
+/// answer row in no-wrap mode.
+fn modal_physical_rows(body: &str, cols: u16) -> usize {
+    newt_core::tty::wrap_line(body, usize::from(cols.max(1))).len()
+}
+
+fn modal_requested_rows(body: &str, cols: u16) -> u16 {
+    u16::try_from(modal_physical_rows(body, cols).saturating_add(1)).unwrap_or(u16::MAX)
+}
+
+/// Bytes needed only when a constrained terminal gave the modal the whole
+/// visible screen. Ratatui's fixed-viewport `clear()` deliberately touches
+/// only the chat block, so it cannot remove modal rows outside that viewport.
+fn full_screen_modal_cleanup() -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    queue!(buf, MoveTo(0, 0), Clear(ClearType::All))?;
+    Ok(buf)
+}
+
 impl Screen {
     fn viewport_rect(&self) -> Rect {
         Rect::new(
@@ -106,6 +157,57 @@ impl Screen {
             },
         )?;
         self.term.clear()
+    }
+
+    /// Open clean rows immediately above the persistent cockpit block.
+    ///
+    /// Scrolling first preserves the transcript in the terminal's history;
+    /// clearing only the shifted copy of the ephemeral block then leaves the
+    /// requested modal rows blank. The chat block is repainted in place below
+    /// them, so the operator can see its dimmed prompt and the modal's active
+    /// prompt at the same time.
+    fn reserve_modal_rows(&mut self, requested: u16) -> io::Result<ModalReservation> {
+        let plan = plan_modal_reservation(self.top, self.rows, requested);
+        if !plan.chat_visible {
+            let mut buf = Vec::new();
+            // Remove the ephemeral block before preserving the visible
+            // transcript in scrollback. That keeps a duplicate editor out of
+            // history while opening a full-screen fallback for the modal.
+            queue!(buf, MoveTo(0, self.top), Clear(ClearType::FromCursorDown))?;
+            if self.top > 0 {
+                queue!(buf, MoveTo(0, self.rows.saturating_sub(1)))?;
+                buf.extend(std::iter::repeat_n(b'\n', self.top as usize));
+            }
+            queue!(buf, MoveTo(0, 0), Clear(ClearType::FromCursorDown))?;
+            self.tty.write_all(&buf)?;
+            self.tty.flush()?;
+            self.term.clear()?;
+            return Ok(plan);
+        }
+        if plan.rows == 0 {
+            return Ok(plan);
+        }
+        let mut buf = Vec::new();
+        queue!(buf, MoveTo(0, self.rows.saturating_sub(1)))?;
+        buf.extend(std::iter::repeat_n(b'\n', plan.rows as usize));
+        queue!(buf, MoveTo(0, plan.start), Clear(ClearType::FromCursorDown))?;
+        self.tty.write_all(&buf)?;
+        self.tty.flush()?;
+        self.term.clear()?;
+        Ok(plan)
+    }
+
+    fn place_cursor(&mut self, row: u16) -> io::Result<()> {
+        execute!(self.tty, MoveTo(0, row))?;
+        self.tty.flush()
+    }
+
+    fn cleanup_modal(&mut self, reservation: &ModalReservation) -> io::Result<()> {
+        if reservation.chat_visible {
+            return Ok(());
+        }
+        self.tty.write_all(&full_screen_modal_cleanup()?)?;
+        self.tty.flush()
     }
 
     /// Insert finished rows into the transcript above the block.
@@ -188,7 +290,12 @@ impl Screen {
 
     /// Paint the block: the status row (raw, clipped, with the queued chip at
     /// the right edge), then the ratatui viewport.
-    fn draw(&mut self, editor: &MountedEditor, chrome: Chrome<'_>) -> io::Result<()> {
+    fn draw(
+        &mut self,
+        editor: &MountedEditor,
+        chrome: Chrome<'_>,
+        chat_inactive: bool,
+    ) -> io::Result<()> {
         if self.status_rows == 1 {
             let cols = self.cols as usize;
             let chip = if self.queued > 0 {
@@ -223,7 +330,7 @@ impl Screen {
             self.tty.write_all(&buf)?;
             self.tty.flush()?;
         }
-        self.term.draw(|f| editor.draw(f, chrome))?;
+        self.term.draw(|f| editor.draw(f, chrome, chat_inactive))?;
         Ok(())
     }
 
@@ -380,6 +487,9 @@ fn line_to_ansi(line: &Line<'_>) -> io::Result<Row> {
         if let Some(fg) = span.style.fg {
             queue!(out, SetForegroundColor(CColor::from(fg)))?;
         }
+        if let Some(bg) = span.style.bg {
+            queue!(out, SetBackgroundColor(CColor::from(bg)))?;
+        }
         if span.style.add_modifier.contains(Modifier::BOLD) {
             queue!(out, SetAttribute(Attribute::Bold))?;
         }
@@ -414,6 +524,9 @@ pub(crate) struct Presenter {
     arbiter: newt_core::tty::EphemeralRegistration,
     _arbiter_target: Arc<dyn newt_core::tty::Ephemeral>,
     was_suspended: bool,
+    /// True only while a blocking interaction owns the keyboard. The editor
+    /// remains visible, but its prompt marker recedes behind the modal.
+    chat_inactive: bool,
     dirty: bool,
     last_draw: Instant,
     /// Restores the terminal modes `open` took — raw mode, line wrap, bracketed
@@ -548,6 +661,7 @@ impl Presenter {
             arbiter,
             _arbiter_target: ephemeral,
             was_suspended: false,
+            chat_inactive: false,
             dirty: true,
             last_draw: Instant::now(),
             _restore: restore,
@@ -655,10 +769,71 @@ impl Presenter {
             // under the cockpit and restores it on drop — the path #1770 fixed
             // and `presenter`'s own PTY test exercises.
             SurfaceRequest::Interact { interaction, reply } => {
-                let window = newt_core::tty::Terminal::suspend_for_prompt();
-                let outcome = crate::permissions::present_on_terminal(&window, &interaction);
+                // Clone the real terminal before changing any focus state. If
+                // this rare allocation fails, the request's reply sender drops
+                // cleanly and chat never gets stranded in its inactive style.
+                let prompt_output = self.screen.tty.try_clone()?;
+                // Requests are drained in a batch before the loop's normal
+                // draw. Apply any pending editor/status geometry first so the
+                // modal reserves rows against the block that will actually be
+                // painted, not the stale top from before (for example) a
+                // background-job row appeared.
+                if self.dirty {
+                    self.draw()?;
+                }
+                let plain_body = newt_core::markup::plain::render(&interaction.definition);
+                let requested_rows = modal_requested_rows(&plain_body, self.screen.cols);
+                let reservation = self.screen.reserve_modal_rows(requested_rows)?;
+                // Transfer visible focus before the blocking read: the modal's
+                // chevron becomes active and the persistent chat chevron
+                // recedes without discarding its draft. When a very short
+                // terminal cannot fit both surfaces, the chat box is hidden
+                // until the modal closes instead of being overwritten.
+                self.chat_inactive = true;
+                if reservation.chat_visible {
+                    if let Err(error) = self.draw() {
+                        self.chat_inactive = false;
+                        return Err(error);
+                    }
+                }
+                if let Err(error) = self.screen.place_cursor(reservation.start) {
+                    self.chat_inactive = false;
+                    let _ = self.screen.cleanup_modal(&reservation);
+                    let _ = self.draw();
+                    return Err(error);
+                }
+                // fd 1 is the cockpit's captured PTY. Route this blocking
+                // interaction to the saved real terminal instead, otherwise
+                // its bytes would wait in the capture until this same loop
+                // returned from the read — a prompt visible only after it was
+                // answered.
+                let window = newt_core::tty::Terminal::suspend_for_prompt_to(prompt_output);
+                let (outcome, prompt_notice) = crate::permissions::present_on_terminal_with_width(
+                    &window,
+                    &interaction,
+                    usize::from(self.screen.cols),
+                );
                 drop(window);
+                let modal_cleanup = self.screen.cleanup_modal(&reservation);
+                self.chat_inactive = false;
+                // The modal wrote outside ratatui's diff. Repaint the inline
+                // region from a clean buffer so focus returns to chat without
+                // leaving modal bytes or a dim chevron behind. Send the answer
+                // even if that cosmetic repaint fails, so the session cannot
+                // remain blocked waiting on a result it already supplied.
+                let repaint = (|| {
+                    self.screen.term.clear()?;
+                    if let Some(notice) = prompt_notice {
+                        // A slash typed at a modal belongs at the chat prompt.
+                        // Commit that guidance above the fixed viewport after
+                        // the modal closes so the repaint cannot swallow it.
+                        self.screen.insert_rows(vec![notice.as_bytes().to_vec()])?;
+                    }
+                    self.draw()
+                })();
                 let _ = reply.send(outcome);
+                modal_cleanup?;
+                repaint?;
             }
             SurfaceRequest::TurnEnded => {
                 self.turn = None;
@@ -866,7 +1041,8 @@ impl Presenter {
             self.editor
                 .wanted_rows(self.screen.cols, self.screen.rows, &self.surface.chrome());
         self.screen.relayout(editor_rows, status_rows)?;
-        self.screen.draw(&self.editor, self.surface.chrome())?;
+        self.screen
+            .draw(&self.editor, self.surface.chrome(), self.chat_inactive)?;
         self.dirty = false;
         self.last_draw = Instant::now();
         Ok(())
@@ -993,6 +1169,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn modal_reservation_sits_immediately_above_the_chat_block() {
+        assert_eq!(
+            plan_modal_reservation(20, 24, 5),
+            ModalReservation {
+                start: 15,
+                rows: 5,
+                chat_visible: true,
+            }
+        );
+        assert_eq!(
+            plan_modal_reservation(3, 7, 8),
+            ModalReservation {
+                start: 0,
+                rows: 7,
+                chat_visible: false,
+            },
+            "a short terminal gives the blocking modal the whole screen"
+        );
+        assert_eq!(
+            plan_modal_reservation(0, 4, 2),
+            ModalReservation {
+                start: 0,
+                rows: 4,
+                chat_visible: false,
+            }
+        );
+    }
+
+    #[test]
+    fn modal_reservation_counts_wrapped_display_rows() {
+        assert_eq!(modal_physical_rows("short", 10), 1);
+        assert_eq!(modal_physical_rows("123456", 5), 2);
+        assert_eq!(
+            modal_physical_rows("ab界\n\nlast", 3),
+            5,
+            "wide cells, hard newlines, and blank lines all occupy rows"
+        );
+        assert_eq!(
+            modal_requested_rows("123456", 5),
+            3,
+            "two wrapped body rows plus the answer row"
+        );
+        assert_eq!(
+            modal_requested_rows("x", 1),
+            2,
+            "the editable answer stays on one clipped, no-wrap row"
+        );
+    }
+
+    #[test]
+    fn full_screen_modal_cleanup_clears_outside_the_fixed_chat_viewport() {
+        let cleanup = full_screen_modal_cleanup().expect("cleanup bytes");
+        let mut expected = Vec::new();
+        queue!(expected, MoveTo(0, 0), Clear(ClearType::All)).expect("expected bytes");
+        assert_eq!(cleanup, expected);
+        assert!(
+            cleanup.windows(4).any(|window| window == b"\x1b[2J"),
+            "cleanup must clear the whole screen, not only ratatui's fixed viewport"
+        );
+    }
+
     fn crlf_count(buf: &[u8]) -> usize {
         buf.windows(2).filter(|w| *w == b"\r\n").count()
     }
@@ -1068,12 +1306,22 @@ mod tests {
         use ratatui::text::Span;
         let line = Line::from(vec![
             Span::styled("[t]", Style::default().fg(Color::DarkGray)),
-            Span::raw(" body"),
+            Span::styled(
+                " body",
+                Style::default().fg(Color::White).bg(Color::Rgb(82, 82, 82)),
+            ),
         ]);
         let bytes = line_to_ansi(&line).unwrap();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("[t]"), "{s:?}");
         assert!(s.contains(" body"), "{s:?}");
+        let color_suppressed = std::env::var_os("NO_COLOR").is_some()
+            || std::env::var("TERM").as_deref() == Ok("dumb");
+        assert_eq!(
+            s.contains("48;2;82;82;82"),
+            !color_suppressed,
+            "command background follows the runtime color policy: {s:?}"
+        );
         assert!(s.contains("\x1b[0m"), "reset present: {s:?}");
         assert_eq!(super::super::ansi::visible_width(&bytes), "[t] body".len());
     }
@@ -1178,7 +1426,176 @@ mod terminal_acceptance {
                  does not open already showing it"
             );
 
-            // ---- a modal opens while the cockpit owns the terminal ----
+            // ---- a modal is visible before an answer while the cockpit owns
+            //      the terminal, then focus and the draft return to chat ----
+            // Push the mounted block to the bottom, then queue a chrome change
+            // that grows it by one row without drawing in between. `run`
+            // drains requests in exactly that order; the interaction must
+            // synchronize the pending layout before reserving its own rows.
+            cockpit
+                .screen
+                .insert_rows(vec![b"transcript row".to_vec(); 24])
+                .expect("push the cockpit block to the bottom");
+            cockpit.draw().expect("seat the bottom-anchored block");
+            let stale_top = cockpit.screen.top;
+            {
+                let (editor, screen) = (&mut cockpit.editor, &mut cockpit.screen);
+                editor
+                    .on_event(Event::Paste("draft survives".into()), screen)
+                    .expect("prefill the mounted draft");
+            }
+            let draft = cockpit.editor.draft();
+            cockpit
+                .handle_request(SurfaceRequest::SetBackgroundJobs(vec![
+                    crate::chat::BackgroundJob::start("indexing repository"),
+                ]))
+                .expect("queue a chrome row before the modal");
+            assert!(cockpit.dirty, "the queued chrome has not drawn yet");
+            let expected_status_rows = cockpit.status_rows();
+            let expected_editor_rows = cockpit.editor.wanted_rows(
+                cockpit.screen.cols,
+                cockpit.screen.rows,
+                &cockpit.surface.chrome(),
+            );
+            let expected_block_h =
+                (expected_editor_rows + expected_status_rows).clamp(1, cockpit.screen.rows.max(1));
+            let expected_top = if stale_top + expected_block_h > cockpit.screen.rows {
+                cockpit.screen.rows - expected_block_h
+            } else {
+                stale_top
+            };
+            assert!(
+                expected_top < stale_top,
+                "the regression needs the pending chrome row to move the block: \
+                 stale={stale_top}, expected={expected_top}"
+            );
+            let definition = crate::permissions::free_text_form("Cockpit modal visible?");
+            let plain_body = newt_core::markup::plain::render(&definition);
+            let requested_rows = modal_requested_rows(&plain_body, cockpit.screen.cols);
+            let expected_reservation =
+                plan_modal_reservation(expected_top, cockpit.screen.rows, requested_rows);
+            assert!(
+                expected_reservation.chat_visible,
+                "acceptance must exercise reserved rows with the inactive chat still visible: {expected_reservation:?}"
+            );
+            let typer = tty.type_when_painted("Prompt — Cockpit modal visible?", b"yes\r");
+            let (reply, answer) = std::sync::mpsc::sync_channel(1);
+            cockpit
+                .handle_request(SurfaceRequest::Interact {
+                    interaction: Box::new(
+                        newt_core::interaction_surface::SurfaceInteraction::blocking(definition),
+                    ),
+                    reply,
+                })
+                .expect("present the interaction");
+            assert!(
+                typer.join().expect("prompt watcher"),
+                "the modal must reach the real terminal before input is sent; painted: {:?}",
+                tty.painted()
+            );
+            assert_eq!(
+                answer.recv().expect("interaction answer"),
+                newt_core::HumanQuestionOutcome::Answer("yes".into())
+            );
+            assert_eq!(cockpit.editor.draft(), draft, "the chat draft survives");
+            assert!(!cockpit.chat_inactive, "keyboard focus returns to chat");
+            assert_eq!(
+                cockpit.screen.top, expected_top,
+                "the pending layout is applied before modal reservation"
+            );
+            let painted = tty.painted();
+            let prompt_at = painted
+                .find("Prompt — Cockpit modal visible?")
+                .expect("modal body reached the terminal");
+            let mut expected_move = Vec::new();
+            queue!(expected_move, MoveTo(0, expected_reservation.start))
+                .expect("cursor-placement bytes");
+            let expected_move = String::from_utf8(expected_move).expect("cursor bytes are UTF-8");
+            assert!(
+                painted[..prompt_at].contains(&expected_move),
+                "the modal was not placed in its reserved rows above chat; expected {expected_move:?}, painted: {painted:?}"
+            );
+            let mut hide = Vec::new();
+            queue!(hide, crossterm::cursor::Hide).expect("hide-cursor bytes");
+            let hide = String::from_utf8(hide).expect("hide bytes are UTF-8");
+            let mut show = Vec::new();
+            queue!(show, crossterm::cursor::Show).expect("show-cursor bytes");
+            let show = String::from_utf8(show).expect("show bytes are UTF-8");
+            let before_modal = &painted[..prompt_at];
+            assert!(
+                before_modal.rfind(&hide) > before_modal.rfind(&show),
+                "the mounted chat cursor must recede before the modal takes focus: {painted:?}"
+            );
+            assert!(
+                painted[prompt_at..].contains(&show),
+                "the chat cursor was not restored after the modal closed: {painted:?}"
+            );
+            let mut enable_wrap = Vec::new();
+            queue!(enable_wrap, EnableLineWrap).expect("enable-wrap bytes");
+            let enable_wrap = String::from_utf8(enable_wrap).expect("wrap bytes are UTF-8");
+            assert!(
+                !painted.contains(&enable_wrap),
+                "a modal must keep terminal autowrap disabled so a long answer cannot spill into chat: {painted:?}"
+            );
+
+            // A slash command entered in a modal backs out to chat and leaves
+            // corrective guidance in durable transcript space. The old path
+            // wrote this notice through PromptWindow on the first chat row;
+            // the immediate cockpit repaint then erased it.
+            let slash_definition =
+                crate::permissions::free_text_form("Slash commands stay in chat?");
+            let slash_top = cockpit.screen.top;
+            let slash_block_h = cockpit.screen.block_h;
+            let slash_rows = cockpit.screen.rows;
+            let slash_cols = cockpit.screen.cols;
+            let before_slash = tty.painted().len();
+            let slash_typer =
+                tty.type_when_painted("Prompt — Slash commands stay in chat?", b"/help\r");
+            let (slash_reply, slash_answer) = std::sync::mpsc::sync_channel(1);
+            cockpit
+                .handle_request(SurfaceRequest::Interact {
+                    interaction: Box::new(
+                        newt_core::interaction_surface::SurfaceInteraction::blocking(
+                            slash_definition,
+                        ),
+                    ),
+                    reply: slash_reply,
+                })
+                .expect("present the slash-command interaction");
+            assert!(
+                slash_typer.join().expect("slash prompt watcher"),
+                "the slash-command prompt must be visible before input"
+            );
+            assert_eq!(
+                slash_answer.recv().expect("slash-command outcome"),
+                newt_core::HumanQuestionOutcome::Cancelled,
+                "a slash command is chat intent, not a modal answer"
+            );
+
+            let painted_after_slash = tty.painted();
+            let slash_delta = &painted_after_slash[before_slash..];
+            let notice_row = crate::permissions::SLASH_COMMAND_PROMPT_NOTICE
+                .as_bytes()
+                .to_vec();
+            let notice_rows = wrap_row(&notice_row, usize::from(slash_cols));
+            let (committed_notice, _) =
+                render_insert(slash_top, slash_block_h, slash_rows, &notice_rows)
+                    .expect("durable notice insertion plan");
+            let committed_notice =
+                String::from_utf8(committed_notice).expect("notice bytes are UTF-8");
+            assert!(
+                slash_delta.contains(&committed_notice),
+                "slash guidance was not committed above the cockpit viewport: {slash_delta:?}"
+            );
+            assert_eq!(
+                cockpit.editor.draft(),
+                draft,
+                "backing out of a modal keeps the mounted chat draft"
+            );
+
+            // The modal's raw reader still composes with the cockpit's own
+            // raw-mode guard. This checks termios directly, independently of
+            // the visibility assertion above.
             // The integration #1770 could not prove alone: that fix made the
             // modal take raw mode from the real termios instead of crossterm's
             // global, and the cockpit is exactly the second raw-mode owner

@@ -38,17 +38,33 @@ pub(crate) struct TestTty {
 impl TestTty {
     /// Take fd 0 and fd 1 onto a fresh pty slave.
     pub(crate) fn install() -> Self {
+        // Start far enough down the screen that the cockpit acceptance test
+        // has real transcript rows above its mounted chat block. Row/column
+        // replies are 1-based, as required by the terminal protocol.
+        Self::install_at(10, 1)
+    }
+
+    /// Take fd 0 and fd 1 onto a fresh pty slave and answer the presenter's
+    /// initial cursor query with `row`, `col`.
+    pub(crate) fn install_at(row: u16, col: u16) -> Self {
+        assert!(row > 0 && col > 0, "cursor replies are one-based");
         // SAFETY: openpty + dup/dup2 on descriptors this test owns; every one
         // is restored or closed in Drop.
         unsafe {
             let (mut master, mut slave) = (-1, -1);
+            let mut size = libc::winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
             assert_eq!(
                 libc::openpty(
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
                     std::ptr::null_mut::<libc::termios>(),
-                    std::ptr::null_mut::<libc::winsize>(),
+                    std::ptr::from_mut(&mut size),
                 ),
                 0,
                 "openpty for the test's terminal"
@@ -70,10 +86,13 @@ impl TestTty {
 
             let painted = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
+            let cursor_reply = format!("\x1b[{row};{col}R").into_bytes();
             let responder = {
                 let painted = Arc::clone(&painted);
                 let stop = Arc::clone(&stop);
-                std::thread::spawn(move || answer_terminal_queries(master, &painted, &stop))
+                std::thread::spawn(move || {
+                    answer_terminal_queries(master, &painted, &stop, &cursor_reply);
+                })
             };
             Self {
                 master,
@@ -101,11 +120,50 @@ impl TestTty {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         String::from_utf8_lossy(&buf).into_owned()
     }
+
+    /// Type `bytes` only after `needle` has reached the emulated operator's
+    /// screen. The fallback write after the deadline keeps a regression from
+    /// deadlocking the test forever; the returned boolean still makes the
+    /// missing-before-answer prompt fail loudly.
+    pub(crate) fn type_when_painted(
+        &self,
+        needle: &str,
+        bytes: &[u8],
+    ) -> std::thread::JoinHandle<bool> {
+        let master = self.master;
+        let painted = Arc::clone(&self.painted);
+        let needle = needle.as_bytes().to_vec();
+        let bytes = bytes.to_vec();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let saw_prompt = loop {
+                let saw = painted
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .windows(needle.len())
+                    .any(|window| window == needle);
+                if saw || std::time::Instant::now() >= deadline {
+                    break saw;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            // SAFETY: `master` remains owned by TestTty until the caller joins
+            // this handle, and `bytes` is live for the duration of the write.
+            let n = unsafe { libc::write(master, bytes.as_ptr().cast(), bytes.len()) };
+            assert_eq!(n as usize, bytes.len(), "write delayed terminal input");
+            saw_prompt
+        })
+    }
 }
 
 /// The answering half of a terminal: accumulate what the application paints,
 /// and reply to a cursor-position query (`ESC[6n`) as a real terminal would.
-fn answer_terminal_queries(master: RawFd, painted: &Mutex<Vec<u8>>, stop: &AtomicBool) {
+fn answer_terminal_queries(
+    master: RawFd,
+    painted: &Mutex<Vec<u8>>,
+    stop: &AtomicBool,
+    cursor_reply: &[u8],
+) {
     let mut buf = [0u8; 4096];
     let mut pending = Vec::new();
     while !stop.load(Ordering::SeqCst) {
@@ -134,8 +192,7 @@ fn answer_terminal_queries(master: RawFd, painted: &Mutex<Vec<u8>>, stop: &Atomi
         // scanned prefix so a query split across reads is still matched.
         while let Some(at) = find(&pending, b"\x1b[6n") {
             // SAFETY: writing our reply to the master.
-            let reply = b"\x1b[1;1R";
-            unsafe { libc::write(master, reply.as_ptr().cast(), reply.len()) };
+            unsafe { libc::write(master, cursor_reply.as_ptr().cast(), cursor_reply.len()) };
             pending.drain(..at + 4);
         }
         if pending.len() > 8 {
