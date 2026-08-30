@@ -244,7 +244,10 @@ impl Screen {
         )?;
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
-        let _ = crossterm::terminal::disable_raw_mode();
+        // Raw mode is NOT released here. The session guard's doc already says
+        // "the MODES are this guard's job"; disabling here as well restored
+        // crossterm's global early, while the capture was still installed, and
+        // then the guard restored again. One owner, one restore (#1925).
         Ok(())
     }
 }
@@ -330,7 +333,9 @@ fn write_mode_restores(w: &mut impl io::Write) -> io::Result<()> {
 /// it has one definition the guard and the test share. Errors are swallowed:
 /// a Drop path cannot propagate, and a best-effort restore beats none.
 fn restore_terminal_modes() {
-    let _ = crossterm::terminal::disable_raw_mode();
+    // Escape sequences ONLY. Raw mode is the `_raw: RawModeGuard` field's, and
+    // it is declared after this guard so it restores AFTER these — see that
+    // field's doc for why the order matters.
     let _ = write_mode_restores(&mut io::stdout());
 }
 
@@ -421,6 +426,22 @@ pub(crate) struct Presenter {
     /// once fd 1 is back on the real terminal, letting its `execute!` land there
     /// rather than in the pty. Reuses `RestoreOnDrop` (#1411 convention).
     _restore: crate::RestoreOnDrop<fn()>,
+    /// Raw mode, restored to the termios this session FOUND (#1925).
+    ///
+    /// It used to be `disable_raw_mode()` inside `_restore`'s closure, and
+    /// crossterm keeps ONE process-global "mode prior to raw" — so the cockpit
+    /// restored to whatever the process last had rather than to what it took.
+    /// C2b (#1920) hit that as a real failure: an inner frame handing the
+    /// terminal back while an outer one was still up.
+    ///
+    /// DECLARED LAST, AFTER `_restore`, AND THAT IS THE SECOND FIX. Fields
+    /// drop in declaration order, so the escape-sequence restores (line wrap,
+    /// bracketed paste, cursor) now run BEFORE raw mode is given back. The old
+    /// `restore_terminal_modes` did raw FIRST — the inverse of the order #1901
+    /// argued for, where releasing line discipline while paste markers are
+    /// still armed lets a paste in that window arrive as a literal `ESC[200~`.
+    /// Composition fixes it without a line of ordering code.
+    _raw: newt_core::tty::raw_mode::RawModeGuard,
 }
 
 /// The cockpit does not paint through the arbiter — its rows are on the real
@@ -467,7 +488,7 @@ impl Presenter {
         } else {
             y
         };
-        crossterm::terminal::enable_raw_mode()?;
+        let raw = newt_core::tty::raw_mode::RawModeGuard::enter()?;
         execute!(
             stdout,
             crossterm::event::EnableBracketedPaste,
@@ -524,6 +545,7 @@ impl Presenter {
             dirty: true,
             last_draw: Instant::now(),
             _restore: restore,
+            _raw: raw,
         })
     }
 
@@ -804,12 +826,25 @@ impl Presenter {
     fn sync_modal_edge(&mut self) {
         let suspended = self.arbiter.suspended();
         if self.was_suspended != suspended {
-            if !suspended {
-                // Belt and braces: the modal restores the exact prior termios
-                // itself now, but a stray `disable_raw_mode` anywhere would
-                // otherwise leave us cooked. A no-op when already raw.
-                let _ = crossterm::terminal::enable_raw_mode();
-            }
+            // NO RE-ASSERT ANY MORE (#1925). This used to call
+            // `enable_raw_mode()` here, and its own comment said why it was
+            // only belt and braces: "the modal restores the exact prior
+            // termios itself now, but a stray `disable_raw_mode` anywhere
+            // would otherwise leave us cooked."
+            //
+            // Both halves have since been closed. #1905 put every modal guard
+            // on `RawModeGuard`, so a modal closing inside a raw cockpit hands
+            // back RAW — what it found. And this file was the last production
+            // member of the `raw-mode owners outside RawModeGuard` category, so
+            // "a stray disable_raw_mode anywhere" cannot be added without
+            // tripping the ratchet.
+            //
+            // A re-assert is also the one thing `RawModeGuard` deliberately
+            // cannot express: it captures on construction and restores on
+            // drop, and an `ensure_raw()` would capture the CURRENT mode as
+            // "prior" — which, at the exact moment you would want to call it,
+            // is the cooked mode you are trying to undo. The right answer was
+            // to stop needing it, not to widen the type.
             // Repaint from nothing: whatever the modal (or the kernel's echo,
             // before that was fixed) put on our rows, ratatui's diff must not
             // be allowed to believe it is still ours.
@@ -845,6 +880,55 @@ pub(crate) fn supported() -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// **The presenter USES the guard** (#1925), which the PTY tests cannot
+    /// show. They prove `RawModeGuard` restores; a guard that is correct and
+    /// unused is exactly the state these files were in before #1897.
+    ///
+    /// Counts CALL FORMS, never names: this file's doc comments discuss
+    /// `enable_raw_mode()` and `disable_raw_mode` precisely because they
+    /// explain why neither is called any more, and a name-based count would
+    /// read its own explanation as a violation.
+    #[test]
+    fn the_cockpit_takes_raw_mode_only_through_the_guard() {
+        let src = crate::production_source(include_str!("presenter.rs"));
+        for call in [
+            "enable_raw_mode()?",
+            "enable_raw_mode();",
+            "disable_raw_mode();",
+        ] {
+            assert_eq!(
+                src.matches(call).count(),
+                0,
+                "`{call}` is a second raw-mode owner on crossterm's \
+                 process-global; the cockpit takes raw through RawModeGuard"
+            );
+        }
+        assert!(
+            src.contains("_raw: newt_core::tty::raw_mode::RawModeGuard"),
+            "the session must HOLD a RawModeGuard"
+        );
+    }
+
+    /// The field order IS the restore order, and it is the half a reader can
+    /// get wrong silently: fields drop in declaration order, so `_restore`
+    /// (line wrap, bracketed paste, cursor) must come BEFORE `_raw`, or line
+    /// discipline is handed back while paste markers are still armed (#1901).
+    #[test]
+    fn the_escape_restores_are_declared_before_raw_mode() {
+        let src = crate::production_source(include_str!("presenter.rs"));
+        let restore = src
+            .find("    _restore: crate::RestoreOnDrop<fn()>,")
+            .expect("the escape-sequence guard is a field");
+        let raw = src
+            .find("    _raw: newt_core::tty::raw_mode::RawModeGuard,")
+            .expect("raw mode is a field");
+        assert!(
+            restore < raw,
+            "_restore must be declared before _raw so the escape restores run \
+             first; swapping them inverts the teardown order silently"
+        );
+    }
+
     use super::*;
 
     /// The geometry that has to be exactly right: where the block lands after
@@ -1140,11 +1224,14 @@ mod terminal_acceptance {
     fn a_panic_restores_the_real_termios_through_the_modes_guard() {
         let _tty = TestTty::install();
         // Clear crossterm's saved-mode static FIRST. It is process-global, so
-        // an earlier test in this binary may have populated it; `enable_raw_mode`
-        // would then be a no-op-ish and `disable_raw_mode` would restore that
-        // older baseline instead of this test's. On Linux the two happen to
-        // agree; on macOS the raw-mode field set differs and the mismatch is
-        // visible. (Same global-static hazard #1770 fixed in the modal.)
+        // an earlier test in this binary may have populated it.
+        //
+        // #1925 is what makes this belt and braces rather than load-bearing:
+        // the presenter takes raw through `RawModeGuard`, which captures the
+        // real termios and never consults that static. The hazard this line
+        // guards against — restoring an OLDER baseline than the one this test
+        // set — is the very defect the swap removes. Kept because other tests
+        // in this binary still populate the static.
         let _ = crossterm::terminal::disable_raw_mode();
         set_canonical_echo(0);
         let before = termios_of(0);
@@ -1152,10 +1239,21 @@ mod terminal_acceptance {
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(|| {
-            let _modes: crate::RestoreOnDrop<fn()> = crate::RestoreOnDrop {
-                restore: restore_terminal_modes,
+            // Model the PRESENTER'S OWN FIELD PAIR, in its declaration order
+            // (#1925). A struct, not two locals, and deliberately: struct
+            // fields drop in declaration order while locals drop in REVERSE,
+            // so two `let`s here would exercise the opposite order to the one
+            // the presenter has and prove nothing about it.
+            struct Held {
+                _restore: crate::RestoreOnDrop<fn()>,
+                _raw: newt_core::tty::raw_mode::RawModeGuard,
+            }
+            let _held = Held {
+                _restore: crate::RestoreOnDrop {
+                    restore: restore_terminal_modes,
+                },
+                _raw: newt_core::tty::raw_mode::RawModeGuard::enter().expect("raw"),
             };
-            crossterm::terminal::enable_raw_mode().expect("raw");
             assert!(!is_canonical(0), "precondition: raw mode taken");
             panic!("turn exploded while the terminal was raw");
         });
