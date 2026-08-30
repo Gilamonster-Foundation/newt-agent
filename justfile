@@ -204,6 +204,14 @@ check:
     # (#1828) is the inward protocol layer and must build with no feature at
     # all — the configuration the wyvern/headless tier leaves it in.
     cargo test -p newt-interaction --no-default-features || rc=1
+    # PIPELINE PARITY: mirrors the "cross-language conformance (external
+    # consumer)" step in .github/workflows/ci.yml. Pure stdlib Python, ~0.5s.
+    # `--self-test` pins its BLAKE3 against the published vectors, `verify`
+    # re-derives every golden id independently, and `check` proves the
+    # committed external responses are still what that consumer produces.
+    python3 newt-interaction/conformance/newt_conformance.py --self-test >/dev/null || rc=1
+    python3 newt-interaction/conformance/newt_conformance.py verify >/dev/null || rc=1
+    python3 newt-interaction/conformance/newt_conformance.py check >/dev/null || rc=1
     # Cheap (~0.1s) and catches the class readme-check cannot see: a dead link
     # between two docs, or source citing a document that no longer exists.
     python3 scripts/docs_check.py --self-test >/dev/null || rc=1

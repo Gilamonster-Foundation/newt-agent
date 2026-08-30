@@ -68,6 +68,19 @@ jobs:
       - name: process-spawn inventory (no unreviewed subprocess)
         if: always()
         run: python3 scripts/spawn_inventory.py
+      # G1 (#1934): the EXTERNAL proof. A stdlib-only Python consumer with its
+      # own BLAKE3, DAG-CBOR encoder, and CID renderer re-derives every golden
+      # vector's bytes and id, and authors the responses
+      # `newt-interaction/tests/external_consumer.rs` validates. It runs here
+      # rather than through a Rust test on purpose: a consumer invoked by the
+      # crate it is meant to check independently is not independent.
+      # HOOK PARITY: mirrored by .githooks/pre-push via `just check`.
+      - name: cross-language conformance (external consumer)
+        if: always()
+        run: |
+          python3 newt-interaction/conformance/newt_conformance.py --self-test
+          python3 newt-interaction/conformance/newt_conformance.py verify
+          python3 newt-interaction/conformance/newt_conformance.py check
       # Documentation references (#1023 follow-up). Source cites docs heavily
       # and nothing verified those paths; readme-check only covers README.md.
       # HOOK PARITY: mirrored by .githooks/pre-push via `just check`.

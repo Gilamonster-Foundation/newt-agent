@@ -1,0 +1,151 @@
+[
+  {
+    "name": "external/response-decision",
+    "authored_by": "newt_conformance.py (stdlib-only, no Newt code)",
+    "json": {
+      "schema": "newt.interaction.response/v1",
+      "definition": "bafyr4ihctz4cceaqfn6gj6gti4pzg4lpw6jpovxeovodczgoj6b2uy7zsa",
+      "instance": "bafyr4if74d2kztq43cz4s46udqqasfniyuzouygnblu37qd6bgjk62m3py",
+      "revision": 0,
+      "values": [
+        {
+          "control": "decision",
+          "value": {
+            "kind": "choice",
+            "option": "deny"
+          }
+        }
+      ],
+      "idempotency_key": "external-decision",
+      "responder_provenance": {
+        "kind": "signed-assertion",
+        "subject": "operator:external-consumer",
+        "audience": "terminal",
+        "assertion": "external-assertion-handle"
+      }
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657381a26576616c7565a2646b696e646663686f696365666f7074696f6e6464656e7967636f6e74726f6c686465636973696f6e68696e7374616e6365d82a58250001711e20bfe0f4acce1cd8b3c973d41c200915a8c532ea60cd0ae9bfc07e0992af699b7e687265766973696f6e006a646566696e6974696f6ed82a58250001711e20e29e782110102b7c64f8d3471f93716fb792f756e4755c3164ce4f83aa63f9906f6964656d706f74656e63795f6b65797165787465726e616c2d6465636973696f6e74726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374781a6f70657261746f723a65787465726e616c2d636f6e73756d65726861756469656e6365687465726d696e616c69617373657274696f6e781965787465726e616c2d617373657274696f6e2d68616e646c65",
+    "content_id": "bafyr4id2oivwmdlazrxw56ve3jdso3v2dozaho2nqfjpmywzu3kkrpungm"
+  },
+  {
+    "name": "external/response-reason",
+    "authored_by": "newt_conformance.py (stdlib-only, no Newt code)",
+    "json": {
+      "schema": "newt.interaction.response/v1",
+      "definition": "bafyr4ihctz4cceaqfn6gj6gti4pzg4lpw6jpovxeovodczgoj6b2uy7zsa",
+      "instance": "bafyr4if74d2kztq43cz4s46udqqasfniyuzouygnblu37qd6bgjk62m3py",
+      "revision": 0,
+      "values": [
+        {
+          "control": "decision",
+          "value": {
+            "kind": "choice",
+            "option": "deny"
+          }
+        },
+        {
+          "control": "reason",
+          "value": {
+            "kind": "text",
+            "text": "answered by the external consumer"
+          }
+        }
+      ],
+      "idempotency_key": "external-reason",
+      "responder_provenance": {
+        "kind": "signed-assertion",
+        "subject": "operator:external-consumer",
+        "audience": "terminal",
+        "assertion": "external-assertion-handle"
+      }
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657382a26576616c7565a2646b696e646663686f696365666f7074696f6e6464656e7967636f6e74726f6c686465636973696f6ea26576616c7565a2646b696e64647465787464746578747821616e737765726564206279207468652065787465726e616c20636f6e73756d657267636f6e74726f6c66726561736f6e68696e7374616e6365d82a58250001711e20bfe0f4acce1cd8b3c973d41c200915a8c532ea60cd0ae9bfc07e0992af699b7e687265766973696f6e006a646566696e6974696f6ed82a58250001711e20e29e782110102b7c64f8d3471f93716fb792f756e4755c3164ce4f83aa63f9906f6964656d706f74656e63795f6b65796f65787465726e616c2d726561736f6e74726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374781a6f70657261746f723a65787465726e616c2d636f6e73756d65726861756469656e6365687465726d696e616c69617373657274696f6e781965787465726e616c2d617373657274696f6e2d68616e646c65",
+    "content_id": "bafyr4iaaa26hodoh3vdalxidst5faz6kb3easyaj73u2t2guw6za2n5uf4"
+  },
+  {
+    "name": "external/response-remember",
+    "authored_by": "newt_conformance.py (stdlib-only, no Newt code)",
+    "json": {
+      "schema": "newt.interaction.response/v1",
+      "definition": "bafyr4ihctz4cceaqfn6gj6gti4pzg4lpw6jpovxeovodczgoj6b2uy7zsa",
+      "instance": "bafyr4if74d2kztq43cz4s46udqqasfniyuzouygnblu37qd6bgjk62m3py",
+      "revision": 0,
+      "values": [
+        {
+          "control": "decision",
+          "value": {
+            "kind": "choice",
+            "option": "deny"
+          }
+        },
+        {
+          "control": "remember",
+          "value": {
+            "kind": "toggle",
+            "on": false
+          }
+        }
+      ],
+      "idempotency_key": "external-remember",
+      "responder_provenance": {
+        "kind": "signed-assertion",
+        "subject": "operator:external-consumer",
+        "audience": "terminal",
+        "assertion": "external-assertion-handle"
+      }
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657382a26576616c7565a2646b696e646663686f696365666f7074696f6e6464656e7967636f6e74726f6c686465636973696f6ea26576616c7565a2626f6ef4646b696e6466746f67676c6567636f6e74726f6c6872656d656d62657268696e7374616e6365d82a58250001711e20bfe0f4acce1cd8b3c973d41c200915a8c532ea60cd0ae9bfc07e0992af699b7e687265766973696f6e006a646566696e6974696f6ed82a58250001711e20e29e782110102b7c64f8d3471f93716fb792f756e4755c3164ce4f83aa63f9906f6964656d706f74656e63795f6b65797165787465726e616c2d72656d656d62657274726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374781a6f70657261746f723a65787465726e616c2d636f6e73756d65726861756469656e6365687465726d696e616c69617373657274696f6e781965787465726e616c2d617373657274696f6e2d68616e646c65",
+    "content_id": "bafyr4ifwp4epm3jny5xhlrofov5h3bh3ujpc5pjjsj5xk2zqwqjd5zxkc4"
+  },
+  {
+    "name": "external/response-passphrase",
+    "authored_by": "newt_conformance.py (stdlib-only, no Newt code)",
+    "json": {
+      "schema": "newt.interaction.response/v1",
+      "definition": "bafyr4ihctz4cceaqfn6gj6gti4pzg4lpw6jpovxeovodczgoj6b2uy7zsa",
+      "instance": "bafyr4if74d2kztq43cz4s46udqqasfniyuzouygnblu37qd6bgjk62m3py",
+      "revision": 0,
+      "values": [
+        {
+          "control": "decision",
+          "value": {
+            "kind": "choice",
+            "option": "deny"
+          }
+        },
+        {
+          "control": "passphrase",
+          "value": {
+            "kind": "secret",
+            "reference": "external-consumer-handle-1"
+          }
+        }
+      ],
+      "idempotency_key": "external-passphrase",
+      "responder_provenance": {
+        "kind": "signed-assertion",
+        "subject": "operator:external-consumer",
+        "audience": "terminal",
+        "assertion": "external-assertion-handle"
+      }
+    },
+    "links": [
+      "definition",
+      "instance"
+    ],
+    "dagcbor_hex": "a766736368656d61781c6e6577742e696e746572616374696f6e2e726573706f6e73652f76316676616c75657382a26576616c7565a2646b696e646663686f696365666f7074696f6e6464656e7967636f6e74726f6c686465636973696f6ea26576616c7565a2646b696e6466736563726574697265666572656e6365781a65787465726e616c2d636f6e73756d65722d68616e646c652d3167636f6e74726f6c6a7061737370687261736568696e7374616e6365d82a58250001711e20bfe0f4acce1cd8b3c973d41c200915a8c532ea60cd0ae9bfc07e0992af699b7e687265766973696f6e006a646566696e6974696f6ed82a58250001711e20e29e782110102b7c64f8d3471f93716fb792f756e4755c3164ce4f83aa63f9906f6964656d706f74656e63795f6b65797365787465726e616c2d7061737370687261736574726573706f6e6465725f70726f76656e616e6365a4646b696e64707369676e65642d617373657274696f6e677375626a656374781a6f70657261746f723a65787465726e616c2d636f6e73756d65726861756469656e6365687465726d696e616c69617373657274696f6e781965787465726e616c2d617373657274696f6e2d68616e646c65",
+    "content_id": "bafyr4iarn7cj3jimygp57mafrio53d4weyjfaefpn4rzg443yr6cupa6ba"
+  }
+]
