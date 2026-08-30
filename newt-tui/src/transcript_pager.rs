@@ -320,9 +320,8 @@ mod terminal {
     use super::{PagerState, RowKind};
 
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-    use crossterm::terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-    };
+    use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+    use newt_core::tty::raw_mode::RawModeGuard;
     use ratatui::backend::CrosstermBackend;
     use ratatui::layout::{Constraint, Layout};
     use ratatui::style::{Color, Modifier, Style};
@@ -340,11 +339,18 @@ mod terminal {
     /// `pub(crate)` solely for `transcript_pager_pty_test` (#1677): the real-PTY
     /// error-path test drops this guard mid-unwind in a child process to prove
     /// the restoration claim above against an actual terminal.
-    pub(crate) struct AltScreenGuard;
+    ///
+    /// **Composed onto [`RawModeGuard`] (#1905).** The alternate screen is
+    /// this type's own; raw mode is the shared, nesting-aware owner held as a
+    /// field. Rust drops fields AFTER the `Drop::drop` body, so the screen is
+    /// left before raw mode is released — the order this guard already had.
+    pub(crate) struct AltScreenGuard {
+        _raw: RawModeGuard,
+    }
 
     impl AltScreenGuard {
         pub(crate) fn enter() -> io::Result<Self> {
-            enable_raw_mode()?;
+            let raw = RawModeGuard::enter()?;
             // Bind the guard BEFORE the fallible `execute!`, so Drop owns the
             // restore from this point on — the same shape `SplashScreenGuard`
             // uses (lib.rs), whose doc records that the hand-rolled rollback
@@ -359,7 +365,7 @@ mod terminal {
             // session on the alternate screen with no owner alive to leave
             // it, for the rest of its life. Reviewer-reproduced against real
             // crossterm on a would-block fd (#1677 review).
-            let guard = Self;
+            let guard = Self { _raw: raw };
             crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
             Ok(guard)
         }
@@ -367,8 +373,8 @@ mod terminal {
 
     impl Drop for AltScreenGuard {
         fn drop(&mut self) {
+            // Screen only; raw mode is released by `_raw` after this returns.
             let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
-            let _ = disable_raw_mode();
         }
     }
 

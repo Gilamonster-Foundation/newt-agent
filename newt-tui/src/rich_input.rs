@@ -65,7 +65,7 @@ use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers,
 };
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use newt_core::tty::raw_mode::RawModeGuard;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -1092,12 +1092,19 @@ pub(crate) struct RichSurface {
 ///
 /// `pub(crate)` solely for `rich_input_pty_test`, which drops it mid-unwind in a
 /// child process to prove the claim above against a real tty.
-pub(crate) struct RawPasteGuard;
+pub(crate) struct RawPasteGuard {
+    /// **A FIELD, and that is the ordering mechanism (#1905).** Rust runs a
+    /// struct's own `Drop::drop` body BEFORE dropping its fields, so releasing
+    /// bracketed paste in the body below and holding raw mode here gives
+    /// paste-then-raw structurally — the order this type's doc argues for, now
+    /// enforced by the language instead of by two adjacent statements someone
+    /// could reorder while tidying.
+    _raw: RawModeGuard,
+}
 
 impl RawPasteGuard {
     pub(crate) fn enter() -> io::Result<Self> {
-        let guard = Self;
-        enable_raw_mode()?;
+        let raw = RawModeGuard::enter()?;
         // Bracketed paste: the terminal wraps a paste in escape markers and
         // delivers it as ONE `Event::Paste(text)` instead of a stream of key
         // presses. Without it, a multi-line paste arrives as Char…Enter…Char…
@@ -1106,15 +1113,18 @@ impl RawPasteGuard {
         // Best-effort exactly as before: a terminal that does not support it
         // is not a reason to refuse the turn.
         let _ = crossterm::execute!(io::stdout(), EnableBracketedPaste);
-        Ok(guard)
+        Ok(Self { _raw: raw })
     }
 }
 
 impl Drop for RawPasteGuard {
     fn drop(&mut self) {
-        // REVERSE OF `enter`. See the type's doc comment before reordering.
+        // Paste only. Raw mode is released by `_raw` AFTER this body runs —
+        // see the field's doc. Releasing raw HERE instead would run first and
+        // re-create the bug the order exists to prevent, which is why
+        // `the_guard_releases_paste_before_raw_mode` asserts this body carries
+        // no raw release at all.
         let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
-        let _ = disable_raw_mode();
     }
 }
 
@@ -1695,15 +1705,25 @@ mod tests {
     #[test]
     fn raw_and_paste_are_owned_by_one_guard() {
         let src = production();
+        // #1905 subsumed the raw half onto `RawModeGuard`, so this file
+        // reaches crossterm's process-global not at all. The count that used
+        // to be "exactly one" is now "none": the ONE nesting-aware owner is in
+        // newt-core, and a bare call reappearing here would be a second owner
+        // restoring to a fixed state instead of to what it found.
         assert_eq!(
-            src.matches("enable_raw_mode()?").count(),
-            1,
-            "the ONLY enable_raw_mode call is RawPasteGuard::enter's"
+            src.matches("enable_raw_mode()").count(),
+            0,
+            "raw mode comes from RawModeGuard, never from crossterm directly"
         );
         assert_eq!(
             src.matches("disable_raw_mode();").count(),
-            1,
-            "the ONLY disable_raw_mode call is the Drop impl's"
+            0,
+            "…and is released by the field, never by a statement here"
+        );
+        assert!(
+            src.contains("_raw: RawModeGuard"),
+            "RawPasteGuard must HOLD a RawModeGuard — composition, not a \
+             reimplementation"
         );
         assert_eq!(
             src.matches("EnableBracketedPaste)").count(),
@@ -1735,17 +1755,56 @@ mod tests {
             .expect("the guard must restore from Drop")
             .1;
         let body = &drop_impl[..drop_impl.find("\n}").unwrap_or(drop_impl.len())];
-        let paste = body
-            .find("DisableBracketedPaste")
-            .expect("Drop must release bracketed paste");
-        let raw = body
-            .find("disable_raw_mode")
-            .expect("Drop must release raw mode");
+        // THE MECHANISM CHANGED, THE CONTRACT DID NOT (#1905). Raw mode is no
+        // longer released by a statement in this body; it is released by the
+        // `_raw: RawModeGuard` field, which Rust drops AFTER this body runs.
+        // So the assertion is structural: paste here, raw as a field, and NO
+        // raw release in the body — a `disable_raw_mode()` back in here would
+        // run FIRST and invert the order.
         assert!(
-            paste < raw,
-            "Drop must release bracketed paste BEFORE raw mode — the exact \
-             reverse of `enter`. See RawPasteGuard's doc comment."
+            body.contains("DisableBracketedPaste"),
+            "Drop must release bracketed paste in its own body"
         );
+        assert!(
+            !body.contains("disable_raw_mode();"),
+            "releasing raw mode in the body would run BEFORE the field drops, \
+             handing line discipline back with paste markers still armed"
+        );
+        assert!(
+            src.contains("_raw: RawModeGuard"),
+            "raw mode must be a FIELD, so it drops after the body"
+        );
+    }
+
+    /// **The language rule the ordering now rests on** (#1905).
+    ///
+    /// The test above asserts a STRUCTURE — paste in the Drop body, raw mode
+    /// in a field — and that only implies the right order if a struct's own
+    /// `Drop::drop` runs before its fields drop. It does; this pins it here
+    /// rather than leaving the contract resting on a fact nobody in this repo
+    /// has checked.
+    #[test]
+    fn a_drop_body_runs_before_its_fields_drop() {
+        use std::cell::RefCell;
+        thread_local! {
+            static ORDER: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+        }
+        struct Field;
+        impl Drop for Field {
+            fn drop(&mut self) {
+                ORDER.with(|o| o.borrow_mut().push("field"));
+            }
+        }
+        struct Outer {
+            _f: Field,
+        }
+        impl Drop for Outer {
+            fn drop(&mut self) {
+                ORDER.with(|o| o.borrow_mut().push("body"));
+            }
+        }
+        drop(Outer { _f: Field });
+        ORDER.with(|o| assert_eq!(*o.borrow(), ["body", "field"]));
     }
 
     use super::*;

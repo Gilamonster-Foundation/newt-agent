@@ -399,11 +399,9 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     execute,
     style::{Color as CtColor, Print, ResetColor, SetForegroundColor},
-    terminal::{
-        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
-        LeaveAlternateScreen,
-    },
+    terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use newt_core::tty::raw_mode::RawModeGuard;
 
 /// The PRODUCTION half of a source file, for the structural guards that assert
 /// "no other path exists" (#1889, #1898).
@@ -492,7 +490,19 @@ impl<F: FnMut()> Drop for RestoreOnDrop<F> {
 /// parked until then is the worse trade. This type is written to be absorbed —
 /// enter/restore is exactly the shape C1 needs.
 struct SplashScreenGuard {
+    /// **Composed onto the one nesting-aware owner (#1905).** The splash owns
+    /// the alternate screen and cursor visibility; raw mode is
+    /// [`RawModeGuard`]'s. Its own doc predicted this: *"This type is written
+    /// to be absorbed — enter/restore is exactly the shape C1 needs."*
+    ///
+    /// DECLARATION ORDER IS THE CONTRACT. Rust drops fields in declaration
+    /// order, after the struct's own `Drop::drop` — and this type has none, so
+    /// `_restore` runs first and `_raw` second. Screen and cursor come back
+    /// before line discipline does, which is the order this guard already had
+    /// when both lived in one closure. Swapping these two lines would invert
+    /// it silently.
     _restore: RestoreOnDrop<fn()>,
+    _raw: RawModeGuard,
 }
 
 impl SplashScreenGuard {
@@ -503,16 +513,21 @@ impl SplashScreenGuard {
     /// entering the alternate screen still gives raw mode back — that path was
     /// itself one of the three leaks.
     fn enter() -> io::Result<Self> {
-        enable_raw_mode()?;
+        let raw = RawModeGuard::enter()?;
         let guard = Self {
+            // Raw mode is NOT in this closure any more — `_raw` owns it. What
+            // remains is exactly the splash's own state.
             _restore: RestoreOnDrop {
                 restore: || {
-                    let _ = disable_raw_mode();
                     let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
                 },
             },
+            _raw: raw,
         };
-        // Flush the tty input queue on taking the terminal. A slow pre-splash step
+        // Flush the tty input queue on taking the terminal. This stays HERE and
+        // must never move into `RawModeGuard` (#1905): it is not part of raw
+        // mode, and every frame silently eating pending input would be a new
+        // bug wearing a refactor's clothes. A slow pre-splash step
         // — notably the first-run summarizer model pull (#661 group C), which runs
         // for seconds in cooked mode — lets impatient keystrokes or echoed bytes
         // queue up; entering raw mode does NOT discard them, so the splash's first
