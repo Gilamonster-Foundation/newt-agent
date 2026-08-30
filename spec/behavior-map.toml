@@ -210,8 +210,8 @@ symbol = "batch_duplicate_id_is_correlation_impossible"
 path = "newt-core/src/agentic/tools_tests/tests.rs"
 symbol = "batch_blank_id_is_correlation_impossible"
 [[BHV-TOOLS-002.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::responses_missing_call_id_aborts_without_a_followup_request"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "responses_missing_call_id_aborts_without_a_followup_request"
 [[BHV-TOOLS-002.refs.production]]
 path = "newt-core/src/agentic/tools.rs"
 symbol = "validate_tool_call_batch"
@@ -236,8 +236,8 @@ tla = "none"
 trace = "none"
 conformance = "partial"
 [[BHV-CONTEXT-001.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::responses_refuses_locally_when_a_configured_window_cannot_fit"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "responses_refuses_locally_when_a_configured_window_cannot_fit"
 [[BHV-CONTEXT-001.refs.rust_tests]]
 path = "newt-core/src/agentic/generation_policy.rs"
 symbol = "tests::cognition_output_reserve_is_the_one_source_of_the_output_budget"
@@ -265,8 +265,8 @@ symbol = "hard_ceiling_never_increases"
 module = "NewtPolicy.ResponsesUsage"
 symbol = "tighten_hard_never_increases"
 [[BHV-CONTEXT-002.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::responses_cw_recovery_ceiling_is_monotone_non_increasing"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "responses_cw_recovery_ceiling_is_monotone_non_increasing"
 
 # 003 was split: transport-level dispatch retries and mid-turn compaction/recovery
 # are DIFFERENT bounds with different state machines (and likely different TLA+
@@ -282,8 +282,8 @@ tla = "planned"
 trace = "none"
 conformance = "partial"
 [[BHV-CONTEXT-003A.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::dispatch_responses_json_retries_transient_transport_failures"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "dispatch_responses_json_retries_transient_transport_failures"
 
 [BHV-CONTEXT-003B]
 description = "Compaction and context-window-recovery attempts within a turn are bounded (no unbounded compact/redispatch loop): a single proactive no-progress compaction attempt, and a bounded cw-400 redispatch."
@@ -297,11 +297,11 @@ tla = "planned"
 trace = "none"
 conformance = "partial"
 [[BHV-CONTEXT-003B.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::responses_proactive_no_progress_invokes_the_compactor_exactly_once"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "responses_proactive_no_progress_invokes_the_compactor_exactly_once"
 [[BHV-CONTEXT-003B.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::responses_context_window_400_recovery_is_bounded"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "responses_context_window_400_recovery_is_bounded"
 
 # ─────────────────────────────── Replay / storage ────────────────────────────
 
@@ -329,8 +329,8 @@ tla = "none"
 trace = "none"
 conformance = "partial"
 [[BHV-STORAGE-001.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::responses_request_sets_store_false"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "responses_request_sets_store_false"
 [[BHV-STORAGE-001.refs.rust_tests]]
 path = "newt-inference/src/responses.rs"
 symbol = "tests::transport_sets_store_false_for_stateless_no_retention"
@@ -362,23 +362,23 @@ invariant = "RetryObligationIsSameRound"
 spec = "ChatRecovery"
 invariant = "RecoveryRequestStaysInRound"
 [[BHV-ROUND-001.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::openai_chat_cw_400_recovery_retries_the_same_logical_round_with_tools"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "openai_chat_cw_400_recovery_retries_the_same_logical_round_with_tools"
 [[BHV-ROUND-001.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::ollama_chat_cw_400_recovery_retries_the_same_logical_round_with_tools"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "ollama_chat_cw_400_recovery_retries_the_same_logical_round_with_tools"
 # Each recovery BRANCH is coded independently (no shared typed recovery-policy
 # yet), so cw-400 coverage cannot stand in for the others: cite the same-round
 # test for every recovery kind this general contract governs.
 [[BHV-ROUND-001.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::ollama_chat_tools_unsupported_recovers_in_the_same_round"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "ollama_chat_tools_unsupported_recovers_in_the_same_round"
 [[BHV-ROUND-001.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::openai_chat_tools_unsupported_recovers_in_the_same_round"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "openai_chat_tools_unsupported_recovers_in_the_same_round"
 [[BHV-ROUND-001.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::ollama_chat_malformed_xml_retries_the_same_logical_round_with_tools"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "ollama_chat_malformed_xml_retries_the_same_logical_round_with_tools"
 
 [BHV-ROUND-002]
 # "Effective" cap, not the soft configured cap: the production loops extend
@@ -427,11 +427,11 @@ conformance = "partial"
 spec = "ChatRecovery"
 invariant = "UnsupportedToolsRetryDisablesTools"
 [[BHV-RECOVERY-002.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::ollama_chat_tools_unsupported_recovers_in_the_same_round"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "ollama_chat_tools_unsupported_recovers_in_the_same_round"
 [[BHV-RECOVERY-002.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::openai_chat_tools_unsupported_recovers_in_the_same_round"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "openai_chat_tools_unsupported_recovers_in_the_same_round"
 
 [BHV-RECOVERY-003]
 description = "Malformed-XML recovery retries the same round with tools retained and a bounded corrective nudge."
@@ -448,11 +448,11 @@ invariant = "MalformedXmlRetryRetainsTools"
 spec = "ChatRecovery"
 invariant = "RecoveryBounds"
 [[BHV-RECOVERY-003.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::ollama_chat_malformed_xml_retries_the_same_logical_round_with_tools"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "ollama_chat_malformed_xml_retries_the_same_logical_round_with_tools"
 [[BHV-RECOVERY-003.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::ollama_chat_malformed_xml_is_bounded_to_two_nudges"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "ollama_chat_malformed_xml_is_bounded_to_two_nudges"
 
 [BHV-RECOVERY-004]
 # tla = "none": the "exhaustion -> Error, never a summary" claim is a LIVENESS/
@@ -472,8 +472,8 @@ tla = "none"
 trace = "none"
 conformance = "partial"
 [[BHV-RECOVERY-004.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::ollama_chat_malformed_xml_is_bounded_to_two_nudges"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "ollama_chat_malformed_xml_is_bounded_to_two_nudges"
 
 # ─────────────────── Prompt / action contract (PR #1520) ─────────────────────
 # The unified prompt/action contract across TUI and web: the published Question
@@ -886,17 +886,17 @@ symbol = "accepted_emitted_le_one"
 path = "newt-core/src/agentic/mod.rs"
 symbol = "RoundObservation"
 [[BHV-USAGE-001.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "observation_hook_tests::accepted_text_emits_exactly_one_accepted"
+path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
+symbol = "accepted_text_emits_exactly_one_accepted"
 [[BHV-USAGE-001.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "observation_hook_tests::validated_tool_calls_emit_one_accepted_and_survive_execution_failure"
+path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
+symbol = "validated_tool_calls_emit_one_accepted_and_survive_execution_failure"
 [[BHV-USAGE-001.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "observation_hook_tests::content_invalid_tool_batch_emits_no_accepted"
+path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
+symbol = "content_invalid_tool_batch_emits_no_accepted"
 [[BHV-USAGE-001.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "observation_hook_tests::truncation_suspect_rounds_emit_nothing"
+path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
+symbol = "truncation_suspect_rounds_emit_nothing"
 
 [BHV-USAGE-002]
 description = "Accepted usage evidence may raise only the SOFT send budget, never the hard ceiling, and the soft budget remains bounded by the current hard ceiling. Context-window recovery may TIGHTEN the hard ceiling but never raise it — so the hard ceiling never increases during a turn."
@@ -930,11 +930,11 @@ symbol = "hard_ceiling_never_increases"
 path = "newt-core/src/agentic/mod.rs"
 symbol = "RoundObservation"
 [[BHV-USAGE-002.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "observation_hook_tests::poisoned_low_budget_recovers_via_accepted_observation_and_raise"
+path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
+symbol = "poisoned_low_budget_recovers_via_accepted_observation_and_raise"
 [[BHV-USAGE-002.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "observation_hook_tests::openai_loop_reports_accepted_rounds"
+path = "newt-core/src/agentic/mod_tests/observation_hook_tests.rs"
+symbol = "openai_loop_reports_accepted_rounds"
 
 # ─────────────────────── Strict Responses wire validation (B5) ────────────────
 
@@ -1045,14 +1045,14 @@ symbol = "tests::post_bridge_budget_rejects_a_fence_inflated_request_with_attrib
 # …and the AGENT-LOOP lifecycle: proactive same-round compaction before the first
 # dispatch, a single no-progress compaction attempt, and final-summary compaction.
 [[BHV-CONTEXT-004.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::responses_proactively_compacts_before_the_first_dispatch"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "responses_proactively_compacts_before_the_first_dispatch"
 [[BHV-CONTEXT-004.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::responses_proactive_no_progress_invokes_the_compactor_exactly_once"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "responses_proactive_no_progress_invokes_the_compactor_exactly_once"
 [[BHV-CONTEXT-004.refs.rust_tests]]
-path = "newt-core/src/agentic/mod.rs"
-symbol = "tool_round_cap_tests::responses_final_summary_is_proactively_compacted"
+path = "newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs"
+symbol = "responses_final_summary_is_proactively_compacted"
 
 # ── A3 interaction protocol (#1803, formal layer #1843) ────────────────────
 # The renderer-neutral interaction controller: `newt-interaction`'s response
