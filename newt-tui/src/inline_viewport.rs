@@ -210,6 +210,20 @@ pub(crate) fn inline_terminal(height: u16) -> io::Result<InlineTerm> {
 /// Same rule, same anchor, same one-shot warning: a cockpit that refuses to
 /// open because the terminal stayed quiet is the same defect as a panel that
 /// does, and it must not be a second implementation of the answer.
+///
+/// **`#[cfg(unix)]` to match its only caller**, not to silence a lint. The
+/// live cockpit — the fd 1/2 capture and this presenter — is unix-only by
+/// construction (`openpty`/`dup2`/termios); Windows keeps the classic
+/// per-turn surface until a ConPTY backend lands (#1746). A
+/// `#[allow(dead_code)]` here would say "trust me"; the cfg says which
+/// caller, and goes stale in the same commit that gives Windows a cockpit.
+///
+/// **Windows panels are NOT left unrescued by this.** They reach the same
+/// fallback through [`inline_terminal`], which is not gated: `config_panel`,
+/// `rich_input` and `interaction_view` are `rich-tui`-gated only, so
+/// `AnchoredBackend::get_cursor_position` runs there exactly as it does here.
+/// What is absent on Windows is the *cockpit*, not the rescue.
+#[cfg(unix)]
 pub(crate) fn cursor_position_or_anchor() -> Position {
     let mut backend = AnchoredBackend::new(io::stdout());
     // `get_cursor_position` above already rescues; this is the last resort if
