@@ -562,12 +562,12 @@ path = "newt-tui/src/prompt_visibility_test.rs"
 symbol = "permission_prompt_controls_are_immediate_and_distinct"
 tier = "integration"
 [[BHV-PROMPT-002.refs.rust_tests]]
-path = "newt-tui/src/permissions.rs"
-symbol = "permission_prompt_tests::ctrl_c_after_a_recoverable_reader_error_sets_cancel_and_exit"
+path = "newt-tui/src/permissions_tests/permission_prompt_tests.rs"
+symbol = "ctrl_c_after_a_recoverable_reader_error_sets_cancel_and_exit"
 tier = "unit"
 [[BHV-PROMPT-002.refs.rust_tests]]
-path = "newt-tui/src/permissions.rs"
-symbol = "permission_prompt_tests::nested_controls_cancel_without_recording_a_permission_decision"
+path = "newt-tui/src/permissions_tests/permission_prompt_tests.rs"
+symbol = "nested_controls_cancel_without_recording_a_permission_decision"
 tier = "unit"
 [[BHV-PROMPT-002.refs.production]]
 path = "newt-core/src/tty/modal.rs"
@@ -591,11 +591,11 @@ invariant = "SingleWinner"
 spec = "PromptControls"
 invariant = "TimeoutNeverAuthorizes"
 [[BHV-PROMPT-003.refs.rust_tests]]
-path = "newt-tui/src/permissions.rs"
-symbol = "permission_prompt_tests::web_verdict_and_local_control_resolve_exactly_once"
+path = "newt-tui/src/permissions_tests/permission_prompt_tests.rs"
+symbol = "web_verdict_and_local_control_resolve_exactly_once"
 [[BHV-PROMPT-003.refs.rust_tests]]
-path = "newt-tui/src/permissions.rs"
-symbol = "permission_prompt_tests::web_decision_timeout_resolves_and_denies_without_hanging"
+path = "newt-tui/src/permissions_tests/permission_prompt_tests.rs"
+symbol = "web_decision_timeout_resolves_and_denies_without_hanging"
 [[BHV-PROMPT-003.refs.rust_tests]]
 path = "newt-core/src/store.rs"
 symbol = "tests::interaction_offer_publish_answer_take_race_and_fence"
@@ -618,14 +618,14 @@ invariant = "ReaderErrorNeverAuthorizes"
 spec = "PromptControls"
 invariant = "RecoveryReArmsControls"
 [[BHV-PROMPT-004.refs.rust_tests]]
-path = "newt-tui/src/permissions.rs"
-symbol = "permission_prompt_tests::transient_reader_error_recovers_and_esc_resolves_through_the_tty_path"
+path = "newt-tui/src/permissions_tests/permission_prompt_tests.rs"
+symbol = "transient_reader_error_recovers_and_esc_resolves_through_the_tty_path"
 [[BHV-PROMPT-004.refs.rust_tests]]
-path = "newt-tui/src/permissions.rs"
-symbol = "permission_prompt_tests::transient_reader_error_does_not_deny_when_a_web_verdict_arrives"
+path = "newt-tui/src/permissions_tests/permission_prompt_tests.rs"
+symbol = "transient_reader_error_does_not_deny_when_a_web_verdict_arrives"
 [[BHV-PROMPT-004.refs.rust_tests]]
-path = "newt-tui/src/permissions.rs"
-symbol = "permission_prompt_tests::reader_failing_until_deadline_denies_without_busy_spin"
+path = "newt-tui/src/permissions_tests/permission_prompt_tests.rs"
+symbol = "reader_failing_until_deadline_denies_without_busy_spin"
 
 [BHV-PROMPT-005]
 # B0a (#1841) made both surfaces build ONE InteractionDefinition and render it
