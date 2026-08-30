@@ -36,3 +36,10 @@ thiserror.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 jsonschema.workspace = true
+# G1 (#1934): fuzz the UNTRUSTED WIRE boundary — arbitrary bytes and
+# arbitrary author-supplied strings reaching `decode_*`, the id minting, and
+# `validate_response`. Same tool newt-core already fuzzes its string boundary
+# with (#1528 B2): no nightly, and it runs inside the per-PR gate rather than
+# beside it. Dev-only; `tests/guard.rs` excludes dev-dependencies by KIND, so
+# this cannot reach the runtime closure it guards at exactly three crates.
+proptest = "1"

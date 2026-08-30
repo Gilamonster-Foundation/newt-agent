@@ -15,6 +15,10 @@
 
 use content_addressable::{canonical, ContentAddressable, ContentId};
 use newt_interaction::{
+    binding::{validate_response, HandlerId, RegisteredAction, ResponderContext},
+    publish, HostMint, Refusal,
+};
+use newt_interaction::{
     AssertionKind, Audience, ChoiceOption, Control, ControlId, ControlKind, ControlValue,
     FeatureDemand, IdempotencyKey, InteractionDefinition, InteractionInstance, InteractionKind,
     Nonce, OptionId, Provenance, Requirement, ResponderPolicy, ResponderProvenance, Response,
@@ -76,7 +80,14 @@ fn generate_invalid() -> Vec<Vector> {
             &format!("response/invalid-{control}"),
             "response",
             &["definition", "instance"],
-            &sample_response(&def, &inst, ControlId::new(control).unwrap(), value),
+            &sample_response(
+                &def,
+                &inst,
+                vec![Submission {
+                    control: ControlId::new(control).unwrap(),
+                    value,
+                }],
+            ),
         );
         v.invalid_because = Some(why.to_string());
         out.push(v);
@@ -227,18 +238,34 @@ fn sample_instance(def: &InteractionDefinition) -> InteractionInstance {
     }
 }
 
+/// The answer the required `decision` control demands.
+///
+/// Every response in the POSITIVE corpus carries it, because a response
+/// that leaves a required control unanswered is refused (`validate_response`
+/// rule 8) — and the positive corpus's whole claim is that a foreign
+/// implementation can reproduce it and have it accepted. It answers with
+/// the REFUSING option: a corpus that shipped a stock "allow" would be a
+/// worked example of granting permission.
+fn decision_answer() -> Submission {
+    Submission {
+        control: ControlId::new("decision").unwrap(),
+        value: ControlValue::Choice {
+            option: OptionId::new("deny").unwrap(),
+        },
+    }
+}
+
 fn sample_response(
     def: &InteractionDefinition,
     inst: &InteractionInstance,
-    control: ControlId,
-    value: ControlValue,
+    values: Vec<Submission>,
 ) -> Response {
     Response {
         schema: newt_interaction::ResponseTag,
         definition: def.definition_id().unwrap(),
         instance: inst.instance_id().unwrap(),
         revision: Revision::FIRST,
-        values: vec![Submission { control, value }],
+        values,
         idempotency_key: IdempotencyKey::new("first-try").unwrap(),
         responder_provenance: ResponderProvenance {
             kind: AssertionKind::SignedAssertion,
@@ -295,11 +322,19 @@ fn generate() -> Vec<Vector> {
             },
         ),
     ] {
+        let control = ControlId::new(control).unwrap();
+        // The kind-specific submission, plus the required control — unless
+        // this vector IS the required control's answer.
+        let values = if control == decision_answer().control {
+            vec![Submission { control, value }]
+        } else {
+            vec![decision_answer(), Submission { control, value }]
+        };
         out.push(vector(
             &format!("response/value-{name}"),
             "response",
             &["definition", "instance"],
-            &sample_response(&def, &inst, ControlId::new(control).unwrap(), value),
+            &sample_response(&def, &inst, values),
         ));
     }
     out
@@ -907,4 +942,136 @@ mod schema_conformance {
             );
         }
     }
+}
+
+/// **The positive corpus is valid in context, not merely well-formed**
+/// (G1, #1934).
+///
+/// `generate_invalid` argues that the positive corpus must not contain
+/// records A3 will reject — "shipping records that A3 will reject,
+/// labelled only by prose someone has to read". That was asserted in a
+/// doc comment and nowhere else, and prose does not hold. A foreign
+/// implementation that reproduces `response/value-text` and submits it is
+/// entitled to have it accepted.
+#[test]
+fn every_positive_response_vector_is_accepted_against_the_offer() {
+    let (definition, instance) = committed_offer();
+    let lifecycle = publish(&HostMint::assert_host_authority(), &instance, &definition)
+        .expect("the offer publishes");
+    let actions = corpus_actions();
+    let context = ResponderContext {
+        workspace_key: &instance.scope.workspace_key,
+        registered: &actions,
+    };
+
+    let mut checked = 0;
+    for vector in committed(vectors_path()) {
+        if vector.record != "response" {
+            continue;
+        }
+        let response: Response =
+            canonical::from_canonical_dagcbor_checked(&from_hex(&vector.dagcbor_hex))
+                .expect("a committed vector decodes");
+        validate_response(&definition, &instance, &lifecycle, &response, &context).unwrap_or_else(
+            |e| {
+                panic!(
+                    "vector `{}` is published as valid but the protocol refuses it: {e}",
+                    vector.name
+                )
+            },
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no response vector was checked");
+}
+
+/// **Anti-vacuous twin.** The same path must be able to refuse.
+///
+/// Without this, the test above could be passing because
+/// `validate_response` accepts everything that decodes.
+#[test]
+fn every_invalid_vector_is_refused_by_that_same_path() {
+    let (definition, instance) = committed_offer();
+    let lifecycle = publish(&HostMint::assert_host_authority(), &instance, &definition)
+        .expect("the offer publishes");
+    let actions = corpus_actions();
+    let context = ResponderContext {
+        workspace_key: &instance.scope.workspace_key,
+        registered: &actions,
+    };
+
+    let mut checked = 0;
+    for vector in committed(invalid_vectors_path()) {
+        assert!(
+            vector.invalid_because.is_some(),
+            "vector `{}` sits in the invalid corpus without saying why",
+            vector.name
+        );
+        let response: Response =
+            canonical::from_canonical_dagcbor_checked(&from_hex(&vector.dagcbor_hex))
+                .expect("an invalid vector still decodes — it is well-formed, not valid");
+        let refusal = validate_response(&definition, &instance, &lifecycle, &response, &context)
+            .expect_err("the invalid corpus must be refused");
+        // The stated reason has to be the reason. A record refused for
+        // some unrelated rule would make `invalid_because` a fiction.
+        assert!(
+            matches!(
+                refusal,
+                Refusal::WrongControlType { .. } | Refusal::ExtraControl { .. }
+            ),
+            "vector `{}` says `{}` but was refused as {refusal}",
+            vector.name,
+            vector.invalid_because.as_deref().unwrap_or("")
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "the invalid corpus is empty; nothing was refused"
+    );
+}
+
+fn committed(path: PathBuf) -> Vec<Vector> {
+    let vectors: Vec<Vector> =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("vectors file exists"))
+            .expect("vectors parse");
+    assert!(!vectors.is_empty(), "{} is empty", path.display());
+    vectors
+}
+
+/// The offer, decoded from the committed bytes rather than rebuilt — the
+/// corpus has to be valid as PUBLISHED, not as regenerated.
+fn committed_offer() -> (InteractionDefinition, InteractionInstance) {
+    let mut definition = None;
+    let mut instance = None;
+    for vector in committed(vectors_path()) {
+        let bytes = from_hex(&vector.dagcbor_hex);
+        match vector.record.as_str() {
+            "definition" => {
+                definition = Some(canonical::from_canonical_dagcbor_checked(&bytes).unwrap())
+            }
+            "instance" => {
+                instance = Some(canonical::from_canonical_dagcbor_checked(&bytes).unwrap())
+            }
+            _ => {}
+        }
+    }
+    (
+        definition.expect("a definition vector"),
+        instance.expect("an instance vector"),
+    )
+}
+
+/// Handlers a host would register for this offer. Not part of the corpus:
+/// `ResolvedAction` says a handler is "The CALLER's handler. Never derived
+/// from the definition."
+fn corpus_actions() -> Vec<RegisteredAction> {
+    ["allow-once", "deny"]
+        .into_iter()
+        .map(|option| RegisteredAction {
+            option: OptionId::new(option).unwrap(),
+            handler: HandlerId::new(format!("gate::{option}").replace('-', "_")).unwrap(),
+            audiences: vec![Audience::Terminal, Audience::Web],
+        })
+        .collect()
 }
