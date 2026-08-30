@@ -21,7 +21,7 @@ use base64::Engine as _;
 
 use crate::enrollment::EnrollmentCandidate;
 use crate::sas_transcript::{sas_words, TranscriptInputs, SAS_WORD_COUNT};
-use crate::tty::{read_prompt_window_line, Echo, PromptLine, PromptWindow};
+use crate::tty::PromptWindow;
 
 /// What the terminal concluded about a staged candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,33 +76,25 @@ pub fn recompute_sas(
     (transcript.hex() == candidate.transcript_id).then(|| sas_words(&transcript))
 }
 
-/// The prompt a human answers, given the words the terminal derived itself.
+/// The confirm the operator is shown, as a definition.
+///
+/// Public so the words it displays and the answers it accepts stay
+/// assertable — the two things `confirm_prompt` and `answer_verdict` were
+/// tested for before F0c retired them.
+///
+/// **Deliberately not named `confirm_prompt`.** That is the ratchet's needle
+/// for a BESPOKE confirm builder beside the shared path, and this is the
+/// opposite: it delegates to `interaction_form::confirm` and adds only this
+/// ceremony's question. Taking a baseline row would record a builder that
+/// does not exist. (The same call D1b-2 made for `CrewForm::write_confirm`.)
 #[must_use]
-pub fn confirm_prompt(words: &[&str; SAS_WORD_COUNT]) -> String {
-    format!(
-        "compare code {} matches the browser? [y/N] ",
-        words.join(" ")
+pub fn confirm_question(words: &[&str; SAS_WORD_COUNT]) -> crate::InteractionDefinition {
+    crate::interaction_form::confirm(
+        format!("compare code {} matches the browser?", words.join(" ")),
+        "",
+        "yes, they match",
+        "no, they differ",
     )
-}
-
-/// The verdict for what a human typed.
-///
-/// `None` means there was no answer at all — EOF (Ctrl-D) or a read error.
-/// Both decline: silence is not assent. Only an explicit yes is a yes; blank,
-/// "n", a stray keypress, and a pasted line all decline.
-///
-/// Split out from [`confirm_enrollment`] so the decision is testable without a
-/// [`PromptWindow`]. The capability cannot be constructed outside `tty` — that
-/// seal is itself compile-fail-tested — so anything that must be proven by a
-/// unit test has to live on this side of the boundary.
-#[must_use]
-pub fn answer_verdict(answer: Option<&str>) -> SasVerdict {
-    match answer {
-        Some(text) if matches!(text.trim().to_ascii_lowercase().as_str(), "y" | "yes") => {
-            SasVerdict::Confirmed
-        }
-        _ => SasVerdict::Declined,
-    }
 }
 
 /// Ask the operator whether the browser shows the same words.
@@ -111,10 +103,23 @@ pub fn answer_verdict(answer: Option<&str>) -> SasVerdict {
 /// [`SasVerdict::NoTerminal`]. It is deliberately not defaulted: a ceremony
 /// with nobody watching has not been confirmed by anybody.
 ///
-/// This function is only plumbing — every decision it makes is delegated to
-/// [`recompute_sas`] and [`answer_verdict`]. The terminal round-trip it wraps
-/// is covered at the UAT tier (tmux, both ends side by side), which is the only
-/// tier that can observe a real terminal.
+/// This function is only plumbing — the transcript decision is
+/// [`recompute_sas`]'s and the answer decision is
+/// `interaction_terminal::confirmed_on_terminal`'s, which resolves through
+/// D0's one resolver. The terminal round-trip it wraps is covered at the UAT
+/// tier (tmux, both ends side by side), the only tier that can observe a real
+/// terminal.
+///
+/// F0c (#1928) retired this module's private `confirm_prompt` (a `[y/N]`
+/// string builder) and `answer_verdict` (a `matches!("y" | "yes")`) — the
+/// last inline yes/no parser A0 §9 listed. Two operator-visible consequences,
+/// both deliberate:
+///
+/// * The prompt no longer advertises `[y/N]`. C0c's rule is that a surface
+///   never renders a default for a decision, and this decision PROMOTES A
+///   KEY — the one place an advertised default is least defensible.
+/// * Blank declines rather than being parsed as "not y". Same verdict,
+///   arrived at by a rule rather than by falling through a `matches!`.
 pub fn confirm_enrollment(
     window: Option<&PromptWindow>,
     candidate: &EnrollmentCandidate,
@@ -127,9 +132,18 @@ pub fn confirm_enrollment(
     let Some(words) = recompute_sas(candidate, issuer, subject) else {
         return SasVerdict::TranscriptMismatch;
     };
-    // The SAS words are shown, not typed secretly — an ordinary echo.
-    match read_prompt_window_line(window, &confirm_prompt(&words), Echo::Chars) {
-        Ok(PromptLine::Line(answer)) => answer_verdict(Some(&answer)),
-        Ok(PromptLine::Eof | PromptLine::Back | PromptLine::Exit) | Err(_) => SasVerdict::Declined,
+    // Echo is derived from the definition — the words are shown, not typed
+    // secretly, and no control here is a `Secret`, so it stays `Chars`
+    // without this site saying so.
+    if crate::interaction_terminal::confirmed_on_terminal(
+        window,
+        &confirm_question(&words),
+        // Blank declines. Nothing about a key promotion may happen because
+        // an operator pressed Enter, and EOF is refused by the adapter.
+        false,
+    ) {
+        SasVerdict::Confirmed
+    } else {
+        SasVerdict::Declined
     }
 }

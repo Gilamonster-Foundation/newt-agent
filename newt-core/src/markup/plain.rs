@@ -129,8 +129,9 @@ fn control_line(control: &Control) -> Option<String> {
     match &control.kind {
         ControlKind::Choice { options } => Some(choice_lines(options)),
         ControlKind::Text => labelled_field(control, ""),
-        // `[y/n]`, never `[y/N]`. The house style elsewhere
-        // (`sas_confirm::confirm_prompt`) capitalizes the default, and this
+        // `[y/n]`, never `[y/N]`. The house style elsewhere used to
+        // capitalize the default — `sas_confirm` did until F0c (#1928)
+        // retired its builder — and this
         // projection must advertise none: the epic's global acceptance
         // criterion is that headless modes never CHOOSE A DEFAULT, and a
         // rendered default is how one gets chosen by accident.
