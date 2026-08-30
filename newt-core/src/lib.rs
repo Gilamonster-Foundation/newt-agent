@@ -46,6 +46,7 @@ pub mod interaction_adapter;
 pub mod interaction_form;
 pub mod interaction_gate;
 pub mod interaction_offer;
+pub mod interaction_terminal;
 // C1 (#1862): the SEMANTIC half of the surface seam. Deliberately separate
 // from newt-tui's thread-shaped `SurfaceRequest`, which carries channels and
 // `Arc`s and can never cross a process (epic non-goal).
