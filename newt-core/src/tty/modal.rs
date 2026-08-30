@@ -21,63 +21,10 @@ pub enum PromptLine {
     Eof,
 }
 
-/// Raw mode for the modal's read, restored to EXACTLY what it was on drop.
-///
-/// Not `crossterm::terminal::enable_raw_mode`, and the difference is the
-/// bug: crossterm keeps ONE process-global "mode prior to raw" and makes a
-/// second `enable_raw_mode` a no-op while it is set. Under the cockpit
-/// (#1669) the terminal thread already owns raw mode for the whole session,
-/// so the modal's request did nothing — and `StdinToken::acquire` had just
-/// switched the tty to canonical+echo for the line-reader path. Result: keys
-/// line-buffered until Enter, echoed by the kernel over the editor row, and a
-/// prompt that looked hung. Saving and restoring the termios here, the way
-/// `StdinToken` does for line mode, makes nested ownership simply compose.
-struct RawGuard {
-    #[cfg(unix)]
-    prev: Option<libc::termios>,
-}
-
-impl RawGuard {
-    fn enter() -> io::Result<Self> {
-        #[cfg(unix)]
-        {
-            // SAFETY: termios round-trip on stdin, restored on drop.
-            let prev = unsafe {
-                let fd = libc::STDIN_FILENO;
-                let mut prev: libc::termios = std::mem::zeroed();
-                if libc::tcgetattr(fd, &mut prev) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                let mut raw = prev;
-                libc::cfmakeraw(&mut raw);
-                if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                prev
-            };
-            Ok(Self { prev: Some(prev) })
-        }
-        #[cfg(not(unix))]
-        {
-            crossterm::terminal::enable_raw_mode()?;
-            Ok(Self {})
-        }
-    }
-}
-
-impl Drop for RawGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(prev) = self.prev.take() {
-            // SAFETY: restoring the termios captured in `enter`.
-            unsafe {
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &prev);
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = crossterm::terminal::disable_raw_mode();
-    }
-}
+/// The shared raw-mode guard (C2b, #1891): promoted out of this module to
+/// `tty::raw_mode` when the RichTUI interaction frame needed it too. Its doc
+/// carries the #1770 reasoning this module paid for.
+use super::raw_mode::RawModeGuard as RawGuard;
 
 /// Classify one submitted headless line (the piped/non-TTY branch, after its
 /// EOF check): a line that is exactly the literal ESC byte is the piped
