@@ -472,7 +472,32 @@ const CATEGORIES: &[Category] = &[
         count: |f| count_sites(&f.squeezed, "fn confirm_prompt("),
         destinations: &[],
         baseline: &[
-            ("newt-core/src/sas_confirm.rs", 1),
+            // `newt-core/src/sas_confirm.rs` was here at 1 until F0c (#1928)
+            // FIXED it: the `[y/N]` string builder and its
+            // `matches!("y" | "yes")` verdict — the last inline yes/no parser
+            // A0 §9 listed — are gone, and the ceremony asks through
+            // `interaction_form::confirm` + `confirmed_on_terminal`.
+            //
+            // ACCEPTED RESIDUAL. `rich_input::confirm_prompt` is not a
+            // confirm-prompt BUILDER; it is a ratatui `Line` for the vi
+            // status row, returning `Option<&'static str>` that
+            // `prompt_line` styles and draws. Nothing reads an answer through
+            // it — the vi key handler does that, keystroke by keystroke, with
+            // the surface still live.
+            //
+            // It therefore cannot go through the shared adapter, and the
+            // reason is structural rather than a matter of effort:
+            // `present_on_terminal` SUSPENDS the surface to own the terminal
+            // for one line read. Suspending the rich input surface to ask it
+            // a question it is already displaying would tear down the thing
+            // asking. Accepted as chrome, not as an un-migrated prompt.
+            //
+            // Left COUNTED rather than renamed out of the needle. D1b-2 and
+            // F0c both renamed a helper that genuinely was not a bespoke
+            // builder (`write_confirm`, `confirm_question`); this one keeps
+            // the name because a reader looking for "where does the vi mode
+            // ask for confirmation" should find it under that name, and the
+            // row is the record of that trade.
             ("newt-tui/src/rich_input.rs", 1),
         ],
         rationale: "bespoke confirm-prompt builders beside the Question path",
@@ -543,9 +568,42 @@ const CATEGORIES: &[Category] = &[
             )
         },
         // D3a's one table algorithm, armed in the commit that created it.
-        destinations: &[("newt-core/src/markup/table.rs", 1)],
-        baseline: &[
+        destinations: &[
+            ("newt-core/src/markup/table.rs", 1),
+            // RECLASSIFIED by F0c (#1928) — moved from `baseline`, on the
+            // evidence D3a asserted and #1928 asked to have checked: this is
+            // "the canonical ANSI renderer — what others converge toward, not
+            // a target".
+            //
+            // The two are not duplicates, they are OPPOSITE ENDS of one
+            // pipeline. `markup/table.rs` turns rows of strings INTO GFM
+            // source; this turns a pulldown-cmark-PARSED table into ANSI
+            // box-drawing for a terminal. Data -> markup::table -> GFM ->
+            // dialect::parse -> here -> the screen. A second implementation
+            // of THIS is the duplicate the category exists to catch, so it
+            // takes the same ceiling `markup/table.rs` has: pinned at one,
+            // checked in both directions.
+            //
+            // It is `pub(super)`, internal to the markdown renderer, which is
+            // also why nothing has converged on it by accident.
             ("newt-core/src/agentic/markdown/table.rs", 1),
+            // RECLASSIFIED by F0c (#1928), on the evidence D3a asserted and
+            // #1928 asked to have checked: this is "the canonical ANSI
+            // renderer — what others converge toward, not a target".
+            //
+            // The two are not duplicates, they are OPPOSITE ENDS of one
+            // pipeline. `markup/table.rs` turns rows of strings INTO GFM
+            // source; this turns a pulldown-cmark-PARSED table into ANSI
+            // box-drawing for a terminal. Data -> markup::table -> GFM ->
+            // dialect::parse -> here -> the screen. A second implementation
+            // of THIS is the duplicate the category exists to catch, so it
+            // takes the same ceiling `markup/table.rs` has: pinned at one,
+            // checked in both directions.
+            //
+            // It is `pub(super)`, internal to the markdown renderer, which is
+            // also why nothing has converged on it by accident.
+        ],
+        baseline: &[
             // `newt-eval/src/scorecard.rs` was here at 1 until D3a: its
             // bespoke fixed-width renderer is deleted, and the type now
             // supplies rows to the algorithm above through `fmt::Display`.
@@ -561,7 +619,27 @@ const CATEGORIES: &[Category] = &[
             // A0 §4.1.2: ZERO production callers, and the decision to delete
             // or wire it must consult wyvern-agent, so D3a leaves it.
             ("newt-core/src/agentic/mod.rs", 2),
+            // ACCEPTED RESIDUAL, and it is not a table renderer at all.
+            // `config_panel::render_panel` is a RATATUI WIDGET: it takes a
+            // `&mut Frame`, builds `Line`s and calls `f.render_widget` into a
+            // bordered `Block`. It emits no text and cannot emit GFM — a pipe
+            // table is not a thing a `Frame` can hold. It matches only
+            // because the category's needle set includes `fn render_panel(`,
+            // which was chosen to catch panel-shaped renderers.
+            //
+            // Its two-column `{:<label_w$}` layout IS hand-laid, but that is
+            // the ad-hoc-width family's concern, and a ratatui widget cannot
+            // migrate there either.
             ("newt-tui/src/config_panel.rs", 1),
+            // ACCEPTED RESIDUAL, and also not an implementation. The site is
+            // a CALL to `pulldown_cmark::html::push_html` — the library's own
+            // HTML writer — inside the web shell's flush. newt-web is the
+            // third projection of one dialect (plain / ANSI / HTML), so this
+            // is the HTML one delegating to the parser crate rather than a
+            // fourth table renderer.
+            //
+            // Deleting it would mean hand-writing HTML generation, which is
+            // the opposite of what this category wants.
             ("newt-web/src/shell.rs", 1),
         ],
         rationale: "named table/document rendering implementations (the 22 \
@@ -595,13 +673,37 @@ const CATEGORIES: &[Category] = &[
         // had just named it.
         destinations: &[("newt-core/src/tty/raw_mode.rs", 2)],
         baseline: &[
-            // THE REAL REMAINING WORK, and C2b named it "the largest item, not
-            // in the list at all": the cockpit manages raw mode with bare
-            // calls and NO guard, session-scoped rather than frame-scoped. Its
-            // own comment already worries that "a stray `disable_raw_mode`
-            // anywhere would…" — this bug class sensed from the other side,
-            // without a failing test. Out of #1905's scope because it is not a
-            // guard to absorb; it is a guard that does not exist yet.
+            // NOT ACCEPTED. A TRACKED DEFECT (#1925), left counted on
+            // purpose: F0's rule allows a residual only for a design choice
+            // we are content with, and this is not one.
+            //
+            // **F0c corrected this row's description, which was wrong.** It
+            // said the cockpit has "NO guard" and that "it is a guard that
+            // does not exist yet". It has one: `_restore:
+            // RestoreOnDrop<fn()>` is a field of the session, bound at
+            // `presenter.rs:486` immediately after the `enable_raw_mode()?`
+            // at :470 and — as its own comment says — crucially BEFORE the
+            // fallible capture install, so no `?` or panic in between can
+            // leave a cooked terminal.
+            //
+            // The real defect is narrower and different in kind: that guard
+            // restores by calling `disable_raw_mode()`, and crossterm keeps
+            // ONE PROCESS-GLOBAL prior mode. So the cockpit restores to
+            // whatever the process last had, not to the termios IT found —
+            // which is exactly what `RawModeGuard` exists to fix, and exactly
+            // this category's rationale.
+            //
+            // Why F0c did not fix it: the four sites are not four
+            // interchangeable calls. Three are the session lifecycle (take at
+            // :470, restore at :247 and :333) and the fourth (:811,
+            // `sync_modal_edge`) RE-ASSERTS raw after a modal suspension
+            // ends — "belt and braces… a no-op when already raw". A
+            // `RawModeGuard` takes and releases; "make sure we are still raw"
+            // is not an operation it has, so site four needs a semantic
+            // decision, and C2b'''s nested-modal PTY scenario is the test that
+            // would catch getting it wrong. That is #1925'''s slice, and it is
+            // smaller than this row used to claim — a mechanism swap, not a
+            // guard to invent.
             ("newt-tui/src/cockpit/presenter.rs", 4),
             // PTY test scaffolding that the shared scanner sees as production
             // because it is not `#[cfg(test)]`-gated. It stands a pty up for
@@ -678,6 +780,32 @@ const CATEGORIES: &[Category] = &[
             // category by moving to the interaction lane, exactly as D3d
             // predicted, rather than by becoming a pipe table.
             ("newt-cli/src/dgx_status.rs", 1),
+            // ACCEPTED RESIDUAL — the shape decision D3c laid out and
+            // declined to make, made here.
+            //
+            // The shape: a header, a rule, then per model ONE row followed by
+            // zero or more INDENTED DETAIL LINES ("estimate calibration:
+            // x1.30 (chars/4 -> real)", quirks). The row is a measurement and
+            // the details explain how it was arrived at.
+            //
+            // Three options, and why none is better than leaving it:
+            //
+            //   table, then all details    Separates every explanation from
+            //                              the number it explains. An
+            //                              operator reading why a context
+            //                              window is 32k would scroll past
+            //                              every other model to find it.
+            //   details in a cell          GFM has no multi-line cell. It
+            //                              would truncate, and the detail is
+            //                              the part worth reading.
+            //   row + details as ONE cell  Same problem, plus it stops being
+            //                              a table in any useful sense.
+            //
+            // So the residual is accepted, and it is accepted for a property
+            // of GFM rather than of this command: **a pipe table cannot
+            // interleave prose between rows.** Any other listing that grows
+            // per-row detail lines lands here too, and the answer will be the
+            // same until the shape changes rather than the transport.
             ("newt-cli/src/tuning_cmd.rs", 2),
             // --- D3e (#1918): the newt-tui six. TWO migrated, FOUR declined.
             //
