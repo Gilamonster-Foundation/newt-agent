@@ -2415,3 +2415,139 @@ fn every_destination_path_is_inside_a_production_root() {
         }
     }
 }
+
+/// **Every category's detector must be shown to fire** (F0d, #1929).
+///
+/// The epic's own tally is nine vacuous greens — a diagram asserted *present*
+/// rather than *readable*, `compile_fail` doctests that ran zero times, a
+/// needle broken by rustfmt reflow, an invariant that held by reachability, a
+/// detector whose blind spot would have armed a baseline two too low. One
+/// diagnostic caught all of them: **ask what the check would do if the thing
+/// it measures did not exist.**
+///
+/// A per-file baseline is exactly that shape. `assert_eq!(actual, baseline)`
+/// passes when a needle matches nothing — a typo, a renamed API, a rustfmt
+/// split — and reports a clean floor while measuring an empty set. Five
+/// categories are at zero duplicates now, which is the state in which a
+/// broken needle is *indistinguishable from success*.
+///
+/// So each category declares a snippet its needles MUST count and one they
+/// must NOT, and the completeness check below is what makes this strict: a
+/// category added without a probe fails the build rather than being trusted.
+/// That is the rule #1924 paid for — a name registry cannot see a newly named
+/// parallel implementation — applied to the registry itself.
+const DETECTOR_PROBES: &[(&str, &str, &str)] = &[
+    (
+        "markdown parser sites",
+        "use pulldown_cmark;\nlet p = Parser::new_ext(src, opts);",
+        // No pulldown import: a `Parser` from anywhere else is not this one.
+        "let p = Parser::new_ext(src, opts);",
+    ),
+    (
+        "question construction sites",
+        "let q = Question{prompt};",
+        "let p: PendingQuestion = x;",
+    ),
+    (
+        "interaction answer validation sites",
+        "fn check(r: &Response) -> Accepted {}",
+        "fn check(r: &Reply) -> Verdict {}",
+    ),
+    (
+        "console ask sites",
+        "console.ask(\"pick one\")?;",
+        // A different receiver is a different site — `gate.ask` is the
+        // PermissionGate, and counting it would report seven phantom rows.
+        "gate.ask(&req)?;",
+    ),
+    (
+        "definition-bridge asks",
+        "console.ask_definition(&d)?;",
+        "console.ask(\"q\")?;",
+    ),
+    (
+        "prompt confirm helpers",
+        "fn confirm_prompt(w: &[&str]) -> String {}",
+        "fn write_confirm(&self) -> InteractionDefinition {}",
+    ),
+    (
+        "direct blocking reads",
+        "io::stdin().read_line(&mut buf)?;",
+        // The sealed window's own read is not a bare stdin read.
+        "window.read_line_into(&mut buf)?;",
+    ),
+    (
+        "table renderer implementations",
+        "fn render_table(cols: &[Column]) -> String {}",
+        "fn menu_label(e: &CardEntry) -> String {}",
+    ),
+    (
+        "raw-mode owners outside RawModeGuard",
+        "crossterm::terminal::enable_raw_mode()?;",
+        // The guard is the destination, and naming its TYPE is not a call.
+        "let g = RawModeGuard::acquire()?;",
+    ),
+    (
+        "ad-hoc two-width-field format sites",
+        "println!(\"{:<20} {:<18} scope\", a, b);",
+        // One padded field is a label, not a hand-laid row.
+        "println!(\"  {:<28}  {}\", a, b);",
+    ),
+];
+
+#[test]
+fn every_category_has_a_detector_that_can_fire() {
+    let code = |src: &str| {
+        let mut squeezed = String::new();
+        for line in src.lines() {
+            squeeze_into(&mut squeezed, line);
+        }
+        FileCode {
+            squeezed,
+            imports_pulldown: src.contains("pulldown_cmark"),
+            adhoc_sites: adhoc_column_sites(src),
+        }
+    };
+
+    // STRICT: a category with no probe fails, rather than being trusted.
+    // This is the half that survives the next person adding a category.
+    let probed: std::collections::BTreeSet<&str> =
+        DETECTOR_PROBES.iter().map(|(name, _, _)| *name).collect();
+    let missing: Vec<&str> = CATEGORIES
+        .iter()
+        .map(|c| c.name)
+        .filter(|n| !probed.contains(n))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these categories have no detector probe, so nothing shows their \
+         needles can match at all: {missing:?}"
+    );
+    let stale: Vec<&str> = probed
+        .iter()
+        .copied()
+        .filter(|n| !CATEGORIES.iter().any(|c| c.name == *n))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "probes for categories that no longer exist: {stale:?}"
+    );
+
+    for (name, fires, quiet) in DETECTOR_PROBES {
+        let cat = CATEGORIES
+            .iter()
+            .find(|c| c.name == *name)
+            .expect("checked above");
+        assert!(
+            (cat.count)(&code(fires)) >= 1,
+            "[{name}] its needles do not match {fires:?} — the detector cannot \
+             fire, so its baseline is measuring an empty set"
+        );
+        assert_eq!(
+            (cat.count)(&code(quiet)),
+            0,
+            "[{name}] matched {quiet:?}, which is not a site — a detector that \
+             fires on everything reports nothing"
+        );
+    }
+}
