@@ -155,11 +155,17 @@ fn run_approve(
         &pubkey_hex[..16.min(pubkey_hex.len())],
         ceremony.sas_words.join(" "),
     ))?;
-    window.ask(&format!("approve dock with `{label}`? [y/N] "))?;
-    let mut answer = String::new();
-    if window.read_line_into(&mut answer)? == 0
-        || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-    {
+    if !newt_core::interaction_terminal::confirmed_on_terminal(
+        &window,
+        &newt_core::interaction_form::confirm(
+            format!("approve dock with `{label}`?"),
+            "",
+            "yes, approve it",
+            "no, leave it",
+        ),
+        // `[y/N]`: blank declines.
+        false,
+    ) {
         window.notice("dock approval declined; nothing changed")?;
         return Ok(1);
     }
@@ -197,11 +203,17 @@ fn run_revoke(
     let root_key = load_root(operator_key_path)?;
 
     let window = newt_core::tty::Terminal::suspend_for_prompt();
-    window.ask(&format!("revoke the dock for `{peer}`? [y/N] "))?;
-    let mut answer = String::new();
-    if window.read_line_into(&mut answer)? == 0
-        || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-    {
+    if !newt_core::interaction_terminal::confirmed_on_terminal(
+        &window,
+        &newt_core::interaction_form::confirm(
+            format!("revoke the dock for `{peer}`?"),
+            "",
+            "yes, revoke it",
+            "no, leave it",
+        ),
+        // `[y/N]`: blank declines.
+        false,
+    ) {
         window.notice("revoke declined; nothing changed")?;
         return Ok(1);
     }
@@ -225,11 +237,17 @@ fn run_revoke_all(
     let root_key = load_root(operator_key_path)?;
 
     let window = newt_core::tty::Terminal::suspend_for_prompt();
-    window.ask("revoke ALL live docks? [y/N] ")?;
-    let mut answer = String::new();
-    if window.read_line_into(&mut answer)? == 0
-        || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-    {
+    if !newt_core::interaction_terminal::confirmed_on_terminal(
+        &window,
+        &newt_core::interaction_form::confirm(
+            "revoke ALL live docks?",
+            "",
+            "yes, revoke them all",
+            "no, leave them",
+        ),
+        // `[y/N]`: blank declines.
+        false,
+    ) {
         window.notice("revoke-all declined; nothing changed")?;
         return Ok(1);
     }

@@ -100,13 +100,17 @@ fn run_revoke_credential(
     // The capability, not a flag: a session with no terminal cannot obtain one,
     // so it reaches the default-deny arm below instead of revoking unattended.
     let window = newt_core::tty::Terminal::suspend_for_prompt();
-    window.ask(&format!(
-        "revoke credential `{handle}` for `{subject}`? [y/N] "
-    ))?;
-    let mut answer = String::new();
-    if window.read_line_into(&mut answer)? == 0
-        || !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-    {
+    if !newt_core::interaction_terminal::confirmed_on_terminal(
+        &window,
+        &newt_core::interaction_form::confirm(
+            format!("revoke credential `{handle}` for `{subject}`?"),
+            "",
+            "yes, revoke it",
+            "no, leave it",
+        ),
+        // `[y/N]`: blank declines.
+        false,
+    ) {
         window.notice("revoke declined; nothing changed")?;
         return Ok(1);
     }

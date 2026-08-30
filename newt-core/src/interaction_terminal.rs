@@ -89,6 +89,174 @@ pub fn present_on_terminal(
         Err(_) => HumanQuestionOutcome::InputFailed,
     }
 }
+/// Present a choice and resolve what the operator typed against the options
+/// it offered.
+///
+/// `None` means **no usable answer**, and deliberately collapses four
+/// different reasons into one refusal: the stream closed, the operator
+/// cancelled, the read failed, or what they typed matched nothing offered.
+/// Every caller of this is a confirm or a menu whose fail-closed arm is the
+/// same in all four cases, and the ones that need to tell them apart call
+/// [`present_on_terminal`] directly.
+///
+/// **EOF is not consent.** That is the whole reason this exists as one
+/// function rather than five copies of `read a line, then resolve it`: #1911
+/// found three `newt-cli` sites getting it wrong, one of them
+/// (`dgx.rs:637`) fail-closed only by accident of `matches!` falling through.
+/// Here the EOF arm cannot be forgotten, because it is not written per site.
+///
+/// This composes two things that already exist —
+/// [`present_on_terminal`] and [`crate::interaction_form::resolve`], which
+/// delegates to D0's one resolver. It adds no parsing and no formatting of
+/// its own, so it is not a third anything: delete it and every caller can
+/// still spell the two calls by hand.
+#[must_use]
+pub fn resolve_on_terminal(
+    window: &PromptWindow,
+    definition: &InteractionDefinition,
+) -> Option<newt_interaction::OptionId> {
+    let interaction = SurfaceInteraction::blocking(definition.clone());
+    match present_on_terminal(window, &interaction) {
+        HumanQuestionOutcome::Answer(line) => {
+            crate::interaction_form::resolve(definition, line.trim())
+        }
+        HumanQuestionOutcome::InputClosed
+        | HumanQuestionOutcome::Cancelled
+        | HumanQuestionOutcome::ExitRequested
+        | HumanQuestionOutcome::InputFailed
+        | HumanQuestionOutcome::Unavailable => None,
+    }
+}
+
+/// Whether the operator affirmatively chose `yes`.
+///
+/// `blank` is what an EMPTY answer means, spelled at the call site so a
+/// reader can see which way each prompt's default falls — the parameter D1b-3
+/// introduced for the setup wizard, for the reason it found there: `[Y/n]`
+/// and `[y/N]` were both written `is_yes(&ans, _)` and only one of them was
+/// dangerous. **Blank may decline; it may never commit** unless the caller
+/// says so explicitly and the prompt displays it.
+///
+/// Everything else is `false` — `no`, an unrecognised answer, EOF, a cancel,
+/// a failed read. **EOF in particular can never be consent**, and it cannot
+/// be forgotten here the way it was at three of the five sites #1911 found,
+/// because the arm is written once rather than per caller.
+#[must_use]
+pub fn confirmed_on_terminal(
+    window: &PromptWindow,
+    definition: &InteractionDefinition,
+    blank: bool,
+) -> bool {
+    let interaction = SurfaceInteraction::blocking(definition.clone());
+    confirm_from_outcome(
+        definition,
+        &present_on_terminal(window, &interaction),
+        blank,
+    )
+}
+
+/// The confirm decision, as a pure function of the outcome.
+///
+/// Split from [`confirmed_on_terminal`] so the contract is testable without a
+/// terminal — exhaustively, over every [`HumanQuestionOutcome`] variant
+/// rather than the ones a test remembered to try. It replaces
+/// `mcp_probe_cmd`'s `consent_given(bytes_read, input)`, which was the same
+/// idea keyed on a byte count: `bytes_read > 0` was that site's way of saying
+/// "EOF is not an answer", and the outcome enum says it in the type.
+///
+/// The match is exhaustive rather than `_ => false`, so a new outcome variant
+/// has to be classified here instead of silently defaulting to "declined" —
+/// which would be safe but would hide a case somebody needs to think about.
+#[must_use]
+fn confirm_from_outcome(
+    definition: &InteractionDefinition,
+    outcome: &HumanQuestionOutcome,
+    blank: bool,
+) -> bool {
+    match outcome {
+        HumanQuestionOutcome::Answer(line) => {
+            let line = line.trim();
+            if line.is_empty() {
+                return blank;
+            }
+            crate::interaction_form::resolve(definition, line)
+                .is_some_and(|picked| picked.as_str() == crate::interaction_form::YES)
+        }
+        // Not a human declining — a human who never answered. Every one of
+        // these is refused, and none of them may be read as consent.
+        HumanQuestionOutcome::InputClosed
+        | HumanQuestionOutcome::Cancelled
+        | HumanQuestionOutcome::ExitRequested
+        | HumanQuestionOutcome::InputFailed
+        | HumanQuestionOutcome::Unavailable => false,
+    }
+}
+
+#[cfg(test)]
+mod f0a_confirm {
+    use super::confirm_from_outcome;
+    use crate::interaction_form::confirm;
+    use crate::HumanQuestionOutcome;
+
+    fn q() -> newt_interaction::InteractionDefinition {
+        confirm("proceed?", "", "yes, do it", "no, stop")
+    }
+
+    /// **EOF is never consent, and neither is any other non-answer.**
+    ///
+    /// This replaces `mcp_probe_cmd::consent_given`'s test, which asserted
+    /// the same contract against a byte count. #1911 found three of five
+    /// `newt-cli` sites getting this wrong — `dgx.rs:637` fail-closed only by
+    /// accident of `matches!` falling through — because each site wrote the
+    /// EOF arm itself. It is written once now, and this covers every variant
+    /// rather than the ones a caller thought of.
+    #[test]
+    fn no_outcome_but_an_affirmative_answer_confirms() {
+        for outcome in [
+            HumanQuestionOutcome::InputClosed,
+            HumanQuestionOutcome::Cancelled,
+            HumanQuestionOutcome::ExitRequested,
+            HumanQuestionOutcome::InputFailed,
+            HumanQuestionOutcome::Unavailable,
+        ] {
+            // Not even when the prompt's blank default is YES: a stream that
+            // ended did not press Enter.
+            assert!(!confirm_from_outcome(&q(), &outcome, true), "{outcome:?}");
+            assert!(!confirm_from_outcome(&q(), &outcome, false), "{outcome:?}");
+        }
+        // `no`, and anything unrecognised, decline too.
+        for typed in ["n", "no", "maybe", "1", "yes please"] {
+            let a = HumanQuestionOutcome::Answer(typed.to_string());
+            assert!(!confirm_from_outcome(&q(), &a, true), "{typed:?}");
+        }
+    }
+
+    /// **The anti-vacuous twin.** Everything above is a refusal, which a
+    /// function returning `false` unconditionally would also satisfy — and
+    /// that function would make every confirm in the tree unanswerable.
+    #[test]
+    fn an_affirmative_answer_does_confirm() {
+        for typed in ["y", "Y", "yes", "  y  "] {
+            let a = HumanQuestionOutcome::Answer(typed.to_string());
+            assert!(confirm_from_outcome(&q(), &a, false), "{typed:?}");
+        }
+    }
+
+    /// Blank is the one case the CALLER decides, spelled at each call site.
+    /// `[Y/n]` passes `true`, `[y/N]` passes `false`, and the prompt shows
+    /// which — blank may decline, and may only consent where a default is
+    /// displayed and a human pressed Enter to accept it.
+    #[test]
+    fn blank_means_what_the_call_site_says_and_nothing_else() {
+        for blank in [true, false] {
+            for typed in ["", "   ", "\t"] {
+                let a = HumanQuestionOutcome::Answer(typed.to_string());
+                assert_eq!(confirm_from_outcome(&q(), &a, blank), blank, "{typed:?}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod d1b_echo {
     use super::echo_for;
