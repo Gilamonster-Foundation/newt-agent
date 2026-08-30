@@ -50,11 +50,11 @@ symbol = "adding_a_differently_named_backend_cannot_fabricate_a_selection"
 module = "NewtPolicy.Backend"
 symbol = "selection_is_position_independent"
 [[BHV-BACKEND-001.refs.rust_tests]]
-path = "newt-core/src/config.rs"
-symbol = "select_backend_tests::default_backend_selects_ollama_over_configured_openai"
+path = "newt-core/src/config_tests/select_backend_tests.rs"
+symbol = "default_backend_selects_ollama_over_configured_openai"
 [[BHV-BACKEND-001.refs.rust_tests]]
-path = "newt-core/src/config.rs"
-symbol = "select_backend_tests::newt_provider_selects_openai_responses"
+path = "newt-core/src/config_tests/select_backend_tests.rs"
+symbol = "newt_provider_selects_openai_responses"
 [[BHV-BACKEND-001.refs.rust_tests]]
 path = "newt-acp-worker/src/lib.rs"
 symbol = "backend_selection_tests::ollama_host_does_not_erase_an_explicitly_selected_openai_backend"
@@ -177,11 +177,11 @@ symbol = "validated_call_id_nonempty"
 module = "NewtPolicy.ToolBatch"
 symbol = "executable"
 [[BHV-TOOLS-001.refs.rust_tests]]
-path = "newt-core/src/agentic/tools.rs"
-symbol = "tests::batch_valid_then_malformed_dispatches_zero"
+path = "newt-core/src/agentic/tools_tests/tests.rs"
+symbol = "batch_valid_then_malformed_dispatches_zero"
 [[BHV-TOOLS-001.refs.rust_tests]]
-path = "newt-core/src/agentic/tools.rs"
-symbol = "tests::batch_all_valid_dispatches_every_call"
+path = "newt-core/src/agentic/tools_tests/tests.rs"
+symbol = "batch_all_valid_dispatches_every_call"
 [[BHV-TOOLS-001.refs.production]]
 path = "newt-core/src/agentic/tools.rs"
 symbol = "validate_tool_call_batch"
@@ -201,14 +201,14 @@ symbol = "validated_call_id_nonempty"
 module = "NewtPolicy.ToolBatch"
 symbol = "validated_batch_ids_distinct"
 [[BHV-TOOLS-002.refs.rust_tests]]
-path = "newt-core/src/agentic/tools.rs"
-symbol = "tests::batch_missing_id_is_correlation_impossible"
+path = "newt-core/src/agentic/tools_tests/tests.rs"
+symbol = "batch_missing_id_is_correlation_impossible"
 [[BHV-TOOLS-002.refs.rust_tests]]
-path = "newt-core/src/agentic/tools.rs"
-symbol = "tests::batch_duplicate_id_is_correlation_impossible"
+path = "newt-core/src/agentic/tools_tests/tests.rs"
+symbol = "batch_duplicate_id_is_correlation_impossible"
 [[BHV-TOOLS-002.refs.rust_tests]]
-path = "newt-core/src/agentic/tools.rs"
-symbol = "tests::batch_blank_id_is_correlation_impossible"
+path = "newt-core/src/agentic/tools_tests/tests.rs"
+symbol = "batch_blank_id_is_correlation_impossible"
 [[BHV-TOOLS-002.refs.rust_tests]]
 path = "newt-core/src/agentic/mod.rs"
 symbol = "tool_round_cap_tests::responses_missing_call_id_aborts_without_a_followup_request"
