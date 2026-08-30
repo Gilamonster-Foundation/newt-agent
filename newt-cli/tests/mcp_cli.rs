@@ -444,10 +444,13 @@ fn list_attributes_claude_code_overlays_to_their_files() {
 
     let assert = newt(&sb).args(["mcp", "list"]).assert().success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    // `newt mcp list` emits a GFM pipe table since #1916, so a row no longer
+    // STARTS with the name. Matching the first CELL is also stricter than the
+    // `starts_with` it replaces, which would have accepted `mine-2` as `mine`.
     let row = |name: &str| {
         stdout
             .lines()
-            .find(|l| l.starts_with(name))
+            .find(|l| l.split('|').nth(1).is_some_and(|cell| cell.trim() == name))
             .unwrap_or_else(|| panic!("no row for {name} in:\n{stdout}"))
             .to_string()
     };

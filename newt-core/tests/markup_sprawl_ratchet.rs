@@ -562,13 +562,37 @@ const CATEGORIES: &[Category] = &[
         // every `{:<5}` in the workspace — status lines, log prefixes — and
         // a tripwire that fires on everything reports nothing.
         baseline: &[
+            // `dock_cmd`, `mcp_cmd`, `models_cmd` and `providers_cmd` were here
+            // at 2 each until D3c (#1916) routed all four through
+            // `markup::table`. 21 -> 13.
+            //
+            // THE FOUR THAT REMAIN IN newt-cli ARE NOT ALL MIGRATIONS WAITING
+            // TO HAPPEN, and saying which is which is the point of leaving them
+            // counted rather than quietly moved:
+            //
+            // * `config_cmd.rs` — emits TOML CONFIG-FILE COMMENTS (`#   {name}
+            //   {slash}  {desc}`), surrounded by prose comment lines, for the
+            //   operator to paste into `~/.newt/config.toml`. A pipe table
+            //   inside `#` comments is not a better document; it is a worse
+            //   config file. NOT a migration candidate.
+            //
+            // * `dgx_status.rs` — an indented sub-list under a `Workloads:`
+            //   heading, three fields, no header row, nested inside a status
+            //   block. An aligned LIST, not a table. NOT a candidate.
+            //
+            // * `tuning_cmd.rs` — a header and rows, but each row is followed
+            //   by INDENTED DETAIL LINES (learned calibration and quirks, per
+            //   docs/design/model-self-tuning.md). GFM cannot interleave prose
+            //   between rows, so migrating it would either drop the detail or
+            //   break the table. Needs a shape decision first, not a
+            //   transport swap.
+            //
+            // * `dgx_card.rs` — a genuine table family (catalog + a numbered
+            //   ranking), and the obvious NEXT slice. Left because the epic
+            //   says one family per PR and it is a different command.
             ("newt-cli/src/config_cmd.rs", 1),
             ("newt-cli/src/dgx_card.rs", 3),
             ("newt-cli/src/dgx_status.rs", 1),
-            ("newt-cli/src/dock_cmd.rs", 2),
-            ("newt-cli/src/mcp_cmd.rs", 2),
-            ("newt-cli/src/models_cmd.rs", 2),
-            ("newt-cli/src/providers_cmd.rs", 2),
             ("newt-cli/src/tuning_cmd.rs", 2),
             ("newt-tui/src/chat.rs", 1),
             ("newt-tui/src/lib.rs", 2),

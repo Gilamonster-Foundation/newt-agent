@@ -90,26 +90,61 @@ fn resolve(alias: Option<&str>) -> anyhow::Result<&'static MiniModel> {
     }
 }
 
+/// One row of `newt models`, as data.
+struct ModelRow {
+    alias: String,
+    ram_gb: f32,
+    arch: String,
+    installed: &'static str,
+    note: String,
+}
+
+/// Render the `newt models` listing.
+///
+/// Extracted from `list` so the exact bytes are testable without a model
+/// palette on disk (#1916). Byte-identical to the `println!`s it replaces —
+/// the migration onto `markup::table` is the NEXT commit, so the golden below
+/// pins what shipped before either change.
+fn models_table(rows: &[ModelRow]) -> String {
+    use newt_core::markup::table::{render_table, Align, Column};
+    let columns = [
+        Column::new("alias"),
+        Column::new("RAM").align(Align::Right),
+        Column::new("arch"),
+        Column::new("installed"),
+        Column::new("note"),
+    ];
+    let data: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            vec![
+                r.alias.clone(),
+                format!("{:.1}G", r.ram_gb),
+                r.arch.clone(),
+                r.installed.to_string(),
+                r.note.clone(),
+            ]
+        })
+        .collect();
+    render_table(&columns, &data)
+}
+
 fn list() -> anyhow::Result<()> {
-    println!(
-        "{:<16} {:>6}  {:<8} {:<9} note",
-        "alias", "RAM", "arch", "installed"
-    );
-    for m in palette::palette() {
-        let installed = if palette::resolve_local(m.name).is_some() {
-            "yes"
-        } else {
-            "no"
-        };
-        println!(
-            "{:<16} {:>5.1}G  {:<8} {:<9} {}",
-            m.name,
-            m.approx_ram_gb,
-            format!("{:?}", m.arch),
-            installed,
-            m.note
-        );
-    }
+    let rows: Vec<ModelRow> = palette::palette()
+        .iter()
+        .map(|m| ModelRow {
+            alias: m.name.to_string(),
+            ram_gb: m.approx_ram_gb,
+            arch: format!("{:?}", m.arch),
+            installed: if palette::resolve_local(m.name).is_some() {
+                "yes"
+            } else {
+                "no"
+            },
+            note: m.note.to_string(),
+        })
+        .collect();
+    print!("{}", models_table(&rows));
     println!(
         "\nSummarizer default: {}   (fetch with: newt models pull [alias])",
         palette::default_model().name
@@ -405,3 +440,63 @@ overloads it and can stall the turn (#979). A small CPU model decouples them.
 
 See docs/decisions/embedded_inference.md and issues #639 / #661 / #979.
 ";
+
+#[cfg(test)]
+mod d3c {
+    use super::{models_table, ModelRow};
+
+    fn rows() -> Vec<ModelRow> {
+        vec![
+            ModelRow {
+                alias: "qwen2.5-coder".into(),
+                ram_gb: 4.7,
+                arch: "Qwen2".into(),
+                installed: "yes",
+                note: "default summarizer".into(),
+            },
+            ModelRow {
+                alias: "llama3.1".into(),
+                ram_gb: 12.0,
+                arch: "Llama".into(),
+                installed: "no",
+                note: String::new(),
+            },
+        ]
+    }
+
+    /// **The byte golden for `newt models` as it ships today** (#1916).
+    ///
+    /// Captured from the shipping renderer, which is the correct method for a
+    /// characterization golden: it pins what an operator sees NOW, so the
+    /// migration onto `markup::table` has to declare its diff instead of
+    /// sliding one past.
+    #[test]
+    fn the_models_listing_is_byte_exact() {
+        assert_eq!(
+            models_table(&rows()),
+            concat!(
+                "| alias         |   RAM | arch  | installed | note               |\n",
+                "| ------------- | ----: | ----- | --------- | ------------------ |\n",
+                "| qwen2.5-coder |  4.7G | Qwen2 | yes       | default summarizer |\n",
+                "| llama3.1      | 12.0G | Llama | no        |                    |\n",
+            )
+        );
+    }
+
+    /// **AMENDED by the migration.** The fixed-width renderer padded the LAST
+    /// column, so a model with no note left trailing spaces on its line. GFM
+    /// closes every row with a pipe, so that whole class is gone — asserted as
+    /// the new property rather than deleted, because "no line ends in
+    /// whitespace" is worth keeping once it is true.
+    #[test]
+    fn no_row_ends_in_trailing_whitespace() {
+        let out = models_table(&rows());
+        for line in out.lines() {
+            assert!(
+                line.ends_with('|'),
+                "every GFM row closes with a pipe: {line:?}"
+            );
+            assert_eq!(line.trim_end(), line, "no trailing whitespace: {line:?}");
+        }
+    }
+}
