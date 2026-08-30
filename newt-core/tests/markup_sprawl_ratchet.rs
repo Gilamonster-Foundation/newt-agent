@@ -1987,7 +1987,21 @@ fn the_setup_wizard_owns_no_reader() {
         // `Echo::` is spelled where the POLICY is decided, not where the
         // enum lives — `modal.rs` writes `Self::Chars` inside its own impl.
         ("Echo::", "newt-tui/src/permissions.rs"),
-        ("enable_raw_mode(", "newt-core/src/tty/modal.rs"),
+        // PROVER MOVED (C2b, #1891): was `modal.rs`, which no longer calls
+        // this. C2b promoted its private `RawGuard` into
+        // `newt_core::tty::raw_mode::RawModeGuard` — one nesting-aware
+        // raw-mode owner — so modal.rs now aliases that type and the only
+        // `enable_raw_mode(` left there is inside `#[cfg(test)]`, which
+        // `production_code()` strips. The prover stopped proving and this
+        // guard correctly refused to report a meaningless pass.
+        //
+        // `raw_mode.rs` is the durable home rather than a convenient one:
+        // after #1905 absorbs the remaining guards onto `RawModeGuard`, it is
+        // the ONLY production file that calls this. (Its own call sits in the
+        // `#[cfg(not(unix))]` arm — the unix path takes raw mode via termios
+        // — so a future Windows termios equivalent would break this pair
+        // again, loudly, which is the guard working.)
+        ("enable_raw_mode(", "newt-core/src/tty/raw_mode.rs"),
     ];
     for path in &setup {
         for (forbidden, _) in paired {
