@@ -24,8 +24,9 @@ use std::time::{Duration, Instant};
 use crossterm::queue;
 use crossterm::style::{Color as CtColor, Print, ResetColor, SetForegroundColor};
 
-use super::arbiter::{Ephemeral, LineLease, Sink, Terminal};
+use super::arbiter::{Ephemeral, Sink, Terminal};
 use super::caps::LineCaps;
+use super::row::EphemeralRow;
 use super::{fit_line, format_spinner, term_cols, FADE_CT};
 
 /// The shared frame cadence. 100 ms unifies the three clocks this replaces
@@ -74,7 +75,13 @@ fn effective_label(label: &str, interrupted: bool) -> &str {
 // ---------------------------------------------------------------------------
 
 struct SpinnerState {
-    lease: LineLease,
+    /// Row ownership, extracted to `tty::row` (D2b, #1895). The concurrency
+    /// rules that used to live here moved with it, verbatim.
+    ///
+    /// An `Arc` because the row is what the arbiter registers as the
+    /// [`Ephemeral`] — it owns the erase and the gate — and the registry holds
+    /// its entries weakly, so this strong reference is what keeps it live.
+    row: Arc<EphemeralRow>,
     start: Instant,
     label: Mutex<String>,
     /// Characters of detail seen so far — drives the `· N chars` tail.
@@ -84,15 +91,6 @@ struct SpinnerState {
     frame: AtomicUsize,
     /// Styling ONLY. Never a capability signal — see [`LineCaps`].
     color: bool,
-    finished: AtomicBool,
-    /// Serializes `draw` against `finish`. Without it a tick could pass the
-    /// `finished` check, lose the CPU, and paint AFTER `finish` had erased —
-    /// a stale row that the lease's final erase would then wipe from wherever
-    /// the cursor had moved to. Harmless when the next writer is a permanent
-    /// line on a fresh row; destructive when it is a viewport that has just
-    /// taken this row (#1727's spinner → live-output hand-off). Lock order is
-    /// always gate → stdout, in both holders.
-    paint_gate: Mutex<()>,
 }
 
 impl SpinnerState {
@@ -100,13 +98,6 @@ impl SpinnerState {
     /// and never scrolls, so a line wider than the terminal would wrap and leave
     /// stale rows behind that no single-line erase can reach.
     fn draw(&self) {
-        let _gate = self
-            .paint_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.finished.load(Ordering::SeqCst) {
-            return;
-        }
         let label = self
             .label
             .lock()
@@ -120,7 +111,7 @@ impl SpinnerState {
         );
         let fitted = fit_line(&line, term_cols());
         let color = self.color;
-        self.lease.paint(move |w| {
+        self.row.paint(move |w| {
             if color {
                 queue!(
                     w,
@@ -147,27 +138,22 @@ impl SpinnerState {
     /// same operation, so teardown can never double-erase a row someone else
     /// has since taken.
     fn finish(&self) {
-        let _gate = self
-            .paint_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.finished.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        // Flush a trailing partial detail line so nothing the model said is lost
-        // to the erase.
-        let tail = {
-            let mut buf = self
-                .line_buf
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::mem::take(&mut *buf)
-        };
-        let trimmed = tail.trim_end_matches(['\n', '\r']);
-        if !trimmed.trim().is_empty() {
-            self.emit_detail_line(trimmed);
-        }
-        self.lease.erase();
+        self.row.finish(|_row| {
+            // Flush a trailing partial detail line so nothing the model said is
+            // lost to the erase. Runs under the row's gate, immediately before
+            // the erase — the same ordering this code had inline.
+            let tail = {
+                let mut buf = self
+                    .line_buf
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::mem::take(&mut *buf)
+            };
+            let trimmed = tail.trim_end_matches(['\n', '\r']);
+            if !trimmed.trim().is_empty() {
+                self.emit_detail_line(trimmed);
+            }
+        });
     }
 
     /// Write one completed detail line into scrollback (dim), below/behind the
@@ -175,7 +161,7 @@ impl SpinnerState {
     fn emit_detail_line(&self, line: &str) {
         let color = self.color;
         let owned = line.to_string();
-        self.lease.emit_line(move |w| {
+        self.row.emit_line(move |w| {
             if color {
                 queue!(
                     w,
@@ -190,43 +176,6 @@ impl SpinnerState {
             }
             Ok(())
         });
-    }
-}
-
-impl Ephemeral for SpinnerState {
-    /// Erase through the SAME [`SpinnerState::paint_gate`] as `draw`/`finish`.
-    ///
-    /// The suspend path is "set `suspended`, THEN erase every ephemeral"
-    /// (`Terminal::suspend_for_prompt`). Without the gate that leaves a live
-    /// window: a tick can pass `LineLease::paint`'s `suspended()` check while
-    /// the flag is still clear, lose the CPU, and flush its frame *after* the
-    /// erase — repainting the row the question is about to occupy. That is
-    /// the invisible-prompt hang the arbiter exists to end, arriving through
-    /// the one door it did not close.
-    ///
-    /// Taking the gate makes the two orderings the only two possible:
-    ///
-    /// - the tick was already inside `draw` → this erase waits for it, then
-    ///   clears what it wrote (`painted` is set, so the erase is real);
-    /// - the tick arrives after → it takes the gate next, and `paint` finds
-    ///   `suspended()` true and writes nothing.
-    ///
-    /// Lock order is `paint_gate` → stdout, matching `draw` and `finish`.
-    /// Both callers of this method — `Terminal::suspend_for_prompt` and
-    /// `Terminal::emit_line` — collect the registered ephemerals under the
-    /// arbiter mutex and **release it before erasing**, so no thread ever
-    /// holds the arbiter mutex while waiting on this gate and there is no
-    /// cycle to deadlock on.
-    fn erase(&self) {
-        let _gate = self
-            .paint_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.lease.erase();
-    }
-    fn restore(&self) {
-        // Nothing to do: the shared ticker repaints within one frame, and
-        // repainting here would race the question's own final flush.
     }
 }
 
@@ -309,21 +258,20 @@ impl Spinner {
     /// Protocol mode still vetoes absolutely. New code should call
     /// [`Spinner::start`].
     pub fn start_with_caps(caps: LineCaps, label: &str, sink: Sink, color: bool) -> Option<Self> {
-        let lease = Terminal::lease_with_caps(caps, sink)?;
+        let row = Arc::new(EphemeralRow::acquire(caps, sink)?);
         let state = Arc::new(SpinnerState {
-            lease,
+            row,
             start: Instant::now(),
             label: Mutex::new(label.to_string()),
             chars: AtomicUsize::new(0),
             line_buf: Mutex::new(String::new()),
             frame: AtomicUsize::new(0),
             color,
-            finished: AtomicBool::new(false),
-            paint_gate: Mutex::new(()),
         });
-        let as_ephemeral: Arc<dyn Ephemeral> = state.clone();
+        // The ROW is the ephemeral now: it owns the erase and the gate.
+        let as_ephemeral: Arc<dyn Ephemeral> = state.row.clone();
         Terminal::register(
-            Arc::as_ptr(&state) as *const () as usize as u64,
+            Arc::as_ptr(&state.row) as *const () as usize as u64,
             &as_ephemeral,
         );
         register(&state);
@@ -439,15 +387,12 @@ mod tests {
         let sp = Spinner::start_with_caps(LineCaps::Own, "thinking…", Sink::Stdout, false)
             .expect("Own yields a spinner");
         let state = sp.state.clone();
-        assert!(!state.finished.load(Ordering::SeqCst));
+        assert!(!state.row.is_finished());
         drop(sp);
-        assert!(
-            state.finished.load(Ordering::SeqCst),
-            "Drop must tear the spinner down"
-        );
+        assert!(state.row.is_finished(), "Drop must tear the spinner down");
         // A second teardown is a no-op rather than a second erase.
         state.finish();
-        assert!(state.finished.load(Ordering::SeqCst));
+        assert!(state.row.is_finished());
     }
 
     /// Dropping the handle releases the LINE too, so the next writer can take
@@ -488,6 +433,7 @@ mod tests {
         let state = sp.state.clone();
         // Stand in for a `draw` that holds the gate and has not written yet.
         let in_flight = state
+            .row
             .paint_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -502,7 +448,7 @@ mod tests {
                     *m.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
                     cv.notify_all();
                 }
-                Ephemeral::erase(&*state);
+                Ephemeral::erase(&*state.row);
                 erased.store(true, Ordering::SeqCst);
             })
         };
@@ -539,11 +485,11 @@ mod tests {
         let sp = Spinner::start_with_caps(LineCaps::Own, "thinking…", Sink::Stdout, false)
             .expect("spinner");
         let state = sp.state.clone();
-        Ephemeral::erase(&*state);
-        Ephemeral::erase(&*state);
+        Ephemeral::erase(&*state.row);
+        Ephemeral::erase(&*state.row);
         state.finish();
-        Ephemeral::erase(&*state);
-        assert!(state.finished.load(Ordering::SeqCst));
+        Ephemeral::erase(&*state.row);
+        assert!(state.row.is_finished());
     }
 
     /// The stage label is mutable without resetting the elapsed clock — the

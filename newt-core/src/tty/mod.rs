@@ -52,6 +52,9 @@ mod pty_notice_test;
 // surface needed it. Saving termios rather than using crossterm's global is
 // what makes nested frames compose.
 pub mod raw_mode;
+/// D2b (#1895): ownership of the ONE ephemeral bottom row, extracted from the
+/// spinner so the renderer can own it. The concurrency rules moved verbatim.
+mod row;
 pub mod spinner;
 pub mod widgets;
 pub mod width;
