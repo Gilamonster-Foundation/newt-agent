@@ -461,7 +461,13 @@ impl Presenter {
     pub(crate) fn open(surface: RichSurface) -> io::Result<Self> {
         let (cols, rows) = crossterm::terminal::size()?;
         let (cols, rows) = (cols.max(1), rows.max(1));
-        let (x, y) = crossterm::cursor::position()?;
+        // #1950: the same one answer the inline surfaces use. This call
+        // used to be the cockpit's own `?` — a quiet terminal meant the
+        // cockpit never opened, which is the same defect as a panel that
+        // never opens, and it must not be a second implementation of the
+        // fallback.
+        let cursor = crate::inline_viewport::cursor_position_or_anchor();
+        let (x, y) = (cursor.x, cursor.y);
         let mut editor = MountedEditor::new(
             surface.edit(),
             surface.gutter(),

@@ -50,6 +50,11 @@ const CHILD_TEST: &str = "panel_raw_mode_pty_test::panel_raw_mode_child";
 const REACH_TIMEOUT: Duration = Duration::from_secs(60);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// #1950 fixture: the panel's inline height, and what it draws.
+const PANEL_TEST_HEIGHT: u16 = 6;
+const PANEL_SENTINEL: &str = "PANEL-DREW-1950";
+const PANEL_SENTINEL_OK: &str = "PANEL-OPENED-1950";
+
 /// The child half: takes the real terminal exactly as a panel does.
 /// `NEWT_PANEL_PTY_CHILD` selects the lifecycle.
 #[test]
@@ -95,6 +100,62 @@ fn panel_raw_mode_child() {
             }
             assert!(inner().is_err(), "the fixture must take the error path");
         }
+        // #1950: THE REPORTED FAILURE. A competing consumer of the same tty
+        // while the panel opens. `Viewport::Inline` makes ratatui ask the
+        // terminal where the cursor is (`ESC[6n`, answered on the INPUT
+        // stream) — and the reader below takes the answer first, so the panel
+        // used to fail to open at all with "The cursor position could not be
+        // read within a normal duration".
+        //
+        // The parent DOES answer the query. That is the point: the terminal is
+        // cooperative and the panel must still open, so a pass cannot be
+        // explained by the query never having been asked.
+        "inline_contended" => {
+            let _guard = PanelRawGuard::enter().expect("enter raw mode");
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader = {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = crossterm::event::poll(Duration::from_millis(50));
+                        let _ = crossterm::event::read();
+                    }
+                })
+            };
+            // Let the reader reach its blocking read before the panel asks.
+            std::thread::sleep(Duration::from_millis(150));
+
+            match crate::config_panel::make_terminal(PANEL_TEST_HEIGHT) {
+                Ok(mut terminal) => {
+                    // RENDERS, not merely constructs. A terminal that was
+                    // built and then drew nothing would leave the operator
+                    // looking at the same blank screen the bug produced.
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(
+                                ratatui::widgets::Paragraph::new(PANEL_SENTINEL),
+                                f.area(),
+                            );
+                        })
+                        .expect("the panel draws");
+                    println!("{PANEL_SENTINEL_OK}");
+                }
+                Err(e) => println!("PANEL-FAILED {e}"),
+            }
+            use std::io::Write as _;
+            std::io::stdout().flush().ok();
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Deliberately NOT `hold()`, and deliberately not joined. The
+            // reader is blocked in `event::read`, so joining would wait for a
+            // keystroke — and it would EAT the byte the parent sends to
+            // release a hold, which is exactly how the first draft of this
+            // fixture hung for 60s and reported the terminal left raw. The
+            // parent has already sampled `is_raw` by now: the child took the
+            // guard, slept 150ms, and spent a DSR round trip before drawing.
+            // Falling off the end here drops the guard and restores the tty,
+            // which is the property the rest of this file exists to hold.
+            drop(reader);
+        }
         other => panic!("unknown child mode {other:?}"),
     }
 }
@@ -105,6 +166,10 @@ struct Outcome {
     /// Was the pty raw while the panel was up? **The control**: a test that
     /// never observed raw mode would prove restoration vacuously.
     raw_during: bool,
+    /// Did the child actually ASK where the cursor was, and did the parent
+    /// answer? #1950's control: a panel that opened because nothing ever
+    /// queried the terminal would prove nothing about a contended query.
+    answered_cursor_query: bool,
     screen: String,
 }
 
@@ -122,10 +187,19 @@ fn drive(mode: &str) -> Outcome {
     .expect("spawn the pty child");
 
     let mut screen = String::new();
+    let mut answered_cursor_query = false;
     let raw_during = {
         let deadline = Instant::now() + REACH_TIMEOUT;
         loop {
             screen.push_str(&pty.screen());
+            // Play the terminal: answer DSR (`ESC[6n`) with a cursor report,
+            // the way a real emulator does. A bare pty answers nothing on its
+            // own, so without this every inline surface would time out here
+            // for a reason that has nothing to do with what is under test.
+            if !answered_cursor_query && screen.contains("\u{1b}[6n") {
+                pty.type_in("\u{1b}[3;1R");
+                answered_cursor_query = true;
+            }
             if pty.is_raw() {
                 break true;
             }
@@ -143,6 +217,10 @@ fn drive(mode: &str) -> Outcome {
         let waiter = scope.spawn(|| wait_for_child(&mut child, EXIT_TIMEOUT));
         while !waiter.is_finished() {
             screen.push_str(&pty.screen());
+            if !answered_cursor_query && screen.contains("\u{1b}[6n") {
+                pty.type_in("\u{1b}[3;1R");
+                answered_cursor_query = true;
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         waiter.join().expect("child reaper thread")
@@ -154,6 +232,7 @@ fn drive(mode: &str) -> Outcome {
     Outcome {
         raw_after: pty.is_raw(),
         raw_during,
+        answered_cursor_query,
         screen,
     }
 }
@@ -196,4 +275,65 @@ fn a_panic_while_the_panel_is_up_still_restores_the_terminal() {
 #[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
 fn an_error_return_while_the_panel_is_up_still_restores_the_terminal() {
     assert_restored("error", &drive("error"));
+}
+
+/// **#1950: the panel opens even when another consumer takes the cursor
+/// reply.**
+///
+/// `Viewport::Inline` makes ratatui ask the terminal where the cursor is, and
+/// the reply comes back on the *input* stream — so any other reader of that
+/// stream can take it first. The operator hit this on `/backends` inside a
+/// multiplexer; newt's own interrupt watcher is another candidate. Before the
+/// fix, `Terminal::with_options` returned
+/// `"The cursor position could not be read within a normal duration"` and the
+/// panel did not open at all.
+///
+/// **This test must fail against `17a89c91`.** It was written by making the
+/// failure — a real competing reader on a real pty — rather than by asserting
+/// on a mocked error, because a mocked error proves only that the rescue
+/// branch compiles.
+///
+/// It was ALSO measured against the pre-#1924 shape: raw mode taken through
+/// `crossterm::terminal::enable_raw_mode` (so crossterm's own raw flag is
+/// correctly set) fails here identically. The cursor query is not a raw-mode
+/// problem, and syncing that flag fixes nothing.
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_panel_still_opens_when_the_cursor_reply_is_taken_by_another_reader() {
+    let out = drive("inline_contended");
+
+    // CONTROL 1: the query really was asked and really was answered. Without
+    // this, a pass could mean the inline viewport never queried at all.
+    assert!(
+        out.answered_cursor_query,
+        "the child never emitted ESC[6n, so nothing was contended and this \
+         test proved nothing; screen={:?}",
+        out.screen
+    );
+    // CONTROL 2: the guard was actually engaged, as the other tests require.
+    assert!(
+        out.raw_during,
+        "the pty was never raw; screen={:?}",
+        out.screen
+    );
+
+    assert!(
+        !out.screen.contains("PANEL-FAILED"),
+        "the panel refused to open — this is #1950; screen={:?}",
+        out.screen
+    );
+    assert!(
+        out.screen.contains(PANEL_SENTINEL_OK) && out.screen.contains(PANEL_SENTINEL),
+        "the panel did not DRAW. Opening without drawing leaves the operator \
+         the same blank screen the bug produced; screen={:?}",
+        out.screen
+    );
+    // And it still hands the terminal back, which is what the rest of this
+    // file exists to hold.
+    assert!(
+        !out.raw_after,
+        "the terminal was left RAW; screen={:?}",
+        out.screen
+    );
 }

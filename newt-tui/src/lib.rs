@@ -25,6 +25,10 @@ pub mod herdr;
 // C2 (#1876): the RichTUI renderer for one interaction. Rich-only — the pure
 // view model it draws lives in `newt_core::interaction_view`, where ratatui is
 // not a dependency, so "no renderer in the model" is a compile error.
+/// #1950: the ONE inline-viewport constructor, and the one answer to "where is
+/// the cursor?" when the terminal will not say.
+#[cfg(feature = "rich-tui")]
+mod inline_viewport;
 #[cfg(feature = "rich-tui")]
 mod interaction_view;
 /// C2 (#1876) — the PTY acceptance proof that the inline INTERACTION frame

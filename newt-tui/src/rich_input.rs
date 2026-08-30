@@ -57,7 +57,7 @@
 //!   unit-tested.
 
 use std::cell::Cell;
-use std::io::{self, Stdout, Write as _};
+use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -66,12 +66,11 @@ use crossterm::event::{
     KeyModifiers,
 };
 use newt_core::tty::raw_mode::RawModeGuard;
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
-use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
+use ratatui::Frame;
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::chat::BackgroundJob;
@@ -89,7 +88,7 @@ const MAX_INPUT_ROWS: u16 = 8;
 /// the prompt on its own line. (A `[tui] gutter = auto|on|off` setting later.)
 const GUTTER_MAX_FRACTION: f32 = 0.33;
 
-type Term = Terminal<CrosstermBackend<Stdout>>;
+type Term = crate::inline_viewport::InlineTerm;
 
 fn use_gutter(width: u16) -> bool {
     width > 0 && (GUTTER_W as f32) <= GUTTER_MAX_FRACTION * width as f32
@@ -433,13 +432,11 @@ fn buffer_is_empty(ta: &TextArea) -> bool {
     ta.lines().iter().all(|l| l.is_empty())
 }
 
+/// #1950: through the ONE inline constructor. The rich input surface is the
+/// prompt itself — if it refuses to open because the terminal stayed quiet,
+/// there is nothing left to type into.
 fn make_terminal(height: u16) -> io::Result<Term> {
-    Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
-        TerminalOptions {
-            viewport: Viewport::Inline(height),
-        },
-    )
+    crate::inline_viewport::inline_terminal(height)
 }
 
 fn new_textarea(edit: Edit) -> TextArea<'static> {
