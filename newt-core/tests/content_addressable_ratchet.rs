@@ -71,8 +71,15 @@ const KNOWN_HAND_ROLLED_DIGESTS: usize = 20;
 /// and report success while the rule was being broken.
 fn expected_by_file() -> BTreeMap<&'static str, usize> {
     BTreeMap::from([
-        // Tests comparing digests; convert with their subject.
-        ("newt-core/src/agentic/tools.rs", 5),
+        // Tests comparing digests; convert with their subject. REPOINTED by
+        // #1899, not lowered: all five moved intact when `tools.rs`'s inline
+        // `execute_tool_branch_tests` became a sibling file. The path now
+        // says what the comment always did, and the row sits beside
+        // `mod_tests/artifact_provenance.rs`, which is the same shape.
+        (
+            "newt-core/src/agentic/tools_tests/execute_tool_branch_tests.rs",
+            5,
+        ),
         // Artifact digests over opaque bytes → RawContentId.
         ("newt-core/src/agentic/artifact_hooks.rs", 4),
         // The §6 turn chain: canonical_encoding_v1/v2 + the content id.
