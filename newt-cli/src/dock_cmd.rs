@@ -276,14 +276,15 @@ fn run_list(operator_key_path: Option<PathBuf>, config: Option<&Path>) -> anyhow
 ///
 /// Extracted so the exact bytes are testable without a dock registry (#1916).
 /// Byte-identical to the `println!`s it replaces.
-pub(crate) fn dock_table(rows: &[[String; 3]]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let _ = writeln!(out, "{:<20} {:<18} scope", "LABEL", "PEER-FP");
-    for r in rows {
-        let _ = writeln!(out, "{:<20} {:<18} {}", r[0], r[1], r[2]);
-    }
-    out
+fn dock_table(rows: &[[String; 3]]) -> String {
+    use newt_core::markup::table::{render_table, Column};
+    let columns = [
+        Column::new("LABEL"),
+        Column::new("PEER-FP"),
+        Column::new("scope"),
+    ];
+    let data: Vec<Vec<String>> = rows.iter().map(|r| r.to_vec()).collect();
+    render_table(&columns, &data)
 }
 
 #[cfg(test)]
@@ -300,8 +301,9 @@ mod d3c {
         assert_eq!(
             super::dock_table(&rows),
             concat!(
-                "LABEL                PEER-FP            scope\n",
-                "laptop-b             abcdef0123456789   mirror-inject\n",
+                "| LABEL    | PEER-FP          | scope         |\n",
+                "| -------- | ---------------- | ------------- |\n",
+                "| laptop-b | abcdef0123456789 | mirror-inject |\n",
             )
         );
     }

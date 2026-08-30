@@ -106,21 +106,27 @@ struct ModelRow {
 /// the migration onto `markup::table` is the NEXT commit, so the golden below
 /// pins what shipped before either change.
 fn models_table(rows: &[ModelRow]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "{:<16} {:>6}  {:<8} {:<9} note",
-        "alias", "RAM", "arch", "installed"
-    );
-    for r in rows {
-        let _ = writeln!(
-            out,
-            "{:<16} {:>5.1}G  {:<8} {:<9} {}",
-            r.alias, r.ram_gb, r.arch, r.installed, r.note
-        );
-    }
-    out
+    use newt_core::markup::table::{render_table, Align, Column};
+    let columns = [
+        Column::new("alias"),
+        Column::new("RAM").align(Align::Right),
+        Column::new("arch"),
+        Column::new("installed"),
+        Column::new("note"),
+    ];
+    let data: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            vec![
+                r.alias.clone(),
+                format!("{:.1}G", r.ram_gb),
+                r.arch.clone(),
+                r.installed.to_string(),
+                r.note.clone(),
+            ]
+        })
+        .collect();
+    render_table(&columns, &data)
 }
 
 fn list() -> anyhow::Result<()> {
@@ -469,23 +475,28 @@ mod d3c {
         assert_eq!(
             models_table(&rows()),
             concat!(
-                "alias               RAM  arch     installed note\n",
-                "qwen2.5-coder      4.7G  Qwen2    yes       default summarizer\n",
-                "llama3.1          12.0G  Llama    no        \n",
+                "| alias         |   RAM | arch  | installed | note               |\n",
+                "| ------------- | ----: | ----- | --------- | ------------------ |\n",
+                "| qwen2.5-coder |  4.7G | Qwen2 | yes       | default summarizer |\n",
+                "| llama3.1      | 12.0G | Llama | no        |                    |\n",
             )
         );
     }
 
-    /// The fixed-width renderer pads the LAST column, so a row with an empty
-    /// note ends in trailing spaces. Named because it is one of the things the
-    /// GFM migration changes, and an unnamed change is the kind F0 calls a bug.
+    /// **AMENDED by the migration.** The fixed-width renderer padded the LAST
+    /// column, so a model with no note left trailing spaces on its line. GFM
+    /// closes every row with a pipe, so that whole class is gone — asserted as
+    /// the new property rather than deleted, because "no line ends in
+    /// whitespace" is worth keeping once it is true.
     #[test]
-    fn a_row_with_an_empty_last_field_ends_in_padding() {
+    fn no_row_ends_in_trailing_whitespace() {
         let out = models_table(&rows());
-        let last = out.lines().nth(2).expect("two data rows");
-        assert!(
-            last.ends_with("no        "),
-            "expected trailing pad, got {last:?}"
-        );
+        for line in out.lines() {
+            assert!(
+                line.ends_with('|'),
+                "every GFM row closes with a pipe: {line:?}"
+            );
+            assert_eq!(line.trim_end(), line, "no trailing whitespace: {line:?}");
+        }
     }
 }

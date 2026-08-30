@@ -58,22 +58,17 @@ pub fn run(cmd: ProvidersCmd) -> anyhow::Result<()> {
 ///
 /// Extracted from `list` so the exact bytes are testable without a live
 /// preset roster (#1916). Byte-identical to the `println!`s it replaces.
-pub(crate) fn providers_table(rows: &[[String; 5]]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "{:<16} {:<26} {:<20} {:<16} ENDPOINT",
-        "NAME", "LABEL", "WIRE", "SOURCE"
-    );
-    for r in rows {
-        let _ = writeln!(
-            out,
-            "{:<16} {:<26} {:<20} {:<16} {}",
-            r[0], r[1], r[2], r[3], r[4]
-        );
-    }
-    out
+fn providers_table(rows: &[[String; 5]]) -> String {
+    use newt_core::markup::table::{render_table, Column};
+    let columns = [
+        Column::new("NAME"),
+        Column::new("LABEL"),
+        Column::new("WIRE"),
+        Column::new("SOURCE"),
+        Column::new("ENDPOINT"),
+    ];
+    let data: Vec<Vec<String>> = rows.iter().map(|r| r.to_vec()).collect();
+    render_table(&columns, &data)
 }
 
 fn list() -> anyhow::Result<()> {
@@ -371,8 +366,9 @@ mod d3c {
         assert_eq!(
             super::providers_table(&rows),
             concat!(
-                "NAME             LABEL                      WIRE                 SOURCE           ENDPOINT\n",
-                "openai           OpenAI                     responses            builtin          https://api.openai.com/v1\n",
+                "| NAME   | LABEL  | WIRE      | SOURCE  | ENDPOINT                  |\n",
+                "| ------ | ------ | --------- | ------- | ------------------------- |\n",
+                "| openai | OpenAI | responses | builtin | https://api.openai.com/v1 |\n",
             )
         );
     }

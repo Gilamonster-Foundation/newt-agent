@@ -639,32 +639,38 @@ fn render_rows(rows: &[McpRow], out: &mut dyn Write) -> anyhow::Result<()> {
         )?;
         return Ok(());
     }
-    let width = rows
+    // Through `markup::table` (#1916). The hand-laid version sized its NAME
+    // column with `r.name.len()` — BYTES, which A0 §4.2.13 records as "the
+    // wrong metric twice over": a CJK or accented server name sized its column
+    // by UTF-8 length and pushed every later column out of line. The one width
+    // model measures display cells.
+    use newt_core::markup::table::{render_table, Column};
+    let columns = [
+        Column::new("NAME"),
+        Column::new("TRANSPORT"),
+        Column::new("ENABLED"),
+        Column::new("SOURCE"),
+    ];
+    let data: Vec<Vec<String>> = rows
         .iter()
-        .map(|r| r.name.len())
-        .chain(["NAME".len()])
-        .max()
-        .unwrap_or(4);
-    writeln!(
-        out,
-        "{:width$}  {:9}  {:7}  SOURCE",
-        "NAME", "TRANSPORT", "ENABLED"
-    )?;
-    for row in rows {
-        let note = if row.valid {
-            ""
-        } else {
-            "  (invalid — dropped at discovery; fix or remove it)"
-        };
-        writeln!(
-            out,
-            "{:width$}  {:9}  {:7}  {}{note}",
-            row.name,
-            row.transport.as_str(),
-            if row.enabled { "yes" } else { "no" },
-            row.source.label(),
-        )?;
-    }
+        .map(|row| {
+            // The invalid marker stays ATTACHED to the source cell rather than
+            // becoming a fifth column: it is a note about that row's origin,
+            // and an empty column on every valid row would be worse.
+            let note = if row.valid {
+                ""
+            } else {
+                "  (invalid — dropped at discovery; fix or remove it)"
+            };
+            vec![
+                row.name.clone(),
+                row.transport.as_str().to_string(),
+                if row.enabled { "yes" } else { "no" }.to_string(),
+                format!("{}{note}", row.source.label()),
+            ]
+        })
+        .collect();
+    write!(out, "{}", render_table(&columns, &data))?;
     Ok(())
 }
 
@@ -2151,10 +2157,11 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             concat!(
-                "NAME       TRANSPORT  ENABLED  SOURCE\n",
-                "scrybe     stdio      yes      newt config\n",
-                "brokenout  stdio      yes      newt mcp.toml\n",
-                "broken     stdio      yes      claude-code (user)  (invalid \u{2014} dropped at discovery; fix or remove it)\n",
+                "| NAME      | TRANSPORT | ENABLED | SOURCE                                                                 |\n",
+                "| --------- | --------- | ------- | ---------------------------------------------------------------------- |\n",
+                "| scrybe    | stdio     | yes     | newt config                                                            |\n",
+                "| brokenout | stdio     | yes     | newt mcp.toml                                                          |\n",
+                "| broken    | stdio     | yes     | claude-code (user)  (invalid \u{2014} dropped at discovery; fix or remove it) |\n",
             )
         );
     }
