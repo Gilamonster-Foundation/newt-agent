@@ -46,6 +46,7 @@ pub mod interaction_adapter;
 pub mod interaction_form;
 pub mod interaction_gate;
 pub mod interaction_offer;
+pub mod interaction_terminal;
 // C1 (#1862): the SEMANTIC half of the surface seam. Deliberately separate
 // from newt-tui's thread-shaped `SurfaceRequest`, which carries channels and
 // `Arc`s and can never cross a process (epic non-goal).
@@ -288,6 +289,16 @@ pub use newt_interaction::Audience;
 /// the consumer; reaching past `newt-core` for half the vocabulary and through
 /// it for the other half is how two spellings of the same model start.
 pub use newt_interaction::ControlKind;
+/// F0a (#1922) adds `InteractionDefinition` for the same reason, and closes a
+/// real gap rather than a convenience one: `interaction_form`'s builders and
+/// `interaction_terminal`'s adapter are `pub` and every one of them takes or
+/// returns this type, so a caller could use newt-core's public API without
+/// being able to NAME what it hands back. `newt-cli` hit exactly that.
+///
+/// The alternative was a `newt-interaction` dependency in every consumer for
+/// one type name — which is the "reaching past newt-core for half the
+/// vocabulary" the note above is about.
+pub use newt_interaction::InteractionDefinition;
 pub use store::{
     sanitize_fts5_query, AnswerOutcome, ClaimOutcome, ConversationStore, InjectOutcome,
     InjectedPrompt, LivenessFn, Roadmap, RoadmapSummary, SearchHit, StoredOwner, Verdict,

@@ -388,22 +388,6 @@ fn render_json_report(o: &ProbeOutcome) -> anyhow::Result<serde_json::Value> {
     }))
 }
 
-fn is_yes(input: &str, default: bool) -> bool {
-    match input.trim().to_ascii_lowercase().as_str() {
-        "" => default,
-        "y" | "yes" => true,
-        _ => false,
-    }
-}
-
-/// The consent decision from one read of stdin. `bytes_read == 0` is EOF
-/// (Ctrl-D) — that is an ABORT, never the default-yes: only an actual
-/// newline keypress may take the default (fail closed, like the non-TTY
-/// path).
-fn consent_given(bytes_read: usize, input: &str) -> bool {
-    bytes_read > 0 && is_yes(input, true)
-}
-
 /// One bounded, control-character-free line out of server-controlled text —
 /// a probed server's title/instructions/version can be multi-KB, multi-line,
 /// or ANSI-laced, and reach both the terminal and the catalog.
@@ -439,10 +423,16 @@ fn confirm_or_bail(question: &str, action: &str, yes: bool) -> anyhow::Result<()
     // window just erased. The `is_terminal` bail above still fires first for
     // the piped case, so nothing that used to reach stderr now goes missing.
     let window = newt_core::tty::Terminal::suspend_for_prompt();
-    window.ask(&format!("{question} [Y/n] "))?;
-    let mut buf = String::new();
-    let bytes_read = window.read_line_into(&mut buf)?;
-    if consent_given(bytes_read, &buf) {
+    if newt_core::interaction_terminal::confirmed_on_terminal(
+        &window,
+        &newt_core::interaction_form::confirm(question, "", "yes, go ahead", "no, stop"),
+        // `[Y/n]`: blank consents, and that stays. It is only reachable from
+        // a human pressing Enter at a terminal — the `is_terminal` bail above
+        // fires first for a pipe, and EOF is refused by the adapter rather
+        // than by this call site. It is a displayed default, not the machine
+        // deciding.
+        true,
+    ) {
         Ok(())
     } else {
         bail!("Aborted.");
@@ -1128,24 +1118,6 @@ mod tests {
         assert_eq!(v["server_info"]["version"], "1.2.3");
         assert_eq!(v["sandbox"], "None");
         assert_eq!(v["net"], "advisory");
-    }
-
-    #[test]
-    fn is_yes_matches_the_setup_semantics() {
-        assert!(is_yes("", true));
-        assert!(!is_yes("", false));
-        assert!(is_yes("Y", false));
-        assert!(!is_yes("n", true));
-    }
-
-    #[test]
-    fn consent_requires_input_eof_fails_closed() {
-        // Ctrl-D at the prompt reads 0 bytes with an empty buffer — that is
-        // NOT a yes. Only an actual newline keypress may take the default.
-        assert!(!consent_given(0, ""), "EOF must never proceed to execution");
-        assert!(consent_given(1, "\n"), "bare Enter = default yes");
-        assert!(consent_given(2, "y\n"));
-        assert!(!consent_given(3, "no\n"));
     }
 
     #[test]

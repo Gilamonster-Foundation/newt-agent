@@ -445,172 +445,46 @@ pub(crate) fn free_text_form(question: &str) -> InteractionDefinition {
     }
 }
 
-/// **The terminal adapter** (C1, #1862): render one semantic interaction on
-/// the terminal and report what the operator did.
+/// **The chat surface's terminal adapter**: `newt_core`'s one adapter, plus
+/// the slash-command back-out.
 ///
-/// This is the ONLY place a `PromptWindow` is turned into a rendered prompt
-/// and a read. It runs on whichever thread owns the terminal — under the
-/// two-thread split that is the UI thread, never the session — and it renders
-/// through `markup::plain::render`, the one plain projection (C0a/C0b).
+/// F0a (#1922) moved the adapter itself down to
+/// [`newt_core::interaction_terminal`], because it needed nothing from this
+/// crate and `newt-cli`'s command flows had no route to the typed path while
+/// it was `pub(crate)` here. What stayed is the only part that was ever
+/// TUI-specific: a leading slash at a prompt is a COMMAND, not an answer, and
+/// the operator is sent back to the chat prompt to use it. `newt dock
+/// approve` has no chat prompt to be sent back to, which is exactly why this
+/// half did not travel.
 ///
-/// Pure of gate state on purpose: the Back/Exit CONTROL side effects
-/// (cancelling the turn, requesting exit) belong to the session, so this
-/// returns the typed outcome and the session applies them.
+/// Back-out rather than refusal: `Cancelled` is what the core adapter already
+/// reports for Esc, and a slash typed at a prompt means the same thing —
+/// "not this, take me out".
 pub(crate) fn present_on_terminal(
     w: &PromptWindow,
     interaction: &SurfaceInteraction,
 ) -> HumanQuestionOutcome {
-    match read_interaction_line(w, interaction) {
-        // A submitted line (including an explicitly empty one) is an answer.
-        Ok(ModalLine::Line(answer)) => HumanQuestionOutcome::Answer(answer),
-        // EOF is the input stream closing — NOT an empty human answer.
-        Ok(ModalLine::Eof) => HumanQuestionOutcome::InputClosed,
-        Ok(ModalLine::Back) => HumanQuestionOutcome::Cancelled,
-        Ok(ModalLine::Exit) => HumanQuestionOutcome::ExitRequested,
-        // A read error is distinct from a missing operator.
-        Err(_) => HumanQuestionOutcome::InputFailed,
-    }
-}
-
-/// **The echo policy is DERIVED, never passed in** (D1b, #1892).
-///
-/// A caller that had to remember "this one is a secret" would eventually
-/// forget, and the failure is silent and permanent: the key lands in the
-/// scrollback. The definition already says which controls are secret, so it
-/// decides — and the one terminal adapter cannot be asked to echo a secret
-/// because nothing offers it the choice.
-///
-/// **Any** secret control masks the whole read, rather than only a
-/// definition whose sole control is secret. The adapter reads ONE line for
-/// the whole definition, so a form mixing a username and a password would
-/// otherwise echo the line that contains both. Fail closed: mask when a
-/// secret is anywhere in the form.
-fn echo_for(definition: &InteractionDefinition) -> Echo {
-    if definition
-        .controls
-        .iter()
-        .any(|control| matches!(control.kind, ControlKind::Secret))
-    {
-        Echo::Stars
-    } else {
-        Echo::Chars
-    }
-}
-
-/// Render and read, with the slash-command back-out applied.
-fn read_interaction_line(
-    w: &PromptWindow,
-    interaction: &SurfaceInteraction,
-) -> io::Result<ModalLine> {
-    let result = read_prompt_window_line(
-        w,
-        &format!(
-            "{}\n{MODAL_INPUT_GLYPH}",
-            plain::render(&interaction.definition)
-        ),
-        echo_for(&interaction.definition),
-    )?;
-    let ModalLine::Line(line) = &result else {
-        return Ok(result);
-    };
-    // The answer is returned VERBATIM — leading/trailing whitespace can be
+    let outcome = newt_core::interaction_terminal::present_on_terminal(w, interaction);
+    // The answer is inspected VERBATIM — leading/trailing whitespace can be
     // meaningful (an indented code line, a spacing-sensitive value, an
-    // intentionally blank-but-submitted answer). Slash-command detection reads a
-    // trim_start VIEW below without mutating the answer.
-    if is_slash_command_at_prompt(line) {
-        w.notice(
-            "(slash commands aren't answers; press Esc, then use the command at the chat prompt)",
-        )
-        .ok();
-        return Ok(ModalLine::Back);
+    // intentionally blank-but-submitted answer). Detection reads a trim_start
+    // VIEW without mutating the answer.
+    if let HumanQuestionOutcome::Answer(line) = &outcome {
+        if is_slash_command_at_prompt(line) {
+            w.notice(
+                "(slash commands aren't answers; press Esc, then use the command at the chat prompt)",
+            )
+            .ok();
+            return HumanQuestionOutcome::Cancelled;
+        }
     }
-    Ok(result)
+    outcome
 }
 
 /// A leading-slash answer at a `request_user_input` prompt is a TUI command
 /// intent, not an answer to hand to the model. Pure, so it's unit-testable.
 fn is_slash_command_at_prompt(answer: &str) -> bool {
     answer.trim_start().starts_with('/')
-}
-
-#[cfg(test)]
-mod d1b_echo {
-    use super::{echo_for, free_text_form};
-    use newt_core::tty::Echo;
-    use newt_interaction::{
-        ChoiceOption, Control, ControlId, ControlKind, InteractionDefinition, InteractionKind,
-        OptionId, Requirement, SemanticRole,
-    };
-
-    fn control(kind: ControlKind) -> Control {
-        Control {
-            id: ControlId::new("field").expect("valid"),
-            kind,
-            label: "API key".to_string(),
-            requirement: Requirement::Required,
-        }
-    }
-
-    fn form(controls: Vec<Control>) -> InteractionDefinition {
-        InteractionDefinition::new(InteractionKind::Form, "credentials", controls)
-    }
-
-    /// A secret control masks the read, and nothing else does.
-    #[test]
-    fn a_secret_control_masks_the_read() {
-        assert_eq!(
-            echo_for(&form(vec![control(ControlKind::Secret)])),
-            Echo::Stars
-        );
-    }
-
-    /// **The anti-vacuous twin.** If `echo_for` returned `Stars`
-    /// unconditionally the test above would pass while every ordinary prompt
-    /// silently stopped echoing — a prompt that shows nothing reads as a hung
-    /// terminal, which is the defect `Echo::Stars` documents avoiding.
-    #[test]
-    fn an_ordinary_control_still_echoes() {
-        for kind in [
-            ControlKind::Text,
-            ControlKind::Toggle,
-            ControlKind::Choice {
-                options: vec![ChoiceOption {
-                    id: OptionId::new("yes").expect("valid"),
-                    role: SemanticRole::Allow,
-                    label: "yes".to_string(),
-                    key: "y".to_string(),
-                    aliases: vec![],
-                }],
-            },
-        ] {
-            assert_eq!(
-                echo_for(&form(vec![control(kind.clone())])),
-                Echo::Chars,
-                "{kind:?} is not a secret and must echo"
-            );
-        }
-        // The production free-text form is an ordinary prompt.
-        assert_eq!(echo_for(&free_text_form("what model?")), Echo::Chars);
-        // A form with NO controls has nothing to hide.
-        assert_eq!(echo_for(&form(vec![])), Echo::Chars);
-    }
-
-    /// **Fail closed on a mixed form.** The adapter reads ONE line for the
-    /// whole definition, so a form pairing a username with a password would
-    /// echo the line carrying both if the policy keyed on "the only control".
-    #[test]
-    fn a_secret_anywhere_masks_the_whole_form() {
-        let mixed = form(vec![
-            control(ControlKind::Text),
-            control(ControlKind::Secret),
-        ]);
-        assert_eq!(echo_for(&mixed), Echo::Stars, "secret last");
-        let mixed = form(vec![
-            control(ControlKind::Secret),
-            control(ControlKind::Text),
-        ]);
-        assert_eq!(echo_for(&mixed), Echo::Stars, "secret first");
-    }
 }
 
 #[cfg(test)]

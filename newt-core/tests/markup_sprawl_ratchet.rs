@@ -399,8 +399,6 @@ const CATEGORIES: &[Category] = &[
             // `InteractionDefinition` state machine driven through C1's
             // `SurfaceInteraction` seam. `setup.rs` is D1b's, which is why
             // `line_console` itself is still here.
-            ("newt-cli/src/dock_cmd.rs", 3),
-            ("newt-cli/src/ocap_cmd.rs", 1),
             // ADDED BY #1909, and the justification the category header asks
             // for. These five are NOT a new path. They are five prompts that
             // were already outside the typed path and already owed a typed
@@ -420,10 +418,24 @@ const CATEGORIES: &[Category] = &[
             // The typed step (`ask_definition` / `InteractionDefinition`) is
             // still owed on all five, and is the reason they are armed here
             // rather than allowed to disappear.
-            ("newt-cli/src/dgx.rs", 2),
-            ("newt-cli/src/dgx_card.rs", 1),
-            ("newt-cli/src/mcp_probe_cmd.rs", 1),
             ("newt-tui/src/lib.rs", 1),
+            // F0a (#1922) took all EIGHT `newt-cli` rows to zero — `dock_cmd`
+            // (3), `dgx` (2), `ocap_cmd`, `dgx_card`, `mcp_probe_cmd`. #1911
+            // had routed five of them through the seal and left them counted
+            // because the TYPED step was still owed; this is that step.
+            //
+            // The obstacle #1911 named was that `present_on_terminal` was
+            // `pub(crate)` in newt-tui. It is resolved by moving the adapter
+            // DOWN to `newt_core::interaction_terminal`, not by a new trait:
+            // the category exists to stop a third Console, and a downward move
+            // is the opposite of one.
+            //
+            // Rebased onto F0b (#1927): this note used to end by re-listing
+            // `tty/modal.rs` here with the words "the common path the other
+            // rows are duplicates BESIDE". That sentence is now the
+            // `destinations` field above, stated once by the framework instead
+            // of by each category in prose — so the row is gone from here, and
+            // what these rows count is DUPLICATES OUTSIDE the adapter.
         ],
         rationale: "interactive ask/answer call sites outside the typed \
                     Question path; D0/D1 fold these into controller-backed \
@@ -659,7 +671,12 @@ const CATEGORIES: &[Category] = &[
             //   lane is migrating everything toward. It belongs to that lane,
             //   not to D3's.
             ("newt-cli/src/config_cmd.rs", 1),
-            ("newt-cli/src/dgx_card.rs", 1),
+            // `newt-cli/src/dgx_card.rs` was here at 1 after D3d, which
+            // found that its numbered menu is not a table at all: the numbers
+            // are SELECTORS the operator types. F0a removed it by migrating
+            // the menu to `interaction_form::menu` — the row left this
+            // category by moving to the interaction lane, exactly as D3d
+            // predicted, rather than by becoming a pipe table.
             ("newt-cli/src/dgx_status.rs", 1),
             ("newt-cli/src/tuning_cmd.rs", 2),
             // --- D3e (#1918): the newt-tui six. TWO migrated, FOUR declined.

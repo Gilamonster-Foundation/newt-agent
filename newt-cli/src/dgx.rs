@@ -637,13 +637,15 @@ fn setup(
         // printing a question onto a JSON-RPC wire and blocking for an answer
         // that is never coming.
         let window = newt_core::tty::Terminal::suspend_for_prompt();
-        window.ask("\nWrite? [y/N] ")?;
-        let mut input = String::new();
-        // EOF is not consent. `read_line_into` reports it as `Ok(0)`, and a
-        // read ERROR is a different thing again — neither may be mistaken for
-        // a typed "y".
-        let read = window.read_line_into(&mut input)?;
-        if read == 0 || !matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        // EOF is not consent, and it is no longer this site's job to remember
+        // that: `confirmed_on_terminal` refuses every outcome that is not an
+        // affirmative answer. The `matches!` this replaces was fail-closed by
+        // accident of falling through, which #1911 recorded.
+        if !newt_core::interaction_terminal::confirmed_on_terminal(
+            &window,
+            &newt_core::interaction_form::confirm("Write?", "", "yes, write it", "no, stop"),
+            false,
+        ) {
             window.notice("Aborted.")?;
             return Ok(());
         }
@@ -2372,6 +2374,29 @@ enum ReconcileAction {
 /// Pick the action from the flags + terminal state. `--adopt`/`--enforce` are
 /// explicit; otherwise the TTY answer decides; a piped/headless run with no flag
 /// only reports (never changes state silently). Pure.
+/// The three-way drift choice, as options.
+///
+/// `a`/`e`/`c` are accelerators on `adopt`/`enforce`/`cancel`, which is what
+/// they always were — the private `match` this replaces spelled each of them
+/// twice ("a" and "adopt") and could not advertise either.
+fn reconcile_menu() -> newt_core::InteractionDefinition {
+    newt_core::interaction_form::menu(
+        "config and the node disagree",
+        "",
+        &[
+            ("a", "adopt the node's state into config"),
+            ("e", "enforce config onto the node"),
+            ("c", "cancel, change nothing"),
+        ],
+    )
+}
+
+/// Which action the drift prompt resolved to.
+///
+/// `picked` is an OPTION ID (`a` / `e` / `c`), not a raw line: the parsing
+/// happened in `resolve_typed` before it got here. What stays is the
+/// PRECEDENCE, which is policy rather than parsing — explicit flags win over
+/// any answer, and a non-TTY reports rather than changing state.
 fn reconcile_action(
     adopt: bool,
     enforce: bool,
@@ -2387,9 +2412,9 @@ fn reconcile_action(
     if !is_tty {
         return ReconcileAction::Report;
     }
-    match tty_answer.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-        Some("a") | Some("adopt") => ReconcileAction::Adopt,
-        Some("e") | Some("enforce") => ReconcileAction::Enforce,
+    match tty_answer {
+        Some("a") => ReconcileAction::Adopt,
+        Some("e") => ReconcileAction::Enforce,
         _ => ReconcileAction::Report,
     }
 }
@@ -2457,12 +2482,13 @@ async fn adopt_cmd(
                 // fail-closed but not honest. `None` now means "no answer",
                 // for either reason, and says so in one place.
                 let window = newt_core::tty::Terminal::suspend_for_prompt();
-                let mut line = String::new();
-                window
-                    .ask("Adopt the node's state into config [a], enforce config onto the node [e], or cancel [c]? ")
-                    .and_then(|()| window.read_line_into(&mut line))
-                    .ok()
-                    .and_then(|read| (read > 0).then_some(line))
+                // The three choices are OPTIONS now, so `a`/`adopt` are an
+                // accelerator and an id rather than two strings a private
+                // match had to know about. `resolve_on_terminal` folds EOF, a
+                // cancel and an unrecognised answer into one `None`, which is
+                // the `Report` (change nothing) arm below.
+                newt_core::interaction_terminal::resolve_on_terminal(&window, &reconcile_menu())
+                    .map(|picked| picked.as_str().to_string())
             } else {
                 None
             };
@@ -3793,11 +3819,11 @@ tiers = ["FAST", "STANDARD"]
         );
         // TTY answers.
         assert_eq!(
-            reconcile_action(false, false, true, Some("a\n")),
+            reconcile_action(false, false, true, Some("a")),
             ReconcileAction::Adopt
         );
         assert_eq!(
-            reconcile_action(false, false, true, Some("enforce")),
+            reconcile_action(false, false, true, Some("e")),
             ReconcileAction::Enforce
         );
         assert_eq!(

@@ -285,23 +285,29 @@ pub async fn run(cmd: CardCmd, config_path: Option<&Path>) -> anyhow::Result<()>
                      for a non-interactive stand-up (see `card list`)"
                 );
             }
-            // Through the seal (#1909). `render_menu` and `parse_selection`
-            // are already pure and stay exactly as they are — only the
-            // transport moves.
+            // D3d found what this actually is: the numbers are SELECTORS the
+            // operator types, not a table's row labels — so it belongs to the
+            // interaction lane, and F0a is where it arrives. `render_menu`
+            // and `parse_selection` are gone with it: the entries are options
+            // and `resolve_typed` resolves them.
             let window = newt_core::tty::Terminal::suspend_for_prompt();
-            window.ask(&format!(
-                "{}? Choose a card (1-{}): ",
-                render_menu(&entries),
-                entries.len()
-            ))?;
-            let mut input = String::new();
-            if window.read_line_into(&mut input)? == 0 {
-                // EOF: the operator closed the stream rather than choosing.
-                // `parse_selection` would report this as a malformed choice,
-                // which is a worse message for a thing that is not a mistake.
-                anyhow::bail!("no card chosen (input closed)");
-            }
-            let idx = parse_selection(&input, entries.len()).map_err(|e| anyhow::anyhow!(e))?;
+            let rows: Vec<(String, String)> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| ((i + 1).to_string(), menu_label(e)))
+                .collect();
+            let choices: Vec<(&str, &str)> =
+                rows.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let picked = newt_core::interaction_terminal::resolve_on_terminal(
+                &window,
+                &newt_core::interaction_form::menu("\nAvailable model cards:", "", &choices),
+            )
+            // EOF, a cancel, and an out-of-range number all land here. The
+            // message says the operator did not choose, which is true of all
+            // three and is a better answer than "malformed choice" for a
+            // closed stream.
+            .ok_or_else(|| anyhow::anyhow!("no card chosen"))?;
+            let idx = picked.as_str().parse::<usize>().unwrap_or(1) - 1;
             let name = entries[idx].card.name.clone();
             setup_card(config_path, &name, model, node, backend, dry_run, force).await
         }
@@ -311,42 +317,19 @@ pub async fn run(cmd: CardCmd, config_path: Option<&Path>) -> anyhow::Result<()>
 /// Render the card catalog as a numbered interactive menu — the `card pick`
 /// front-end for `card list`. Pure; the TTY read lives in [`run`].
 #[must_use]
-pub fn render_menu(entries: &[CardEntry]) -> String {
-    let mut out = String::from("\nAvailable model cards:\n\n");
-    for (i, e) in entries.iter().enumerate() {
-        let backend = e.card.backend.map_or("-", |b| b.as_str());
-        let gib = e
-            .card
-            .footprint_gib
-            .map_or_else(|| "-".to_string(), |f| format!("{f:.0}GiB"));
-        out.push_str(&format!(
-            "  {:>2}. {:<22} {:<8} {:>7}  {}\n",
-            i + 1,
-            e.card.name,
-            backend,
-            gib,
-            e.source
-        ));
-    }
-    out.push('\n');
-    out
-}
-
-/// Parse a 1-based menu selection into a 0-based catalog index. Pure — the
-/// impure TTY read is in [`run`].
+/// One catalog row's label, for the menu's option text.
 ///
-/// # Errors
-/// Returns a human-readable message when the input is not a number or is out of
-/// the `1..=len` range.
-pub fn parse_selection(input: &str, len: usize) -> Result<usize, String> {
-    let choice: usize = input
-        .trim()
-        .parse()
-        .map_err(|_| format!("`{}` is not a number", input.trim()))?;
-    if choice < 1 || choice > len {
-        return Err(format!("selection {choice} out of range (1-{len})"));
-    }
-    Ok(choice - 1)
+/// The `{:>2}. {:<22} {:<8} {:>7}` hand-laid columns this replaces were the
+/// `dgx_card` row D3d left in the ad-hoc-width category, and they went the
+/// way D3d predicted: not by becoming a pipe table, but by becoming OPTIONS.
+/// The leading number is the option's key now, so it is not in the label.
+fn menu_label(e: &CardEntry) -> String {
+    let backend = e.card.backend.map_or("-", |b| b.as_str());
+    let gib = e
+        .card
+        .footprint_gib
+        .map_or_else(|| "-".to_string(), |f| format!("{f:.0}GiB"));
+    format!("{} {} {} {}", e.card.name, backend, gib, e.source)
 }
 
 /// Resolve a card by name, validate it, and stand its backend up. Shared by
@@ -625,33 +608,54 @@ mod tests {
     }
 
     #[test]
-    fn render_menu_numbers_every_card() {
+    fn the_card_menu_offers_every_card_as_a_numbered_option() {
         let dir = catalog_dir_raw(&[
             ("aaa", &valid_body("aaa", 0.6)),
             ("bbb", &valid_body("bbb", 0.6)),
         ]);
         let (entries, _) = catalog_rows(Some(dir.path()));
-        let out = render_menu(&entries);
-        // 1-based numbering, one line per card (built-ins list too), the
-        // drop-ins present with their backend shown.
-        assert!(out.contains(" 1. "), "{out}");
-        assert!(out.contains(". aaa"), "{out}");
-        assert!(out.contains(". bbb"), "{out}");
-        assert!(out.contains("vllm"));
-    }
+        let rows: Vec<(String, String)> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| ((i + 1).to_string(), menu_label(e)))
+            .collect();
+        let choices: Vec<(&str, &str)> =
+            rows.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let def = newt_core::interaction_form::menu("cards", "", &choices);
+        let shown = newt_core::markup::plain::render(&def);
 
-    #[test]
-    fn parse_selection_accepts_in_range_1_based() {
-        assert_eq!(parse_selection("1\n", 3), Ok(0));
-        assert_eq!(parse_selection("  3 ", 3), Ok(2));
-    }
-
-    #[test]
-    fn parse_selection_rejects_out_of_range_and_garbage() {
-        assert!(parse_selection("0", 3).is_err());
-        assert!(parse_selection("4", 3).is_err());
-        assert!(parse_selection("abc", 3).is_err());
-        assert!(parse_selection("", 3).is_err());
+        // One option per card, numbered from 1, each on its own line with its
+        // key bracketed. The catalog carries BUILT-INS as well as the two
+        // drop-ins this test writes, so the drop-ins are NOT at positions 1
+        // and 2 — the count comes from the catalog, not from the fixtures.
+        // Asserting `[1] 1 ` was wrong twice over: the number is the option's
+        // KEY, not part of its label, and entry 1 is a built-in.
+        let n = entries.len();
+        assert!(n > 2, "built-ins are in the catalog too: {n}");
+        assert_eq!(shown.lines().count(), n + 1, "body plus one line per card");
+        assert!(shown.contains("[1] "), "{shown}");
+        assert!(shown.contains(&format!("[{n}] ")), "{shown}");
+        assert!(shown.contains(" aaa "), "{shown}");
+        assert!(shown.contains(" bbb "), "{shown}");
+        assert!(shown.contains("vllm"), "{shown}");
+        for i in 1..=n {
+            let key = i.to_string();
+            assert_eq!(
+                newt_core::interaction_form::resolve(&def, &key).map(|o| o.as_str().to_string()),
+                Some(key.clone()),
+                "{key}"
+            );
+        }
+        // Out of range and garbage resolve to nothing, which the call site
+        // turns into "no card chosen" — the arm `parse_selection`'s
+        // malformed-choice error used to occupy.
+        let past_end = (n + 1).to_string();
+        for miss in ["0", &past_end, "abc", ""] {
+            assert!(
+                newt_core::interaction_form::resolve(&def, miss).is_none(),
+                "{miss}"
+            );
+        }
     }
 
     #[test]
