@@ -1605,7 +1605,7 @@ mod tests {
                 &conv,
                 &definition,
                 newt_core::OfferDanger::High,
-                newt_core::Audience::Web,
+                &[newt_core::Audience::Web],
             )
             .unwrap();
 
@@ -1682,7 +1682,7 @@ mod tests {
                 &conv,
                 &definition,
                 newt_core::OfferDanger::High,
-                newt_core::Audience::Web,
+                &[newt_core::Audience::Web],
             )
             .unwrap();
         (store, conv, rid)
