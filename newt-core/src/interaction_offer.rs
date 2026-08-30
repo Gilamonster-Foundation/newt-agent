@@ -86,6 +86,32 @@ pub struct PendingOffer {
     pub danger: OfferDanger,
 }
 
+/// Parse a stored instance and check it against the identity it is filed
+/// under.
+///
+/// **Why this is not merely a parse.** `instance_id` is a `ContentId` over
+/// the instance, so the row key IS the checksum for these bytes. Until C4
+/// it was computed once at publish time and never read back, which is the
+/// `provenance-audit` skill's third question — evidence nobody reads is
+/// decoration. The bytes come out of a row a SECOND process can write, so
+/// re-deriving here is input validation at a trust boundary.
+///
+/// It is a free function with a named caller rather than an inline check
+/// inside the answer path, because an unreachable correct answer is how
+/// this epic got its worst bug: `RawGuard` was private, so the next surface
+/// reached for crossterm and inherited the defect three times (C2b, #1891).
+/// Anything that needs the stored instance goes through here.
+///
+/// `None` means unusable, deliberately conflating "does not parse" with
+/// "is not what it claims to be": neither may authorize anything, and a
+/// caller that could tell them apart would be tempted to treat one as
+/// recoverable.
+#[must_use]
+fn verified_instance(instance_id: &str, instance_json: &str) -> Option<InteractionInstance> {
+    let instance: InteractionInstance = serde_json::from_str(instance_json).ok()?;
+    (instance.instance_id().ok()?.to_string() == instance_id).then_some(instance)
+}
+
 impl PendingOffer {
     /// The definition this offer publishes.
     ///
@@ -96,13 +122,14 @@ impl PendingOffer {
         serde_json::from_str(&self.definition_json)
     }
 
-    /// The instance that binds it.
+    /// The instance that binds it, checked against the identity it is
+    /// filed under.
     ///
-    /// # Errors
-    ///
-    /// A deserialization failure.
-    pub fn instance(&self) -> serde_json::Result<InteractionInstance> {
-        serde_json::from_str(&self.instance_json)
+    /// `None` when the bytes do not parse, or when they do not hash to
+    /// `instance_id` — see [`verified_instance`].
+    #[must_use]
+    pub fn instance(&self) -> Option<InteractionInstance> {
+        verified_instance(&self.instance_id, &self.instance_json)
     }
 }
 
@@ -118,7 +145,7 @@ impl ConversationStore {
         conversation_id: &str,
         definition: &InteractionDefinition,
         danger: OfferDanger,
-        audience: Audience,
+        audiences: &[Audience],
     ) -> anyhow::Result<String> {
         // The STORE stamps the fence and the tick. A caller that minted the
         // instance itself could stamp a fence the row is not filed under,
@@ -128,7 +155,7 @@ impl ConversationStore {
             definition,
             self.workspace_fence(),
             conversation_id,
-            audience,
+            audiences,
             self.claim_tick(),
         )
         .map_err(|e| anyhow::anyhow!("cannot mint an offer for this definition: {e}"))?;
@@ -251,12 +278,17 @@ impl ConversationStore {
             return Ok(AnswerOutcome::AlreadyResolved);
         }
 
-        let (Ok(definition), Ok(instance)) = (
-            serde_json::from_str::<InteractionDefinition>(&definition_json),
-            serde_json::from_str::<InteractionInstance>(&instance_json),
-        ) else {
+        let Ok(definition) = serde_json::from_str::<InteractionDefinition>(&definition_json) else {
             tx.commit()?;
             return Ok(AnswerOutcome::InvalidAction);
+        };
+        // Stored bytes that do not hash to their own row key name no offer
+        // this identity ever published. `Unknown`, not `InvalidAction`: the
+        // action is not what is wrong, and this fails closed exactly as
+        // expiry does below.
+        let Some(instance) = verified_instance(instance_id, &instance_json) else {
+            tx.commit()?;
+            return Ok(AnswerOutcome::Unknown);
         };
         // Expiry authorizes nothing, and synthesizes nothing.
         if Lifecycle::has_elapsed(&instance, now) {
@@ -422,7 +454,7 @@ mod b0b2 {
         let ws = tempfile::tempdir().unwrap();
         let (store, conv) = store_and_conv(root.path(), ws.path());
         let published = store
-            .publish_interaction_offer(&conv, &definition(), OfferDanger::High, Audience::Web)
+            .publish_interaction_offer(&conv, &definition(), OfferDanger::High, &[Audience::Web])
             .unwrap();
         drop(store);
 
@@ -468,7 +500,7 @@ mod b0b2 {
         let other = tempfile::tempdir().unwrap();
         let (store, conv) = store_and_conv(root.path(), ws.path());
         let id = store
-            .publish_interaction_offer(&conv, &definition(), OfferDanger::Low, Audience::Web)
+            .publish_interaction_offer(&conv, &definition(), OfferDanger::Low, &[Audience::Web])
             .unwrap();
         assert!(store.pending_interaction_offer(&conv).unwrap().is_some());
 
@@ -503,7 +535,7 @@ mod b0b2 {
         let (store, conv) = store_and_conv(root.path(), ws.path());
 
         let id = store
-            .publish_interaction_offer(&conv, &definition(), OfferDanger::Low, Audience::Web)
+            .publish_interaction_offer(&conv, &definition(), OfferDanger::Low, &[Audience::Web])
             .unwrap();
         // Nobody has answered yet.
         assert_eq!(store.interaction_answered_by(&conv, &id).unwrap(), None);
@@ -520,7 +552,7 @@ mod b0b2 {
         // guessing — the honest analogue of the old `answered_by = 'tty'`
         // and `'expired'` rows, which recorded a claim, not an answer.
         let cancelled = store
-            .publish_interaction_offer(&conv, &definition(), OfferDanger::Low, Audience::Web)
+            .publish_interaction_offer(&conv, &definition(), OfferDanger::Low, &[Audience::Web])
             .unwrap();
         assert!(store.cancel_interaction_offer(&conv, &cancelled).unwrap());
         assert_eq!(
@@ -543,34 +575,50 @@ mod b0b2 {
         let ws = tempfile::tempdir().unwrap();
         let (seed, conv) = store_and_conv(root.path(), ws.path());
         let id = seed
-            .publish_interaction_offer(&conv, &definition(), OfferDanger::Low, Audience::Web)
+            .publish_interaction_offer(
+                &conv,
+                &definition(),
+                OfferDanger::Low,
+                &[Audience::Terminal, Audience::Web],
+            )
             .unwrap();
         drop(seed);
 
         let barrier = Arc::new(Barrier::new(3));
         let mut workers = Vec::new();
-        for action in [PermissionAction::AllowOnce, PermissionAction::Deny] {
+        // C4 (#1894): the two racers are now the two SURFACES, not two web
+        // requests. This is the broker's central claim — a terminal answer
+        // and a web answer contend for one row — and it is a one-parameter
+        // widening of B0b-2's harness rather than a second race test.
+        for (action, audience) in [
+            (PermissionAction::AllowOnce, Audience::Terminal),
+            (PermissionAction::Deny, Audience::Web),
+        ] {
             let root_path = root.path().to_path_buf();
             let ws_path = ws.path().to_path_buf();
             let (conv, id) = (conv.clone(), id.clone());
             let barrier = Arc::clone(&barrier);
             workers.push(std::thread::spawn(move || {
                 // A FRESH store: its own connection, as a web request gets.
+                // Two threads sharing ONE store would only exercise its
+                // `Arc<Mutex<Connection>>` and prove nothing about SQLite.
                 let store = ConversationStore::new(root_path, ws_path, 100).unwrap();
+                let answering = audience.clone();
                 barrier.wait();
                 (
                     action,
-                    store.answer_interaction_offer(&conv, &id, action, Audience::Web),
+                    audience,
+                    store.answer_interaction_offer(&conv, &id, action, answering),
                 )
             }));
         }
         barrier.wait();
         let outcomes: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
 
-        let winners: Vec<PermissionAction> = outcomes
+        let winners: Vec<(PermissionAction, Audience)> = outcomes
             .iter()
-            .filter(|(_, r)| matches!(r, Ok(AnswerOutcome::Answered)))
-            .map(|(a, _)| *a)
+            .filter(|(_, _, r)| matches!(r, Ok(AnswerOutcome::Answered)))
+            .map(|(a, aud, _)| (*a, aud.clone()))
             .collect();
         assert_eq!(
             winners.len(),
@@ -580,7 +628,7 @@ mod b0b2 {
         assert!(
             outcomes
                 .iter()
-                .any(|(_, r)| matches!(r, Ok(AnswerOutcome::AlreadyResolved))),
+                .any(|(_, _, r)| matches!(r, Ok(AnswerOutcome::AlreadyResolved))),
             "the loser must be told it lost: {outcomes:#?}"
         );
 
@@ -589,11 +637,162 @@ mod b0b2 {
         let reopened = ConversationStore::new(root.path(), ws.path(), 100).unwrap();
         assert_eq!(
             reopened.take_interaction_decision(&conv, &id).unwrap(),
-            Some(winners[0])
+            Some(winners[0].0)
         );
+        // And the audit fact names whichever SURFACE won, not a hardcoded
+        // one — the assertion that would have survived a broker that always
+        // credited the web.
         assert_eq!(
             reopened.interaction_answered_by(&conv, &id).unwrap(),
-            Some(Audience::Web)
+            Some(winners[0].1.clone())
+        );
+    }
+
+    /// **The broker property** (C4, #1894): ONE offer, one row, one CAS,
+    /// answerable by whichever surface the operator reaches first.
+    ///
+    /// Nothing here is new machinery. `ResponderPolicy.audiences` has been
+    /// a `Vec<Audience>` since A2, and both eligibility checks
+    /// (`binding.rs:426`, `:462`) have always been set membership. The set
+    /// was simply hardcoded to one element at the two mint sites.
+    #[test]
+    fn an_offer_open_to_both_surfaces_admits_either_one() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let (store, conv) = store_and_conv(root.path(), ws.path());
+
+        for answering in [Audience::Terminal, Audience::Web] {
+            let id = store
+                .publish_interaction_offer(
+                    &conv,
+                    &definition(),
+                    OfferDanger::Low,
+                    &[Audience::Terminal, Audience::Web],
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .answer_interaction_offer(
+                        &conv,
+                        &id,
+                        PermissionAction::AllowOnce,
+                        answering.clone()
+                    )
+                    .unwrap(),
+                AnswerOutcome::Answered,
+                "an offer open to both surfaces refused {answering:?}"
+            );
+            assert_eq!(
+                store.interaction_answered_by(&conv, &id).unwrap(),
+                Some(answering.clone()),
+                "the audit fact must name the surface that actually answered"
+            );
+        }
+    }
+
+    /// The twin. If a narrowed offer admitted everyone, the test above
+    /// would pass no matter what the audience set said.
+    #[test]
+    fn an_offer_open_to_one_surface_still_refuses_the_other() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let (store, conv) = store_and_conv(root.path(), ws.path());
+        let id = store
+            .publish_interaction_offer(&conv, &definition(), OfferDanger::Low, &[Audience::Web])
+            .unwrap();
+        assert_eq!(
+            store
+                .answer_interaction_offer(
+                    &conv,
+                    &id,
+                    PermissionAction::AllowOnce,
+                    Audience::Terminal
+                )
+                .unwrap(),
+            AnswerOutcome::InvalidAction,
+            "a Web-only offer must still refuse the terminal"
+        );
+    }
+
+    /// **The trust boundary** (C4, #1894). The answer path reads
+    /// `instance_json` back out of a row a SECOND process can write, and
+    /// nothing re-derives the identity that commits to those bytes.
+    ///
+    /// `instance_id` is a `ContentId` over the instance, so the row key IS
+    /// the checksum — but it is computed only at publish time
+    /// (`interaction_offer.rs:137`) and asserted only in a test (`:444`).
+    /// `authorized_response` re-checks the instance→definition binding via
+    /// `publish`, which leaves every OTHER field of the instance unchecked.
+    ///
+    /// `responder_policy.audiences` is one of those fields, and it is the
+    /// eligibility gate at `binding.rs:426`. So widening it in the stored
+    /// bytes escalates an offer the publisher scoped to one surface — under
+    /// a row key that still claims to name the original.
+    #[test]
+    fn a_tampered_instance_cannot_answer_under_the_published_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let (store, conv) = store_and_conv(root.path(), ws.path());
+        let id = store
+            .publish_interaction_offer(&conv, &definition(), OfferDanger::Low, &[Audience::Web])
+            .unwrap();
+
+        // Control: as published, the offer is Web-only, so the terminal is
+        // refused. This is the property the tamper tries to buy.
+        assert_eq!(
+            store
+                .answer_interaction_offer(
+                    &conv,
+                    &id,
+                    PermissionAction::AllowOnce,
+                    Audience::Terminal
+                )
+                .unwrap(),
+            AnswerOutcome::InvalidAction,
+            "a Web-only offer must refuse a Terminal answer, or this test proves nothing"
+        );
+
+        // Tamper: widen the audience set in the STORED bytes, leaving the
+        // row key — the content id of the ORIGINAL instance — untouched.
+        let mut instance: InteractionInstance = {
+            let conn = store.lock_conn();
+            let json: String = conn
+                .query_row(
+                    "SELECT instance_json FROM interaction_offers WHERE instance_id = ?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&json).unwrap()
+        };
+        instance.responder_policy.audiences.push(Audience::Terminal);
+        // The tampered bytes name a DIFFERENT instance, and that is the
+        // whole point: the row key no longer matches its own content.
+        assert_ne!(
+            instance.instance_id().unwrap().to_string(),
+            id,
+            "the tamper did not change the identity, so it is not a tamper"
+        );
+        {
+            let conn = store.lock_conn();
+            conn.execute(
+                "UPDATE interaction_offers SET instance_json = ?2 WHERE instance_id = ?1",
+                rusqlite::params![&id, serde_json::to_string(&instance).unwrap()],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .answer_interaction_offer(
+                    &conv,
+                    &id,
+                    PermissionAction::AllowOnce,
+                    Audience::Terminal
+                )
+                .unwrap(),
+            AnswerOutcome::Unknown,
+            "stored bytes that do not hash to their own row key must not authorize an answer"
         );
     }
 

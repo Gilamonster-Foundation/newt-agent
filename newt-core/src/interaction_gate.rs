@@ -85,7 +85,7 @@ pub fn mint_offer(
     definition: &InteractionDefinition,
     workspace_key: &str,
     conversation_id: &str,
-    audience: Audience,
+    audiences: &[Audience],
     minted_tick: i64,
 ) -> Result<(InteractionInstance, Lifecycle), LifecycleError> {
     let nonce = Nonce::new(format!("{minted_tick}-{}", uuid::Uuid::new_v4().simple()))
@@ -103,7 +103,7 @@ pub fn mint_offer(
             conversation_id: conversation_id.to_string(),
         },
         responder_policy: ResponderPolicy {
-            audiences: vec![audience],
+            audiences: audiences.to_vec(),
             // The terminal operator's authority comes from holding the
             // terminal, and the web decision channel presents no
             // credential today — so requiring one here would fail every

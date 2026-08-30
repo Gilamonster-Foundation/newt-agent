@@ -709,7 +709,7 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
             &self.conversation_id,
             &definition,
             tier,
-            Audience::Web,
+            &[Audience::Web],
         ) {
             Ok(id) => id,
             Err(_) => return (PromptChoice::Deny, "web-unavailable"),
@@ -936,7 +936,7 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
             definition,
             &self.state.workspace_key,
             &self.conversation_id,
-            audience.clone(),
+            std::slice::from_ref(&audience),
             newt_core::interaction_gate::now_tick(),
         ) else {
             return Err(newt_interaction::Refusal::MissingRequiredControl {
@@ -1516,7 +1516,7 @@ mod permission_prompt_tests {
                 conv,
                 &definition,
                 newt_core::interaction_offer::OfferDanger::Low,
-                Audience::Web,
+                &[Audience::Web],
             )
             .unwrap()
     }
@@ -3954,7 +3954,7 @@ mod b0b {
             audience.clone(),
         );
         let (instance, lifecycle) =
-            mint_offer(&definition, "ws", "conv-1", audience, now_tick()).expect("mints");
+            mint_offer(&definition, "ws", "conv-1", &[audience], now_tick()).expect("mints");
         (definition, instance, lifecycle)
     }
 
@@ -4037,8 +4037,8 @@ mod b0b {
         };
         let terminal_form =
             permission_definition(&low, &danger::DangerTable::builtin(), Audience::Terminal);
-        let (inst, life) =
-            mint_offer(&terminal_form, "ws", "conv-1", Audience::Web, now_tick()).expect("mints");
+        let (inst, life) = mint_offer(&terminal_form, "ws", "conv-1", &[Audience::Web], now_tick())
+            .expect("mints");
         assert!(
             authorize_action(
                 &terminal_form,

@@ -6579,7 +6579,7 @@ mod tests {
                 &conv,
                 &definition,
                 crate::interaction_offer::OfferDanger::High,
-                newt_interaction::Audience::Web,
+                &[newt_interaction::Audience::Web],
             )
             .unwrap();
         assert!(store.pending_interaction_offer(&conv).unwrap().is_some());
@@ -6618,7 +6618,7 @@ mod tests {
             &definition,
             store.workspace_fence(),
             conv,
-            newt_interaction::Audience::Web,
+            &[newt_interaction::Audience::Web],
             // The store's OWN clock, so the offer's TTL window is the one
             // the store measures against rather than a fixed literal that
             // is already ancient by wall time.
@@ -6646,7 +6646,7 @@ mod tests {
                 &conv,
                 &definition,
                 crate::interaction_offer::OfferDanger::Low,
-                newt_interaction::Audience::Web,
+                &[newt_interaction::Audience::Web],
             )
             .unwrap();
         let pending = store.pending_interaction_offer(&conv).unwrap().unwrap();
@@ -6991,7 +6991,7 @@ mod tests {
                 &conv,
                 &definition,
                 crate::interaction_offer::OfferDanger::Low,
-                newt_interaction::Audience::Web,
+                &[newt_interaction::Audience::Web],
             )
             .unwrap();
         store
