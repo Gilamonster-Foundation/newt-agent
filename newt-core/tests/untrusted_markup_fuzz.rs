@@ -127,12 +127,26 @@ proptest! {
         prop_assert_eq!(&rendered, &plain::render(&definition(&markdown, &label)));
     }
 
-    /// Measuring a diagram is total and its depth is bounded by the source.
+    /// Measuring a diagram is total, and its shape is bounded by the source.
+    ///
+    /// **The node bound is `edges + lines`, not `lines`** (#1956). The old
+    /// bound was never true: a line splits into at most one more endpoint
+    /// than it has arrows, so `A->B` is one line and two legitimate nodes
+    /// and would have failed it. It survived only because a random `\PC*`
+    /// string rarely contains an arrow token — the fuzzer needed 45 tries to
+    /// reach `"->"`, and would have found `"A->B"` just as damning.
+    ///
+    /// This bound does NOT subsume the pinned cases in
+    /// `mermaid::e0a_shape_scan`. `"->"` under the OLD scanner reports 2
+    /// nodes, 1 edge, 1 line — which satisfies `2 <= 1 + 1`. So correcting
+    /// the property alone would have turned this red into a green while the
+    /// phantom nodes stayed, and only the pinned case holds the scanner
+    /// honest.
     #[test]
     fn measuring_any_mermaid_source_terminates(source in "\\PC*") {
         let shape = mermaid::measure(&source);
         prop_assert!(shape.depth <= source.len());
-        prop_assert!(shape.nodes <= source.lines().count());
+        prop_assert!(shape.nodes <= shape.edges + source.lines().count());
     }
 
     /// A table cell can hold anything, and the table stays a table: one
