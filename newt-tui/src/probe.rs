@@ -1640,26 +1640,34 @@ pub async fn probe_tool_conformance(
 // ---------------------------------------------------------------------------
 
 /// Print the full capabilities matrix to stdout.
-pub fn print_capabilities_table(
+/// The capability table as data: the lines above the rows, one line per
+/// model, and which row is the active one.
+///
+/// Split out of [`print_capabilities_table`] by D3e (#1918) so the bytes an
+/// operator sees can be asserted. The tests beside this function used to say
+/// so themselves — *"the table writes straight to stdout, so these tests
+/// can't assert on the rendered text without refactoring production code"* —
+/// and a golden that does not exist before a change cannot make F0's
+/// unlisted-diff rule bite.
+///
+/// `active` is an INDEX rather than a name so the caller can colour that row
+/// without matching text back against the model list. Matching would be the
+/// `starts_with` hazard D3c hit in `mcp_cli.rs`, arriving in a new place.
+pub(crate) struct CapabilitiesTable {
+    pub(crate) head: Vec<String>,
+    pub(crate) rows: Vec<String>,
+    pub(crate) active: Option<usize>,
+}
+
+/// Build the capability table for `models`.
+pub(crate) fn capabilities_table(
     models: &[ModelInfo],
     cache: &CapabilityCache,
     active: &str,
-    endpoint: &str,
-    color: bool,
-) {
-    // This table is an Ollama (Multiplexer) view, so the capability key is the
-    // bare model name — go through cap_key so the keying discipline lives in one
-    // place rather than open-coding `&m.name`.
-    let tested = models
-        .iter()
-        .filter(|m| cache.contains_key(&cap_key(newt_core::Serving::Multiplexer, "", &m.name)))
-        .count();
-    println!(
-        "Models on {}  ({} total, {} tested)\n",
-        endpoint,
-        models.len(),
-        tested,
-    );
+) -> CapabilitiesTable {
+    let mut head: Vec<String> = Vec::new();
+    let mut out: Vec<String> = Vec::with_capacity(models.len());
+    let mut active_row: Option<usize> = None;
 
     // Column widths.
     let name_w = models
@@ -1671,11 +1679,13 @@ pub fn print_capabilities_table(
 
     // Header.
     let sep = "─".repeat(name_w);
-    println!(
+    head.push(format!(
         "  {:<name_w$}  {:>6}  {:<8}  {:<5}  {:>8}  {:>8}  Conf  Tested",
         "Model", "Size", "Tool Use", "Think", "Ctx Win", "Safe Ctx"
-    );
-    println!("  {sep}  ──────  ────────  ─────  ────────  ────────  ────  ──────────");
+    ));
+    head.push(format!(
+        "  {sep}  ──────  ────────  ─────  ────────  ────────  ────  ──────────"
+    ));
 
     for m in models {
         let is_active = m.name == active;
@@ -1729,10 +1739,49 @@ pub fn print_capabilities_table(
             };
 
         let name = &m.name;
-        let row = format!(
+        if is_active {
+            active_row = Some(out.len());
+        }
+        out.push(format!(
             "  {name:<name_w$}{active_tag}  {size}  {conformance_str}  {think_str:<5}  {ctx_win_str}  {safe_ctx_str}  {conf_str}  {date_str}"
-        );
-        if color && is_active {
+        ));
+    }
+
+    CapabilitiesTable {
+        head,
+        rows: out,
+        active: active_row,
+    }
+}
+
+/// Print the capability table for `/model`.
+pub fn print_capabilities_table(
+    models: &[ModelInfo],
+    cache: &CapabilityCache,
+    active: &str,
+    endpoint: &str,
+    color: bool,
+) {
+    // This table is an Ollama (Multiplexer) view, so the capability key is the
+    // bare model name — go through cap_key so the keying discipline lives in one
+    // place rather than open-coding `&m.name`.
+    let tested = models
+        .iter()
+        .filter(|m| cache.contains_key(&cap_key(newt_core::Serving::Multiplexer, "", &m.name)))
+        .count();
+    println!(
+        "Models on {}  ({} total, {} tested)\n",
+        endpoint,
+        models.len(),
+        tested,
+    );
+
+    let table = capabilities_table(models, cache, active);
+    for line in &table.head {
+        println!("{line}");
+    }
+    for (i, row) in table.rows.iter().enumerate() {
+        if color && table.active == Some(i) {
             use crossterm::style::Color as CtColor;
             use crossterm::{
                 execute,
@@ -2839,14 +2888,110 @@ mod tests {
         assert_eq!(TuneConfidence::default(), TuneConfidence::None);
     }
 
-    // --- print_capabilities_table ---
+    // --- the capability table ---
     //
-    // The table writes straight to stdout, so these tests can't assert on the
-    // rendered text without refactoring production code (out of scope).  They
-    // are edge-case exercises: every formatting branch (tested/untested,
-    // every confidence level, missing ctx fields, active-row colouring, empty
-    // model list hitting the `max().unwrap_or(20)` width fallback) must
-    // complete without panicking.
+    // D3e (#1918) split the rendering out of `print_capabilities_table`, so
+    // these no longer have to settle for "did not panic". The goldens below
+    // record what an operator sees TODAY; the migration onto `markup::table`
+    // amends them and declares its diff.
+
+    /// Two models, one active, one untested — the ordinary case, byte for
+    /// byte.
+    #[test]
+    fn the_capability_table_renders_its_current_bytes() {
+        let mut cache = CapabilityCache::default();
+        let mut e = make_entry();
+        e.tune_confidence = TuneConfidence::High;
+        e.tested_date = "2026-06-10".to_string();
+        cache.insert(mk("llama3.1:8b"), e);
+        let models: Vec<ModelInfo> = [("llama3.1:8b", "8B"), ("qwen2.5-coder:7b", "7B")]
+            .into_iter()
+            .map(|(n, s)| ModelInfo {
+                name: n.to_string(),
+                param_size: s.to_string(),
+            })
+            .collect();
+
+        let t = capabilities_table(&models, &cache, "llama3.1:8b");
+        assert_eq!(t.active, Some(0), "the active row is identified by index");
+        assert_eq!(
+            t.head[0],
+            "  Model                   Size  Tool Use  Think   Ctx Win  Safe Ctx  Conf  Tested"
+        );
+        assert_eq!(
+            t.head[1],
+            "  ────────────────────  ──────  ────────  ─────  ────────  ────────  ────  ──────────"
+        );
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(
+            t.rows[0],
+            "  llama3.1:8b          ◀      8B  ✓ native  \u{2014}           32k       25k  High  2026-06-10"
+        );
+        assert_eq!(
+            t.rows[1],
+            "  qwen2.5-coder:7b            7B  \u{2014}         \u{2014}             \u{2014}         \u{2014}    \u{2014}   (untested)"
+        );
+    }
+
+    /// **The bug, pinned before it is fixed** (A0 §4.2.13, "the wrong metric
+    /// twice over" — and it is actually three).
+    ///
+    /// `name_w` is computed from `m.name.len()`, which is BYTES. The padding
+    /// `{:<name_w$}` counts CHARS. The terminal renders CELLS. A CJK model
+    /// name therefore sizes the column by its UTF-8 length, gets padded by
+    /// its character count, and occupies twice its character count on screen
+    /// — so every later column on that row lands somewhere else than on
+    /// every other row.
+    ///
+    /// This asserts the CURRENT misalignment so the migration has something
+    /// to amend rather than a difference buried in whitespace. It is the same
+    /// entry D3c fixed the other half of, in `mcp_cmd`.
+    #[test]
+    fn a_cjk_model_name_currently_misaligns_every_later_column() {
+        let cache = CapabilityCache::default();
+        let models: Vec<ModelInfo> = [("日本語モデル:7b", "7B"), ("ascii-model:7b", "7B")]
+            .into_iter()
+            .map(|(n, s)| ModelInfo {
+                name: n.to_string(),
+                param_size: s.to_string(),
+            })
+            .collect();
+        let t = capabilities_table(&models, &cache, "none");
+
+        // 21 bytes, 9 chars — the column is sized by the former.
+        assert_eq!("日本語モデル:7b".len(), 21);
+        assert_eq!("日本語モデル:7b".chars().count(), 9);
+
+        // Both rows are the same CHAR length, because padding counts chars...
+        assert_eq!(
+            t.rows[0].chars().count(),
+            t.rows[1].chars().count(),
+            "padding equalises characters"
+        );
+        // ...and DIFFERENT display widths, which is what the operator sees.
+        let cells = |s: &str| -> usize {
+            s.chars()
+                .map(|c| {
+                    if ('\u{1100}'..='\u{115f}').contains(&c)
+                        || ('\u{2e80}'..='\u{a4cf}').contains(&c)
+                        || ('\u{ac00}'..='\u{d7a3}').contains(&c)
+                        || ('\u{f900}'..='\u{faff}').contains(&c)
+                        || ('\u{ff00}'..='\u{ff60}').contains(&c)
+                    {
+                        2
+                    } else {
+                        1
+                    }
+                })
+                .sum()
+        };
+        assert_ne!(
+            cells(&t.rows[0]),
+            cells(&t.rows[1]),
+            "the two rows do NOT line up on a terminal — this is the defect"
+        );
+        assert_eq!(cells(&t.rows[0]) - cells(&t.rows[1]), 6);
+    }
 
     #[test]
     fn print_capabilities_table_handles_empty_model_list() {
