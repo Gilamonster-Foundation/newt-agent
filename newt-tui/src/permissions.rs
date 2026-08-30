@@ -769,9 +769,18 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
                     format!("{note}\n{MODAL_CONTROL_HINT}")
                 }
             });
+        // C4b (#1944): RENDER the offer, not just an "awaiting…" line.
+        //
+        // The operator can now answer this, and a capability nobody can see
+        // is the failure this epic keeps paying for. Until now the terminal
+        // showed only that it was waiting, because waiting was all it could
+        // do. It shows the options because it can now act on them, through
+        // the same canonical projection the terminal-only path renders (C0a)
+        // — one definition, one rendering, whichever surface is looking.
         w.notice(&newt_line(
             &format!(
-                "awaiting a decision from the web for `{}`…\n{note}",
+                "{}\n`{}` — you or the web; whoever answers first decides.\n{note}",
+                plain::render(&definition),
                 req.target
             ),
             self.color,
