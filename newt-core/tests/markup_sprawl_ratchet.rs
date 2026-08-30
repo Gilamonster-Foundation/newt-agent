@@ -44,7 +44,33 @@ struct Category {
     name: &'static str,
     /// Sites in one file's squeezed production code.
     count: fn(&FileCode) -> usize,
-    /// Workspace-relative path -> exact expected production count.
+    /// The files that ARE this category's destination — the one place
+    /// everything else is meant to converge ON — with their exact expected
+    /// count.
+    ///
+    /// **A baseline that counts the implementation of the thing it measures
+    /// compliance with is measuring the wrong set** (#1911, generalised by
+    /// #1923). Five categories listed their own convergence point in
+    /// `baseline`: `markup/dialect.rs` is C3a's one parser,
+    /// `markup/table.rs` D3a's one table algorithm, `binding.rs` A3's typed
+    /// validator, `tty/modal.rs` the shared ask adapter, `tty/arbiter.rs` the
+    /// sealed window's own read. Each said so in prose, and a reader had to
+    /// find that prose and subtract by hand.
+    ///
+    /// Split out so `baseline` counts DUPLICATES ONLY and can reach zero —
+    /// which F0 needs before it can turn these counts into strict guards, per
+    /// #1923: a strict guard on a count that includes its own destination can
+    /// never reach zero and nobody can interpret its number.
+    ///
+    /// This is asserted as an EXACT CEILING, not merely excluded, because
+    /// "the destination has exactly N implementations" is a real and different
+    /// assertion from "N duplicates remain". Both directions are a problem: a
+    /// higher count is a second implementation growing inside the destination;
+    /// a lower one means the convergence point itself went away, and every
+    /// other row in the category is now converging on nothing.
+    destinations: &'static [(&'static str, usize)],
+    /// Workspace-relative path -> exact expected production count, for the
+    /// DUPLICATES this category exists to drive to zero.
     baseline: &'static [(&'static str, usize)],
     rationale: &'static str,
 }
@@ -243,15 +269,11 @@ const CATEGORIES: &[Category] = &[
                 0
             }
         },
-        baseline: &[
-            // C3a (#1857) ratcheted this from 2 sites to 1. The rows that
-            // went are `agentic/markdown/mod.rs` and `newt-web/src/shell.rs`
-            // — the two SURFACES, which no longer construct a parser at all;
-            // they call `markup::dialect::parse`. What remains is that one
-            // constructor. A row reappearing here is a surface choosing its
-            // own dialect again, which is the divergence C3a deleted.
-            ("newt-core/src/markup/dialect.rs", 1),
-        ],
+        // C3a (#1857) took this 2 -> 1 by deleting the two SURFACES' own
+        // parsers; they call `markup::dialect::parse` now. What remained was
+        // never a duplicate — it is the parser.
+        destinations: &[("newt-core/src/markup/dialect.rs", 1)],
+        baseline: &[],
         rationale: "one Markdown parser constructor, on one option matrix. \
                     A1 (#1825) named both matrices in \
                     newt_core::markup::dialect; C3a (#1857) deleted the \
@@ -289,6 +311,7 @@ const CATEGORIES: &[Category] = &[
         // Three consecutive slices predicted the adapter row would reach 0
         // "when the terminal decode moves onto the controller". It has, and so
         // did the other two.
+        destinations: &[],
         baseline: &[],
         rationale: "every place a user-facing Question is assembled outside \
                     the (future) one definition path; B0/D0 migrate these",
@@ -315,14 +338,12 @@ const CATEGORIES: &[Category] = &[
                 &["&Response)", "&Response,", "Accepted,Refusal>"],
             )
         },
-        baseline: &[
-            // The ONE sanctioned implementation: `validate_response`
-            // (two `&Response` parameter sites plus its verdict type).
-            // A2 froze the records; A3 validates them in exactly one
-            // place, and B0 switches the surfaces onto it. A second file
-            // appearing here is the sprawl this category exists to catch.
-            ("newt-interaction/src/binding.rs", 3),
-        ],
+        // A3's ONE typed validator: `validate_response`, two `&Response`
+        // parameter sites plus its verdict type. A2 froze the records, A3
+        // validates them in exactly one place, B0 switched the surfaces onto
+        // it.
+        destinations: &[("newt-interaction/src/binding.rs", 3)],
+        baseline: &[],
         rationale: "answer validation against the Newt Markup types belongs in \
                     ONE place (newt-interaction::binding); a second site is a \
                     third answer-validation implementation, which is the exact \
@@ -340,6 +361,9 @@ const CATEGORIES: &[Category] = &[
                 &["console.ask(", "console.ask_secret(", "window.ask("],
             )
         },
+        // The shared modal/prompt-window adapter — the common path every
+        // other row is a duplicate BESIDE.
+        destinations: &[("newt-core/src/tty/modal.rs", 5)],
         baseline: &[
             // D1b-0 (#1892) split `setup.rs` into `setup/{mod,commit,tests}.rs`.
             // The row was REPOINTED, not lowered: all 23 sites moved intact to
@@ -400,10 +424,6 @@ const CATEGORIES: &[Category] = &[
             ("newt-cli/src/dgx_card.rs", 1),
             ("newt-cli/src/mcp_probe_cmd.rs", 1),
             ("newt-tui/src/lib.rs", 1),
-            // The shared modal/prompt-window implementation itself — the
-            // common path the other rows are duplicates BESIDE, pinned so the
-            // shared layer does not quietly grow ask-shaped surface either.
-            ("newt-core/src/tty/modal.rs", 5),
         ],
         rationale: "interactive ask/answer call sites outside the typed \
                     Question path; D0/D1 fold these into controller-backed \
@@ -428,6 +448,7 @@ const CATEGORIES: &[Category] = &[
         // definitions while the `Console` trait still delivered them, and
         // D1b-3 deleted the trait. An empty baseline is the stronger floor,
         // because any reappearance trips as a NEW site file.
+        destinations: &[],
         baseline: &[],
         rationale: "the D1b migration bridge: prompts already modelled as \
                     definitions, still delivered through the `Console` trait. \
@@ -437,6 +458,7 @@ const CATEGORIES: &[Category] = &[
     Category {
         name: "prompt confirm helpers",
         count: |f| count_sites(&f.squeezed, "fn confirm_prompt("),
+        destinations: &[],
         baseline: &[
             ("newt-core/src/sas_confirm.rs", 1),
             ("newt-tui/src/rich_input.rs", 1),
@@ -458,6 +480,12 @@ const CATEGORIES: &[Category] = &[
                 ],
             )
         },
+        // `PromptWindow::read_line_into`'s own body. #1909 found this row
+        // inside the seal the category was defined as counting reads OUTSIDE
+        // of, and fixed the DEFINITION because two categories could not share
+        // needles. #1923 fixed the infrastructure instead, so the row can now
+        // say what it is.
+        destinations: &[("newt-core/src/tty/arbiter.rs", 1)],
         baseline: &[
             // `newt-tui/src/line_console.rs` held 2 until D1b-3 deleted the
             // module. `StdinConsole::ask`'s cooked read and `read_line_raw`'s
@@ -483,19 +511,6 @@ const CATEGORIES: &[Category] = &[
             // here until #1909 routed all five through
             // `Terminal::suspend_for_prompt`.
             ("newt-tui/src/lean_input.rs", 1),
-            // THE ONE SANCTIONED READ, and the rationale below is corrected to
-            // say so (#1909). This is `PromptWindow::read_line_into`'s own
-            // body — the seal's implementation, not something the seal is
-            // meant to replace. The old rationale said this category counted
-            // reads "outside the sealed PromptWindow", which excluded the very
-            // row it listed.
-            //
-            // Kept here rather than split into its own category: two
-            // categories cannot share needles, because a file with hits
-            // matches EVERY category whose count returns > 0 — verified, it
-            // reports each file under both. So the definition is fixed instead
-            // of the membership, and the ceiling is stated on the row.
-            ("newt-core/src/tty/arbiter.rs", 1),
         ],
         rationale: "synchronous stdin reads; every one is a site to route \
                     through the semantic request seam EXCEPT the single \
@@ -515,12 +530,9 @@ const CATEGORIES: &[Category] = &[
                 ],
             )
         },
+        // D3a's one table algorithm, armed in the commit that created it.
+        destinations: &[("newt-core/src/markup/table.rs", 1)],
         baseline: &[
-            // THE one table algorithm (D3a, #1874) — the destination, listed
-            // deliberately rather than named around the needle. A migrated
-            // family's row disappears from this table; this row is what it
-            // migrates ONTO, and it is the row that must stay at exactly 1.
-            ("newt-core/src/markup/table.rs", 1),
             ("newt-core/src/agentic/markdown/table.rs", 1),
             // `newt-eval/src/scorecard.rs` was here at 1 until D3a: its
             // bespoke fixed-width renderer is deleted, and the type now
@@ -564,13 +576,13 @@ const CATEGORIES: &[Category] = &[
         // were added by this epic itself, in parallel slices that each
         // correctly fixed a leak and each grew its own guard. A call-site
         // needle sees the next one on the day it is written.
+        // `RawModeGuard`'s own non-unix fallback — the owner's implementation.
+        // ARMED BY ME ONE SLICE AGO (#1905) with a prose comment calling it
+        // sanctioned, which is exactly the shape #1923 exists to remove. The
+        // pattern reproduced itself in a category written by the person who
+        // had just named it.
+        destinations: &[("newt-core/src/tty/raw_mode.rs", 2)],
         baseline: &[
-            // THE OWNER'S OWN IMPLEMENTATION. `RawModeGuard`'s non-unix arm
-            // falls back to crossterm's global because there is no termios to
-            // save; the unix arm, which is the one that composes, uses none.
-            // Sanctioned and stays at exactly 2 — the same shape as the
-            // arbiter's one sanctioned stdin read.
-            ("newt-core/src/tty/raw_mode.rs", 2),
             // THE REAL REMAINING WORK, and C2b named it "the largest item, not
             // in the list at all": the cockpit manages raw mode with bare
             // calls and NO guard, session-scoped rather than frame-scoped. Its
@@ -605,6 +617,7 @@ const CATEGORIES: &[Category] = &[
         // (tuning_cmd.rs, probe.rs). Widening to ONE field would sweep in
         // every `{:<5}` in the workspace — status lines, log prefixes — and
         // a tripwire that fires on everything reports nothing.
+        destinations: &[],
         baseline: &[
             // `dock_cmd`, `mcp_cmd`, `models_cmd` and `providers_cmd` were here
             // at 2 each until D3c (#1916) routed all four through
@@ -766,6 +779,49 @@ fn production_counts() -> BTreeMap<(&'static str, String), usize> {
     counts
 }
 
+/// Check a category's DESTINATIONS as an exact ceiling.
+///
+/// Split out from the assertion loop so it is directly testable — the ceiling
+/// is new machinery (#1923) and new machinery that only runs against the real
+/// tree cannot be shown to fail. `the_destination_ceiling_can_fail` drives it
+/// with synthetic inputs.
+///
+/// Deliberately NOT folded into the baseline comparison below: that loop's
+/// messages ("Delete the duplicate", "Progress! Ratchet down") are all wrong
+/// for a file which is supposed to be there and supposed to stay.
+fn destination_problems(
+    cat: &Category,
+    destinations: &BTreeMap<&str, usize>,
+    actual: &BTreeMap<String, usize>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (path, want) in destinations {
+        match actual.get(*path) {
+            Some(n) if n > want => problems.push(format!(
+                "[{}] {path} is this category's DESTINATION and grew: {n} > \
+                 {want}. A second implementation inside the one place \
+                 everything else converges on — {}.",
+                cat.name, cat.rationale
+            )),
+            Some(n) if n < want => problems.push(format!(
+                "[{}] {path} is this category's DESTINATION and shrank: {n} < \
+                 {want}. The convergence point lost an implementation, so every \
+                 other row is now converging on nothing. If that is intended, \
+                 move the row or lower the ceiling deliberately.",
+                cat.name
+            )),
+            Some(_) => {}
+            None => problems.push(format!(
+                "[{}] {path} is this category's DESTINATION and has no sites at \
+                 all. It is gone, and the category now measures convergence on \
+                 nothing.",
+                cat.name
+            )),
+        }
+    }
+    problems
+}
+
 /// Workspace-relative path with forward slashes (Windows CI runs this too).
 fn rel(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
@@ -780,12 +836,23 @@ fn duplicate_site_baselines_only_ratchet_down() {
     let mut problems = Vec::new();
     for cat in CATEGORIES {
         let expected: BTreeMap<&str, usize> = cat.baseline.iter().copied().collect();
+        let destinations: BTreeMap<&str, usize> = cat.destinations.iter().copied().collect();
         let actual: BTreeMap<String, usize> = counts
             .iter()
             .filter(|((name, _), _)| *name == cat.name)
             .map(|((_, path), n)| (path.clone(), *n))
             .collect();
+
+        // The destination is a CEILING, checked both ways — see the field's
+        // doc. It is deliberately not folded into the baseline loop below,
+        // whose messages ("Delete the duplicate", "Progress! Ratchet down")
+        // are all wrong for a file that is supposed to be there.
+        problems.extend(destination_problems(cat, &destinations, &actual));
+
         for (path, n) in &actual {
+            if destinations.contains_key(path.as_str()) {
+                continue;
+            }
             match expected.get(path.as_str()) {
                 None => problems.push(format!(
                     "[{}] NEW site file {path} ({n} hit(s)) — {}. Delete the \
@@ -2127,4 +2194,79 @@ fn the_plain_projection_reads_no_ambient_width() {
         "the width needles no longer match the module that DOES measure — \
          the guard above is passing vacuously"
     );
+}
+
+/// **The twin for the destination ceiling (#1923).**
+///
+/// The ceiling is new machinery, and new machinery that only ever runs against
+/// a green tree cannot be shown to fail. Every arm is exercised, including the
+/// one that is easy to leave out: a destination that SHRANK. That direction
+/// matters because a category whose convergence point lost its implementation
+/// is measuring convergence on nothing, and a check that only looked for
+/// growth would call that healthy.
+#[test]
+fn the_destination_ceiling_can_fail() {
+    let cat = Category {
+        name: "probe",
+        count: |_| 0,
+        destinations: &[],
+        baseline: &[],
+        rationale: "a probe",
+    };
+    let dest: BTreeMap<&str, usize> = [("the/one.rs", 2)].into_iter().collect();
+    let actual = |n: Option<usize>| -> BTreeMap<String, usize> {
+        n.into_iter()
+            .map(|n| ("the/one.rs".to_string(), n))
+            .collect()
+    };
+
+    assert!(
+        destination_problems(&cat, &dest, &actual(Some(2))).is_empty(),
+        "exactly the ceiling is the healthy state"
+    );
+
+    let grew = destination_problems(&cat, &dest, &actual(Some(3)));
+    assert_eq!(grew.len(), 1);
+    assert!(grew[0].contains("grew"), "{grew:?}");
+
+    let shrank = destination_problems(&cat, &dest, &actual(Some(1)));
+    assert_eq!(shrank.len(), 1);
+    assert!(shrank[0].contains("shrank"), "{shrank:?}");
+
+    let gone = destination_problems(&cat, &dest, &actual(None));
+    assert_eq!(gone.len(), 1);
+    assert!(gone[0].contains("no sites at all"), "{gone:?}");
+
+    // …and a category with no destination declares no problems, so the field
+    // is inert where it is unused rather than quietly asserting something.
+    assert!(destination_problems(&cat, &BTreeMap::new(), &actual(Some(9))).is_empty());
+}
+
+/// **Every destination is also a real file the scan can see.**
+///
+/// A ceiling naming a path that does not exist would pass the "grew" check
+/// forever and fail the "gone" check loudly — but a TYPO in a path would look
+/// like a deleted destination, and the message would send the reader hunting
+/// for a deletion that never happened. This proves each declared destination
+/// is inside a production root, the same guarantee
+/// `every_baselined_path_is_inside_a_production_root` gives the baselines.
+#[test]
+fn every_destination_path_is_inside_a_production_root() {
+    let root = workspace_root();
+    let roots = production_roots(&root);
+    for cat in CATEGORIES {
+        for (path, _) in cat.destinations {
+            let full = root.join(path);
+            assert!(
+                full.is_file(),
+                "[{}] destination {path} is not a file",
+                cat.name
+            );
+            assert!(
+                roots.iter().any(|r| full.starts_with(r)),
+                "[{}] destination {path} is outside every production root",
+                cat.name
+            );
+        }
+    }
 }
