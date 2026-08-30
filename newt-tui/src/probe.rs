@@ -1653,6 +1653,13 @@ pub async fn probe_tool_conformance(
 /// `active` is an INDEX rather than a name so the caller can colour that row
 /// without matching text back against the model list. Matching would be the
 /// `starts_with` hazard D3c hit in `mcp_cli.rs`, arriving in a new place.
+/// What an absent value shows. One spelling, where the pre-D3e code had
+/// five — `"  \u{2014}   "`, `"       \u{2014}"`, `"  \u{2014} "`,
+/// `"\u{2014}       "` and a bare `"\u{2014}"` — each hand-padded to the
+/// column it sat in. The column now does the padding, so the value only has
+/// to say what it is.
+const EMPTY: &str = "\u{2014}";
+
 pub(crate) struct CapabilitiesTable {
     pub(crate) head: Vec<String>,
     pub(crate) rows: Vec<String>,
@@ -1665,91 +1672,98 @@ pub(crate) fn capabilities_table(
     cache: &CapabilityCache,
     active: &str,
 ) -> CapabilitiesTable {
-    let mut head: Vec<String> = Vec::new();
-    let mut out: Vec<String> = Vec::with_capacity(models.len());
+    use newt_core::markup::table::{render_table, Align, Column};
+
     let mut active_row: Option<usize> = None;
-
-    // Column widths.
-    let name_w = models
-        .iter()
-        .map(|m| m.name.len())
-        .max()
-        .unwrap_or(20)
-        .max(20);
-
-    // Header.
-    let sep = "─".repeat(name_w);
-    head.push(format!(
-        "  {:<name_w$}  {:>6}  {:<8}  {:<5}  {:>8}  {:>8}  Conf  Tested",
-        "Model", "Size", "Tool Use", "Think", "Ctx Win", "Safe Ctx"
-    ));
-    head.push(format!(
-        "  {sep}  ──────  ────────  ─────  ────────  ────────  ────  ──────────"
-    ));
+    let mut cells: Vec<Vec<String>> = Vec::with_capacity(models.len());
 
     for m in models {
         let is_active = m.name == active;
-        let active_tag = if is_active { " ◀" } else { "  " };
-        let size = if m.param_size.is_empty() {
-            "  —   ".to_string()
+        if is_active {
+            active_row = Some(cells.len());
+        }
+        // The marker joins the NAME cell. It used to be a separate two-column
+        // field padded inside the name's width, which is why the name column
+        // had to be at least 20 wide whatever it held.
+        let name = if is_active {
+            format!("{} \u{25c0}", m.name)
         } else {
-            format!("{:>6}", m.param_size)
+            m.name.clone()
         };
-        let (conformance_str, think_str, ctx_win_str, safe_ctx_str, conf_str, date_str) =
+        let size = if m.param_size.is_empty() {
+            EMPTY.to_string()
+        } else {
+            m.param_size.clone()
+        };
+        let (conformance, think, ctx_win, safe_ctx, conf, tested) =
             match cache.get(&cap_key(newt_core::Serving::Multiplexer, "", &m.name)) {
                 Some(e) => {
-                    let ctx = e
-                        .context_window
-                        .map(|c| format!("{:>8}", fmt_k(c)))
-                        .unwrap_or_else(|| "       —".to_string());
-                    let safe = e
-                        .safe_context
-                        .map(|c| format!("{:>8}", fmt_k(c)))
-                        .unwrap_or_else(|| "       —".to_string());
+                    // Cells carry CONTENT; the column carries alignment. Each
+                    // of these used to arrive pre-padded (`{:>8}`, `"  — "`),
+                    // which is the hand-laid layout this slice removes.
+                    let ctx = e.context_window.map_or_else(|| EMPTY.to_string(), fmt_k);
+                    let safe = e.safe_context.map_or_else(|| EMPTY.to_string(), fmt_k);
                     let conf = match e.tune_confidence {
-                        TuneConfidence::None => "  — ".to_string(),
-                        TuneConfidence::Low => " Low".to_string(),
-                        TuneConfidence::Medium => " Med".to_string(),
-                        TuneConfidence::High => "High".to_string(),
+                        TuneConfidence::None => EMPTY,
+                        TuneConfidence::Low => "Low",
+                        TuneConfidence::Medium => "Med",
+                        TuneConfidence::High => "High",
                     };
                     // A reasoning/"thinking" model: it has been observed
                     // returning chain-of-thought tokens (emits_thinking sticky).
                     let think = if e.emits_thinking == Some(true) {
-                        "✓".to_string()
+                        "\u{2713}"
                     } else {
-                        "—".to_string()
+                        EMPTY
                     };
                     (
                         e.conformance.symbol().to_string(),
-                        think,
+                        think.to_string(),
                         ctx,
                         safe,
-                        conf,
+                        conf.to_string(),
                         e.tested_date.clone(),
                     )
                 }
                 None => (
-                    "—       ".to_string(),
-                    "—".to_string(),
-                    "       —".to_string(),
-                    "       —".to_string(),
-                    "  — ".to_string(),
+                    EMPTY.to_string(),
+                    EMPTY.to_string(),
+                    EMPTY.to_string(),
+                    EMPTY.to_string(),
+                    EMPTY.to_string(),
                     "(untested)".to_string(),
                 ),
             };
-
-        let name = &m.name;
-        if is_active {
-            active_row = Some(out.len());
-        }
-        out.push(format!(
-            "  {name:<name_w$}{active_tag}  {size}  {conformance_str}  {think_str:<5}  {ctx_win_str}  {safe_ctx_str}  {conf_str}  {date_str}"
-        ));
+        cells.push(vec![
+            name,
+            size,
+            conformance,
+            think,
+            ctx_win,
+            safe_ctx,
+            conf,
+            tested,
+        ]);
     }
 
+    let columns = [
+        Column::new("Model"),
+        Column::new("Size").align(Align::Right),
+        Column::new("Tool Use"),
+        Column::new("Think"),
+        Column::new("Ctx Win").align(Align::Right),
+        Column::new("Safe Ctx").align(Align::Right),
+        Column::new("Conf").align(Align::Right),
+        Column::new("Tested"),
+    ];
+    let rendered = render_table(&columns, &cells);
+    let mut lines = rendered.lines().map(str::to_string);
+    // GFM's header and delimiter, then one line per model in input order —
+    // which is what lets the caller colour `active` by index.
+    let head: Vec<String> = lines.by_ref().take(2).collect();
     CapabilitiesTable {
         head,
-        rows: out,
+        rows: lines.collect(),
         active: active_row,
     }
 }
@@ -2896,7 +2910,13 @@ mod tests {
     // amends them and declares its diff.
 
     /// Two models, one active, one untested — the ordinary case, byte for
-    /// byte.
+    /// byte, AFTER the migration onto `markup::table`.
+    ///
+    /// The pre-migration bytes are in the previous commit; this is the
+    /// declared diff. Columns now fit their content, alignment is carried by
+    /// the delimiter row rather than by spaces inside each cell, and the
+    /// active marker is part of the Model cell instead of a second field
+    /// padded inside the name's width.
     #[test]
     fn the_capability_table_renders_its_current_bytes() {
         let mut cache = CapabilityCache::default();
@@ -2916,25 +2936,33 @@ mod tests {
         assert_eq!(t.active, Some(0), "the active row is identified by index");
         assert_eq!(
             t.head[0],
-            "  Model                   Size  Tool Use  Think   Ctx Win  Safe Ctx  Conf  Tested"
+            "| Model            | Size | Tool Use | Think | Ctx Win | Safe Ctx | Conf | Tested     |"
         );
         assert_eq!(
             t.head[1],
-            "  ────────────────────  ──────  ────────  ─────  ────────  ────────  ────  ──────────"
+            "| ---------------- | ---: | -------- | ----- | ------: | -------: | ---: | ---------- |"
         );
         assert_eq!(t.rows.len(), 2);
         assert_eq!(
             t.rows[0],
-            "  llama3.1:8b          ◀      8B  ✓ native  \u{2014}           32k       25k  High  2026-06-10"
+            "| llama3.1:8b \u{25c0}    |   8B | \u{2713} native | \u{2014}     |     32k |      25k | High | 2026-06-10 |"
         );
         assert_eq!(
             t.rows[1],
-            "  qwen2.5-coder:7b            7B  \u{2014}         \u{2014}             \u{2014}         \u{2014}    \u{2014}   (untested)"
+            "| qwen2.5-coder:7b |   7B | \u{2014}        | \u{2014}     |       \u{2014} |        \u{2014} |    \u{2014} | (untested) |"
+        );
+        // The Model column now fits its content. It used to be padded to at
+        // least 20 for an 11-character name, because the active marker was a
+        // separate field living inside that width.
+        assert!(
+            !t.rows.iter().any(|r| r.contains("           ")),
+            "no run of hand-laid padding survives: {:?}",
+            t.rows
         );
     }
 
-    /// **The bug, pinned before it is fixed** (A0 §4.2.13, "the wrong metric
-    /// twice over" — and it is actually three).
+    /// **The bug, fixed — asserted with the SAME measurement that recorded
+    /// it** (A0 §4.2.13, "the wrong metric twice over" — really three).
     ///
     /// `name_w` is computed from `m.name.len()`, which is BYTES. The padding
     /// `{:<name_w$}` counts CHARS. The terminal renders CELLS. A CJK model
@@ -2943,11 +2971,13 @@ mod tests {
     /// — so every later column on that row lands somewhere else than on
     /// every other row.
     ///
-    /// This asserts the CURRENT misalignment so the migration has something
-    /// to amend rather than a difference buried in whitespace. It is the same
-    /// entry D3c fixed the other half of, in `mcp_cmd`.
+    /// The previous commit asserted the misalignment; this one asserts its
+    /// absence, by measuring display cells exactly as before. Turning the
+    /// assertion round rather than deleting it is what makes the fix legible:
+    /// the same six-cell discrepancy that was `assert_ne!` is now zero. It is
+    /// the same A0 entry D3c fixed the other half of, in `mcp_cmd`.
     #[test]
-    fn a_cjk_model_name_currently_misaligns_every_later_column() {
+    fn a_cjk_model_name_no_longer_misaligns_any_column() {
         let cache = CapabilityCache::default();
         let models: Vec<ModelInfo> = [("日本語モデル:7b", "7B"), ("ascii-model:7b", "7B")]
             .into_iter()
@@ -2958,17 +2988,11 @@ mod tests {
             .collect();
         let t = capabilities_table(&models, &cache, "none");
 
-        // 21 bytes, 9 chars — the column is sized by the former.
+        // Unchanged facts about the name: 21 bytes, 9 chars, 15 cells. What
+        // changed is which of the three the renderer uses.
         assert_eq!("日本語モデル:7b".len(), 21);
         assert_eq!("日本語モデル:7b".chars().count(), 9);
 
-        // Both rows are the same CHAR length, because padding counts chars...
-        assert_eq!(
-            t.rows[0].chars().count(),
-            t.rows[1].chars().count(),
-            "padding equalises characters"
-        );
-        // ...and DIFFERENT display widths, which is what the operator sees.
         let cells = |s: &str| -> usize {
             s.chars()
                 .map(|c| {
@@ -2985,12 +3009,15 @@ mod tests {
                 })
                 .sum()
         };
-        assert_ne!(
+        assert_eq!(
             cells(&t.rows[0]),
             cells(&t.rows[1]),
-            "the two rows do NOT line up on a terminal — this is the defect"
+            "the two rows line up on a terminal — they differed by 6 cells before"
         );
-        assert_eq!(cells(&t.rows[0]) - cells(&t.rows[1]), 6);
+        // The header and delimiter line up with them too, which is what
+        // sizing by cells rather than by bytes actually buys.
+        assert_eq!(cells(&t.head[0]), cells(&t.rows[0]));
+        assert_eq!(cells(&t.head[1]), cells(&t.rows[0]));
     }
 
     #[test]
