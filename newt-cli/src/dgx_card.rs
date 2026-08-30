@@ -94,26 +94,40 @@ pub fn render_list(entries: &[CardEntry], problems: &[String], json: bool) -> St
     } else if entries.is_empty() && problems.is_empty() {
         "no cards found".to_string()
     } else {
-        let mut out = format!(
-            "{:<22} {:<8} {:>6}  {:<6} {}\n",
-            "NAME", "BACKEND", "GiB", "GATED", "SOURCE"
-        );
-        for e in entries {
-            let backend = e.card.backend.map_or("-", |b| b.as_str());
-            let gib = e
-                .card
-                .footprint_gib
-                .map_or_else(|| "-".to_string(), |f| format!("{f:.0}"));
-            let gated = if e.card.gated.unwrap_or(false) {
-                "yes"
-            } else {
-                ""
-            };
-            out.push_str(&format!(
-                "{:<22} {:<8} {:>6}  {:<6} {}\n",
-                e.card.name, backend, gib, gated, e.source
-            ));
-        }
+        use newt_core::markup::table::{render_table, Align, Column};
+        let columns = [
+            Column::new("NAME"),
+            Column::new("BACKEND"),
+            Column::new("GiB").align(Align::Right),
+            Column::new("GATED"),
+            Column::new("SOURCE"),
+        ];
+        let data: Vec<Vec<String>> = entries
+            .iter()
+            .map(|e| {
+                vec![
+                    e.card.name.clone(),
+                    e.card.backend.map_or("-", |b| b.as_str()).to_string(),
+                    e.card
+                        .footprint_gib
+                        .map_or_else(|| "-".to_string(), |f| format!("{f:.0}")),
+                    if e.card.gated.unwrap_or(false) {
+                        "yes"
+                    } else {
+                        ""
+                    }
+                    .to_string(),
+                    e.source.to_string(),
+                ]
+            })
+            .collect();
+        let mut out = render_table(&columns, &data);
+        // Problems stay OUTSIDE the table, exactly as before. They are
+        // diagnostics about files that produced no row — an unresolvable card
+        // has no name, backend or footprint to put in one — so folding them in
+        // would mean a table of mostly-empty cells claiming to be entries.
+        // They also come after every row rather than between them, which is
+        // why this table can be GFM at all where `tuning_cmd`'s cannot.
         for problem in problems {
             out.push_str(&format!("!  {problem}\n"));
         }
@@ -571,10 +585,11 @@ mod tests {
         assert_eq!(
             render_list(&entries, &problems, false),
             concat!(
-                "NAME                   BACKEND     GiB  GATED  SOURCE\n",
-                "Ornith-1.0-35B         vllm         35         built-in\n",
-                "Ornith-1.0-397B        vllm        400  yes    built-in\n",
-                "demo                   vllm          -         drop-in\n",
+                "| NAME            | BACKEND | GiB | GATED | SOURCE   |\n",
+                "| --------------- | ------- | --: | ----- | -------- |\n",
+                "| Ornith-1.0-35B  | vllm    |  35 |       | built-in |\n",
+                "| Ornith-1.0-397B | vllm    | 400 | yes   | built-in |\n",
+                "| demo            | vllm    |   - |       | drop-in  |\n",
             )
         );
     }

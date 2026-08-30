@@ -587,11 +587,22 @@ const CATEGORIES: &[Category] = &[
             //   break the table. Needs a shape decision first, not a
             //   transport swap.
             //
-            // * `dgx_card.rs` — a genuine table family (catalog + a numbered
-            //   ranking), and the obvious NEXT slice. Left because the epic
-            //   says one family per PR and it is a different command.
+            // * `dgx_card.rs` — 3 -> 1 in D3d (#1916). The CATALOG (`card
+            //   list`) is now `markup::table`. The survivor is `render_menu`,
+            //   and it is NOT a table:
+            //
+            //   Its output is interpolated straight into `window.ask(...)` —
+            //   it is part of a QUESTION, not a document. The number it prints
+            //   is not a rank either: it is a SELECTOR the operator types,
+            //   parsed back by `parse_selection` into a catalog index. A
+            //   numbered list of alternatives with a typed key is exactly
+            //   `ControlKind::Choice`, which `markup::plain` already renders
+            //   one option per line (C0a/C0c). Rendering it as a GFM document
+            //   table would move it AWAY from the interaction model the C/D
+            //   lane is migrating everything toward. It belongs to that lane,
+            //   not to D3's.
             ("newt-cli/src/config_cmd.rs", 1),
-            ("newt-cli/src/dgx_card.rs", 3),
+            ("newt-cli/src/dgx_card.rs", 1),
             ("newt-cli/src/dgx_status.rs", 1),
             ("newt-cli/src/tuning_cmd.rs", 2),
             ("newt-tui/src/chat.rs", 1),
