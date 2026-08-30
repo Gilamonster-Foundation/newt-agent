@@ -605,9 +605,36 @@ const CATEGORIES: &[Category] = &[
             ("newt-cli/src/dgx_card.rs", 1),
             ("newt-cli/src/dgx_status.rs", 1),
             ("newt-cli/src/tuning_cmd.rs", 2),
+            // --- D3e (#1918): the newt-tui six. TWO migrated, FOUR declined.
+            //
+            // `newt-tui/src/probe.rs` was here at 2 until D3e. `/model`'s
+            // capability listing is a real table — a header, a rule, and eight
+            // uniform columns — and it carried the OTHER half of the A0
+            // §4.2.13 byte-sizing entry D3c fixed in `mcp_cmd`.
+            //
+            // The four below stay, because a GFM pipe table is not what they
+            // are. Every one of them is an aligned LIST inside narration: no
+            // header row, prose above and below in the same output. Forcing
+            // them through `render_table` would invent a header nobody asked
+            // for and wedge a table into a paragraph, which is a regression
+            // dressed as consolidation.
+            //
+            // `/context show`: an indexed breakdown under "context contents
+            // (freshly built):" and above a "total: N messages" summary. The
+            // `[i]` index is part of each line and the total is not a row.
             ("newt-tui/src/chat.rs", 1),
+            // Both are `/permissions` output built as a `Vec<String>` of
+            // narration: a heading line, indented decision/audit rows, then
+            // prose ("log: …", "to make an allow permanent, edit …"). GFM
+            // cannot interleave prose between rows — D3c's `tuning_cmd`
+            // reason, in a different command.
             ("newt-tui/src/lib.rs", 2),
-            ("newt-tui/src/probe.rs", 2),
+            // `/prompt`'s token help. Uniform three columns, and still
+            // declined: `PROMPT_TOKENS` is one source of truth rendered in
+            // TWO places, and the other is `newt-cli/src/config_cmd.rs` above
+            // — already declined because "a pipe table inside `#` comments is
+            // a worse config file". Migrating only this one would split one
+            // list into two shapes for no gain.
             ("newt-tui/src/prompt.rs", 1),
         ],
         rationale: "hand-laid column rows: one string literal padding two or \
