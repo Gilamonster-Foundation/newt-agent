@@ -4,12 +4,13 @@
 //! # Why this is its own type
 //!
 //! The spinner used to be two things at once: the thing that *knows what the
-//! row should say*, and the thing that *owns the row*. D2's cutover needs those
-//! separated — the renderer owns the row, the spinner produces facts — and a
-//! `LineLease` is **exclusive** (`Inner::line_held`, with a 50 ms
-//! wait-timeout), so the two owners cannot briefly coexist while ownership
-//! moves. Extracting the mechanics first, unchanged, is what makes the handover
-//! a single edit rather than a window in which both hold or neither does.
+//! row should say*, and the thing that *owns the row*. D2's cutover separated
+//! them — the renderer ([`super::progress_sink::TerminalProgressSink`]) owns
+//! the row, the spinner produces facts — and a `LineLease` is **exclusive**
+//! (`Inner::line_held`, with a 50 ms wait-timeout), so the two owners could not
+//! briefly coexist while ownership moved. Extracting the mechanics first,
+//! unchanged, is what made the handover a single edit rather than a window in
+//! which both held or neither did.
 //!
 //! # The concurrency here is load-bearing and was moved VERBATIM
 //!
@@ -37,7 +38,7 @@
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use super::arbiter::{Ephemeral, LineLease, LineWriter, Sink, Terminal};
 use super::caps::LineCaps;
@@ -63,12 +64,25 @@ impl EphemeralRow {
     /// Take the row, or `None` when this process may not own one — in which
     /// case **zero bytes are emitted, on any stream**. Protocol mode is an
     /// absolute veto no capability override may pierce.
-    pub(crate) fn acquire(caps: LineCaps, sink: Sink) -> Option<Self> {
-        Terminal::lease_with_caps(caps, sink).map(|lease| Self {
+    ///
+    /// Returns an `Arc` and **registers itself** with the arbiter, because a
+    /// row that is not registered is not erased when a question is about to
+    /// render — the invisible-prompt hang, arriving through a caller that
+    /// forgot a second call. Registration is the row's own business, so there
+    /// is no way to hold one that skipped it.
+    pub(crate) fn acquire(caps: LineCaps, sink: Sink) -> Option<Arc<Self>> {
+        let lease = Terminal::lease_with_caps(caps, sink)?;
+        let row = Arc::new(Self {
             lease,
             paint_gate: Mutex::new(()),
             finished: AtomicBool::new(false),
-        })
+        });
+        let as_ephemeral: Arc<dyn Ephemeral> = row.clone();
+        Terminal::register(
+            Arc::as_ptr(&row) as *const () as usize as u64,
+            &as_ephemeral,
+        );
+        Some(row)
     }
 
     /// Redraw the row in place, unless it has finished.
@@ -111,8 +125,8 @@ impl EphemeralRow {
         self.lease.erase();
     }
 
-    /// Whether teardown has run. Test-only today; the renderer will want it
-    /// when it takes the row in the cutover commit.
+    /// Whether teardown has run. Test-only: production code learns it by the
+    /// row being taken (see `TerminalProgressSink::finish`).
     #[cfg(test)]
     pub(super) fn is_finished(&self) -> bool {
         self.finished.load(Ordering::SeqCst)
