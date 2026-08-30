@@ -673,38 +673,20 @@ const CATEGORIES: &[Category] = &[
         // had just named it.
         destinations: &[("newt-core/src/tty/raw_mode.rs", 2)],
         baseline: &[
-            // NOT ACCEPTED. A TRACKED DEFECT (#1925), left counted on
-            // purpose: F0's rule allows a residual only for a design choice
-            // we are content with, and this is not one.
+            // `newt-tui/src/cockpit/presenter.rs` was here at 4 until #1925,
+            // the row that made this category's "largest item". It was never a
+            // missing guard — the cockpit had one, bound immediately after it
+            // took the terminal. #1925 swapped that guard's RAW HALF onto
+            // `RawModeGuard`, so the session restores the termios it FOUND
+            // rather than crossterm's process-global.
             //
-            // **F0c corrected this row's description, which was wrong.** It
-            // said the cockpit has "NO guard" and that "it is a guard that
-            // does not exist yet". It has one: `_restore:
-            // RestoreOnDrop<fn()>` is a field of the session, bound at
-            // `presenter.rs:486` immediately after the `enable_raw_mode()?`
-            // at :470 and — as its own comment says — crucially BEFORE the
-            // fallible capture install, so no `?` or panic in between can
-            // leave a cooked terminal.
-            //
-            // The real defect is narrower and different in kind: that guard
-            // restores by calling `disable_raw_mode()`, and crossterm keeps
-            // ONE PROCESS-GLOBAL prior mode. So the cockpit restores to
-            // whatever the process last had, not to the termios IT found —
-            // which is exactly what `RawModeGuard` exists to fix, and exactly
-            // this category's rationale.
-            //
-            // Why F0c did not fix it: the four sites are not four
-            // interchangeable calls. Three are the session lifecycle (take at
-            // :470, restore at :247 and :333) and the fourth (:811,
-            // `sync_modal_edge`) RE-ASSERTS raw after a modal suspension
-            // ends — "belt and braces… a no-op when already raw". A
-            // `RawModeGuard` takes and releases; "make sure we are still raw"
-            // is not an operation it has, so site four needs a semantic
-            // decision, and C2b'''s nested-modal PTY scenario is the test that
-            // would catch getting it wrong. That is #1925'''s slice, and it is
-            // smaller than this row used to claim — a mechanism swap, not a
-            // guard to invent.
-            ("newt-tui/src/cockpit/presenter.rs", 4),
+            // Site four, the `sync_modal_edge` re-assert, was DELETED rather
+            // than translated. "Make sure we are still raw" is the one thing
+            // `RawModeGuard` deliberately cannot express, and it no longer
+            // needs expressing: #1905 put every modal guard on the same type,
+            // so a modal closing inside a raw cockpit hands back RAW. This row
+            // reaching zero is what closes the loophole its own comment named
+            // — "a stray disable_raw_mode anywhere" is now a ratchet failure.
             // PTY test scaffolding that the shared scanner sees as production
             // because it is not `#[cfg(test)]`-gated. It stands a pty up for
             // the cockpit's own tests and legitimately drives the global.
