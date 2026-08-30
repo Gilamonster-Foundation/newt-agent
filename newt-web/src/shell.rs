@@ -36,6 +36,13 @@ pub(crate) fn escape(s: &str) -> String {
 pub(crate) fn render_markdown(src: &str) -> String {
     use pulldown_cmark::{html, CodeBlockKind, Event, Tag, TagEnd};
 
+    // #1941: `ammonia` allowlists TAGS and ATTRIBUTES; it does not touch the
+    // characters inside a text node, and a browser implements UAX #9 — so a
+    // `U+202E` sails through the sanitizer and reorders the rendered page
+    // exactly as it reorders a terminal. Neutralised before parsing, through
+    // the same `newt_core` function the plain and span projections use.
+    let src = &*newt_core::notes_scan::neutralize_for_display(src);
+
     // SANITIZE FIRST, THEN WRAP (#1848). The extension marker is built
     // AFTER `ammonia` has run and is never present in its input, so it
     // cannot be forged — not merely filtered. `data-markdown-extension`
@@ -1132,6 +1139,69 @@ mod tests {
     ///
     /// Every vector is run through one shared battery, so adding a vector
     /// costs one line and inherits every check.
+    /// **#1941: a bidi override is an XSS-adjacent shape `ammonia` does not
+    /// see.**
+    ///
+    /// `ammonia` allowlists TAGS and ATTRIBUTES. It does not touch the
+    /// characters inside a text node — and a browser implements UAX #9, so a
+    /// `U+202E` sails through the sanitizer and reorders the rendered page
+    /// exactly as it reorders a terminal. Nothing above catches it: the markup
+    /// is clean, the escaping is correct, and only what the human SAW is
+    /// wrong.
+    ///
+    /// This is the fifth surface in #1941's inventory; the other four are in
+    /// `newt-core/tests/untrusted_display_scan.rs`, which cannot reach this
+    /// crate.
+    #[cfg(test)]
+    mod c3a_bidi {
+        use super::render_markdown;
+
+        const RLO: char = '\u{202E}';
+
+        /// The override never reaches the page, and it is made VISIBLE rather
+        /// than dropped — dropping it hides that anything was there.
+        #[test]
+        fn a_bidi_override_never_reaches_the_page() {
+            let html = render_markdown(&format!("allow {RLO}yned once"));
+            assert!(
+                !html.contains(RLO),
+                "a bidi override reached the page: {html:?}"
+            );
+            assert!(
+                html.contains("&lt;U+202E&gt;") || html.contains("<U+202E>"),
+                "the hidden character was not made visible: {html:?}"
+            );
+        }
+
+        /// A raw `ESC` likewise: harmless in HTML, but the transcript is also
+        /// copied and replayed, and one policy for both surfaces beats two.
+        #[test]
+        fn a_raw_escape_never_reaches_the_page() {
+            let html = render_markdown("run \u{1b}[2Koops");
+            assert!(!html.contains('\u{1b}'), "a raw ESC reached the page: {html:?}");
+        }
+
+        /// **Anti-vacuous twin.** Every assertion above would hold over a
+        /// renderer that emitted nothing. It renders, and it leaves benign
+        /// text — including legitimate RTL, which carries no override —
+        /// alone.
+        #[test]
+        fn the_page_still_renders_its_text_and_legitimate_rtl() {
+            let html = render_markdown("allow SENTINEL once");
+            assert!(html.contains("SENTINEL"), "nothing rendered: {html:?}");
+            assert!(!html.contains("<U+"), "benign text was neutralised: {html:?}");
+
+            for rtl in ["تشغيل bash؟", "האם להריץ bash?"] {
+                let html = render_markdown(rtl);
+                assert!(
+                    html.contains(rtl),
+                    "legitimate RTL was altered — a scan that rejects all bidi \
+                     is broken for two scripts, not fail-closed: {html:?}"
+                );
+            }
+        }
+    }
+
     #[cfg(test)]
     mod c3a_xss {
         use super::render_markdown;

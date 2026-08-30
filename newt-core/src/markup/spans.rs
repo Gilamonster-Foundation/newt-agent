@@ -79,7 +79,7 @@ impl Span {
     #[must_use]
     pub fn plain(text: impl Into<String>) -> Self {
         Self {
-            text: text.into(),
+            text: Self::displayable(text),
             emphasis: Emphasis::Plain,
         }
     }
@@ -88,8 +88,31 @@ impl Span {
     #[must_use]
     pub fn styled(text: impl Into<String>, emphasis: Emphasis) -> Self {
         Self {
-            text: text.into(),
+            text: Self::displayable(text),
             emphasis,
+        }
+    }
+
+    /// **Every span is display text, so every span is neutralised** (#1941).
+    ///
+    /// In the constructors rather than at the call sites, because the call
+    /// sites are where this was already missed once: neutralising
+    /// `spans::project`'s *input* covered the markdown body and nothing else,
+    /// while `interaction_view` builds an option label, a note line, and a
+    /// field label into spans DIRECTLY — and an option label is the `allow` /
+    /// `deny` text a permission prompt spoofs. Making the type carry the rule
+    /// is what the reuse discipline means by preferring an unrepresentable bug
+    /// to a fix at N sites.
+    ///
+    /// Idempotent: the marker `<U+202E>` contains no hazard of its own, so the
+    /// body — neutralised once on the way into the parser and again here — is
+    /// unchanged by the second pass. `project` still neutralises its input
+    /// because its internal run-merging appends to `text` directly and does
+    /// not come back through these constructors.
+    fn displayable(text: impl Into<String>) -> String {
+        match crate::notes_scan::neutralize_for_display(&text.into()) {
+            std::borrow::Cow::Borrowed(clean) => clean.to_string(),
+            std::borrow::Cow::Owned(fixed) => fixed,
         }
     }
 }
@@ -125,6 +148,10 @@ impl SpanLine {
 /// no dialect and no second option matrix.
 #[must_use]
 pub fn project(markdown: &str) -> Vec<SpanLine> {
+    // #1941: before parsing, not after. A hazard neutralised per-span would
+    // have to be caught at every `push` site; done here it cannot be missed,
+    // and the marker text flows through the parser as ordinary characters.
+    let markdown = &*crate::notes_scan::neutralize_for_display(markdown);
     let mut out: Vec<SpanLine> = Vec::new();
     let mut line = SpanLine::default();
     let mut stack: Vec<Emphasis> = Vec::new();
