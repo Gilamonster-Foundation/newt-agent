@@ -698,6 +698,54 @@ const CATEGORIES: &[Category] = &[
                     saves the termios it took and is the one nesting-aware owner",
     },
     Category {
+        name: "ephemeral-row owners outside EphemeralRow",
+        count: |f| {
+            count_any(
+                &f.squeezed,
+                &["Terminal::lease(", "Terminal::lease_with_caps("],
+            )
+        },
+        // Armed at ZERO duplicates by SCAN (D2b, #1895), which is the state
+        // F0d exists for: a per-file baseline of zero is indistinguishable
+        // from a needle that matches nothing, so this category's entry in
+        // `DETECTOR_PROBES` is what makes the zero readable.
+        //
+        // The needle is the LEASE CALL, because taking the lease *is* taking
+        // the row — the arbiter hands it to exactly one holder, and nothing
+        // can paint the ephemeral bottom row without one. That is the same
+        // call-site discipline the raw-mode family paid for above: a needle on
+        // the owner's NAME cannot see a newly named parallel implementation,
+        // and this is a family that has grown five of those before (#1312).
+        //
+        // WHAT D2b MOVED: the spinner used to hold the lease and paint. It now
+        // holds neither; `TerminalProgressSink` owns the row through
+        // `EphemeralRow`, and `spinner.rs`'s own
+        // `the_spinner_owns_no_ephemeral_row` fails the build if that comes
+        // back. This category is the durable half of that deletion — it sees
+        // the NEXT row owner on the day it is written, which a per-file
+        // deletion gate cannot.
+        //
+        // WHAT IT DELIBERATELY DOES NOT CLAIM: hand-rolled `\r` + `ESC[K`
+        // erases are a different family and are not counted here. The two
+        // production sites that clear to end-of-line outside the arbiter —
+        // `newt-tui/src/cockpit/presenter.rs` and `newt-tui/src/splash.rs` —
+        // were read: both `MoveTo(col, row)` first and own an
+        // absolute-positioned row of their own, which is the multi-row
+        // `register_ephemeral` shape, not the ONE ephemeral bottom row a lease
+        // confers. Counting them would report two duplicates that have nowhere
+        // to converge, and a category that fires on everything reports
+        // nothing.
+        destinations: &[("newt-core/src/tty/row.rs", 1)],
+        baseline: &[],
+        rationale: "the arbiter hands the ONE ephemeral bottom row to exactly \
+                    one holder, and newt_core::tty::row::EphemeralRow is that \
+                    holder — it carries the paint gate, the idempotent \
+                    teardown and the erase-under-the-gate rule that keep a \
+                    tick from landing on top of a question the operator is \
+                    reading; a second lease call is a second row owner with \
+                    none of them",
+    },
+    Category {
         name: "ad-hoc two-width-field format sites",
         count: |f| f.adhoc_sites,
         // Armed at 21 by SCAN, not by the inventory's "22" (D3b, #1886).
@@ -2468,6 +2516,11 @@ const DETECTOR_PROBES: &[(&str, &str, &str)] = &[
         "crossterm::terminal::enable_raw_mode()?;",
         // The guard is the destination, and naming its TYPE is not a call.
         "let g = RawModeGuard::acquire()?;",
+    ),
+    (
+        "ephemeral-row owners outside EphemeralRow",
+        "let l = Terminal::lease_with_caps(caps, sink)?;",
+        "let g = Terminal::register_ephemeral(&e);",
     ),
     (
         "ad-hoc two-width-field format sites",

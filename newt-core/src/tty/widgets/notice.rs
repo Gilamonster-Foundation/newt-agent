@@ -40,13 +40,13 @@
 //! is why `emit` degrades to the same text rather than to nothing.
 
 use std::borrow::Cow;
-use std::io::Write as _;
+use std::io::{self, Write as _};
 
 use crossterm::queue;
 use crossterm::style::{Color as CtColor, Print, ResetColor, SetForegroundColor};
 
 use crate::tty::caps::{protocol_mode, LineCaps};
-use crate::tty::{Sink, Terminal};
+use crate::tty::{LineWriter, Sink, Terminal};
 
 /// The ONE hue table. Six registers, each with a distinct meaning; every
 /// notice in the workspace lands in one of them.
@@ -152,9 +152,24 @@ impl<'a> Notice<'a> {
         if protocol_mode() || !caps.can_own() {
             return;
         }
+        Terminal::emit_line(sink, self.writer(color));
+    }
+
+    /// The bytes this notice puts on a permanent line, as a closure the caller
+    /// routes through whichever emit path it owns.
+    ///
+    /// Split out so the styling exists **once** while two emit paths remain
+    /// necessary. [`Notice::emit`] routes through [`Terminal::emit_line`],
+    /// which erases every registered ephemeral through its own gate; a writer
+    /// that is *already holding* that gate — the ephemeral row's teardown,
+    /// flushing a trailing line between "mark finished" and the erase — must
+    /// not re-enter it, and routes the same bytes through its own lease
+    /// instead. Copying the styling into that second path is how the four
+    /// amber encodings this widget replaced came about in the first place.
+    pub(crate) fn writer(&self, color: bool) -> impl FnOnce(&mut LineWriter<'_>) -> io::Result<()> {
         let line = self.line();
         let hue = if color { self.level.hue() } else { None };
-        Terminal::emit_line(sink, move |w| match hue {
+        move |w| match hue {
             Some(h) => queue!(
                 w,
                 SetForegroundColor(h),
@@ -163,7 +178,7 @@ impl<'a> Notice<'a> {
                 Print("\n"),
             ),
             None => writeln!(w, "{line}"),
-        });
+        }
     }
 }
 
