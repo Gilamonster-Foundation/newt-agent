@@ -86,6 +86,31 @@ pub struct PendingOffer {
     pub danger: OfferDanger,
 }
 
+/// Parse a stored instance and check it against the identity it is filed
+/// under.
+///
+/// **Why this is not merely a parse.** `instance_id` is a `ContentId` over
+/// the instance, so the row key IS the checksum for these bytes. Until now
+/// it was computed once at publish time and never read back — the
+/// `provenance-audit` skill's third question, *is the evidence actually
+/// read*, answered no. The bytes come out of a row a SECOND process can
+/// write, so re-deriving here is input validation at a trust boundary.
+///
+/// It is a free function with a named caller rather than an inline check
+/// inside the answer path, because an unreachable correct answer is how
+/// this epic got its worst bug: `RawGuard` was private, so the next surface
+/// reached for crossterm and inherited the defect three times (C2b, #1891).
+/// Anything needing the stored instance goes through here.
+///
+/// `None` deliberately conflates "does not parse" with "is not what it
+/// claims to be": neither may authorize anything, and a caller able to tell
+/// them apart would be tempted to treat one as recoverable.
+#[must_use]
+fn verified_instance(instance_id: &str, instance_json: &str) -> Option<InteractionInstance> {
+    let instance: InteractionInstance = serde_json::from_str(instance_json).ok()?;
+    (instance.instance_id().ok()?.to_string() == instance_id).then_some(instance)
+}
+
 impl PendingOffer {
     /// The definition this offer publishes.
     ///
@@ -96,13 +121,14 @@ impl PendingOffer {
         serde_json::from_str(&self.definition_json)
     }
 
-    /// The instance that binds it.
+    /// The instance that binds it, checked against the identity it is
+    /// filed under.
     ///
-    /// # Errors
-    ///
-    /// A deserialization failure.
-    pub fn instance(&self) -> serde_json::Result<InteractionInstance> {
-        serde_json::from_str(&self.instance_json)
+    /// `None` when the bytes do not parse, or when they do not hash to
+    /// `instance_id` — see [`verified_instance`].
+    #[must_use]
+    pub fn instance(&self) -> Option<InteractionInstance> {
+        verified_instance(&self.instance_id, &self.instance_json)
     }
 }
 
@@ -251,12 +277,17 @@ impl ConversationStore {
             return Ok(AnswerOutcome::AlreadyResolved);
         }
 
-        let (Ok(definition), Ok(instance)) = (
-            serde_json::from_str::<InteractionDefinition>(&definition_json),
-            serde_json::from_str::<InteractionInstance>(&instance_json),
-        ) else {
+        let Ok(definition) = serde_json::from_str::<InteractionDefinition>(&definition_json) else {
             tx.commit()?;
             return Ok(AnswerOutcome::InvalidAction);
+        };
+        // Stored bytes that do not hash to their own row key name no offer
+        // this identity ever published. `Unknown`, not `InvalidAction`: the
+        // action is not what is wrong, and this fails closed exactly as
+        // expiry does below.
+        let Some(instance) = verified_instance(instance_id, &instance_json) else {
+            tx.commit()?;
+            return Ok(AnswerOutcome::Unknown);
         };
         // Expiry authorizes nothing, and synthesizes nothing.
         if Lifecycle::has_elapsed(&instance, now) {
@@ -594,6 +625,82 @@ mod b0b2 {
         assert_eq!(
             reopened.interaction_answered_by(&conv, &id).unwrap(),
             Some(Audience::Web)
+        );
+    }
+
+    /// **The trust boundary** (C4, #1894). The answer path reads
+    /// `instance_json` back out of a row a SECOND process can write, and
+    /// until now nothing re-derived the identity committing to those bytes.
+    ///
+    /// `authorized_response` re-checks the instance→definition binding via
+    /// `publish`, which leaves every OTHER field of the instance unchecked.
+    /// `responder_policy.audiences` is one of those, and it is the
+    /// eligibility gate at `binding.rs:426` — so widening it in the stored
+    /// bytes escalates an offer the publisher scoped to one surface, under a
+    /// row key still claiming to name the original.
+    #[test]
+    fn a_tampered_instance_cannot_answer_under_the_published_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let (store, conv) = store_and_conv(root.path(), ws.path());
+        let id = store
+            .publish_interaction_offer(&conv, &definition(), OfferDanger::Low, Audience::Web)
+            .unwrap();
+
+        // Control: as published, the offer is Web-only, so the terminal is
+        // refused. This is the property the tamper tries to buy.
+        assert_eq!(
+            store
+                .answer_interaction_offer(
+                    &conv,
+                    &id,
+                    PermissionAction::AllowOnce,
+                    Audience::Terminal
+                )
+                .unwrap(),
+            AnswerOutcome::InvalidAction,
+            "a Web-only offer must refuse a Terminal answer, or this test proves nothing"
+        );
+
+        // Tamper: widen the audience set in the STORED bytes, leaving the
+        // row key — the content id of the ORIGINAL instance — untouched.
+        let mut instance: InteractionInstance = {
+            let conn = store.lock_conn();
+            let json: String = conn
+                .query_row(
+                    "SELECT instance_json FROM interaction_offers WHERE instance_id = ?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&json).unwrap()
+        };
+        instance.responder_policy.audiences.push(Audience::Terminal);
+        assert_ne!(
+            instance.instance_id().unwrap().to_string(),
+            id,
+            "the tamper did not change the identity, so it is not a tamper"
+        );
+        {
+            let conn = store.lock_conn();
+            conn.execute(
+                "UPDATE interaction_offers SET instance_json = ?2 WHERE instance_id = ?1",
+                rusqlite::params![&id, serde_json::to_string(&instance).unwrap()],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .answer_interaction_offer(
+                    &conv,
+                    &id,
+                    PermissionAction::AllowOnce,
+                    Audience::Terminal
+                )
+                .unwrap(),
+            AnswerOutcome::Unknown,
+            "stored bytes that do not hash to their own row key must not authorize an answer"
         );
     }
 
