@@ -53,23 +53,21 @@
 //! [`PanelState`] is pure and unit-tested; the raw-mode loop ([`run`]) is
 //! TUI-drive tested.
 
-use std::io::{self, Stdout};
+use std::io;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use newt_core::tty::raw_mode::RawModeGuard;
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
 use newt_core::role_profile::Cognition;
 use newt_core::tenacity::{clear_cli_tenacity, cli_tenacity, set_cli_tenacity, Tenacity};
 
-pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
+pub(crate) type Term = crate::inline_viewport::InlineTerm;
 
 /// The cognition dial's ladder of OVERRIDE positions (auto/inherit → off → levels).
 const COGNITION_LADDER: &[CognitionOverride] = &[
@@ -834,13 +832,11 @@ impl PanelRawGuard {
     }
 }
 
+/// #1950: through the ONE inline constructor, so a terminal that will not
+/// answer `ESC[6n` anchors the panel instead of refusing to open it. This is
+/// the site the operator reported (`/backends`, which shares this function).
 pub(crate) fn make_terminal(height: u16) -> io::Result<Term> {
-    Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
-        TerminalOptions {
-            viewport: Viewport::Inline(height),
-        },
-    )
+    crate::inline_viewport::inline_terminal(height)
 }
 
 fn draw(f: &mut ratatui::Frame, state: &PanelState) {

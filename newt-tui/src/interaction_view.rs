@@ -41,11 +41,9 @@ mod terminal {
     use newt_core::interaction_surface::SurfaceInteraction;
     use newt_core::tty::raw_mode::RawModeGuard;
     use newt_core::HumanQuestionOutcome;
-    use ratatui::backend::CrosstermBackend;
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span as TuiSpan};
     use ratatui::widgets::{Paragraph, Wrap};
-    use ratatui::{Terminal, TerminalOptions, Viewport};
     use std::io;
     use std::time::Duration;
 
@@ -171,12 +169,9 @@ mod terminal {
         let canonical = view.fallback().to_string();
         let height = view.rows().len().clamp(1, MAX_ROWS) as u16;
         let _guard = InlineGuard::enter()?;
-        let mut terminal = Terminal::with_options(
-            CrosstermBackend::new(io::stdout()),
-            TerminalOptions {
-                viewport: Viewport::Inline(height),
-            },
-        )?;
+        // #1950: through the ONE inline constructor. A permission frame that
+        // will not open is a decision the operator never gets to make.
+        let mut terminal = crate::inline_viewport::inline_terminal(height)?;
         loop {
             terminal.draw(|f| draw(f, &view))?;
             if !event::poll(Duration::from_millis(250))? {
