@@ -59,8 +59,11 @@ const EDGES: &[&str] = &[
 /// Count a source's shape, cheaply and without parsing.
 ///
 /// * **edges** — arrow tokens, longest-match-first so one arrow counts once.
-/// * **nodes** — lines that declare something rather than continue it: a
-///   non-empty line that is not a directive and not pure punctuation.
+/// * **nodes** — the endpoints an edge joins, plus any line that declares
+///   something on its own. A line is split on its arrow tokens and each
+///   remaining run that contains a letter or digit counts once, so `A-->B`
+///   is two and `A-->B-->C` is three. An arrow with nothing on either side
+///   declares nothing and counts zero.
 /// * **depth** — the deepest indentation, in levels of two spaces, which is
 ///   how `subgraph` nesting shows up without knowing what `subgraph` means.
 #[must_use]
@@ -80,28 +83,33 @@ pub fn measure(source: &str) -> Shape {
 
         // Longest-match-first, consuming as we go, so `<-->` is one edge and
         // not also a `-->` and a `--`.
+        // Walk the line once, splitting on arrows. A run between two arrows
+        // (or between an arrow and an end of line) is an endpoint if it
+        // contains a letter or digit — the same "declares something rather
+        // than punctuation" test the whole line used to get, applied per
+        // endpoint instead.
         let mut rest = trimmed;
-        let mut found_edge = false;
+        let mut endpoint_has_content = false;
         'scan: while !rest.is_empty() {
             for token in EDGES {
                 if let Some(tail) = rest.strip_prefix(token) {
                     edges += 1;
-                    found_edge = true;
+                    if endpoint_has_content {
+                        nodes += 1;
+                        endpoint_has_content = false;
+                    }
                     rest = tail;
                     continue 'scan;
                 }
             }
             let mut chars = rest.chars();
-            chars.next();
+            if chars.next().is_some_and(char::is_alphanumeric) {
+                endpoint_has_content = true;
+            }
             rest = chars.as_str();
         }
-
-        // A line with an edge declares the nodes on either side of it; a line
-        // without one declares at most itself. Coarse on purpose — see the
-        // module docs.
-        if found_edge {
-            nodes += 2;
-        } else if trimmed.chars().any(char::is_alphanumeric) {
+        // The run after the last arrow, or the whole line if it had none.
+        if endpoint_has_content {
             nodes += 1;
         }
     }
@@ -332,5 +340,70 @@ mod tests {
             ))
         );
         assert_eq!(p.source(), huge, "even refused, the source comes back");
+    }
+}
+
+#[cfg(test)]
+mod e0a_shape_scan {
+    use super::measure;
+
+    /// **#1956, pinned.** The fuzz seed that found this is not reproducible
+    /// by design, so the minimal input is nailed down here where no seed can
+    /// lose it.
+    ///
+    /// `"->"` is an arrow with nothing on either side. It joins no
+    /// endpoints, so it declares no nodes. The scan used to credit it TWO —
+    /// which is not merely a miscount: `Budgets` are applied to this
+    /// `Shape`, so two bytes of attacker-chosen input bought two nodes of
+    /// budget, the cheapest possible way to spend someone else's ceiling.
+    #[test]
+    fn an_arrow_with_no_endpoints_declares_no_nodes() {
+        let shape = measure("->");
+        assert_eq!(shape.nodes, 0, "an arrow joining nothing declared nodes");
+        assert_eq!(shape.edges, 1, "the arrow itself is still an edge");
+    }
+
+    /// The twin, and the reason the fix is not "return 0 more often": real
+    /// endpoints must still be counted, or the budget stops measuring
+    /// anything and every diagram passes.
+    #[test]
+    fn real_endpoints_are_still_counted() {
+        assert_eq!(measure("A->B").nodes, 2);
+        assert_eq!(measure("graph TD").nodes, 1);
+    }
+
+    /// The same bug in the other direction, which #1956 did not name: the
+    /// old scan credited a flat `2` to any line containing an arrow, so a
+    /// chain UNDER-counted. Three endpoints are three nodes.
+    #[test]
+    fn a_chain_counts_every_endpoint_not_two() {
+        assert_eq!(measure("A->B->C").nodes, 3, "a chain under-counted");
+        assert_eq!(measure("A-->B\nC-->D").nodes, 4);
+    }
+
+    /// Punctuation declares nothing, before or after an arrow. This is the
+    /// rule that keeps `"->"` at zero from being a special case.
+    #[test]
+    fn punctuation_is_not_an_endpoint() {
+        assert_eq!(measure("!!!").nodes, 0);
+        assert_eq!(measure("!!!->???").nodes, 0);
+        assert_eq!(measure("!!!->B").nodes, 1);
+    }
+
+    /// The bound the fuzz property now asserts, checked here on the cases
+    /// that make it tight — so a reader can see WHY it is `edges + lines`
+    /// and not something looser.
+    #[test]
+    fn nodes_are_bounded_by_edges_plus_lines() {
+        for src in ["->", "A->B", "A->B->C", "graph TD", "!!!", "A-->B\nC-->D"] {
+            let shape = measure(src);
+            assert!(
+                shape.nodes <= shape.edges + src.lines().count(),
+                "{src:?}: {} nodes exceeds {} edges + {} lines",
+                shape.nodes,
+                shape.edges,
+                src.lines().count()
+            );
+        }
     }
 }
