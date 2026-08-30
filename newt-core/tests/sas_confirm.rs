@@ -11,9 +11,7 @@ use newt_core::credential_registry::{
     append_credential, load_credentials, resolve_credential, revoke_credential,
 };
 use newt_core::enrollment::EnrollmentCandidate;
-use newt_core::sas_confirm::{
-    answer_verdict, confirm_enrollment, confirm_prompt, recompute_sas, SasVerdict,
-};
+use newt_core::sas_confirm::{confirm_enrollment, confirm_question, recompute_sas, SasVerdict};
 use newt_core::sas_transcript::{commit, sas_words, TranscriptInputs};
 
 const ISSUER: &str = "issuer-fp";
@@ -58,7 +56,8 @@ fn the_terminal_derives_the_same_words_the_ceremony_did() {
     // anything the candidate merely asserted.
     let expected = sas_words(&candidate.transcript_id.parse().unwrap());
     assert_eq!(words, expected);
-    assert!(confirm_prompt(&words).contains(words[0]));
+    let shown = newt_core::markup::plain::render(&confirm_question(&words));
+    assert!(shown.contains(words[0]), "{shown}");
 }
 
 /// The attack the recompute exists to stop: a surface that shows the browser
@@ -131,28 +130,49 @@ fn a_mismatched_candidate_is_refused_before_prompting() {
     );
 }
 
-/// Only an explicit yes promotes. Silence, EOF, and near-misses all decline.
+/// Only an explicit yes promotes. Silence and near-misses all decline.
+///
+/// The same contract `answer_verdict` carried, asserted against the resolver
+/// that replaced it (F0c, #1928). EOF and read errors are no longer this
+/// module's arm at all — `confirmed_on_terminal` refuses every outcome that
+/// is not an affirmative answer, exhaustively, and that is covered beside it.
+///
+/// **One declared change: `"YES"` no longer promotes.** `resolve_typed` is
+/// case-DISTINCT on purpose — in the permission menu `a` and `A` are
+/// different grants — so an all-caps answer is not a near-miss it forgives.
+/// Stricter, in the fail-closed direction, on the one decision in this file
+/// that promotes a key.
 #[test]
 fn only_an_explicit_yes_confirms() {
-    for yes in ["y", "Y", "yes", "YES", " yes \n", "y\n"] {
+    let words = sas_words(&"a".repeat(64).parse().unwrap());
+    let q = confirm_question(&words);
+    let verdict = |input: &str| match newt_core::interaction_form::resolve(&q, input.trim()) {
+        Some(picked) if picked.as_str() == newt_core::interaction_form::YES => {
+            SasVerdict::Confirmed
+        }
+        _ => SasVerdict::Declined,
+    };
+    for yes in ["y", "Y", "yes", " yes \n", "y\n"] {
         assert_eq!(
-            answer_verdict(Some(yes)),
+            verdict(yes),
             SasVerdict::Confirmed,
             "{yes:?} should confirm"
         );
     }
-    for no in ["", "\n", "n", "no", "yep", "ye", "yes please", "1", "sure"] {
-        assert_eq!(
-            answer_verdict(Some(no)),
-            SasVerdict::Declined,
-            "{no:?} must decline"
-        );
+    for no in [
+        "",
+        "\n",
+        "n",
+        "no",
+        "yep",
+        "ye",
+        "yes please",
+        "1",
+        "sure",
+        "YES",
+    ] {
+        assert_eq!(verdict(no), SasVerdict::Declined, "{no:?} must decline");
     }
-    assert_eq!(
-        answer_verdict(None),
-        SasVerdict::Declined,
-        "EOF / read error is a refusal, never assent"
-    );
 }
 
 // --- revocation ---
