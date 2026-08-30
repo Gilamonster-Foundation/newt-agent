@@ -28,8 +28,9 @@ use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers,
 };
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
+use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, queue};
+use newt_core::tty::raw_mode::RawModeGuard;
 
 use crate::{InputSurface, ReadOutcome};
 
@@ -215,12 +216,18 @@ fn layout(prompt_w: usize, buf: &str, cursor_byte: usize, cols: usize) -> (usize
 
 /// RAII: restore the terminal (cooked mode, bracketed paste off) on every exit
 /// path — normal return, `?`, or panic.
-struct RawGuard;
+/// **Composed onto [`RawModeGuard`] (#1905), not replaced by it.** This owns
+/// bracketed paste as well as raw mode, so the raw half becomes a FIELD and
+/// the paste half stays in the body. Rust drops a struct's fields AFTER
+/// running its `Drop::drop`, so paste is released first — the order this type
+/// always had, now given by the language rather than by statement order.
+struct RawGuard {
+    _raw: RawModeGuard,
+}
 impl Drop for RawGuard {
     fn drop(&mut self) {
         let _ = queue!(io::stdout(), DisableBracketedPaste);
         let _ = io::stdout().flush();
-        let _ = disable_raw_mode();
     }
 }
 
@@ -308,8 +315,9 @@ impl LeanSurface {
 
     /// Interactive TTY path: raw-mode editing until Enter / Ctrl-C / Ctrl-D.
     fn read_tty(&mut self, prompt: &str) -> io::Result<ReadOutcome> {
-        enable_raw_mode()?;
-        let _guard = RawGuard;
+        let _guard = RawGuard {
+            _raw: RawModeGuard::enter()?,
+        };
         queue!(io::stdout(), EnableBracketedPaste)?;
         io::stdout().flush()?;
 

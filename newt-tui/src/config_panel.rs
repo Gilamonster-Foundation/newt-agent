@@ -57,7 +57,7 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use newt_core::tty::raw_mode::RawModeGuard;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -811,19 +811,26 @@ const PANEL_HEIGHT: u16 = 10;
 /// `enter_panel_raw_mode_is_the_only_way_in` pins that neither panel reaches
 /// past this type to crossterm; `panel_raw_mode_pty_test` proves the Drop
 /// against a real tty, from a parent that outlives the panicking child.
-pub(crate) struct PanelRawGuard;
+///
+/// **SUBSUMED onto [`RawModeGuard`] (#1905).** This owned raw mode and nothing
+/// else, through crossterm's `enable_raw_mode`/`disable_raw_mode` — which keep
+/// ONE process-global "mode prior to raw" and so restore to a fixed state
+/// rather than to what this guard found. C2b (#1891) hit that as a live defect
+/// in `InlineGuard`: an inner frame closing handed the terminal back to cooked
+/// while the outer frame was still up. `RawModeGuard` captures the prior
+/// termios at `enter` and restores exactly that, so nesting composes.
+///
+/// A newtype rather than a plain alias, because the panels' own tests and the
+/// PTY child name this type, and because the doc above is about the panels.
+pub(crate) struct PanelRawGuard {
+    _raw: RawModeGuard,
+}
 
 impl PanelRawGuard {
     pub(crate) fn enter() -> io::Result<Self> {
-        let guard = Self;
-        enable_raw_mode()?;
-        Ok(guard)
-    }
-}
-
-impl Drop for PanelRawGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
+        Ok(Self {
+            _raw: RawModeGuard::enter()?,
+        })
     }
 }
 
@@ -1097,15 +1104,25 @@ mod tests {
         // discusses `enable_raw_mode()` and `disable_raw_mode()` in prose, and
         // a test that counted mentions would move every time someone edited a
         // comment — noise that trains people to adjust the number.
+        // #1905 SUBSUMED the raw half onto `RawModeGuard`, so the count that
+        // was "exactly one" is now "none" in BOTH files. The one nesting-aware
+        // owner lives in newt-core; a bare crossterm call reappearing here
+        // would be a second owner restoring to a fixed state rather than to
+        // what it found — the defect C2b hit in `InlineGuard`.
         assert_eq!(
             config.matches("enable_raw_mode()?").count(),
-            1,
-            "the ONLY enable_raw_mode call in config_panel is PanelRawGuard::enter's"
+            0,
+            "raw mode comes from RawModeGuard, never crossterm directly"
         );
         assert_eq!(
             config.matches("disable_raw_mode();").count(),
-            1,
-            "the ONLY disable_raw_mode call in config_panel is the Drop impl's"
+            0,
+            "…and is released by the field, never by a statement here"
+        );
+        assert!(
+            config.contains("_raw: RawModeGuard"),
+            "PanelRawGuard must HOLD a RawModeGuard — composition, not a \
+             reimplementation"
         );
         assert_eq!(
             backend.matches("enable_raw_mode(").count(),
@@ -1120,10 +1137,13 @@ mod tests {
         // The guard itself must still be a Drop obligation. A guard whose
         // restore moved into an inherent method would satisfy every count
         // above and leak on unwind again.
+        // No `impl Drop for PanelRawGuard` any more, and its absence is the
+        // point: the restore is the FIELD's, so there is nothing here to
+        // forget. A hand-written Drop reappearing would mean a second restore
+        // racing the field's.
         assert!(
-            config.contains("impl Drop for PanelRawGuard"),
-            "PanelRawGuard must restore from Drop, not from a method someone \
-             has to remember to call"
+            !config.contains("impl Drop for PanelRawGuard"),
+            "the restore is RawModeGuard's; a Drop impl here would be a second one"
         );
     }
 

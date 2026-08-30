@@ -546,6 +546,50 @@ const CATEGORIES: &[Category] = &[
                     algorithm is the D3 exit",
     },
     Category {
+        name: "raw-mode owners outside RawModeGuard",
+        count: |f| count_any(&f.squeezed, &["enable_raw_mode()", "disable_raw_mode()"]),
+        // Armed at 8 by SCAN after the #1905 sweep, not by a hoped-for number.
+        //
+        // WHAT THE SWEEP REMOVED: six guards used to call crossterm directly —
+        // `modal::RawGuard`, `interaction_view::InlineGuard` (both C2b),
+        // `config_panel::PanelRawGuard`, `rich_input::RawPasteGuard`,
+        // `lean_input::RawGuard`, `transcript_pager::AltScreenGuard` and
+        // `lib::SplashScreenGuard` (#1905). Each now takes `RawModeGuard`,
+        // which restores the termios IT captured, so nesting composes.
+        //
+        // The needle is CALL SITES, not guard type names, and that choice is
+        // the lesson of this family. A name registry cannot see a NEWLY NAMED
+        // parallel implementation — this file's own header says so — and eight
+        // guards is exactly what a name-blind family grows to. Three of them
+        // were added by this epic itself, in parallel slices that each
+        // correctly fixed a leak and each grew its own guard. A call-site
+        // needle sees the next one on the day it is written.
+        baseline: &[
+            // THE OWNER'S OWN IMPLEMENTATION. `RawModeGuard`'s non-unix arm
+            // falls back to crossterm's global because there is no termios to
+            // save; the unix arm, which is the one that composes, uses none.
+            // Sanctioned and stays at exactly 2 — the same shape as the
+            // arbiter's one sanctioned stdin read.
+            ("newt-core/src/tty/raw_mode.rs", 2),
+            // THE REAL REMAINING WORK, and C2b named it "the largest item, not
+            // in the list at all": the cockpit manages raw mode with bare
+            // calls and NO guard, session-scoped rather than frame-scoped. Its
+            // own comment already worries that "a stray `disable_raw_mode`
+            // anywhere would…" — this bug class sensed from the other side,
+            // without a failing test. Out of #1905's scope because it is not a
+            // guard to absorb; it is a guard that does not exist yet.
+            ("newt-tui/src/cockpit/presenter.rs", 4),
+            // PTY test scaffolding that the shared scanner sees as production
+            // because it is not `#[cfg(test)]`-gated. It stands a pty up for
+            // the cockpit's own tests and legitimately drives the global.
+            ("newt-tui/src/cockpit/test_tty.rs", 2),
+        ],
+        rationale: "crossterm's enable/disable_raw_mode keep ONE process-global \
+                    prior mode, so a caller restores to a fixed state rather \
+                    than to what it found; newt_core::tty::raw_mode::RawModeGuard \
+                    saves the termios it took and is the one nesting-aware owner",
+    },
+    Category {
         name: "ad-hoc two-width-field format sites",
         count: |f| f.adhoc_sites,
         // Armed at 21 by SCAN, not by the inventory's "22" (D3b, #1886).
