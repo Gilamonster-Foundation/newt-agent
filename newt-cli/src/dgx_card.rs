@@ -558,6 +558,40 @@ mod tests {
         assert!(out.contains("!  bad: malformed"), "{out}");
     }
 
+    /// **The byte golden for `newt dgx card list` as it ships today** (#1916).
+    ///
+    /// Captured from the shipping renderer — the method D3c used, and the
+    /// reason is the same: F0's "unlisted golden diffs are bugs" only bites if
+    /// there is something to diff against. The source labels are `built-in` /
+    /// `drop-in` rather than paths, so this is stable across machines.
+    #[test]
+    fn the_card_catalog_is_byte_exact() {
+        let dir = catalog_dir_raw(&[("demo", &valid_body("demo", 0.6))]);
+        let (entries, problems) = catalog_rows(Some(dir.path()));
+        assert_eq!(
+            render_list(&entries, &problems, false),
+            concat!(
+                "NAME                   BACKEND     GiB  GATED  SOURCE\n",
+                "Ornith-1.0-35B         vllm         35         built-in\n",
+                "Ornith-1.0-397B        vllm        400  yes    built-in\n",
+                "demo                   vllm          -         drop-in\n",
+            )
+        );
+    }
+
+    /// The `--json` arm must NOT move: it is a machine contract, and this
+    /// slice changes only the human table.
+    #[test]
+    fn the_card_catalog_json_is_unchanged_by_the_table_migration() {
+        let dir = catalog_dir_raw(&[("demo", &valid_body("demo", 0.6))]);
+        let (entries, problems) = catalog_rows(Some(dir.path()));
+        let json = render_list(&entries, &problems, true);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let arr = parsed.as_array().expect("an array");
+        assert_eq!(arr.len(), 3, "{json}");
+        assert_eq!(arr[2]["name"], "demo", "{json}");
+    }
+
     #[test]
     fn render_list_json_is_a_valid_array_with_error_rows() {
         let dir = catalog_dir_raw(&[("demo", &valid_body("demo", 0.6))]);
