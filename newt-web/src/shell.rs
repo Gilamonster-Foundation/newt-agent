@@ -1178,7 +1178,10 @@ mod tests {
         #[test]
         fn a_raw_escape_never_reaches_the_page() {
             let html = render_markdown("run \u{1b}[2Koops");
-            assert!(!html.contains('\u{1b}'), "a raw ESC reached the page: {html:?}");
+            assert!(
+                !html.contains('\u{1b}'),
+                "a raw ESC reached the page: {html:?}"
+            );
         }
 
         /// **Anti-vacuous twin.** Every assertion above would hold over a
@@ -1189,7 +1192,10 @@ mod tests {
         fn the_page_still_renders_its_text_and_legitimate_rtl() {
             let html = render_markdown("allow SENTINEL once");
             assert!(html.contains("SENTINEL"), "nothing rendered: {html:?}");
-            assert!(!html.contains("<U+"), "benign text was neutralised: {html:?}");
+            assert!(
+                !html.contains("<U+"),
+                "benign text was neutralised: {html:?}"
+            );
 
             for rtl in ["تشغيل bash؟", "האם להריץ bash?"] {
                 let html = render_markdown(rtl);
