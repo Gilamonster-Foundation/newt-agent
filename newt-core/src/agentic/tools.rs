@@ -2037,13 +2037,41 @@ fn shell_envelope_output(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     let out = format!("{stdout}{stderr}");
+    // #1969: the exit code decides success, not the shape of the output.
+    //
+    // This used to be consulted ONLY when the output was empty, so every
+    // command that failed LOUDLY — which is every failing compile — returned
+    // a non-empty string with no failure marker and was classified by
+    // `tool_result_ok`'s prefix test as a success. Three consumers read that
+    // one bit: the turn's `ToolEvent` ledger, `RepeatCallGuard` (which
+    // memoizes a `Failure` only for `!ok`, so the per-run steer never fired
+    // on a repeated failing build), and `loop_watch::repeated_failure`.
+    //
+    // The marker is a prefix rather than a suffix because that is what
+    // `tool_result_ok` reads, and it names the code because "it failed" with
+    // no evidence is the claim this repo keeps refusing to accept elsewhere.
+    // The diagnostics follow it untouched — the model still needs them.
+    let code = envelope
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(-1);
+    let mark_failure = |payload: String| {
+        if code == 0 {
+            payload
+        } else {
+            format!("error: command exited {code}\n{payload}")
+        }
+    };
     if out.trim().is_empty() {
-        let code = envelope
-            .get("exit_code")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(-1);
-        format!("(exit {code})")
-    } else {
+        // A failing command that printed nothing needs no second rendering of
+        // its own code: the marker already carries it.
+        return if code == 0 {
+            format!("(exit {code})")
+        } else {
+            format!("error: command exited {code}")
+        };
+    }
+    {
         // The terminal follows the full output tail even when the model-facing
         // payload below is token-capped or replaced by a spill handle.
         if let Some(presentation) = presentation {
@@ -2103,10 +2131,10 @@ fn shell_envelope_output(
         // explicit next-step hint so the model opens the PR instead of stalling.
         // Detected from the UNcapped output so a long push log can't truncate the
         // URL away, and appended AFTER the cap so the hint always survives.
-        match pr_creation_url(&out) {
+        mark_failure(match pr_creation_url(&out) {
             Some(url) => format!("{capped}{}", pr_next_step_hint(url)),
             None => capped,
-        }
+        })
     }
 }
 
@@ -5486,6 +5514,14 @@ mod tests;
 #[cfg(test)]
 #[path = "tools_tests/execute_tool_branch_tests.rs"]
 mod execute_tool_branch_tests;
+
+// ---------------------------------------------------------------------------
+// #1969 — the ledger's `ok` bit follows the exit code, not a string prefix.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "tools_tests/exit_code_ok_tests.rs"]
+mod exit_code_ok_tests;
 
 // ---------------------------------------------------------------------------
 // INTERIM (#297) --disable-ocap / --yolo tests — the exec escape hatch.

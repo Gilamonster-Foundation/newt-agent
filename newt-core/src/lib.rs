@@ -65,8 +65,9 @@ pub mod interaction_view;
 pub mod kit;
 pub mod launch_authority;
 pub mod lazy_emission;
-/// Generic agent lifecycle events — the seam integrations subscribe to.
 pub mod lifecycle;
+/// Generic agent lifecycle events — the seam integrations subscribe to.
+pub mod loop_watch;
 pub mod markup;
 pub mod mcp;
 pub mod mcp_catalog;

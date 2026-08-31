@@ -2114,6 +2114,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut repeat_calls = RepeatCallGuard::default();
+    // #1948: DETECTION beside the guard — it notices a clean-then-build
+    // loop and says so once; it never blocks or rewrites the call.
+    let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
     let mut overflow_retries: u32 = 0;
     let mut suspicious_empty_retries: u32 = 0;
     // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
@@ -3814,6 +3817,19 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 round_progress = true;
             }
             repeat_calls.record(name, &args, ok, &result);
+            // #1948: a clean-then-build loop discards output its own
+            // edits already invalidated. Detection only — the call has
+            // already run, and this adds one guidance message per turn.
+            if let Some(warning) = clean_build.observe(
+                args.get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            ) {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!("{} {warning}", compress::LOOP_GUIDANCE_PREFIX),
+                }));
+            }
             if workflow_runtime.record_tool_result(&result) {
                 round_progress = true;
             }
@@ -5955,6 +5971,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut repeat_calls = RepeatCallGuard::default();
+    // #1948: DETECTION beside the guard — it notices a clean-then-build
+    // loop and says so once; it never blocks or rewrites the call.
+    let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
     // At most one reasoning-only length-stop continuation per user turn. The
     // signal index lets the next response record whether that bounded recovery
     // produced visible content or an executable call.
@@ -7290,6 +7309,19 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 round_progress = true;
             }
             repeat_calls.record(name, &args, ok, &result);
+            // #1948: a clean-then-build loop discards output its own
+            // edits already invalidated. Detection only — the call has
+            // already run, and this adds one guidance message per turn.
+            if let Some(warning) = clean_build.observe(
+                args.get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            ) {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!("{} {warning}", compress::LOOP_GUIDANCE_PREFIX),
+                }));
+            }
             if workflow_runtime.record_tool_result(&result) {
                 round_progress = true;
             }
@@ -8012,6 +8044,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut repeat_calls = RepeatCallGuard::default();
+    // #1948: DETECTION beside the guard — it notices a clean-then-build
+    // loop and says so once; it never blocks or rewrites the call.
+    let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
     // At most one reasoning-only length-stop continuation per user turn
     // (mirrors the OpenAI path; the length stop is `max_tokens` here).
     let mut reasoning_continuation_attempted = false;
@@ -9223,6 +9258,19 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 round_progress = true;
             }
             repeat_calls.record(name, &args, ok, &result);
+            // #1948: a clean-then-build loop discards output its own
+            // edits already invalidated. Detection only — the call has
+            // already run, and this adds one guidance message per turn.
+            if let Some(warning) = clean_build.observe(
+                args.get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            ) {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!("{} {warning}", compress::LOOP_GUIDANCE_PREFIX),
+                }));
+            }
             if workflow_runtime.record_tool_result(&result) {
                 round_progress = true;
             }
@@ -9745,6 +9793,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut repeat_calls = RepeatCallGuard::default();
+    // #1948: DETECTION beside the guard — it notices a clean-then-build
+    // loop and says so once; it never blocks or rewrites the call.
+    let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
     let mut tools_supported = true;
     let mut tools_unsupported_notified = false;
     let mut unverified_exec_blocker_nudges: usize = 0;
@@ -10277,6 +10328,19 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             repeat_calls.record(name, &args, ok, &result);
+            // #1948: a clean-then-build loop discards output its own
+            // edits already invalidated. Detection only — the call has
+            // already run, and this adds one guidance message per turn.
+            if let Some(warning) = clean_build.observe(
+                args.get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            ) {
+                input.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!("{} {warning}", compress::LOOP_GUIDANCE_PREFIX),
+                }));
+            }
             if let Some(rec) = tool_events.as_deref_mut() {
                 rec.push(crate::ToolEvent::from_call(
                     name,
