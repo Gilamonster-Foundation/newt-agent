@@ -302,17 +302,34 @@ impl RegionLease {
     ///
     /// The cockpit presenter's block moves (`self.top = plan.new_top`) and is
     /// clamped on resize, so a lease it had to drop and re-take would churn
-    /// and, worse, would own nothing in the window between. Re-checked under
-    /// the same lock against every OTHER holder; `false` means the move was
-    /// refused and the lease still holds what it held.
-    pub fn relocate(&mut self, to: Region) -> bool {
+    /// and, worse, would own nothing in the window between.
+    ///
+    /// **`policy` mirrors the mint's, and #1980 is why it has to.** A move can
+    /// be either of two things and they cannot share a rule:
+    ///
+    /// * a REQUEST, which may be refused — [`OnCollision::Refuse`], the
+    ///   checked form: `false` means the move did not happen and the lease
+    ///   still holds exactly what it held.
+    /// * a REPORT of a move that already happened — [`OnCollision::SuspendHolder`].
+    ///   The presenter recomputes its top from the terminal's NEW size on a
+    ///   resize, and takes `new_top` from a scroll that has already scrolled.
+    ///   Refusing there would not un-move the block; it would only leave the
+    ///   lease describing rows the block no longer occupies, which is worse
+    ///   than holding no lease at all — a wrong answer instead of no answer.
+    ///
+    /// [`OnCollision::Shift`] is rejected: a relocation names the rows the
+    /// caller is moving TO, and silently landing somewhere else would make the
+    /// lease disagree with the caller's own bookkeeping.
+    pub fn relocate(&mut self, to: Region, policy: OnCollision) -> bool {
         let mut state = lock();
-        if state
+        let contested = state
             .regions
             .iter()
-            .any(|(id, held)| *id != self.id && held.intersects(to))
-        {
-            return false;
+            .any(|(id, held)| *id != self.id && held.intersects(to));
+        match policy {
+            OnCollision::Refuse if contested => return false,
+            OnCollision::Shift => return false,
+            _ => {}
         }
         if let Some(entry) = state.regions.iter_mut().find(|(id, _)| *id == self.id) {
             entry.1 = to;
@@ -1356,11 +1373,14 @@ mod tests {
     fn a_lease_relocates_in_place_and_still_respects_other_holders() {
         let _other = Terminal::lease_region(rows(0, 4), OnCollision::Refuse).expect("other");
         let mut moving = Terminal::lease_region(rows(18, 6), OnCollision::Refuse).expect("moving");
-        assert!(moving.relocate(rows(10, 6)), "a clear move must succeed");
+        assert!(
+            moving.relocate(rows(10, 6), OnCollision::Refuse),
+            "a clear move must succeed"
+        );
         assert_eq!(moving.region(), rows(10, 6));
         // TWIN: relocation is checked, not merely recorded.
         assert!(
-            !moving.relocate(rows(2, 4)),
+            !moving.relocate(rows(2, 4), OnCollision::Refuse),
             "relocating onto another holder was allowed"
         );
         assert_eq!(
@@ -1369,7 +1389,10 @@ mod tests {
             "a refused move must leave the lease holding what it held"
         );
         // Moving onto its OWN rows is not a self-collision.
-        assert!(moving.relocate(rows(10, 8)), "a lease may resize in place");
+        assert!(
+            moving.relocate(rows(10, 8), OnCollision::Refuse),
+            "a lease may resize in place"
+        );
     }
 
     /// **Compose proof.** Panel over prompt, close, both restored in order —
@@ -1405,5 +1428,39 @@ mod tests {
         );
         drop(prompt);
         drop(reclaimed);
+    }
+
+    /// A relocation is sometimes a REPORT, not a request (#1980).
+    ///
+    /// The cockpit presenter recomputes its top from the terminal's new size
+    /// on a resize. Refusing that move would not un-resize the terminal — it
+    /// would leave the lease naming rows the block has already left.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_forced_relocation_lands_where_a_checked_one_is_refused() {
+        let _other = Terminal::lease_region(rows(0, 4), OnCollision::Refuse).expect("other");
+        let mut block = Terminal::lease_region(rows(18, 6), OnCollision::Refuse).expect("block");
+
+        // Checked: refused, and the lease is unchanged.
+        assert!(!block.relocate(rows(2, 4), OnCollision::Refuse));
+        assert_eq!(block.region(), rows(18, 6));
+
+        // Forced: lands, because the move already happened on the terminal.
+        assert!(
+            block.relocate(rows(2, 4), OnCollision::SuspendHolder),
+            "a forced relocation must land, or the lease describes rows the \
+             writer has already left"
+        );
+        assert_eq!(block.region(), rows(2, 4));
+
+        // TWIN: `Shift` is rejected outright rather than quietly landing
+        // somewhere else, which would make the lease disagree with the
+        // caller's own bookkeeping.
+        assert!(
+            !block.relocate(rows(0, 4), OnCollision::Shift),
+            "a shifting relocation would move the lease somewhere the caller \
+             did not ask for"
+        );
+        assert_eq!(block.region(), rows(2, 4));
     }
 }

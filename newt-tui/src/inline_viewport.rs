@@ -353,14 +353,14 @@ mod region_lease_door {
         out
     }
 
-    /// Region claims that do NOT yet go through a lease.
+    /// Region claims that still hold NO lease.
     ///
-    /// A ratchet, not a permission list: the count may only go DOWN. The
-    /// cockpit presenter builds two `Viewport::Fixed` regions from its own row
-    /// arithmetic (`self.top`, clamped on resize), which is a claim on rows by
-    /// any reading — it is simply not this slice's. #1979's sweep takes it,
-    /// and `RegionLease::relocate` exists because that block MOVES.
-    const UNLEASED_REGION_CLAIMS: &[(&str, usize)] = &[("presenter.rs", 2)];
+    /// A ratchet, not a permission list: the count may only go DOWN, and
+    /// #1980 brought it to **zero**. The cockpit presenter was the last
+    /// entry — two `Viewport::Fixed` regions built from its own `self.top`
+    /// arithmetic — and it now holds a session-scoped lease that it
+    /// `relocate`s on every move.
+    const UNLEASED_REGION_CLAIMS: &[(&str, usize)] = &[];
 
     /// **The door is one door, and it takes a lease.**
     ///
@@ -396,28 +396,32 @@ mod region_lease_door {
         }
     }
 
-    /// The wider category, ratcheted: every OTHER way a surface claims rows.
+    /// The wider category: every OTHER way a surface claims rows must hold a
+    /// lease for them.
     ///
-    /// Separate from the door above because the door's baseline is zero from
-    /// birth, while this one starts at two and is meant to reach zero in the
-    /// sweep. Counting them keeps the mess visible and monotonically
-    /// decreasing rather than rewritten.
+    /// Separate from the door above because the door's baseline was zero from
+    /// birth, while this one started at two (#1979) and reaches zero here. It
+    /// asks for a HOLDER rather than counting call sites, because the claim is
+    /// not the defect — claiming rows nobody arbitrates is.
     #[test]
-    fn unleased_region_claims_only_decrease() {
+    fn every_region_claim_holds_a_lease() {
+        const HOLDS: &str = "RegionLease";
         for (name, body) in &sources() {
             if name == "inline_viewport.rs" {
                 continue; // the door itself, and this test's own needles
             }
-            let found = body.matches(OPTIONS).count();
+            if !body.contains(OPTIONS) {
+                continue;
+            }
             let allowed = UNLEASED_REGION_CLAIMS
                 .iter()
                 .find(|(f, _)| *f == name)
                 .map_or(0, |(_, n)| *n);
             assert!(
-                found <= allowed,
-                "{name} makes {found} region claims, {allowed} declared. A new \
-                 one must mint a `RegionLease`; a removed one must lower the \
-                 baseline."
+                body.contains(HOLDS) || allowed > 0,
+                "{name} builds a viewport but holds no `RegionLease`. Rows a \
+                 surface claims without telling the arbiter are rows another \
+                 surface can be handed (#1977)."
             );
         }
     }
