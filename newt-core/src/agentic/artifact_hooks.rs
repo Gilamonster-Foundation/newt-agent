@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
 
 use super::artifact_read::{ArtifactReadContext, ArtifactReadRecord, PromptArtifactSink};
-use super::compress::{CompressAction, CompressTrigger};
+use super::compress::{CompressAction, CompressTrigger, FloorTrend};
 #[cfg(test)]
 use super::prompt_intake::PROMPT_COMPREHENSION_SCHEMA_CURRENT;
 use super::prompt_intake::{
@@ -630,6 +630,11 @@ fn path_locator(path: &Path) -> Option<String> {
 /// can explain the decision in bounded scalar metadata. Recovery and manual
 /// callers pass `None`; `send_budget_authoritative` is then intentionally
 /// ignored and no automatic-trigger metadata is written.
+///
+/// `floor_trend` (#1993) is independent of `trigger`: it is the SAME
+/// cross-round `CompressState` reading regardless of which call site
+/// produced this checkpoint (automatic or recovery), so it is always
+/// written, never gated on `trigger.is_some()`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_compaction_checkpoint(
     sink: &dyn PromptArtifactSink,
@@ -642,6 +647,7 @@ pub(crate) fn record_compaction_checkpoint(
     reason: &str,
     trigger: Option<&CompressTrigger>,
     send_budget_authoritative: bool,
+    floor_trend: FloorTrend,
 ) -> anyhow::Result<Option<ArtifactReadRecord>> {
     let action = match action {
         CompressAction::Pruned => "pruned",
@@ -672,6 +678,19 @@ pub(crate) fn record_compaction_checkpoint(
         "budget": budget,
         "round": round,
         "reason": reason,
+        // #1993: #1966's evidence was read out of these DB artifacts, but
+        // `floor_trend` landed only in the Rust API — every prior checkpoint
+        // carried the fired action and never the trend. `previous`/`latest`
+        // are `null` (not merely absent, and not collapsed into a single
+        // derived boolean) when no reading has landed yet, so "no fresh
+        // floor reading this round" stays distinguishable from "a real,
+        // flat (unchanging) trend" — both would otherwise report `rising:
+        // false` and be unrecoverable from each other in the record.
+        "floor_trend": {
+            "previous": floor_trend.previous,
+            "latest": floor_trend.latest,
+            "rising": floor_trend.rising(),
+        },
     });
     if let Some(trigger) = trigger {
         // The trigger is deliberately a bounded, scalar-only projection. It
@@ -938,6 +957,16 @@ mod tests {
             root,
             ArtifactReadContext::new(Some(originating), Some(active), Some(root), None),
         )
+    }
+
+    /// A `FloorTrend` with no readings landed — the shape every call site
+    /// unrelated to #1993 passes, so those tests stay focused on what they
+    /// actually assert.
+    fn no_floor_reading() -> FloorTrend {
+        FloorTrend {
+            previous: None,
+            latest: None,
+        }
     }
 
     fn digest_metadata(text: &str) -> Value {
@@ -1416,6 +1445,7 @@ mod tests {
                 "not transformed",
                 None,
                 false,
+                no_floor_reading(),
             )
             .unwrap()
             .is_none());
@@ -1431,7 +1461,17 @@ mod tests {
             let (_, _, context) = context();
             let reason = "r".repeat(COMPACTION_REASON_CHARS + 100);
             record_compaction_checkpoint(
-                &sink, context, action, 1_000, 700, 800, 3, &reason, None, false,
+                &sink,
+                context,
+                action,
+                1_000,
+                700,
+                800,
+                3,
+                &reason,
+                None,
+                false,
+                no_floor_reading(),
             )
             .unwrap();
             let artifacts = sink.artifacts();
@@ -1482,6 +1522,7 @@ mod tests {
             "automatic_token_threshold",
             Some(&trigger),
             true,
+            no_floor_reading(),
         )
         .unwrap();
 
@@ -1501,6 +1542,110 @@ mod tests {
         assert_eq!(trigger["causes"]["token_threshold"], true);
         assert_eq!(trigger["causes"]["send_budget"], false);
         assert_eq!(trigger["primary_cause"], "token_threshold");
+    }
+
+    /// Red-first for #1993: `CompressState::floor_trend()` (#1966) landed
+    /// only in the Rust API — #1966's own evidence was read out of THESE
+    /// checkpoint artifacts, so an escalating trend must be visible in the
+    /// persisted record, not merely computable by a caller that already has
+    /// the live `CompressState` (which a forensic sweep over a stored DB
+    /// does not).
+    #[test]
+    fn an_escalating_floor_trend_lands_in_the_persisted_checkpoint() {
+        let sink = RecordingSink::default();
+        let (_, _, context) = context();
+        // Exact in both f32 and f64 (powers of two) — an f32 -> JSON -> f64
+        // round trip must not fail this assertion on rounding noise, only
+        // on an actual logic error.
+        let trend = FloorTrend {
+            previous: Some(0.5),
+            latest: Some(0.75),
+        };
+        record_compaction_checkpoint(
+            &sink,
+            context,
+            CompressAction::Pruned,
+            10_000,
+            9_000,
+            10_000,
+            5,
+            "automatic_send_budget",
+            None,
+            false,
+            trend,
+        )
+        .unwrap();
+
+        let artifacts = sink.artifacts();
+        let floor_trend = &artifacts[0].metadata()["floor_trend"];
+        assert_eq!(floor_trend["previous"], 0.5);
+        assert_eq!(floor_trend["latest"], 0.75);
+        assert_eq!(floor_trend["rising"], true);
+    }
+
+    /// **The twin** (#1993): a checkpoint with NO fresh floor reading must
+    /// be distinguishable in the persisted record from a checkpoint whose
+    /// floor genuinely held FLAT — both compute `rising() == false`, so a
+    /// record that only wrote that one derived boolean would conflate "I
+    /// have no data" with "I have data and it did not move". `previous`/
+    /// `latest` being JSON `null` (absent) vs. real, equal numbers is what
+    /// keeps the two cases apart.
+    #[test]
+    fn no_reading_is_distinguishable_from_a_genuinely_flat_trend() {
+        let no_reading = no_floor_reading();
+        let flat = FloorTrend {
+            previous: Some(0.5),
+            latest: Some(0.5),
+        };
+        // Both report the same derived signal...
+        assert!(!no_reading.rising());
+        assert!(!flat.rising());
+
+        let sink = RecordingSink::default();
+        let (_, _, context) = context();
+        record_compaction_checkpoint(
+            &sink,
+            context,
+            CompressAction::Pruned,
+            1_000,
+            900,
+            1_000,
+            1,
+            "automatic_send_budget",
+            None,
+            false,
+            no_reading,
+        )
+        .unwrap();
+        record_compaction_checkpoint(
+            &sink,
+            context,
+            CompressAction::Pruned,
+            1_000,
+            900,
+            1_000,
+            2,
+            "automatic_send_budget",
+            None,
+            false,
+            flat,
+        )
+        .unwrap();
+
+        let artifacts = sink.artifacts();
+        let no_reading_trend = &artifacts[0].metadata()["floor_trend"];
+        let flat_trend = &artifacts[1].metadata()["floor_trend"];
+        // ...but the persisted RECORDS must not be the same shape.
+        assert_ne!(
+            no_reading_trend, flat_trend,
+            "{no_reading_trend:?} vs {flat_trend:?}"
+        );
+        assert!(no_reading_trend["previous"].is_null());
+        assert!(no_reading_trend["latest"].is_null());
+        assert_eq!(flat_trend["previous"], 0.5);
+        assert_eq!(flat_trend["latest"], 0.5);
+        assert_eq!(no_reading_trend["rising"], false);
+        assert_eq!(flat_trend["rising"], false);
     }
 
     /// **The twin** (#1965): a turn under the DEFAULT cap records 40 from

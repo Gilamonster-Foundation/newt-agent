@@ -180,8 +180,8 @@ pub use artifact_read::{
 };
 pub use compress::{
     compress_user_initiated, compress_user_initiated_for_task, CompressCounters, CompressState,
-    ManualCompressOutcome, ManualCompressPolicy, SummarizeFn, SummarizeFuture, Summarizer,
-    CONTINUATION_PREFIX, SUMMARY_END_MARKER, SUMMARY_PREFIX,
+    FloorTrend, ManualCompressOutcome, ManualCompressPolicy, SummarizeFn, SummarizeFuture,
+    Summarizer, CONTINUATION_PREFIX, SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
 pub use content_spill::{
     SessionSpillStore, SpillCid, SpillCidError, SpillProvenance, SpillRecordV1, SpillScope,
@@ -2552,6 +2552,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         trigger.primary_cause.artifact_reason(),
                         Some(&trigger),
                         send_budget_authoritative,
+                        compress_state.floor_trend(),
                         color,
                     );
                 }
@@ -2822,6 +2823,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     "context_window_400",
                                     None,
                                     false,
+                                    compress_state.floor_trend(),
                                     color,
                                 );
                             }
@@ -3491,6 +3493,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 "silent_overflow_recovery",
                                 None,
                                 false,
+                                compress_state.floor_trend(),
                                 color,
                             );
                         } else if !rewrites_history {
@@ -3533,6 +3536,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     "silent_overflow_structural_fallback",
                                     None,
                                     false,
+                                    compress_state.floor_trend(),
                                     color,
                                 );
                             }
@@ -4657,6 +4661,12 @@ fn record_compaction_artifact(
     reason: &str,
     trigger: Option<&CompressTrigger>,
     send_budget_authoritative: bool,
+    // #1993: the SAME `CompressState` the caller already threads through
+    // `compress()` — floor_trend is cross-round session state, not derived
+    // from this one call's trigger/outcome, so it is passed independently
+    // of `trigger` and is present on every checkpoint (recovery paths
+    // included), not only the automatic-trigger ones.
+    floor_trend: FloorTrend,
     color: bool,
 ) {
     let (Some(sink), Some(context)) = (artifact_sink, artifact_context) else {
@@ -4673,6 +4683,7 @@ fn record_compaction_artifact(
         reason,
         trigger,
         send_budget_authoritative,
+        floor_trend,
     ) {
         print_harness_notice(
             &format!("warning: failed to record compaction artifact: {error}"),
@@ -6432,6 +6443,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         trigger.primary_cause.artifact_reason(),
                         Some(&trigger),
                         send_budget_authoritative,
+                        compress_state.floor_trend(),
                         color,
                     );
                 }
@@ -6689,6 +6701,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     "context_window_400",
                                     None,
                                     false,
+                                    compress_state.floor_trend(),
                                     color,
                                 );
                             }
@@ -8488,6 +8501,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         trigger.primary_cause.artifact_reason(),
                         Some(&trigger),
                         send_budget_authoritative,
+                        compress_state.floor_trend(),
                         color,
                     );
                 }
@@ -8677,6 +8691,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                     "context_window_400",
                                     None,
                                     false,
+                                    compress_state.floor_trend(),
                                     color,
                                 );
                             }
