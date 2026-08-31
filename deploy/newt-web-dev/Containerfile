@@ -6,13 +6,14 @@
 # drake-interactive-hostkeys Secret; entrypoint.sh stages them 0600 (fsGroup
 # makes Secret files group-readable, which sshd refuses).
 #
-# SUPPLY-CHAIN POSTURE (review, 2026-07-22): the base is digest-pinned, the
-# one downloaded artifact (just) is sha256-verified per-arch, and the deploy
-# script rolls by image DIGEST — what was attested is what runs.
+# SUPPLY-CHAIN POSTURE (review, 2026-08-15): the base is digest-pinned, all
+# downloaded artifacts (just and Herdr) are sha256-verified per-arch, and the
+# deploy script rolls by image DIGEST — what was attested is what runs.
 
 # Stage 1: build newt-web INSIDE the image lineage so glibc always matches.
 FROM rust:1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
 WORKDIR /src
+COPY --from=agent_mesh . /agent-mesh
 COPY . .
 RUN CARGO_TARGET_DIR=/build cargo build --release --manifest-path newt-web/Cargo.toml
 
@@ -45,6 +46,23 @@ RUN set -eux; \
     rm -f /tmp/just.tar.gz; \
     /usr/local/bin/just --version
 
+# Keep Herdr available as an operator-invoked multiplexer; SSH still opens the
+# normal login shell and never auto-attaches to a Herdr session.
+ARG HERDR_VERSION=0.8.0
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) herdr_arch="x86_64"; \
+             herdr_sha="b872ea7e40fa2cb17e857ac9b62b1bf26db7b403c622f5d2f3f5b35f6e9acd28" ;; \
+      arm64) herdr_arch="aarch64"; \
+             herdr_sha="f647ac66468d9efbc642fe534fb284468f0aea60641606fc008dfc0d82a3ca87" ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    curl --proto '=https' --tlsv1.2 -fsSLo /usr/local/bin/herdr \
+      "https://github.com/herdrdev/herdr/releases/download/v${HERDR_VERSION}/herdr-linux-${herdr_arch}"; \
+    echo "${herdr_sha}  /usr/local/bin/herdr" | sha256sum -c -; \
+    chmod 0755 /usr/local/bin/herdr; \
+    /usr/local/bin/herdr --version
+
 # No HostKey generation: keys arrive via the Secret + entrypoint staging.
 RUN rm -f /etc/ssh/ssh_host_*_key* \
     && printf '%s\n' \
@@ -59,3 +77,5 @@ COPY deploy/newt-web-dev/entrypoint.sh /entrypoint.sh
 
 EXPOSE 22 8880
 CMD ["/entrypoint.sh"]
+
+# Model: not exposed by harness | Harness: Codex | Operator: Shawn Hartsock | Time: 12:33 UTC | Date: 2026-08-15
