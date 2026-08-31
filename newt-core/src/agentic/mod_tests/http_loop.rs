@@ -1182,7 +1182,7 @@ async fn empty_final_summary_yields_cap_fallback() {
         .await
         .expect("chat_complete should succeed");
 
-    assert!(reply.contains("tool-call limit of 2"), "got: {reply}");
+    assert!(reply.contains("tool-round limit (2"), "got: {reply}");
     assert!(
         reply.contains("increase the tool-round limit"),
         "gives caller-neutral recovery advice"
@@ -2386,7 +2386,7 @@ async fn openai_cap_exit_fallback_when_final_summary_errors() {
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
         .await
         .expect("must succeed even when the summary errors");
-    assert!(reply.contains("tool-call limit of 2"), "got: {reply}");
+    assert!(reply.contains("tool-round limit (2"), "got: {reply}");
     assert!(reply.contains("increase the tool-round limit"));
 }
 
@@ -3389,7 +3389,7 @@ Next Steps Required
 
 To continue, I would need to remove the duplicate function using edit_file, locate and remove the stray brace, verify cargo check, then proceed with step 2 of the plan.
 
-However, I've reached the tool-call limit and cannot make these edits now.";
+However, I've reached the tool-round limit and cannot make these edits now.";
     let (reply, rounds) = run_openai_script_with_ledger(
         vec![
             serde_json::json!({ "content": findings }),
@@ -3432,7 +3432,7 @@ However, I've reached the tool-call limit and cannot make these edits now.";
     );
     assert_eq!(reply, "Done.");
     assert!(
-        !reply.contains("tool-call limit"),
+        !reply.contains("tool-round limit"),
         "must not accept the handoff summary: {reply}"
     );
     let snap = ledger.snapshot();

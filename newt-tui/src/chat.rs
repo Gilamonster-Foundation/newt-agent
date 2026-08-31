@@ -307,11 +307,11 @@ mod origin_upgrade_tests {
     #[test]
     fn capped_progress_is_persistable_without_duplicate_notices_and_resumes_its_objective() {
         let parent = ctx();
-        let core_handoff = "Progress captured.\n\nPaused at the tool-call limit of 40 rounds.";
+        let core_handoff = "Progress captured.\n\nPaused at the tool-round limit (40 rounds).";
         let persisted =
             decorate_round_cap_reply(core_handoff, Some(newt_core::TurnEndReason::RoundCap));
         assert_eq!(
-            persisted.matches("tool-call limit").count(),
+            persisted.matches("tool-round limit").count(),
             1,
             "the TUI adds only the interactive affordance: {persisted}"
         );

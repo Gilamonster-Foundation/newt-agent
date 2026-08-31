@@ -1,5 +1,40 @@
 use super::*;
 
+/// **The cap is a ROUND limit, and the trailer must say so** (#1965).
+///
+/// It read "the tool-call limit of 40 rounds" — which names one unit and
+/// measures in another. A round may issue several tool calls, so the evidenced
+/// session showed 65 tool calls under a 40-round cap, and an operator reading
+/// the trailer had every reason to think the cap was 40 calls and that they
+/// had been given 25 extra. The number was always the EFFECTIVE cap; the unit
+/// was the lie.
+///
+/// Pins every operator-facing cap-exit surface at once, because the phrase was
+/// duplicated across three of them and one site in `mod.rs` already spelled it
+/// "tool-round limit" — the codebase was inconsistent with itself.
+#[test]
+fn no_cap_exit_surface_calls_a_round_limit_a_tool_call_limit() {
+    let surfaces = [
+        cap_exit_nudge(40, None, &[]),
+        cap_exit_fallback(40, None, 0, None),
+        cap_exit_progress_handoff(40, None, "done", false, None),
+    ];
+    for text in &surfaces {
+        assert!(
+            !text.contains("tool-call limit"),
+            "a round limit announced as a call limit: {text}"
+        );
+        assert!(
+            text.contains("tool-round limit"),
+            "…and it must still name the limit it hit: {text}"
+        );
+        assert!(
+            text.contains("40 rounds"),
+            "…with the EFFECTIVE cap and its unit: {text}"
+        );
+    }
+}
+
 #[test]
 fn cap_exit_nudge_names_the_limit_and_folds_in_progress() {
     let nudge = cap_exit_nudge(5, None, &[]);
@@ -100,7 +135,7 @@ fn cap_exit_fallback_usage_advice_and_salvage() {
 
     let without = cap_exit_fallback(4, None, 0, None);
     assert!(!without.contains("tokens consumed"), "got: {without}");
-    assert!(without.contains("tool-call limit of 4"), "got: {without}");
+    assert!(without.contains("tool-round limit (4"), "got: {without}");
 
     // Step 27.5: a thrash run (≥ one failed call per round) gets HONEST
     // advice — a tooling problem, not "raise the cap".
@@ -123,7 +158,7 @@ fn cap_exit_fallback_usage_advice_and_salvage() {
 fn cap_exit_summary_detects_every_pending_action_handoff() {
     let handoff = "I have two issues: duplicate topic_has_rollups and a stray brace. Let me fix both — read around 490 to see what needs removing, then verify with a build check.";
     assert!(cap_exit_summary_is_action_handoff(handoff));
-    let plan_update = "Summary\n\nI reached the tool-call limit.\n\nNext Steps Required\n\nTo continue, I would need to remove the duplicate function using edit_file, verify cargo check, then finish the plan.";
+    let plan_update = "Summary\n\nI reached the tool-round limit.\n\nNext Steps Required\n\nTo continue, I would need to remove the duplicate function using edit_file, verify cargo check, then finish the plan.";
     assert!(
         cap_exit_summary_is_action_handoff(plan_update),
         "plan-shaped progress handoffs also contain pending actions"
@@ -139,7 +174,7 @@ fn cap_exit_summary_detects_every_pending_action_handoff() {
         true,
         Some("<plan>1. [ ] remove duplicate helper</plan><state>check=pending</state>"),
     );
-    assert!(paused.contains("tool-call limit of 25"), "{paused}");
+    assert!(paused.contains("tool-round limit (25"), "{paused}");
     assert!(
         paused.contains("Next Steps Required"),
         "the model-authored progress update survives: {paused}"

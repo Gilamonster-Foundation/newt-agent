@@ -580,7 +580,7 @@ async fn ollama_loop_honors_configured_cap_and_returns_real_final_answer() {
     // The cap-exit issued a final tools-disabled completion and returned
     // its text — NOT the dead placeholder.
     assert!(reply.starts_with("here is my partial summary"), "{reply}");
-    assert_ne!(reply, "(reached tool-call limit)");
+    assert_ne!(reply, "(reached tool-round limit)");
     assert!(!streamed);
     // The cap exit reports itself (acceptance forensics, commit 4).
     assert_eq!(end_reason, Some(crate::TurnEndReason::RoundCap));
@@ -696,7 +696,7 @@ async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
     .expect("final summary helper should return a fallback");
 
     assert!(!streamed);
-    assert!(reply.contains("tool-call limit of 25"), "{reply}");
+    assert!(reply.contains("tool-round limit (25"), "{reply}");
     assert!(
         reply.contains("Let me fix both"),
         "the model's progress prose should survive the pause: {reply}"
@@ -840,7 +840,7 @@ async fn ollama_cap_exit_refuses_giant_fresh_result_before_dispatch() {
     .expect("oversized cap exit returns deterministic fallback");
     assert!(!streamed);
     assert!(usage.is_none());
-    assert!(reply.contains("tool-call limit of 1"), "{reply}");
+    assert!(reply.contains("tool-round limit (1"), "{reply}");
     assert!(
         reply.contains("final summarization request also failed"),
         "{reply}"
@@ -898,7 +898,7 @@ async fn openai_cap_exit_refuses_giant_fresh_result_before_dispatch() {
     .expect("oversized cap exit returns deterministic fallback");
     assert!(!streamed);
     assert!(usage.is_none());
-    assert!(reply.contains("tool-call limit of 1"), "{reply}");
+    assert!(reply.contains("tool-round limit (1"), "{reply}");
     assert!(
         server
             .received_requests()
@@ -2325,7 +2325,7 @@ async fn responses_unusable_cap_summary_returns_a_round_cap_fallback() {
         .expect("an unusable final summary becomes an honest paused fallback");
     assert!(!streamed);
     assert_eq!(usage, None);
-    assert!(reply.contains("Paused at the tool-call limit"), "{reply}");
+    assert!(reply.contains("Paused at the tool-round limit"), "{reply}");
     assert!(
         reply.contains("final summarization request also failed"),
         "{reply}"
@@ -3597,7 +3597,7 @@ async fn openai_loop_honors_configured_cap_and_returns_real_final_answer() {
 
     assert_eq!(served.load(Ordering::SeqCst), cap);
     assert!(reply.starts_with("openai partial answer"), "{reply}");
-    assert_ne!(reply, "(reached tool-call limit)");
+    assert_ne!(reply, "(reached tool-round limit)");
     assert!(!streamed);
     assert_eq!(end_reason, Some(crate::TurnEndReason::RoundCap));
 }
@@ -3991,7 +3991,7 @@ async fn cap_exit_fallback_when_final_summary_errors() {
 
     // Fallback names the limit + recovery direction — strictly better than the bare
     // placeholder.
-    assert!(reply.contains("tool-call limit"));
+    assert!(reply.contains("tool-round limit"));
     assert!(reply.contains("increase the tool-round limit"));
 }
 
@@ -4162,7 +4162,7 @@ async fn accumulated_usage_survives_summary_failure() {
     .expect("chat_complete must succeed even when final summary errors");
 
     // The fallback reply must contain accumulated token counts.
-    assert!(reply.contains("tool-call limit"), "got: {reply}");
+    assert!(reply.contains("tool-round limit"), "got: {reply}");
     assert!(
         reply.contains("in / ") && reply.contains("out tokens"),
         "fallback must include accumulated token counts, got: {reply}"

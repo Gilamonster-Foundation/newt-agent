@@ -5064,7 +5064,7 @@ fn pending_plan_completion_nudge(
              with the full ordered plan: mark completed steps completed, make the immediate \
              blocker repair the active step, and keep later feature work pending. Then call the \
              next concrete tool for that active repair. Do not repeat the findings summary or \
-             claim a tool-call limit while this nudge is giving you another round.{workflow_clause}"
+             claim a tool-round limit while this nudge is giving you another round.{workflow_clause}"
         ))
     } else {
         Some(format!(
@@ -5230,7 +5230,7 @@ fn cap_exit_nudge(max_tool_rounds: usize, progress: Option<&str>, observed: &[St
     // its priors at exactly this point. Constrain the summary to what is
     // still verbatim in context; absence must be stated, not papered over.
     let mut nudge = format!(
-        "You have reached the tool-call limit ({max_tool_rounds} rounds). \
+        "You have reached the tool-round limit ({max_tool_rounds} rounds). \
          Do NOT call any more tools. Give the operator a concise progress update \
          that separates completed and verified work, the current state or blocker, \
          and remaining work. The tool loop has stopped at the cap. Report whether \
@@ -5324,7 +5324,7 @@ fn cap_exit_fallback(
     let advice = cap_exit_advice(max_tool_rounds, wasted_calls);
     let salvaged = cap_exit_progress_block("Progress captured before the summary failed", progress);
     format!(
-        "Paused at the tool-call limit of {max_tool_rounds} rounds{tokens_hint}. \
+        "Paused at the tool-round limit ({max_tool_rounds} rounds){tokens_hint}. \
          The final summarization request also failed while preparing a progress \
          update; {advice}.{salvaged}"
     )
@@ -5349,7 +5349,7 @@ fn cap_exit_progress_handoff(
     };
     let captured = cap_exit_progress_block("Captured working state", progress);
     format!(
-        "{content}\n\nThe tool loop reached the tool-call limit of {max_tool_rounds} rounds{tokens_hint}. \
+        "{content}\n\nThe tool loop reached the tool-round limit ({max_tool_rounds} rounds){tokens_hint}. \
          This progress handoff preserves the model's update.{pending}{captured}"
     )
 }
@@ -10740,7 +10740,7 @@ mod cap_exit_unit_tests;
 // they are absent — letting us assert that:
 //   (1) the loop honours the configured `max_tool_rounds` cap, and
 //   (2) on hitting the cap newt issues ONE final tools-disabled completion and
-//       returns its text (NOT the `(reached tool-call limit)` placeholder).
+//       returns its text (NOT the `(reached tool-round limit)` placeholder).
 //
 // Hard context-window recovery is covered both by the headless driver tests
 // and by a TUI-side integration test that grounds capability-cache persistence.
