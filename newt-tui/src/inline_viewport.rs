@@ -103,11 +103,24 @@ fn anchor(size: Size) -> Position {
 /// four copies it replaces.
 pub(crate) struct AnchoredBackend<W: Write> {
     inner: CrosstermBackend<W>,
+    /// The rows this backend is allowed to paint (#1979).
+    ///
+    /// Held here so the terminal OWNS its lease: the rows are returned when
+    /// the surface is dropped, in the right order, with no caller to forget.
+    /// `None` is the query-only path — [`cursor_position_or_anchor`] asks
+    /// where the cursor is and paints nothing, so it holds no rows.
+    lease: Option<newt_core::tty::RegionLease>,
 }
 
 impl<W: Write> AnchoredBackend<W> {
+    /// Query-only: answers "where is the cursor?" and never paints a viewport.
     pub(crate) fn new(writer: W) -> Self {
+        Self::with_lease(writer, None)
+    }
+
+    fn with_lease(writer: W, lease: Option<newt_core::tty::RegionLease>) -> Self {
         Self {
+            lease,
             inner: CrosstermBackend::new(writer),
         }
     }
@@ -124,6 +137,20 @@ impl<W: Write> Backend for AnchoredBackend<W> {
                 // `size()` is an ioctl, not a query — it does not depend on
                 // the terminal answering anything, so it is still trustworthy
                 // in exactly the situation that got us here.
+                // #1979/#1977: if this surface holds rows, THOSE rows are the
+                // anchor. The bare bottom-of-screen answer is what put two
+                // viewports on the same rows — the panel and the prompt each
+                // asked "where do I go?" and got the same reply.
+                //
+                // When nothing collided the lease IS the bottom rows, so this
+                // returns exactly what `anchor` did and today's panels keep
+                // their position. It differs only when the mint shifted the
+                // request, which is the case that was broken.
+                if let Some(newt_core::tty::Region::Rows { top, .. }) =
+                    self.lease.as_ref().map(newt_core::tty::RegionLease::region)
+                {
+                    return Ok(Position { x: 0, y: top });
+                }
                 Ok(anchor(self.inner.size().unwrap_or(Size {
                     width: 0,
                     height: 0,
@@ -192,16 +219,53 @@ impl<W: Write> Write for AnchoredBackend<W> {
     }
 }
 
-/// **The ONE inline-viewport constructor.** Every surface in this crate that
-/// wants `Viewport::Inline` comes through here, so the rescue above cannot be
-/// forgotten by the next one.
-pub(crate) fn inline_terminal(height: u16) -> io::Result<InlineTerm> {
+/// **The ONE inline-viewport constructor, and it takes a lease** (#1979).
+///
+/// Every surface in this crate that wants `Viewport::Inline` comes through
+/// here — F0b (#1923) collapsed four copies into this one — so requiring the
+/// capability HERE requires it of all of them in a single edit. There is no
+/// bare form to call: the height is read off the lease, because a height that
+/// disagreed with the leased rows would be a viewport painting outside what it
+/// owns, which is the whole defect (#1977).
+///
+/// The terminal owns the lease, so the rows are returned on drop with no
+/// caller left to forget.
+pub(crate) fn inline_terminal(lease: newt_core::tty::RegionLease) -> io::Result<InlineTerm> {
+    let height = match lease.region() {
+        newt_core::tty::Region::Rows { height, .. } => height,
+        // A whole-screen holder is the alternate screen, not an inline strip.
+        newt_core::tty::Region::WholeScreen => {
+            return Err(io::Error::other(
+                "an inline viewport cannot be built from a whole-screen lease",
+            ))
+        }
+    };
     Terminal::with_options(
-        AnchoredBackend::new(io::stdout()),
+        AnchoredBackend::with_lease(io::stdout(), Some(lease)),
         TerminalOptions {
             viewport: Viewport::Inline(height),
         },
     )
+}
+
+/// Lease the bottom `height` rows, which is where every inline surface here
+/// sits, and say what should happen if somebody already holds them.
+///
+/// The screen measurement stays with the caller-facing helper rather than in
+/// the arbiter: #1979's non-goal is a layout engine, and the arbiter's
+/// vocabulary is a row range plus a policy.
+pub(crate) fn lease_bottom_rows(
+    height: u16,
+    policy: newt_core::tty::OnCollision,
+) -> io::Result<newt_core::tty::RegionLease> {
+    let screen =
+        ratatui::backend::Backend::size(&CrosstermBackend::new(io::stdout())).unwrap_or(Size {
+            width: 80,
+            height: 24,
+        });
+    let top = screen.height.saturating_sub(height);
+    newt_core::tty::Terminal::lease_region(newt_core::tty::Region::Rows { top, height }, policy)
+        .ok_or_else(|| io::Error::other("another surface already owns these rows"))
 }
 
 /// The cursor position for a caller that is not building a ratatui terminal —

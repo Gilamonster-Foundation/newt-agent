@@ -103,6 +103,11 @@ struct Inner {
     line_held: bool,
     /// Registered ephemerals, weakly held so a leaked handle cannot pin them.
     registered: Vec<(u64, Weak<dyn Ephemeral>)>,
+    /// Rows held by multi-row writers. `line_held` guards the ONE ephemeral
+    /// bottom row; this guards regions, which nothing arbitrated before
+    /// #1979 — `register_ephemeral` deliberately takes no lease, so two
+    /// viewports could hold the same rows and overpaint each other (#1977).
+    regions: Vec<(u64, Region)>,
     /// A `PromptWindow` is alive: every writer paints nothing.
     suspended: bool,
     next_id: u64,
@@ -185,6 +190,146 @@ impl Drop for EphemeralRegistration {
 // ---------------------------------------------------------------------------
 // The line lease
 // ---------------------------------------------------------------------------
+
+/// The nearest free rows AT OR ABOVE a request.
+///
+/// Bounded, and it walks UP because every surface here is bottom-anchored: the
+/// free space is above the holder, and the screen's top is the natural stop.
+/// `None` means there is nowhere to go — the caller degrades rather than
+/// drawing through somebody.
+fn shift_clear_of(held: &[(u64, Region)], want: Region) -> Option<Region> {
+    let Region::Rows { mut top, height } = want else {
+        // Whole-screen cannot be shifted anywhere: it is every row by
+        // definition, so it either fits alone or it does not fit.
+        return held.is_empty().then_some(want);
+    };
+    // One step per holder is sufficient — each step clears at least one — and
+    // the bound makes a malformed table terminate rather than spin.
+    for _ in 0..=held.len() {
+        let candidate = Region::Rows { top, height };
+        match held.iter().find(|(_, h)| h.intersects(candidate)) {
+            None => return Some(candidate),
+            Some((_, Region::WholeScreen)) => return None,
+            Some((
+                _,
+                Region::Rows {
+                    top: holder_top, ..
+                },
+            )) => {
+                top = holder_top.checked_sub(height)?;
+            }
+        }
+    }
+    None
+}
+
+/// Which rows a writer owns.
+///
+/// Absolute, resolved by the caller against the screen it already measured —
+/// every surface that wants one computes its anchor anyway
+/// (`inline_viewport::anchor`, `presenter`'s `self.top`). Keeping the arbiter
+/// out of layout is deliberate: #1979's non-goal is a layout engine, and a
+/// row range plus a policy is the whole vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Region {
+    /// `height` rows starting at `top`, zero-based from the top of the screen.
+    Rows { top: u16, height: u16 },
+    /// Every row. The alternate screen is this: entering it IS taking them
+    /// all, and the arbiter should know.
+    WholeScreen,
+}
+
+impl Region {
+    /// Do these two regions share a row?
+    #[must_use]
+    pub fn intersects(self, other: Self) -> bool {
+        match (self, other) {
+            // The alternate screen takes everything, including from itself.
+            (Self::WholeScreen, _) | (_, Self::WholeScreen) => true,
+            (Self::Rows { top: a, height: ah }, Self::Rows { top: b, height: bh }) => {
+                // A zero-height region owns nothing and collides with nothing.
+                ah != 0 && bh != 0 && a < b.saturating_add(bh) && b < a.saturating_add(ah)
+            }
+        }
+    }
+}
+
+/// What the mint does when the requested rows are already held.
+///
+/// The caller's DECLARED intent, not a fallback accident. Each of these is a
+/// behaviour already in the tree, now with a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnCollision {
+    /// Take the rows; the holder is expected to be suspended or erased first.
+    /// This is what [`Terminal::suspend_for_prompt`] already does to every
+    /// registered ephemeral before a question renders.
+    SuspendHolder,
+    /// Move the request to the nearest free rows ABOVE the holder. #1977's
+    /// panel does this: the prompt keeps its rows and the panel opens over
+    /// them rather than through them.
+    Shift,
+    /// Refuse, and let the caller degrade — #1952's degrade-don't-die rule.
+    Refuse,
+}
+
+/// Exclusive ownership of a range of terminal rows.
+///
+/// The N-row sibling of [`LineLease`], NOT its generalisation, and the
+/// distinction is the one [`Terminal::register_ephemeral`] already records: a
+/// `LineLease` carries the ONE bottom row's erase (`\r` + `ESC[K`), which is
+/// the wrong erase for a writer that owns rows above the cursor. Two
+/// vocabularies over one authority — this table and `line_held` live in the
+/// same [`Inner`], so a single lock orders every ownership decision.
+///
+/// Drop returns the rows. It does NOT erase them: what a region contains is
+/// the holder's business (ratatui restores its own viewport, the pager leaves
+/// the alternate screen), and an arbiter that also erased would be painting
+/// through a surface that already cleaned up.
+pub struct RegionLease {
+    id: u64,
+    region: Region,
+}
+
+impl RegionLease {
+    /// The rows this lease holds — which may not be the rows requested, when
+    /// the policy was [`OnCollision::Shift`].
+    #[must_use]
+    pub fn region(&self) -> Region {
+        self.region
+    }
+
+    /// Move or resize the held rows, keeping ownership CONTINUOUS.
+    ///
+    /// The cockpit presenter's block moves (`self.top = plan.new_top`) and is
+    /// clamped on resize, so a lease it had to drop and re-take would churn
+    /// and, worse, would own nothing in the window between. Re-checked under
+    /// the same lock against every OTHER holder; `false` means the move was
+    /// refused and the lease still holds what it held.
+    pub fn relocate(&mut self, to: Region) -> bool {
+        let mut state = lock();
+        if state
+            .regions
+            .iter()
+            .any(|(id, held)| *id != self.id && held.intersects(to))
+        {
+            return false;
+        }
+        if let Some(entry) = state.regions.iter_mut().find(|(id, _)| *id == self.id) {
+            entry.1 = to;
+        }
+        self.region = to;
+        true
+    }
+}
+
+impl Drop for RegionLease {
+    fn drop(&mut self) {
+        let (m, cv) = arbiter();
+        let mut state = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.regions.retain(|(id, _)| *id != self.id);
+        cv.notify_all();
+    }
+}
 
 /// Exclusive ownership of the terminal's ephemeral bottom line.
 ///
@@ -393,6 +538,44 @@ impl Terminal {
             let _ = f(w);
             let _ = w.flush();
         });
+    }
+
+    /// Take exclusive ownership of a range of rows.
+    ///
+    /// The one place "who owns these rows" is decided for multi-row writers.
+    /// Before #1979 nothing decided it: `register_ephemeral` takes no lease by
+    /// design, so two inline viewports both anchored at the bottom held the
+    /// same rows and overpainted each other (#1977).
+    ///
+    /// `policy` is the caller's DECLARED intent. A caller that has already
+    /// quiesced the holder asks for [`OnCollision::SuspendHolder`]; one that
+    /// can open elsewhere asks for [`OnCollision::Shift`]; one that would
+    /// rather not open asks for [`OnCollision::Refuse`] and degrades.
+    ///
+    /// **`SuspendHolder` does not suspend anything itself.** It records that
+    /// the rows are taken and trusts the caller to have quiesced the holder —
+    /// which is what [`Terminal::suspend_for_prompt`] already does by erasing
+    /// every registered ephemeral. Making the mint do the erasing would give
+    /// the arbiter a second way to paint, and one owner of that is the point.
+    pub fn lease_region(region: Region, policy: OnCollision) -> Option<RegionLease> {
+        let mut state = lock();
+        let granted = match policy {
+            OnCollision::SuspendHolder => region,
+            OnCollision::Refuse => {
+                if state.regions.iter().any(|(_, h)| h.intersects(region)) {
+                    return None;
+                }
+                region
+            }
+            OnCollision::Shift => shift_clear_of(&state.regions, region)?,
+        };
+        state.next_id += 1;
+        let id = state.next_id;
+        state.regions.push((id, granted));
+        Some(RegionLease {
+            id,
+            region: granted,
+        })
     }
 
     /// Register an ephemeral so [`Terminal::suspend_for_prompt`] can erase it.
@@ -1071,5 +1254,121 @@ mod tests {
             "Blocked is emitted exactly once, with stdin already owned \
              (post-acquire, not intent); Unblocked on drop, after stdin is released"
         );
+    }
+
+    // ---- #1979: region ownership --------------------------------------
+
+    fn rows(top: u16, height: u16) -> Region {
+        Region::Rows { top, height }
+    }
+
+    #[test]
+    fn regions_intersect_only_when_they_share_a_row() {
+        assert!(rows(10, 3).intersects(rows(12, 2)), "overlapping");
+        assert!(rows(12, 2).intersects(rows(10, 3)), "and symmetrically");
+        assert!(
+            !rows(10, 3).intersects(rows(13, 2)),
+            "adjacent is not overlapping"
+        );
+        assert!(!rows(13, 2).intersects(rows(10, 3)), "and symmetrically");
+        // The alternate screen is every row, including against itself.
+        assert!(Region::WholeScreen.intersects(rows(0, 1)));
+        assert!(rows(40, 1).intersects(Region::WholeScreen));
+        assert!(Region::WholeScreen.intersects(Region::WholeScreen));
+        // A zero-height region owns nothing.
+        assert!(!rows(10, 0).intersects(rows(10, 3)));
+    }
+
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn the_mint_refuses_rows_another_writer_holds() {
+        let held = Terminal::lease_region(rows(18, 6), OnCollision::Refuse).expect("first take");
+        assert_eq!(held.region(), rows(18, 6));
+        assert!(
+            Terminal::lease_region(rows(20, 4), OnCollision::Refuse).is_none(),
+            "two writers were granted the same rows — this is #1977"
+        );
+        // TWIN: the refusal is about the OVERLAP, not about refusing always.
+        let elsewhere = Terminal::lease_region(rows(2, 4), OnCollision::Refuse)
+            .expect("clear rows are granted");
+        assert_eq!(elsewhere.region(), rows(2, 4));
+        // And dropping returns them.
+        drop(held);
+        drop(elsewhere);
+        let reclaimed =
+            Terminal::lease_region(rows(18, 6), OnCollision::Refuse).expect("released rows return");
+        assert_eq!(reclaimed.region(), rows(18, 6));
+    }
+
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn shift_opens_above_the_holder_rather_than_through_it() {
+        let prompt = Terminal::lease_region(rows(18, 6), OnCollision::Refuse).expect("prompt");
+        let panel = Terminal::lease_region(rows(18, 6), OnCollision::Shift).expect("panel shifts");
+        assert_eq!(
+            panel.region(),
+            rows(12, 6),
+            "#1977: the panel must open ABOVE the prompt's rows, not over them"
+        );
+        assert!(
+            !panel.region().intersects(prompt.region()),
+            "the shifted region still overlaps"
+        );
+    }
+
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn shift_refuses_when_there_is_no_room_above() {
+        let _floor = Terminal::lease_region(rows(0, 4), OnCollision::Refuse).expect("floor");
+        assert!(
+            Terminal::lease_region(rows(2, 6), OnCollision::Shift).is_none(),
+            "shifting off the top of the screen must refuse, not wrap"
+        );
+    }
+
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn the_whole_screen_collides_with_everything_and_shifts_nowhere() {
+        let _rowsy = Terminal::lease_region(rows(10, 2), OnCollision::Refuse).expect("some rows");
+        assert!(
+            Terminal::lease_region(Region::WholeScreen, OnCollision::Refuse).is_none(),
+            "the alternate screen takes every row and cannot share"
+        );
+        assert!(
+            Terminal::lease_region(Region::WholeScreen, OnCollision::Shift).is_none(),
+            "whole-screen has nowhere to shift to"
+        );
+    }
+
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn suspend_holder_takes_the_rows_the_caller_already_quiesced() {
+        let _held = Terminal::lease_region(rows(18, 6), OnCollision::Refuse).expect("holder");
+        let taken = Terminal::lease_region(rows(18, 6), OnCollision::SuspendHolder)
+            .expect("a caller that quiesced the holder takes the rows");
+        assert_eq!(taken.region(), rows(18, 6));
+    }
+
+    /// The cockpit presenter's block moves and is clamped on resize, so the
+    /// lease has to move WITHOUT a release-and-retake window.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_lease_relocates_in_place_and_still_respects_other_holders() {
+        let _other = Terminal::lease_region(rows(0, 4), OnCollision::Refuse).expect("other");
+        let mut moving = Terminal::lease_region(rows(18, 6), OnCollision::Refuse).expect("moving");
+        assert!(moving.relocate(rows(10, 6)), "a clear move must succeed");
+        assert_eq!(moving.region(), rows(10, 6));
+        // TWIN: relocation is checked, not merely recorded.
+        assert!(
+            !moving.relocate(rows(2, 4)),
+            "relocating onto another holder was allowed"
+        );
+        assert_eq!(
+            moving.region(),
+            rows(10, 6),
+            "a refused move must leave the lease holding what it held"
+        );
+        // Moving onto its OWN rows is not a self-collision.
+        assert!(moving.relocate(rows(10, 8)), "a lease may resize in place");
     }
 }

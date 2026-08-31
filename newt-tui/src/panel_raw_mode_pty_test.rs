@@ -185,7 +185,12 @@ fn panel_raw_mode_child() {
             // rows — which is #1977's geometry. A shorter prompt overlaps only
             // part of the panel and the assertion below could pass on a row
             // that was never contested.
-            let mut prompt = crate::inline_viewport::inline_terminal(PANEL_TEST_HEIGHT)
+            let prompt_lease = crate::inline_viewport::lease_bottom_rows(
+                PANEL_TEST_HEIGHT,
+                newt_core::tty::OnCollision::Refuse,
+            )
+            .expect("the prompt takes the bottom rows first");
+            let mut prompt = crate::inline_viewport::inline_terminal(prompt_lease)
                 .expect("prompt viewport opens");
             // The content must CHANGE on each paint. ratatui diffs cells and
             // emits only what differs, so a prompt repainting identical text

@@ -171,7 +171,11 @@ mod terminal {
         let _guard = InlineGuard::enter()?;
         // #1950: through the ONE inline constructor. A permission frame that
         // will not open is a decision the operator never gets to make.
-        let mut terminal = crate::inline_viewport::inline_terminal(height)?;
+        // #1979: Shift, for `config_panel`'s reason — a permission frame opens
+        // DURING a turn, over whatever is already pinned to the bottom.
+        let lease =
+            crate::inline_viewport::lease_bottom_rows(height, newt_core::tty::OnCollision::Shift)?;
+        let mut terminal = crate::inline_viewport::inline_terminal(lease)?;
         loop {
             terminal.draw(|f| draw(f, &view))?;
             if !event::poll(Duration::from_millis(250))? {
