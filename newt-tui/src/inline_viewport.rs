@@ -353,14 +353,14 @@ mod region_lease_door {
         out
     }
 
-    /// Region claims that do NOT yet go through a lease.
+    /// Region claims that still hold NO lease.
     ///
-    /// A ratchet, not a permission list: the count may only go DOWN. The
-    /// cockpit presenter builds two `Viewport::Fixed` regions from its own row
-    /// arithmetic (`self.top`, clamped on resize), which is a claim on rows by
-    /// any reading — it is simply not this slice's. #1979's sweep takes it,
-    /// and `RegionLease::relocate` exists because that block MOVES.
-    const UNLEASED_REGION_CLAIMS: &[(&str, usize)] = &[("presenter.rs", 2)];
+    /// A ratchet, not a permission list: the count may only go DOWN, and
+    /// #1980 brought it to **zero**. The cockpit presenter was the last
+    /// entry — two `Viewport::Fixed` regions built from its own `self.top`
+    /// arithmetic — and it now holds a session-scoped lease that it
+    /// `relocate`s on every move.
+    const UNLEASED_REGION_CLAIMS: &[(&str, usize)] = &[];
 
     /// **The door is one door, and it takes a lease.**
     ///
@@ -396,30 +396,137 @@ mod region_lease_door {
         }
     }
 
-    /// The wider category, ratcheted: every OTHER way a surface claims rows.
+    /// The wider category: every OTHER way a surface claims rows must hold a
+    /// lease for them.
     ///
-    /// Separate from the door above because the door's baseline is zero from
-    /// birth, while this one starts at two and is meant to reach zero in the
-    /// sweep. Counting them keeps the mess visible and monotonically
-    /// decreasing rather than rewritten.
+    /// Separate from the door above because the door's baseline was zero from
+    /// birth, while this one started at two (#1979) and reaches zero here. It
+    /// asks for a HOLDER rather than counting call sites, because the claim is
+    /// not the defect — claiming rows nobody arbitrates is.
     #[test]
-    fn unleased_region_claims_only_decrease() {
+    fn every_region_claim_holds_a_lease() {
+        const HOLDS: &str = "RegionLease";
         for (name, body) in &sources() {
             if name == "inline_viewport.rs" {
                 continue; // the door itself, and this test's own needles
             }
-            let found = body.matches(OPTIONS).count();
+            if !body.contains(OPTIONS) {
+                continue;
+            }
             let allowed = UNLEASED_REGION_CLAIMS
                 .iter()
                 .find(|(f, _)| *f == name)
                 .map_or(0, |(_, n)| *n);
             assert!(
-                found <= allowed,
-                "{name} makes {found} region claims, {allowed} declared. A new \
-                 one must mint a `RegionLease`; a removed one must lower the \
-                 baseline."
+                body.contains(HOLDS) || allowed > 0,
+                "{name} builds a viewport but holds no `RegionLease`. Rows a \
+                 surface claims without telling the arbiter are rows another \
+                 surface can be handed (#1977)."
             );
         }
+    }
+
+    /// **Every whole-screen writer holds the screen (#1980).**
+    ///
+    /// The collision proof next door shows the ARBITER refuses under a
+    /// whole-screen lease. It does not show that the pager and the splash
+    /// actually take one — it mints the lease itself. This does: entering the
+    /// alternate screen IS claiming every row, so a file that enters it must
+    /// hold a `RegionLease`.
+    ///
+    /// Needle on the call form, as ever (#1924): prose about the alternate
+    /// screen is everywhere in this crate.
+    #[test]
+    fn every_alternate_screen_entry_holds_a_region_lease() {
+        const ENTER: &str = "EnterAlternateScreen)";
+        const HOLDS: &str = "_region: newt_core::tty::RegionLease";
+        let files = sources();
+        assert!(
+            files.len() > 10,
+            "the scan found {} files, so it is not reading the crate",
+            files.len()
+        );
+        let mut entrants = 0;
+        for (name, body) in &files {
+            if !body.contains(ENTER) {
+                continue;
+            }
+            entrants += 1;
+            assert!(
+                body.contains(HOLDS),
+                "{name} enters the alternate screen but holds no `RegionLease`. \
+                 Taking every row without telling the arbiter is what let an \
+                 inline surface open underneath the pager (#1980)."
+            );
+        }
+        // POSITIVE READ ASSERTION: without this, a scan that matched nothing —
+        // a renamed import, a moved file — would report every entrant leased.
+        assert_eq!(
+            entrants, 2,
+            "expected the pager and the splash to be the two alternate-screen \
+             entrants; found {entrants}. A new one must hold the screen, and a \
+             removed one must lower this number."
+        );
+    }
+
+    /// Writers that own rows but cannot yet NAME them.
+    ///
+    /// Both paint cursor-relative — `MoveUp` then
+    /// `Clear(ClearType::FromCursorDown)` — so they claim "from here down"
+    /// rather than an absolute range. A `Region` needs absolute rows, and
+    /// neither writer knows its own top: learning it means a DSR cursor query,
+    /// which #1950/#1952 established is exactly the thing that cannot be
+    /// relied on. Migrating them is a redesign, not a field.
+    ///
+    /// Enumerated so they stay countable and this list may only shrink.
+    const CURSOR_RELATIVE_CLAIMS: &[(&str, &str)] = &[
+        (
+            "live_spill.rs",
+            "N rows below the cursor; already registers as an ephemeral, so a \
+             prompt erases it — it lacks exclusion, not visibility",
+        ),
+        (
+            "lean_input.rs",
+            "rows_above_cursor, on the plain-scroller path that #1803's \
+             migration notice moves to wyvern-agent",
+        ),
+    ];
+
+    /// The cursor-relative holdouts are exactly the two declared ones.
+    ///
+    /// Not a permission list: a THIRD writer that paints from the cursor down
+    /// is a new unarbitrated region, and it fails here until someone either
+    /// leases it or argues it onto this list.
+    #[test]
+    fn cursor_relative_region_painters_are_the_declared_two() {
+        const NEEDLE: &str = "Clear(ClearType::FromCursorDown)";
+        let files = sources();
+        assert!(
+            files.len() > 10,
+            "the scan found {} files, so it is not reading the crate",
+            files.len()
+        );
+        let mut found: Vec<&str> = Vec::new();
+        for (name, body) in &files {
+            if !body.contains(NEEDLE) {
+                continue;
+            }
+            // A file that leases its rows is painting INSIDE what it owns —
+            // `InlineGuard::drop` erasing its own viewport, for instance.
+            if body.contains("RegionLease") || body.contains("lease_bottom_rows") {
+                continue;
+            }
+            found.push(name.as_str());
+        }
+        found.sort_unstable();
+        let mut declared: Vec<&str> = CURSOR_RELATIVE_CLAIMS.iter().map(|(f, _)| *f).collect();
+        declared.sort_unstable();
+        assert_eq!(
+            found, declared,
+            "the cursor-relative holdouts changed. A new one must lease its \
+             rows or be declared here with a reason; a migrated one must be \
+             removed from the list."
+        );
     }
 
     /// Probe one: the needle WOULD fire on a new site. Without this the test
@@ -446,5 +553,39 @@ mod region_lease_door {
             !prose.contains(DOOR),
             "the needle matches prose, so the guard would flag documentation"
         );
+    }
+}
+
+#[cfg(test)]
+mod screen_lease_collision {
+    use newt_core::tty::{OnCollision, Region, Terminal};
+
+    /// **#1980's observable consequence.** The pager and the splash now hold
+    /// the whole screen, so an inline surface that asks for the bottom rows
+    /// while one is up is refused and degrades (#1952) instead of painting
+    /// through it. Before the sweep the arbiter did not know the screen was
+    /// taken and handed the rows out.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn an_inline_surface_is_refused_while_the_whole_screen_is_held() {
+        let screen = Terminal::lease_region(Region::WholeScreen, OnCollision::SuspendHolder)
+            .expect("the alternate screen is always grantable");
+        assert!(
+            super::lease_bottom_rows(6, OnCollision::Refuse).is_err(),
+            "an inline surface was granted rows the pager owns"
+        );
+        // Shifting cannot rescue it either: there is nowhere above a holder
+        // that occupies every row.
+        assert!(
+            super::lease_bottom_rows(6, OnCollision::Shift).is_err(),
+            "a shift found free rows under a whole-screen holder"
+        );
+
+        // TWIN: the refusal is about the SCREEN being held, not about
+        // refusing always. Release it and the same call succeeds.
+        drop(screen);
+        let rows = super::lease_bottom_rows(6, OnCollision::Refuse)
+            .expect("with the screen free, the inline surface opens");
+        assert!(matches!(rows.region(), Region::Rows { height: 6, .. }));
     }
 }

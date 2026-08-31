@@ -85,6 +85,19 @@ struct Screen {
     status: Row,
     /// Submits made while a turn ran, not yet consumed by a `ReadLine`.
     queued: usize,
+    /// **The rows this block owns (#1980).** Replaces nothing — `top` and
+    /// `block_h` stay, because the presenter needs them for its own arithmetic
+    /// — but they are no longer PRIVATE bookkeeping: every move is reported to
+    /// the arbiter, so another surface can no longer be handed these rows.
+    region: newt_core::tty::RegionLease,
+}
+
+/// The block's rows, as the arbiter names them.
+fn block_region(top: u16, block_h: u16) -> newt_core::tty::Region {
+    newt_core::tty::Region::Rows {
+        top,
+        height: block_h,
+    }
 }
 
 impl Screen {
@@ -124,6 +137,12 @@ impl Screen {
         self.tty.flush()?;
         let moved = plan.new_top != self.top;
         self.top = plan.new_top;
+        // FORCED: the scroll has already happened on the terminal. See
+        // `RegionLease::relocate` — refusing here would not un-scroll it.
+        self.region.relocate(
+            block_region(self.top, self.block_h),
+            newt_core::tty::OnCollision::SuspendHolder,
+        );
         if moved {
             self.rebuild_term()?;
         } else {
@@ -150,6 +169,12 @@ impl Screen {
         self.tty.write_all(&buf)?;
         self.tty.flush()?;
         self.block_h = new_h;
+        // FORCED: a relayout is a redraw of a block that has already changed
+        // height.
+        self.region.relocate(
+            block_region(self.top, self.block_h),
+            newt_core::tty::OnCollision::SuspendHolder,
+        );
         self.status_rows = status_rows;
         self.rebuild_term()
     }
@@ -171,6 +196,12 @@ impl Screen {
         self.block_h = new_h;
         self.status_rows = status_rows;
         self.top = self.rows - new_h;
+        // FORCED: the TERMINAL resized; the block's new position is a
+        // consequence, not a request.
+        self.region.relocate(
+            block_region(self.top, self.block_h),
+            newt_core::tty::OnCollision::SuspendHolder,
+        );
         // Erase from the topmost of the OLD and new block tops, not just the new
         // one (#4). Both blocks are bottom-anchored — each occupies
         // `[top, rows)` — so clearing from `min(old_top, new_top)` down wipes the
@@ -522,6 +553,16 @@ impl Presenter {
                 viewport: Viewport::Fixed(Rect::new(0, top, cols, block_h)),
             },
         )?;
+        // The INITIAL take is a request and may honestly fail: the cockpit is
+        // the session's base surface, so anything already holding these rows
+        // means something is wrong, and starting anyway would reproduce the
+        // overpainting this sweep exists to end. Subsequent moves are reports,
+        // not requests — see the `relocate` calls above.
+        let region = newt_core::tty::Terminal::lease_region(
+            block_region(top, block_h),
+            newt_core::tty::OnCollision::Refuse,
+        )
+        .ok_or_else(|| io::Error::other("another surface already owns the cockpit's rows"))?;
         let mut screen = Screen {
             tty,
             term,
@@ -532,6 +573,7 @@ impl Presenter {
             status_rows: 0,
             status: Vec::new(),
             queued: 0,
+            region,
         };
         screen.term.clear()?;
         let ephemeral: Arc<dyn newt_core::tty::Ephemeral> = Arc::new(NoOpEphemeral);
