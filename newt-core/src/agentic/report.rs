@@ -278,9 +278,21 @@ fn compose_document(args: &serde_json::Value) -> Result<(String, String), String
 pub(crate) fn execute_render_report(
     args: &serde_json::Value,
     color: bool,
+    evidence: Option<&super::capability_check::Evidence>,
 ) -> (String, Option<String>) {
     match compose_document(args) {
         Ok((markdown, ack)) => {
+            // #1947: capability claims are checked against the turn's tool
+            // ledger the way `claim_check` checks path claims against the
+            // workspace — append a visible refutation, never rewrite. Applied
+            // to the MARKDOWN so the annotation renders in the operator's
+            // document; `ack` (what the model sees) is left alone, because
+            // this slice annotates the report rather than steering the model
+            // mid-turn. `None` evidence ⇒ no recorder ⇒ nothing to check.
+            let markdown = match evidence {
+                Some(evidence) => super::capability_check::annotate_unsupported(markdown, evidence),
+                None => markdown,
+            };
             let rendered = render_markdown(
                 &markdown,
                 RenderOpts {
@@ -301,6 +313,84 @@ mod tests {
 
     fn compose(v: serde_json::Value) -> Result<(String, String), String> {
         compose_document(&v)
+    }
+
+    /// #1947 WIRING. The pure check is proven in `capability_check`; this
+    /// proves `render_report` actually calls it. A check that is correct and
+    /// unreachable is the exact state C2b found `RawGuard` in.
+    mod capability_wiring {
+        use super::*;
+        use crate::agentic::capability_check::Evidence;
+
+        const CLAIM: &str = "| converse | ✅ |\n\nVerified working end-to-end.";
+
+        fn render(evidence: Option<&Evidence>) -> String {
+            let (_ack, doc) = execute_render_report(
+                &json!({"title": "Voice stack", "body": CLAIM}),
+                false,
+                evidence,
+            );
+            doc.expect("a composed report always renders a document")
+        }
+
+        fn events(names: &[(&str, bool)]) -> Vec<crate::ToolEvent> {
+            names
+                .iter()
+                .map(|(t, ok)| crate::ToolEvent::from_call(*t, &json!({}), *ok, None))
+                .collect()
+        }
+
+        /// The refutation reaches the document the OPERATOR sees.
+        #[test]
+        fn an_unsupported_claim_is_annotated_in_the_rendered_document() {
+            let evidence = Evidence::from_events(&events(&[("list_audio_devices", true)]));
+            let doc = render(Some(&evidence));
+            assert!(doc.contains("capability check (#1947)"), "{doc}");
+            assert!(
+                doc.contains("converse"),
+                "the refuted subject is named: {doc}"
+            );
+        }
+
+        /// **Anti-vacuous twin.** The same call with corroborating evidence
+        /// renders no annotation — so the assertion above is about the
+        /// evidence, not about the wiring firing unconditionally.
+        #[test]
+        fn a_corroborated_claim_renders_no_annotation() {
+            let evidence = Evidence::from_events(&events(&[("voice__converse", true)]));
+            let doc = render(Some(&evidence));
+            assert!(
+                !doc.contains("capability check"),
+                "a corroborated report must render clean: {doc}"
+            );
+        }
+
+        /// **No recorder is not an empty ledger.** Eval and headless lend no
+        /// `tool_events` vec; annotating there would refute every report for
+        /// a reason that has nothing to do with the report.
+        #[test]
+        fn no_recorder_means_no_check_rather_than_a_refutation() {
+            let doc = render(None);
+            assert!(
+                !doc.contains("capability check"),
+                "absence of a recorder must not read as absence of evidence: {doc}"
+            );
+        }
+
+        /// And the ack the model sees is untouched by any of it — this slice
+        /// annotates the report, it does not steer the model mid-turn.
+        #[test]
+        fn the_ack_is_unchanged_whatever_the_evidence_says() {
+            let silent = Evidence::default();
+            let (annotated, _) = execute_render_report(
+                &json!({"title": "Voice stack", "body": CLAIM}),
+                false,
+                Some(&silent),
+            );
+            let (plain, _) =
+                execute_render_report(&json!({"title": "Voice stack", "body": CLAIM}), false, None);
+            assert_eq!(annotated, plain);
+        }
     }
 
     #[test]

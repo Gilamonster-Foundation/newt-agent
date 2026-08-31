@@ -3595,6 +3595,14 @@ fn artifact_postcondition_warning(
 #[derive(Default)]
 pub(crate) struct ToolCollaborators<'a> {
     pub(crate) build_check_cmd: Option<&'a str>,
+    /// #1947: the turn's tool ledger, distilled — what `render_report`'s
+    /// capability claims are checked against.
+    ///
+    /// `Option` is load-bearing and not a convenience. `None` means there is
+    /// no RECORDER (eval, headless), which is not the same fact as an empty
+    /// ledger; conflating them would refute every report in those tiers for
+    /// a reason that has nothing to do with the report.
+    pub(crate) tool_evidence: Option<&'a super::capability_check::Evidence>,
     pub(crate) note_sink: Option<&'a mut dyn NoteSink>,
     pub(crate) recall_source: Option<&'a dyn RecallSource>,
     pub(crate) memory_source: Option<&'a dyn MemorySource>,
@@ -4036,6 +4044,7 @@ async fn execute_tool_inner(
     // One unpack; the dispatch body below binds the same names it always has.
     let ToolCollaborators {
         build_check_cmd,
+        tool_evidence,
         note_sink,
         recall_source,
         memory_source,
@@ -4688,7 +4697,7 @@ async fn execute_tool_inner(
         // the plain scroller. Always-on (no injected capability); hands the
         // rendered block to the presenter and returns a short ack to the model.
         "render_report" => {
-            let (result, document) = execute_render_report(args, color);
+            let (result, document) = execute_render_report(args, color, tool_evidence);
             if let Some(document) = document {
                 presentation.document(&document);
             }

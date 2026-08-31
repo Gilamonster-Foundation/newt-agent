@@ -20,6 +20,10 @@ mod budget;
 /// transport reuses the body builder/reply parser instead of duplicating them
 /// (the `retry` re-export precedent; the dependency points inference → core).
 pub mod anthropic_wire;
+/// #1947: `claim_check`'s sibling for CAPABILITY claims — "verified",
+/// "working end-to-end", a table of green checkmarks — bound against the
+/// turn's `ToolEvent` ledger. Same append-never-rewrite shape.
+mod capability_check;
 mod claim_check;
 pub(crate) mod compress;
 mod crew_attest;
@@ -3735,6 +3739,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 // host-exec timeout ceiling. `is_cancelled` between rounds still
                 // catches the abandoned turn; this closes the *during-a-tool*
                 // window that a foreground child on the tty used to wedge.
+                // #1947: distil the ledger BEFORE the call. What a
+                // `render_report` in THIS call can be checked against is what
+                // the turn has already done — the events for this very call
+                // are pushed after it returns.
+                let tool_evidence = tool_events
+                    .as_deref()
+                    .map(|e| capability_check::Evidence::from_events(e));
                 let Some(result) = tools::execute_tool_with_collaborators(
                     name,
                     &args,
@@ -3745,6 +3756,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     mcp,
                     tools::ToolCollaborators {
                         build_check_cmd: build_check_cmd.as_deref(),
+                        tool_evidence: tool_evidence.as_ref(),
                         // Reborrow + re-coerce: shortens the trait-object
                         // lifetime to this call (Option<&mut dyn _> is
                         // invariant, so the longer ChatCtx lifetime can't
@@ -7195,6 +7207,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 );
                 report
             } else {
+                // #1947: distil the ledger BEFORE the call. What a
+                // `render_report` in THIS call can be checked against is what
+                // the turn has already done — the events for this very call
+                // are pushed after it returns.
+                let tool_evidence = tool_events
+                    .as_deref()
+                    .map(|e| capability_check::Evidence::from_events(e));
                 let Some(result) = tools::execute_tool_with_collaborators(
                     name,
                     &args,
@@ -7205,6 +7224,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     mcp,
                     tools::ToolCollaborators {
                         build_check_cmd: build_check_cmd.as_deref(),
+                        tool_evidence: tool_evidence.as_ref(),
                         // Reborrow + re-coerce: shortens the trait-object
                         // lifetime to this call (Option<&mut dyn _> is
                         // invariant, so the longer ChatCtx lifetime can't
@@ -9127,6 +9147,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 );
                 report
             } else {
+                // #1947: distil the ledger BEFORE the call. What a
+                // `render_report` in THIS call can be checked against is what
+                // the turn has already done — the events for this very call
+                // are pushed after it returns.
+                let tool_evidence = tool_events
+                    .as_deref()
+                    .map(|e| capability_check::Evidence::from_events(e));
                 let Some(result) = tools::execute_tool_with_collaborators(
                     name,
                     &args,
@@ -9137,6 +9164,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     mcp,
                     tools::ToolCollaborators {
                         build_check_cmd: build_check_cmd.as_deref(),
+                        tool_evidence: tool_evidence.as_ref(),
                         // Reborrow + re-coerce — see the OpenAI path.
                         note_sink: note_sink
                             .as_deref_mut()
@@ -10174,6 +10202,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 );
                 report
             } else {
+                // #1947: distil the ledger BEFORE the call. What a
+                // `render_report` in THIS call can be checked against is what
+                // the turn has already done — the events for this very call
+                // are pushed after it returns.
+                let tool_evidence = tool_events
+                    .as_deref()
+                    .map(|e| capability_check::Evidence::from_events(e));
                 let Some(result) = tools::execute_tool_with_collaborators(
                     name,
                     &args,
@@ -10184,6 +10219,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     mcp,
                     tools::ToolCollaborators {
                         build_check_cmd: build_check_cmd.as_deref(),
+                        tool_evidence: tool_evidence.as_ref(),
                         // Reborrow + re-coerce: shortens the trait-object
                         // lifetime to this call (Option<&mut dyn _> is
                         // invariant, so the longer ChatCtx lifetime can't
