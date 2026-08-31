@@ -103,11 +103,43 @@ fn anchor(size: Size) -> Position {
 /// four copies it replaces.
 pub(crate) struct AnchoredBackend<W: Write> {
     inner: CrosstermBackend<W>,
+    /// The rows this backend is allowed to paint (#1979).
+    ///
+    /// Held here so the terminal OWNS its lease: the rows are returned when
+    /// the surface is dropped, in the right order, with no caller to forget.
+    /// `None` is the query-only path — [`cursor_position_or_anchor`] asks
+    /// where the cursor is and paints nothing, so it holds no rows.
+    lease: Option<newt_core::tty::RegionLease>,
 }
 
 impl<W: Write> AnchoredBackend<W> {
+    /// Query-only: answers "where is the cursor?" and never paints a viewport.
+    ///
+    /// **`#[cfg(unix)]` to match its only caller**, exactly as
+    /// [`cursor_position_or_anchor`] below is and for the same stated reason.
+    /// That caller is the cockpit presenter's, and the live cockpit is unix-only
+    /// by construction (`openpty`/`dup2`/termios), so on Windows this function
+    /// has nobody to serve and `-D warnings` correctly calls it dead.
+    ///
+    /// **This is not the lease-taking path, and Windows is not losing a
+    /// viewport.** Inline surfaces reach [`Self::with_lease`] through
+    /// [`inline_terminal`], which is ungated — `config_panel`, `rich_input`
+    /// and `interaction_view` are `rich-tui`-gated only. What is absent on
+    /// Windows is the *cockpit*, not the rescue and not the lease.
+    ///
+    /// An `#[allow(dead_code)]` would have been the smaller edit and the wrong
+    /// one: it says "trust me" and stays silent forever, whereas the cfg names
+    /// which caller justifies the function and becomes a compile error in the
+    /// same commit that gives Windows a cockpit. The boundary should break when
+    /// it drifts.
+    #[cfg(unix)]
     pub(crate) fn new(writer: W) -> Self {
+        Self::with_lease(writer, None)
+    }
+
+    fn with_lease(writer: W, lease: Option<newt_core::tty::RegionLease>) -> Self {
         Self {
+            lease,
             inner: CrosstermBackend::new(writer),
         }
     }
@@ -124,6 +156,20 @@ impl<W: Write> Backend for AnchoredBackend<W> {
                 // `size()` is an ioctl, not a query — it does not depend on
                 // the terminal answering anything, so it is still trustworthy
                 // in exactly the situation that got us here.
+                // #1979/#1977: if this surface holds rows, THOSE rows are the
+                // anchor. The bare bottom-of-screen answer is what put two
+                // viewports on the same rows — the panel and the prompt each
+                // asked "where do I go?" and got the same reply.
+                //
+                // When nothing collided the lease IS the bottom rows, so this
+                // returns exactly what `anchor` did and today's panels keep
+                // their position. It differs only when the mint shifted the
+                // request, which is the case that was broken.
+                if let Some(newt_core::tty::Region::Rows { top, .. }) =
+                    self.lease.as_ref().map(newt_core::tty::RegionLease::region)
+                {
+                    return Ok(Position { x: 0, y: top });
+                }
                 Ok(anchor(self.inner.size().unwrap_or(Size {
                     width: 0,
                     height: 0,
@@ -192,16 +238,53 @@ impl<W: Write> Write for AnchoredBackend<W> {
     }
 }
 
-/// **The ONE inline-viewport constructor.** Every surface in this crate that
-/// wants `Viewport::Inline` comes through here, so the rescue above cannot be
-/// forgotten by the next one.
-pub(crate) fn inline_terminal(height: u16) -> io::Result<InlineTerm> {
+/// **The ONE inline-viewport constructor, and it takes a lease** (#1979).
+///
+/// Every surface in this crate that wants `Viewport::Inline` comes through
+/// here — F0b (#1923) collapsed four copies into this one — so requiring the
+/// capability HERE requires it of all of them in a single edit. There is no
+/// bare form to call: the height is read off the lease, because a height that
+/// disagreed with the leased rows would be a viewport painting outside what it
+/// owns, which is the whole defect (#1977).
+///
+/// The terminal owns the lease, so the rows are returned on drop with no
+/// caller left to forget.
+pub(crate) fn inline_terminal(lease: newt_core::tty::RegionLease) -> io::Result<InlineTerm> {
+    let height = match lease.region() {
+        newt_core::tty::Region::Rows { height, .. } => height,
+        // A whole-screen holder is the alternate screen, not an inline strip.
+        newt_core::tty::Region::WholeScreen => {
+            return Err(io::Error::other(
+                "an inline viewport cannot be built from a whole-screen lease",
+            ))
+        }
+    };
     Terminal::with_options(
-        AnchoredBackend::new(io::stdout()),
+        AnchoredBackend::with_lease(io::stdout(), Some(lease)),
         TerminalOptions {
             viewport: Viewport::Inline(height),
         },
     )
+}
+
+/// Lease the bottom `height` rows, which is where every inline surface here
+/// sits, and say what should happen if somebody already holds them.
+///
+/// The screen measurement stays with the caller-facing helper rather than in
+/// the arbiter: #1979's non-goal is a layout engine, and the arbiter's
+/// vocabulary is a row range plus a policy.
+pub(crate) fn lease_bottom_rows(
+    height: u16,
+    policy: newt_core::tty::OnCollision,
+) -> io::Result<newt_core::tty::RegionLease> {
+    let screen =
+        ratatui::backend::Backend::size(&CrosstermBackend::new(io::stdout())).unwrap_or(Size {
+            width: 80,
+            height: 24,
+        });
+    let top = screen.height.saturating_sub(height);
+    newt_core::tty::Terminal::lease_region(newt_core::tty::Region::Rows { top, height }, policy)
+        .ok_or_else(|| io::Error::other("another surface already owns these rows"))
 }
 
 /// The cursor position for a caller that is not building a ratatui terminal —
@@ -232,4 +315,136 @@ pub(crate) fn cursor_position_or_anchor() -> Position {
     backend
         .get_cursor_position()
         .unwrap_or(Position { x: 0, y: 0 })
+}
+
+#[cfg(test)]
+mod region_lease_door {
+    /// Every file that may construct an inline viewport. **Declared, not
+    /// discovered** (F0b): a scan that trusted a glob would silently start
+    /// permitting a new file the day someone added one.
+    const DESTINATIONS: &[&str] = &["inline_viewport.rs"];
+
+    /// The CALL FORM, never the bare name (#1924). Seven files mention
+    /// `Viewport::Inline` in prose — including the doc comment that explains
+    /// this very rule — and a name-shaped needle would count all of them, so
+    /// the guard would pass by matching its own explanation.
+    const DOOR: &str = "Viewport::Inline(";
+    const OPTIONS: &str = "Terminal::with_options(";
+
+    fn sources() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        let mut stack = vec![dir];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).expect("newt-tui/src is readable") {
+                let path = entry.expect("a readable entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let name = path
+                        .file_name()
+                        .expect("a file name")
+                        .to_string_lossy()
+                        .into_owned();
+                    out.push((name, std::fs::read_to_string(&path).expect("readable")));
+                }
+            }
+        }
+        out
+    }
+
+    /// Region claims that do NOT yet go through a lease.
+    ///
+    /// A ratchet, not a permission list: the count may only go DOWN. The
+    /// cockpit presenter builds two `Viewport::Fixed` regions from its own row
+    /// arithmetic (`self.top`, clamped on resize), which is a claim on rows by
+    /// any reading — it is simply not this slice's. #1979's sweep takes it,
+    /// and `RegionLease::relocate` exists because that block MOVES.
+    const UNLEASED_REGION_CLAIMS: &[(&str, usize)] = &[("presenter.rs", 2)];
+
+    /// **The door is one door, and it takes a lease.**
+    ///
+    /// `inline_terminal` is the only inline-viewport constructor, and its
+    /// signature requires a `RegionLease` — so there is no bare form to call
+    /// and no second place to add one. This is the `PromptWindow` seal pattern
+    /// at region scale: the capability is the way in.
+    #[test]
+    fn the_inline_viewport_door_exists_in_exactly_one_declared_place() {
+        let files = sources();
+        // POSITIVE READ ASSERTION FIRST. An absence-check that silently read
+        // nothing passes forever, and gets MORE likely to pass as the scan
+        // breaks.
+        assert!(
+            files.len() > 10,
+            "the scan found {} files, so it is not reading the crate",
+            files.len()
+        );
+        assert!(
+            files.iter().any(|(n, _)| n == "inline_viewport.rs"),
+            "the scan never reached the file that holds the door"
+        );
+
+        for (name, body) in &files {
+            if body.contains(DOOR) {
+                assert!(
+                    DESTINATIONS.contains(&name.as_str()),
+                    "`{DOOR}` appears in {name}, which is not a declared \
+                     destination. An inline viewport is a claim on rows: mint a \
+                     `RegionLease` and go through `inline_terminal`."
+                );
+            }
+        }
+    }
+
+    /// The wider category, ratcheted: every OTHER way a surface claims rows.
+    ///
+    /// Separate from the door above because the door's baseline is zero from
+    /// birth, while this one starts at two and is meant to reach zero in the
+    /// sweep. Counting them keeps the mess visible and monotonically
+    /// decreasing rather than rewritten.
+    #[test]
+    fn unleased_region_claims_only_decrease() {
+        for (name, body) in &sources() {
+            if name == "inline_viewport.rs" {
+                continue; // the door itself, and this test's own needles
+            }
+            let found = body.matches(OPTIONS).count();
+            let allowed = UNLEASED_REGION_CLAIMS
+                .iter()
+                .find(|(f, _)| *f == name)
+                .map_or(0, |(_, n)| *n);
+            assert!(
+                found <= allowed,
+                "{name} makes {found} region claims, {allowed} declared. A new \
+                 one must mint a `RegionLease`; a removed one must lower the \
+                 baseline."
+            );
+        }
+    }
+
+    /// Probe one: the needle WOULD fire on a new site. Without this the test
+    /// above passes equally well when the needle matches nothing at all.
+    #[test]
+    fn the_door_needle_catches_a_bare_construction() {
+        let smuggled = "let t = Terminal::with_options(b, TerminalOptions { \
+                        viewport: Viewport::Inline(6) });";
+        assert!(smuggled.contains(DOOR), "the needle misses a real call");
+        assert!(
+            smuggled.contains(OPTIONS),
+            "the options needle misses a real call"
+        );
+    }
+
+    /// Probe two: it does NOT fire on prose. Six files discuss
+    /// `Viewport::Inline` without constructing one, and a name-shaped needle
+    /// would have flagged every one of them — which is how a guard gets
+    /// weakened until it means nothing.
+    #[test]
+    fn the_door_needle_ignores_prose_about_the_rule() {
+        let prose = "//! opens this transient ratatui `Viewport::Inline` overlay: one surface";
+        assert!(
+            !prose.contains(DOOR),
+            "the needle matches prose, so the guard would flag documentation"
+        );
+    }
 }

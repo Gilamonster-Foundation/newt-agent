@@ -835,8 +835,16 @@ impl PanelRawGuard {
 /// #1950: through the ONE inline constructor, so a terminal that will not
 /// answer `ESC[6n` anchors the panel instead of refusing to open it. This is
 /// the site the operator reported (`/backends`, which shares this function).
+/// #1979: leases its rows with [`OnCollision::Shift`]. A panel opens while the
+/// prompt viewport is live and bottom-pinned, so asking for the bottom rows
+/// outright is #1977 — the panel drew and the prompt's next repaint erased its
+/// body. Shifting mints the nearest free rows ABOVE the holder, which is the
+/// anchor-above-the-prompt fix expressed as the mint's policy rather than as a
+/// special case in the fallback.
 pub(crate) fn make_terminal(height: u16) -> io::Result<Term> {
-    crate::inline_viewport::inline_terminal(height)
+    let lease =
+        crate::inline_viewport::lease_bottom_rows(height, newt_core::tty::OnCollision::Shift)?;
+    crate::inline_viewport::inline_terminal(lease)
 }
 
 fn draw(f: &mut ratatui::Frame, state: &PanelState) {

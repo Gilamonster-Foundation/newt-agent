@@ -435,8 +435,14 @@ fn buffer_is_empty(ta: &TextArea) -> bool {
 /// #1950: through the ONE inline constructor. The rich input surface is the
 /// prompt itself — if it refuses to open because the terminal stayed quiet,
 /// there is nothing left to type into.
+/// #1979: leases its rows with [`OnCollision::Refuse`]. The prompt is the
+/// incumbent bottom-pinned surface — it is normally first, and when it is not,
+/// taking rows an open panel owns would be #1977 with the roles swapped. A
+/// refusal degrades to the lean input rather than painting through somebody.
 fn make_terminal(height: u16) -> io::Result<Term> {
-    crate::inline_viewport::inline_terminal(height)
+    let lease =
+        crate::inline_viewport::lease_bottom_rows(height, newt_core::tty::OnCollision::Refuse)?;
+    crate::inline_viewport::inline_terminal(lease)
 }
 
 fn new_textarea(edit: Edit) -> TextArea<'static> {
