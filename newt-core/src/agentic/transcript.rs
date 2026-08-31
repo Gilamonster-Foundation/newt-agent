@@ -147,8 +147,12 @@ pub fn transcript_lines_styled(
         first_turn = false;
 
         let mut first_line_of_msg = true;
+        // #1941: a transcript carries untrusted model, tool, and docked-peer
+        // text. Neutralised BEFORE wrapping, so the marker counts toward the
+        // width the operator actually sees.
+        let content = crate::notes_scan::neutralize_for_display(&msg.content);
         // Preserve hard newlines; wrap each segment to the width.
-        for segment in msg.content.split('\n') {
+        for segment in content.split('\n') {
             for wrapped in wrap_to_width(segment, width) {
                 out.push(TranscriptLine {
                     role,

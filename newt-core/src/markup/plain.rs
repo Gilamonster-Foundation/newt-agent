@@ -106,11 +106,18 @@ pub fn render(definition: &InteractionDefinition) -> String {
         .collect();
     parts.extend(control_lines.iter().map(String::as_str));
 
-    parts
+    // #1941: untrusted markup reaches this projection verbatim — law 11 says
+    // a definition may come from it, so `markdown` and every label are
+    // attacker-chosen. A `U+202E` here renders `allow` and `deny` in swapped
+    // order and spoofs the decision the prompt exists to take; an `ESC`
+    // repaints the terminal. Neutralised once, on the way out, so no call
+    // site can forget it.
+    let joined = parts
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    crate::notes_scan::neutralize_for_display(&joined).into_owned()
 }
 
 /// What one control contributes to the plain form, if anything.

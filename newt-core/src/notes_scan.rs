@@ -185,7 +185,14 @@ pub fn scan_note(text: &str) -> anyhow::Result<()> {
 /// characters, and the remaining format ranges. Visible text in any script,
 /// combining accents, and non-ZWJ emoji (incl. VS15/VS16 variation
 /// selectors, which are Mn not Cf) all pass.
-fn invisible_char_name(c: char) -> Option<&'static str> {
+///
+/// **This is the ONE table, and it now serves two policies** (#1941). The
+/// note policy is this function verbatim: reject the write. The display
+/// policy is [`display_hazard_name`], which permits two arms this one
+/// forbids. Widening the table here widens both; adding a second table
+/// beside it is what this arrangement exists to prevent.
+#[must_use]
+pub fn invisible_char_name(c: char) -> Option<&'static str> {
     match c {
         '\n' | '\t' => None,
         // Cc — C0/C1 controls (includes \r, ESC, BEL, NUL…).
@@ -222,6 +229,95 @@ fn invisible_char_name(c: char) -> Option<&'static str> {
         '\u{1D173}'..='\u{1D17A}' => Some("musical format character"),
         _ => None,
     }
+}
+
+/// The marker a neutralised character is displayed as.
+///
+/// ASCII on purpose: it has to survive the monochrome and lean tiers, and a
+/// replacement glyph that needs a font is no use to the operator it exists
+/// to warn. It is deliberately wider than what it replaces — a hidden
+/// character SHOULD cost visible space.
+fn display_marker(c: char, out: &mut String) {
+    out.push_str("<U+");
+    // Uppercase hex, at least four digits, matching the convention the note
+    // scanner already uses in its diagnostic.
+    out.push_str(&format!("{:04X}", c as u32));
+    out.push('>');
+}
+
+/// Whether `c` may reach a **rendered surface** verbatim, and what it is if
+/// not. `None` means safe to display.
+///
+/// This is [`invisible_char_name`]'s table with exactly two arms subtracted,
+/// and the subtraction is the substance of #1941. It is one table with two
+/// policies, not two tables.
+///
+/// **Permitted here, forbidden for notes: the bidi MARKS (`U+200E`,
+/// `U+200F`) and the bidi ISOLATES (`U+2066`–`U+2069`).** Neither can force
+/// a strong character to render against its inherent direction — a mark
+/// only resolves the direction of neighbouring *neutrals*, and an isolate
+/// only bounds a run so it cannot affect its surroundings. They are what
+/// legitimate Arabic and Hebrew text uses, and the isolates are the
+/// construct Unicode itself recommends in place of the embeddings below. A
+/// scan that rejected all bidi would not be fail-closed; it would be broken
+/// for two scripts, which is why "reject everything invisible" is the wrong
+/// policy for a surface even though it is the right one for a note.
+///
+/// **Still forbidden, and the actual spoofing primitive: `U+202A`–`U+202E`**
+/// — LRE, RLE, PDF, LRO, RLO. These *override* a character's inherent
+/// directionality, which is what lets `deny` and `allow` render in swapped
+/// order in a permission prompt. Unicode deprecates them in favour of the
+/// isolates. Also still forbidden: every C0/C1 control except `\n`/`\t`
+/// (an `ESC` in untrusted text can repaint the terminal, and a `\r` can
+/// rewrite the line the operator is reading), the zero-width set, and the
+/// tag characters — all of which let what the operator SEES be a strict
+/// subset of what is actually there.
+///
+/// The residual this does not close: an unbalanced isolate can still change
+/// the ORDER of mixed-direction runs. That is correct bidi behaviour for
+/// mixed content rather than a forcing primitive, and neutralising it would
+/// break the legitimate case it exists for.
+#[must_use]
+pub fn display_hazard_name(c: char) -> Option<&'static str> {
+    match c {
+        '\u{200E}' | '\u{200F}' | '\u{2066}'..='\u{2069}' => None,
+        other => invisible_char_name(other),
+    }
+}
+
+/// Replace every character [`display_hazard_name`] names with a visible
+/// marker, so untrusted text cannot reorder, hide, or repaint what an
+/// operator reads.
+///
+/// **Neutralise rather than reject** (#1941). The three candidates were
+/// reject-at-ingest, neutralise-at-render, and annotate; the reasoning is in
+/// `docs/decisions/untrusted_markup_display_scan.md`. The short form: a
+/// definition's markdown is machine-generated from an arbitrary command line
+/// and a transcript line is arbitrary program output, so refusing to display
+/// them turns a display defect into a denial of the permission ceremony —
+/// and an operator who sees nothing is not safer than one who sees something
+/// honest. The record is left untouched, so a `ContentId` minted over it is
+/// unchanged and nothing moves on the wire.
+///
+/// Borrows when the text is clean, which is every honest input.
+#[must_use]
+pub fn neutralize_for_display(text: &str) -> std::borrow::Cow<'_, str> {
+    let Some(first) = text
+        .char_indices()
+        .find_map(|(i, c)| display_hazard_name(c).map(|_| i))
+    else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    let mut out = String::with_capacity(text.len() + 8);
+    out.push_str(&text[..first]);
+    for c in text[first..].chars() {
+        if display_hazard_name(c).is_some() {
+            display_marker(c, &mut out);
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 fn scan_invisible_unicode(text: &str) -> anyhow::Result<()> {
@@ -313,6 +409,145 @@ pub(crate) fn is_exfil_safe_host(host: &str) -> bool {
         ".test",
     ];
     LOCAL_SUFFIXES.iter().any(|s| host.ends_with(s))
+}
+
+#[cfg(test)]
+mod display_policy_tests {
+    use super::*;
+
+    /// **The substance of #1941: an override is not a mark.**
+    ///
+    /// `U+202E` RIGHT-TO-LEFT OVERRIDE *forces* direction on characters
+    /// against their inherent class — that is the primitive that renders
+    /// `allow` and `deny` in swapped order in a permission prompt. `U+200F`
+    /// RIGHT-TO-LEFT MARK cannot: it only resolves the direction of
+    /// neighbouring *neutrals*. Both directions are asserted, because a
+    /// policy that neutralised everything would be "broken for two scripts",
+    /// not "fail-closed".
+    #[test]
+    fn a_direction_forcing_control_is_a_hazard_and_a_mark_is_not() {
+        for forcing in ['\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}'] {
+            assert!(
+                display_hazard_name(forcing).is_some(),
+                "U+{:04X} forces direction and must be neutralised",
+                forcing as u32
+            );
+        }
+        for permitted in [
+            '\u{200E}', '\u{200F}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ] {
+            assert!(
+                display_hazard_name(permitted).is_none(),
+                "U+{:04X} is a mark or an isolate — it cannot force a strong \
+                 character against its direction, and neutralising it would \
+                 corrupt legitimate RTL text",
+                permitted as u32
+            );
+        }
+    }
+
+    /// **One table, two policies.** The note policy is unchanged by #1941:
+    /// what display permits, a note still rejects. If this ever fails, the
+    /// subtraction has leaked into the stricter policy.
+    #[test]
+    fn the_note_policy_still_rejects_what_the_display_policy_permits() {
+        for permitted in ['\u{200E}', '\u{200F}', '\u{2066}', '\u{2069}'] {
+            assert!(
+                display_hazard_name(permitted).is_none(),
+                "display policy changed"
+            );
+            assert!(
+                invisible_char_name(permitted).is_some(),
+                "U+{:04X} must still be refused in a NOTE — a note is injected \
+                 verbatim into the system prompt and has no legitimate use for \
+                 it",
+                permitted as u32
+            );
+        }
+        // And everything else agrees, so the two policies differ by exactly
+        // the arms named above and nothing else.
+        for c in [
+            '\u{202E}',
+            '\u{200B}',
+            '\u{FEFF}',
+            '\u{1b}',
+            '\r',
+            '\u{E0041}',
+        ] {
+            assert_eq!(
+                display_hazard_name(c).is_some(),
+                invisible_char_name(c).is_some(),
+                "the two policies disagree about U+{:04X}",
+                c as u32
+            );
+        }
+        for c in ['a', 'ب', 'א', '中', '\n', '\t', '\u{0301}'] {
+            assert!(display_hazard_name(c).is_none(), "{c:?} is ordinary text");
+            assert!(invisible_char_name(c).is_none(), "{c:?} is ordinary text");
+        }
+    }
+
+    /// **Legitimate Arabic and Hebrew survive byte-for-byte.**
+    ///
+    /// The constraint that ruled out "reject everything invisible": a scan
+    /// that broke two scripts would not be fail-closed, it would be broken.
+    /// Strong RTL characters need no controls at all — the bidi algorithm
+    /// orders them from their own class — and the marks these strings do
+    /// carry are permitted.
+    #[test]
+    fn legitimate_rtl_text_is_untouched() {
+        for text in [
+            "تشغيل bash؟",
+            "האם להריץ bash?",
+            // With an explicit mark and an isolate, both permitted.
+            "run \u{200F}عربى\u{200E} now",
+            "run \u{2068}עברית\u{2069} now",
+        ] {
+            let out = neutralize_for_display(text);
+            assert_eq!(out, text, "legitimate RTL text was altered");
+            assert!(
+                matches!(out, std::borrow::Cow::Borrowed(_)),
+                "clean text must be borrowed, not copied"
+            );
+        }
+    }
+
+    /// An `ESC` in untrusted text repaints the terminal and a `\r` rewrites
+    /// the line the operator is reading. Both are hazards; `\n` and `\t` are
+    /// not, because a projection is made of them.
+    #[test]
+    fn a_control_byte_is_a_hazard_but_newline_and_tab_are_not() {
+        assert!(
+            display_hazard_name('\u{1b}').is_some(),
+            "ESC must not reach a surface"
+        );
+        assert!(
+            display_hazard_name('\r').is_some(),
+            "CR must not reach a surface"
+        );
+        assert!(display_hazard_name('\n').is_none());
+        assert!(display_hazard_name('\t').is_none());
+        assert_eq!(
+            neutralize_for_display("a\u{1b}[2Kb"),
+            "a<U+001B>[2Kb",
+            "the escape must be visible, not silently dropped"
+        );
+    }
+
+    /// The marker names the codepoint, and the surrounding text is preserved
+    /// exactly. Dropping the character instead would hide that anything was
+    /// there, which is the failure mode being fixed rather than a fix for it.
+    #[test]
+    fn a_hazard_becomes_a_visible_marker_and_nothing_else_moves() {
+        assert_eq!(
+            neutralize_for_display("run \u{202E}hsab\u{202C} now"),
+            "run <U+202E>hsab<U+202C> now"
+        );
+        assert!(matches!(
+            neutralize_for_display("run bash now"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
 }
 
 #[cfg(test)]
