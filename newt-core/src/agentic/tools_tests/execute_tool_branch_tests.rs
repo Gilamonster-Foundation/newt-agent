@@ -847,8 +847,13 @@ async fn find_output_is_sorted() {
 }
 
 /// #1235: every tool invocation goes through one display boundary. The
-/// operator sees the command plus a bounded tail, while the model-facing
-/// result remains complete.
+/// operator sees the command plus a bounded head+tail, while the
+/// model-facing result remains complete.
+///
+/// #1973 declared amendment: this golden MOVED from tail-only
+/// (c.rs/d.rs/e.rs) to head+tail (a.rs .. e.rs) — see the module doc on
+/// `display::spill_view_lines`. This test's own property (the operator's
+/// bounded excerpt vs. the model's complete result) is unaffected.
 #[tokio::test]
 async fn find_command_and_full_result_share_the_spill_boundary() {
     let ws = tempfile::TempDir::new().unwrap();
@@ -867,9 +872,8 @@ async fn find_command_and_full_result_share_the_spill_boundary() {
     assert_eq!(
         rendered,
         "⚙  find: . (name=*.rs, type=f)\n\
-             ▲ 2 more lines above · /spill N raises this view\n\
-             ▒ c.rs\n\
-             ▒ d.rs\n\
+             ▒ a.rs\n\
+             ▲ 3 lines omitted · /spill N raises this view\n\
              ▓ e.rs\n\
              …\n"
     );
