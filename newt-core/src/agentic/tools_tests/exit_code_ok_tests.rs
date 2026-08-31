@@ -152,3 +152,48 @@ fn the_pre_fix_writer_produced_thrash_no_detector_could_see() {
         "this must stay invisible: it is the shape the fix exists to end"
     );
 }
+
+// -----------------------------------------------------------------------
+// #1972: the lifecycle tool's honest no-op degrade must not ledger `ok =
+// true` either — the sibling gap to #1969 (a different string shape, same
+// "did real work happen?" question the `ok` bit answers).
+// -----------------------------------------------------------------------
+
+/// Red-first: before #1972, `unconfigured_phase_message`'s plain no-op text
+/// carried no failure-shaped prefix `tool_result_ok` recognized, so it
+/// ledgered `ok = true` — indistinguishable from a phase that actually ran.
+#[test]
+fn lifecycle_unconfigured_noop_is_not_ledgered_as_success() {
+    let msg = crate::tooling::unconfigured_phase_message(crate::tooling::Phase::Test, &[]);
+    assert!(
+        !tool_result_ok(&msg),
+        "an honest no-op must not ledger as a claimable success: {msg}"
+    );
+    assert!(
+        !msg.starts_with("error:"),
+        "and it must not be misrepresented as a failure either: {msg}"
+    );
+}
+
+/// Same, for the actionable (nested-project-named) shape — it is still a
+/// no-op (the phase did not run), even though it is more useful than the
+/// plain wording.
+#[test]
+fn lifecycle_actionable_noop_is_not_ledgered_as_success() {
+    let msg = crate::tooling::unconfigured_phase_message(
+        crate::tooling::Phase::Test,
+        &[std::path::PathBuf::from("agent-voice")],
+    );
+    assert!(
+        !tool_result_ok(&msg),
+        "naming a candidate directory is still not a completed run: {msg}"
+    );
+}
+
+/// The twin that stops "everything lifecycle-shaped is a no-op now": a
+/// resolved command's `list` output (a real, claimable answer) stays
+/// `ok = true`.
+#[test]
+fn lifecycle_resolved_list_output_is_still_a_success() {
+    assert!(tool_result_ok("lifecycle test → cargo test"));
+}

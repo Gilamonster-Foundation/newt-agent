@@ -4745,19 +4745,28 @@ async fn execute_tool_inner(
                 );
             };
             let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("run");
+            // #1972: `dir` resolves through the SAME seam run_command's `cwd`
+            // uses — detection AND execution both target it, not just the
+            // workspace root, so a nested project isn't structurally
+            // unreachable in a polyglot/monorepo workspace.
+            let effective_dir = resolve_exec_cwd(workspace, args.get("dir").and_then(|v| v.as_str()));
+            let effective_path = std::path::Path::new(&effective_dir);
             // Resolve from the `[lifecycle]` override → matching tooling packs.
             // Several toolchains may each contribute a command; join with `&&`
             // so the confined shell runs them in sequence and short-circuits on
             // the first failure (the safe-subset engine supports `&&`).
-            let cmds =
-                crate::tooling::resolved_phase_commands(std::path::Path::new(workspace), phase);
+            let cmds = crate::tooling::resolved_phase_commands(effective_path, phase);
             if cmds.is_empty() {
-                return format!(
-                    "no command configured for lifecycle phase '{}'. Set it in \
-                     .newt/config.toml [lifecycle] or a tooling pack; `lifecycle` \
-                     only runs commands the project declares.",
-                    phase.as_str()
-                );
+                // #1972: root(-or-`dir`)-level detection found nothing — before
+                // giving up, name any first-level subdirectory that DOES have
+                // this phase configured, so a nested project (e.g.
+                // `agent-voice/Cargo.toml`) is not silently invisible. The
+                // message keeps the same "no command configured" lead either
+                // way — see `tool_result_ok`, which treats the whole family as
+                // a no-op rather than a claimable success.
+                let nested =
+                    crate::tooling::nested_projects_with_configured_phase(effective_path, phase);
+                return crate::tooling::unconfigured_phase_message(phase, &nested);
             }
             let joined = cmds.join(" && ");
             match action {
@@ -4765,7 +4774,7 @@ async fn execute_tool_inner(
                 "run" => {
                     exec_confined_command(
                         &joined,
-                        workspace,
+                        &effective_dir,
                         color,
                         tool_output_lines,
                         caveats,
@@ -5486,15 +5495,24 @@ async fn execute_tool_inner(
 /// Classify an [`execute_tool`] result string as success or failure for the
 /// turn's recorded tool events (Step 17.6, #246). Best-effort by necessity —
 /// tool results are plain strings fed back to the model — so this mirrors
-/// the failure prefixes this module (and `McpTools::call`) actually emit:
-/// `error:`, `capability denied:`, and `unknown tool`. A successful
-/// `run_command` whose *output* happens to start with one of these is
-/// misclassified; the recorded event is an outcome claim, not a gate.
+/// the prefixes this module (and `McpTools::call`) actually emit for a call
+/// that accomplished no claimable work: the hard-failure family (`error:`,
+/// `capability denied:`, `unknown tool`), and — #1972 — the lifecycle tool's
+/// honest no-op degrade (`no command configured`, `crate::tooling::
+/// unconfigured_phase_message`). That prefix is deliberately NOT `error:`:
+/// the tool genuinely did not fail (it degrades honestly, by design — see
+/// `catalog::lifecycle_tool_definition`), so alarming the model with a fake
+/// failure would be its own dishonesty; but recording it `ok=true` let a
+/// no-op ledger as indistinguishable from a real phase having run. A
+/// successful `run_command` whose *output* happens to start with one of
+/// these is misclassified; the recorded event is an outcome claim, not a
+/// gate.
 pub(crate) fn tool_result_ok(result: &str) -> bool {
     let r = result.trim_start();
     !(r.starts_with("error:")
         || r.starts_with("capability denied:")
-        || r.starts_with("unknown tool"))
+        || r.starts_with("unknown tool")
+        || r.starts_with("no command configured"))
 }
 
 // Private-source recovery is a composition invariant, not only a renderer
