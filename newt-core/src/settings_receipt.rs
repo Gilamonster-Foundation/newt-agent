@@ -54,20 +54,76 @@ pub const SETTING_CHANGE_SCHEMA_V1: &str = "newt.setting-change/v1";
 /// empty for exactly that reason.
 pub const RECEIPT_PATH_ENV: &str = "NEWT_SETTINGS_RECEIPTS";
 
+/// What a setting was, or became.
+///
+/// Most settings are a closed token vocabulary — `vi`, `relentless`, `auto` —
+/// and those are [`Self::Token`]. The round cap is not: its value is a number
+/// that only means something beside the derivation that produced it, so it
+/// carries [`ToolRoundLimit`] — #1982's record, **reused rather than
+/// re-declared**. "320 rounds" is a number; "320, from an override, over a
+/// configured 40, under relentless" is what #1965 asked for.
+///
+/// `#[serde(untagged)]` is load-bearing, not tidiness: a token serializes as a
+/// bare string, exactly as the plain `String` field it replaced did, so every
+/// receipt already written keeps parsing AND keeps its content address. The
+/// two variants are disjoint on the wire (a string versus an object), so the
+/// untagged read cannot go wrong.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SettingValue {
+    /// A value from the setting's own closed vocabulary.
+    Token(String),
+    /// A tool-round cap AND the derivation that produced it (#1982).
+    ToolRounds(crate::tenacity::ToolRoundLimit),
+}
+
+impl From<&str> for SettingValue {
+    fn from(value: &str) -> Self {
+        Self::Token(value.to_string())
+    }
+}
+
+impl From<String> for SettingValue {
+    fn from(value: String) -> Self {
+        Self::Token(value)
+    }
+}
+
+impl From<crate::tenacity::ToolRoundLimit> for SettingValue {
+    fn from(limit: crate::tenacity::ToolRoundLimit) -> Self {
+        Self::ToolRounds(limit)
+    }
+}
+
+impl std::fmt::Display for SettingValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Token(token) => f.write_str(token),
+            Self::ToolRounds(limit) => write!(
+                f,
+                "{} (from {}, over a configured {})",
+                limit.rounds,
+                limit.source.as_str(),
+                limit.configured
+            ),
+        }
+    }
+}
+
 /// One applied setting change.
 ///
-/// `from` and `to` are the setting's own value vocabulary (`vi`, `relentless`,
-/// `auto`) — closed token sets, never free operator text, so a receipt cannot
-/// become a second transcript of what was typed.
+/// `from` and `to` are the setting's own value vocabulary — never free
+/// operator text, so a receipt cannot become a second transcript of what was
+/// typed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettingChange {
     pub schema: String,
     /// The setting's canonical name — the `/settings <name>` deep-link token.
     pub setting: String,
     /// What it was before this change.
-    pub from: String,
+    pub from: SettingValue,
     /// What it is now.
-    pub to: String,
+    pub to: SettingValue,
     /// The route the operator actually took: `/settings`, `/vi`, `/psyche
     /// tenacity`. The same change through two verbs is two different events,
     /// and which verb was used is the part a reader cannot reconstruct.
@@ -78,12 +134,17 @@ pub struct SettingChange {
 
 impl SettingChange {
     #[must_use]
-    pub fn new(setting: &str, from: &str, to: &str, via: &str) -> Self {
+    pub fn new(
+        setting: &str,
+        from: impl Into<SettingValue>,
+        to: impl Into<SettingValue>,
+        via: &str,
+    ) -> Self {
         Self {
             schema: SETTING_CHANGE_SCHEMA_V1.to_string(),
             setting: setting.to_string(),
-            from: from.to_string(),
-            to: to.to_string(),
+            from: from.into(),
+            to: to.into(),
             via: via.to_string(),
             ts_claim: chrono::Utc::now().to_rfc3339(),
         }
@@ -219,7 +280,7 @@ mod tests {
     #[test]
     fn an_edited_receipt_is_not_intact() {
         let mut receipt = SettingReceipt::mint(change()).expect("mintable");
-        receipt.change.to = "nano".to_string();
+        receipt.change.to = SettingValue::Token("nano".to_string());
         assert!(
             !receipt.is_intact(),
             "a rewritten `to` still verified — the address proves nothing"
@@ -247,7 +308,7 @@ mod tests {
 
         // ...and so is the value, obviously — but assert it, because a
         // canonical form that dropped a field would pass the check above.
-        a.to = "nano".to_string();
+        a.to = SettingValue::Token("nano".to_string());
         b = change();
         b.ts_claim.clone_from(&a.ts_claim);
         assert_ne!(a.content_id().unwrap(), b.content_id().unwrap());
@@ -263,6 +324,116 @@ mod tests {
         assert_eq!(read.len(), 2, "the intact lines must survive");
         assert_eq!(read[0], receipt);
         assert!(read.iter().all(SettingReceipt::is_intact));
+    }
+
+    fn rounds(
+        rounds: usize,
+        source: crate::tenacity::ToolRoundLimitSource,
+        configured: usize,
+    ) -> crate::tenacity::ToolRoundLimit {
+        crate::tenacity::ToolRoundLimit {
+            rounds,
+            source,
+            configured,
+            tenacity: Some(crate::Tenacity::Relentless),
+        }
+    }
+
+    /// **A token still encodes as a bare string.**
+    ///
+    /// This is what makes `SettingValue` a widening rather than a break: every
+    /// receipt written before the enum existed still parses, and — because the
+    /// canonical bytes are unchanged — still computes to the same address. An
+    /// externally-tagged enum would have silently re-addressed every receipt on
+    /// disk.
+    #[test]
+    fn a_token_value_is_wire_identical_to_the_plain_string_it_replaced() {
+        let receipt = SettingReceipt::mint(change()).expect("mintable");
+        let line = receipt.render_line().expect("renderable");
+        assert!(line.contains(r#""from":"vi""#), "{line}");
+        assert!(line.contains(r#""to":"emacs""#), "{line}");
+        assert!(receipt.is_intact());
+    }
+
+    /// **The derivation is bound into the address, not decoration beside it.**
+    ///
+    /// #1965's complaint was that "320 rounds" was recorded without what it was
+    /// measured against. Each field of the derivation is varied ALONE here —
+    /// same rounds, same everything else — because a pair that differs in two
+    /// fields proves nothing about either: an earlier version of this test
+    /// varied `rounds` and `configured` together and passed happily with
+    /// `configured` dropped from the encoding entirely.
+    #[test]
+    fn each_field_of_the_derivation_is_bound_into_the_address() {
+        use crate::tenacity::ToolRoundLimitSource::{Config, Override, Tenacity as FromTenacity};
+        let base = SettingChange::new(
+            "rounds",
+            rounds(40, Config, 40),
+            rounds(320, Override, 40),
+            "/rounds",
+        );
+        let vary = |mutate: &dyn Fn(&mut crate::tenacity::ToolRoundLimit)| {
+            let mut other = base.clone();
+            if let SettingValue::ToolRounds(limit) = &mut other.to {
+                mutate(limit);
+            }
+            other
+        };
+
+        // 320 over a configured 40 is an ESCALATION; 320 over a configured 320
+        // is not. Same number, different fact.
+        let baseline = vary(&|l| l.configured = 320);
+        // Which input won: an override the operator typed, or a tenacity level.
+        let source = vary(&|l| l.source = FromTenacity);
+        // The level in play when it happened.
+        let level = vary(&|l| l.tenacity = Some(crate::Tenacity::Standard));
+        // …and the number itself, obviously.
+        let number = vary(&|l| l.rounds = 321);
+
+        let id = base.content_id().unwrap();
+        for (name, other) in [
+            ("configured", baseline),
+            ("source", source),
+            ("tenacity", level),
+            ("rounds", number),
+        ] {
+            assert_ne!(
+                id,
+                other.content_id().unwrap(),
+                "`{name}` is not in the address — a receipt that drops it \
+                 records the escalation exactly as invisibly as before"
+            );
+        }
+
+        // Anti-vacuous: an unmutated copy DOES agree, so the assertions above
+        // are about the payload and not about `ts_claim` moving underneath.
+        assert_eq!(id, base.clone().content_id().unwrap());
+    }
+
+    /// A rounds receipt survives the journal and stays verifiable.
+    #[test]
+    fn a_rounds_receipt_round_trips_through_the_journal() {
+        use crate::tenacity::ToolRoundLimitSource::{Config, Override};
+        let change = SettingChange::new(
+            "rounds",
+            rounds(40, Config, 40),
+            rounds(320, Override, 40),
+            "/max-rounds",
+        );
+        let receipt = SettingReceipt::mint(change).expect("mintable");
+        let read = read_jsonl(&receipt.render_line().expect("renderable"));
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0], receipt);
+        assert!(
+            read[0].is_intact(),
+            "a rounds receipt must verify like any other"
+        );
+        // The alias the operator actually typed survives the round trip.
+        assert_eq!(read[0].change.via, "/max-rounds");
+        assert_eq!(
+            read[0].change.to.to_string(),
+            "320 (from override, over a configured 40)"
+        );
     }
 
     /// The path is overridable, which is also how a caller keeps the journal
