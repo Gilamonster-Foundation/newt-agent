@@ -154,6 +154,59 @@ impl TestTty {
             saw_prompt
         })
     }
+
+    /// Block until `needle` has appeared in the painted screen AT OR AFTER
+    /// byte offset `from`, or `timeout` elapses. Returns whether it was seen.
+    ///
+    /// The write side (`Screen::draw`/`write_all`+`flush`) completing does
+    /// NOT mean the read side has caught up: `answer_terminal_queries` drains
+    /// the pty master on its own thread, so a caller that calls [`painted`]
+    /// immediately after a blocking `handle_request` returns is racing that
+    /// thread, not synchronized with it — unlike input, where
+    /// [`type_when_painted`] already closes exactly this race by waiting
+    /// before it writes. This is the read-side twin: same bounded-poll
+    /// technique, so a snapshot taken after a `true` return is safe to
+    /// assert against in full.
+    ///
+    /// `from` matters and is not optional: several expected sequences (cursor
+    /// Show, for one) legitimately occur earlier in the same session, so
+    /// "appears anywhere" would return immediately without ever waiting for
+    /// the LATER occurrence under test.
+    pub(crate) fn wait_for_painted_after(
+        &self,
+        from: usize,
+        needle: &str,
+        timeout: std::time::Duration,
+    ) -> bool {
+        wait_for_after(&self.painted, from, needle, timeout)
+    }
+}
+
+/// Free-function core of [`TestTty::wait_for_painted_after`], taking the
+/// shared buffer directly so the polling logic is testable against a plain
+/// `Mutex<Vec<u8>>` — no real pty, no responder thread, nothing for a
+/// `TestTty::drop` to restore.
+fn wait_for_after(
+    buf: &Mutex<Vec<u8>>,
+    from: usize,
+    needle: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let seen = {
+            let buf = buf
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let text = String::from_utf8_lossy(&buf);
+            text.get(from.min(text.len())..)
+                .is_some_and(|tail| tail.contains(needle))
+        };
+        if seen || std::time::Instant::now() >= deadline {
+            return seen;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// The answering half of a terminal: accumulate what the application paints,
@@ -295,4 +348,70 @@ pub(crate) fn mode_diff(a: &libc::termios, b: &libc::termios) -> String {
         }
     }
     out.join(", ")
+}
+
+#[cfg(test)]
+mod wait_for_after_tests {
+    use super::wait_for_after;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Already present after `from` → returns `true` immediately (no need to
+    /// exhaust the timeout, though a short one keeps the test fast either way).
+    #[test]
+    fn finds_a_needle_already_present_after_the_offset() {
+        let buf = Mutex::new(b"before SHOWN after".to_vec());
+        assert!(wait_for_after(&buf, 7, "SHOWN", Duration::from_millis(200)));
+    }
+
+    /// The offset is load-bearing: a needle that only occurs BEFORE `from`
+    /// must not satisfy the wait — this is the exact bug class the helper
+    /// exists to avoid (cursor Show legitimately appears earlier too).
+    #[test]
+    fn ignores_an_occurrence_before_the_offset() {
+        let buf = Mutex::new(b"SHOWN before, nothing after".to_vec());
+        assert!(!wait_for_after(
+            &buf,
+            11,
+            "SHOWN",
+            Duration::from_millis(200)
+        ));
+    }
+
+    /// The race this exists to close: the needle is not there yet, but a
+    /// concurrent writer appends it shortly after the wait begins. A
+    /// snapshot-only check (no poll) would have missed this.
+    #[test]
+    fn observes_a_needle_appended_after_the_wait_begins() {
+        let buf = Arc::new(Mutex::new(b"before ".to_vec()));
+        let writer = std::thread::spawn({
+            let buf = Arc::clone(&buf);
+            move || {
+                std::thread::sleep(Duration::from_millis(30));
+                buf.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(b"SHOWN after");
+            }
+        });
+        assert!(wait_for_after(&buf, 7, "SHOWN", Duration::from_secs(1)));
+        writer.join().expect("writer thread");
+    }
+
+    /// A needle that never arrives times out and returns `false` rather than
+    /// hanging — the timeout is a real bound, not decoration.
+    #[test]
+    fn times_out_and_returns_false_when_the_needle_never_arrives() {
+        let buf = Mutex::new(b"before after".to_vec());
+        let start = std::time::Instant::now();
+        assert!(!wait_for_after(
+            &buf,
+            7,
+            "SHOWN",
+            Duration::from_millis(100)
+        ));
+        assert!(
+            start.elapsed() >= Duration::from_millis(100),
+            "must actually wait out the timeout, not return early"
+        );
+    }
 }

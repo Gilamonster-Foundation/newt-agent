@@ -1509,10 +1509,32 @@ mod terminal_acceptance {
                 cockpit.screen.top, expected_top,
                 "the pending layout is applied before modal reservation"
             );
-            let painted = tty.painted();
-            let prompt_at = painted
+            let provisional = tty.painted();
+            let prompt_at = provisional
                 .find("Prompt — Cockpit modal visible?")
                 .expect("modal body reached the terminal");
+            let mut show = Vec::new();
+            queue!(show, crossterm::cursor::Show).expect("show-cursor bytes");
+            let show = String::from_utf8(show).expect("show bytes are UTF-8");
+            // #1959 (post-rebase flake): the modal's OPENING is already
+            // synchronized (`type_when_painted` above waits for its prompt
+            // text before this point), but the repaint that restores the
+            // chat cursor when it CLOSES is the last thing this round
+            // writes, with no synchronization point before the snapshot
+            // below — unlike input, `painted()` has no way to know the
+            // responder thread (which drains the pty master on its own
+            // thread) has caught up with a write that already returned.
+            // Proved directly, not assumed: 15 concurrent runs of this exact
+            // test, 6 failed here, each truncated at a DIFFERENT byte
+            // offset — the signature of a drain race, not a fixed defect.
+            // Waiting for the exact evidence the assertion below checks for
+            // changes WHEN it is safe to read, not WHAT is asserted.
+            assert!(
+                tty.wait_for_painted_after(prompt_at, &show, std::time::Duration::from_secs(2)),
+                "the chat cursor was not restored after the modal closed (waited 2s): {:?}",
+                tty.painted()
+            );
+            let painted = tty.painted();
             let mut expected_move = Vec::new();
             queue!(expected_move, MoveTo(0, expected_reservation.start))
                 .expect("cursor-placement bytes");
@@ -1524,9 +1546,6 @@ mod terminal_acceptance {
             let mut hide = Vec::new();
             queue!(hide, crossterm::cursor::Hide).expect("hide-cursor bytes");
             let hide = String::from_utf8(hide).expect("hide bytes are UTF-8");
-            let mut show = Vec::new();
-            queue!(show, crossterm::cursor::Show).expect("show-cursor bytes");
-            let show = String::from_utf8(show).expect("show bytes are UTF-8");
             let before_modal = &painted[..prompt_at];
             assert!(
                 before_modal.rfind(&hide) > before_modal.rfind(&show),
@@ -1578,8 +1597,6 @@ mod terminal_acceptance {
                 "a slash command is chat intent, not a modal answer"
             );
 
-            let painted_after_slash = tty.painted();
-            let slash_delta = &painted_after_slash[before_slash..];
             let notice_row = crate::permissions::SLASH_COMMAND_PROMPT_NOTICE
                 .as_bytes()
                 .to_vec();
@@ -1589,6 +1606,22 @@ mod terminal_acceptance {
                     .expect("durable notice insertion plan");
             let committed_notice =
                 String::from_utf8(committed_notice).expect("notice bytes are UTF-8");
+            // #1959 (post-rebase flake, same shape as the cursor-restore wait
+            // above): the notice-commit repaint is the last thing this round
+            // writes, with no synchronization point before a snapshot taken
+            // right after `handle_request` returns. Wait for the exact
+            // evidence the assertion below checks for.
+            assert!(
+                tty.wait_for_painted_after(
+                    before_slash,
+                    &committed_notice,
+                    std::time::Duration::from_secs(2)
+                ),
+                "slash guidance was not committed above the cockpit viewport (waited 2s): {:?}",
+                &tty.painted()[before_slash..]
+            );
+            let painted_after_slash = tty.painted();
+            let slash_delta = &painted_after_slash[before_slash..];
             assert!(
                 slash_delta.contains(&committed_notice),
                 "slash guidance was not committed above the cockpit viewport: {slash_delta:?}"
