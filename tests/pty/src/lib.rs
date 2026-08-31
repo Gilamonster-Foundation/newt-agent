@@ -164,3 +164,91 @@ impl Drop for Pty {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The screen as a GRID.
+//
+// Promoted here from `newt_tui::interaction_view_pty_test` (C2b, #1891) when
+// #1979 needed it too. It was private to one test file, which is the exact
+// condition under which the next caller writes a second, worse copy — the
+// failure this epic keeps paying for. One reader of the escape stream.
+// ---------------------------------------------------------------------------
+
+/// The screen as a GRID, by applying cursor positioning rather than stripping it.
+///
+/// This exists because the first cut of the width assertion was wrong in a way
+/// worth recording: `ratatui` does not emit padding, it MOVES the cursor
+/// (`ESC[1;3H`) and prints a fragment. Stripping escapes therefore
+/// concatenates every fragment onto one line — `⊘run_commandwantstorun…` —
+/// and a width check over that measures nothing about the screen. Only by
+/// honouring `CUP` does "no line exceeds the terminal width" become a claim
+/// about what the operator sees.
+///
+/// Deliberately tiny: `CUP`, `\r`, `\n`, and printable text. Anything else is
+/// consumed and ignored, which is sound here because the assertions are about
+/// WHERE text lands, not how it is coloured.
+pub fn screen_grid(screen: &str) -> Vec<String> {
+    let mut grid: Vec<Vec<char>> = Vec::new();
+    let (mut row, mut col) = (0usize, 0usize);
+    let put = |grid: &mut Vec<Vec<char>>, row: usize, col: usize, ch: char| {
+        while grid.len() <= row {
+            grid.push(Vec::new());
+        }
+        let line = &mut grid[row];
+        while line.len() <= col {
+            line.push(' ');
+        }
+        line[col] = ch;
+    };
+    let mut chars = screen.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' => {
+                row += 1;
+                col = 0;
+            }
+            '\r' => col = 0,
+            '\u{1b}' => match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    let mut params = String::new();
+                    let mut final_byte = '\0';
+                    for f in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&f) {
+                            final_byte = f;
+                            break;
+                        }
+                        params.push(f);
+                    }
+                    if final_byte == 'H' {
+                        // CUP is 1-based, and an omitted parameter is 1.
+                        let mut it = params.split(';');
+                        let r: usize = it.next().unwrap_or("").parse().unwrap_or(1);
+                        let c2: usize = it.next().unwrap_or("").parse().unwrap_or(1);
+                        row = r.saturating_sub(1);
+                        col = c2.saturating_sub(1);
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(f) = chars.next() {
+                        if f == '\u{7}' || (f == '\u{1b}' && chars.peek() == Some(&'\\')) {
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            },
+            printable if !printable.is_control() => {
+                put(&mut grid, row, col, printable);
+                col += 1;
+            }
+            _ => {}
+        }
+    }
+    grid.into_iter()
+        .map(|l| l.into_iter().collect::<String>().trim_end().to_string())
+        .collect()
+}
