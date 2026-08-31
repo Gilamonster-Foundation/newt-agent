@@ -153,6 +153,85 @@ fn doctor_runs_without_crash() {
         .stdout(predicate::str::contains("newt doctor"));
 }
 
+/// #1951 regression: an ambiguous backend drop-in — the exact old newt-adopt
+/// probe marker plus operator-looking evidence (`model`), which
+/// `Config::resolve()` refuses to attribute — used to make `Config::resolve()?`
+/// end `newt doctor` with that same failure before a single line of diagnosis
+/// printed: the tool died with the exact error it exists to diagnose. Would
+/// have failed (exit 1, no "Backend drop-ins:" section at all) before the
+/// fix; now doctor reports the finding and keeps running everything that
+/// does not need a resolved config.
+#[test]
+fn doctor_reports_unattributable_dropin_instead_of_dying() {
+    let newt = common::newt();
+    let dropin_dir = newt.config_dir().join("backends");
+    std::fs::create_dir_all(&dropin_dir).unwrap();
+    let dropin = dropin_dir.join("api-moonshot-ai-443.toml");
+    std::fs::write(
+        &dropin,
+        "endpoint = \"https://api.moonshot.ai/v1\"\n\
+         model = \"kimi-k2\"\n\
+         [provenance]\n\
+         source = \"newt adopt v0.7.3 (probed; delete this file to reset)\"\n",
+    )
+    .unwrap();
+
+    let mut cmd = newt;
+    cmd.arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("FINDING"))
+        .stdout(predicate::str::contains("Backend drop-ins:"))
+        .stdout(predicate::str::contains(dropin.display().to_string()))
+        .stdout(predicate::str::contains("cannot be attributed"));
+}
+
+/// Anti-vacuous twin of [`doctor_reports_unattributable_dropin_instead_of_dying`]:
+/// against a clean fixture (no drop-in at all) doctor reports no finding —
+/// proving the assertion above is about THIS file, not something every
+/// `doctor` run prints regardless of input.
+#[test]
+fn doctor_reports_no_finding_for_a_clean_dropin_directory() {
+    common::newt()
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Backend drop-ins:"))
+        .stdout(predicate::str::contains("(none)"))
+        .stdout(predicate::str::contains("FINDING").not());
+}
+
+/// #1951 C0b regression: `--fix` on a piped/headless run (every `assert_cmd`
+/// spawn — no pty) must REFUSE to guess which of the two remediations
+/// applies, not silently pick one. The two repairs have opposite
+/// consequences (keep the backend as configuration vs. discard it as
+/// residue), so a non-interactive guess would be worse than the original
+/// failure. The file must be byte-for-byte untouched.
+#[test]
+fn doctor_fix_refuses_to_guess_without_a_terminal() {
+    let newt = common::newt();
+    let dropin_dir = newt.config_dir().join("backends");
+    std::fs::create_dir_all(&dropin_dir).unwrap();
+    let dropin = dropin_dir.join("api-moonshot-ai-443.toml");
+    let original = "endpoint = \"https://api.moonshot.ai/v1\"\n\
+         model = \"kimi-k2\"\n\
+         [provenance]\n\
+         source = \"newt adopt v0.7.3 (probed; delete this file to reset)\"\n";
+    std::fs::write(&dropin, original).unwrap();
+
+    let mut cmd = newt;
+    cmd.args(["doctor", "--fix"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("refusing to guess"));
+
+    assert_eq!(
+        std::fs::read_to_string(&dropin).unwrap(),
+        original,
+        "a piped `--fix` must not modify the ambiguous drop-in — the choice needs a human"
+    );
+}
+
 #[test]
 fn config_prints_toml() {
     common::newt()

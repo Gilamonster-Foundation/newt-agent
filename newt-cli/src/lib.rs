@@ -764,6 +764,13 @@ pub enum Command {
         /// refused and reported (exit 2).
         #[arg(long = "sign-ocap")]
         sign_ocap: bool,
+        /// #1951: offer to repair a backend drop-in doctor cannot attribute on
+        /// its own (an old newt-adopt probe cache carrying operator-looking
+        /// fields). Prompts interactively per ambiguous file; on a piped or
+        /// headless run there is no one to ask, so it reports the finding and
+        /// changes nothing, same as without the flag.
+        #[arg(long)]
+        fix: bool,
     },
     /// Manage the `~/.newt/ocap/` durable-policy store. `propose` folds the
     /// flight-recorder capture of a `--full-access` session into reviewable,
@@ -1432,13 +1439,21 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                     unsafe { std::env::remove_var(newt_core::flight_recorder::CAPTURE_PATH_ENV) };
                 }
             }
+            // #1951: resolved ONCE for this arm's four startup checks below
+            // (shell engine, splash preference, team runner, DGX drift
+            // notice) — each used to call `Config::resolve()` independently,
+            // so a config that fails to resolve (e.g. an unattributable
+            // legacy backend drop-in) logged the same warning repeatedly on
+            // a single command, paying the disk read + drop-in merge again
+            // for an answer already in hand.
+            let session_cfg = newt_core::Config::resolve().ok();
             // --shell-engine selects which agent-bridle engine run_command uses
-            // (ADR 0005 D2 seam). Resolved ONCE here — precedence
-            // `--shell-engine` > `[shell] engine` > `--full-access`→`host` >
-            // `safe-subset` — and published via NEWT_SHELL_ENGINE for newt-core's
-            // dispatch to read (same env pattern as NEWT_FULL_ACCESS).
+            // (ADR 0005 D2 seam). Precedence: `--shell-engine` > `[shell] engine`
+            // > `--full-access`→`host` > `safe-subset` — published via
+            // NEWT_SHELL_ENGINE for newt-core's dispatch to read (same env
+            // pattern as NEWT_FULL_ACCESS).
             {
-                let shell_cfg = newt_core::Config::resolve().ok().and_then(|c| c.shell);
+                let shell_cfg = session_cfg.as_ref().and_then(|c| c.shell.clone());
                 // #1243 Leg 1: publish NEWT_SHELL_ENGINE only for a FIXED choice
                 // (explicit flag/config or the --full-access auto-upgrade). The
                 // confined default is intentionally left UNPUBLISHED so the deep
@@ -1478,9 +1493,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             // Resolve splash preference: CLI flags override config, and
             // --splash overrides --no-splash (enforced by overrides_with).
-            let config_no_splash = newt_core::Config::resolve()
-                .ok()
-                .and_then(|c| c.tui)
+            let config_no_splash = session_cfg
+                .as_ref()
+                .and_then(|c| c.tui.clone())
                 .map(|t| t.no_splash)
                 .unwrap_or(false);
             let no_splash = (cli.no_splash || config_no_splash) && !cli.splash;
@@ -1501,7 +1516,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 // affirmation, modelled as `Presence::Prompt` (23.2). It's the
                 // dev-escape stand-in for the real attest ceremony, which arrives
                 // with BOOT (#472); a `Passkey`-required crew op holds until then.
-                newt_core::Config::resolve().ok().map(|cfg| {
+                session_cfg.clone().map(|cfg| {
                     crate::crew_runner::LocalCrewRunner::new(
                         cfg,
                         dir,
@@ -1514,7 +1529,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // Best-effort: if the DGX node has drifted from [dgx] config, print a
             // one-line notice (→ `newt dgx adopt`) before the session. Never
             // blocks startup; silent when dgx is unconfigured or unreachable.
-            dgx::startup_drift_notice(cli.config.as_deref()).await;
+            dgx::startup_drift_notice(session_cfg.as_ref()).await;
             // First-run provisioning is COVERED by the splash (#985): build a
             // background setup handle (interactive + embedded + unprovisioned) and
             // hand it to run_code, which shows a spinner over the download instead
@@ -1635,7 +1650,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Doctor { sign_ocap } => {
+        Command::Doctor { sign_ocap, fix } => {
             if sign_ocap {
                 let code = doctor::sign_ocap()?;
                 if code != 0 {
@@ -1643,7 +1658,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 }
                 Ok(())
             } else {
-                doctor::run(cli.config.as_deref()).await
+                doctor::run(cli.config.as_deref(), fix).await
             }
         }
         Command::Ocap { cmd } => {

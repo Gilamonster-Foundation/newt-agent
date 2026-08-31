@@ -2550,8 +2550,13 @@ fn drift_notice_line(verdict: &ReconcileVerdict) -> Option<String> {
 /// Never errors and never blocks startup — it's skipped when dgx isn't in use,
 /// and the whole probe is bounded by a short timeout so a slow/unreachable node
 /// is a silent no-op. The chosen "startup notice + `dgx adopt`" UX (Step 14.16).
-pub(crate) async fn startup_drift_notice(config_path: Option<&Path>) {
-    let Ok(dgx) = dgx_config(config_path) else {
+///
+/// Takes an ALREADY-RESOLVED config (#1951) rather than a path to resolve
+/// itself: this is one of several startup checks the `Command::Code` dispatch
+/// arm makes off a single shared resolution, so a config that fails to
+/// resolve is not re-read from disk (and re-warned about) once per check.
+pub(crate) async fn startup_drift_notice(config: Option<&Config>) {
+    let Some(dgx) = config.and_then(|c| c.dgx.clone()) else {
         return;
     };
     // Only when dgx is actually configured/in use — never probe otherwise.
@@ -2590,6 +2595,30 @@ pub(crate) async fn startup_drift_notice(config_path: Option<&Path>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1951: `startup_drift_notice` used to resolve its own config (a
+    /// SECOND `Config::resolve()` beyond the one the CLI dispatch preamble
+    /// already made for the shell-engine and splash checks — three
+    /// independent resolutions, and three repeats of any warning a bad
+    /// config file produced, on every single command). It now takes the
+    /// preamble's own result. `None` is exactly what that preamble passes
+    /// through when resolution failed — must return cleanly, never panic,
+    /// and never attempt a probe (there is nothing to interrogate a node
+    /// about with no config).
+    #[tokio::test]
+    async fn startup_drift_notice_skips_cleanly_when_config_did_not_resolve() {
+        startup_drift_notice(None).await;
+    }
+
+    /// The other shape a resolved config commonly takes: no `[dgx]` section
+    /// at all. Must still be a clean no-op — dgx is only probed when
+    /// actually configured.
+    #[tokio::test]
+    async fn startup_drift_notice_skips_cleanly_when_dgx_is_unconfigured() {
+        let cfg = Config::default();
+        assert!(cfg.dgx.is_none());
+        startup_drift_notice(Some(&cfg)).await;
+    }
     use wiremock::matchers::{method, path as wm_path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
