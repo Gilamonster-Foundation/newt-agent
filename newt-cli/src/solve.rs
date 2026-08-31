@@ -178,7 +178,13 @@ fn solve_tool_round_limit(
     explicit_tenacity: Option<newt_core::Tenacity>,
     explicit_rounds: Option<usize>,
 ) -> usize {
+    // Headless `solve` enforces the same effective cap the TUI would, but it
+    // does not persist per-turn records, so the derivation (`source`,
+    // `configured`, `tenacity`) has nowhere durable to land here — an
+    // asymmetry #1982 documents rather than hides. If solve ever grows turn
+    // persistence, record the full `ToolRoundLimit` there too.
     newt_core::tenacity::resolve_tool_round_limit(configured, explicit_tenacity, explicit_rounds)
+        .rounds
 }
 
 /// The serving principal headless `solve` decides capabilities for — the

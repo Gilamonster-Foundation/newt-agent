@@ -1,5 +1,40 @@
 use super::*;
 
+/// **The cap is a ROUND limit, and the trailer must say so** (#1965).
+///
+/// It read "the tool-call limit of 40 rounds" — which names one unit and
+/// measures in another. A round may issue several tool calls, so the evidenced
+/// session showed 65 tool calls under a 40-round cap, and an operator reading
+/// the trailer had every reason to think the cap was 40 calls and that they
+/// had been given 25 extra. The number was always the EFFECTIVE cap; the unit
+/// was the lie.
+///
+/// Pins every operator-facing cap-exit surface at once, because the phrase was
+/// duplicated across three of them and one site in `mod.rs` already spelled it
+/// "tool-round limit" — the codebase was inconsistent with itself.
+#[test]
+fn no_cap_exit_surface_calls_a_round_limit_a_tool_call_limit() {
+    let surfaces = [
+        cap_exit_nudge(40, None, &[]),
+        cap_exit_fallback(40, None, 0, None),
+        cap_exit_progress_handoff(40, None, "done", false, None),
+    ];
+    for text in &surfaces {
+        assert!(
+            !text.contains("tool-call limit"),
+            "a round limit announced as a call limit: {text}"
+        );
+        assert!(
+            text.contains("tool-round limit"),
+            "…and it must still name the limit it hit: {text}"
+        );
+        assert!(
+            text.contains("40 rounds"),
+            "…with the EFFECTIVE cap and its unit: {text}"
+        );
+    }
+}
+
 #[test]
 fn cap_exit_nudge_names_the_limit_and_folds_in_progress() {
     let nudge = cap_exit_nudge(5, None, &[]);
@@ -100,7 +135,7 @@ fn cap_exit_fallback_usage_advice_and_salvage() {
 
     let without = cap_exit_fallback(4, None, 0, None);
     assert!(!without.contains("tokens consumed"), "got: {without}");
-    assert!(without.contains("tool-call limit of 4"), "got: {without}");
+    assert!(without.contains("tool-round limit (4"), "got: {without}");
 
     // Step 27.5: a thrash run (≥ one failed call per round) gets HONEST
     // advice — a tooling problem, not "raise the cap".
@@ -123,7 +158,7 @@ fn cap_exit_fallback_usage_advice_and_salvage() {
 fn cap_exit_summary_detects_every_pending_action_handoff() {
     let handoff = "I have two issues: duplicate topic_has_rollups and a stray brace. Let me fix both — read around 490 to see what needs removing, then verify with a build check.";
     assert!(cap_exit_summary_is_action_handoff(handoff));
-    let plan_update = "Summary\n\nI reached the tool-call limit.\n\nNext Steps Required\n\nTo continue, I would need to remove the duplicate function using edit_file, verify cargo check, then finish the plan.";
+    let plan_update = "Summary\n\nI reached the tool-round limit.\n\nNext Steps Required\n\nTo continue, I would need to remove the duplicate function using edit_file, verify cargo check, then finish the plan.";
     assert!(
         cap_exit_summary_is_action_handoff(plan_update),
         "plan-shaped progress handoffs also contain pending actions"
@@ -139,7 +174,7 @@ fn cap_exit_summary_detects_every_pending_action_handoff() {
         true,
         Some("<plan>1. [ ] remove duplicate helper</plan><state>check=pending</state>"),
     );
-    assert!(paused.contains("tool-call limit of 25"), "{paused}");
+    assert!(paused.contains("tool-round limit (25"), "{paused}");
     assert!(
         paused.contains("Next Steps Required"),
         "the model-authored progress update survives: {paused}"
@@ -476,4 +511,79 @@ fn workflow_classifier_text_keeps_recent_user_issue_context() {
     assert!(hint.contains("github_pr"), "{hint}");
     assert!(hint.contains("read_issue"), "{hint}");
     assert!(hint.contains("open_pr"), "{hint}");
+}
+
+// ---------------------------------------------------------------------
+// #1965 — the turn heartbeat
+// ---------------------------------------------------------------------
+
+/// **Bounded, and pure over a stated elapsed.** No clock is read here and none
+/// is slept on: `due` takes the elapsed it should judge, so the whole schedule
+/// is table-testable. A wall-clock assertion would be a flake generator on a
+/// saturating box, which is exactly why the policy and the clock are separate.
+#[test]
+fn the_heartbeat_fires_once_per_interval_and_never_catches_up() {
+    let five = std::time::Duration::from_secs(300);
+    let at = std::time::Duration::from_secs;
+    let mut hb = TurnHeartbeat::default();
+
+    assert!(!hb.due(at(0), five), "a turn that just started is not late");
+    assert!(
+        !hb.due(at(299), five),
+        "…nor one just short of the first mark"
+    );
+    assert!(hb.due(at(300), five), "the first interval fires");
+    assert!(!hb.due(at(301), five), "…exactly once");
+    assert!(!hb.due(at(599), five));
+    assert!(hb.due(at(600), five), "the second interval fires");
+
+    // A turn that blocked for an hour inside ONE tool call emits one line on
+    // return, not twelve. Catching up would turn a quiet signal into a wall of
+    // text at the moment the operator is trying to read what happened.
+    assert!(
+        hb.due(at(4200), five),
+        "the long gap yields exactly one line"
+    );
+    assert!(!hb.due(at(4200), five));
+    assert!(!hb.due(at(4499), five));
+}
+
+/// The anti-vacuous twin: an ordinary turn emits NOTHING. A heartbeat that
+/// fired on short turns would be noise, and `due` returning `true` always
+/// would satisfy the schedule test above on its own.
+#[test]
+fn an_ordinary_turn_emits_no_heartbeat_at_all() {
+    let five = std::time::Duration::from_secs(300);
+    let mut hb = TurnHeartbeat::default();
+    for secs in [0, 1, 5, 30, 90, 180, 299] {
+        assert!(
+            !hb.due(std::time::Duration::from_secs(secs), five),
+            "{secs}s into a turn is not heartbeat-worthy"
+        );
+    }
+}
+
+/// A zero interval disables it rather than dividing by zero or firing every
+/// round — the zero-is-noop contract this workspace uses elsewhere.
+#[test]
+fn a_zero_interval_disables_the_heartbeat() {
+    let mut hb = TurnHeartbeat::default();
+    for secs in [0, 300, 10_000] {
+        assert!(!hb.due(
+            std::time::Duration::from_secs(secs),
+            std::time::Duration::ZERO
+        ));
+    }
+}
+
+/// The line names elapsed minutes and the round against the EFFECTIVE cap, so
+/// an escalated turn reads as "round 210 of 10000" rather than looking like it
+/// has overrun a limit of 40 — which is the confusion #1965 is about.
+#[test]
+fn the_heartbeat_line_reports_elapsed_and_the_effective_cap() {
+    let line = turn_heartbeat_line(std::time::Duration::from_secs(1954), 210, 10_000);
+    assert!(line.contains("32m elapsed"), "{line}");
+    assert!(line.contains("round 210 of 10000"), "{line}");
+    assert!(!line.contains('\u{1b}'), "no ANSI in the pure line: {line}");
+    assert!(!line.contains('\n'), "one line: {line}");
 }

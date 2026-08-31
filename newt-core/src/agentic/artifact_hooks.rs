@@ -721,6 +721,19 @@ fn compaction_trigger_metadata(
 }
 
 /// Record a completed turn without duplicating the assistant transcript.
+///
+/// `tool_round_limit` is the cap this turn actually ran under, WITH its
+/// derivation (#1965). It is stamped here because this is the only per-turn
+/// durable row: the effective limit is recomputed per dispatch from config,
+/// model tuning, tenacity and a session-local `/rounds` override, and slash
+/// commands are excluded from prompt receipts by design — so an escalation
+/// from 40 to effectively unlimited previously left no record in config, in
+/// receipts, in turns, or in artifacts, and runs reaching rounds 145/236/285/320
+/// were indistinguishable from runs under the announced cap.
+///
+/// Four bounded scalars, no text: the ledger's content-free rule is untouched.
+/// `configured` is carried beside `rounds` so a reader sees the ESCALATION and
+/// not merely the result.
 pub fn record_turn_outcome(
     sink: &dyn PromptArtifactSink,
     context: ArtifactReadContext<'_>,
@@ -728,6 +741,7 @@ pub fn record_turn_outcome(
     usage: Option<TokenUsage>,
     end_reason: Option<TurnEndReason>,
     elapsed_ms: u64,
+    tool_round_limit: Option<crate::tenacity::ToolRoundLimit>,
 ) -> anyhow::Result<ArtifactReadRecord> {
     let reply_digest = blake3::hash(reply.as_bytes()).to_hex().to_string();
     append(
@@ -741,6 +755,10 @@ pub fn record_turn_outcome(
                 "usage": usage,
                 "end_reason": end_reason,
                 "elapsed_ms": elapsed_ms,
+                "tool_round_limit": tool_round_limit.map(|l| l.rounds),
+                "tool_round_limit_source": tool_round_limit.map(|l| l.source.as_str()),
+                "configured_tool_round_limit": tool_round_limit.map(|l| l.configured),
+                "tenacity": tool_round_limit.and_then(|l| l.tenacity).map(|t| t.label()),
             })),
     )
 }
@@ -970,7 +988,7 @@ mod tests {
     fn append_uses_submitted_origin_not_active_selector() {
         let sink = RecordingSink::default();
         let (originating, root, context) = context();
-        record_turn_outcome(&sink, context, "ok", None, None, 1).unwrap();
+        record_turn_outcome(&sink, context, "ok", None, None, 1, None).unwrap();
         let writes = sink.writes.lock().unwrap();
         assert_eq!(writes[0].0, originating);
         assert_eq!(writes[0].1, root);
@@ -1227,7 +1245,7 @@ mod tests {
     fn missing_prompt_authority_and_sink_errors_are_returned() {
         let sink = RecordingSink::default();
         let missing_origin = ArtifactReadContext::new(None, None, Some(PromptId::new()), None);
-        let error = record_turn_outcome(&sink, missing_origin, "ok", None, None, 1)
+        let error = record_turn_outcome(&sink, missing_origin, "ok", None, None, 1, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("originating prompt"), "{error}");
@@ -1235,7 +1253,7 @@ mod tests {
 
         let failing = RecordingSink::failing("disk full");
         let (_, _, context) = context();
-        let error = record_turn_outcome(&failing, context, "ok", None, None, 1)
+        let error = record_turn_outcome(&failing, context, "ok", None, None, 1, None)
             .unwrap_err()
             .to_string();
         assert_eq!(error, "disk full");
@@ -1485,6 +1503,57 @@ mod tests {
         assert_eq!(trigger["primary_cause"], "token_threshold");
     }
 
+    /// **The twin** (#1965): a turn under the DEFAULT cap records 40 from
+    /// config, and reports itself unescalated.
+    ///
+    /// Without this the escalated assertion above could pass against a record
+    /// that always says "override" — and the field that matters most is the
+    /// difference between the two, not either value alone.
+    #[test]
+    fn a_default_cap_turn_records_forty_from_config() {
+        let sink = RecordingSink::default();
+        let (_, _, context) = context();
+        let limit = crate::tenacity::ToolRoundLimit {
+            rounds: 40,
+            source: crate::tenacity::ToolRoundLimitSource::Config,
+            configured: 40,
+            tenacity: None,
+        };
+        assert!(!limit.is_escalated());
+        record_turn_outcome(&sink, context, "ok", None, None, 1, Some(limit)).unwrap();
+        let artifacts = sink.artifacts();
+        let metadata = artifacts[0].metadata();
+        assert_eq!(metadata["tool_round_limit"], 40);
+        assert_eq!(metadata["tool_round_limit_source"], "config");
+        assert_eq!(metadata["configured_tool_round_limit"], 40);
+        assert_eq!(metadata["tenacity"], serde_json::Value::Null);
+    }
+
+    /// A tenacity-driven escalation names TENACITY, not the override, and
+    /// carries the level — so a reader can tell "the operator typed /rounds
+    /// 320" apart from "a relentless posture raised it", which are different
+    /// operator acts with different remedies.
+    #[test]
+    fn a_tenacity_escalation_names_the_level_that_caused_it() {
+        let sink = RecordingSink::default();
+        let (_, _, context) = context();
+        let limit = crate::tenacity::resolve_tool_round_limit(
+            40,
+            Some(crate::tenacity::Tenacity::Relentless),
+            None,
+        );
+        record_turn_outcome(&sink, context, "ok", None, None, 1, Some(limit)).unwrap();
+        let artifacts = sink.artifacts();
+        let metadata = artifacts[0].metadata();
+        assert_eq!(
+            metadata["tool_round_limit"],
+            crate::tenacity::RELENTLESS_TOOL_ROUND_TARGET
+        );
+        assert_eq!(metadata["tool_round_limit_source"], "tenacity");
+        assert_eq!(metadata["configured_tool_round_limit"], 40);
+        assert_eq!(metadata["tenacity"], "relentless");
+    }
+
     #[test]
     fn turn_outcome_keeps_digest_and_metrics_but_not_reply() {
         let sink = RecordingSink::default();
@@ -1500,6 +1569,12 @@ mod tests {
             }),
             Some(TurnEndReason::Completed),
             55,
+            Some(crate::tenacity::ToolRoundLimit {
+                rounds: 320,
+                source: crate::tenacity::ToolRoundLimitSource::Override,
+                configured: 40,
+                tenacity: None,
+            }),
         )
         .unwrap();
         let artifacts = sink.artifacts();
@@ -1510,6 +1585,13 @@ mod tests {
         assert_eq!(artifact.metadata()["usage"]["input_tokens"], 10);
         assert_eq!(artifact.metadata()["end_reason"], "completed");
         assert_eq!(artifact.metadata()["elapsed_ms"], 55);
+        // #1965 — the escalation is on the record. Before this, a turn that ran
+        // 320 rounds under an announced cap of 40 was indistinguishable in the
+        // ledger from one that ran under 40, because the effective limit is
+        // recomputed per dispatch and slash commands never reach a receipt.
+        assert_eq!(artifact.metadata()["tool_round_limit"], 320);
+        assert_eq!(artifact.metadata()["tool_round_limit_source"], "override");
+        assert_eq!(artifact.metadata()["configured_tool_round_limit"], 40);
         assert!(!artifact.metadata().to_string().contains(reply));
     }
 

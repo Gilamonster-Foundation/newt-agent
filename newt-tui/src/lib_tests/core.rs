@@ -502,22 +502,52 @@ fn tool_round_limit_commands_parse_expected_forms() {
 fn tool_round_limit_override_resolves_and_reports() {
     use newt_core::Tenacity;
 
-    assert_eq!(effective_tool_round_limit(25, None, None), 25);
+    use newt_core::tenacity::ToolRoundLimitSource;
+
+    // #1965: the resolver now returns the number WITH its derivation, so each
+    // case pins which input won as well as what it produced. `configured` is
+    // carried through every arm so a reader of a turn record sees the
+    // escalation, not just the result.
+    let plain = effective_tool_round_limit(25, None, None);
     assert_eq!(
-        effective_tool_round_limit(25, Some(Tenacity::Standard), None),
-        25
+        (plain.rounds, plain.source),
+        (25, ToolRoundLimitSource::Config)
     );
+    assert!(!plain.is_escalated());
+
+    let standard = effective_tool_round_limit(25, Some(Tenacity::Standard), None);
     assert_eq!(
-        effective_tool_round_limit(25, Some(Tenacity::Relentless), None),
-        EFFECTIVELY_UNLIMITED_TOOL_ROUNDS,
+        (standard.rounds, standard.source),
+        (25, ToolRoundLimitSource::Config),
+        "a tenacity level that does not RAISE the limit did not decide it"
+    );
+
+    let relentless = effective_tool_round_limit(25, Some(Tenacity::Relentless), None);
+    assert_eq!(
+        (relentless.rounds, relentless.source, relentless.configured),
+        (
+            EFFECTIVELY_UNLIMITED_TOOL_ROUNDS,
+            ToolRoundLimitSource::Tenacity,
+            25
+        ),
         "an explicitly selected relentless posture should not hit the ordinary safety cap"
     );
+    assert!(relentless.is_escalated());
+    assert_eq!(relentless.tenacity, Some(Tenacity::Relentless));
+
+    let overridden = effective_tool_round_limit(25, Some(Tenacity::Relentless), Some(7));
     assert_eq!(
-        effective_tool_round_limit(25, Some(Tenacity::Relentless), Some(7)),
-        7,
+        (overridden.rounds, overridden.source, overridden.configured),
+        (7, ToolRoundLimitSource::Override, 25),
         "a deliberate /rounds override remains the outermost limit"
     );
-    assert_eq!(effective_tool_round_limit(25, None, Some(50)), 50);
+
+    let raised = effective_tool_round_limit(25, None, Some(50));
+    assert_eq!(
+        (raised.rounds, raised.source, raised.configured),
+        (50, ToolRoundLimitSource::Override, 25),
+        "the escalation this issue is about: 50 enforced over a configured 25"
+    );
     assert_eq!(double_tool_round_limit(25), 50);
     assert_eq!(
         double_tool_round_limit(EFFECTIVELY_UNLIMITED_TOOL_ROUNDS),
@@ -565,7 +595,8 @@ fn tool_round_limit_override_resolves_and_reports() {
             25,
             relentless,
             apply_tool_round_limit_command(25, relentless, Some(25), ToolRoundLimitCommand::Reset,),
-        ),
+        )
+        .rounds,
         EFFECTIVELY_UNLIMITED_TOOL_ROUNDS
     );
     assert_eq!(

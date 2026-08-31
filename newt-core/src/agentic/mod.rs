@@ -2265,7 +2265,22 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let hard_tool_rounds = max_tool_rounds.saturating_add(workflow_grace_rounds);
     let mut workflow_grace_active = false;
     let mut current_tool_round_limit = max_tool_rounds;
+    // #1965: the turn's only whole-turn wall-clock signal. The evidenced
+    // 32-minute turn emitted none — this file has per-tool `Instant` timers
+    // and nothing watching the turn as a whole.
+    let turn_started = std::time::Instant::now();
+    let mut turn_heartbeat = TurnHeartbeat::default();
     'round_loop: for round in 0..hard_tool_rounds {
+        // Bounded to ONE line per interval, and the policy is pure over the
+        // elapsed it is handed — this reads the clock, `due` does not.
+        let turn_elapsed = turn_started.elapsed();
+        if turn_heartbeat.due(turn_elapsed, TURN_HEARTBEAT_INTERVAL) {
+            print_newt(
+                &turn_heartbeat_line(turn_elapsed, round, current_tool_round_limit),
+                color,
+                false,
+            );
+        }
         // FIRST statement of every round: the previous round's completed
         // viewport must come down before ANY canonical line this round can
         // print — the grace-window debug note, the round separator, the
@@ -5064,7 +5079,7 @@ fn pending_plan_completion_nudge(
              with the full ordered plan: mark completed steps completed, make the immediate \
              blocker repair the active step, and keep later feature work pending. Then call the \
              next concrete tool for that active repair. Do not repeat the findings summary or \
-             claim a tool-call limit while this nudge is giving you another round.{workflow_clause}"
+             claim a tool-round limit while this nudge is giving you another round.{workflow_clause}"
         ))
     } else {
         Some(format!(
@@ -5219,6 +5234,61 @@ fn suspicious_empty_ollama_diagnostic(json: &serde_json::Value) -> String {
     )
 }
 
+/// How much wall-clock passes between turn heartbeats (#1965).
+///
+/// Five minutes: long enough that an ordinary turn emits none at all, short
+/// enough that a turn on its way to 1954 seconds says something four times
+/// before it lands. The evidenced 32-minute turn emitted no intermediate
+/// signal of any kind — `mod.rs` has per-tool `Instant` timers and nothing
+/// that watches the turn as a whole.
+const TURN_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Whether a turn heartbeat is due, and the bookkeeping to keep them bounded.
+///
+/// **Pure over a supplied `elapsed`** — it reads no clock. Production hands it
+/// `turn_start.elapsed()`; a test states the time. That is the difference
+/// between a test that asserts a schedule and one that sleeps, and this box
+/// saturates badly enough that a wall-clock assertion here would be a flake
+/// generator rather than a check.
+#[derive(Debug, Default)]
+struct TurnHeartbeat {
+    /// Interval boundaries already announced. Bounded by construction: it
+    /// counts, so a turn of any length holds one integer.
+    emitted: u64,
+}
+
+impl TurnHeartbeat {
+    /// Consume the heartbeat due at `elapsed`, if one is.
+    ///
+    /// At most one line per interval however long the gap: a turn that blocks
+    /// for an hour inside a single tool call emits ONE line when it returns,
+    /// not twelve. Catching up would turn a quiet signal into a wall of text
+    /// at exactly the moment the operator is trying to read what happened.
+    fn due(&mut self, elapsed: std::time::Duration, interval: std::time::Duration) -> bool {
+        if interval.is_zero() {
+            return false;
+        }
+        let boundary = elapsed.as_secs() / interval.as_secs().max(1);
+        if boundary > self.emitted {
+            self.emitted = boundary;
+            return true;
+        }
+        false
+    }
+}
+
+/// The heartbeat line. Pure, no ANSI, no I/O — the same split
+/// `Notice::line`/`Notice::emit` uses.
+///
+/// It reports the two facts missing from the evidenced 32-minute turn: how long
+/// it has been running, and how far into the ROUND budget it is — against the
+/// EFFECTIVE cap, so an escalated turn shows "round 210 of 10000" rather than
+/// looking like it has overrun a limit of 40.
+fn turn_heartbeat_line(elapsed: std::time::Duration, round: usize, limit: usize) -> String {
+    let mins = elapsed.as_secs() / 60;
+    format!("still working — {mins}m elapsed, round {round} of {limit}")
+}
+
 /// Build the nudge appended to the message list when the tool-round cap is hit.
 /// `progress` (the `<plan>`/`<state>` working memory, Step 27.5) is folded in so
 /// the model summarizes against what it actually accomplished; `observed`
@@ -5230,7 +5300,7 @@ fn cap_exit_nudge(max_tool_rounds: usize, progress: Option<&str>, observed: &[St
     // its priors at exactly this point. Constrain the summary to what is
     // still verbatim in context; absence must be stated, not papered over.
     let mut nudge = format!(
-        "You have reached the tool-call limit ({max_tool_rounds} rounds). \
+        "You have reached the tool-round limit ({max_tool_rounds} rounds). \
          Do NOT call any more tools. Give the operator a concise progress update \
          that separates completed and verified work, the current state or blocker, \
          and remaining work. The tool loop has stopped at the cap. Report whether \
@@ -5324,7 +5394,7 @@ fn cap_exit_fallback(
     let advice = cap_exit_advice(max_tool_rounds, wasted_calls);
     let salvaged = cap_exit_progress_block("Progress captured before the summary failed", progress);
     format!(
-        "Paused at the tool-call limit of {max_tool_rounds} rounds{tokens_hint}. \
+        "Paused at the tool-round limit ({max_tool_rounds} rounds){tokens_hint}. \
          The final summarization request also failed while preparing a progress \
          update; {advice}.{salvaged}"
     )
@@ -5349,7 +5419,7 @@ fn cap_exit_progress_handoff(
     };
     let captured = cap_exit_progress_block("Captured working state", progress);
     format!(
-        "{content}\n\nThe tool loop reached the tool-call limit of {max_tool_rounds} rounds{tokens_hint}. \
+        "{content}\n\nThe tool loop reached the tool-round limit ({max_tool_rounds} rounds){tokens_hint}. \
          This progress handoff preserves the model's update.{pending}{captured}"
     )
 }
@@ -6092,7 +6162,22 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let hard_tool_rounds = max_tool_rounds.saturating_add(workflow_grace_rounds);
     let mut workflow_grace_active = false;
     let mut current_tool_round_limit = max_tool_rounds;
+    // #1965: the turn's only whole-turn wall-clock signal. The evidenced
+    // 32-minute turn emitted none — this file has per-tool `Instant` timers
+    // and nothing watching the turn as a whole.
+    let turn_started = std::time::Instant::now();
+    let mut turn_heartbeat = TurnHeartbeat::default();
     'round_loop: for round in 0..hard_tool_rounds {
+        // Bounded to ONE line per interval, and the policy is pure over the
+        // elapsed it is handed — this reads the clock, `due` does not.
+        let turn_elapsed = turn_started.elapsed();
+        if turn_heartbeat.due(turn_elapsed, TURN_HEARTBEAT_INTERVAL) {
+            print_newt(
+                &turn_heartbeat_line(turn_elapsed, round, current_tool_round_limit),
+                color,
+                false,
+            );
+        }
         // FIRST statement of every round: the previous round's completed
         // viewport must come down before ANY canonical line this round can
         // print — the grace-window debug note, the round separator, the
@@ -8153,7 +8238,22 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let hard_tool_rounds = max_tool_rounds.saturating_add(workflow_grace_rounds);
     let mut workflow_grace_active = false;
     let mut current_tool_round_limit = max_tool_rounds;
+    // #1965: the turn's only whole-turn wall-clock signal. The evidenced
+    // 32-minute turn emitted none — this file has per-tool `Instant` timers
+    // and nothing watching the turn as a whole.
+    let turn_started = std::time::Instant::now();
+    let mut turn_heartbeat = TurnHeartbeat::default();
     'round_loop: for round in 0..hard_tool_rounds {
+        // Bounded to ONE line per interval, and the policy is pure over the
+        // elapsed it is handed — this reads the clock, `due` does not.
+        let turn_elapsed = turn_started.elapsed();
+        if turn_heartbeat.due(turn_elapsed, TURN_HEARTBEAT_INTERVAL) {
+            print_newt(
+                &turn_heartbeat_line(turn_elapsed, round, current_tool_round_limit),
+                color,
+                false,
+            );
+        }
         // FIRST statement of every round: the previous round's completed
         // viewport must come down before ANY canonical line this round can
         // print — the grace-window debug note, the round separator, the
@@ -9835,7 +9935,22 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         body
     };
 
+    // #1965: the turn's only whole-turn wall-clock signal. The evidenced
+    // 32-minute turn emitted none — this file has per-tool `Instant` timers
+    // and nothing watching the turn as a whole.
+    let turn_started = std::time::Instant::now();
+    let mut turn_heartbeat = TurnHeartbeat::default();
     for round in 0..max_tool_rounds {
+        // Bounded to ONE line per interval, and the policy is pure over the
+        // elapsed it is handed — this reads the clock, `due` does not.
+        let turn_elapsed = turn_started.elapsed();
+        if turn_heartbeat.due(turn_elapsed, TURN_HEARTBEAT_INTERVAL) {
+            print_newt(
+                &turn_heartbeat_line(turn_elapsed, round, max_tool_rounds),
+                color,
+                false,
+            );
+        }
         // FIRST statement of every round: the previous round's completed
         // viewport comes down while the cursor is still just below it — before
         // the cancel checkpoint's return, the trace writer, or any dispatch
@@ -10740,7 +10855,7 @@ mod cap_exit_unit_tests;
 // they are absent — letting us assert that:
 //   (1) the loop honours the configured `max_tool_rounds` cap, and
 //   (2) on hitting the cap newt issues ONE final tools-disabled completion and
-//       returns its text (NOT the `(reached tool-call limit)` placeholder).
+//       returns its text (NOT the `(reached tool-round limit)` placeholder).
 //
 // Hard context-window recovery is covered both by the headless driver tests
 // and by a TUI-side integration test that grounds capability-cache persistence.
