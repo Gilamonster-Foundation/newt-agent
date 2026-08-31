@@ -33,7 +33,11 @@ pub const MAX_ADJUDICATION_BATCH: usize = 15;
 const RESEARCH_TOOL_ROUND_LIMIT: usize = 3;
 pub(super) const PROMPT_COMPREHENSION_SCHEMA_V1: &str = "prompt_comprehension_manifest_v1";
 pub(super) const PROMPT_COMPREHENSION_SCHEMA_V2: &str = "prompt_comprehension_manifest_v2";
-pub(super) const PROMPT_COMPREHENSION_SCHEMA_CURRENT: &str = PROMPT_COMPREHENSION_SCHEMA_V2;
+/// #1971: adds `atomic_ask_kinds` and, for informational clauses only, their
+/// text. A v3 reader accepts v1/v2 records unchanged — the new fields are
+/// optional, and an absent list is exactly equivalent to an empty one.
+pub(super) const PROMPT_COMPREHENSION_SCHEMA_V3: &str = "prompt_comprehension_manifest_v3";
+pub(super) const PROMPT_COMPREHENSION_SCHEMA_CURRENT: &str = PROMPT_COMPREHENSION_SCHEMA_V3;
 
 /// The harness-selected mode for one accepted prompt receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,17 +84,53 @@ impl PromptDisposition {
     }
 }
 
+/// What one extracted clause *is* — an instruction to act on, or a fact the
+/// operator stated (#1971).
+///
+/// Splitting clauses without asking this question is how a pure FYI became one
+/// atomic ask with `disposition=act` and the full round budget: the intake had
+/// no vocabulary for "the operator told me something" as distinct from "the
+/// operator asked me to do something".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskKind {
+    /// Something to do. The historical and still-default reading.
+    Instruction,
+    /// Something stated. Carries content the turn must not lose, and carries
+    /// **no authorization**.
+    Informational,
+}
+
+impl AskKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Instruction => "instruction",
+            Self::Informational => "informational",
+        }
+    }
+}
+
 /// One bounded clause extracted from a monolithic prompt. Text remains only in
-/// memory and in the durable prompt receipt; artifact metadata stores a digest
-/// and byte count instead.
+/// memory, in the durable prompt receipt, and — for an informational clause
+/// only — in the durable artifact; see [`PromptIntake::artifact_metadata`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtomicAsk {
     text: String,
+    kind: AskKind,
 }
 
 impl AtomicAsk {
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Whether this clause instructs or merely states.
+    pub fn kind(&self) -> AskKind {
+        self.kind
+    }
+
+    pub fn is_informational(&self) -> bool {
+        self.kind == AskKind::Informational
     }
 }
 
@@ -215,6 +255,11 @@ impl PromptComprehensionManifest {
         &self.atomic_asks
     }
 
+    /// The clauses that STATE rather than ask (#1971).
+    pub fn informational_asks(&self) -> impl Iterator<Item = &AtomicAsk> {
+        self.atomic_asks.iter().filter(|a| a.is_informational())
+    }
+
     pub fn decision_count(&self) -> usize {
         self.decisions.len()
     }
@@ -265,8 +310,12 @@ impl PromptIntake {
         if prompt.trim().is_empty() {
             return intake; // the empty-prompt Ask terminal is not lexicon-driven
         }
-        // Re-derive only the lexicon-driven part; asks/decisions are unchanged.
-        intake.post_lock_disposition = infer_disposition_with(prompt, lexicon);
+        // Re-derive the lexicon-driven part. Ask KINDS are lexicon-driven too
+        // (#1971), so the asks are re-extracted rather than reused; decisions
+        // depend only on ask text, which the re-extraction reproduces.
+        let (asks, _) = extract_atomic_asks_with(prompt, lexicon);
+        intake.post_lock_disposition = infer_disposition_with(prompt, &asks, lexicon);
+        intake.manifest.atomic_asks = asks;
         if intake.disposition != PromptDisposition::Ask {
             intake.disposition = intake.post_lock_disposition;
         }
@@ -281,6 +330,7 @@ impl PromptIntake {
                 manifest: PromptComprehensionManifest {
                     atomic_asks: vec![AtomicAsk {
                         text: "(empty operator prompt)".to_string(),
+                        kind: AskKind::Instruction,
                     }],
                     decisions: vec![DecisionLock {
                         question: "Provide a non-empty task before execution.".to_string(),
@@ -298,7 +348,7 @@ impl PromptIntake {
             return intake;
         }
         let (atomic_asks, atomic_overflow) = extract_atomic_asks(prompt);
-        let post_lock_disposition = infer_disposition(prompt);
+        let post_lock_disposition = infer_disposition(prompt, &atomic_asks);
         let (mut decisions, decision_overflow) = extract_decisions(&atomic_asks);
         if atomic_overflow || decision_overflow {
             decisions.push(overflow_decision());
@@ -687,6 +737,34 @@ impl PromptIntake {
             card.push('\n');
             card.push_str(&refinement);
         }
+        // #1971: the stated facts, VERBATIM and named as facts.
+        //
+        // This is the one place the card is not content-free, and the exception
+        // is the whole point of the fix. A clause the harness has decided
+        // carries no authorization is exactly the clause most likely to be
+        // dropped — the evidenced session turned a 92-byte statement into
+        // `atomic_ask_count: 1` and nothing else, and the fact it stated was
+        // never acted on or mentioned again. A count cannot be read back; the
+        // text can.
+        let noted: Vec<&str> = self
+            .manifest
+            .informational_asks()
+            .map(AtomicAsk::text)
+            .collect();
+        if !noted.is_empty() {
+            card.push_str(
+                "\nnoted_facts: the operator STATED the following; they carry no request to act\n",
+            );
+            for fact in noted {
+                card.push_str("  - ");
+                card.push_str(fact);
+                card.push('\n');
+            }
+            card.push_str(
+                "noted_instruction: acknowledge these in your reply and carry them forward; \
+                 do not treat them as authorization to mutate anything",
+            );
+        }
         card
     }
 
@@ -727,6 +805,31 @@ impl PromptIntake {
             "decision_count": self.manifest.decisions.len() as u64,
             "decision_status_counts": Value::Object(status_counts),
             "decision_source_counts": Value::Object(source_counts),
+            "informational_ask_count": self.manifest.informational_asks().count() as u64,
+            // #1971. Every other field here is a count or a digest, and that
+            // rule is kept for everything an operator DECIDED. Stated facts are
+            // the deliberate exception, for three reasons:
+            //
+            // * a digest cannot be read back, so the durable record of a
+            //   dropped fact could not say what was dropped — the artifact that
+            //   evidenced this bug recorded `atomic_ask_count=1, bytes=92` and
+            //   the fact itself was unrecoverable;
+            // * this duplicates nothing: `prompt_receipts.raw_text` already
+            //   persists the entire prompt verbatim in the same database, so
+            //   the content-free rule was never a privacy boundary here;
+            // * it is bounded — informational clauses only, already truncated
+            //   to MAX_ASK_BYTES by extraction.
+            "informational_asks": self
+                .manifest
+                .informational_asks()
+                .map(|ask| Value::from(ask.text()))
+                .collect::<Vec<_>>(),
+            "atomic_ask_kinds": self
+                .manifest
+                .atomic_asks
+                .iter()
+                .map(|ask| Value::from(ask.kind().as_str()))
+                .collect::<Vec<_>>(),
             "atomic_ask_digests": self
                 .manifest
                 .atomic_asks
@@ -804,7 +907,60 @@ impl PromptIntake {
     }
 }
 
+/// Classify one clause as an instruction or a stated fact (#1971).
+///
+/// # Why this only ever *narrows*
+///
+/// Measured before it was written: of 22 ordinary operator imperatives — "add
+/// a test for the parser", "update the docs", "rebase onto main", "continue",
+/// "land it" — **22 reach `Act` solely through the no-match fallback**,
+/// because the action lexicon is 17 needles wide. Inverting that fallback, or
+/// treating "no recognised imperative" as informational, would silently strip
+/// authorization from every one of them.
+///
+/// So this fires only on POSITIVE evidence that a clause states rather than
+/// asks, in two shapes, both pure data:
+///
+/// 1. an explicit marker at the clause's start (`fyi`, `note that`,
+///    `i'll want`) — self-announcing, no further evidence needed;
+/// 2. a declarative subject lead (`the`, `it`, `we`, `there`) **and** a
+///    stative marker (` is `, ` are `, `'s `) — the "X is now at Y" shape the
+///    issue names. Both halves are required: `the` alone would swallow "the
+///    tests need updating", and ` is ` alone would swallow "make sure it is
+///    green".
+///
+/// Everything else stays an instruction, which keeps today's behaviour for
+/// every clause this cannot positively read. The failure mode of a gap here is
+/// therefore an FYI that is still treated as an instruction — the status quo —
+/// never an instruction demoted by a lexicon miss.
+fn classify_clause(clause: &str, lexicon: &DispositionLexicon) -> AskKind {
+    let lower = clause.trim().to_ascii_lowercase();
+    let opens_with = |needles: &[String]| {
+        needles
+            .iter()
+            .any(|n| !n.is_empty() && lower.starts_with(n.as_str()))
+    };
+    if opens_with(&lexicon.informational_markers) {
+        return AskKind::Informational;
+    }
+    // A stative marker is padded on both sides so it matches as a WORD: bare
+    // "is" would fire inside "revise", and " is" alone inside "this ".
+    let padded = format!(" {lower} ");
+    let stative = lexicon
+        .stative_markers
+        .iter()
+        .any(|m| !m.is_empty() && padded.contains(m.as_str()));
+    if stative && opens_with(&lexicon.declarative_leads) {
+        return AskKind::Informational;
+    }
+    AskKind::Instruction
+}
+
 fn extract_atomic_asks(prompt: &str) -> (Vec<AtomicAsk>, bool) {
+    extract_atomic_asks_with(prompt, &DispositionLexicon::default())
+}
+
+fn extract_atomic_asks_with(prompt: &str, lexicon: &DispositionLexicon) -> (Vec<AtomicAsk>, bool) {
     let mut asks = Vec::new();
     for line in prompt.lines() {
         let line = strip_list_marker(line.trim());
@@ -826,6 +982,7 @@ fn extract_atomic_asks(prompt: &str) -> (Vec<AtomicAsk>, bool) {
                 }
                 asks.push(AtomicAsk {
                     text: truncate_chars(clause, MAX_ASK_BYTES),
+                    kind: classify_clause(clause, lexicon),
                 });
             }
         }
@@ -833,6 +990,7 @@ fn extract_atomic_asks(prompt: &str) -> (Vec<AtomicAsk>, bool) {
     if asks.is_empty() {
         asks.push(AtomicAsk {
             text: "(empty operator prompt)".to_string(),
+            kind: AskKind::Instruction,
         });
     }
     (asks, false)
@@ -917,6 +1075,16 @@ pub struct DispositionLexicon {
     /// fallback cliff made visible and tunable (#1257: "What are the 10 largest
     /// Rust files…?" classified Explain SOLELY through this).
     pub question_mark_disposition: PromptDisposition,
+    /// Clause openings that announce a stated fact outright (#1971). Matched at
+    /// the START of a clause; no further evidence is required.
+    pub informational_markers: Vec<String>,
+    /// Declarative subject leads. Informational only when a
+    /// [`stative_markers`](Self::stative_markers) entry also appears — see
+    /// [`classify_clause`].
+    pub declarative_leads: Vec<String>,
+    /// Copulas and stative auxiliaries: the "X **is** Y" half of a statement.
+    /// Matched as whole words.
+    pub stative_markers: Vec<String>,
 }
 
 impl Default for DispositionLexicon {
@@ -996,18 +1164,100 @@ impl Default for DispositionLexicon {
             .map(str::to_string)
             .to_vec(),
             question_mark_disposition: PromptDisposition::Explain,
+            // Self-announcing statements. `i'll want` / `i'm going to` are the
+            // future-tense forms only: bare `i want` is routinely an
+            // instruction ("I want you to fix the parser") and is deliberately
+            // absent.
+            informational_markers: [
+                "fyi",
+                "btw",
+                "by the way",
+                "just so you know",
+                "heads up",
+                "note that",
+                "for reference",
+                "for context",
+                "i'll want",
+                "i will want",
+                "i'm going to",
+                "i am going to",
+                "we're going to",
+                "we are going to",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            // Subject leads. An English imperative does not open with one of
+            // these, which is what keeps the 22 measured fallback imperatives
+            // ("add…", "update…", "continue") out of this branch entirely.
+            declarative_leads: [
+                "the ", "a ", "an ", "this ", "that ", "these ", "those ", "it ", "its ", "it's ",
+                "i ", "i'm ", "i've ", "i'll ", "we ", "we're ", "we've ", "we'll ", "you ",
+                "your ", "there ", "my ", "our ", "their ", "his ", "her ",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            // Padded on both sides by `classify_clause`, so each matches as a
+            // whole word rather than inside `revise` or `this`.
+            stative_markers: [
+                " is ",
+                " are ",
+                " was ",
+                " were ",
+                " isn't ",
+                " aren't ",
+                " will be ",
+                " has ",
+                " have ",
+                " had ",
+                "'s ",
+                "'re ",
+                "'ve ",
+            ]
+            .map(str::to_string)
+            .to_vec(),
         }
     }
 }
 
-fn infer_disposition(prompt: &str) -> PromptDisposition {
-    infer_disposition_with(prompt, &DispositionLexicon::default())
+fn infer_disposition(prompt: &str, asks: &[AtomicAsk]) -> PromptDisposition {
+    infer_disposition_with(prompt, asks, &DispositionLexicon::default())
 }
 
 /// Classify a prompt's disposition against `lexicon` (#1260) — pure, no I/O.
 /// Precedence is unchanged from the historical logic: an action needle wins
-/// outright; else research; else explain; else the `?` fallback; else Act.
-fn infer_disposition_with(prompt: &str, lexicon: &DispositionLexicon) -> PromptDisposition {
+/// outright; else research; else explain; else the `?` fallback; else the
+/// terminal fallback.
+///
+/// # The terminal fallback no longer grants on silence (#1971)
+///
+/// It used to be `Act` unconditionally, which made *absence of evidence* the
+/// most permissive disposition: a 92-byte statement of fact matched no needle,
+/// fell through, and was handed the full execution authority and round budget
+/// while the fact it stated was never acted on at all. That is the shape
+/// #1908 named — "no match" and "matched as Act" are different facts, and
+/// conflating them grants authority on silence.
+///
+/// It is now `Act` **unless every clause positively reads as a statement**, in
+/// which case the turn is [`Explain`](PromptDisposition::Explain): answer,
+/// acknowledge, read if useful, mutate nothing.
+///
+/// **`Act` remains the fallback for silence, and that is deliberate.** Of 22
+/// ordinary imperatives measured against this lexicon — "add a test for the
+/// parser", "update the docs", "rebase onto main", "continue", "land it" —
+/// **all 22 reach `Act` only through this fallback**. Inverting it would strip
+/// authorization from the ordinary case to fix the exceptional one. So the
+/// narrowing is driven by evidence FOR a statement, never by the absence of
+/// evidence for an instruction: silence still means Act, but a clause that
+/// says "X is Y" no longer does.
+///
+/// A mixed prompt keeps `Act`. One instruction among five statements is still
+/// an instruction, and `all()` over an empty ask list cannot arise —
+/// [`extract_atomic_asks_with`] always yields at least one.
+fn infer_disposition_with(
+    prompt: &str,
+    asks: &[AtomicAsk],
+    lexicon: &DispositionLexicon,
+) -> PromptDisposition {
     let lower = prompt.to_ascii_lowercase();
     // Padding makes a lexicon entry with a leading-space word boundary match at
     // the beginning of a prompt without losing that boundary inside prose.
@@ -1024,6 +1274,9 @@ fn infer_disposition_with(prompt: &str, lexicon: &DispositionLexicon) -> PromptD
     }
     if lower.trim_end().ends_with('?') {
         return lexicon.question_mark_disposition;
+    }
+    if !asks.is_empty() && asks.iter().all(AtomicAsk::is_informational) {
+        return PromptDisposition::Explain;
     }
     PromptDisposition::Act
 }
@@ -1362,9 +1615,275 @@ fn digest_metadata(text: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        DispositionLexicon, PromptDisposition, PromptIntake, MAX_ATOMIC_ASKS,
+        AskKind, AtomicAsk, DispositionLexicon, PromptDisposition, PromptIntake, MAX_ATOMIC_ASKS,
         MAX_CONCRETE_DECISIONS, PROMPT_COMPREHENSION_MODEL_CARD_PREFIX,
     };
+
+    // -----------------------------------------------------------------
+    // #1971 — an informational prompt grants no act authority, and the fact
+    // it states survives the turn.
+    // -----------------------------------------------------------------
+
+    /// The evidenced prompt, reconstructed to its recorded shape and EXACT
+    /// recorded length.
+    ///
+    /// The artifact that evidenced this bug (`kind=decision`, `body NULL`)
+    /// stored `atomic_ask_count=1` and a digest — so the text is not
+    /// recoverable from it, and the conversation it came from is absent from
+    /// the surviving `conversations.db`. What the issue does record is the
+    /// shape (a git-remote statement of fact, no imperative) and the length
+    /// (92 bytes, `wc -c` verified). This is that shape at that length.
+    ///
+    /// **That the input cannot be recovered from its own durable record is
+    /// itself the second half of this bug**, and is why
+    /// `artifact_metadata` now carries informational text rather than only a
+    /// digest.
+    const GIT_REMOTE_FYI: &str =
+        "the git remote for agent-voice repo is git@github.com:Gilamonster-Foundation/agent-voice.git";
+
+    #[test]
+    fn the_evidence_prompt_is_the_recorded_length() {
+        assert_eq!(
+            GIT_REMOTE_FYI.len(),
+            92,
+            "the issue records 92 bytes (wc -c verified); a reconstruction of a \
+             different length is not the case being pinned"
+        );
+    }
+
+    /// **The fix.** A statement of fact no longer buys execution authority.
+    ///
+    /// Before this, the prompt matched no action, research or explain needle,
+    /// did not end in `?`, and fell through to `Act` — full authority and the
+    /// full round budget, granted on the absence of any evidence of intent.
+    #[test]
+    fn an_informational_prompt_does_not_grant_act_authority() {
+        let intake = PromptIntake::analyze(GIT_REMOTE_FYI);
+        assert_eq!(
+            intake.disposition(),
+            PromptDisposition::Explain,
+            "a stated fact authorizes nothing"
+        );
+        assert!(
+            intake.atomic_asks().iter().all(AtomicAsk::is_informational),
+            "the clause states rather than asks: {:?}",
+            intake.atomic_asks()
+        );
+    }
+
+    /// **The stated fact survives.** Both halves of the evidenced failure: the
+    /// model is told the fact in its own turn, and the durable artifact can say
+    /// WHAT was stated rather than only that something 92 bytes long was.
+    #[test]
+    fn the_stated_fact_survives_to_the_card_and_the_durable_artifact() {
+        let intake = PromptIntake::analyze(GIT_REMOTE_FYI);
+
+        let card = intake.model_card();
+        assert!(
+            card.contains(GIT_REMOTE_FYI),
+            "the model must be told the fact it was given: {card}"
+        );
+        assert!(
+            card.contains("carry no request to act"),
+            "…and told it is not authorization: {card}"
+        );
+
+        let metadata = intake.artifact_metadata();
+        assert_eq!(metadata["informational_ask_count"], 1);
+        assert_eq!(
+            metadata["informational_asks"][0].as_str(),
+            Some(GIT_REMOTE_FYI),
+            "a digest cannot be read back; the durable record must be able to \
+             say what was dropped"
+        );
+        assert_eq!(metadata["atomic_ask_kinds"][0], "informational");
+    }
+
+    /// The content-free rule is UNCHANGED for everything an operator
+    /// instructed or decided — only stated facts are carried, and the
+    /// pre-existing secret-bearing action prompt proves it, because that
+    /// prompt is an instruction and stays digest-only.
+    #[test]
+    fn an_instruction_carries_no_text_into_the_artifact_or_the_card() {
+        let intake = PromptIntake::analyze("ship the private parser change to /top-secret");
+        let metadata = intake.artifact_metadata().to_string();
+        assert!(!metadata.contains("private parser"), "{metadata}");
+        assert_eq!(intake.artifact_metadata()["informational_ask_count"], 0);
+        assert!(!intake.model_card().contains("private parser"));
+        assert!(!intake.model_card().contains("noted_facts"));
+    }
+
+    /// **Why `Explain` and not `Research`** — the decision, made visible so it
+    /// can be overruled in one enum value.
+    ///
+    /// The defect is AUTHORITY, not budget: an informational turn was granted
+    /// the power to mutate, and mutate is what it did. `Explain` removes that
+    /// and keeps the ordinary round budget, because a stated fact often
+    /// deserves a read before answering — "the remote is X" may reasonably be
+    /// checked against the remote actually configured. `Research` would also
+    /// cap rounds at 3, which is a COST heuristic wearing an authorization
+    /// rule's clothes, and would tell the model to go gather evidence when what
+    /// it was given was a fact.
+    ///
+    /// `Ask` is excluded for a different reason: it is terminal with a ZERO
+    /// round limit, so routing every unclassified statement there would end the
+    /// turn without a reply and nag on each one.
+    #[test]
+    fn an_informational_turn_keeps_its_budget_and_loses_its_authority() {
+        let intake = PromptIntake::analyze(GIT_REMOTE_FYI);
+        assert_eq!(intake.disposition(), PromptDisposition::Explain);
+        assert_eq!(
+            intake.disposition().tool_round_limit(8),
+            8,
+            "the budget is unchanged — this fix is about authority"
+        );
+        assert_eq!(
+            PromptDisposition::Ask.tool_round_limit(8),
+            0,
+            "…and Ask is excluded because it is terminal, not merely strict"
+        );
+        assert!(
+            intake.model_card().contains("answer without mutation"),
+            "the model is told it may not mutate: {}",
+            intake.model_card()
+        );
+    }
+
+    /// **The twin that bounds the blast radius, measured not asserted.**
+    ///
+    /// All 22 of these reach `Act` ONLY through the terminal fallback — the
+    /// action lexicon is 17 needles wide and matches none of them. They are
+    /// what makes inverting that fallback the wrong fix, so every one of them
+    /// must still infer `Act` after the narrowing. A regression here means the
+    /// narrowing has started eating ordinary instructions.
+    #[test]
+    fn every_ordinary_imperative_still_infers_act() {
+        for prompt in [
+            "add a test for the parser",
+            "update the docs",
+            "remove the dead code",
+            "refactor the tty module",
+            "rename the field",
+            "install the hooks",
+            "upgrade serde",
+            "bump the version",
+            "revert that",
+            "rebase onto main",
+            "tag the release",
+            "extract the helper",
+            "wire it up",
+            "port it to windows",
+            "migrate the store",
+            "continue",
+            "proceed",
+            "go ahead",
+            "carry on",
+            "clean that up",
+            "split the file",
+            "land it",
+        ] {
+            assert_eq!(
+                PromptIntake::analyze(prompt).disposition(),
+                PromptDisposition::Act,
+                "{prompt:?} reaches Act only through the terminal fallback — \
+                 the #1971 narrowing must not touch it"
+            );
+        }
+    }
+
+    /// One instruction among statements is still an instruction. The narrowing
+    /// requires EVERY clause to state; a mixed prompt keeps `Act`, so an FYI
+    /// cannot be used to launder away the authority of the sentence beside it.
+    #[test]
+    fn a_mixed_prompt_keeps_act() {
+        let intake = PromptIntake::analyze(&format!("{GIT_REMOTE_FYI}. add the CI workflow"));
+        assert_eq!(intake.disposition(), PromptDisposition::Act);
+        let kinds: Vec<AskKind> = intake.atomic_asks().iter().map(AtomicAsk::kind).collect();
+        assert_eq!(
+            kinds,
+            vec![AskKind::Informational, AskKind::Instruction],
+            "the clauses are classified separately: {:?}",
+            intake.atomic_asks()
+        );
+        // …and the stated half still survives, even though the turn acts.
+        assert!(intake.model_card().contains(GIT_REMOTE_FYI));
+    }
+
+    /// The two positive shapes, and the negatives that must NOT trip them.
+    /// A subject lead alone and a copula alone are each insufficient — both
+    /// halves are required — which is what keeps "make sure it is green" and
+    /// "the tests need updating" instructions.
+    #[test]
+    fn only_a_positive_statement_shape_is_informational() {
+        for stated in [
+            "fyi the remote moved",
+            "btw we are on 0.8 now",
+            "note that the CI runner is self-hosted",
+            "i'll want a TUI eventually",
+            "the parser is broken",
+            "there is a bug in the parser",
+        ] {
+            assert_eq!(
+                PromptIntake::analyze(stated).disposition(),
+                PromptDisposition::Explain,
+                "{stated:?} states a fact"
+            );
+        }
+        for instructed in [
+            // A copula with no subject lead: an imperative about a state.
+            "make sure it is green",
+            // A subject lead with no copula.
+            "the tests need updating",
+            // Bare `i want` is routinely an instruction and is deliberately
+            // absent from the marker list.
+            "i want you to fix the parser",
+        ] {
+            assert_eq!(
+                PromptIntake::analyze(instructed).disposition(),
+                PromptDisposition::Act,
+                "{instructed:?} instructs"
+            );
+        }
+    }
+
+    /// **An FYI prefix cannot launder an instruction.** The action needles are
+    /// still checked FIRST and still win outright, so a marker at the start of
+    /// a clause cannot demote a recognised imperative sitting beside it.
+    ///
+    /// This is why the informational test runs last rather than first: reversed,
+    /// "fyi …, fix it" would classify as a statement and lose the `fix`.
+    #[test]
+    fn an_fyi_prefix_cannot_launder_a_recognised_imperative() {
+        assert_eq!(
+            PromptIntake::analyze("fyi the parser is broken, fix it").disposition(),
+            PromptDisposition::Act,
+            "`fix` is an action needle and wins outright"
+        );
+    }
+
+    /// **A known limitation, pinned rather than hidden.**
+    ///
+    /// An UNRECOGNISED imperative comma-joined onto a marker-led clause is read
+    /// as part of the statement, because clause splitting is by line, `;` and
+    /// `. ` — not by comma — and widening it to commas would split "add a, b
+    /// and c" into three asks.
+    ///
+    /// The result is `Explain`: the agent answers instead of acting. That is
+    /// the conservative direction of the same trade-off this whole change
+    /// makes — a visible lost round the operator recovers with one more
+    /// sentence, rather than an invisible unauthorized mutation — and the text
+    /// survives verbatim in the card, so the model sees the request and can
+    /// offer to do it.
+    #[test]
+    fn an_unrecognised_imperative_joined_to_an_fyi_by_a_comma_is_read_as_stated() {
+        let intake = PromptIntake::analyze("fyi the parser is broken, tidy it up");
+        assert_eq!(intake.disposition(), PromptDisposition::Explain);
+        assert!(
+            intake.model_card().contains("tidy it up"),
+            "the request is not lost, only unauthorized: {}",
+            intake.model_card()
+        );
+    }
 
     #[test]
     fn action_prompt_is_atomic_and_metadata_is_content_free() {
@@ -1377,7 +1896,7 @@ mod tests {
         let artifact_metadata = intake.artifact_metadata();
         assert_eq!(
             artifact_metadata["schema"],
-            "prompt_comprehension_manifest_v2"
+            "prompt_comprehension_manifest_v3"
         );
         let metadata = artifact_metadata.to_string();
         assert!(!metadata.contains("private parser"));
@@ -1678,7 +2197,7 @@ mod tests {
         );
         assert_eq!(
             action.artifact_metadata()["schema"],
-            "prompt_comprehension_manifest_v2"
+            "prompt_comprehension_manifest_v3"
         );
         assert_eq!(action.artifact_metadata()["disposition"], "plan");
 
@@ -1762,19 +2281,30 @@ mod tests {
             .map(str::to_string)
             .to_vec(),
             question_mark_disposition: PromptDisposition::Explain,
+            // #1971's lists are not part of the reconstructed 2026-era data;
+            // taking the defaults keeps this fixture about the #1260 cliff.
+            ..DispositionLexicon::default()
         }
+    }
+
+    /// `infer_disposition_with` over a prompt's OWN extracted asks — the shape
+    /// production uses. #1971 gave the classifier a second input; these tests
+    /// still measure the same thing through it.
+    fn infer(prompt: &str, lexicon: &DispositionLexicon) -> PromptDisposition {
+        let (asks, _) = super::extract_atomic_asks_with(prompt, lexicon);
+        super::infer_disposition_with(prompt, &asks, lexicon)
     }
 
     #[test]
     fn largest_files_question_classified_explain_via_question_mark_fallback_pre_1260() {
         let old = pre_1260_lexicon();
         assert_eq!(
-            super::infer_disposition_with(LARGEST_FILES_PROMPT, &old),
+            infer(LARGEST_FILES_PROMPT, &old),
             PromptDisposition::Explain,
             "under the OLD data the ? fallback alone decided"
         );
         assert_eq!(
-            super::infer_disposition_with(LARGEST_FILES_PROMPT.trim_end_matches('?'), &old),
+            infer(LARGEST_FILES_PROMPT.trim_end_matches('?'), &old),
             PromptDisposition::Act,
             "…and the same prompt minus its ? fell off the cliff to Act"
         );
@@ -1914,11 +2444,7 @@ mod tests {
             // No needle, no ?: Act.
             ("status report", PromptDisposition::Act),
         ] {
-            assert_eq!(
-                super::infer_disposition_with(prompt, &custom),
-                want,
-                "{prompt:?}"
-            );
+            assert_eq!(infer(prompt, &custom), want, "{prompt:?}");
         }
     }
 
