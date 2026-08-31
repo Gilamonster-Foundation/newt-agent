@@ -89,3 +89,66 @@ fn the_empty_output_path_is_unchanged_for_success_and_failure() {
         "an empty failing command must also ledger a failure: {bad_empty}"
     );
 }
+
+/// **The bridge, and the reason #1969 had to land before #1946.**
+///
+/// `loop_watch::repeated_failure` counts `ok == false`. Its own tests plant a
+/// synthetic ledger — and a synthetic ledger is only evidence if the real
+/// writer produces that shape. Before this fix it did not: every failing
+/// compile ledgered `ok = true`, so a detector proven against `ok = false`
+/// rows would have been proven against data production never emitted.
+///
+/// That is the vacuous-green shape one level down, and neither half of an
+/// anti-vacuous PAIR catches it, because both halves share the wrong
+/// assumption. Only a test that builds its events through the REAL `ok`
+/// computation can. So this one does.
+#[test]
+fn the_real_writer_produces_events_the_thrash_detector_can_see() {
+    let envelope = failing_compile_envelope();
+    let args = serde_json::json!({"command": "cargo check -p thing", "cwd": "/w"});
+
+    // Exactly how the loop builds a ledger event: render, classify, record.
+    let turn = |ms: u64| {
+        let rendered = render(&envelope);
+        vec![crate::ToolEvent::from_call(
+            "run_command",
+            &args,
+            tool_result_ok(&rendered),
+            Some(ms),
+        )]
+    };
+    let turns = vec![turn(3226), turn(14885), turn(9051)];
+
+    assert!(
+        turns.iter().all(|t| !t[0].ok),
+        "the real writer still records a failing compile as a success"
+    );
+    let found = crate::loop_watch::repeated_failure(&turns)
+        .expect("thrash built from real writer output went unseen");
+    assert_eq!(found.tool, "run_command");
+    assert_eq!(found.executed_failures, 3);
+}
+
+/// The twin, and the counterfactual stated as a test: the SAME three turns as
+/// the pre-#1969 writer would have recorded them are invisible to the
+/// detector. This is what the session evidence actually contained — 17
+/// multi-second failing compiles, all ledgered `ok = 1`.
+#[test]
+fn the_pre_fix_writer_produced_thrash_no_detector_could_see() {
+    let args = serde_json::json!({"command": "cargo check -p thing", "cwd": "/w"});
+    let turn = |ms: u64| {
+        // `ok = true` — what the prefix test returned for compiler output.
+        vec![crate::ToolEvent::from_call(
+            "run_command",
+            &args,
+            true,
+            Some(ms),
+        )]
+    };
+    let turns = vec![turn(3226), turn(14885), turn(9051)];
+    assert_eq!(
+        crate::loop_watch::repeated_failure(&turns),
+        None,
+        "this must stay invisible: it is the shape the fix exists to end"
+    );
+}

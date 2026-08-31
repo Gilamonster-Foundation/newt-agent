@@ -2472,6 +2472,13 @@ fn session_body(
         })
     };
 
+    // #1946: cross-run thrash. `RepeatCallGuard` catches an identical repeat
+    // WITHIN one run and is strictly stronger there — it refuses the second
+    // call rather than commenting on the third. It is also a per-run map, so
+    // it resets between turns while the failing command does not. This watch
+    // spans turns, which is the half the guard structurally cannot do.
+    let mut repeated_failures = newt_core::loop_watch::RepeatedFailureWatch::default();
+
     loop {
         // #1709 integration: refresh the embedded git tool's `CommitAttribution`
         // from the LIVE inference model + the resolved identity before this
@@ -7644,6 +7651,18 @@ fn session_body(
                                 // the checkpoint only after that save succeeds.
                                 let compaction_record = memory.take_compaction_record();
                                 let compaction_artifact_summary = compaction_record.clone();
+                                // #1946: DETECTION — surface cross-run thrash to
+                                // the OPERATOR and continue. Nothing here blocks,
+                                // retries, or rewrites the turn.
+                                if let Some(found) =
+                                    repeated_failures.observe_turn(&turn_tool_events)
+                                {
+                                    print_newt(
+                                        &newt_core::loop_watch::repeated_failure_notice(&found),
+                                        color,
+                                        verbose,
+                                    );
+                                }
                                 let conversation_save = save_turn_if_persistent(
                                     conversation_store.as_ref(),
                                     &active_conversation_id,
