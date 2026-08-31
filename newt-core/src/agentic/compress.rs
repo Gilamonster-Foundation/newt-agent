@@ -179,6 +179,21 @@ const GAP_MIN_PROGRESS: f32 = 0.25;
 /// ...or if it reclaimed at least this many tokens outright.
 const ABS_MIN_RECLAIM_TOKENS: usize = 200;
 
+/// #1966: structural prune alone never removes a message (`crate::prune`'s
+/// documented invariant) — it can only shrink message CONTENT. Under a hard,
+/// authoritative budget with `headroom_aware` policy (which suppresses the
+/// message-count trigger whenever an authoritative ceiling is known, per
+/// `compression_trigger`), that means the post-prune floor can only grow,
+/// round over round, as aged tool rounds accrete residual one-liners — a
+/// live session evidenced 422 est-tokens/round accretion, the floor reaching
+/// 82% of budget over 175 rounds (every round paying ~160k input tokens)
+/// before a late, lossy mass-summarize. Once the post-prune floor reaches
+/// this fraction of the budget, `compress` escalates to the LLM-summary
+/// stage PROACTIVELY — even though the raw estimate is still technically
+/// within budget — instead of waiting for the reactive over-budget path.
+/// The issue's own proposal named a 70-80% range; this is the midpoint.
+const PROACTIVE_SUMMARIZE_FLOOR_FRACTION: f32 = 0.75;
+
 // ---------------------------------------------------------------------------
 // Anti-thrash state
 // ---------------------------------------------------------------------------
@@ -213,6 +228,16 @@ pub struct CompressState {
     /// different event from anti-thrash latching off or the HWM being exceeded,
     /// and conflating them is what makes a refusal diagnostic lie.
     append_only_notified: bool,
+    /// Post-prune floor fraction (`tokens_after / budget`) of the last two
+    /// hard-budget, authoritative compressions that structural prune alone
+    /// settled (#1966) — `None` until a real reading lands. Read via
+    /// [`Self::floor_trend`]. The whole point is to make visible what the
+    /// issue's evidence found invisible: `crate::prune` shrinks message
+    /// CONTENT but never removes a message, so this fraction can only grow
+    /// across successive "pruned" settles while the transcript ages without
+    /// a summarize — and every prior checkpoint carried only the fired
+    /// action, never this trend.
+    last_floor_fraction: [Option<f32>; 2],
 }
 
 impl Default for CompressState {
@@ -231,6 +256,33 @@ impl CompressState {
             notified: false,
             failopen_notified: false,
             append_only_notified: false,
+            last_floor_fraction: [None, None],
+        }
+    }
+
+    /// Record one post-prune floor reading (#1966) — called only when
+    /// structural prune alone settled a hard, authoritative compression
+    /// (whether or not that settle then proactively escalates below).
+    /// Rotates the last two readings, mirroring `last_savings`'s pattern. A
+    /// zero budget is a defensive no-op (never divides by zero); in practice
+    /// `req.budget` is always a real token budget.
+    fn record_floor(&mut self, tokens_after: usize, budget: usize) {
+        if budget == 0 {
+            return;
+        }
+        let fraction = tokens_after as f32 / budget as f32;
+        self.last_floor_fraction = [self.last_floor_fraction[1], Some(fraction)];
+    }
+
+    /// The post-prune floor trend across the last two recorded readings
+    /// (#1966) — the visibility fix the issue asked for: repeated
+    /// successful "pruned" checkpoints previously carried no signal that the
+    /// floor itself was accreting toward the wall. `None` fields mean fewer
+    /// than two readings have landed yet.
+    pub fn floor_trend(&self) -> FloorTrend {
+        FloorTrend {
+            previous: self.last_floor_fraction[0],
+            latest: self.last_floor_fraction[1],
         }
     }
 
@@ -381,6 +433,28 @@ pub struct CompressCounters {
     /// Reclaim fraction (0.0–1.0) of the most recent recorded compression;
     /// `None` before any compression recorded.
     pub last_reclaim: Option<f32>,
+}
+
+/// Two consecutive post-prune floor readings (`tokens_after / budget`) from
+/// [`CompressState::floor_trend`] — #1966's visibility fix for a floor that
+/// can silently accrete toward the budget across many successful "pruned"
+/// rounds, because `crate::prune` shrinks message CONTENT but never removes
+/// a message.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FloorTrend {
+    /// The reading before `latest`, when a second one has landed.
+    pub previous: Option<f32>,
+    /// The most recently recorded reading.
+    pub latest: Option<f32>,
+}
+
+impl FloorTrend {
+    /// True only once both readings exist and the floor grew between them —
+    /// the specific "wall approaching" signal, not merely "a reading
+    /// exists".
+    pub fn rising(&self) -> bool {
+        matches!((self.previous, self.latest), (Some(p), Some(l)) if l > p)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -902,18 +976,44 @@ pub(crate) async fn compress(
     let mut pruned = pruned.messages;
     let after_prune = estimate_tokens(&pruned, req.est);
     if !over(after_prune, pruned.len()) {
-        if tokens_over_entry {
-            state.record(tokens_before, after_prune, req.budget);
+        // #1966: record the floor reading whenever prune alone would settle
+        // this round, whether or not the proactive check below then
+        // overrides that settle — the trend must stay visible even on
+        // rounds the caller ultimately keeps.
+        if req.hard_budget && req.authoritative {
+            state.record_floor(after_prune, req.budget);
         }
-        return CompressOutcome {
-            messages: pruned,
-            action: CompressAction::Pruned,
-            refusal: None,
-            fired: prune_changed,
-            tokens_before,
-            tokens_after: after_prune,
-            notice: state.take_notice(),
-        };
+        // Proactive escalation (#1966): structural prune never removes a
+        // message, so a floor this close to the budget will only keep
+        // growing round over round under headroom_aware — waiting for it to
+        // strictly exceed the budget is what let the session evidence's
+        // floor accrete silently to 82% while every round still paid full
+        // send cost. Scoped to hard, authoritative budgets — the same
+        // correctness-guard scope `state.record` already uses — so a soft
+        // count-only pass or a non-authoritative HWM-only budget (Step
+        // 20.3's fail-open case) is unaffected.
+        let proactive_escalate = req.hard_budget
+            && req.authoritative
+            && req.budget > 0
+            && (after_prune as f32 / req.budget as f32) >= PROACTIVE_SUMMARIZE_FLOOR_FRACTION;
+        if !proactive_escalate {
+            if tokens_over_entry {
+                state.record(tokens_before, after_prune, req.budget);
+            }
+            return CompressOutcome {
+                messages: pruned,
+                action: CompressAction::Pruned,
+                refusal: None,
+                fired: prune_changed,
+                tokens_before,
+                tokens_after: after_prune,
+                notice: state.take_notice(),
+            };
+        }
+        // Else: fall through to the boundary/summary pipeline below. The
+        // floor is technically within budget but converging on it, so
+        // reclaim proactively now rather than waiting for the reactive
+        // over-budget path.
     }
 
     // (2) Boundary: head + token-budgeted (and, for the count trigger,
@@ -4004,6 +4104,228 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- #1966: proactive floor escalation + floor-trend tracking ---------------
+
+    /// One growing-transcript round: append a fresh, aged-shaped tool round
+    /// (read_file + a >200-char result, just over `summarize_min_chars`, so
+    /// pass 2 one-lines it once it ages out of `keep_last`).
+    fn push_tool_round(msgs: &mut Vec<Value>, round: usize) {
+        msgs.push(assistant_call(
+            "read_file",
+            json!({"path": format!("src/f{round}.rs")}),
+        ));
+        msgs.push(tool_result(&format!("{round}:{}", "x".repeat(300))));
+    }
+
+    /// Red-first reproduction of #1966's mechanism: under a hard,
+    /// authoritative budget with `max_messages: None` (mirroring
+    /// `headroom_aware`'s suppression of the count trigger whenever an
+    /// authoritative ceiling is known — `compression_trigger`'s
+    /// `count_fired` is unreachable in that combination), `crate::prune`
+    /// never removes a message, so a growing transcript's post-prune floor
+    /// accretes round over round instead of shrinking back to a constant —
+    /// the exact "converges to an incompressible floor" shape the issue's
+    /// live session evidenced (422 est-tokens/round accretion, 82% of
+    /// budget reached over 175 rounds before a late, lossy mass-summarize).
+    ///
+    /// Before the fix, `compress` only escalates past a successful prune
+    /// once the POST-PRUNE floor itself strictly exceeds the budget
+    /// (`crate::agentic::compress`'s `over()` gate) — reactive, at the wall.
+    /// After the fix, `CompressState::floor_trend`'s `latest` reading at the
+    /// escalating round (recorded from the same internal post-prune value
+    /// `compress` gates on, BEFORE the proactive check can override the
+    /// settle) must show the floor was still within budget (`< 1.0`) yet
+    /// past the proactive threshold — proving the escalation was PROACTIVE,
+    /// not merely the pre-existing reactive path relabeled.
+    #[tokio::test]
+    async fn repeated_pruned_rounds_under_headroom_aware_proactively_escalate() {
+        let budget = 3_000usize;
+        let mut msgs = vec![
+            sys("you are newt"),
+            active_prompt_card(),
+            user("fix the bug"),
+        ];
+        let mut state = CompressState::new();
+        let mut escalated: Option<(usize, FloorTrend)> = None;
+
+        for round in 0..80 {
+            push_tool_round(&mut msgs, round);
+            // Captured BEFORE this round's call: `record_floor` only fires
+            // from inside the `!over(after_prune, ...)` branch, so a PURELY
+            // REACTIVE escalation (the pre-fix path — `after_prune` itself
+            // exceeds budget) skips it and leaves the trend unchanged from
+            // this snapshot. Comparing against it is what makes the
+            // "escalated this round from a genuine settle" proof below
+            // resistant to a disabled/no-op proactive check.
+            let trend_before = state.floor_trend();
+            let out = run(&msgs, budget, None, None, &mut state).await;
+            assert_ne!(
+                out.action,
+                CompressAction::Refused,
+                "round {round}: must never refuse — nothing here is irreducible"
+            );
+            msgs = out.messages.clone();
+            if matches!(
+                out.action,
+                CompressAction::Summarized | CompressAction::StaticFallback
+            ) {
+                escalated = Some((round, trend_before));
+                break;
+            }
+            assert!(
+                matches!(out.action, CompressAction::Fit | CompressAction::Pruned),
+                "round {round}: expected Fit-or-Pruned before escalation, got {:?}",
+                out.action
+            );
+        }
+
+        let (round, trend_before) = escalated.expect(
+            "the pipeline never escalated past structural-pruned-only across 80 \
+             rounds of a growing transcript — the accreting floor should have \
+             crossed the proactive threshold well before this",
+        );
+        let trend = state.floor_trend();
+        assert_ne!(
+            trend, trend_before,
+            "round {round}: no NEW floor reading landed on the escalating round \
+             itself — `record_floor` only fires from a genuine settle-then-maybe-\
+             override branch, so an unchanged trend here means this escalation \
+             was the pre-existing REACTIVE (over-budget) path, which skips that \
+             branch entirely, not a proactive one: {trend:?}"
+        );
+        let latest = trend.latest.expect(
+            "a floor reading must have been recorded for the round that escalated \
+             (`compress` records it before the proactive check can override the \
+             settle) — got no reading at all",
+        );
+        assert!(
+            latest < 1.0,
+            "round {round}: escalation must be PROACTIVE — the internal post-prune \
+             floor fraction that triggered it ({latest}) must still be within \
+             budget (< 1.0); a value >= 1.0 would mean this was only the \
+             pre-existing REACTIVE over-budget path: {trend:?}"
+        );
+        assert!(
+            latest >= PROACTIVE_SUMMARIZE_FLOOR_FRACTION,
+            "round {round}: the recorded floor fraction ({latest}) must have \
+             crossed the proactive threshold ({PROACTIVE_SUMMARIZE_FLOOR_FRACTION}) \
+             to explain why this round escalated: {trend:?}"
+        );
+        assert!(
+            trend.rising(),
+            "the floor trend across the settled prune-only rounds leading up to \
+             escalation must show a RISE — the accretion the issue's evidence \
+             found invisible: {trend:?}"
+        );
+    }
+
+    /// One growing-transcript round with LARGE (5,000-char) results — big
+    /// enough that structural prune is exercised repeatedly within a modest
+    /// budget (unlike [`push_tool_round`]'s smaller results, which a huge
+    /// budget would let sail past the entry check without ever attempting a
+    /// prune at all — see the twin below).
+    fn push_big_tool_round(msgs: &mut Vec<Value>, round: usize) {
+        msgs.push(assistant_call(
+            "read_file",
+            json!({"path": format!("src/f{round}.rs")}),
+        ));
+        msgs.push(tool_result(&format!("{round}:{}", "x".repeat(5_000))));
+    }
+
+    /// Twin of the reproduction above: a HEALTHY session whose structural
+    /// prune is genuinely exercised (large per-round results force the raw
+    /// estimate over budget repeatedly, unlike a budget so generous prune
+    /// never engages at all — that would pass vacuously without touching
+    /// the code path under test), but whose settled floor stays well under
+    /// the proactive threshold throughout. Must never escalate; proves the
+    /// new trigger is a genuine threshold check, not an eager
+    /// summarize-on-any-prune.
+    #[tokio::test]
+    async fn a_healthy_session_with_a_stable_floor_never_proactively_escalates() {
+        let budget = 20_000usize;
+        let mut msgs = vec![
+            sys("you are newt"),
+            active_prompt_card(),
+            user("fix the bug"),
+        ];
+        let mut state = CompressState::new();
+        let mut prune_engaged = false;
+
+        for round in 0..80 {
+            push_big_tool_round(&mut msgs, round);
+            let out = run(&msgs, budget, None, None, &mut state).await;
+            assert!(
+                matches!(out.action, CompressAction::Fit | CompressAction::Pruned),
+                "round {round}: a healthy, far-under-threshold floor must never \
+                 escalate to summarize, got {:?}",
+                out.action
+            );
+            prune_engaged |= out.action == CompressAction::Pruned;
+            msgs = out.messages.clone();
+        }
+        assert!(
+            prune_engaged,
+            "structural prune was never exercised across 80 rounds — this twin \
+             proves nothing about the proactive threshold if the code path it \
+             gates was never reached"
+        );
+    }
+
+    // -- #1966: `CompressState::floor_trend` ------------------------------------
+
+    #[test]
+    fn floor_trend_starts_unrecorded_and_is_never_rising() {
+        let state = CompressState::new();
+        let trend = state.floor_trend();
+        assert_eq!(trend.previous, None);
+        assert_eq!(trend.latest, None);
+        assert!(!trend.rising());
+    }
+
+    #[test]
+    fn floor_trend_detects_a_rise_across_two_recordings() {
+        let mut state = CompressState::new();
+        state.record_floor(2_500, 10_000); // 0.25 — exact in f32
+        state.record_floor(7_500, 10_000); // 0.75 — exact in f32
+        let trend = state.floor_trend();
+        assert_eq!(trend.previous, Some(0.25));
+        assert_eq!(trend.latest, Some(0.75));
+        assert!(trend.rising(), "{trend:?}");
+    }
+
+    /// Twin: a held or shrinking floor must never report as rising.
+    #[test]
+    fn floor_trend_does_not_report_rising_when_the_floor_holds_or_shrinks() {
+        let mut state = CompressState::new();
+        state.record_floor(7_500, 10_000);
+        state.record_floor(7_500, 10_000); // holds
+        assert!(
+            !state.floor_trend().rising(),
+            "holding: {:?}",
+            state.floor_trend()
+        );
+
+        state.record_floor(2_500, 10_000); // shrinks
+        assert!(
+            !state.floor_trend().rising(),
+            "shrinking: {:?}",
+            state.floor_trend()
+        );
+    }
+
+    #[test]
+    fn record_floor_is_a_defensive_noop_on_a_zero_budget() {
+        let mut state = CompressState::new();
+        state.record_floor(1_000, 0);
+        assert_eq!(
+            state.floor_trend(),
+            FloorTrend {
+                previous: None,
+                latest: None
+            }
+        );
     }
 
     // -- anti-thrash ------------------------------------------------------------
