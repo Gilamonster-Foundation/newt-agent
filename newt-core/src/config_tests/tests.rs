@@ -5351,8 +5351,43 @@ fn skipped_and_malformed_dropins_do_not_clear_the_unconfigured_flag() {
     );
 }
 
+/// **#1989.** Reads `$NEWT_PROVIDER` without touching it, which is why it
+/// flaked: `BackendOverride::apply` routes through the shared selection
+/// precedence, and that consults `$NEWT_PROVIDER` first (`config.rs`, "the
+/// most-specific PRESENT selector decides"). A selector naming no backend is a
+/// deliberate typed ERROR rather than a fallback — so while a sibling holds
+/// `NEWT_PROVIDER=ghost`, `try_apply` fails, `apply` swallows the failure into
+/// a `tracing::warn!`, `backend_fallback` stays set, and this assertion trips.
+///
+/// **Two guards, because the writers are two disjoint populations** and
+/// neither mechanism covers both:
+///
+/// * `serial(real_fs)` — the `config::tests` writers (`"ghost"`, `"hollow"`,
+///   `"a"`, `"b"`) mutate `NEWT_PROVIDER` with a raw `unsafe set_var` and are
+///   isolated ONLY by this lane. `process_env`'s lock cannot see them; its own
+///   doc says so: it "cannot stop … an unguarded read", and these are
+///   unguarded writes.
+/// * `GlobalSettingsGuard` — `runtime.rs`'s writers take `process_env`'s lock
+///   through this guard but sit in NO lane, so the lane alone would leave them
+///   racing this test in a full `--lib` run.
+///
+/// The guard is the existing machinery rather than a fresh `process_env::lock()`:
+/// it already snapshots `NEWT_PROVIDER` (it is in `ENV_KEYS`) and restores it on
+/// drop even through a panic, which is what lets the body clear the variable
+/// instead of merely hoping it is unset. That last part matters — the lane and
+/// the lock exclude sibling TESTS, but neither does anything about an operator
+/// (or a CI job) whose environment already exports `NEWT_PROVIDER`. The test
+/// asserted a precondition it never established.
+///
+/// The assertion itself is unchanged: an explicit `--backend-*` override must
+/// still clear the unconfigured flag.
+#[serial_test::serial(real_fs)] // reads NEWT_PROVIDER via the selection precedence
 #[test]
 fn cli_backend_override_clears_the_unconfigured_flag() {
+    let _env = crate::test_guard::GlobalSettingsGuard::acquire();
+    // Establish the precondition rather than assume it; the guard puts back
+    // whatever was here.
+    crate::process_env::remove_var("NEWT_PROVIDER");
     let mut cfg = Config::default();
     BackendOverride {
         model: Some("qwen3:32b".into()),
