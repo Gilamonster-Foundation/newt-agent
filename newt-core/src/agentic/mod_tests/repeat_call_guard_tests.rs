@@ -13,12 +13,16 @@ fn loop_owned_tool_results_share_one_complete_spill_block() {
             "a.rs\nb.rs\nc.rs\nd.rs",
         );
     }
+    // #1973 declared amendment: this golden MOVED from tail-only
+    // (b.rs/c.rs/d.rs) to head+tail (a.rs .. d.rs) — see the module doc on
+    // `display::spill_view_lines` for why tail-only is a defect, not a
+    // style choice. This test's own property (one complete spill block per
+    // result, not split across a repeat-call boundary) is unaffected.
     assert_eq!(
         String::from_utf8(repeated).unwrap(),
         "⚙  find: . (name=*.rs, type=f)\n\
-             ▲ 1 more lines above · /spill N raises this view\n\
-             ▒ b.rs\n\
-             ▒ c.rs\n\
+             ▒ a.rs\n\
+             ▲ 2 lines omitted · /spill N raises this view\n\
              ▓ d.rs\n\
              …\n"
     );

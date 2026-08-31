@@ -387,16 +387,65 @@ fn tool_call_lines(name: &str, detail: &str, cols: usize) -> Vec<String> {
         .collect()
 }
 
-/// #1235: the SPILL VIEW — a bounded, TAIL-biased rendering of completed
-/// tool output. Pure: returns the exact lines to print (gutter glyphs
-/// included) so the unit tier tests the geometry without a terminal.
+/// #1235/#1973: the SPILL VIEW — a bounded rendering of completed tool
+/// output. Pure: returns the exact lines to print (gutter glyphs included)
+/// so the unit tier tests the geometry without a terminal.
 ///
-/// Shape (per the issue sketch): when the output fits in `view` lines it is
-/// shown whole with the `▒` gutter and the `…` end-of-output marker; when it
-/// overflows, the LAST `view` lines are shown (the tail is where grep hits
-/// and errors live), the `▲` boundary line carries the hidden count, and the
-/// `▓` thumb marks the tail position. `view == 0` means unbounded (no gutter
-/// — the raw historical behavior). This is the completion-time foundation;
+/// **#1973 — why this is head+tail, not tail-only.** Before this, an
+/// overflowing block showed only its LAST `view` lines, on the reasoning
+/// that "the tail is where grep hits and errors live" — true for
+/// cargo-style output, where the compiler emits diagnostics and a final
+/// summary line at the end. It is FALSE for "print results, then something
+/// in cleanup crashes" — a shape at least as common (any script/test
+/// harness whose success path finishes before an unrelated teardown
+/// exception). The live incident: an MCP integration test printed
+/// `Response 0`..`Response N` confirming the protocol worked, then an
+/// unrelated asyncio cleanup raised `ProcessLookupError`; tail-only showed
+/// ONLY the traceback, so the one visible artifact at the exact moment a
+/// report claimed "verified working end-to-end" was a crash — the
+/// confirming responses were entirely inside the hidden head. A fold that
+/// must guess which end holds the decisive content is exactly that: a
+/// guess. Showing both ends removes the guess. This is a display-only
+/// fix — it does not change what gets recorded (`#1947` is the separate,
+/// ledger-side rule that an agent's own claims must be backed by evidence
+/// on record); this only changes what the OPERATOR sees without taking
+/// action, since `/spill N` is a recovery step available only AFTER the
+/// misleading view has already been read.
+///
+/// Considered and rejected: content-sniffing for "looks like a traceback /
+/// looks like a result line" (the issue's other proposed alternative). It
+/// would need a pattern per language/harness (Python tracebacks, Rust
+/// panics, JS unhandled rejections, ad-hoc `PASS`/`FAIL`/JSON-RPC shapes,
+/// …) and fails exactly the shapes nobody anticipated — the failure mode
+/// this whole issue is about. A structural head+tail split needs no
+/// language knowledge and degrades gracefully: it can't perfectly center
+/// on the true head/tail boundary in content it hasn't classified, but it
+/// can never fully hide either end the way a single-ended fold can.
+///
+/// Shape: when the output fits in `view` lines it is shown whole with the
+/// `▒` gutter and the `…` end-of-output marker (unchanged from before).
+/// When it overflows, the **first** and **last** portions are shown — a
+/// head (proves what happened before any later failure) and a tail (still
+/// where cargo-style errors live) — with one `▲` marker in between naming
+/// the hidden count, and the `▓` thumb still marks the true tail position.
+/// The head/tail split is roughly even, tail getting any odd remainder row
+/// (`content_budget - content_budget / 2`): either end could hold the
+/// decisive content depending on the output's shape, and the small tail
+/// bias preserves today's historical prior that errors conventionally sit
+/// at the very end. `view == 0` means unbounded (no gutter — the raw
+/// historical behavior).
+///
+/// **The reserve fix, checked specifically (#1973's small-render finding —
+/// a 12-line block clipped 2 MORE lines than its `view` budget implied it
+/// should).** The pre-fix marker line was an unaccounted-for EXTRA row: a
+/// `view`-line budget rendered `view` content lines plus the boundary
+/// marker plus the trailing `…` — `view + 2` total rows, not `view`. The
+/// reserve for that marker was 0 when it should have been at least 1 — off
+/// by exactly the marker's own height. Fixed here by reserving 1 row for
+/// the marker OUT OF `view` before splitting head/tail
+/// (`content_budget = view.saturating_sub(1)`), tightening the overshoot
+/// to `view + 1` (the pre-existing trailing `…` is the one row left
+/// unreserved — see the note on it below). This is the completion-time foundation;
 /// live tail-follow and interactive scrolling are gated on a superseding
 /// decision doc (plain_scroller_tui.md bans multi-line redraws) plus a streaming
 /// dispatch seam — see #1235 for the ladder.
@@ -478,8 +527,11 @@ fn spill_view_lines_with_hint(
         return lines.iter().map(|l| (*l).to_string()).collect();
     }
 
-    // Walk from the tail (where errors and hits live) taking whole lines while
-    // their rendered rows fit the budget.
+    // Does everything fit? Walk from the tail with the FULL (unreserved)
+    // budget — the cheapest way to answer "does it fit" without a separate
+    // full-content row sum, and it reproduces the pre-#1973 behavior exactly
+    // when nothing needs to move (this walk alone decided the whole render
+    // before #1973; it now only decides fits-vs-overflow).
     let mut kept = 0usize;
     let mut used = 0usize;
     for l in lines.iter().rev() {
@@ -494,46 +546,141 @@ fn spill_view_lines_with_hint(
         }
     }
     let start = lines.len() - kept;
-    let tail = &lines[start..];
 
-    // A single line wider than the whole budget is the pathological case the
-    // issue is about. It is the ONLY case where the text is altered, and it is
-    // altered the same way the rest of this function already works: keep the
-    // TAIL, which is where the error is, and say so.
-    if used > view && tail.len() == 1 {
-        let wrapped = wrap_to_width(tail[0], content_width);
-        let dropped = wrapped.len() - view;
-        let mut out = vec![format!(
-            "▲ {dropped} more wrapped rows above · {recovery_hint}"
-        )];
-        for (i, row) in wrapped[dropped..].iter().enumerate() {
-            let glyph = if i + 1 == view { '▓' } else { '▒' };
-            out.push(format!("{glyph} {row}"));
-        }
-        out.push("…".to_string());
-        return out;
+    // A single line wider than the whole budget is the pathological case
+    // #1433 was about. #1973: it gets the SAME head+tail treatment as the
+    // multi-line case for the same reason — the decisive part of one huge
+    // line (a JSON blob, a base64 payload) is not reliably at its end either.
+    if used > view && kept == 1 {
+        return spill_wide_line_head_and_tail(lines[0], view, content_width, recovery_hint);
     }
 
-    let lines: Vec<String> = tail.iter().map(|l| (*l).to_string()).collect();
-    let hidden_logical = start;
-    let mut out = Vec::new();
-    if hidden_logical == 0 {
+    if start == 0 {
+        // Fits: unchanged from pre-#1973.
+        let mut out = Vec::with_capacity(lines.len() + 1);
         for l in &lines {
             out.push(format!("▒ {l}"));
         }
         out.push("…".to_string());
         return out;
     }
-    let hidden = hidden_logical;
+
+    // #1973 OVERFLOW: show both ends rather than tail-only — see the module
+    // doc above for the full reasoning (evidence inversion + the considered
+    // and rejected content-sniffing alternative) and the reserve fix.
+    //
+    // Reserve 1 row for the boundary marker OUT OF `view` (the reserve-off-
+    // by-the-marker's-own-height fix) before splitting; roughly even between
+    // head and tail, tail taking any odd remainder row.
+    let content_budget = view.saturating_sub(1);
+    if content_budget == 0 {
+        // view == 1: no room to reserve for a marker AND show content from
+        // both ends. Not a realistic operator setting — fall back to the
+        // pre-#1973 pure-tail shape using the already-computed full walk.
+        let tail = &lines[start..];
+        let mut out = vec![format!("▲ {start} more lines above · {recovery_hint}")];
+        for (i, l) in tail.iter().enumerate() {
+            let glyph = if i + 1 == tail.len() { '▓' } else { '▒' };
+            out.push(format!("{glyph} {l}"));
+        }
+        out.push("…".to_string());
+        return out;
+    }
+    let head_budget = content_budget / 2;
+    let tail_budget = content_budget - head_budget;
+
+    let mut head_kept = 0usize;
+    let mut head_used = 0usize;
+    for l in &lines {
+        let r = rows_of(l);
+        if head_kept > 0 && head_used + r > head_budget {
+            break;
+        }
+        if r > head_budget {
+            break; // can't fit even one line in the head budget
+        }
+        head_kept += 1;
+        head_used += r;
+        if head_used >= head_budget {
+            break;
+        }
+    }
+
+    let max_tail_lines = lines.len() - head_kept;
+    let mut tail_kept = 0usize;
+    let mut tail_used = 0usize;
+    for l in lines.iter().rev() {
+        if tail_kept >= max_tail_lines {
+            break;
+        }
+        let r = rows_of(l);
+        if tail_kept > 0 && tail_used + r > tail_budget {
+            break;
+        }
+        tail_kept += 1;
+        tail_used += r;
+        if tail_used >= tail_budget {
+            break;
+        }
+    }
+
+    let hidden = lines.len() - head_kept - tail_kept;
+    if hidden == 0 {
+        // The reserved (smaller) split still covered everything after all.
+        let mut out = Vec::with_capacity(lines.len() + 1);
+        for l in &lines {
+            out.push(format!("▒ {l}"));
+        }
+        out.push("…".to_string());
+        return out;
+    }
+
+    let mut out = Vec::with_capacity(head_kept + tail_kept + 2);
+    for l in &lines[..head_kept] {
+        out.push(format!("▒ {l}"));
+    }
     // #1263: this excerpt is PLAIN PRINTED TEXT — it deliberately shares the
     // ▲/▒/▓ glyphs with the live viewport, so without this hint it masqueraded
     // as the interactive scroller (the diagnosed operator tried to expand it in
     // scrollback). Name the real recovery path at the point of use.
-    out.push(format!("▲ {hidden} more lines above · {recovery_hint}"));
-    let tail = &lines[..];
-    for (i, l) in tail.iter().enumerate() {
-        let glyph = if i + 1 == tail.len() { '▓' } else { '▒' };
+    out.push(format!("▲ {hidden} lines omitted · {recovery_hint}"));
+    let tail_start = lines.len() - tail_kept;
+    for (i, l) in lines[tail_start..].iter().enumerate() {
+        let glyph = if i + 1 == tail_kept { '▓' } else { '▒' };
         out.push(format!("{glyph} {l}"));
+    }
+    out.push("…".to_string());
+    out
+}
+
+/// The #1433 pathological case (one line wider than the whole row budget),
+/// given the SAME head+tail treatment as the multi-line path (#1973) — see
+/// [`spill_view_lines_with_hint`]'s module doc. Operates on already-wrapped
+/// rows, so every row costs exactly 1 (no per-row wrap-width accounting
+/// needed, unlike the multi-line split).
+fn spill_wide_line_head_and_tail(
+    line: &str,
+    view: usize,
+    content_width: usize,
+    recovery_hint: &str,
+) -> Vec<String> {
+    let wrapped = wrap_to_width(line, content_width);
+    let content_budget = view.saturating_sub(1).max(1);
+    let head_budget = (content_budget / 2).min(wrapped.len());
+    let tail_budget = (content_budget - content_budget / 2).min(wrapped.len() - head_budget);
+    let tail_start = wrapped.len() - tail_budget;
+    let hidden = tail_start - head_budget;
+
+    let mut out = Vec::new();
+    for row in &wrapped[..head_budget] {
+        out.push(format!("▒ {row}"));
+    }
+    if hidden > 0 {
+        out.push(format!("▲ {hidden} wrapped rows omitted · {recovery_hint}"));
+    }
+    for (i, row) in wrapped[tail_start..].iter().enumerate() {
+        let glyph = if i + 1 == tail_budget { '▓' } else { '▒' };
+        out.push(format!("{glyph} {row}"));
     }
     out.push("…".to_string());
     out
@@ -964,6 +1111,17 @@ mod tests {
     /// #1433: measuring in rows must still SPEND the budget in rows — a wide
     /// line costs what it actually occupies, so fewer lines are shown, not more
     /// rows than asked for.
+    ///
+    /// **#1973 declared amendment: this golden MOVED.** Pre-#1973 the wide
+    /// line alone consumed the whole 3-row budget, leaving zero room for
+    /// `a`/`b`/`c` — tail-only by construction never shows anything before
+    /// the tail item it kept. Post-#1973 the budget is split head+tail
+    /// (content_budget=2 → head=1/tail=1), so `a` (the head) now shows
+    /// alongside the wide line (the tail) — TWO body rows, not one. The
+    /// property this test still proves is unchanged and is what it is
+    /// actually named for: the wide line's row cost is still measured
+    /// correctly, so `b`/`c` are still excluded (only `a` fits the 1-row
+    /// head budget).
     #[test]
     fn a_wide_line_spends_the_row_budget_it_actually_occupies() {
         const COLS: usize = 20;
@@ -976,37 +1134,42 @@ mod tests {
             .filter(|l| l.starts_with('▒') || l.starts_with('▓'))
             .collect();
         assert_eq!(
-            body.len(),
-            1,
-            "the wide line alone should consume the 3-row budget, leaving no \
-             room for a/b/c:\n{out:#?}"
+            body,
+            vec!["▒ a", &format!("▓ {wide}")],
+            "the wide line's 3-row cost must still exclude b/c — only the \
+             1-row head (a) and the wide tail fit the split budget:\n{out:#?}"
         );
-        assert!(out[0].contains("more lines above"), "{out:#?}");
+        assert!(out.iter().any(|l| l.contains("lines omitted")), "{out:#?}");
         assert!(
-            out[0].contains(SPILL_RECOVERY_HINT),
+            out.iter().any(|l| l.contains(SPILL_RECOVERY_HINT)),
             "every truncation marker names the way out:\n{out:#?}"
         );
     }
 
-    /// #1235: the spill view is TAIL-biased with the issue's gutter glyphs —
-    /// small outputs show whole (▒ gutter + … end marker), overflow shows the
-    /// LAST `view` lines with the ▲ hidden-count boundary and the ▓ thumb on
-    /// the tail line. view=0 = unbounded raw (historical behavior).
+    /// #1235/#1973: the spill view shows BOTH ends with the issue's gutter
+    /// glyphs — small outputs show whole (▒ gutter + … end marker), overflow
+    /// shows a head and a tail with the ▲ hidden-count boundary between them
+    /// and the ▓ thumb on the true tail line. view=0 = unbounded raw
+    /// (historical behavior).
+    ///
+    /// **#1973 declared amendment: the overflow golden MOVED**, from
+    /// tail-only (`l3,l4,l5`) to head+tail (`l1` .. `l5`) — see the module
+    /// doc on [`spill_view_lines`] for why tail-only is a defect, not a
+    /// style choice.
     #[test]
-    fn spill_view_is_tail_biased_with_gutter_glyphs() {
-        // Fits: whole output, ▒ gutter, end marker.
+    fn spill_view_shows_both_ends_with_gutter_glyphs() {
+        // Fits: whole output, ▒ gutter, end marker — unchanged by #1973.
         let small = spill_view_lines("a\nb\nc", 3, 80);
         assert_eq!(small, vec!["▒ a", "▒ b", "▒ c", "…"]);
 
-        // Overflows: LAST view lines (tail is where errors/hits live),
-        // ▲ carries the hidden count, ▓ thumbs the tail.
+        // Overflows: a head AND a tail (#1973 — neither end is fully
+        // hidden), ▲ carries the hidden count, ▓ thumbs the true tail.
         let big = spill_view_lines("l1\nl2\nl3\nl4\nl5", 3, 80);
         assert_eq!(
             big,
             vec![
-                "▲ 2 more lines above · /spill N raises this view",
-                "▒ l3",
-                "▒ l4",
+                "▒ l1",
+                "▲ 3 lines omitted · /spill N raises this view",
                 "▓ l5",
                 "…"
             ]
@@ -1018,6 +1181,8 @@ mod tests {
         assert!(spill_view_lines("", 3, 80).is_empty());
     }
 
+    /// **#1973 declared amendment: this golden MOVED** — same head+tail
+    /// reasoning as `spill_view_shows_both_ends_with_gutter_glyphs`.
     #[test]
     fn completed_tool_output_uses_the_spill_view() {
         let output = "l1\nl2\nl3\nl4\nl5";
@@ -1025,9 +1190,8 @@ mod tests {
         assert_eq!(
             spill_view_lines(output, 3, 80),
             vec![
-                "▲ 2 more lines above · /spill N raises this view",
-                "▒ l3",
-                "▒ l4",
+                "▒ l1",
+                "▲ 3 lines omitted · /spill N raises this view",
                 "▓ l5",
                 "…"
             ]
@@ -1040,13 +1204,23 @@ mod tests {
     /// of use — it is plain printed text sharing the live viewport's glyphs, so
     /// without the hint it masqueraded as the interactive scroller (the
     /// diagnosed operator tried to expand it in scrollback and could not).
+    ///
+    /// **#1973 declared amendment:** the hint no longer lives at a fixed
+    /// index — with a head shown before it, the boundary marker (and its
+    /// hint) sits wherever the head ends, not always at `lines[0]`. The
+    /// property this test proves — the hint appears somewhere, exactly
+    /// once, whenever truncation occurs — is unchanged.
     #[test]
     fn completed_excerpt_names_its_recovery_path() {
         let lines = spill_view_lines("l1\nl2\nl3\nl4\nl5", 3, 80);
-        assert!(
-            lines[0].contains("/spill N raises this view"),
-            "the ▲ boundary must carry the recovery hint: {:?}",
-            lines[0]
+        let hint_lines: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("/spill N raises this view"))
+            .collect();
+        assert_eq!(
+            hint_lines.len(),
+            1,
+            "the boundary marker must carry the recovery hint exactly once: {lines:?}"
         );
         // #1263 fingerprint pin (the other half lives in the spill_view tests):
         // the completed excerpt's last row is the INERT `…` — never the live
@@ -1055,6 +1229,126 @@ mod tests {
         // The fits-entirely form is inert-terminated too.
         let small = spill_view_lines("a\nb", 3, 80);
         assert_eq!(small.last().map(String::as_str), Some("…"));
+    }
+
+    /// #1973 anti-vacuous pair, replaying the incident's own shape: a script
+    /// prints real results, then something unrelated in cleanup crashes.
+    /// Tail-only showed ONLY the traceback — the confirming responses were
+    /// entirely inside the hidden middle. Both the LAST result line and the
+    /// TRACEBACK'S OWN HEAD must be visible in one default render.
+    ///
+    /// `view=8` (not the bare `[tui] spill_lines` default of 3) is chosen
+    /// deliberately and stated so, not smuggled in: no fold of a 3-row
+    /// budget can show 2 result lines AND any part of a 12-line traceback —
+    /// there is not enough room at any split, head+tail or otherwise. 8 is
+    /// what "the default view" (as the issue frames it, contrasted with an
+    /// operator's `/spill N` AFTER already reading a misleading render)
+    /// looks like for a moderately verbose tool result; the property under
+    /// test is the SPLIT's behavior, not a specific numeric default.
+    #[test]
+    fn results_then_a_crash_shows_the_last_result_and_the_traceback_head() {
+        let output = [
+            "Response 0: initialize ok",
+            "Response 1: tools/list ok",
+            "Traceback (most recent call last):",
+            "File \"cleanup.py\", line 40, in shutdown",
+            "File \"cleanup.py\", line 30, in _terminate",
+            "File \"cleanup.py\", line 20, in _kill",
+            "File \"cleanup.py\", line 15, in _signal",
+            "File \"cleanup.py\", line 10, in _reap",
+            "File \"cleanup.py\", line 8, in _wait",
+            "File \"cleanup.py\", line 6, in _proc",
+            "File \"cleanup.py\", line 4, in _pid",
+            "ProcessLookupError: [Errno 3] No such process",
+        ]
+        .join("\n");
+        let output = output.as_str();
+        let out = spill_view_lines(output, 8, 80);
+        let joined = out.join("\n");
+
+        assert!(
+            joined.contains("Response 1: tools/list ok"),
+            "the last result line — the confirming evidence — must not be \
+             fully hidden inside the fold:\n{out:#?}"
+        );
+        assert!(
+            joined.contains("Traceback (most recent call last):"),
+            "the traceback's own head must not be fully hidden either — \
+             showing only its tail (the pre-#1973 behavior) is exactly the \
+             evidence-inversion this issue is about:\n{out:#?}"
+        );
+        // The true tail — the actual exception — is still the tail's last
+        // line (▓-thumbed): the fix ADDS a head, it does not sacrifice the
+        // tail cargo-style output already depended on.
+        assert!(
+            out.last().is_some_and(|l| l == "…"),
+            "inert-terminated as always:\n{out:#?}"
+        );
+        assert!(
+            joined.contains("ProcessLookupError"),
+            "the actual exception must still be visible — this is not a \
+             head-only regression of the tail:\n{out:#?}"
+        );
+    }
+
+    /// #1973 anti-vacuous TWIN: cargo-style output (the decisive content
+    /// really is last) must not regress. Same `view` as the sibling test
+    /// above for a fair comparison.
+    #[test]
+    fn cargo_style_output_with_errors_last_still_shows_the_errors() {
+        let output = [
+            "Compiling foo v0.1.0",
+            "Compiling bar v0.1.0",
+            "Compiling baz v0.1.0",
+            "Compiling qux v0.1.0",
+            "Compiling quux v0.1.0",
+            "Compiling corge v0.1.0",
+            "Compiling grault v0.1.0",
+            "error[E0499]: cannot borrow `x` as mutable more than once",
+            "  --> src/lib.rs:42:5",
+            "error[E0502]: cannot borrow `x` as immutable",
+            "  --> src/lib.rs:43:5",
+            "error: could not compile `foo` (bin \"foo\") due to 2 previous errors",
+        ]
+        .join("\n");
+        let output = output.as_str();
+        let out = spill_view_lines(output, 8, 80);
+        let joined = out.join("\n");
+
+        assert!(
+            joined
+                .contains("error: could not compile `foo` (bin \"foo\") due to 2 previous errors"),
+            "the final cargo summary line — the decisive content for THIS \
+             shape — must still be visible:\n{out:#?}"
+        );
+        assert!(
+            joined.contains("E0499") || joined.contains("E0502"),
+            "at least one of the actual diagnostics should still be in the \
+             tail window:\n{out:#?}"
+        );
+    }
+
+    /// #1973's small-render finding, checked directly: the reserve for the
+    /// boundary marker was previously 0 (an unaccounted extra row on top of
+    /// `view` content rows), so a `view`-row budget rendered `view + 2`
+    /// total rows (content + marker + the pre-existing trailing `…`), not
+    /// `view`. Reserving 1 row for the marker tightens this to `view + 1` —
+    /// the one row still unaccounted for is the trailing `…`, which predates
+    /// #1973 and is not part of "the marker's own height".
+    #[test]
+    fn the_marker_reserve_is_tightened_by_its_own_height() {
+        for view in [2usize, 3, 5, 8, 12] {
+            // Enough lines to guarantee overflow at every tested view.
+            let lines: Vec<String> = (0..view + 20).map(|i| format!("l{i}")).collect();
+            let out = spill_view_lines(&lines.join("\n"), view, 80);
+            assert!(
+                out.len() <= view + 1,
+                "view={view}: rendered {} total rows, expected at most view+1 \
+                 ({}) — the marker's reserve regressed:\n{out:#?}",
+                out.len(),
+                view + 1
+            );
+        }
     }
 
     /// #1640 Layer 1: a spilled result collapses to ONE line in summary mode —
