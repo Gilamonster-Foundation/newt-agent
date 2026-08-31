@@ -469,6 +469,66 @@ mod region_lease_door {
         );
     }
 
+    /// Writers that own rows but cannot yet NAME them.
+    ///
+    /// Both paint cursor-relative — `MoveUp` then
+    /// `Clear(ClearType::FromCursorDown)` — so they claim "from here down"
+    /// rather than an absolute range. A `Region` needs absolute rows, and
+    /// neither writer knows its own top: learning it means a DSR cursor query,
+    /// which #1950/#1952 established is exactly the thing that cannot be
+    /// relied on. Migrating them is a redesign, not a field.
+    ///
+    /// Enumerated so they stay countable and this list may only shrink.
+    const CURSOR_RELATIVE_CLAIMS: &[(&str, &str)] = &[
+        (
+            "live_spill.rs",
+            "N rows below the cursor; already registers as an ephemeral, so a \
+             prompt erases it — it lacks exclusion, not visibility",
+        ),
+        (
+            "lean_input.rs",
+            "rows_above_cursor, on the plain-scroller path that #1803's \
+             migration notice moves to wyvern-agent",
+        ),
+    ];
+
+    /// The cursor-relative holdouts are exactly the two declared ones.
+    ///
+    /// Not a permission list: a THIRD writer that paints from the cursor down
+    /// is a new unarbitrated region, and it fails here until someone either
+    /// leases it or argues it onto this list.
+    #[test]
+    fn cursor_relative_region_painters_are_the_declared_two() {
+        const NEEDLE: &str = "Clear(ClearType::FromCursorDown)";
+        let files = sources();
+        assert!(
+            files.len() > 10,
+            "the scan found {} files, so it is not reading the crate",
+            files.len()
+        );
+        let mut found: Vec<&str> = Vec::new();
+        for (name, body) in &files {
+            if !body.contains(NEEDLE) {
+                continue;
+            }
+            // A file that leases its rows is painting INSIDE what it owns —
+            // `InlineGuard::drop` erasing its own viewport, for instance.
+            if body.contains("RegionLease") || body.contains("lease_bottom_rows") {
+                continue;
+            }
+            found.push(name.as_str());
+        }
+        found.sort_unstable();
+        let mut declared: Vec<&str> = CURSOR_RELATIVE_CLAIMS.iter().map(|(f, _)| *f).collect();
+        declared.sort_unstable();
+        assert_eq!(
+            found, declared,
+            "the cursor-relative holdouts changed. A new one must lease its \
+             rows or be declared here with a reason; a migrated one must be \
+             removed from the list."
+        );
+    }
+
     /// Probe one: the needle WOULD fire on a new site. Without this the test
     /// above passes equally well when the needle matches nothing at all.
     #[test]
