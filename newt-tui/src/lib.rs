@@ -55,6 +55,9 @@ mod prompt;
 /// needs a real terminal to observe a terminal property. See the module docs.
 #[cfg(all(test, unix))]
 mod prompt_visibility_test;
+/// #1981: the ONE list of top-level slash commands. Three lists knew this
+/// before and none agreed; see the module doc.
+mod slash_registry;
 #[cfg(feature = "live-spill")]
 mod spill_view;
 /// #1669 PR-A — the staged tab switch and the one tab-action handler, against
@@ -12628,11 +12631,7 @@ fn dispatch_slash(
         "crew" => commands::crew::dispatch(arg1, arg2, color, verbose),
         "setup" => commands::setup::dispatch(arg1, color, verbose),
         other => {
-            print_newt(
-                &format!("unknown command: /{other}  (try /help)"),
-                color,
-                verbose,
-            );
+            print_newt(&slash_registry::fallthrough_message(other), color, verbose);
             Ok(true)
         }
     }
