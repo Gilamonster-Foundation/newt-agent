@@ -513,12 +513,17 @@ pub fn session_tool_rounds() -> Option<usize> {
     SESSION_TOOL_ROUNDS.lock().ok().and_then(|s| *s)
 }
 
-/// Install the config/model-tuned round cap for the ACTIVE model — the
-/// baseline an override is measured against. Called by the session wherever it
-/// already derives that number, the same way `set_active_model_family` is.
-pub fn set_configured_tool_rounds(rounds: usize) {
+/// Install (or forget, with `None`) the config/model-tuned round cap for the
+/// ACTIVE model — the baseline an override is measured against. Called by the
+/// session wherever it already derives that number, the same way
+/// `set_active_model_family` is.
+///
+/// `Option` for symmetry with [`set_session_tool_rounds`], and because
+/// "forget the baseline" is a real state: no model has settled yet, and a
+/// receipt written then must say so rather than reuse a stale number.
+pub fn set_configured_tool_rounds(rounds: Option<usize>) {
     if let Ok(mut slot) = CONFIGURED_TOOL_ROUNDS.lock() {
-        *slot = Some(rounds);
+        *slot = rounds;
     }
 }
 
@@ -608,7 +613,7 @@ mod tests {
         set_session_tool_rounds(None);
         assert_eq!(session_tool_rounds(), None, "the override releases");
 
-        set_configured_tool_rounds(40);
+        set_configured_tool_rounds(Some(40));
         assert_eq!(configured_tool_rounds(), Some(40));
     }
 
@@ -620,7 +625,7 @@ mod tests {
     #[test]
     fn the_derivation_is_computable_from_the_globals() {
         let _g = crate::test_guard::GlobalSettingsGuard::acquire();
-        set_configured_tool_rounds(40);
+        set_configured_tool_rounds(Some(40));
         set_cli_tenacity(Tenacity::Relentless);
         set_session_tool_rounds(Some(320));
 
@@ -647,9 +652,7 @@ mod tests {
     #[test]
     fn no_baseline_means_no_derivation_not_a_default() {
         let _g = crate::test_guard::GlobalSettingsGuard::acquire();
-        if let Ok(mut slot) = CONFIGURED_TOOL_ROUNDS.lock() {
-            *slot = None;
-        }
+        set_configured_tool_rounds(None);
         assert_eq!(configured_tool_rounds(), None);
         assert!(
             session_tool_round_limit().is_none(),
@@ -908,7 +911,7 @@ mod tests {
         ));
         set_active_model_family(Some("nemotron".to_string()));
         set_session_tool_rounds(Some(320));
-        set_configured_tool_rounds(40);
+        set_configured_tool_rounds(Some(40));
         assert_eq!(cli_tenacity(), Some(Tenacity::Relentless));
         assert_eq!(persona_tenacity(), Some(Tenacity::Insistent));
         assert!(tenacity_config().is_some_and(|c| !c.families.is_empty()));

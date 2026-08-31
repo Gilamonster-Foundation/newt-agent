@@ -60,6 +60,24 @@ pub(crate) type Ask<'a> = &'a dyn Fn(&SurfaceInteraction) -> HumanQuestionOutcom
 /// `/psyche` is therefore NOT absorbed: its panel and its status view perform,
 /// and they keep performing. What moved here is its two text setters, which
 /// only ever set. See `docs/decisions/slash_command_target_set.md`.
+/// What a field will accept.
+///
+/// Four of the five settings are a closed vocabulary, and a menu is the right
+/// surface for those. The round cap is a NUMBER, so it gets a text field —
+/// widening the form rather than bolting a second dispatch beside it, which is
+/// what forced `/rounds` to keep its own unrecorded write until now.
+enum ValueSpace {
+    /// A closed vocabulary, rendered as a menu of `(value, what it means)`.
+    Choice(Vec<(&'static str, String)>),
+    /// A number in `min..=max`, plus one token that RELEASES the setting back
+    /// to its derived default (`auto`).
+    Number {
+        release: &'static str,
+        min: usize,
+        max: usize,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Field {
     EditMode,
@@ -67,6 +85,7 @@ pub(crate) enum Field {
     Cognition,
     Thinking,
     Nudge,
+    Rounds,
 }
 
 impl Field {
@@ -77,6 +96,7 @@ impl Field {
         Self::Cognition,
         Self::Thinking,
         Self::Nudge,
+        Self::Rounds,
     ];
 
     /// The deep-link token: `/settings <name> [value]`. This is ALSO the
@@ -89,6 +109,7 @@ impl Field {
             Self::Cognition => "cognition",
             Self::Thinking => "thinking",
             Self::Nudge => "nudge",
+            Self::Rounds => "rounds",
         }
     }
 
@@ -99,6 +120,7 @@ impl Field {
             Self::Cognition => "cognition",
             Self::Thinking => "thinking spinner",
             Self::Nudge => "action-pressure nudges",
+            Self::Rounds => "tool-call round limit",
         }
     }
 
@@ -108,11 +130,11 @@ impl Field {
     /// `Cognition::all()` — the same lists `/psyche … list` renders. A second
     /// hand-written copy here is how the form and the dial would drift apart
     /// the first time a level is added.
-    fn values(self) -> Vec<(&'static str, String)> {
+    fn value_space(self) -> ValueSpace {
         use newt_core::role_profile::Cognition;
         use newt_core::Tenacity;
-        let owned = |pairs: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
-            pairs.iter().map(|(v, d)| (*v, (*d).to_string())).collect()
+        let owned = |pairs: &[(&'static str, &str)]| -> ValueSpace {
+            ValueSpace::Choice(pairs.iter().map(|(v, d)| (*v, (*d).to_string())).collect())
         };
         match self {
             Self::EditMode => owned(&[
@@ -120,17 +142,19 @@ impl Field {
                 ("emacs", "emacs-style editing"),
                 ("nano", "nano-style editing"),
             ]),
-            Self::Tenacity => std::iter::once((
-                "auto",
-                "inherit from the persona / config / model family".to_string(),
-            ))
-            .chain(
-                Tenacity::all()
-                    .into_iter()
-                    .map(|t| (t.label(), t.describe())),
-            )
-            .collect(),
-            Self::Cognition => {
+            Self::Tenacity => ValueSpace::Choice(
+                std::iter::once((
+                    "auto",
+                    "inherit from the persona / config / model family".to_string(),
+                ))
+                .chain(
+                    Tenacity::all()
+                        .into_iter()
+                        .map(|t| (t.label(), t.describe())),
+                )
+                .collect(),
+            ),
+            Self::Cognition => ValueSpace::Choice(
                 std::iter::once(("auto", "follow the active persona (default)".to_string()))
                     .chain(std::iter::once((
                         "off",
@@ -141,8 +165,8 @@ impl Field {
                             .into_iter()
                             .map(|c| (c.label(), c.describe().to_string())),
                     )
-                    .collect()
-            }
+                    .collect(),
+            ),
             Self::Thinking => owned(&[
                 ("on", "stream reasoning above the answer (default)"),
                 ("off", "just the answer"),
@@ -151,6 +175,15 @@ impl Field {
                 ("on", "action-pressure steering enabled (default)"),
                 ("off", "no narration rescue / workflow repair / plan pushes"),
             ]),
+            // The one field that is not a vocabulary. `/rounds double` and
+            // `/rounds unlimited` stay affordances of the VERB — they are
+            // relative operations, not values — and the verb resolves them to a
+            // number before it lands here.
+            Self::Rounds => ValueSpace::Number {
+                release: "auto",
+                min: 1,
+                max: newt_core::tenacity::RELENTLESS_TOOL_ROUND_TARGET,
+            },
         }
     }
 
@@ -184,6 +217,25 @@ impl Field {
             }
             .to_string(),
             Self::Nudge => if nudges_off() { "off" } else { "on" }.to_string(),
+            Self::Rounds => newt_core::tenacity::session_tool_rounds()
+                .map_or_else(|| "auto".to_string(), |n| n.to_string()),
+        }
+    }
+
+    /// This setting's value **with whatever provenance it has** — the payload a
+    /// receipt records (#1998).
+    ///
+    /// For every token-valued field that is just the token. For the round cap
+    /// it is the whole `ToolRoundLimit`, because a cap without the number it
+    /// was measured against is precisely the record #1965 found missing. It
+    /// falls back to the token when no config baseline has been installed:
+    /// "unknown" is an honest answer, an invented `configured` is not.
+    fn value_now(self) -> newt_core::settings_receipt::SettingValue {
+        use newt_core::settings_receipt::SettingValue;
+        match self {
+            Self::Rounds => newt_core::tenacity::session_tool_round_limit()
+                .map_or_else(|| SettingValue::Token(self.current()), SettingValue::from),
+            _ => SettingValue::Token(self.current()),
         }
     }
 
@@ -200,7 +252,7 @@ impl Field {
     /// The alias arms are not politeness — each one was accepted by the verb
     /// this field absorbed, and absorbing a command must not silently drop an
     /// affordance operators already type.
-    fn accepts(self, value: &str) -> Option<&'static str> {
+    fn accepts(self, value: &str) -> Option<String> {
         let want = value.trim().to_lowercase();
         let want = match (self, want.as_str()) {
             // `/edit-mode vim`
@@ -210,12 +262,53 @@ impl Field {
             // `/psyche cognition none` / `reset` / `persona`
             (Self::Cognition, "none") => "off",
             (Self::Cognition, "reset" | "persona") => "auto",
+            // `/rounds reset|default` release the override, the same word the
+            // dials use for the same act.
+            (Self::Rounds, "reset" | "default") => "auto",
             _ => want.as_str(),
         };
-        self.values()
-            .into_iter()
-            .find(|(v, _)| *v == want)
-            .map(|(v, _)| v)
+        match self.value_space() {
+            ValueSpace::Choice(values) => values
+                .into_iter()
+                .find(|(v, _)| *v == want)
+                .map(|(v, _)| v.to_string()),
+            ValueSpace::Number { release, min, max } => {
+                if want == release {
+                    return Some(release.to_string());
+                }
+                // Canonical decimal, so `/settings rounds 0050` and
+                // `/settings rounds 50` are one value with one address.
+                want.parse::<usize>()
+                    .ok()
+                    .filter(|n| (min..=max).contains(n))
+                    .map(|n| n.to_string())
+            }
+        }
+    }
+
+    /// The tokens this field offers, for tests that check the vocabulary is the
+    /// dial's own rather than a second copy. Empty for a numeric field.
+    #[cfg(test)]
+    fn offered(self) -> Vec<&'static str> {
+        match self.value_space() {
+            ValueSpace::Choice(values) => values.into_iter().map(|(v, _)| v).collect(),
+            ValueSpace::Number { release, .. } => vec![release],
+        }
+    }
+
+    /// What this field accepts, said in one line — the refusal message, and the
+    /// text field's hint.
+    fn accepts_hint(self) -> String {
+        match self.value_space() {
+            ValueSpace::Choice(values) => values
+                .into_iter()
+                .map(|(v, _)| v)
+                .collect::<Vec<_>>()
+                .join(", "),
+            ValueSpace::Number { release, min, max } => {
+                format!("{release}, or a number from {min} to {max}")
+            }
+        }
     }
 }
 
@@ -247,8 +340,16 @@ pub(crate) fn field_menu() -> InteractionDefinition {
 /// The second step: which value for `field`.
 pub(crate) fn value_menu(field: Field) -> InteractionDefinition {
     let current = field.current();
-    let entries: Vec<(String, String)> = field
-        .values()
+    let ValueSpace::Choice(values) = field.value_space() else {
+        // A number has no menu to pick from, so the form asks for it — still a
+        // typed `InteractionDefinition`, so it still renders on the plain
+        // scroller, the RichTUI and the web.
+        return newt_core::interaction_form::text_field(
+            format!("{} — currently {current}", field.label()),
+            format!("{} · Esc cancels", field.accepts_hint()),
+        );
+    };
+    let entries: Vec<(String, String)> = values
         .into_iter()
         .enumerate()
         .map(|(i, (value, what))| {
@@ -282,13 +383,13 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
     use newt_core::Tenacity;
 
     let Some(value) = field.accepts(value) else {
-        let allowed: Vec<&str> = field.values().into_iter().map(|(v, _)| v).collect();
         return Err(format!(
-            "/settings {} takes one of: {}",
+            "/settings {} takes {}",
             field.name(),
-            allowed.join(", ")
+            field.accepts_hint()
         ));
     };
+    let value = value.as_str();
     match field {
         // Under the process-env lock (#1850); the editor is rebuilt right
         // after a slash command returns, before further input is read.
@@ -328,6 +429,10 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
                 newt_core::process_env::remove_var("NEWT_NUDGE");
             }
         }
+        // `auto` releases the override so the cap derives from tenacity +
+        // config again; anything else is a number `accepts` has already
+        // bounded, so the parse cannot fail.
+        Field::Rounds => newt_core::tenacity::set_session_tool_rounds(value.parse::<usize>().ok()),
     }
     Ok(format!("{}: {value}", field.label()))
 }
@@ -344,7 +449,12 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
 ///
 /// Pure, so the whole decision is exercised with no filesystem: the write
 /// itself belongs to `settings_receipt::record`.
-fn change_for(field: Field, from: &str, to: &str, via: &str) -> Option<SettingChange> {
+fn change_for(
+    field: Field,
+    from: newt_core::settings_receipt::SettingValue,
+    to: newt_core::settings_receipt::SettingValue,
+    via: &str,
+) -> Option<SettingChange> {
     match crate::slash_registry::receipt_for(field.name()) {
         crate::slash_registry::Receipt::Journal => {
             Some(SettingChange::new(field.name(), from, to, via))
@@ -370,9 +480,9 @@ fn change_for(field: Field, from: &str, to: &str, via: &str) -> Option<SettingCh
 /// swallows its own failures): failing to observe a change must never undo the
 /// change.
 pub(crate) fn apply_and_record(field: Field, value: &str, via: &str) -> Result<String, String> {
-    let from = field.current();
+    let from = field.value_now();
     let message = apply(field, value)?;
-    if let Some(change) = change_for(field, &from, &field.current(), via) {
+    if let Some(change) = change_for(field, from, field.value_now(), via) {
         let _ = newt_core::settings_receipt::record(change);
     }
     Ok(message)
@@ -428,18 +538,37 @@ pub(crate) fn run(ask: Ask<'_>, rest: &str) -> Vec<String> {
 }
 
 fn ask_value(ask: Ask<'_>, field: Field) -> Vec<String> {
-    let menu = value_menu(field);
-    let Some(choice) = ask_choice(ask, &menu) else {
-        return vec!["settings: cancelled".to_string()];
+    let cancelled = || vec!["settings: cancelled".to_string()];
+    let definition = value_menu(field);
+    let value = match field.value_space() {
+        // A number is taken as typed; `apply` is the one validator, so the
+        // form does not grow a second opinion about what is in range.
+        ValueSpace::Number { .. } => {
+            let interaction = SurfaceInteraction::blocking(definition.clone());
+            let HumanQuestionOutcome::Answer(answer) = ask(&interaction) else {
+                return cancelled();
+            };
+            let answer = answer.trim().to_string();
+            // An empty line is backing out, not an invalid number.
+            if answer.is_empty() {
+                return cancelled();
+            }
+            answer
+        }
+        ValueSpace::Choice(values) => {
+            let Some(choice) = ask_choice(ask, &definition) else {
+                return cancelled();
+            };
+            let Some(index) = choice.parse::<usize>().ok().filter(|i| *i >= 1) else {
+                return cancelled();
+            };
+            let Some((value, _)) = values.get(index - 1) else {
+                return cancelled();
+            };
+            (*value).to_string()
+        }
     };
-    let Some(index) = choice.parse::<usize>().ok().filter(|i| *i >= 1) else {
-        return vec!["settings: cancelled".to_string()];
-    };
-    let values = field.values();
-    let Some((value, _)) = values.get(index - 1) else {
-        return vec!["settings: cancelled".to_string()];
-    };
-    vec![match apply_and_record(field, value, "/settings") {
+    vec![match apply_and_record(field, &value, "/settings") {
         Ok(msg) | Err(msg) => msg,
     }]
 }
@@ -483,6 +612,21 @@ mod tests {
             next.set(i + 1);
             answers.get(i).map_or(HumanQuestionOutcome::Cancelled, |a| {
                 HumanQuestionOutcome::Answer((*a).to_string())
+            })
+        }
+    }
+
+    /// Like [`answering`] but for answers built at runtime (a field index, a
+    /// typed number).
+    fn answering_owned(
+        answers: Vec<String>,
+    ) -> impl Fn(&SurfaceInteraction) -> HumanQuestionOutcome {
+        let next = std::cell::Cell::new(0usize);
+        move |_| {
+            let i = next.get();
+            next.set(i + 1);
+            answers.get(i).map_or(HumanQuestionOutcome::Cancelled, |a| {
+                HumanQuestionOutcome::Answer(a.clone())
             })
         }
     }
@@ -547,8 +691,8 @@ mod tests {
     /// must not silently drop an alias operators type.
     #[test]
     fn the_vim_alias_the_old_verb_took_still_resolves() {
-        assert_eq!(Field::EditMode.accepts("vim"), Some("vi"));
-        assert_eq!(Field::EditMode.accepts("VI"), Some("vi"));
+        assert_eq!(Field::EditMode.accepts("vim").as_deref(), Some("vi"));
+        assert_eq!(Field::EditMode.accepts("VI").as_deref(), Some("vi"));
         assert_eq!(Field::EditMode.accepts("ed"), None);
     }
 
@@ -615,22 +759,14 @@ mod tests {
     /// would silently disagree.
     #[test]
     fn the_dial_levels_are_the_dials_own() {
-        let offered: Vec<&str> = Field::Tenacity
-            .values()
-            .into_iter()
-            .map(|(v, _)| v)
-            .collect();
+        let offered = Field::Tenacity.offered();
         for level in newt_core::Tenacity::all() {
             assert!(offered.contains(&level.label()), "{level:?} not offered");
         }
         assert!(offered.contains(&"auto"), "the release value is missing");
         assert_eq!(offered.len(), newt_core::Tenacity::all().len() + 1);
 
-        let offered: Vec<&str> = Field::Cognition
-            .values()
-            .into_iter()
-            .map(|(v, _)| v)
-            .collect();
+        let offered = Field::Cognition.offered();
         for level in newt_core::role_profile::Cognition::all() {
             assert!(offered.contains(&level.label()), "{level:?} not offered");
         }
@@ -651,7 +787,7 @@ mod tests {
             (Field::Cognition, "persona", "auto"),
         ] {
             assert_eq!(
-                field.accepts(typed),
+                field.accepts(typed).as_deref(),
                 Some(want),
                 "/{} {typed} stopped resolving",
                 field.name()
@@ -690,12 +826,15 @@ mod tests {
                 "/settings {} has no declared receipt destination",
                 field.name()
             );
-            assert!(change_for(*field, "a", "b", "/settings").is_some());
+            assert!(change_for(*field, "a".into(), "b".into(), "/settings").is_some());
         }
         // **Anti-vacuous.** If the column read `Journal` for everything,
-        // reading it would prove nothing. `/rounds` is the #1965 command
-        // itself and is still undeclared; `/help` mutates nothing.
-        assert_eq!(receipt_for("rounds"), Receipt::Missing);
+        // reading it would prove nothing. `/remember` writes durable notes and
+        // still records no decision; `/help` mutates nothing.
+        //
+        // This used to name `/rounds`, which is the whole point of #1998: the
+        // example had to be replaced because the debt it stood for was paid.
+        assert_eq!(receipt_for("remember"), Receipt::Missing);
         assert_eq!(receipt_for("help"), Receipt::None_);
         assert_eq!(receipt_for("zzznotacommand"), Receipt::Missing);
     }
@@ -704,15 +843,159 @@ mod tests {
     /// half of the event a reader cannot reconstruct from the resulting state.
     #[test]
     fn the_recorded_change_names_the_route_and_the_transition() {
-        let change = change_for(Field::EditMode, "vi", "emacs", "/vi").expect("declared");
+        let change =
+            change_for(Field::EditMode, "vi".into(), "emacs".into(), "/vi").expect("declared");
         assert_eq!(change.setting, "edit-mode");
-        assert_eq!(change.from, "vi");
-        assert_eq!(change.to, "emacs");
+        assert_eq!(change.from.to_string(), "vi");
+        assert_eq!(change.to.to_string(), "emacs");
         assert_eq!(change.via, "/vi");
         assert_eq!(
             change.schema,
             newt_core::settings_receipt::SETTING_CHANGE_SCHEMA_V1
         );
+    }
+
+    /// **The round cap takes a number, which no other field does** (#1998).
+    ///
+    /// The form only knew closed vocabularies, and that — not the derived
+    /// operations — is what actually kept `/rounds` outside it.
+    #[test]
+    fn the_round_cap_accepts_a_bounded_number_and_a_release_token() {
+        let max = newt_core::tenacity::RELENTLESS_TOOL_ROUND_TARGET;
+        assert_eq!(Field::Rounds.accepts("50").as_deref(), Some("50"));
+        // Canonicalized, so `0050` and `50` are one value with one address.
+        assert_eq!(Field::Rounds.accepts(" 0050 ").as_deref(), Some("50"));
+        assert_eq!(
+            Field::Rounds.accepts(&max.to_string()).as_deref(),
+            Some(max.to_string().as_str())
+        );
+        // Every word the verb uses to RELEASE the override lands on one value.
+        for release in ["auto", "reset", "default"] {
+            assert_eq!(Field::Rounds.accepts(release).as_deref(), Some("auto"));
+        }
+        // Anti-vacuous: the bound is real at both ends, and it is a number
+        // field, not a "take anything" field.
+        assert_eq!(Field::Rounds.accepts("0"), None, "0 rounds is not a limit");
+        assert_eq!(Field::Rounds.accepts(&(max + 1).to_string()), None);
+        assert_eq!(
+            Field::Rounds.accepts("unlimited"),
+            None,
+            "a verb affordance, not a value"
+        );
+        assert_eq!(Field::Rounds.accepts("banana"), None);
+    }
+
+    /// A numeric field is asked for, not chosen from — and it is still a typed
+    /// definition, so it still renders everywhere the menus do.
+    #[test]
+    fn the_number_field_is_a_text_definition_not_a_menu() {
+        let _g = settings_guard();
+        let asked = value_menu(Field::Rounds);
+        assert!(
+            asked
+                .controls
+                .iter()
+                .all(|c| !matches!(c.kind, newt_interaction::ControlKind::Choice { .. })),
+            "a number has no menu to pick from"
+        );
+        let rendered = newt_core::markup::plain::render(&asked);
+        assert!(rendered.contains("10000"), "the bound is shown: {rendered}");
+
+        // …and the menus still are menus.
+        assert!(value_menu(Field::Tenacity)
+            .controls
+            .iter()
+            .any(|c| matches!(c.kind, newt_interaction::ControlKind::Choice { .. })));
+    }
+
+    /// **The form drives the numeric field end to end**: pick `rounds`, type a
+    /// number, and the cap is set.
+    #[test]
+    fn the_form_walks_to_the_round_cap_and_takes_a_typed_number() {
+        let _g = settings_guard();
+        newt_core::tenacity::set_session_tool_rounds(None);
+        let index = Field::ALL
+            .iter()
+            .position(|f| *f == Field::Rounds)
+            .expect("rounds is offered")
+            + 1;
+        let out = run(
+            &answering_owned(vec![index.to_string(), "320".to_string()]),
+            "",
+        );
+        assert_eq!(out, vec!["tool-call round limit: 320".to_string()]);
+        assert_eq!(newt_core::tenacity::session_tool_rounds(), Some(320));
+
+        // An empty line backs out rather than being an invalid number.
+        let out = run(
+            &answering_owned(vec![index.to_string(), "  ".to_string()]),
+            "",
+        );
+        assert_eq!(out, vec!["settings: cancelled".to_string()]);
+        assert_eq!(
+            newt_core::tenacity::session_tool_rounds(),
+            Some(320),
+            "backing out of the number must not clear the cap"
+        );
+    }
+
+    /// **The receipt for a cap carries the whole derivation** (#1998) — the
+    /// difference between "320 rounds" and the record #1965 asked for.
+    #[test]
+    fn the_round_cap_records_its_derivation_not_just_the_number() {
+        use newt_core::settings_receipt::SettingValue;
+        let _g = settings_guard();
+        newt_core::tenacity::set_configured_tool_rounds(Some(40));
+        newt_core::tenacity::set_cli_tenacity(newt_core::Tenacity::Relentless);
+        newt_core::tenacity::set_session_tool_rounds(None);
+
+        let from = Field::Rounds.value_now();
+        apply(Field::Rounds, "320").expect("in range");
+        let to = Field::Rounds.value_now();
+        let change = change_for(Field::Rounds, from, to, "/max-rounds").expect("declared");
+
+        let SettingValue::ToolRounds(after) = &change.to else {
+            panic!("the cap was recorded as a bare token: {:?}", change.to);
+        };
+        assert_eq!(after.rounds, 320);
+        assert_eq!(after.configured, 40, "the baseline it escalated over");
+        assert!(after.is_escalated());
+        assert_eq!(change.via, "/max-rounds", "the alias typed is bound in");
+
+        // Anti-vacuous: a token-valued field is still a token, so the branch
+        // above is about `Rounds` and not about every field.
+        let token = change_for(
+            Field::EditMode,
+            Field::EditMode.value_now(),
+            Field::EditMode.value_now(),
+            "/vi",
+        )
+        .expect("declared");
+        assert!(matches!(token.to, SettingValue::Token(_)));
+    }
+
+    /// **No baseline means no invented one.** With nothing installed the cap
+    /// records as a token — honest — rather than claiming a `configured` it
+    /// never saw.
+    #[test]
+    fn a_cap_with_no_installed_baseline_records_a_token_not_a_guess() {
+        use newt_core::settings_receipt::SettingValue;
+        let _g = settings_guard();
+        newt_core::tenacity::set_configured_tool_rounds(None);
+        newt_core::tenacity::set_session_tool_rounds(Some(320));
+        assert!(
+            matches!(Field::Rounds.value_now(), SettingValue::Token(ref t) if t == "320"),
+            "with no baseline the cap must record as a token, not a guessed derivation"
+        );
+
+        // Anti-vacuous: install one and the SAME override records as a
+        // derivation, so the assertion above is about the baseline and not
+        // about `value_now` always returning a token.
+        newt_core::tenacity::set_configured_tool_rounds(Some(40));
+        assert!(matches!(
+            Field::Rounds.value_now(),
+            SettingValue::ToolRounds(_)
+        ));
     }
 
     /// The recording route applies exactly what the bare mutation would.

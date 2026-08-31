@@ -9281,7 +9281,15 @@ enum ToolRoundLimitCommand {
     Unlimited,
 }
 
-fn tool_round_limit_command_arg(input: &str) -> Option<&str> {
+/// The verb the operator typed and the argument after it.
+///
+/// The NAME is returned, not just the argument (#1998): `/rounds 320` and
+/// `/max-rounds 320` are the same setting reached two ways, and which way is
+/// the half of the event a reader cannot reconstruct afterwards — so it is
+/// bound into the receipt's address. This shape also hid two aliases from the
+/// help text for a long while; returning the name is what lets the receipt
+/// name them.
+fn tool_round_limit_command(input: &str) -> Option<(&'static str, &str)> {
     let body = input.trim().trim_start_matches('/').trim();
     ["rounds", "tool-rounds", "max-rounds"]
         .iter()
@@ -9293,8 +9301,12 @@ fn tool_round_limit_command_arg(input: &str) -> Option<&str> {
                     .next()
                     .map(char::is_whitespace)
                     .unwrap_or(false);
-            boundary.then(|| rest.trim())
+            boundary.then(|| (*cmd, rest.trim()))
         })
+}
+
+fn tool_round_limit_command_arg(input: &str) -> Option<&str> {
+    tool_round_limit_command(input).map(|(_, arg)| arg)
 }
 
 /// Parse `/rounds [show|<n>|double|reset|config|unlimited]`, the
@@ -9372,10 +9384,16 @@ fn double_tool_round_limit(current: usize) -> usize {
     }
 }
 
-/// Apply a parsed `/rounds` command to the session-override cell. Keeping this
+/// Resolve a parsed `/rounds` command to the override it lands on. Keeping this
 /// transition pure makes the two different reset intents explicit and testable:
 /// `Reset` removes the override (so tenacity/config derive the next value),
 /// while `Configured` installs the raw config/model number as an override.
+///
+/// **It performs the derivation; it does not perform the write** (#1998).
+/// `double` and `unlimited` are relative operations, which is why `/rounds`
+/// stays a verb — but the value they resolve to goes through
+/// `settings_form::apply_and_record` like every other setting, so the
+/// escalation that produced #1965 now leaves a receipt.
 fn apply_tool_round_limit_command(
     configured: usize,
     explicit_tenacity: Option<newt_core::Tenacity>,
