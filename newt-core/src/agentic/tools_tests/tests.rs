@@ -2409,6 +2409,102 @@ async fn lifecycle_unknown_phase_lists_valid_phases() {
     assert!(out.contains("check"), "should name valid phases: {out}");
 }
 
+/// #1972 red-first, reproduced against this repo's own real tree (no
+/// tempfile): `crates/` carries no lifecycle markers of its own, but its
+/// child `crates/newt-tuner/` has a real `Cargo.toml` — the same shape as
+/// the reported bug's `agent-voice/Cargo.toml`, invisible to root-anchored
+/// detection before this fix. `workspace` is relative to `cargo test`'s cwd
+/// (this crate's own directory), so `../crates` is the repo's real
+/// `crates/` dir. Closes the loop end to end: the nested project is named
+/// (not silently dropped), the message is honest (not `error:`-prefixed),
+/// and the no-op no longer ledgers as a claimable success.
+#[tokio::test]
+async fn lifecycle_root_empty_names_a_nested_project_instead_of_a_silent_noop() {
+    let caveats = crate::caveats::Caveats::top();
+    let args = serde_json::json!({ "phase": "test" });
+    let out = execute_tool(
+        "lifecycle",
+        &args,
+        "../crates",
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(
+        out.starts_with("no command configured for lifecycle phase 'test'"),
+        "{out}"
+    );
+    assert!(
+        out.contains("newt-tuner"),
+        "names the nested project: {out}"
+    );
+    assert!(out.contains("dir=\"<path>\""), "points at the fix: {out}");
+    assert!(
+        !out.starts_with("error:"),
+        "an honest degrade is not a fake failure: {out}"
+    );
+    assert!(
+        !tool_result_ok(&out),
+        "a no-op must not ledger as a claimable success: {out}"
+    );
+}
+
+/// Twin of the above: `dir` resolves detection AND execution against the
+/// SAME real nested project directly — proving the resolve_exec_cwd reuse
+/// (#1972 part 1). `action=list` keeps this subprocess-free; `ok=true`
+/// confirms a genuinely resolved phase is unaffected by the no-op
+/// classifier added for the case above.
+#[tokio::test]
+async fn lifecycle_dir_param_resolves_a_nested_project_directly() {
+    let caveats = crate::caveats::Caveats::top();
+    let args = serde_json::json!({ "phase": "test", "action": "list", "dir": "newt-tuner" });
+    let out = execute_tool(
+        "lifecycle",
+        &args,
+        "../crates",
+        false,
+        20,
+        &caveats,
+        &mut NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(out, "lifecycle test → cargo test", "got: {out}");
+    assert!(
+        tool_result_ok(&out),
+        "a genuinely resolved phase is still ok=true: {out}"
+    );
+}
+
 /// `save_note` is sink-gated: absent from the base `tool_definitions`
 /// (headless/eval callers see no memory tool) and from the merged set
 /// without a sink; present in the merged set when a sink exists.

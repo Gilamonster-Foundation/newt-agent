@@ -241,6 +241,14 @@ fn request_user_input_tool_definition() -> serde_json::Value {
 /// "no command configured", not an error), so it needs no presence gate. The
 /// phase-name enum is built from [`crate::tooling::Phase::ALL`] so the schema
 /// can never drift from the vocabulary.
+///
+/// #1972: `dir` resolves detection AND execution against a subdirectory,
+/// through the SAME `resolve_exec_cwd` seam `run_command`'s `cwd` uses — a
+/// polyglot/nested-project workspace (e.g. `agent-voice/Cargo.toml` under a
+/// workspace root with no root-level markers) is no longer structurally
+/// invisible to this tool. When root detection finds nothing, the executor
+/// names any nested project it DID find instead of silently no-op'ing
+/// (`crate::tooling::unconfigured_phase_message`).
 pub fn lifecycle_tool_definition() -> serde_json::Value {
     let phases: Vec<&str> = crate::tooling::Phase::ALL
         .iter()
@@ -261,7 +269,11 @@ pub fn lifecycle_tool_definition() -> serde_json::Value {
                 gate for this project. Prefer this over run_command for build / \
                 test / format / lint / check work so the project's own \
                 conventions are honored uniformly across build systems. Use \
-                action=list to see the resolved command without running it.",
+                action=list to see the resolved command without running it. \
+                In a polyglot/monorepo workspace, pass `dir` to target a \
+                nested project directly — if you omit it and nothing is \
+                configured at the workspace root, the response names any \
+                nested project it found so you can retry with `dir` set.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -275,6 +287,13 @@ pub fn lifecycle_tool_definition() -> serde_json::Value {
                         "enum": ["run", "list"],
                         "description": "run (default) executes the phase's resolved command; \
                                         list returns the command without running it."
+                    },
+                    "dir": {
+                        "type": "string",
+                        "description": "Optional subdirectory to resolve and run the phase in, \
+                            relative to the workspace root (e.g. \"agent-voice\") or an absolute \
+                            path inside it. Confined to the workspace. Use this for a nested \
+                            project the workspace root itself has no lifecycle command for."
                     }
                 },
                 "required": ["phase"]

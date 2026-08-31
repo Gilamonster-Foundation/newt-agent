@@ -132,18 +132,28 @@ pub struct ToolingPack {
 }
 
 impl ToolingPack {
-    /// Does this pack's detection match a repo at `repo_dir`?
+    /// Does this pack's detection match `repo_dir`, given `exists` as the
+    /// marker-file existence check? Injectable so nested-directory scanning
+    /// (#1972) can reuse the SAME detection rule — `require_all` / any-of —
+    /// without a real fs, keeping that path in the fully-mocked unit tier.
     #[must_use]
-    fn matches(&self, repo_dir: &Path) -> bool {
+    fn matches_with(&self, repo_dir: &Path, exists: &impl Fn(&Path) -> bool) -> bool {
         if self.detect.is_empty() {
             return false;
         }
-        let exists = |m: &String| repo_dir.join(m).exists();
+        let hit = |m: &String| exists(&repo_dir.join(m));
         if self.require_all {
-            self.detect.iter().all(exists)
+            self.detect.iter().all(hit)
         } else {
-            self.detect.iter().any(exists)
+            self.detect.iter().any(hit)
         }
+    }
+
+    /// Does this pack's detection match a repo at `repo_dir`, against the
+    /// REAL filesystem?
+    #[must_use]
+    fn matches(&self, repo_dir: &Path) -> bool {
+        self.matches_with(repo_dir, &|p| p.exists())
     }
 }
 
@@ -309,6 +319,17 @@ pub fn set_lifecycle_override(cmds: PhaseCommands) {
     let _ = LIFECYCLE_OVERRIDE.set(cmds);
 }
 
+/// Built-in packs merged under the `~/.newt/tooling/` drop-in dir — the
+/// SAME layering [`resolved_phase_commands`] uses, factored out so nested
+/// scanning ([`nested_projects_with_configured_phase`], #1972) resolves
+/// against identical pack data instead of a second load path.
+fn merged_packs() -> Vec<ToolingPack> {
+    let dropins = crate::config::Config::user_config_dir()
+        .map(|d| load_tooling_packs_from_dir(&d.join("tooling")))
+        .unwrap_or_default();
+    merge_tooling_packs(vec![builtin_tooling_packs(), dropins])
+}
+
 /// The resolved commands for `phase` in `repo_dir`:
 /// the repo `[lifecycle].<phase>` override (a single command) wins; else every
 /// matching tooling pack's default (built-in merged under `~/.newt/tooling/`).
@@ -318,11 +339,110 @@ pub fn resolved_phase_commands(repo_dir: &Path, phase: Phase) -> Vec<String> {
     if let Some(cmd) = LIFECYCLE_OVERRIDE.get().and_then(|c| c.get(phase)) {
         return vec![cmd.to_string()];
     }
-    let dropins = crate::config::Config::user_config_dir()
-        .map(|d| load_tooling_packs_from_dir(&d.join("tooling")))
-        .unwrap_or_default();
-    let packs = merge_tooling_packs(vec![builtin_tooling_packs(), dropins]);
-    phase_commands_from_packs(repo_dir, phase, &packs)
+    phase_commands_from_packs(repo_dir, phase, &merged_packs())
+}
+
+/// #1972: of `candidates`, the ones that carry a configured command for
+/// `phase` under ANY matching pack. Pure — `exists` is the injected
+/// marker-file check (see [`ToolingPack::matches_with`]) — so this stays in
+/// the fully-mocked unit tier even though the real caller
+/// ([`nested_projects_with_configured_phase`]) feeds it a real-fs listing.
+#[must_use]
+fn nested_phase_dirs(
+    candidates: &[std::path::PathBuf],
+    phase: Phase,
+    packs: &[ToolingPack],
+    exists: impl Fn(&Path) -> bool,
+) -> Vec<std::path::PathBuf> {
+    candidates
+        .iter()
+        .filter(|dir| {
+            packs
+                .iter()
+                .any(|p| p.phases.get(phase).is_some() && p.matches_with(dir, &exists))
+        })
+        .cloned()
+        .collect()
+}
+
+/// First-level subdirectories of `repo_dir` — the real-fs edge nested
+/// scanning reads from. Thin by design (mirrors
+/// [`load_tooling_packs_from_dir`]'s untested enumeration): a missing/
+/// unreadable dir yields `[]` rather than erroring, since this is a
+/// best-effort discovery aid, not a required read. Skips dot-dirs and the
+/// obvious build-noise directories so `target/`/`node_modules/` never masquerade
+/// as a nested project.
+fn first_level_subdirs(repo_dir: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(repo_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
+                !name.starts_with('.') && name != "target" && name != "node_modules"
+            })
+        })
+        .collect()
+}
+
+/// #1972: when [`resolved_phase_commands`] finds nothing at `repo_dir`,
+/// the first-level subdirectories that DO carry a configured command for
+/// `phase` — named so the caller (the `lifecycle` tool) can report them
+/// instead of silently no-op'ing on a nested project it never looked at.
+#[must_use]
+pub fn nested_projects_with_configured_phase(
+    repo_dir: &Path,
+    phase: Phase,
+) -> Vec<std::path::PathBuf> {
+    nested_phase_dirs(
+        &first_level_subdirs(repo_dir),
+        phase,
+        &merged_packs(),
+        |p| p.exists(),
+    )
+}
+
+/// #1972: the `lifecycle` tool's degrade-honest message when no command is
+/// configured for `phase` at the resolved directory. Keeps
+/// `catalog.rs`'s documented intent — "a phase with no configured command
+/// returns a clear 'no command configured', not an error" — for BOTH
+/// shapes: `nested` empty is the plain original wording; non-empty turns it
+/// into an actionable pointer at the first-level subdirectories
+/// ([`nested_projects_with_configured_phase`]) that DO have the phase
+/// configured, so a root-anchored resolution no longer strands a nested
+/// project (`agent-voice/Cargo.toml` under a workspace root with none) as
+/// invisible.
+///
+/// Both shapes share the same leading `"no command configured"` text
+/// specifically so [`crate::agentic::tools::tool_result_ok`] can recognize
+/// the whole family as a no-op rather than a claimable success — without an
+/// `error:` prefix, which would misrepresent an honest degrade as a
+/// failure.
+#[must_use]
+pub fn unconfigured_phase_message(phase: Phase, nested: &[std::path::PathBuf]) -> String {
+    if nested.is_empty() {
+        return format!(
+            "no command configured for lifecycle phase '{}'. Set it in \
+             .newt/config.toml [lifecycle] or a tooling pack; `lifecycle` \
+             only runs commands the project declares.",
+            phase.as_str()
+        );
+    }
+    let names: Vec<String> = nested.iter().map(|p| p.display().to_string()).collect();
+    let subject = if names.len() == 1 {
+        "a nested project has"
+    } else {
+        "nested projects have"
+    };
+    format!(
+        "no command configured for lifecycle phase '{}' at this directory, but {subject} \
+         it configured: {}. Pass dir=\"<path>\" to run there.",
+        phase.as_str(),
+        names.join(", ")
+    )
 }
 
 #[cfg(test)]
@@ -443,5 +563,100 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lc.check.as_deref(), Some("just check"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #1972: nested-project detection + the degrade-honest message.
+    // Fully mocked — `exists` is an injected closure, no tempfile.
+    // -----------------------------------------------------------------------
+
+    /// Red-first: the exact session shape — a nested `agent-voice/Cargo.toml`
+    /// created mid-session, invisible to root-anchored detection (a
+    /// candidate subdir carries a real marker; before #1972 nothing looked
+    /// at subdirectories at all). `docs/` (no marker) is a distractor.
+    #[test]
+    fn nested_phase_dirs_finds_a_pack_marker_invisible_to_root_detection() {
+        let candidates = vec![
+            std::path::PathBuf::from("agent-voice"),
+            std::path::PathBuf::from("docs"),
+        ];
+        let packs = builtin_tooling_packs();
+        let found = nested_phase_dirs(&candidates, Phase::Test, &packs, |p| {
+            p == Path::new("agent-voice/Cargo.toml")
+        });
+        assert_eq!(found, vec![std::path::PathBuf::from("agent-voice")]);
+    }
+
+    /// Twin: a subdirectory whose pack HAS no command for the requested
+    /// phase (the `python` pack sets no `setup`) must not be surfaced, even
+    /// though its marker is present — matching the marker is not enough.
+    #[test]
+    fn nested_phase_dirs_excludes_a_matched_pack_with_no_command_for_the_phase() {
+        let candidates = vec![std::path::PathBuf::from("pytool")];
+        let packs = builtin_tooling_packs();
+        let found = nested_phase_dirs(&candidates, Phase::Setup, &packs, |p| {
+            p == Path::new("pytool/pyproject.toml")
+        });
+        assert!(found.is_empty(), "got: {found:?}");
+    }
+
+    /// A dir with no marker present at all is never surfaced (baseline).
+    #[test]
+    fn nested_phase_dirs_excludes_a_dir_with_no_marker() {
+        let candidates = vec![std::path::PathBuf::from("docs")];
+        let packs = builtin_tooling_packs();
+        let found = nested_phase_dirs(&candidates, Phase::Test, &packs, |_| false);
+        assert!(found.is_empty(), "got: {found:?}");
+    }
+
+    /// `matches_with` (the widened, injectable form) agrees with the
+    /// original real-fs `matches` on a genuinely configured root — the
+    /// #1972 refactor changes NOTHING about root-level detection.
+    #[test]
+    fn matches_with_agrees_with_matches_on_a_configured_root() {
+        let rust = builtin_tooling_packs()
+            .into_iter()
+            .find(|p| p.name == "rust")
+            .unwrap();
+        let root = Path::new("/repo");
+        assert!(rust.matches_with(root, &|p| p == Path::new("/repo/Cargo.toml")));
+        assert!(!rust.matches_with(root, &|p| p == Path::new("/repo/pyproject.toml")));
+    }
+
+    #[test]
+    fn unconfigured_message_is_plain_when_nothing_is_configured_anywhere() {
+        let msg = unconfigured_phase_message(Phase::Test, &[]);
+        assert!(msg.starts_with("no command configured for lifecycle phase 'test'"));
+        assert!(msg.contains(".newt/config.toml [lifecycle]"));
+        assert!(
+            !msg.contains("dir="),
+            "no nested pointer when nothing was found: {msg}"
+        );
+    }
+
+    /// Actionable shape names the candidate(s) and points at `dir=`, while
+    /// keeping the SAME leading prefix as the plain case — the shared prefix
+    /// is what lets `tool_result_ok` recognize the whole family as a no-op.
+    #[test]
+    fn unconfigured_message_names_a_single_nested_project() {
+        let msg =
+            unconfigured_phase_message(Phase::Test, &[std::path::PathBuf::from("agent-voice")]);
+        assert!(msg.starts_with("no command configured for lifecycle phase 'test'"));
+        assert!(msg.contains("a nested project has"), "got: {msg}");
+        assert!(msg.contains("agent-voice"), "got: {msg}");
+        assert!(msg.contains("dir=\"<path>\""), "got: {msg}");
+    }
+
+    #[test]
+    fn unconfigured_message_names_multiple_nested_projects() {
+        let msg = unconfigured_phase_message(
+            Phase::Test,
+            &[
+                std::path::PathBuf::from("agent-voice"),
+                std::path::PathBuf::from("agent-tools"),
+            ],
+        );
+        assert!(msg.contains("nested projects have"), "got: {msg}");
+        assert!(msg.contains("agent-voice, agent-tools"), "got: {msg}");
     }
 }
