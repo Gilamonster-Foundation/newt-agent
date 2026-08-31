@@ -291,7 +291,15 @@ pub fn gate_python_workspace_with(
 /// and would let the gate *report* fabrications in code newt never wrote (noise).
 /// The `retry` revert is already fenced to newt's own writes by the ledger, but
 /// keeping these out of the walk is defense-in-depth and a real speedup.
-const SKIP_DIRS: &[&str] = &[
+///
+/// **Shared, not copied** (#1945). `agentic::self_verify` needs the same
+/// judgement for the same reason — a `Cargo.toml` under `target/` or
+/// `node_modules/` is a dependency's, not the task's — and the workspace
+/// already carries two hand-rolled `starts_with('.') || "target" ||
+/// "node_modules"` predicates (`newt-tools::search`, `navigator::text`). A
+/// third would be the shape the ratchets exist to catch, so the ignore-set is
+/// data with one home and the gates that need it read it here.
+pub(crate) const SKIP_DIRS: &[&str] = &[
     ".git",
     ".venv",
     "venv",

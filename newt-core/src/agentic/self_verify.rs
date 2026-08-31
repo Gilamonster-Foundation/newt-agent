@@ -245,17 +245,110 @@ pub fn enabled() -> bool {
         .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
 }
 
-/// The workspace's top-level entry names for [`detect_checks`]. A thin fs wrapper
-/// (the pure detection is tested with injected entries); errors → empty, so a
-/// missing/denied dir simply disables the gate rather than failing the turn.
+/// How many directory levels below the workspace root the scan descends
+/// (#1945).
+///
+/// Three, because that is where the manifests actually are and not further.
+/// A one-level scan — what this used to do — cannot see `backend/Cargo.toml`,
+/// `services/api/package.json` or `tests/test_solve.py`, so [`detect_checks`]
+/// registered nothing and the gate went quiet on exactly the repositories
+/// that ship the most verification. Three levels reaches
+/// `crates/newt-tuner/Cargo.toml` and `backend/services/api/package.json`;
+/// deeper is where the ratio of manifests to directories collapses and the
+/// scan starts paying for vendored trees [`SKIP_DIRS`] did not name.
+const MAX_DEPTH: usize = 3;
+
+/// Hard ceiling on directory entries examined in one scan.
+///
+/// The scan runs each time a turn tries to conclude, so "bounded" has to mean
+/// bounded on a pathological tree as well as a typical one. A generated or
+/// symlink-loopy workspace stops the scan rather than the turn: the names
+/// already collected are used, which degrades to a weaker gate instead of a
+/// slow one. [`SKIP_DIRS`] keeps a normal repository orders of magnitude
+/// under this.
+const MAX_ENTRIES: usize = 10_000;
+
+/// The DISTINCT entry names under `root`, to [`MAX_DEPTH`] levels — the input
+/// [`detect_checks`] matches on. Pure over the injected `list`.
+///
+/// # Names, not paths, and deduplicated
+///
+/// [`detect_checks`] matches bare names (`cargo.toml`, `package.json`), so
+/// that is what this yields, and a name found in five places yields one entry.
+/// **The dedup is load-bearing, not tidiness**: without it a monorepo with
+/// four `Cargo.toml` files registers four identical `cargo test` checks and
+/// the nudge names it four times. One-level scanning could not produce a
+/// duplicate — one directory has one `Cargo.toml` — so recursion is what
+/// introduces the possibility, and this is where it is closed. Case-insensitive,
+/// because `detect_checks` lower-cases before matching and `Cargo.toml` beside
+/// `cargo.toml` is one check, not two.
+///
+/// # Pure, with the filesystem injected
+///
+/// `list` returns one directory's `(name, is_dir)` pairs. Keeping the walk
+/// pure is what lets the whole of it — depth bound, ignore-set, budget,
+/// dedup — be tested with an in-memory tree and no `tempfile`, which is this
+/// repo's unit-tier rule. [`workspace_entries`] is the thin real-fs wrapper.
+fn collect_entry_names(
+    root: &std::path::Path,
+    max_depth: usize,
+    budget: usize,
+    list: &impl Fn(&std::path::Path) -> Vec<(String, bool)>,
+) -> Vec<String> {
+    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut queue: std::collections::VecDeque<(std::path::PathBuf, usize)> =
+        std::collections::VecDeque::new();
+    queue.push_back((root.to_path_buf(), 0));
+    let mut examined = 0usize;
+
+    while let Some((dir, depth)) = queue.pop_front() {
+        for (name, is_dir) in list(&dir) {
+            examined += 1;
+            if examined > budget {
+                // Stop scanning, keep what we have: a weaker gate beats a slow
+                // turn, and beats a panic on a tree nobody anticipated.
+                return seen.into_values().collect();
+            }
+            if is_dir {
+                let skip = crate::verify_gate::SKIP_DIRS.contains(&name.as_str());
+                if !skip && depth < max_depth {
+                    queue.push_back((dir.join(&name), depth + 1));
+                }
+                // A directory name is itself a signal (`tests`), so it is
+                // collected whether or not it is descended into.
+            }
+            seen.entry(name.to_ascii_lowercase()).or_insert(name);
+        }
+    }
+    seen.into_values().collect()
+}
+
+/// The workspace's entry names for [`detect_checks`], scanned to
+/// [`MAX_DEPTH`] levels. A thin fs wrapper over [`collect_entry_names`] (the
+/// pure detection and the pure walk are tested with injected entries); an
+/// unreadable directory contributes nothing, so a missing/denied dir weakens
+/// the gate rather than failing the turn.
+///
+/// **Symlinked directories are not followed.** `file_type()` does not traverse
+/// the final symlink, so a link is identified before it is entered — the same
+/// hard boundary [`crate::verify_gate`] draws, and for the stronger reason
+/// here that a link into `/usr/lib` would have this gate demand the model run
+/// a dependency's test suite. A symlink is still reported as a NAME, because a
+/// symlinked `Cargo.toml` is a real manifest.
 pub fn workspace_entries(dir: &std::path::Path) -> Vec<String> {
-    std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .filter_map(|e| e.file_name().into_string().ok())
-                .collect()
-        })
-        .unwrap_or_default()
+    collect_entry_names(dir, MAX_DEPTH, MAX_ENTRIES, &|d| {
+        std::fs::read_dir(d)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .filter_map(|e| {
+                        let name = e.file_name().into_string().ok()?;
+                        let ft = e.file_type().ok()?;
+                        Some((name, ft.is_dir() && !ft.is_symlink()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
 }
 
 #[cfg(test)]
@@ -408,6 +501,163 @@ mod tests {
     fn run_marker_match_is_case_insensitive() {
         let checks = detect_checks(&entries(&["Makefile"]), "");
         assert_eq!(verify_gate_nudge(&checks, &["MAKE TEST".into()]), None);
+    }
+
+    // ---------------------------------------------------------------
+    // #1945 — the scanner has to be able to SEE
+    // ---------------------------------------------------------------
+
+    /// An in-memory workspace tree for the pure walk: relative dir path →
+    /// `(name, is_dir)` pairs. No `tempfile`, no real fs — the unit-tier rule.
+    fn tree(spec: &[(&str, &[(&str, bool)])]) -> impl Fn(&std::path::Path) -> Vec<(String, bool)> {
+        let map: std::collections::BTreeMap<String, Vec<(String, bool)>> = spec
+            .iter()
+            .map(|(dir, kids)| {
+                (
+                    (*dir).to_string(),
+                    kids.iter().map(|(n, d)| ((*n).to_string(), *d)).collect(),
+                )
+            })
+            .collect();
+        move |p: &std::path::Path| {
+            map.get(&p.to_string_lossy().replace('\\', "/"))
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    /// A monorepo: the manifests are one and two levels down, and `target/`
+    /// holds a dependency's manifest that is not the task's.
+    const MONOREPO: &[(&str, &[(&str, bool)])] = &[
+        (
+            ".",
+            &[
+                ("README.md", false),
+                ("backend", true),
+                ("crates", true),
+                ("target", true),
+            ],
+        ),
+        ("./backend", &[("package.json", false), ("app.js", false)]),
+        ("./crates", &[("tuner", true)]),
+        ("./crates/tuner", &[("Cargo.toml", false), ("src", true)]),
+        ("./target", &[("Cargo.toml", false), ("debug", true)]),
+    ];
+
+    /// **The bug (#1945).** At one level — what this scanned before — the root
+    /// holds no manifest at all, so `detect_checks` registers NOTHING and the
+    /// gate is silent on a repository that ships two test suites. This pins
+    /// the old behaviour as the defect rather than describing it in prose.
+    #[test]
+    fn a_one_level_scan_cannot_see_the_manifests_and_detects_nothing() {
+        let names = collect_entry_names(std::path::Path::new("."), 0, MAX_ENTRIES, &tree(MONOREPO));
+        assert!(
+            detect_checks(&names, "").is_empty(),
+            "one level sees only {names:?}"
+        );
+    }
+
+    /// The fix: at [`MAX_DEPTH`] both manifests are found, one and two levels
+    /// down, and each registers its check.
+    #[test]
+    fn a_manifest_below_the_root_is_detected() {
+        let names = collect_entry_names(
+            std::path::Path::new("."),
+            MAX_DEPTH,
+            MAX_ENTRIES,
+            &tree(MONOREPO),
+        );
+        let labels: Vec<String> = detect_checks(&names, "")
+            .into_iter()
+            .map(|c| c.label)
+            .collect();
+        assert!(
+            labels.iter().any(|l| l.contains("npm test")),
+            "backend/package.json (one level down): {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("cargo test")),
+            "crates/tuner/Cargo.toml (two levels down): {labels:?}"
+        );
+    }
+
+    /// **The walk must not descend into `target/`.** Its `Cargo.toml` is a
+    /// build tree's, not the task's — and `debug/` beneath it is where a scan
+    /// that ignored the ignore-set would spend the rest of its life.
+    ///
+    /// The directory NAME is still collected (it is one of the root's
+    /// entries); what must not appear is anything from INSIDE it.
+    #[test]
+    fn the_walk_does_not_descend_into_ignored_directories() {
+        let names = collect_entry_names(
+            std::path::Path::new("."),
+            MAX_DEPTH,
+            MAX_ENTRIES,
+            &tree(&[
+                (
+                    ".",
+                    &[("target", true), ("node_modules", true), (".git", true)],
+                ),
+                ("./target", &[("Cargo.toml", false)]),
+                ("./node_modules", &[("package.json", false)]),
+                ("./.git", &[("Makefile", false)]),
+            ]),
+        );
+        assert!(
+            detect_checks(&names, "").is_empty(),
+            "nothing inside an ignored dir may register a check: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "target"),
+            "the dir NAME is still an entry: {names:?}"
+        );
+    }
+
+    /// A name found in five places is ONE check. Without the dedup a monorepo
+    /// with four manifests nudges four times for the same command — a
+    /// duplicate one-level scanning could not produce, so recursion is what
+    /// introduces it. Case-insensitive, because matching is.
+    #[test]
+    fn a_name_found_repeatedly_registers_exactly_one_check() {
+        let names = collect_entry_names(
+            std::path::Path::new("."),
+            MAX_DEPTH,
+            MAX_ENTRIES,
+            &tree(&[
+                (".", &[("a", true), ("b", true), ("Cargo.toml", false)]),
+                ("./a", &[("Cargo.toml", false)]),
+                ("./b", &[("cargo.toml", false)]),
+            ]),
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.eq_ignore_ascii_case("cargo.toml"))
+                .count(),
+            1,
+            "{names:?}"
+        );
+        assert_eq!(detect_checks(&names, "").len(), 1);
+    }
+
+    /// The budget stops a pathological tree instead of the turn, and what was
+    /// already collected is still used — a weaker gate, never a slow one.
+    #[test]
+    fn a_pathological_tree_stops_at_the_budget_and_keeps_what_it_found() {
+        let wide: Vec<(String, bool)> = (0..500).map(|i| (format!("d{i}"), true)).collect();
+        let list = move |p: &std::path::Path| {
+            if p.to_string_lossy().matches('/').count() > 6 {
+                Vec::new()
+            } else {
+                wide.clone()
+            }
+        };
+        let names = collect_entry_names(std::path::Path::new("."), 8, 1_200, &list);
+        assert!(
+            names.len() <= 500,
+            "the walk stopped rather than enumerating the tree: {}",
+            names.len()
+        );
     }
 
     #[test]
