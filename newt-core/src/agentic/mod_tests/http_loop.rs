@@ -13,6 +13,22 @@ fn msgs() -> Vec<MemMessage> {
     ]
 }
 
+/// The loop tests' workspace: a path that deliberately does NOT exist.
+///
+/// These tests are about the LOOP — nudges, wire shapes, retries, round caps —
+/// not about the self-verify gate, which #1943 arms by default. Under
+/// `cargo test` the process's `.` is this crate's own directory, which ships a
+/// `Cargo.toml`, so an armed gate correctly detects `cargo test` and adds a
+/// round to every one of these tests. Pointing them at a workspace that
+/// affords no verification keeps each measuring what it is named for, and
+/// removes an ambient-filesystem dependency they never wanted (#514).
+///
+/// The gate's own wiring is NOT left unproved by this — that would recreate,
+/// in the test suite, exactly the dark gate #1943 exists to end. It is proved
+/// against a workspace that DOES afford a check, by
+/// `an_armed_self_verify_gate_adds_a_round_when_the_workspace_ships_a_check`.
+const NO_CHECKS_WORKSPACE: &str = "newt-core-test-workspace-that-does-not-exist";
+
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
         rewrites_history: true,
@@ -22,7 +38,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         api_key: None,
         messages,
         task: "do the thing",
-        workspace: ".",
+        workspace: NO_CHECKS_WORKSPACE,
         color: false,
         markdown: false,
         tool_offload: false,
@@ -1211,8 +1227,8 @@ async fn cap_exit_hallucinated_path_gets_claim_check_refutation() {
     let uri = server.uri();
     let mut c = ctx(&uri, &messages, &caveats);
     c.max_tool_rounds = 2;
-    // `ctx` sets workspace = "." (this crate's dir under cargo test), so
-    // the cited `newt-tui/src/commands.rs` provably does not exist there.
+    // `ctx` sets a workspace that does not exist, so the cited
+    // `newt-tui/src/commands.rs` provably does not resolve in it.
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
         .await
         .expect("chat_complete should succeed");
@@ -2423,6 +2439,70 @@ async fn run_openai_script_with_ledger(
 
 async fn run_openai_script(script: Vec<serde_json::Value>) -> (String, usize) {
     run_openai_script_with_ledger(script, None).await
+}
+
+/// [`run_openai_script`] against a workspace the caller chooses, so a test can
+/// point the loop at a directory that actually affords a verification.
+async fn run_openai_script_in(script: Vec<serde_json::Value>, workspace: &str) -> (String, usize) {
+    let server = MockServer::start().await;
+    let round = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ScriptedOpenAi {
+            round: round.clone(),
+            script,
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.workspace = workspace;
+    let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+    (reply, round.load(Ordering::SeqCst))
+}
+
+/// **The wiring #1943 arms, proved end to end through the loop.**
+///
+/// Every other test in this file points at [`NO_CHECKS_WORKSPACE`] so the gate
+/// stays out of their way — which would leave the armed gate exactly as
+/// unexercised as the env var left it, and that is the failure this whole PR
+/// is about. So one test points the loop at a workspace that DOES ship a
+/// verification and holds it to firing.
+///
+/// `.` under `cargo test -p newt-core` is this crate's directory, which ships
+/// a `Cargo.toml`. That is a deliberate real-filesystem dependency in exactly
+/// one test, and it is what **grounds** `self_verify`'s mocked scanner tests:
+/// those encode a belief about what `read_dir` yields, and this is the test
+/// that would fail if the belief were wrong.
+#[tokio::test]
+async fn an_armed_self_verify_gate_adds_a_round_when_the_workspace_ships_a_check() {
+    // The model answers without ever running a command, three times running.
+    // Armed, the gate hands it another round each time — and then STOPS at
+    // `SELF_VERIFY_CAP` (2), so a model that will not verify still ends its
+    // turn. Pinning the exact count pins the cap with it: a gate that could
+    // nudge forever would hang the turn it was meant to improve.
+    let script = vec![
+        serde_json::json!({ "content": "Done — the fix is in place." }),
+        serde_json::json!({ "content": "Still done." }),
+        serde_json::json!({ "content": "Confirmed complete." }),
+    ];
+    let (_, rounds) = run_openai_script_in(script.clone(), ".").await;
+    assert_eq!(
+        rounds, 3,
+        "an unverified conclusion in a workspace shipping `cargo test` costs a round per nudge, capped at SELF_VERIFY_CAP = 2 — that is #1943"
+    );
+
+    // The anti-vacuous twin, in the same test so the two can never drift: the
+    // extra round is the GATE, not something else in the loop. The same script
+    // against a workspace that affords nothing concludes in one.
+    let (_, rounds) = run_openai_script_in(script, NO_CHECKS_WORKSPACE).await;
+    assert_eq!(
+        rounds, 1,
+        "with nothing to verify the gate must stay silent — otherwise the assertion above is measuring some other nudge"
+    );
 }
 
 /// #1259: `request_user_input` is a legitimate escalation in an **Explain**
