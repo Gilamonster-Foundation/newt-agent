@@ -884,6 +884,84 @@ fn active_operator_task<'a>(
         .unwrap_or(submitted_task)
 }
 
+/// Whether the turn-level tuning ratchet ([`newt_core::CapabilityEntry::
+/// record_success`], via `probe::save_cache`) should run for this turn
+/// (#1967).
+///
+/// `turn_saw_accepted` alone (ANY round in the turn was quality-gated
+/// Accepted) is not enough: `input_tokens` is the turn's max prompt size
+/// across every round (Step 18.1), which can be a DIFFERENT, later,
+/// truncation-suspect round's number even when the round that was accepted
+/// was small and legitimate. Gates on the SAME predicate
+/// (`newt_core::agentic::is_truncation_suspect`) the per-round ratchet
+/// already gates on via `emit_accepted` — one rule, not two copies, so a
+/// future writer cannot reintroduce this defect by re-deriving its own
+/// suspect threshold. A suspect turn-max is window evidence of nothing and
+/// skips the WHOLE turn's ratchet; the per-round path already captured
+/// whichever earlier round in the same turn genuinely was safe evidence.
+fn turn_tuning_ratchet_is_trustworthy(
+    turn_saw_accepted: bool,
+    input_tokens: u32,
+    num_ctx: Option<u32>,
+) -> bool {
+    turn_saw_accepted && !newt_core::agentic::is_truncation_suspect(input_tokens, num_ctx)
+}
+
+/// #1967 regression: the turn-level tuning ratchet must honor the same
+/// truncation-suspect exclusion the per-round ratchet already has, so a
+/// suspect turn-max input can never promote confidence — and, on its
+/// anti-vacuous twin, a genuinely clean accepted round must still ratchet
+/// normally (the fix must not turn the gate into a permanent no-op).
+#[cfg(test)]
+mod turn_tuning_ratchet_tests {
+    use super::turn_tuning_ratchet_is_trustworthy;
+
+    /// Replays the incident's exact numbers (#1967's evidence): `num_ctx`
+    /// 209,715 (the session's `safe_context`, standing in for an explicit
+    /// `[backends] num_ctx` the config never set), the poisoned round's
+    /// real 205,189 input tokens (97.8% of that window — inside the 95%
+    /// suspect zone), and a turn that DID see an Accepted round elsewhere.
+    /// A suspect turn-max at 97.8% of the window, following a turn that
+    /// otherwise completed normally, must not move `max_ok_input` — this
+    /// fails on current (pre-fix) `main` by construction, since that code
+    /// path checks only `turn_saw_accepted`.
+    #[test]
+    fn a_suspect_turn_max_does_not_ratchet_even_with_an_earlier_accept() {
+        assert!(
+            !turn_tuning_ratchet_is_trustworthy(true, 205_189, Some(209_715)),
+            "turn_saw_accepted alone must not license a suspect turn-max"
+        );
+    }
+
+    /// The anti-vacuous twin: a genuinely clean turn — accepted, and its
+    /// max input nowhere near the window — still ratchets. Proves the fix
+    /// is a real exclusion, not a change that silently disables the
+    /// turn-level ratchet altogether.
+    #[test]
+    fn a_genuinely_clean_accepted_turn_still_ratchets() {
+        assert!(turn_tuning_ratchet_is_trustworthy(
+            true,
+            4_136,
+            Some(209_715)
+        ));
+        // And the untouched half of the existing gate: no acceptance at all
+        // still means no ratchet, suspect or not.
+        assert!(!turn_tuning_ratchet_is_trustworthy(
+            false,
+            4_136,
+            Some(209_715)
+        ));
+    }
+
+    /// No known `num_ctx` (e.g. a provider that never reports one): nothing
+    /// to compare against, so `is_truncation_suspect` is never true and an
+    /// accepted turn ratchets exactly as it always has.
+    #[test]
+    fn unknown_num_ctx_never_blocks_the_ratchet() {
+        assert!(turn_tuning_ratchet_is_trustworthy(true, 205_189, None));
+    }
+}
+
 /// #1963: persist a turn that did NOT reach a normal completion — cancelled
 /// by the operator (Esc/Ctrl-C) or ended in a backend/loop error — through
 /// exactly the same durable path [`save_turn_if_persistent`]'s Ok-arm caller
@@ -7979,7 +8057,11 @@ fn session_body(
                                 // at detection by the observation hook, with the
                                 // truthful per-round number.
                                 if let Some(input_tokens) = usage.map(|u| u.input_tokens) {
-                                    if turn_saw_accepted.get() {
+                                    if turn_tuning_ratchet_is_trustworthy(
+                                        turn_saw_accepted.get(),
+                                        input_tokens,
+                                        eff_num_ctx,
+                                    ) {
                                         let entry = cap_cache.entry(cap_id.clone()).or_default();
                                         let dirty = entry.record_success(input_tokens, &today);
                                         if dirty {

@@ -271,7 +271,7 @@ pub use permissions::{
 pub use plan_mode::PlanModeControl;
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
-pub use send_budget::initial_context_input_budget;
+pub use send_budget::{initial_context_input_budget, is_truncation_suspect};
 pub use steering::{ReplaceRejected, Rev, SessionSteeringInbox, SteeringInbox};
 pub use tools::{
     execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt,
@@ -2831,9 +2831,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // Phase 20 §2.2: a prompt within 5% of the request's `num_ctx` may
         // have been silently head-truncated by Ollama — such a round is
         // window evidence of NOTHING and must neither raise the budget nor
-        // emit an `Accepted` observation.
-        let truncation_suspect = round_usage
-            .is_some_and(|u| num_ctx.is_some_and(|c| u.input_tokens >= c.saturating_mul(95) / 100));
+        // emit an `Accepted` observation. #1967: the ONE shared predicate —
+        // do not re-derive this threshold at another writer.
+        let truncation_suspect =
+            round_usage.is_some_and(|u| is_truncation_suspect(u.input_tokens, num_ctx));
         // Mid-turn budget raise on window evidence alone: the backend just
         // evaluated this many prompt tokens inside the `num_ctx` it was sent,
         // so one over-budget acceptance stops the compress-every-round thrash
