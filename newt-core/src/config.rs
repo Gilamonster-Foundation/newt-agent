@@ -3793,6 +3793,18 @@ struct BackendAssembly {
     operator_configured: bool,
     /// A nonempty CLI request was applied.
     requested: bool,
+    /// #1984: every skip/degrade decision this assembly made, as VALUES —
+    /// the primary record. `warn` (below) is the ONE place that both
+    /// appends here and emits the `tracing::warn!` a human `RUST_LOG=warn`
+    /// session still sees; every other call site in this impl block goes
+    /// through it rather than calling `tracing::warn!` directly, so there
+    /// is exactly one emission point to keep in sync. Tests assert on
+    /// `warnings()`, not on a scraped log — see `config_tests/tests.rs`'s
+    /// module doc for why the log-scraping shape was flaky (a per-test
+    /// `tracing::subscriber::with_default` capture races tracing's
+    /// process-wide callsite interest cache against sibling tests doing
+    /// the same, #1984).
+    warnings: Vec<String>,
 }
 
 impl BackendAssembly {
@@ -3808,7 +3820,39 @@ impl BackendAssembly {
             pending_probes: Vec::new(),
             operator_configured: false,
             requested: false,
+            warnings: Vec::new(),
         })
+    }
+
+    /// The ONE place this impl block records a skip/degrade decision:
+    /// appends `message` to the returned-value record (#1984's fix) and
+    /// emits it as a `tracing::warn!` so an operator with `RUST_LOG=warn`
+    /// (the default — see #1951) still sees it live. `message` should read
+    /// the same whether it reaches a human via the log or a test via
+    /// [`Self::warnings`].
+    fn warn(&mut self, message: String) {
+        tracing::warn!("{message}");
+        self.warnings.push(message);
+    }
+
+    /// Every skip/degrade decision recorded so far, in the order they
+    /// happened — the returned-value record `warn` builds. Callable any
+    /// time before [`Self::finish`] consumes `self`.
+    ///
+    /// `#[cfg(test)]`: `warn` (above) is the sole PRODUCTION consumer of
+    /// `self.warnings` today (it feeds `tracing::warn!`) — nothing in
+    /// production reads the accumulated Vec back out yet. `newt doctor`'s
+    /// drop-in diagnostics (#1951/#1962) were checked as a candidate
+    /// consumer and are NOT: that scan deliberately does not call
+    /// `merge_dir` at all, because it must keep reporting file-by-file even
+    /// when `merge_dir` hard-errors (the ambiguous-legacy-marker case) —
+    /// exactly the failure this accessor's caller would already be past.
+    /// Un-gate this the day a production caller needs it; until then,
+    /// `#[cfg(test)]` is the honest signal that it is a value the TESTS
+    /// rely on, not a currently-dead production API surface.
+    #[cfg(test)]
+    fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     fn is_empty(&self) -> bool {
@@ -3883,7 +3927,10 @@ impl BackendAssembly {
             let tag = match disk_record_tag(&text) {
                 Ok(tag) => tag,
                 Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "skipping malformed backend file");
+                    self.warn(format!(
+                        "{}: skipping malformed backend file: {e}",
+                        path.display()
+                    ));
                     continue;
                 }
             };
@@ -3897,7 +3944,10 @@ impl BackendAssembly {
                             // The header parse is laxer than the full parse
                             // (it reads one key) — a body-malformed file
                             // lands here, same visible skip as everywhere.
-                            tracing::warn!(path = %path.display(), error = %e, "skipping malformed backend file");
+                            self.warn(format!(
+                                "{}: skipping malformed backend file: {e}",
+                                path.display()
+                            ));
                             continue;
                         }
                     };
@@ -3922,21 +3972,27 @@ impl BackendAssembly {
         let mut backend = match toml::from_str::<BackendConfig>(text) {
             Ok(backend) => backend,
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "skipping malformed backend file");
+                self.warn(format!(
+                    "{}: skipping malformed backend file: {e}",
+                    path.display()
+                ));
                 return;
             }
         };
         // The filename is authoritative for the name (collision-free).
         backend.name = stem.to_string();
         if !backend_has_destination(&backend) {
-            tracing::warn!(
-                path = %path.display(),
-                "skipping backend with neither endpoint nor model_path"
-            );
+            self.warn(format!(
+                "{}: skipping backend with neither endpoint nor model_path",
+                path.display()
+            ));
             return;
         }
         if let Err(reason) = validate_backend_destination(&backend) {
-            tracing::warn!(path = %path.display(), %reason, "skipping backend drop-in");
+            self.warn(format!(
+                "{}: skipping backend drop-in: {reason}",
+                path.display()
+            ));
             return;
         }
         self.operator_configured = true;
@@ -3946,10 +4002,10 @@ impl BackendAssembly {
             NameMatch::Ambiguous => {
                 // Unreachable (the constructor validated uniqueness) — but
                 // never guess which duplicate a file means.
-                tracing::warn!(
-                    path = %path.display(),
-                    "several staged backends share this name — drop-in not merged"
-                );
+                self.warn(format!(
+                    "{}: several staged backends share this name — drop-in not merged",
+                    path.display()
+                ));
             }
         }
     }
@@ -3960,11 +4016,10 @@ impl BackendAssembly {
         let record = match parse_probe_record(text) {
             Ok(record) => record,
             Err(reason) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    %reason,
-                    "invalid probe record — not overlaid (delete the file to re-probe)"
-                );
+                self.warn(format!(
+                    "{}: invalid probe record — not overlaid (delete the file to re-probe): {reason}",
+                    path.display()
+                ));
                 return;
             }
         };
@@ -3990,17 +4045,17 @@ impl BackendAssembly {
             let slot = match self.find(&stem) {
                 NameMatch::Unique(i) => &mut self.slots[i],
                 NameMatch::Missing => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "probe record names an unconfigured backend — ignored (delete the file)"
-                    );
+                    self.warn(format!(
+                        "{}: probe record names an unconfigured backend — ignored (delete the file)",
+                        path.display()
+                    ));
                     continue;
                 }
                 NameMatch::Ambiguous => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "several staged backends share this name — probe record not attached"
-                    );
+                    self.warn(format!(
+                        "{}: several staged backends share this name — probe record not attached",
+                        path.display()
+                    ));
                     continue;
                 }
             };
@@ -4010,12 +4065,13 @@ impl BackendAssembly {
             let observed_at = BackendDestination::new(Some(observation.endpoint.clone()), None);
             let declared_at = BackendDestination::of(&slot.declaration);
             if declared_at != observed_at {
-                tracing::warn!(
-                    path = %path.display(),
-                    configured = %slot.declaration.endpoint,
-                    probed = %observation.endpoint,
-                    "probe record's destination does not match the configured backend — not overlaid"
-                );
+                let configured = slot.declaration.endpoint.clone();
+                let probed = observation.endpoint.clone();
+                self.warn(format!(
+                    "{}: probe record's destination does not match the configured backend \
+                     (configured={configured}, probed={probed}) — not overlaid",
+                    path.display()
+                ));
                 continue;
             }
             slot.observation = Some(observation);
