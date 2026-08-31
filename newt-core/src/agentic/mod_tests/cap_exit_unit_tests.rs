@@ -512,3 +512,78 @@ fn workflow_classifier_text_keeps_recent_user_issue_context() {
     assert!(hint.contains("read_issue"), "{hint}");
     assert!(hint.contains("open_pr"), "{hint}");
 }
+
+// ---------------------------------------------------------------------
+// #1965 — the turn heartbeat
+// ---------------------------------------------------------------------
+
+/// **Bounded, and pure over a stated elapsed.** No clock is read here and none
+/// is slept on: `due` takes the elapsed it should judge, so the whole schedule
+/// is table-testable. A wall-clock assertion would be a flake generator on a
+/// saturating box, which is exactly why the policy and the clock are separate.
+#[test]
+fn the_heartbeat_fires_once_per_interval_and_never_catches_up() {
+    let five = std::time::Duration::from_secs(300);
+    let at = std::time::Duration::from_secs;
+    let mut hb = TurnHeartbeat::default();
+
+    assert!(!hb.due(at(0), five), "a turn that just started is not late");
+    assert!(
+        !hb.due(at(299), five),
+        "…nor one just short of the first mark"
+    );
+    assert!(hb.due(at(300), five), "the first interval fires");
+    assert!(!hb.due(at(301), five), "…exactly once");
+    assert!(!hb.due(at(599), five));
+    assert!(hb.due(at(600), five), "the second interval fires");
+
+    // A turn that blocked for an hour inside ONE tool call emits one line on
+    // return, not twelve. Catching up would turn a quiet signal into a wall of
+    // text at the moment the operator is trying to read what happened.
+    assert!(
+        hb.due(at(4200), five),
+        "the long gap yields exactly one line"
+    );
+    assert!(!hb.due(at(4200), five));
+    assert!(!hb.due(at(4499), five));
+}
+
+/// The anti-vacuous twin: an ordinary turn emits NOTHING. A heartbeat that
+/// fired on short turns would be noise, and `due` returning `true` always
+/// would satisfy the schedule test above on its own.
+#[test]
+fn an_ordinary_turn_emits_no_heartbeat_at_all() {
+    let five = std::time::Duration::from_secs(300);
+    let mut hb = TurnHeartbeat::default();
+    for secs in [0, 1, 5, 30, 90, 180, 299] {
+        assert!(
+            !hb.due(std::time::Duration::from_secs(secs), five),
+            "{secs}s into a turn is not heartbeat-worthy"
+        );
+    }
+}
+
+/// A zero interval disables it rather than dividing by zero or firing every
+/// round — the zero-is-noop contract this workspace uses elsewhere.
+#[test]
+fn a_zero_interval_disables_the_heartbeat() {
+    let mut hb = TurnHeartbeat::default();
+    for secs in [0, 300, 10_000] {
+        assert!(!hb.due(
+            std::time::Duration::from_secs(secs),
+            std::time::Duration::ZERO
+        ));
+    }
+}
+
+/// The line names elapsed minutes and the round against the EFFECTIVE cap, so
+/// an escalated turn reads as "round 210 of 10000" rather than looking like it
+/// has overrun a limit of 40 — which is the confusion #1965 is about.
+#[test]
+fn the_heartbeat_line_reports_elapsed_and_the_effective_cap() {
+    let line = turn_heartbeat_line(std::time::Duration::from_secs(1954), 210, 10_000);
+    assert!(line.contains("32m elapsed"), "{line}");
+    assert!(line.contains("round 210 of 10000"), "{line}");
+    assert!(!line.contains('\u{1b}'), "no ANSI in the pure line: {line}");
+    assert!(!line.contains('\n'), "one line: {line}");
+}
