@@ -15,6 +15,7 @@ use super::compress::{CompressAction, CompressTrigger};
 use super::prompt_intake::PROMPT_COMPREHENSION_SCHEMA_CURRENT;
 use super::prompt_intake::{
     PromptIntake, PROMPT_COMPREHENSION_SCHEMA_V1, PROMPT_COMPREHENSION_SCHEMA_V2,
+    PROMPT_COMPREHENSION_SCHEMA_V3,
 };
 use super::scheduled::{PlanSnapshot, Step, StepStatus, MAX_STEPS, STEP_DESC_CAP};
 use crate::artifact::{ArtifactKind, ArtifactRelation, NewPromptArtifact};
@@ -28,7 +29,12 @@ const MAX_ATOMIC_ASK_DIGESTS: usize = 64;
 const MAX_CLARIFICATION_DIGESTS: usize = 16;
 const MAX_DECISION_AGGREGATE_COUNT: u64 = 1_024;
 
-const PROMPT_COMPREHENSION_FIELDS: [&str; 10] = [
+/// Cap on one carried informational clause. Matches `prompt_intake`'s own
+/// `MAX_ASK_BYTES`, so extraction has already truncated to it and this is a
+/// second, independent bound on what reaches the ledger.
+const MAX_INFORMATIONAL_ASK_BYTES: usize = 4_096;
+
+const PROMPT_COMPREHENSION_FIELDS: [&str; 13] = [
     "schema",
     "disposition",
     "atomic_ask_count",
@@ -39,6 +45,10 @@ const PROMPT_COMPREHENSION_FIELDS: [&str; 10] = [
     "atomic_ask_digests",
     "clarification_digests",
     "authorized_assumption_digests",
+    // #1971, v3. Optional: records written before v3 have none.
+    "informational_ask_count",
+    "informational_asks",
+    "atomic_ask_kinds",
 ];
 const DECISION_STATUS_FIELDS: [&str; 2] = ["pending", "locked"];
 const DECISION_SOURCE_FIELDS: [&str; 3] = ["operator", "policy", "authorized_assumption"];
@@ -104,7 +114,12 @@ fn bounded_prompt_comprehension_metadata(metadata: &Value) -> anyhow::Result<Val
     let object = exact_object(
         metadata,
         &PROMPT_COMPREHENSION_FIELDS,
-        &["authorized_assumption_digests"],
+        &[
+            "authorized_assumption_digests",
+            "informational_ask_count",
+            "informational_asks",
+            "atomic_ask_kinds",
+        ],
         "prompt-comprehension metadata",
     )?;
 
@@ -119,6 +134,11 @@ fn bounded_prompt_comprehension_metadata(metadata: &Value) -> anyhow::Result<Val
         PROMPT_COMPREHENSION_SCHEMA_V2 => {
             if !matches!(disposition, "ask" | "act" | "explain" | "research" | "plan") {
                 anyhow::bail!("prompt-comprehension metadata has an invalid v2 disposition");
+            }
+        }
+        PROMPT_COMPREHENSION_SCHEMA_V3 => {
+            if !matches!(disposition, "ask" | "act" | "explain" | "research" | "plan") {
+                anyhow::bail!("prompt-comprehension metadata has an invalid v3 disposition");
             }
         }
         _ => anyhow::bail!("prompt-comprehension metadata has an unsupported schema"),
@@ -197,7 +217,39 @@ fn bounded_prompt_comprehension_metadata(metadata: &Value) -> anyhow::Result<Val
         );
     }
 
+    // #1971 — the one place prompt-derived TEXT enters the ledger, and the
+    // narrowest one available.
+    //
+    // Everything above is a count or a digest, and that stays true for every
+    // clause an operator INSTRUCTED or DECIDED. Stated facts are carried
+    // because the bug being fixed is that the durable record of a dropped fact
+    // could not say what was dropped: the evidencing artifact held
+    // `atomic_ask_count=1` and a digest, and the fact itself was unrecoverable
+    // from it. A digest cannot be read back.
+    //
+    // It discloses nothing new. `prompt_receipts.raw_text` already persists the
+    // ENTIRE prompt verbatim, in the same database — so this classifies bytes
+    // that are already durable rather than copying new ones in, and it is
+    // doubly bounded: informational clauses only, capped in count and in bytes.
+    let informational_asks = bounded_informational_asks(object.get("informational_asks"))?;
+    let informational_ask_count = match object.get("informational_ask_count") {
+        None => u64::try_from(informational_asks.len()).unwrap_or(u64::MAX),
+        Some(_) => required_count(object, "informational_ask_count")?,
+    };
+    if informational_ask_count != u64::try_from(informational_asks.len()).unwrap_or(u64::MAX) {
+        anyhow::bail!("prompt-comprehension informational asks do not match their count");
+    }
+    let atomic_ask_kinds = bounded_ask_kinds(object.get("atomic_ask_kinds"))?;
+    if !atomic_ask_kinds.is_empty()
+        && atomic_ask_count != u64::try_from(atomic_ask_kinds.len()).unwrap_or(u64::MAX)
+    {
+        anyhow::bail!("prompt-comprehension ask kinds do not match the atomic-ask count");
+    }
+
     Ok(json!({
+        "informational_ask_count": informational_ask_count,
+        "informational_asks": informational_asks,
+        "atomic_ask_kinds": atomic_ask_kinds,
         "schema": schema,
         "disposition": disposition,
         "atomic_ask_count": atomic_ask_count,
@@ -209,6 +261,54 @@ fn bounded_prompt_comprehension_metadata(metadata: &Value) -> anyhow::Result<Val
         "clarification_digests": clarification_digests,
         "authorized_assumption_digests": authorized_assumption_digests,
     }))
+}
+
+/// Informational clause text, bounded in count and in bytes. Anything else in
+/// the list is a malformed record, not a clause.
+fn bounded_informational_asks(value: Option<&Value>) -> anyhow::Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .context("informational asks must be a JSON array")?;
+    if items.len() > MAX_ATOMIC_ASK_DIGESTS {
+        anyhow::bail!("informational asks exceed the artifact bound");
+    }
+    items
+        .iter()
+        .map(|item| {
+            let text = item
+                .as_str()
+                .context("an informational ask must be a string")?;
+            if text.len() > MAX_INFORMATIONAL_ASK_BYTES {
+                anyhow::bail!("an informational ask exceeds the artifact byte bound");
+            }
+            Ok(text.to_string())
+        })
+        .collect()
+}
+
+/// Per-clause kinds. A closed vocabulary, so an unknown kind is a malformed
+/// record rather than a silently accepted new authority category.
+fn bounded_ask_kinds(value: Option<&Value>) -> anyhow::Result<Vec<String>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let items = value.as_array().context("ask kinds must be a JSON array")?;
+    if items.len() > MAX_ATOMIC_ASK_DIGESTS {
+        anyhow::bail!("ask kinds exceed the artifact bound");
+    }
+    items
+        .iter()
+        .map(|item| {
+            let kind = item.as_str().context("an ask kind must be a string")?;
+            if !matches!(kind, "instruction" | "informational") {
+                anyhow::bail!("an ask kind is outside the closed vocabulary");
+            }
+            Ok(kind.to_string())
+        })
+        .collect()
 }
 
 fn exact_object<'a>(
@@ -935,9 +1035,101 @@ mod tests {
         let writes = sink.writes.lock().unwrap();
         assert_eq!(
             writes[0].2.metadata()["schema"],
-            "prompt_comprehension_manifest_v2"
+            "prompt_comprehension_manifest_v3"
         );
         assert_eq!(writes[0].2.metadata()["disposition"], "plan");
+    }
+
+    /// **A v2 record already on disk still validates** (#1971). The three new
+    /// fields are optional, and an absent list is exactly equivalent to an
+    /// empty one — the same compatibility rule `authorized_assumption_digests`
+    /// established. Without this, arming a schema bump would reject every
+    /// manifest written before it.
+    #[test]
+    fn prompt_comprehension_manifest_accepts_a_v2_record_without_the_new_fields() {
+        let sink = RecordingSink::default();
+        let (_, _, context) = context();
+        let v2 = serde_json::json!({
+            "schema": "prompt_comprehension_manifest_v2",
+            "disposition": "act",
+            "atomic_ask_count": 1,
+            "clarification_count": 0,
+            "decision_count": 0,
+            "decision_status_counts": { "pending": 0, "locked": 0 },
+            "decision_source_counts": {
+                "operator": 0, "policy": 0, "authorized_assumption": 0
+            },
+            "atomic_ask_digests": [{ "digest": "a".repeat(64), "bytes": 12 }],
+            "clarification_digests": [],
+        });
+
+        record_prompt_comprehension_metadata(&sink, context, &v2).unwrap();
+
+        let writes = sink.writes.lock().unwrap();
+        let metadata = writes[0].2.metadata();
+        assert_eq!(metadata["schema"], "prompt_comprehension_manifest_v2");
+        assert_eq!(
+            metadata["informational_ask_count"], 0,
+            "an absent list normalizes to zero, not to a rejection"
+        );
+        assert_eq!(metadata["informational_asks"], serde_json::json!([]));
+    }
+
+    /// The carried text is bounded in both directions, and the kind vocabulary
+    /// is closed — an unknown kind is a malformed record, never a silently
+    /// accepted new authority category.
+    #[test]
+    fn the_v3_fields_are_bounded_and_their_vocabulary_is_closed() {
+        let base = |informational: serde_json::Value, kinds: serde_json::Value| {
+            serde_json::json!({
+                "schema": "prompt_comprehension_manifest_v3",
+                "disposition": "explain",
+                "atomic_ask_count": 1,
+                "clarification_count": 0,
+                "decision_count": 0,
+                "decision_status_counts": { "pending": 0, "locked": 0 },
+                "decision_source_counts": {
+                    "operator": 0, "policy": 0, "authorized_assumption": 0
+                },
+                "atomic_ask_digests": [{ "digest": "a".repeat(64), "bytes": 12 }],
+                "clarification_digests": [],
+                "informational_ask_count": 1,
+                "informational_asks": informational,
+                "atomic_ask_kinds": kinds,
+            })
+        };
+        let ok = base(
+            serde_json::json!(["the remote is X"]),
+            serde_json::json!(["informational"]),
+        );
+        assert!(bounded_prompt_comprehension_metadata(&ok).is_ok());
+
+        let oversized = base(
+            serde_json::json!(["x".repeat(MAX_INFORMATIONAL_ASK_BYTES + 1)]),
+            serde_json::json!(["informational"]),
+        );
+        assert!(
+            bounded_prompt_comprehension_metadata(&oversized).is_err(),
+            "an oversized clause must be refused, not truncated silently"
+        );
+
+        let unknown_kind = base(
+            serde_json::json!(["the remote is X"]),
+            serde_json::json!(["advisory"]),
+        );
+        assert!(
+            bounded_prompt_comprehension_metadata(&unknown_kind).is_err(),
+            "the kind vocabulary is closed"
+        );
+
+        let miscounted = base(
+            serde_json::json!(["a", "b"]),
+            serde_json::json!(["informational"]),
+        );
+        assert!(
+            bounded_prompt_comprehension_metadata(&miscounted).is_err(),
+            "the count must match the list it counts"
+        );
     }
 
     #[test]
@@ -972,8 +1164,11 @@ mod tests {
         missing_field.as_object_mut().unwrap().remove("schema");
         assert_prompt_comprehension_metadata_rejected(&missing_field);
 
+        // v3 became a supported schema in #1971; the guard is that an
+        // UNKNOWN schema is refused, so it moves to the next unminted version
+        // rather than being deleted.
         let mut unsupported_schema = valid_prompt_comprehension_metadata();
-        unsupported_schema["schema"] = Value::from("prompt_comprehension_manifest_v3");
+        unsupported_schema["schema"] = Value::from("prompt_comprehension_manifest_v4");
         assert_prompt_comprehension_metadata_rejected(&unsupported_schema);
 
         let mut root_text = valid_prompt_comprehension_metadata();
@@ -991,6 +1186,14 @@ mod tests {
         let mut digest_text = valid_prompt_comprehension_metadata();
         digest_text["atomic_ask_digests"][0]["text"] = Value::from("private atomic ask");
         assert_prompt_comprehension_metadata_rejected(&digest_text);
+
+        // #1971 admits exactly ONE text-bearing field, by name and bounded.
+        // Arbitrary prompt text is still refused — including under a plausible
+        // sibling name — so the boundary moved by one named field rather than
+        // opening.
+        let mut plausible_sibling = valid_prompt_comprehension_metadata();
+        plausible_sibling["informational_ask_text"] = Value::from("private operator prompt");
+        assert_prompt_comprehension_metadata_rejected(&plausible_sibling);
     }
 
     #[test]
