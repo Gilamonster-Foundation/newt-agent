@@ -297,3 +297,135 @@ pub(crate) fn cursor_position_or_anchor() -> Position {
         .get_cursor_position()
         .unwrap_or(Position { x: 0, y: 0 })
 }
+
+#[cfg(test)]
+mod region_lease_door {
+    /// Every file that may construct an inline viewport. **Declared, not
+    /// discovered** (F0b): a scan that trusted a glob would silently start
+    /// permitting a new file the day someone added one.
+    const DESTINATIONS: &[&str] = &["inline_viewport.rs"];
+
+    /// The CALL FORM, never the bare name (#1924). Seven files mention
+    /// `Viewport::Inline` in prose — including the doc comment that explains
+    /// this very rule — and a name-shaped needle would count all of them, so
+    /// the guard would pass by matching its own explanation.
+    const DOOR: &str = "Viewport::Inline(";
+    const OPTIONS: &str = "Terminal::with_options(";
+
+    fn sources() -> Vec<(String, String)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        let mut stack = vec![dir];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).expect("newt-tui/src is readable") {
+                let path = entry.expect("a readable entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let name = path
+                        .file_name()
+                        .expect("a file name")
+                        .to_string_lossy()
+                        .into_owned();
+                    out.push((name, std::fs::read_to_string(&path).expect("readable")));
+                }
+            }
+        }
+        out
+    }
+
+    /// Region claims that do NOT yet go through a lease.
+    ///
+    /// A ratchet, not a permission list: the count may only go DOWN. The
+    /// cockpit presenter builds two `Viewport::Fixed` regions from its own row
+    /// arithmetic (`self.top`, clamped on resize), which is a claim on rows by
+    /// any reading — it is simply not this slice's. #1979's sweep takes it,
+    /// and `RegionLease::relocate` exists because that block MOVES.
+    const UNLEASED_REGION_CLAIMS: &[(&str, usize)] = &[("presenter.rs", 2)];
+
+    /// **The door is one door, and it takes a lease.**
+    ///
+    /// `inline_terminal` is the only inline-viewport constructor, and its
+    /// signature requires a `RegionLease` — so there is no bare form to call
+    /// and no second place to add one. This is the `PromptWindow` seal pattern
+    /// at region scale: the capability is the way in.
+    #[test]
+    fn the_inline_viewport_door_exists_in_exactly_one_declared_place() {
+        let files = sources();
+        // POSITIVE READ ASSERTION FIRST. An absence-check that silently read
+        // nothing passes forever, and gets MORE likely to pass as the scan
+        // breaks.
+        assert!(
+            files.len() > 10,
+            "the scan found {} files, so it is not reading the crate",
+            files.len()
+        );
+        assert!(
+            files.iter().any(|(n, _)| n == "inline_viewport.rs"),
+            "the scan never reached the file that holds the door"
+        );
+
+        for (name, body) in &files {
+            if body.contains(DOOR) {
+                assert!(
+                    DESTINATIONS.contains(&name.as_str()),
+                    "`{DOOR}` appears in {name}, which is not a declared \
+                     destination. An inline viewport is a claim on rows: mint a \
+                     `RegionLease` and go through `inline_terminal`."
+                );
+            }
+        }
+    }
+
+    /// The wider category, ratcheted: every OTHER way a surface claims rows.
+    ///
+    /// Separate from the door above because the door's baseline is zero from
+    /// birth, while this one starts at two and is meant to reach zero in the
+    /// sweep. Counting them keeps the mess visible and monotonically
+    /// decreasing rather than rewritten.
+    #[test]
+    fn unleased_region_claims_only_decrease() {
+        for (name, body) in &sources() {
+            if name == "inline_viewport.rs" {
+                continue; // the door itself, and this test's own needles
+            }
+            let found = body.matches(OPTIONS).count();
+            let allowed = UNLEASED_REGION_CLAIMS
+                .iter()
+                .find(|(f, _)| *f == name)
+                .map_or(0, |(_, n)| *n);
+            assert!(
+                found <= allowed,
+                "{name} makes {found} region claims, {allowed} declared. A new \
+                 one must mint a `RegionLease`; a removed one must lower the \
+                 baseline."
+            );
+        }
+    }
+
+    /// Probe one: the needle WOULD fire on a new site. Without this the test
+    /// above passes equally well when the needle matches nothing at all.
+    #[test]
+    fn the_door_needle_catches_a_bare_construction() {
+        let smuggled = "let t = Terminal::with_options(b, TerminalOptions { \
+                        viewport: Viewport::Inline(6) });";
+        assert!(smuggled.contains(DOOR), "the needle misses a real call");
+        assert!(
+            smuggled.contains(OPTIONS),
+            "the options needle misses a real call"
+        );
+    }
+
+    /// Probe two: it does NOT fire on prose. Six files discuss
+    /// `Viewport::Inline` without constructing one, and a name-shaped needle
+    /// would have flagged every one of them — which is how a guard gets
+    /// weakened until it means nothing.
+    #[test]
+    fn the_door_needle_ignores_prose_about_the_rule() {
+        let prose = "//! opens this transient ratatui `Viewport::Inline` overlay: one surface";
+        assert!(
+            !prose.contains(DOOR),
+            "the needle matches prose, so the guard would flag documentation"
+        );
+    }
+}

@@ -1371,4 +1371,39 @@ mod tests {
         // Moving onto its OWN rows is not a self-collision.
         assert!(moving.relocate(rows(10, 8)), "a lease may resize in place");
     }
+
+    /// **Compose proof.** Panel over prompt, close, both restored in order —
+    /// the nested-modal property (`a_nested_frame_does_not_restore_the_
+    /// terminal_early`) at region scale. The inner holder returning its rows
+    /// must not disturb the outer one, which is what makes nesting safe.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn an_inner_region_returns_without_disturbing_the_outer_one() {
+        let prompt = Terminal::lease_region(rows(18, 6), OnCollision::Refuse).expect("prompt");
+        {
+            let panel = Terminal::lease_region(rows(18, 6), OnCollision::Shift).expect("panel");
+            assert_eq!(panel.region(), rows(12, 6));
+            // While both are up, the rows they hold are BOTH unavailable.
+            assert!(
+                Terminal::lease_region(rows(12, 6), OnCollision::Refuse).is_none(),
+                "the panel's rows were re-let while it held them"
+            );
+            assert!(
+                Terminal::lease_region(rows(18, 6), OnCollision::Refuse).is_none(),
+                "the prompt's rows were re-let while it held them"
+            );
+        }
+        // The panel closed. ITS rows are free; the prompt's are NOT — the
+        // inner drop must not have released the outer holder's claim.
+        let reclaimed = Terminal::lease_region(rows(12, 6), OnCollision::Refuse)
+            .expect("the panel's rows return");
+        assert_eq!(reclaimed.region(), rows(12, 6));
+        assert!(
+            Terminal::lease_region(rows(18, 6), OnCollision::Refuse).is_none(),
+            "closing the panel released the PROMPT's rows — restoring more than \
+             it took is the nested-modal defect"
+        );
+        drop(prompt);
+        drop(reclaimed);
+    }
 }
