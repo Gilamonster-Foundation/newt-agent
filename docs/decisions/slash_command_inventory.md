@@ -52,6 +52,22 @@ Two scanner bugs were hit and are worth recording, because both are the
 * **A first pass modelled only `body == "x"` forms** and missed the
   `match verb { … }` shape the navigator and `/mcp` use after a `split_once`
   hop, undercounting by 18.
+* **The brace-depth skip itself was wrong**, and this one is worth the most.
+  `#[cfg(test)]` does not always introduce a brace block: in `lib.rs` it
+  precedes `use …;` and `#[path = "…"] mod x;` declarations, because #1949
+  extracted the test bodies to `lib_tests/`. A skipper that assumed a block
+  scanned forward to the next `{` *anywhere* and skipped to its matching
+  close — eating ~760 lines of production. Re-running with a skipper that
+  distinguishes a block from a declaration yields **the same 75**: the bug
+  was real and no command lived in the eaten region. That the number survived
+  a scanner that was demonstrably reading the wrong text is better evidence
+  for it than the first clean-looking run was.
+
+`production_source`, the crate's own helper, cannot be used on these files
+for the same reason: it splits on `\n#[cfg(test)]\nmod tests {`, which
+`lib.rs` and `chat.rs` no longer contain, so it would panic rather than
+silently truncate. That is the right failure — but it means the registry's
+drift test needs its own cut, written against the declaration form.
 
 ## The drift, both directions
 
