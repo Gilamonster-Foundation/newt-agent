@@ -106,9 +106,23 @@ pub fn detect_checks(entries: &[String], instruction: &str) -> Vec<VerifyCheck> 
                 ],
             )),
             "cargo.toml" => {
+                // `cargo check` is deliberately NOT a marker (#1942). It is a
+                // TYPE-CHECK: it compiles and runs nothing, so accepting it
+                // satisfies this gate on a turn that executed no test at all —
+                // the "declares done on a broken solution" failure the module
+                // doc calls the measured #1 capability lever. A check that its
+                // own wrong evidence satisfies is worse than no check, because
+                // it reports confidence.
+                //
+                // `cargo test` is a SUBSTRING marker, so every flag-bearing
+                // form already counts (`-p foo`, `--workspace`, `--lib x`) and
+                // narrowing costs none of them. `cargo nextest` is listed
+                // beside it because it is a different binary running the same
+                // tests: a turn that ran it has verified exactly as much, and
+                // omitting it would nudge a workspace that had.
                 checks.push(VerifyCheck::new(
                     "`cargo test`",
-                    &["cargo test", "cargo check"],
+                    &["cargo test", "cargo nextest"],
                 ));
             }
             "go.mod" => checks.push(VerifyCheck::new("`go test ./...`", &["go test"])),
@@ -285,6 +299,57 @@ mod tests {
         assert!(labels.iter().any(|l| l.contains("cargo test")));
         assert!(labels.iter().any(|l| l.contains("just test")));
         assert!(labels.iter().any(|l| l.contains("go test")));
+    }
+
+    /// **#1942 — `cargo check` is not evidence that tests ran.** It is a
+    /// type-check: it compiles and runs nothing. Accepting it satisfies the
+    /// gate on a turn that never executed a single test, which is precisely
+    /// the "declares done on a broken solution" failure this module's own doc
+    /// calls the measured #1 capability lever.
+    ///
+    /// Red before the fix by construction: `cargo check` was a run marker, so
+    /// this turn silenced the nudge.
+    #[test]
+    fn a_cargo_check_alone_does_not_satisfy_the_cargo_test_check() {
+        let checks = detect_checks(&entries(&["Cargo.toml"]), "");
+        for only in [
+            "cargo check",
+            "cargo check --workspace",
+            "cargo check --all-targets",
+            "cargo clippy --workspace -- -D warnings",
+        ] {
+            assert!(
+                verify_gate_nudge(&checks, &[only.into()]).is_some(),
+                "`{only}` runs no test, so the gate must still fire"
+            );
+        }
+    }
+
+    /// The anti-vacuous twin: the markers that DO mean tests ran still
+    /// satisfy the check, so the fix above is a narrowing and not a break.
+    ///
+    /// Both families are here deliberately. `cargo test` is a substring
+    /// marker, so every flag-bearing form of it already counts — the fix does
+    /// not cost `-p`, `--workspace` or `--lib`. `cargo nextest` is a second
+    /// marker because it is a different binary running the same tests, and a
+    /// turn that ran it has verified exactly as much.
+    #[test]
+    fn real_test_runs_still_satisfy_the_cargo_check() {
+        let checks = detect_checks(&entries(&["Cargo.toml"]), "");
+        for ran in [
+            "cargo test",
+            "cargo test -p newt-core",
+            "cargo test --workspace --all-targets",
+            "cargo test --lib self_verify",
+            "cargo nextest run",
+            "cargo nextest run -p newt-core",
+        ] {
+            assert_eq!(
+                verify_gate_nudge(&checks, &[ran.into()]),
+                None,
+                "`{ran}` ran the tests, so the gate must be silent"
+            );
+        }
     }
 
     #[test]
