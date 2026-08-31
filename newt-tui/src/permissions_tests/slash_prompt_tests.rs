@@ -1,4 +1,5 @@
-use super::is_slash_command_at_prompt;
+use super::{apply_chat_prompt_policy, is_slash_command_at_prompt, SLASH_COMMAND_PROMPT_NOTICE};
+use newt_core::HumanQuestionOutcome;
 
 #[test]
 fn refuses_slash_commands_as_tool_answers() {
@@ -17,4 +18,16 @@ fn refuses_slash_commands_as_tool_answers() {
     // answer itself.
     assert!(!is_slash_command_at_prompt("  indented answer  "));
     assert!(!is_slash_command_at_prompt("   "));
+}
+
+#[test]
+fn slash_policy_returns_guidance_for_the_surface_that_owns_repaint() {
+    let (outcome, notice) = apply_chat_prompt_policy(HumanQuestionOutcome::Answer("/help".into()));
+    assert_eq!(outcome, HumanQuestionOutcome::Cancelled);
+    assert_eq!(notice, Some(SLASH_COMMAND_PROMPT_NOTICE));
+
+    let answer = HumanQuestionOutcome::Answer("  ordinary answer  ".into());
+    let (outcome, notice) = apply_chat_prompt_policy(answer.clone());
+    assert_eq!(outcome, answer, "ordinary answers remain byte-exact");
+    assert_eq!(notice, None);
 }

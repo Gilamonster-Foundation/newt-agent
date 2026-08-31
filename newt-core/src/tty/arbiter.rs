@@ -10,8 +10,8 @@
 //! of them before it returns.
 //!
 //! **Capability typestate (static, compile-time).** [`PromptWindow`] has no
-//! public constructor — its only field is a private sealed ZST, so no crate can
-//! build one with struct-literal syntax either. Every function that may block
+//! public constructor and contains a private sealed ZST, so no crate can build
+//! one with struct-literal syntax either. Every function that may block
 //! on a human takes `&PromptWindow`. You cannot obtain the argument without
 //! having suspended, so *a prompt printed onto a live spinner does not compile*.
 //! The failure mode is not "remembered"; it is unrepresentable.
@@ -22,7 +22,8 @@
 //! for the *other* half of the terminal. Stdin ownership moves in here so one
 //! object arbitrates both directions.
 
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
@@ -652,13 +653,30 @@ impl Terminal {
     /// Everything after this point is guaranteed a clean bottom row, and the
     /// shared ticker paints nothing until the returned window is dropped.
     pub fn suspend_for_prompt() -> PromptWindow {
+        Self::suspend_for_prompt_with_output(PromptOutput::Stdout)
+    }
+
+    /// [`Terminal::suspend_for_prompt`] with an explicit terminal output.
+    ///
+    /// The process may have redirected fd 1 into an internal capture while
+    /// retaining a [`File`] for the operator's real terminal. This variant
+    /// keeps the same stdin arbitration, protocol veto, lifecycle events, and
+    /// ephemeral suspension as the default seam, but routes
+    /// [`PromptWindow::ask`] and [`PromptWindow::notice`] directly to that
+    /// file. Ownership is moved into the window so the destination remains
+    /// alive for the entire prompt.
+    pub fn suspend_for_prompt_to(output: File) -> PromptWindow {
+        Self::suspend_for_prompt_with_output(PromptOutput::File(output))
+    }
+
+    fn suspend_for_prompt_with_output(output: PromptOutput) -> PromptWindow {
         // Counted before the veto ON PURPOSE: a protocol-mode caller reaching
         // this seam is exactly what an operator would want to see in
         // `prompt_windows_constructed`, and silently not counting the attempt
         // would hide the misbehaving caller this veto exists to contain.
         SUSPENSIONS.fetch_add(1, Ordering::SeqCst);
         if !prompts_permitted(super::caps::protocol_mode()) {
-            return PromptWindow::vetoed();
+            return PromptWindow::vetoed(output);
         }
         // 1. Take stdin FIRST and block until the turn watcher's read finishes,
         //    so we never erase the screen and then wait to be allowed to ask.
@@ -685,6 +703,7 @@ impl Terminal {
             _seal: Seal,
             stdin: Some(stdin),
             resume: live,
+            output,
             live: true,
             vetoed: false,
         }
@@ -807,17 +826,53 @@ pub fn prompt_stdin_active() -> bool {
 /// syntax* — privacy on the type, not merely on the constructor.
 struct Seal;
 
+/// Where a prompt capability writes its human-facing bytes.
+///
+/// `Stdout` preserves the original process-wide behavior. `File` is the
+/// direct-terminal seam for a presenter that has intentionally captured fd 1.
+enum PromptOutput {
+    Stdout,
+    File(File),
+}
+
+impl PromptOutput {
+    fn write_text(&self, text: &str, newline: bool) -> io::Result<()> {
+        fn write_to(mut output: impl Write, text: &str, newline: bool) -> io::Result<()> {
+            if newline {
+                writeln!(output, "{text}")?;
+            } else {
+                write!(output, "{text}")?;
+            }
+            output.flush()
+        }
+
+        match self {
+            Self::Stdout => write_to(io::stdout(), text, newline),
+            Self::File(file) => write_to(file, text, newline),
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        match self {
+            Self::Stdout => io::stdout().is_terminal(),
+            Self::File(file) => file.is_terminal(),
+        }
+    }
+}
+
 /// The capability to talk to a human.
 ///
 /// There is no public constructor. The only ways to obtain one are
-/// [`Terminal::suspend_for_prompt`] — which erases every ephemeral writer
-/// before it returns — and [`PromptWindow::test_stub`] under `cfg(test)`.
+/// [`Terminal::suspend_for_prompt`] or [`Terminal::suspend_for_prompt_to`] —
+/// which erase every ephemeral writer before returning — and
+/// [`PromptWindow::test_stub`] under `cfg(test)`.
 /// Because every blocking prompt takes `&PromptWindow`, a question printed onto
 /// a live spinner is not a bug you can write.
 pub struct PromptWindow {
     _seal: Seal,
     stdin: Option<StdinToken>,
     resume: Vec<Arc<dyn Ephemeral>>,
+    output: PromptOutput,
     /// `false` for the test stub: it arbitrates nothing and must not clear the
     /// process-wide suspend flag on drop.
     live: bool,
@@ -835,11 +890,12 @@ impl PromptWindow {
     /// constructor, that the struct cannot be literaled, and that `test_stub`
     /// is not reachable from outside. This adds a third *internal* shape, not
     /// a fourth door.
-    fn vetoed() -> Self {
+    fn vetoed(output: PromptOutput) -> Self {
         Self {
             _seal: Seal,
             stdin: None,
             resume: Vec::new(),
+            output,
             live: false,
             vetoed: true,
         }
@@ -868,9 +924,7 @@ impl PromptWindow {
         if self.vetoed {
             return Err(Self::no_operator("ask"));
         }
-        let mut out = io::stdout();
-        write!(out, "{text}")?;
-        out.flush()
+        self.output.write_text(text, false)
     }
 
     /// The ONLY sanctioned blocking read. Stdin is already exclusively owned and
@@ -908,9 +962,16 @@ impl PromptWindow {
         if self.vetoed {
             return Ok(());
         }
-        let mut out = io::stdout();
-        writeln!(out, "{text}")?;
-        out.flush()
+        self.output.write_text(text, true)
+    }
+
+    /// Whether the output owned by this prompt is an interactive terminal.
+    ///
+    /// Modal input uses this instead of probing process stdout: fd 1 may be a
+    /// terminal-shaped internal capture while this window writes directly to
+    /// the operator's saved terminal.
+    pub(crate) fn output_is_terminal(&self) -> bool {
+        self.output.is_terminal()
     }
 
     /// The only other constructor: an inert window for tests, which arbitrates
@@ -922,6 +983,7 @@ impl PromptWindow {
             _seal: Seal,
             stdin: None,
             resume: Vec::new(),
+            output: PromptOutput::Stdout,
             live: false,
             vetoed: false,
         }
@@ -988,14 +1050,14 @@ mod tests {
     /// The veto as the CALLER meets it: a vetoed window refuses, and refuses in
     /// the two different ways the three methods deliberately chose.
     ///
-    /// Reaches `PromptWindow::vetoed()` because this module is the seal's
+    /// Reaches `PromptWindow::vetoed(..)` because this module is the seal's
     /// inside. Nothing here widens it — the constructor is private, and the
     /// trybuild proofs under `tests/ui/` still pin that no public constructor
     /// exists, the struct cannot be literaled, and `test_stub` is unreachable
     /// from outside.
     #[test]
     fn a_vetoed_window_refuses_to_ask_or_read_and_drops_notices() {
-        let window = super::PromptWindow::vetoed();
+        let window = super::PromptWindow::vetoed(super::PromptOutput::Stdout);
 
         assert!(
             window.ask("question > ").is_err(),
@@ -1026,6 +1088,124 @@ mod tests {
         let window = super::PromptWindow::test_stub();
         assert!(window.ask("").is_ok(), "an ordinary window may ask");
         assert!(window.notice("").is_ok(), "an ordinary window may narrate");
+    }
+
+    /// The explicit-output seam writes both prompt byte families to the file
+    /// it owns. A regular file is deliberately non-terminal, which also pins
+    /// the capability probe modal input uses instead of process stdout.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn an_explicit_prompt_output_routes_ask_and_notice_to_that_file() {
+        let output = tempfile::NamedTempFile::new().expect("prompt output file");
+        let c = counter();
+        let dynamic: Arc<dyn Ephemeral> = c.clone();
+        Terminal::register(9_002, &dynamic);
+        let window = Terminal::suspend_for_prompt_to(
+            output.reopen().expect("independent prompt output handle"),
+        );
+
+        assert_eq!(
+            c.erased.load(Ordering::SeqCst),
+            1,
+            "the alternate output must not bypass prompt arbitration"
+        );
+        assert!(suspended(), "the alternate output quiesces other writers");
+        assert!(
+            prompt_stdin_active(),
+            "the alternate output still owns prompt stdin"
+        );
+        assert!(
+            !window.output_is_terminal(),
+            "a regular-file destination must select the non-TTY modal path"
+        );
+        window.ask("question > ").expect("write the question");
+        window.notice("narration").expect("write the notice");
+        drop(window);
+
+        assert!(!suspended(), "dropping the window resumes other writers");
+        assert!(!prompt_stdin_active(), "dropping the window releases stdin");
+        assert_eq!(c.restored.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read_to_string(output.path()).expect("read routed prompt bytes"),
+            "question > narration\n"
+        );
+    }
+
+    /// Real-resource grounding for the modal branch predicate: a duplicated
+    /// PTY slave is a `File` just like a presenter's saved terminal, and the
+    /// window both recognizes it as interactive and writes to that device.
+    #[cfg(unix)]
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn an_explicit_pty_output_is_detected_and_written_as_a_terminal() {
+        use std::io::Read as _;
+        use std::os::fd::FromRawFd as _;
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        // SAFETY: `openpty` initializes both owned descriptors on success. Each
+        // is immediately transferred into exactly one `File` below.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "open the grounding PTY");
+        // SAFETY: successful `openpty` returned fresh descriptors, and these
+        // `File`s become their sole owners.
+        let (mut master, output) =
+            unsafe { (File::from_raw_fd(master_fd), File::from_raw_fd(slave_fd)) };
+        let window = Terminal::suspend_for_prompt_to(output);
+
+        assert!(
+            window.output_is_terminal(),
+            "the saved terminal file must select the interactive modal path"
+        );
+        window.ask("direct prompt").expect("write to the PTY slave");
+
+        let mut painted = [0_u8; "direct prompt".len()];
+        master
+            .read_exact(&mut painted)
+            .expect("read the explicitly routed terminal bytes");
+        assert_eq!(&painted, b"direct prompt");
+        drop(window);
+    }
+
+    /// Protocol veto semantics belong to the window, not to stdout. Supplying
+    /// another file must not create a side door that can emit a question.
+    #[test]
+    fn a_vetoed_explicit_output_still_emits_zero_bytes() {
+        let output = tempfile::NamedTempFile::new().expect("vetoed prompt output file");
+        let window = PromptWindow::vetoed(PromptOutput::File(
+            output.reopen().expect("independent prompt output handle"),
+        ));
+
+        assert!(window.ask("question").is_err());
+        assert!(window.notice("narration").is_ok());
+        drop(window);
+
+        assert_eq!(
+            std::fs::read_to_string(output.path()).expect("read vetoed prompt output"),
+            ""
+        );
+    }
+
+    /// The original entry point remains process-stdout-backed. Keeping this
+    /// as a distinct assertion prevents a future refactor from silently
+    /// making every prompt require an explicit file.
+    #[test]
+    fn the_default_prompt_window_keeps_the_process_stdout_route() {
+        let window = PromptWindow::test_stub();
+        assert!(matches!(&window.output, PromptOutput::Stdout));
+        assert_eq!(
+            window.output_is_terminal(),
+            io::stdout().is_terminal(),
+            "the legacy window must keep probing the stream it writes"
+        );
     }
 
     use super::*;
@@ -1215,6 +1395,115 @@ mod tests {
         drop(token);
         assert!(!prompt_stdin_active());
         assert!(try_watch_stdin().is_some(), "released on drop");
+    }
+
+    /// **#1959: the seal has exactly two doors, and both gates sit BELOW the
+    /// fork.**
+    ///
+    /// The seal's value is that its doors are enumerated and each is proven.
+    /// A second public constructor is fine; a second constructor that skipped
+    /// the protocol veto or the stdin token would be a hole, and the thing
+    /// that keeps both honest is that they delegate to ONE private builder
+    /// with the gates inside it.
+    ///
+    /// Stated as a source scan rather than a behaviour, because the property
+    /// is structural: "no future door can be added above the gates". A
+    /// behavioural test can only cover the doors that exist today.
+    ///
+    /// Production code only, and cut at the test module — the lesson
+    /// `config_panel::enter_panel_raw_mode_is_the_only_way_in` records the
+    /// hard way: this test lives IN the file it scans, so its own needles
+    /// would otherwise be counted.
+    #[test]
+    fn the_seal_has_exactly_two_doors_and_both_gates_sit_below_the_fork() {
+        let src = include_str!("arbiter.rs");
+        let production = src.split("\n#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            production.len() > 1000,
+            "the production cut read nothing; every count below would be vacuous"
+        );
+
+        assert_eq!(
+            production.matches("pub fn suspend_for_prompt(").count(),
+            1,
+            "the stdout door"
+        );
+        assert_eq!(
+            production.matches("pub fn suspend_for_prompt_to(").count(),
+            1,
+            "the File door (#1959)"
+        );
+        assert_eq!(
+            production
+                .matches("Self::suspend_for_prompt_with_output(")
+                .count(),
+            2,
+            "BOTH public doors must delegate to the one private builder — a \
+             third door, or a door that built a PromptWindow itself, would \
+             bypass the gates below"
+        );
+
+        // Call forms, not names: `prompts_permitted` is also DEFINED here and
+        // discussed in prose, and counting mentions would move whenever
+        // someone edited a comment.
+        let veto = "prompts_permitted(super::caps::protocol_mode())";
+        let acquire = "StdinToken::acquire()";
+        assert_eq!(production.matches(veto).count(), 1, "one veto, one place");
+        assert_eq!(
+            production.matches(acquire).count(),
+            1,
+            "one acquire, one place"
+        );
+
+        let fork = production
+            .find("fn suspend_for_prompt_with_output")
+            .expect("the private builder");
+        assert!(
+            production.find(veto).is_some_and(|at| at > fork),
+            "the protocol veto was hoisted ABOVE the fork — it would then \
+             cover only the door it sits in, and the other would prompt on a \
+             JSON-RPC wire"
+        );
+        assert!(
+            production.find(acquire).is_some_and(|at| at > fork),
+            "the stdin token was hoisted ABOVE the fork — one door would then \
+             ask without exclusive stdin"
+        );
+    }
+
+    /// **#1959: the File door takes the same exclusive stdin token.**
+    ///
+    /// The scan above proves the acquire is shared; this proves what sharing
+    /// it buys, through the same `prompt_stdin_active` observable
+    /// `watcher_and_prompt_exclude_each_other_on_stdin` uses for door one.
+    ///
+    /// `/dev/null` is a real fd, which the unit tier otherwise avoids —
+    /// `PromptOutput::File` takes a `std::fs::File` and offers no seam. It is
+    /// never written to here: the window is constructed and dropped, and the
+    /// assertions are all about stdin.
+    #[cfg(unix)]
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn the_file_door_takes_the_same_exclusive_stdin_token() {
+        assert!(!prompt_stdin_active(), "stdin must start idle");
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null");
+
+        let window = Terminal::suspend_for_prompt_to(sink);
+        assert!(
+            prompt_stdin_active(),
+            "the File door must take the prompt's stdin token, like the stdout door"
+        );
+        assert!(
+            try_watch_stdin().is_none(),
+            "and hold it EXCLUSIVELY — the turn watcher must not read underneath it"
+        );
+
+        drop(window);
+        assert!(!prompt_stdin_active(), "released on drop");
+        assert!(try_watch_stdin().is_some(), "the watcher may read again");
     }
 
     /// The test stub is inert: it arbitrates nothing, so it cannot leave the

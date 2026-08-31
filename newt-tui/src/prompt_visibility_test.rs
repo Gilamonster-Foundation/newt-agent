@@ -326,12 +326,108 @@ fn a_permission_prompt_is_visible_and_survives_a_live_spinner() {
         "expected no redraw after prompt appears\nscreen={screen:?}\nintruders={intruders:?}"
     );
 
-    let visible_tail = window.trim_end_matches(|c: char| c.is_whitespace());
+    // VISIBLE means visible (#1959). SGR sequences are zero-width, so a row
+    // written as `❯ \x1b[0m` ends, to the operator, at the chevron. #1959 gave
+    // the modal input row an accent, and an accent must reset after itself or
+    // the text the user types inherits it — which appends exactly such a
+    // sequence. Measuring the raw byte tail would make this an assertion about
+    // which INVISIBLE bytes come last, which is not what it is for.
+    //
+    // The guard is unchanged in strength: anything the operator can actually
+    // SEE after the chevron — a spinner frame, a stray glyph, a redraw — still
+    // lands at the end of the visible tail and still fails.
+    let visible = strip_ansi(window);
+    let visible_tail = visible.trim_end_matches(|c: char| c.is_whitespace());
     // The input line ends with the modal chevron the user types behind. Assert
     // against the production glyph itself (not a hardcoded `>`) so this
     // visibility check tracks `MODAL_INPUT_GLYPH` and can't drift from it.
     assert!(
         visible_tail.ends_with(MODAL_INPUT_GLYPH.trim_end()),
-        "menu missing before input\nscreen={screen:?}"
+        "menu missing before input\nvisible_tail={visible_tail:?}\nscreen={screen:?}"
     );
+}
+
+/// Everything in `text` an operator can see: CSI/OSC escape sequences removed,
+/// printable characters kept in order.
+///
+/// Local to this file on purpose. `cockpit::ansi::visible_width` is the
+/// nearest existing thing and would be the right one to widen, but it lives
+/// under `mod cockpit`, which is `rich-tui`-gated, and this test is not —
+/// reaching for it would gate a unix regression test on a feature it does not
+/// otherwise need. Kept deliberately small: it recognises the two escape
+/// shapes a terminal writer actually emits here.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameters and intermediates, then one final byte in @..~.
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC: runs to BEL or ST (ESC \).
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                    if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // A two-byte escape; its second byte is already consumed.
+            _ => {}
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod strip_ansi_tests {
+    use super::strip_ansi;
+
+    /// The exact shape #1959's accent emits, plus the redraw around it.
+    #[test]
+    fn an_sgr_wrapped_row_reduces_to_its_visible_characters() {
+        assert_eq!(strip_ansi("\u{1b}[38;2;255;165;90m❯ \u{1b}[0m"), "❯ ");
+        assert_eq!(
+            strip_ansi("a\u{1b}[0m\u{1b}[1G\u{1b}[2K\u{1b}[38;2;1;2;3m❯ \u{1b}[0m"),
+            "a❯ "
+        );
+    }
+
+    /// **Anti-vacuous twin.** A stripper that returned the empty string, or
+    /// that ate ordinary text, would satisfy the assertion it feeds. It keeps
+    /// every visible character — including one painted AFTER the chevron,
+    /// which is the case the visibility guard exists to catch.
+    #[test]
+    fn a_visible_character_after_the_chevron_survives_stripping() {
+        let painted_over = "\u{1b}[38;2;1;2;3m❯ \u{1b}[0m⠋";
+        let visible = strip_ansi(painted_over);
+        assert_eq!(visible, "❯ ⠋");
+        assert!(
+            !visible.trim_end().ends_with('❯'),
+            "a spinner frame after the chevron must still break the tail check"
+        );
+    }
+
+    /// Plain text is untouched, and an OSC hyperlink is removed whole.
+    #[test]
+    fn plain_text_is_untouched_and_osc_is_removed() {
+        assert_eq!(strip_ansi("[a]llow once"), "[a]llow once");
+        assert_eq!(
+            strip_ansi("\u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{7}"),
+            "link"
+        );
+    }
 }

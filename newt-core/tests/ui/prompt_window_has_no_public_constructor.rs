@@ -1,6 +1,6 @@
-//! There is no `new`, no `Default`, and no other public way in. The ONLY
-//! sanctioned constructor is `Terminal::suspend_for_prompt()`, which erases
-//! every live ephemeral writer before it returns one.
+// There is no `new`, no `Default`, and no other public way in. The sanctioned
+// constructors are `Terminal::suspend_for_prompt()` and `suspend_for_prompt_to()`;
+// both erase every live ephemeral writer before returning a sealed window.
 fn main() {
     let _w = newt_core::tty::PromptWindow::new();
 }

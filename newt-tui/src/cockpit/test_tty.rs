@@ -38,17 +38,33 @@ pub(crate) struct TestTty {
 impl TestTty {
     /// Take fd 0 and fd 1 onto a fresh pty slave.
     pub(crate) fn install() -> Self {
+        // Start far enough down the screen that the cockpit acceptance test
+        // has real transcript rows above its mounted chat block. Row/column
+        // replies are 1-based, as required by the terminal protocol.
+        Self::install_at(10, 1)
+    }
+
+    /// Take fd 0 and fd 1 onto a fresh pty slave and answer the presenter's
+    /// initial cursor query with `row`, `col`.
+    pub(crate) fn install_at(row: u16, col: u16) -> Self {
+        assert!(row > 0 && col > 0, "cursor replies are one-based");
         // SAFETY: openpty + dup/dup2 on descriptors this test owns; every one
         // is restored or closed in Drop.
         unsafe {
             let (mut master, mut slave) = (-1, -1);
+            let mut size = libc::winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
             assert_eq!(
                 libc::openpty(
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
                     std::ptr::null_mut::<libc::termios>(),
-                    std::ptr::null_mut::<libc::winsize>(),
+                    std::ptr::from_mut(&mut size),
                 ),
                 0,
                 "openpty for the test's terminal"
@@ -70,10 +86,13 @@ impl TestTty {
 
             let painted = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
+            let cursor_reply = format!("\x1b[{row};{col}R").into_bytes();
             let responder = {
                 let painted = Arc::clone(&painted);
                 let stop = Arc::clone(&stop);
-                std::thread::spawn(move || answer_terminal_queries(master, &painted, &stop))
+                std::thread::spawn(move || {
+                    answer_terminal_queries(master, &painted, &stop, &cursor_reply);
+                })
             };
             Self {
                 master,
@@ -101,11 +120,103 @@ impl TestTty {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         String::from_utf8_lossy(&buf).into_owned()
     }
+
+    /// Type `bytes` only after `needle` has reached the emulated operator's
+    /// screen. The fallback write after the deadline keeps a regression from
+    /// deadlocking the test forever; the returned boolean still makes the
+    /// missing-before-answer prompt fail loudly.
+    pub(crate) fn type_when_painted(
+        &self,
+        needle: &str,
+        bytes: &[u8],
+    ) -> std::thread::JoinHandle<bool> {
+        let master = self.master;
+        let painted = Arc::clone(&self.painted);
+        let needle = needle.as_bytes().to_vec();
+        let bytes = bytes.to_vec();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let saw_prompt = loop {
+                let saw = painted
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .windows(needle.len())
+                    .any(|window| window == needle);
+                if saw || std::time::Instant::now() >= deadline {
+                    break saw;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            // SAFETY: `master` remains owned by TestTty until the caller joins
+            // this handle, and `bytes` is live for the duration of the write.
+            let n = unsafe { libc::write(master, bytes.as_ptr().cast(), bytes.len()) };
+            assert_eq!(n as usize, bytes.len(), "write delayed terminal input");
+            saw_prompt
+        })
+    }
+
+    /// Block until `needle` has appeared in the painted screen AT OR AFTER
+    /// byte offset `from`, or `timeout` elapses. Returns whether it was seen.
+    ///
+    /// The write side (`Screen::draw`/`write_all`+`flush`) completing does
+    /// NOT mean the read side has caught up: `answer_terminal_queries` drains
+    /// the pty master on its own thread, so a caller that calls [`painted`]
+    /// immediately after a blocking `handle_request` returns is racing that
+    /// thread, not synchronized with it — unlike input, where
+    /// [`type_when_painted`] already closes exactly this race by waiting
+    /// before it writes. This is the read-side twin: same bounded-poll
+    /// technique, so a snapshot taken after a `true` return is safe to
+    /// assert against in full.
+    ///
+    /// `from` matters and is not optional: several expected sequences (cursor
+    /// Show, for one) legitimately occur earlier in the same session, so
+    /// "appears anywhere" would return immediately without ever waiting for
+    /// the LATER occurrence under test.
+    pub(crate) fn wait_for_painted_after(
+        &self,
+        from: usize,
+        needle: &str,
+        timeout: std::time::Duration,
+    ) -> bool {
+        wait_for_after(&self.painted, from, needle, timeout)
+    }
+}
+
+/// Free-function core of [`TestTty::wait_for_painted_after`], taking the
+/// shared buffer directly so the polling logic is testable against a plain
+/// `Mutex<Vec<u8>>` — no real pty, no responder thread, nothing for a
+/// `TestTty::drop` to restore.
+fn wait_for_after(
+    buf: &Mutex<Vec<u8>>,
+    from: usize,
+    needle: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let seen = {
+            let buf = buf
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let text = String::from_utf8_lossy(&buf);
+            text.get(from.min(text.len())..)
+                .is_some_and(|tail| tail.contains(needle))
+        };
+        if seen || std::time::Instant::now() >= deadline {
+            return seen;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// The answering half of a terminal: accumulate what the application paints,
 /// and reply to a cursor-position query (`ESC[6n`) as a real terminal would.
-fn answer_terminal_queries(master: RawFd, painted: &Mutex<Vec<u8>>, stop: &AtomicBool) {
+fn answer_terminal_queries(
+    master: RawFd,
+    painted: &Mutex<Vec<u8>>,
+    stop: &AtomicBool,
+    cursor_reply: &[u8],
+) {
     let mut buf = [0u8; 4096];
     let mut pending = Vec::new();
     while !stop.load(Ordering::SeqCst) {
@@ -134,8 +245,7 @@ fn answer_terminal_queries(master: RawFd, painted: &Mutex<Vec<u8>>, stop: &Atomi
         // scanned prefix so a query split across reads is still matched.
         while let Some(at) = find(&pending, b"\x1b[6n") {
             // SAFETY: writing our reply to the master.
-            let reply = b"\x1b[1;1R";
-            unsafe { libc::write(master, reply.as_ptr().cast(), reply.len()) };
+            unsafe { libc::write(master, cursor_reply.as_ptr().cast(), cursor_reply.len()) };
             pending.drain(..at + 4);
         }
         if pending.len() > 8 {
@@ -238,4 +348,70 @@ pub(crate) fn mode_diff(a: &libc::termios, b: &libc::termios) -> String {
         }
     }
     out.join(", ")
+}
+
+#[cfg(test)]
+mod wait_for_after_tests {
+    use super::wait_for_after;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Already present after `from` → returns `true` immediately (no need to
+    /// exhaust the timeout, though a short one keeps the test fast either way).
+    #[test]
+    fn finds_a_needle_already_present_after_the_offset() {
+        let buf = Mutex::new(b"before SHOWN after".to_vec());
+        assert!(wait_for_after(&buf, 7, "SHOWN", Duration::from_millis(200)));
+    }
+
+    /// The offset is load-bearing: a needle that only occurs BEFORE `from`
+    /// must not satisfy the wait — this is the exact bug class the helper
+    /// exists to avoid (cursor Show legitimately appears earlier too).
+    #[test]
+    fn ignores_an_occurrence_before_the_offset() {
+        let buf = Mutex::new(b"SHOWN before, nothing after".to_vec());
+        assert!(!wait_for_after(
+            &buf,
+            11,
+            "SHOWN",
+            Duration::from_millis(200)
+        ));
+    }
+
+    /// The race this exists to close: the needle is not there yet, but a
+    /// concurrent writer appends it shortly after the wait begins. A
+    /// snapshot-only check (no poll) would have missed this.
+    #[test]
+    fn observes_a_needle_appended_after_the_wait_begins() {
+        let buf = Arc::new(Mutex::new(b"before ".to_vec()));
+        let writer = std::thread::spawn({
+            let buf = Arc::clone(&buf);
+            move || {
+                std::thread::sleep(Duration::from_millis(30));
+                buf.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(b"SHOWN after");
+            }
+        });
+        assert!(wait_for_after(&buf, 7, "SHOWN", Duration::from_secs(1)));
+        writer.join().expect("writer thread");
+    }
+
+    /// A needle that never arrives times out and returns `false` rather than
+    /// hanging — the timeout is a real bound, not decoration.
+    #[test]
+    fn times_out_and_returns_false_when_the_needle_never_arrives() {
+        let buf = Mutex::new(b"before after".to_vec());
+        let start = std::time::Instant::now();
+        assert!(!wait_for_after(
+            &buf,
+            7,
+            "SHOWN",
+            Duration::from_millis(100)
+        ));
+        assert!(
+            start.elapsed() >= Duration::from_millis(100),
+            "must actually wait out the timeout, not return early"
+        );
+    }
 }

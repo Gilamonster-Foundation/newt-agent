@@ -462,16 +462,15 @@ fn decision_scope(choice: PromptChoice) -> &'static str {
 pub(crate) fn free_text_form(question: &str) -> InteractionDefinition {
     // C0a (#1856): the free-text form is an `InteractionDefinition` too, so
     // it renders through the ONE plain projection rather than through a
-    // second type. Byte-identical to the actionless `Question` it replaces —
-    // a `Text` control contributes no choices line, so the rendering is
-    // body + note, exactly as before (`c0a::the_free_text_form_renders_
-    // exactly_as_it_did`). The interaction MODEL is D0's to migrate; only
-    // the rendering moved here.
+    // second type. A `Text` control contributes no choices line, so the
+    // rendering is body + note. `Prompt —` names the transient input surface
+    // in words: a bare leading `?` looked like stray punctuation, especially
+    // when the actual question already ended in `?`.
     InteractionDefinition {
         note: Some(MODAL_CONTROL_HINT.into()),
         ..InteractionDefinition::new(
             InteractionKind::Prompt,
-            format!("? {question}"),
+            format!("Prompt — {question}"),
             vec![Control {
                 id: ControlId::new(ANSWER_CONTROL).expect(
                     "`answer` is a valid control id (non-empty, drawn from \
@@ -506,20 +505,59 @@ pub(crate) fn present_on_terminal(
     interaction: &SurfaceInteraction,
 ) -> HumanQuestionOutcome {
     let outcome = newt_core::interaction_terminal::present_on_terminal(w, interaction);
+    let (outcome, notice) = apply_chat_prompt_policy(outcome);
+    if let Some(notice) = notice {
+        w.notice(notice).ok();
+    }
+    outcome
+}
+
+/// Cockpit variant of [`present_on_terminal`]: the core terminal adapter
+/// manually wraps only the immutable plain body to the available width. The
+/// editable answer row stays unwrapped and anchored while this wrapper keeps
+/// the chat-only slash-command policy in exactly one place.
+///
+/// `unix`, not just `rich-tui`: its sole caller is `cockpit::presenter`,
+/// which is unix-only by construction (`openpty`/`dup2`/termios — see
+/// `cockpit/mod.rs`). The gate follows the caller, not the platform, per
+/// #1986's precedent for the same Windows-clippy shape
+/// (`InlineTerminal::new`/`with_lease`) — an `#[allow(dead_code)]` here
+/// would say "trust me" where the cfg says which caller, and goes stale the
+/// moment a Windows cockpit lands.
+#[cfg(all(unix, feature = "rich-tui"))]
+pub(crate) fn present_on_terminal_with_width(
+    w: &PromptWindow,
+    interaction: &SurfaceInteraction,
+    width: usize,
+) -> (HumanQuestionOutcome, Option<&'static str>) {
+    let outcome =
+        newt_core::interaction_terminal::present_on_terminal_with_width(w, interaction, width);
+    // The cockpit repaints the mounted chat region as soon as this blocking
+    // window closes. Return the policy notice to that owner so it can commit
+    // the row into durable transcript space after teardown; writing it through
+    // `w` here would place it under the viewport and immediately erase it.
+    apply_chat_prompt_policy(outcome)
+}
+
+pub(crate) const SLASH_COMMAND_PROMPT_NOTICE: &str =
+    "(slash commands aren't answers; press Esc, then use the command at the chat prompt)";
+
+fn apply_chat_prompt_policy(
+    outcome: HumanQuestionOutcome,
+) -> (HumanQuestionOutcome, Option<&'static str>) {
     // The answer is inspected VERBATIM — leading/trailing whitespace can be
     // meaningful (an indented code line, a spacing-sensitive value, an
     // intentionally blank-but-submitted answer). Detection reads a trim_start
     // VIEW without mutating the answer.
     if let HumanQuestionOutcome::Answer(line) = &outcome {
         if is_slash_command_at_prompt(line) {
-            w.notice(
-                "(slash commands aren't answers; press Esc, then use the command at the chat prompt)",
-            )
-            .ok();
-            return HumanQuestionOutcome::Cancelled;
+            return (
+                HumanQuestionOutcome::Cancelled,
+                Some(SLASH_COMMAND_PROMPT_NOTICE),
+            );
         }
     }
-    outcome
+    (outcome, None)
 }
 
 /// A leading-slash answer at a `request_user_input` prompt is a TUI command

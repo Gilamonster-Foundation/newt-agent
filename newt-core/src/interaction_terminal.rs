@@ -26,6 +26,7 @@ use crate::markup::plain;
 use crate::tty::{read_prompt_window_line, Echo, PromptLine, PromptWindow, MODAL_INPUT_GLYPH};
 use crate::HumanQuestionOutcome;
 use newt_interaction::{ControlKind, InteractionDefinition};
+use std::io::{self, IsTerminal as _};
 
 /// **The echo policy is DERIVED, never passed in** (D1b-1, #1892).
 ///
@@ -77,10 +78,42 @@ pub fn present_on_terminal(
     window: &PromptWindow,
     interaction: &SurfaceInteraction,
 ) -> HumanQuestionOutcome {
-    let prompt = format!(
-        "{}\n{MODAL_INPUT_GLYPH}",
-        plain::render(&interaction.definition)
-    );
+    present_on_terminal_with_layout(window, interaction, None)
+}
+
+/// Present one semantic interaction with its already-rendered PLAIN body
+/// manually wrapped to `width` on an interactive terminal.
+///
+/// Only the immutable body is wrapped. The final editable answer row remains
+/// one terminal row, which is load bearing for modal redraw: backspace clears
+/// and repaints that same row rather than wrapping into the mounted chat box.
+/// If either side is not a TTY, the width is ignored and the exact legacy
+/// headless bytes are preserved.
+#[must_use]
+pub fn present_on_terminal_with_width(
+    window: &PromptWindow,
+    interaction: &SurfaceInteraction,
+    width: usize,
+) -> HumanQuestionOutcome {
+    let width = (io::stdin().is_terminal() && window.output_is_terminal()).then_some(width);
+    present_on_terminal_with_layout(window, interaction, width)
+}
+
+fn prompt_text(definition: &InteractionDefinition, width: Option<usize>) -> String {
+    let body = plain::render(definition);
+    let body = match width {
+        Some(width) => crate::tty::wrap_line(&body, width).join("\n"),
+        None => body,
+    };
+    format!("{body}\n{MODAL_INPUT_GLYPH}")
+}
+
+fn present_on_terminal_with_layout(
+    window: &PromptWindow,
+    interaction: &SurfaceInteraction,
+    width: Option<usize>,
+) -> HumanQuestionOutcome {
+    let prompt = prompt_text(&interaction.definition, width);
     match read_prompt_window_line(window, &prompt, echo_for(&interaction.definition)) {
         Ok(PromptLine::Line(answer)) => HumanQuestionOutcome::Answer(answer),
         Ok(PromptLine::Eof) => HumanQuestionOutcome::InputClosed,
@@ -189,6 +222,47 @@ fn confirm_from_outcome(
         | HumanQuestionOutcome::ExitRequested
         | HumanQuestionOutcome::InputFailed
         | HumanQuestionOutcome::Unavailable => false,
+    }
+}
+
+#[cfg(test)]
+mod width_layout {
+    use super::prompt_text;
+    use crate::markup::plain;
+    use crate::tty::{str_width, wrap_line, MODAL_INPUT_GLYPH};
+    use newt_interaction::{InteractionDefinition, InteractionKind};
+
+    fn definition() -> InteractionDefinition {
+        InteractionDefinition::new(
+            InteractionKind::Form,
+            "Prompt — choose a deliberately long destination path",
+            vec![],
+        )
+    }
+
+    #[test]
+    fn width_layout_wraps_only_the_canonical_plain_body() {
+        let definition = definition();
+        let canonical = plain::render(&definition);
+        let expected_body = wrap_line(&canonical, 12).join("\n");
+        let prompt = prompt_text(&definition, Some(12));
+
+        assert_eq!(prompt, format!("{expected_body}\n{MODAL_INPUT_GLYPH}"));
+        let (body, answer_row) = prompt.rsplit_once('\n').expect("answer row");
+        assert_eq!(answer_row, MODAL_INPUT_GLYPH);
+        assert!(
+            body.lines().all(|line| str_width(line) <= 12),
+            "body was not manually wrapped to the terminal width: {body:?}"
+        );
+    }
+
+    #[test]
+    fn no_width_preserves_the_exact_headless_prompt_bytes() {
+        let definition = definition();
+        assert_eq!(
+            prompt_text(&definition, None),
+            format!("{}\n{MODAL_INPUT_GLYPH}", plain::render(&definition))
+        );
     }
 }
 

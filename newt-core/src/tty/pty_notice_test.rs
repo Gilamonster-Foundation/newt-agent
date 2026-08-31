@@ -198,6 +198,55 @@ fn protocol_mode_prompt_child() {
         .notice(NOTICE_TEXT)
         .expect("a dropped notice is not an error");
     drop(window);
+
+    // #1959: THE SECOND DOOR, under the same real flag.
+    //
+    // `suspend_for_prompt_to` routes `ask`/`notice` to an explicit terminal
+    // File rather than stdout — the shape a process uses when fd 1 has been
+    // redirected into an internal capture. The seal's value is ENUMERATED,
+    // PROVEN doors, so a door that is only reasoned about is not proven.
+    //
+    // The file is `/dev/tty`, which in this child IS the pty slave the parent
+    // reads. That is what makes this cost the parent nothing: its existing
+    // "no prompt byte reached the terminal" assertions now cover BOTH doors,
+    // and a veto that covered only the stdout path would put the question on
+    // the parent's screen and fail there.
+    // A dup of fd 1 rather than an open of `/dev/tty`: the parent hands the
+    // slave to the child as stdin/stdout but does NOT make it the child's
+    // controlling terminal (that needs `setsid` + `TIOCSCTTY`), so `/dev/tty`
+    // has nothing to resolve to here. Duping fd 1 is also the truer fixture —
+    // "the process kept a File for the real terminal" is exactly the shape
+    // this door exists for.
+    let terminal = {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        // SAFETY: `dup` returns a fresh owned descriptor for the pty slave;
+        // `OwnedFd` takes ownership and the `File` closes it on drop.
+        let raw = unsafe { libc::dup(1) };
+        assert!(
+            raw >= 0,
+            "dup(1) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) })
+    };
+    let window = Terminal::suspend_for_prompt_to(terminal);
+    let asked = window.ask(QUESTION);
+    let mut buf = String::new();
+    let read = window.read_line_into(&mut buf);
+    assert!(
+        asked.is_err(),
+        "the File door must refuse in protocol mode too — the veto sits in \
+         the shared constructor precisely so neither door can miss it"
+    );
+    assert!(read.is_err(), "the File door must refuse to read: {read:?}");
+    assert!(
+        buf.is_empty(),
+        "nothing may be written into the caller's buffer"
+    );
+    window
+        .notice(NOTICE_TEXT)
+        .expect("a dropped notice is not an error");
+    drop(window);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,9 +1,10 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::style::ResetColor;
 use std::io::{self, IsTerminal, Write};
 use std::marker::PhantomData;
 use std::time::Duration;
 
-use super::PromptWindow;
+use super::{PromptWindow, ACTIVE_INPUT_CT};
 
 pub const MODAL_CONTROL_HINT: &str = "Esc=back · Ctrl-C/Ctrl-D=exit";
 
@@ -52,7 +53,7 @@ pub fn read_prompt_window_line(
     prompt: &str,
     echo: Echo,
 ) -> io::Result<PromptLine> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+    if !io::stdin().is_terminal() || !window.output_is_terminal() {
         window.ask(prompt)?;
         let mut line = String::new();
         if window.read_line_into(&mut line)? == 0 {
@@ -63,14 +64,15 @@ pub fn read_prompt_window_line(
 
     let result = {
         let _guard = take_modal_ownership(window)?;
-        window.ask(&render(prompt, "", true)?)?;
+        let accent = modal_accent_enabled();
+        window.ask(&render(prompt, "", true, accent)?)?;
         let mut value = String::new();
         loop {
             let key = match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => key,
                 Event::Paste(text) => {
                     value.extend(text.chars().filter(|ch| !ch.is_control()));
-                    window.ask(&render(prompt, &echo.display(&value), false)?)?;
+                    window.ask(&render(prompt, &echo.display(&value), false, accent)?)?;
                     continue;
                 }
                 _ => continue,
@@ -82,14 +84,14 @@ pub fn read_prompt_window_line(
                 KeyCode::Enter => break PromptLine::Line(value),
                 KeyCode::Backspace => {
                     value.pop();
-                    window.ask(&render(prompt, &echo.display(&value), false)?)?;
+                    window.ask(&render(prompt, &echo.display(&value), false, accent)?)?;
                 }
                 KeyCode::Char(ch)
                     if !key.modifiers.contains(KeyModifiers::ALT)
                         && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     value.push(ch);
-                    window.ask(&render(prompt, &echo.display(&value), false)?)?;
+                    window.ask(&render(prompt, &echo.display(&value), false, accent)?)?;
                 }
                 _ => {}
             }
@@ -184,24 +186,247 @@ impl Echo {
     }
 }
 
-fn render(prompt: &str, value: &str, first: bool) -> io::Result<String> {
+fn render(prompt: &str, value: &str, first: bool, accent: bool) -> io::Result<String> {
     let mut out = Vec::new();
+    // A modal can arrive directly after arbitrarily-styled tool output. Take
+    // ownership of the foreground before drawing any content so the dialog
+    // cannot inherit that output's green/grey/etc. The piped branch never
+    // calls this renderer, so canonical/headless text stays ANSI-free.
+    crossterm::queue!(out, ResetColor)?;
     if first {
-        write!(out, "{}", prompt.replace('\n', "\r\n"))?;
+        match prompt.rsplit_once('\n') {
+            Some((body, answer_row)) => {
+                write!(out, "{}\r\n", body.replace('\n', "\r\n"))?;
+                write_answer_row(&mut out, answer_row, accent)?;
+            }
+            None => write_answer_row(&mut out, prompt, accent)?,
+        }
     } else {
         crossterm::queue!(
             out,
             crossterm::cursor::MoveToColumn(0),
             crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
         )?;
-        write!(out, "{}", prompt.rsplit_once('\n').map_or(prompt, |x| x.1))?;
+        write_answer_row(
+            &mut out,
+            prompt.rsplit_once('\n').map_or(prompt, |x| x.1),
+            accent,
+        )?;
     }
     write!(out, "{value}")?;
     String::from_utf8(out).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn take_modal_ownership(_window: &PromptWindow) -> io::Result<RawGuard> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+/// Draw the final input row. The semantic prompt remains plain text; only the
+/// terminal view promotes its active chevron into the shared input accent.
+fn write_answer_row(out: &mut Vec<u8>, row: &str, accent: bool) -> io::Result<()> {
+    if let Some(crossterm::style::Color::Rgb { r, g, b }) = answer_row_accent(row, accent) {
+        // Serialize the resolved policy directly. Crossterm's color command
+        // independently memoizes NO_COLOR, which would otherwise suppress an
+        // explicit NEWT_COLOR=always after the application had already
+        // resolved that explicit flag as the winner.
+        write!(out, "\x1b[38;2;{r};{g};{b}m{row}\x1b[0m")?;
+    } else {
+        write!(out, "{row}")?;
+    }
+    Ok(())
+}
+
+fn answer_row_accent(row: &str, accent: bool) -> Option<crossterm::style::Color> {
+    (accent && row == MODAL_INPUT_GLYPH).then_some(ACTIVE_INPUT_CT)
+}
+
+/// Whether this interactive TTY should use the active-input accent.
+///
+/// This mirrors the application's documented runtime precedence without
+/// pulling a TUI configuration object into the terminal primitive. An
+/// explicit `NEWT_COLOR` wins; otherwise either `NO_COLOR` or `TERM=dumb`
+/// disables the accent. The caller is already in the TTY-only branch, so
+/// `auto` means color is available here.
+fn modal_accent_enabled() -> bool {
+    // Opening a visual prompt must not republish scratch/tool/tenacity/etc.
+    // globals. Runtime startup owns publication; this path only reads one
+    // resolved TUI field.
+    let cfg_color = crate::Config::resolve_runtime_unpublished()
+        .ok()
+        .and_then(|config| config.tui.as_ref().map(|tui| tui.color))
+        .unwrap_or_default();
+    modal_accent_enabled_with(&|key| std::env::var(key).ok(), cfg_color)
+}
+
+fn modal_accent_enabled_with(
+    get_env: &dyn Fn(&str) -> Option<String>,
+    cfg_color: crate::ColorMode,
+) -> bool {
+    if let Some(mode) =
+        get_env("NEWT_COLOR").and_then(|value| crate::ColorMode::from_keyword(&value))
+    {
+        return mode.forced().unwrap_or(true);
+    }
+    if get_env("NO_COLOR").is_some() || get_env("TERM").as_deref() == Some("dumb") {
+        return false;
+    }
+    cfg_color.forced().unwrap_or(true)
+}
+
+#[cfg(test)]
+mod visual_style {
+    use super::{
+        answer_row_accent, modal_accent_enabled_with, render, ACTIVE_INPUT_CT, MODAL_INPUT_GLYPH,
+    };
+
+    /// A modal can open immediately after arbitrarily styled tool output. Its
+    /// body must first return to the terminal default, then only its active
+    /// answer chevron gets the input accent, and the typed value starts from
+    /// the default again. Otherwise the whole dialog inherits (for example)
+    /// a green file-preview tint and reads as ordinary tool output.
+    #[test]
+    fn the_modal_owns_its_body_and_active_answer_colors() {
+        let prompt = format!("Prompt — Write this file? [y/N]\n{MODAL_INPUT_GLYPH}");
+        let rendered = render(&prompt, "y", true, true).expect("render");
+
+        assert_eq!(
+            rendered,
+            "\x1b[0mPrompt — Write this file? [y/N]\r\n\
+             \x1b[38;2;255;165;90m❯ \x1b[0my"
+        );
+        assert_eq!(
+            answer_row_accent(MODAL_INPUT_GLYPH, true),
+            Some(ACTIVE_INPUT_CT)
+        );
+        assert_eq!(answer_row_accent(MODAL_INPUT_GLYPH, false), None);
+    }
+
+    /// Redraws repaint only the answer row. They must repeat the same explicit
+    /// color ownership instead of relying on whatever SGR state the first draw
+    /// happened to leave behind.
+    #[test]
+    fn answer_row_redraw_reasserts_the_active_accent_and_resets_before_value() {
+        let prompt = format!("Prompt — Write this file? [y/N]\n{MODAL_INPUT_GLYPH}");
+        let rendered = render(&prompt, "yes", false, true).expect("render");
+
+        assert!(
+            rendered.ends_with("\x1b[38;2;255;165;90m❯ \x1b[0myes"),
+            "answer row did not own its style: {rendered:?}"
+        );
+        assert!(
+            rendered.starts_with("\x1b[0m"),
+            "did not reset inherited style"
+        );
+        assert!(!rendered.contains("Write this file"), "redrew the body too");
+    }
+
+    #[test]
+    fn long_answer_and_backspace_repaint_one_stable_no_wrap_row() {
+        let body = crate::tty::wrap_line(
+            "Prompt — choose a destination whose label needs several rows",
+            10,
+        )
+        .join("\n");
+        let prompt = format!("{body}\n{MODAL_INPUT_GLYPH}");
+        let long_value = "abcdefghijklmnopqrstuvwxyz";
+        let after_backspace = &long_value[..long_value.len() - 1];
+        let long = render(&prompt, long_value, false, true).expect("long redraw");
+        let shorter = render(&prompt, after_backspace, false, true).expect("backspace redraw");
+
+        let mut anchor = Vec::new();
+        crossterm::queue!(
+            anchor,
+            crossterm::style::ResetColor,
+            crossterm::cursor::MoveToColumn(0),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
+        )
+        .expect("answer-row anchor");
+        let anchor = String::from_utf8(anchor).expect("anchor is UTF-8");
+
+        for (redraw, value) in [(&long, long_value), (&shorter, after_backspace)] {
+            assert!(
+                redraw.starts_with(&anchor),
+                "each edit must return to and clear the same answer row: {redraw:?}"
+            );
+            assert!(redraw.ends_with(value), "typed value was not repainted");
+            assert!(
+                !redraw.contains("\r\n"),
+                "answer redraw must never advance into another row: {redraw:?}"
+            );
+            assert!(
+                !redraw.contains("\x1b[?7h"),
+                "answer redraw must not enable terminal autowrap: {redraw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn modal_accent_obeys_the_runtime_color_precedence() {
+        let env = |pairs: &[(&str, &str)]| {
+            let pairs = pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect::<Vec<_>>();
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(candidate, _)| candidate == key)
+                    .map(|(_, value)| value.clone())
+            }
+        };
+
+        assert!(modal_accent_enabled_with(&env(&[]), crate::ColorMode::Auto));
+        assert!(!modal_accent_enabled_with(
+            &env(&[("NO_COLOR", "1")]),
+            crate::ColorMode::Always,
+        ));
+        assert!(!modal_accent_enabled_with(
+            &env(&[("TERM", "dumb")]),
+            crate::ColorMode::Always,
+        ));
+        assert!(modal_accent_enabled_with(
+            &env(&[
+                ("NEWT_COLOR", "always"),
+                ("NO_COLOR", "1"),
+                ("TERM", "dumb"),
+            ]),
+            crate::ColorMode::Never
+        ));
+        assert!(!modal_accent_enabled_with(
+            &env(&[("NEWT_COLOR", "mono"), ("TERM", "xterm-256color"),]),
+            crate::ColorMode::Always
+        ));
+        assert!(!modal_accent_enabled_with(
+            &env(&[]),
+            crate::ColorMode::Never
+        ));
+        assert!(!modal_accent_enabled_with(
+            &env(&[]),
+            crate::ColorMode::Mono
+        ));
+        assert!(modal_accent_enabled_with(&env(&[]), crate::ColorMode::Dark));
+    }
+
+    #[test]
+    fn modal_color_lookup_uses_the_non_publishing_config_path() {
+        let production = include_str!("modal.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        let body = production
+            .split("fn modal_accent_enabled()")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n").next())
+            .expect("modal_accent_enabled body");
+        assert!(
+            body.contains("Config::resolve_runtime_unpublished()"),
+            "opening a visual prompt must not publish process-global runtime settings: {body}"
+        );
+        assert!(
+            !body.contains("Config::resolve()"),
+            "the publishing compatibility resolver returned to the visual path: {body}"
+        );
+    }
+}
+
+fn take_modal_ownership(window: &PromptWindow) -> io::Result<RawGuard> {
+    if !io::stdin().is_terminal() || !window.output_is_terminal() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "terminal required",
