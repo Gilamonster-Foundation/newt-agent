@@ -311,11 +311,11 @@ fn transient_reader_error_recovers_and_esc_resolves_through_the_tty_path() {
         &win,
         &mut WebWaitIo {
             reacquire: &mut || {
-            readers
-                .pop_front()
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
-                .ok_or_else(broken)
-        },
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
             now: &stepping_clock(Duration::from_millis(50)),
             sleep: &mut |_d| {},
             notify: &mut |_m| {},
@@ -357,11 +357,11 @@ fn transient_reader_error_does_not_deny_when_a_web_verdict_arrives() {
         &win,
         &mut WebWaitIo {
             reacquire: &mut || {
-            readers
-                .pop_front()
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
-                .ok_or_else(broken)
-        },
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
             now: &stepping_clock(Duration::from_millis(50)),
             sleep: &mut |_d| {},
             notify: &mut |_m| {},
@@ -446,11 +446,11 @@ fn web_verdict_and_local_control_resolve_exactly_once() {
         &win,
         &mut WebWaitIo {
             reacquire: &mut || {
-            readers
-                .pop_front()
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
-                .ok_or_else(broken)
-        },
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
             now: &stepping_clock(Duration::from_millis(50)),
             sleep: &mut |_d| {},
             notify: &mut |_m| {},
@@ -486,11 +486,11 @@ fn web_verdict_and_local_control_resolve_exactly_once() {
         &win2,
         &mut WebWaitIo {
             reacquire: &mut || {
-            readers2
-                .pop_front()
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
-                .ok_or_else(broken)
-        },
+                readers2
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
             now: &stepping_clock(Duration::from_millis(50)),
             sleep: &mut |_d| {},
             notify: &mut |_m| {},
@@ -539,11 +539,11 @@ fn ctrl_c_after_a_recoverable_reader_error_sets_cancel_and_exit() {
         &win,
         &mut WebWaitIo {
             reacquire: &mut || {
-            readers
-                .pop_front()
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
-                .ok_or_else(broken)
-        },
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
             now: &stepping_clock(Duration::from_millis(50)),
             sleep: &mut |_d| {},
             notify: &mut |_m| {},
@@ -596,12 +596,12 @@ fn repeated_interrupted_keeps_the_reader_and_paces_without_spinning() {
         &win,
         &mut WebWaitIo {
             reacquire: &mut || {
-            reacquired.set(reacquired.get() + 1);
-            readers
-                .pop_front()
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
-                .ok_or_else(broken)
-        },
+                reacquired.set(reacquired.get() + 1);
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
             now: &stepping_clock(Duration::from_millis(50)),
             sleep: &mut |_d| sleeps.set(sleeps.get() + 1),
             notify: &mut |_m| {},
@@ -657,11 +657,11 @@ fn an_initial_unsupported_still_retries_and_recovers() {
         &win,
         &mut WebWaitIo {
             reacquire: &mut || {
-            outcomes
-                .pop_front()
-                .unwrap_or_else(|| Err(broken()))
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
-        },
+                outcomes
+                    .pop_front()
+                    .unwrap_or_else(|| Err(broken()))
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+            },
             now: &stepping_clock(Duration::from_millis(50)),
             sleep: &mut |_d| {},
             notify: &mut |_m| {},
@@ -707,11 +707,11 @@ fn a_post_live_unsupported_keeps_retrying_and_recovers() {
         &win,
         &mut WebWaitIo {
             reacquire: &mut || {
-            outcomes
-                .pop_front()
-                .unwrap_or_else(|| Err(broken()))
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
-        },
+                outcomes
+                    .pop_front()
+                    .unwrap_or_else(|| Err(broken()))
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+            },
             now: &stepping_clock(Duration::from_millis(50)),
             sleep: &mut |_d| {},
             notify: &mut |_m| {},
@@ -2073,9 +2073,10 @@ fn close_out_message_reflects_the_rotation_kind() {
 fn a_typed_terminal_answer_decides_the_offer_instead_of_being_dropped() {
     let (_r, _w, store, conv) = store_and_conv();
     let request_id = publish_open_to_both(&store, &conv);
-    let mut readers: VecDeque<ScriptedReader> = VecDeque::from([ScriptedReader(VecDeque::from([
-        Ok(Some(ModalLine::Line("a".to_string()))),
-    ]))]);
+    let mut readers: VecDeque<ScriptedReader> =
+        VecDeque::from([ScriptedReader(VecDeque::from([Ok(Some(ModalLine::Line(
+            "a".to_string(),
+        )))]))]);
     let mut state = PermissionPromptState {
         web_store: Some(store.clone()),
         ..Default::default()
@@ -2138,9 +2139,10 @@ fn a_terminal_answer_that_loses_to_the_web_is_told_it_lost() {
     store
         .answer_interaction_offer(&conv, &request_id, PromptChoice::Deny, Audience::Web)
         .unwrap();
-    let mut readers: VecDeque<ScriptedReader> = VecDeque::from([ScriptedReader(VecDeque::from([
-        Ok(Some(ModalLine::Line("a".to_string()))),
-    ]))]);
+    let mut readers: VecDeque<ScriptedReader> =
+        VecDeque::from([ScriptedReader(VecDeque::from([Ok(Some(ModalLine::Line(
+            "a".to_string(),
+        )))]))]);
     let mut state = PermissionPromptState {
         web_store: Some(store.clone()),
         ..Default::default()
@@ -2176,7 +2178,11 @@ fn a_terminal_answer_that_loses_to_the_web_is_told_it_lost() {
         PromptChoice::Deny,
         "the losing terminal answer was applied instead of the winner's"
     );
-    assert_eq!(told.len(), 1, "the operator was not told they lost: {told:?}");
+    assert_eq!(
+        told.len(),
+        1,
+        "the operator was not told they lost: {told:?}"
+    );
     assert!(
         told[0].contains("deny") && told[0].contains("allow_once"),
         "the message must name the winner AND the operator's own answer: {}",
@@ -2190,9 +2196,10 @@ fn a_terminal_answer_that_loses_to_the_web_is_told_it_lost() {
 fn a_terminal_answer_that_wins_is_told_nothing() {
     let (_r, _w, store, conv) = store_and_conv();
     let request_id = publish_open_to_both(&store, &conv);
-    let mut readers: VecDeque<ScriptedReader> = VecDeque::from([ScriptedReader(VecDeque::from([
-        Ok(Some(ModalLine::Line("a".to_string()))),
-    ]))]);
+    let mut readers: VecDeque<ScriptedReader> =
+        VecDeque::from([ScriptedReader(VecDeque::from([Ok(Some(ModalLine::Line(
+            "a".to_string(),
+        )))]))]);
     let mut state = PermissionPromptState {
         web_store: Some(store.clone()),
         ..Default::default()
