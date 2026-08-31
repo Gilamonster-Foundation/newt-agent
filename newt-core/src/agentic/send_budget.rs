@@ -177,14 +177,51 @@ pub(super) fn calibrate_down(real: usize, ratio: f32) -> usize {
     (real as f32 / ratio).floor() as usize
 }
 
-/// Sanitize a per-model `estimate_ratio` for one turn (Phase 20 §2.3): only
-/// finite values inside the learning clamp [0.5, 3.0] are trusted; anything
-/// else (absent, NaN, a corrupted cache entry) degrades to 1.0 — the
-/// identity, i.e. exactly the pre-calibration behavior.
+/// Sanitize a per-model `estimate_ratio` for DISPATCH use — preflight
+/// estimate scaling and trigger budget pricing (Phase 20 §2.3). Never used
+/// for reporting, which reads the raw stored EMA directly.
+///
+/// Two independent guards:
+/// 1. Only a finite value inside the learning clamp `[0.5, 3.0]` is
+///    trusted; anything else (absent, NaN, a corrupted cache entry)
+///    degrades to 1.0 — the identity, i.e. exactly the pre-calibration
+///    behavior.
+/// 2. **Floored at 1.0 (#1968).** Calibration may only TIGHTEN the
+///    authoritative send-budget gate, never loosen it. A stored EMA below
+///    1.0 usually means an Ollama prompt-cache-hit sample partially escaped
+///    `newt-tui`'s `CapabilityEntry::record_estimate_sample` exclusion (a
+///    partial hit reports only the newly-evaluated suffix, undercounting
+///    the true prompt) — dispatching with it verbatim would scale chars/4
+///    estimates DOWN below the model's real token cost. #1968's incident:
+///    a poisoned EMA of ~0.999 let the authoritative 167,772-token gate
+///    admit an estimate that resolved to a 205,189-token real request
+///    (23.7% over budget). The floor is a backstop, not the fix on its
+///    own — sample exclusion is what keeps the raw EMA honest in the
+///    first place, and a floor of exactly 1.0 would not by itself have
+///    caught this incident's true under-count. It still protects every
+///    OTHER model whose EMA has not (yet) been re-learned clean.
 pub(super) fn sanitize_estimate_ratio(estimate_ratio: Option<f32>) -> f32 {
     estimate_ratio
         .filter(|r| r.is_finite() && (0.5..=3.0).contains(r))
         .unwrap_or(1.0)
+        .max(1.0)
+}
+
+/// Whether a round's real prompt-token count is truncation-suspect (Phase 20
+/// §2.2): within 5% of the request's `num_ctx`, where Ollama may have
+/// silently head-truncated the prompt. Such a round is window evidence of
+/// NOTHING and must not raise any budget ratchet or promote tuning
+/// confidence.
+///
+/// The ONE predicate every writer that ratchets from observed usage must
+/// gate on (#1967): the per-round writer via [`emit_accepted`] below, the
+/// turn-level writer in `newt-tui`'s chat loop
+/// (`CapabilityEntry::record_success`), and retroactive pin validation at
+/// cache load (`CapabilityEntry`'s suspect-pin invalidation) all call this
+/// SAME function rather than re-deriving the 95% threshold — #1967's defect
+/// was exactly a second, ungated copy of this check.
+pub fn is_truncation_suspect(input_tokens: u32, num_ctx: Option<u32>) -> bool {
+    num_ctx.is_some_and(|c| input_tokens >= c.saturating_mul(95) / 100)
 }
 
 /// Report one quality-gated [`RoundObservation::Accepted`] (Phase 20 §2.2).
@@ -678,8 +715,53 @@ mod send_budget_tests {
         assert_eq!(sanitize_estimate_ratio(Some(0.1)), 1.0);
         assert_eq!(sanitize_estimate_ratio(Some(5.0)), 1.0);
         assert_eq!(sanitize_estimate_ratio(Some(1.29)), 1.29);
-        assert_eq!(sanitize_estimate_ratio(Some(0.5)), 0.5, "clamp inclusive");
         assert_eq!(sanitize_estimate_ratio(Some(3.0)), 3.0, "clamp inclusive");
+    }
+
+    /// #1968: dispatch calibration may only tighten the authoritative
+    /// send-budget gate, never loosen it — a stored EMA below 1.0 (a
+    /// cache-hit-poisoned sample that escaped exclusion) must not scale
+    /// preflight estimates DOWN below the model's real token cost.
+    #[test]
+    fn sanitize_estimate_ratio_floors_dispatch_at_1_0() {
+        use super::sanitize_estimate_ratio;
+        // Below 1.0 but inside the learning clamp: floored, not passed
+        // through — this is the exact shape of the #1968 incident's final
+        // stored ratio (0.9994337).
+        assert_eq!(
+            sanitize_estimate_ratio(Some(0.5)),
+            1.0,
+            "the clamp's own lower bound must not loosen the gate"
+        );
+        assert_eq!(sanitize_estimate_ratio(Some(0.9994337)), 1.0);
+        // At or above 1.0: unaffected — the floor only ever raises, never
+        // lowers, a value already safe to dispatch with.
+        assert_eq!(sanitize_estimate_ratio(Some(1.0)), 1.0);
+        assert_eq!(sanitize_estimate_ratio(Some(1.3)), 1.3);
+    }
+
+    /// #1967: the ONE truncation-suspect predicate — a suspect round's
+    /// prompt is window evidence of nothing (Ollama may have silently
+    /// head-truncated it), so nothing may treat it as proof of a safe
+    /// ceiling. Replays the incident's exact numbers: `num_ctx` 209,715
+    /// (the session's `safe_context`, absent an explicit `[backends]
+    /// num_ctx`), threshold 199,229 (95% of it, integer floor), and the
+    /// poisoned round's real 205,189 input tokens.
+    #[test]
+    fn is_truncation_suspect_replays_the_1967_incident_numbers() {
+        use super::is_truncation_suspect;
+        assert!(
+            is_truncation_suspect(205_189, Some(209_715)),
+            "205,189 is 97.8% of 209,715 — inside the suspect zone"
+        );
+        // The threshold itself: exactly 95% (integer floor) is suspect;
+        // one token under is not.
+        assert!(is_truncation_suspect(199_229, Some(209_715)));
+        assert!(!is_truncation_suspect(199_228, Some(209_715)));
+        // No known `num_ctx` — nothing to compare against, never suspect.
+        assert!(!is_truncation_suspect(205_189, None));
+        // A genuinely small prompt, nowhere near the window.
+        assert!(!is_truncation_suspect(4_136, Some(209_715)));
     }
 
     /// Phase 20 §2.3 — currency composition at the trigger boundary: a

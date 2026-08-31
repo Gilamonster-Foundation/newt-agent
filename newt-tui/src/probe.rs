@@ -286,20 +286,34 @@ impl CapabilityEntry {
     /// prompt tokens where the loop's chars/4 figure was `estimated`
     /// (Phase 20 §2.3). EMA `0.75·old + 0.25·sample`, clamped [0.5, 3.0].
     ///
-    /// Samples with `observed < 0.5 × estimated` are SKIPPED: an Ollama
-    /// prompt-cache hit reports only newly-evaluated tokens and would poison
-    /// the ratio downward (spec §2.3). Returns `true` only when the stored
-    /// value moved by more than 0.01 — the value itself is stored as-is, the
-    /// threshold just avoids a disk write per round (save thrash).
+    /// **Samples with `observed < 1.0 × estimated` are SKIPPED (#1968).** An
+    /// Ollama prompt-cache hit — full OR partial — reports only the
+    /// newly-evaluated suffix of the prompt, undercounting the true prompt
+    /// size; a partial hit lands anywhere in `[0.5, 1.0)`, not only below
+    /// 0.5. The system's own chars/4 estimator is documented to err on the
+    /// side of counting (never undercounting, the 18.1 rule), so a
+    /// genuinely fresh, uncached round is not expected to come in UNDER its
+    /// estimate — `raw < 1.0` is cache-hit-shaped regardless of how far
+    /// under 1.0 it lands, and there is currently no signal available here
+    /// to prove a request was cache-cold, so it is excluded rather than
+    /// guessed at. (#1968's incident: partial hits in exactly this
+    /// previously-admitted `[0.5, 1.0)` band dragged the EMA down to
+    /// ~0.999, which under-scaled the preflight estimate for a 205,189-token
+    /// real request against a 167,772-token authoritative budget.) Returns
+    /// `true` only when the stored value moved by more than 0.01 — the
+    /// value itself is stored as-is, the threshold just avoids a disk write
+    /// per round (save thrash).
     pub fn record_estimate_sample(&mut self, observed: u32, estimated: usize) -> bool {
         if estimated == 0 {
             return false;
         }
         let raw = observed as f32 / estimated as f32;
-        if raw < 0.5 {
+        if raw < 1.0 {
             return false;
         }
-        let sample = raw.clamp(0.5, 3.0);
+        // The lower bound is now unreachable (raw >= 1.0 here) — clamp(1.0,
+        // 3.0) says so honestly rather than leaving a dead 0.5 floor.
+        let sample = raw.clamp(1.0, 3.0);
         let new = match self.estimate_ratio {
             None => sample,
             Some(old) => (0.75 * old + 0.25 * sample).clamp(0.5, 3.0),
@@ -622,9 +636,11 @@ fn cache_path() -> Option<PathBuf> {
 
 /// Load the capability cache from disk, returning an empty map on any error.
 ///
-/// Runs [`migrate_accounting`] on the parsed cache and persists the result
-/// when anything changed, so poisoned pre-18.1 ratchet values are invalidated
-/// exactly once.
+/// Runs [`migrate_accounting`] (pre-18.1 double-counting de-poisoning) and
+/// [`invalidate_suspect_pins`] (#1967/#1968 truncation-suspect de-poisoning)
+/// on the parsed cache and persists the result when anything changed, so a
+/// poisoned ratchet value is invalidated exactly once, on the next launch
+/// after the fix that stops writing it — no separate manual repair step.
 pub fn load_cache() -> CapabilityCache {
     let Some(path) = cache_path() else {
         return Default::default();
@@ -633,7 +649,9 @@ pub fn load_cache() -> CapabilityCache {
         return Default::default();
     };
     let mut cache: CapabilityCache = serde_json::from_str(&data).unwrap_or_default();
-    if migrate_accounting(&mut cache) {
+    // Bitwise OR, not `||`: both migrations must run — short-circuiting
+    // would skip the second de-poisoning pass whenever the first was dirty.
+    if migrate_accounting(&mut cache) | invalidate_suspect_pins(&mut cache) {
         save_cache(&cache);
     }
     cache
@@ -677,6 +695,58 @@ pub fn migrate_accounting(cache: &mut CapabilityCache) -> bool {
             entry.tune_confidence = TuneConfidence::None;
         }
         entry.accounting_version = ACCOUNTING_VERSION;
+        dirty = true;
+    }
+    dirty
+}
+
+/// #1967/#1968 remediation: a `max_ok_input` pin at or above 95% of its own
+/// `safe_context` is exactly the "window evidence of nothing" shape the
+/// per-round and (now, #1967) turn-level ratchets both refuse to write —
+/// but an entry pinned by an OLDER build, before that exclusion existed,
+/// can still be sitting on disk with such a value (the live incident: a
+/// `nemotron-3-ultra` entry pinned `max_ok_input: 205,189` at High
+/// confidence against a 209,715 `safe_context` — 97.8%). Retroactively
+/// invalidates it, the same shape as [`migrate_accounting`]'s
+/// pre-18.1 de-poisoning, run alongside it on every [`load_cache`].
+///
+/// **Skips any entry with `hard_context_window: Some(_)`** — a
+/// cw-400-derived pin (`CapabilityEntry::record_context_window_400_with_pct`)
+/// is EXPECTED to sit at or above its own `safe_context`; that path derives
+/// `max_ok_input` from the endpoint's reported hard limit while
+/// `safe_context` stays VRAM-capped, and `hard_context_window` is the one
+/// field only that path ever sets. Without this guard, invalidating that
+/// legitimate, authoritative pin would be a regression, not a fix.
+///
+/// Checked against the entry's CURRENT `safe_context` (what a new request
+/// would actually send as `num_ctx` today), not the historical dispatch,
+/// which is not recorded — a conservative proxy, not a replay.
+///
+/// Idempotent: an already-invalidated entry has `max_ok_input: None` and is
+/// skipped on the next load. Returns `true` when anything changed (caller
+/// should persist).
+pub fn invalidate_suspect_pins(cache: &mut CapabilityCache) -> bool {
+    let mut dirty = false;
+    for (key, entry) in cache.iter_mut() {
+        if entry.hard_context_window.is_some() {
+            continue;
+        }
+        let Some(max_ok) = entry.max_ok_input else {
+            continue;
+        };
+        if !newt_core::agentic::is_truncation_suspect(max_ok, entry.safe_context) {
+            continue;
+        }
+        tracing::warn!(
+            cap_key = %key,
+            max_ok_input = max_ok,
+            safe_context = ?entry.safe_context,
+            "invalidating a max_ok_input pin at >= 95% of its own safe_context — \
+             window evidence of nothing (#1967/#1968); the ratchet will re-learn"
+        );
+        entry.max_ok_input = None;
+        entry.consecutive_ok = 0;
+        entry.tune_confidence = TuneConfidence::None;
         dirty = true;
     }
     dirty
@@ -2024,27 +2094,59 @@ mod tests {
     }
 
     #[test]
-    fn record_estimate_sample_clamps_both_ends() {
+    fn record_estimate_sample_clamps_the_high_end() {
         // A wild over-report clamps the SAMPLE to 3.0 before the EMA.
         let mut e = make_entry();
         assert!(e.record_estimate_sample(10_000, 1_000)); // raw 10.0
         assert_eq!(e.estimate_ratio, Some(3.0), "init clamped to 3.0");
-        // A 0.5 raw sample is the under-report boundary: NOT skipped
-        // (cache-hit skip is strictly below 0.5) and clamps to 0.5.
-        let mut e2 = make_entry();
-        assert!(e2.record_estimate_sample(500, 1_000));
-        assert_eq!(e2.estimate_ratio, Some(0.5));
-        // The EMA result is clamped too: stored value can never escape
-        // [0.5, 3.0] no matter the history.
+        // The EMA result is clamped too: stored value can never exceed 3.0
+        // no matter the history.
         assert!(!e.record_estimate_sample(10_000, 1_000), "3.0 → 3.0: clean");
         assert_eq!(e.estimate_ratio, Some(3.0));
+    }
+
+    /// #1968 anti-vacuous pair: a cache-hit-SHAPED sample (`raw` in
+    /// `[0.5, 1.0)` — the exact band the pre-fix code admitted) is now
+    /// excluded outright, and its twin — a genuinely fresh, full-eval
+    /// sample at `raw >= 1.0` — still updates the EMA normally. Before this
+    /// fix only `raw < 0.5` was skipped; a `raw` of exactly 0.9 (a plausible
+    /// partial cache hit) fed straight into the EMA.
+    #[test]
+    fn record_estimate_sample_excludes_the_partial_cache_hit_band() {
+        // The twin first: a legitimate full-eval sample (raw 1.0, the exact
+        // new boundary) is NOT excluded and initializes the ratio.
+        let mut clean = make_entry();
+        assert!(clean.record_estimate_sample(1_000, 1_000));
+        assert_eq!(clean.estimate_ratio, Some(1.0));
+
+        // Now the excluded band: raw 0.9 — previously admitted (>= the old
+        // 0.5 skip line), now excluded. Nothing stored.
+        let mut cache_hit = make_entry();
+        assert!(!cache_hit.record_estimate_sample(900, 1_000));
+        assert_eq!(
+            cache_hit.estimate_ratio, None,
+            "a [0.5, 1.0) sample must not seed the ratio"
+        );
+        // And it must not disturb an already-learned ratio either — this is
+        // exactly #1968's incident shape: a partial cache hit arriving
+        // mid-session must not drag a previously-healthy EMA down.
+        cache_hit.estimate_ratio = Some(1.3);
+        assert!(!cache_hit.record_estimate_sample(900, 1_000));
+        assert_eq!(cache_hit.estimate_ratio, Some(1.3));
+
+        // The pre-fix admitted range's boundary, restated: raw just under
+        // 1.0 is excluded; raw at or above 1.0 is not.
+        let mut boundary = make_entry();
+        assert!(!boundary.record_estimate_sample(999, 1_000)); // raw 0.999
+        assert!(boundary.record_estimate_sample(1_001, 1_000)); // raw 1.001
     }
 
     #[test]
     fn record_estimate_sample_skips_cache_hits_and_zero_estimates() {
         let mut e = make_entry();
-        // Ollama prompt-cache hit: observed < 0.5 × estimated — would poison
-        // the ratio downward (spec §2.3). Skipped, nothing stored.
+        // A full Ollama prompt-cache hit: observed well under estimated —
+        // would poison the ratio downward (spec §2.3, #1968). Skipped,
+        // nothing stored.
         assert!(!e.record_estimate_sample(400, 1_000));
         assert_eq!(e.estimate_ratio, None);
         // Zero estimate: no honest ratio exists.
@@ -2433,6 +2535,107 @@ mod tests {
         assert!(migrate_accounting(&mut cache), "first pass migrates");
         let snapshot = serde_json::to_string(&cache).unwrap();
         assert!(!migrate_accounting(&mut cache), "second pass is a no-op");
+        assert_eq!(serde_json::to_string(&cache).unwrap(), snapshot);
+    }
+
+    // --- invalidate_suspect_pins (#1967/#1968 remediation) ---
+
+    /// Replays the live incident's exact numbers: `max_ok_input` 205,189
+    /// pinned at High confidence against `safe_context` 209,715 (97.8% —
+    /// inside the 95% suspect zone), `hard_context_window: None` (this
+    /// entry was never cw-400-confirmed — it came from the ungated
+    /// turn-level ratchet #1967 fixes). Must be invalidated.
+    #[test]
+    fn invalidate_suspect_pins_drops_the_1967_incident_pin() {
+        let mut cache = CapabilityCache::default();
+        cache.insert(
+            mk("nemotron-3-ultra"),
+            CapabilityEntry {
+                conformance: ToolConformance::Native,
+                tested_date: "2026-08-29".into(),
+                context_window: Some(262_144),
+                hard_context_window: None,
+                safe_context: Some(209_715),
+                max_ok_input: Some(205_189),
+                consecutive_ok: 0,
+                tune_confidence: TuneConfidence::High,
+                tune_date: Some("2026-08-29".into()),
+                ..Default::default()
+            },
+        );
+        assert!(invalidate_suspect_pins(&mut cache), "must report dirty");
+        let e = &cache[&mk("nemotron-3-ultra")];
+        assert_eq!(e.max_ok_input, None, "the poisoned pin must be dropped");
+        assert_eq!(e.consecutive_ok, 0);
+        assert_eq!(e.tune_confidence, TuneConfidence::None);
+        // Non-ratchet state survives — this is a targeted invalidation, not
+        // a reset of the whole entry.
+        assert_eq!(e.context_window, Some(262_144));
+        assert_eq!(e.safe_context, Some(209_715));
+    }
+
+    /// Anti-false-positive twin: a LEGITIMATE cw-400-derived pin sits at or
+    /// above its own `safe_context` by construction
+    /// (`record_context_window_400_with_pct`), and that path is the ONE
+    /// writer of `hard_context_window` — its presence must exempt the
+    /// entry, or this remediation would regress a working safety mechanism
+    /// instead of fixing a broken one.
+    #[test]
+    fn invalidate_suspect_pins_spares_a_legitimate_cw_400_pin() {
+        let mut cache = CapabilityCache::default();
+        cache.insert(
+            mk("hosted-model"),
+            CapabilityEntry {
+                conformance: ToolConformance::Native,
+                tested_date: "2026-06-09".into(),
+                hard_context_window: Some(1_000_000),
+                safe_context: Some(64_000),
+                max_ok_input: Some(800_000), // cw-400 discovery: legit > safe_context
+                consecutive_ok: 2,
+                tune_confidence: TuneConfidence::Medium,
+                ..Default::default()
+            },
+        );
+        assert!(
+            !invalidate_suspect_pins(&mut cache),
+            "a hard_context_window-confirmed pin must never be touched"
+        );
+        let e = &cache[&mk("hosted-model")];
+        assert_eq!(e.max_ok_input, Some(800_000));
+        assert_eq!(e.tune_confidence, TuneConfidence::Medium);
+    }
+
+    /// A genuinely healthy pin — well under its own `safe_context` — is
+    /// left alone regardless of confidence or `hard_context_window`.
+    #[test]
+    fn invalidate_suspect_pins_spares_a_healthy_pin() {
+        let mut cache = CapabilityCache::default();
+        let mut e = make_entry();
+        e.max_ok_input = Some(4_136);
+        e.tune_confidence = TuneConfidence::High;
+        cache.insert(mk("healthy-model"), e);
+        assert!(!invalidate_suspect_pins(&mut cache));
+        assert_eq!(cache[&mk("healthy-model")].max_ok_input, Some(4_136));
+    }
+
+    /// Running the invalidation twice must be a no-op the second time.
+    #[test]
+    fn invalidate_suspect_pins_is_idempotent() {
+        let mut cache = CapabilityCache::default();
+        let mut e = make_entry();
+        e.safe_context = Some(209_715);
+        e.max_ok_input = Some(205_189);
+        e.tune_confidence = TuneConfidence::High;
+        cache.insert(mk("m"), e);
+        assert!(
+            invalidate_suspect_pins(&mut cache),
+            "first pass invalidates"
+        );
+        let snapshot = serde_json::to_string(&cache).unwrap();
+        assert!(
+            !invalidate_suspect_pins(&mut cache),
+            "second pass is a no-op"
+        );
         assert_eq!(serde_json::to_string(&cache).unwrap(), snapshot);
     }
 
