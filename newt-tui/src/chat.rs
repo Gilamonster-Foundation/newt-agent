@@ -1003,6 +1003,11 @@ fn persist_incomplete_turn(
     artifact_sink: Option<&dyn newt_core::agentic::PromptArtifactSink>,
     active_prompt_context: Option<&newt_core::TurnPromptContext>,
     artifact_source: Option<&dyn newt_core::agentic::ArtifactSource>,
+    // The cap this turn ran under, with its derivation (#1965). An interrupted
+    // or errored turn needs it MOST: the escalated run that reached round 320
+    // left no turn row at all, so the only turns whose cap was ever
+    // recoverable were the ones that finished under it.
+    tool_round_limit: Option<newt_core::tenacity::ToolRoundLimit>,
     rt: &tokio::runtime::Handle,
     color: bool,
     verbose: bool,
@@ -1062,6 +1067,7 @@ fn persist_incomplete_turn(
                     metrics.usage,
                     metrics.end_reason,
                     metrics.elapsed_ms,
+                    tool_round_limit,
                 ) {
                     print_newt(
                         &format!("warning: could not record turn outcome artifact: {e}"),
@@ -6535,11 +6541,16 @@ fn session_body(
                     let configured_max_tool_rounds = model_tune
                         .and_then(|t| t.max_tool_rounds)
                         .unwrap_or_else(|| max_tool_rounds(&cfg));
-                    let eff_max_tool_rounds = effective_tool_round_limit(
+                    // #1965: one derivation, carried whole. `eff_max_tool_rounds`
+                    // is the number the loop enforces; `tool_round_limit` is the
+                    // same value with its provenance, stamped into the turn's
+                    // durable outcome so an escalation is recoverable later.
+                    let tool_round_limit = effective_tool_round_limit(
                         configured_max_tool_rounds,
                         newt_core::tenacity::cli_tenacity(),
                         max_tool_rounds_override,
                     );
+                    let eff_max_tool_rounds = tool_round_limit.rounds;
                     let eff_workflow_grace_rounds = model_tune
                         .and_then(|t| t.workflow_grace_rounds)
                         .unwrap_or_else(|| workflow_grace_rounds(&cfg));
@@ -7708,6 +7719,7 @@ fn session_body(
                             artifact_sink,
                             active_prompt_context.as_ref(),
                             artifact_source,
+                            Some(tool_round_limit),
                             &rt,
                             color,
                             verbose,
@@ -7983,6 +7995,7 @@ fn session_body(
                                                 metrics.usage,
                                                 metrics.end_reason,
                                                 metrics.elapsed_ms,
+                                                Some(tool_round_limit),
                                             ) {
                                                 print_newt(
                                                     &format!(
@@ -8137,6 +8150,7 @@ fn session_body(
                                     artifact_sink,
                                     active_prompt_context.as_ref(),
                                     artifact_source,
+                                    Some(tool_round_limit),
                                     &rt,
                                     color,
                                     verbose,
@@ -9485,6 +9499,7 @@ mod incomplete_turn_persistence_tests {
             Some(&f.sink as &dyn newt_core::agentic::PromptArtifactSink),
             Some(&f.turn),
             None,
+            None,
             &rt,
             false,
             false,
@@ -9563,6 +9578,7 @@ mod incomplete_turn_persistence_tests {
             &f.step_ledger,
             Some(&f.sink as &dyn newt_core::agentic::PromptArtifactSink),
             Some(&f.turn),
+            None,
             None,
             &rt,
             false,

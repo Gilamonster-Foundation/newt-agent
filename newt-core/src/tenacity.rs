@@ -119,22 +119,108 @@ impl Tenacity {
     }
 }
 
+/// Which input decided the effective tool-round limit (#1965).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRoundLimitSource {
+    /// The configured value — `[tui].max_tool_rounds` or a per-model tuning.
+    Config,
+    /// An operator-selected tenacity level raised it.
+    Tenacity,
+    /// An explicit `/rounds` / `--max-rounds` value, the outermost override.
+    Override,
+}
+
+impl ToolRoundLimitSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::Tenacity => "tenacity",
+            Self::Override => "override",
+        }
+    }
+}
+
+/// The effective tool-round limit **and how it was reached** (#1965).
+///
+/// # Why this is a struct and not a `usize`
+///
+/// [`resolve_tool_round_limit`] promised, in its own doc comment, to compose
+/// this "without losing provenance" — and returned a bare number, so the
+/// provenance was computed and discarded at the one site responsible for
+/// keeping it. A session escalated 40 rounds to effectively unlimited and left
+/// no record anywhere: not in config, not in a receipt, not in a turn row.
+/// Runs then reached rounds 145, 236, 285 and 320.
+///
+/// Carrying the derivation in the return type means a caller cannot record the
+/// number while dropping where it came from — the number and its justification
+/// are one value. That is the same move as `#1908`'s: make the lossy call
+/// impossible to write rather than remember to write it correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolRoundLimit {
+    /// The limit actually enforced this turn.
+    pub rounds: usize,
+    /// Which input won.
+    pub source: ToolRoundLimitSource,
+    /// What config alone would have given — kept so a reader can see the
+    /// ESCALATION, not merely the result. "320 rounds" is a number; "320,
+    /// from an override, over a configured 40" is an explanation.
+    pub configured: usize,
+    /// The operator-selected level, when one was in play.
+    pub tenacity: Option<Tenacity>,
+}
+
+impl ToolRoundLimit {
+    /// Whether the effective limit differs from what config alone would give —
+    /// the condition worth telling an operator about.
+    #[must_use]
+    pub fn is_escalated(&self) -> bool {
+        self.rounds != self.configured
+    }
+}
+
 /// Compose the tool-round safety valve without losing provenance. Automatic
 /// persona/config/family tenacity is intentionally not accepted here: callers
 /// pass only a direct operator choice, because small loop-prone families often
 /// default to relentless and must not silently receive 10,000 rounds. An
 /// explicit `/rounds`/`--max-rounds` value remains the outermost override.
+///
+/// Returns a [`ToolRoundLimit`] rather than a number, so the derivation cannot
+/// be dropped on the way to a durable record — see that type's docs (#1965).
 #[must_use]
 pub fn resolve_tool_round_limit(
     configured: usize,
     explicit_tenacity: Option<Tenacity>,
     explicit_rounds: Option<usize>,
-) -> usize {
-    explicit_rounds.unwrap_or_else(|| {
-        explicit_tenacity
-            .map(|level| level.project_tool_round_limit(configured))
-            .unwrap_or(configured)
-    })
+) -> ToolRoundLimit {
+    if let Some(rounds) = explicit_rounds {
+        return ToolRoundLimit {
+            rounds,
+            source: ToolRoundLimitSource::Override,
+            configured,
+            tenacity: explicit_tenacity,
+        };
+    }
+    // A tenacity level that does not RAISE the limit did not decide it — the
+    // configured value did, and saying "tenacity" there would name a cause that
+    // changed nothing.
+    if let Some(level) = explicit_tenacity {
+        let projected = level.project_tool_round_limit(configured);
+        if projected != configured {
+            return ToolRoundLimit {
+                rounds: projected,
+                source: ToolRoundLimitSource::Tenacity,
+                configured,
+                tenacity: Some(level),
+            };
+        }
+    }
+    ToolRoundLimit {
+        rounds: configured,
+        source: ToolRoundLimitSource::Config,
+        configured,
+        tenacity: explicit_tenacity,
+    }
 }
 
 impl fmt::Display for Tenacity {
@@ -505,9 +591,10 @@ mod tests {
             20_000,
             "the posture must not lower an already larger configured budget"
         );
+        let overridden = resolve_tool_round_limit(40, Some(Tenacity::Relentless), Some(7));
         assert_eq!(
-            resolve_tool_round_limit(40, Some(Tenacity::Relentless), Some(7)),
-            7,
+            (overridden.rounds, overridden.source),
+            (7, ToolRoundLimitSource::Override),
             "a direct round limit remains the outermost operator choice"
         );
     }

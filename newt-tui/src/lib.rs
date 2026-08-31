@@ -9318,14 +9318,21 @@ fn tenacity_tool_round_limit(
     configured: usize,
     explicit_tenacity: Option<newt_core::Tenacity>,
 ) -> usize {
-    newt_core::tenacity::resolve_tool_round_limit(configured, explicit_tenacity, None)
+    newt_core::tenacity::resolve_tool_round_limit(configured, explicit_tenacity, None).rounds
 }
 
+/// The cap this turn will run under, WITH its derivation (#1965).
+///
+/// Returns the whole [`ToolRoundLimit`](newt_core::tenacity::ToolRoundLimit)
+/// rather than the number, because the number alone is what made an escalation
+/// from 40 to effectively unlimited unrecordable: the caller stamps the
+/// derivation into the turn's durable outcome, and cannot do that from a
+/// `usize`.
 fn effective_tool_round_limit(
     configured: usize,
     explicit_tenacity: Option<newt_core::Tenacity>,
     session_override: Option<usize>,
-) -> usize {
+) -> newt_core::tenacity::ToolRoundLimit {
     newt_core::tenacity::resolve_tool_round_limit(configured, explicit_tenacity, session_override)
 }
 
@@ -9355,15 +9362,14 @@ fn apply_tool_round_limit_command(
     match command {
         ToolRoundLimitCommand::Show => session_override,
         ToolRoundLimitCommand::Set(rounds) => Some(rounds),
-        ToolRoundLimitCommand::Double => Some(double_tool_round_limit(effective_tool_round_limit(
-            configured,
-            explicit_tenacity,
-            session_override,
-        ))),
+        ToolRoundLimitCommand::Double => Some(double_tool_round_limit(
+            effective_tool_round_limit(configured, explicit_tenacity, session_override).rounds,
+        )),
         ToolRoundLimitCommand::Reset => None,
         ToolRoundLimitCommand::Configured => Some(configured),
         ToolRoundLimitCommand::Unlimited => Some(
             effective_tool_round_limit(configured, explicit_tenacity, session_override)
+                .rounds
                 .max(EFFECTIVELY_UNLIMITED_TOOL_ROUNDS),
         ),
     }
