@@ -884,6 +884,140 @@ fn active_operator_task<'a>(
         .unwrap_or(submitted_task)
 }
 
+/// #1963: persist a turn that did NOT reach a normal completion — cancelled
+/// by the operator (Esc/Ctrl-C) or ended in a backend/loop error — through
+/// exactly the same durable path [`save_turn_if_persistent`]'s Ok-arm caller
+/// uses for a completed one. Before this existed, `save_turn_if_persistent`
+/// had exactly one call site, gated on the turn's response being `Ok`, so
+/// any other exit — and everything the loop had already done before it —
+/// left no `turns` row, no `turn_outcome` artifact, and no memory sync: a
+/// 79-minute, ~280-round, 84-file-change run left nothing for resume context
+/// or forensics to find, because it never reached that one call.
+///
+/// `turn_tool_events` and `turn_phantom_reaches` are the caller's real,
+/// already-accumulated ledgers — populated by `&mut` reference during the
+/// call regardless of how it ends, never re-derived here. `usage` and
+/// `reply` are likewise whatever the caller could actually recover (often
+/// real: every interrupt checkpoint in the four wire loops returns `Ok`
+/// with its accumulated usage, never a fabricated `Err`, because
+/// cancellation is a controlled stop, not a failure) — `None`/`""` when
+/// nothing was recoverable, never a manufactured zero (a persisted turn
+/// with fake usage would poison the tuner, #1967).
+#[allow(clippy::too_many_arguments)]
+fn persist_incomplete_turn(
+    conversation_store: Option<&newt_core::ConversationStore>,
+    active_conversation_id: &str,
+    active_persona: Option<&Persona>,
+    task: &str,
+    reply: &str,
+    turn_tool_events: &[newt_core::ToolEvent],
+    turn_phantom_reaches: &[newt_core::PhantomReach],
+    usage: Option<newt_core::TokenUsage>,
+    hallucinations: u32,
+    end_reason: newt_core::TurnEndReason,
+    elapsed: std::time::Duration,
+    inf_model: &str,
+    inf_url: &str,
+    pricing: &newt_core::PricingConfig,
+    memory: &mut newt_core::MemoryManager,
+    scratchpad_store: &newt_core::SessionScratchpadStore,
+    step_ledger: &newt_core::SessionStepLedger,
+    artifact_sink: Option<&dyn newt_core::agentic::PromptArtifactSink>,
+    active_prompt_context: Option<&newt_core::TurnPromptContext>,
+    artifact_source: Option<&dyn newt_core::agentic::ArtifactSource>,
+    rt: &tokio::runtime::Handle,
+    color: bool,
+    verbose: bool,
+) {
+    let metrics = newt_core::TurnMetrics {
+        elapsed_ms: elapsed.as_millis() as u64,
+        usage,
+        cost_usd: pricing.estimate_cost(inf_model, usage.as_ref()),
+        model_id: inf_model.to_string(),
+        endpoint: inf_url.to_string(),
+        hallucinations,
+        end_reason: Some(end_reason),
+    };
+    let memory_task = active_operator_task(active_prompt_context, task);
+    tokio::task::block_in_place(|| {
+        rt.block_on(memory.sync_all_with_active_task(task, reply, &metrics, memory_task));
+    });
+    let scratchpad_snapshot = {
+        use newt_core::ScratchpadStore;
+        scratchpad_store.entries()
+    };
+    let plan_snapshot = {
+        use newt_core::StepLedger;
+        step_ledger.snapshot()
+    };
+    let compaction_record = memory.take_compaction_record();
+    let compaction_artifact_summary = compaction_record.clone();
+    let conversation_save = save_turn_if_persistent(
+        conversation_store,
+        active_conversation_id,
+        active_persona,
+        task,
+        reply,
+        turn_tool_events,
+        turn_phantom_reaches,
+        usage,
+        compaction_record,
+        &scratchpad_snapshot,
+        &plan_snapshot,
+    );
+    match conversation_save {
+        Ok(save_state) => {
+            if let TurnSaveState::DurableWithAncillaryWarning(error) = save_state {
+                print_newt(
+                    &format!("warning: conversation ancillary save failed: {error}"),
+                    color,
+                    verbose,
+                );
+            }
+            if let (Some(sink), Some(turn)) = (artifact_sink, active_prompt_context) {
+                let context =
+                    newt_core::agentic::ArtifactReadContext::from_turn(turn, artifact_source);
+                if let Err(e) = newt_core::agentic::record_turn_outcome(
+                    sink,
+                    context,
+                    reply,
+                    metrics.usage,
+                    metrics.end_reason,
+                    metrics.elapsed_ms,
+                ) {
+                    print_newt(
+                        &format!("warning: could not record turn outcome artifact: {e}"),
+                        color,
+                        verbose,
+                    );
+                }
+            }
+            if let (Some(summary), Some(sink), Some(turn)) = (
+                compaction_artifact_summary.as_deref(),
+                artifact_sink,
+                active_prompt_context,
+            ) {
+                let context =
+                    newt_core::agentic::ArtifactReadContext::from_turn(turn, artifact_source);
+                if let Err(e) =
+                    newt_core::agentic::record_memory_compaction_checkpoint(sink, context, summary)
+                {
+                    print_newt(
+                        &format!("warning: could not record compaction checkpoint artifact: {e}"),
+                        color,
+                        verbose,
+                    );
+                }
+            }
+        }
+        Err(e) => print_newt(
+            &format!("warning: conversation save failed: {e}"),
+            color,
+            verbose,
+        ),
+    }
+}
+
 /// Cloneable liveness state for work owned by the harness but rendered by an
 /// [`InputSurface`]. Workers only flip the state; the active surface remains
 /// the sole terminal writer.
@@ -7459,6 +7593,47 @@ fn session_body(
                         };
                         print_newt(note, color, verbose);
                         println!();
+                        // #1963: every interrupt checkpoint in the four wire
+                        // loops returns `Ok` with whatever it actually
+                        // accumulated before noticing `turn_cancel` — real
+                        // streamed text the operator already saw on screen,
+                        // real merged usage across every completed round —
+                        // never an `Err` purely because of cancellation. This
+                        // branch used to discard `response` unread; read it
+                        // defensively rather than assume Ok (a genuine `Err`
+                        // racing the same instant has nothing recoverable).
+                        let (cancel_reply, cancel_usage, cancel_hallucinations) = match &response {
+                            Ok((reply, _was_streamed, usage, hallucinations)) => {
+                                (reply.as_str(), *usage, *hallucinations)
+                            }
+                            Err(_) => ("", None, 0),
+                        };
+                        let pricing = cfg.pricing.clone().unwrap_or_default();
+                        persist_incomplete_turn(
+                            conversation_store.as_ref(),
+                            &active_conversation_id,
+                            active_persona.as_ref(),
+                            &task,
+                            cancel_reply,
+                            &turn_tool_events,
+                            &turn_phantom_reaches,
+                            cancel_usage,
+                            cancel_hallucinations,
+                            newt_core::TurnEndReason::Cancelled,
+                            elapsed,
+                            &inf_model,
+                            &inf_url,
+                            &pricing,
+                            &mut memory,
+                            &scratchpad_store,
+                            &step_ledger,
+                            artifact_sink,
+                            active_prompt_context.as_ref(),
+                            artifact_source,
+                            &rt,
+                            color,
+                            verbose,
+                        );
                     } else {
                         newt_core::lifecycle::emit(if response.is_ok() {
                             newt_core::lifecycle::LifecycleEvent::TurnCompleted
@@ -7847,7 +8022,44 @@ fn session_body(
                                     }
                                 }
                             }
-                            Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                            Err(e) => {
+                                print_newt(&format!("error: {e}"), color, verbose);
+                                // #1963: `turn_tool_events`/`turn_phantom_reaches`
+                                // still hold whatever earlier rounds actually did
+                                // before this failure — real ledgers, not
+                                // re-derived. Usage is NOT recoverable here: unlike
+                                // a cancel, a genuine `Err` carries no accumulated-
+                                // usage channel back to this caller, so `None`
+                                // (stored as NULL) is the honest value — never a
+                                // fabricated zero (it would poison the tuner,
+                                // #1967).
+                                let pricing = cfg.pricing.clone().unwrap_or_default();
+                                persist_incomplete_turn(
+                                    conversation_store.as_ref(),
+                                    &active_conversation_id,
+                                    active_persona.as_ref(),
+                                    &task,
+                                    "",
+                                    &turn_tool_events,
+                                    &turn_phantom_reaches,
+                                    None,
+                                    0,
+                                    newt_core::TurnEndReason::Failed,
+                                    elapsed,
+                                    &inf_model,
+                                    &inf_url,
+                                    &pricing,
+                                    &mut memory,
+                                    &scratchpad_store,
+                                    &step_ledger,
+                                    artifact_sink,
+                                    active_prompt_context.as_ref(),
+                                    artifact_source,
+                                    &rt,
+                                    color,
+                                    verbose,
+                                );
+                            }
                         }
                     }
                 }
@@ -9006,6 +9218,299 @@ mod prompt_ingress_tests {
                 .unwrap()
                 .is_none(),
             "a fully explicit answer must clear the recovered pending state"
+        );
+    }
+}
+
+/// #1963 regression: a turn that is cancelled or errors must still leave a
+/// `turns` row, a `turn_outcome` artifact, and (when recoverable) real
+/// usage — before this, only a genuine `Ok` completion ever reached
+/// [`save_turn_if_persistent`], so a 79-minute, ~280-round interrupted run
+/// left no trace for resume context or forensics to find.
+#[cfg(test)]
+mod incomplete_turn_persistence_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Test-only [`newt_core::agentic::PromptArtifactSink`] that records what
+    /// was written instead of persisting it — mirrors the shape of
+    /// `artifact_hooks.rs`'s own private `RecordingSink` (that one cannot be
+    /// reused directly: it is private to a different crate's test module).
+    #[derive(Default)]
+    struct RecordingArtifactSink {
+        writes: Mutex<Vec<newt_core::NewPromptArtifact>>,
+    }
+
+    impl RecordingArtifactSink {
+        fn artifacts(&self) -> Vec<newt_core::NewPromptArtifact> {
+            self.writes.lock().unwrap().clone()
+        }
+    }
+
+    impl newt_core::agentic::PromptArtifactSink for RecordingArtifactSink {
+        fn append_artifact(
+            &self,
+            originating_prompt_id: newt_core::PromptId,
+            objective_root_id: newt_core::PromptId,
+            artifact: newt_core::NewPromptArtifact,
+        ) -> anyhow::Result<newt_core::agentic::ArtifactReadRecord> {
+            let mut writes = self.writes.lock().unwrap();
+            writes.push(artifact.clone());
+            Ok(newt_core::agentic::ArtifactReadRecord {
+                id: newt_core::ArtifactId::new(),
+                prompt_id: originating_prompt_id,
+                root_prompt_id: objective_root_id,
+                writer_fingerprint: "test-writer".to_string(),
+                seq: writes.len() as u64,
+                prev_hash: "prev".to_string(),
+                kind: format!("{:?}", artifact.kind()),
+                relation: format!("{:?}", artifact.relation()),
+                locator: artifact.locator().map(str::to_string),
+                body: artifact.body().map(str::to_string),
+                metadata: artifact.metadata().clone(),
+                ts_claim: 1,
+                artifact_hash: "hash".to_string(),
+            })
+        }
+    }
+
+    struct Fixture {
+        _root: tempfile::TempDir,
+        _ws: tempfile::TempDir,
+        store: newt_core::ConversationStore,
+        conversation_id: String,
+        memory: newt_core::MemoryManager,
+        scratchpad_store: newt_core::SessionScratchpadStore,
+        step_ledger: newt_core::SessionStepLedger,
+        pricing: newt_core::PricingConfig,
+        sink: RecordingArtifactSink,
+        turn: newt_core::TurnPromptContext,
+    }
+
+    fn fixture(conversation_id: &str) -> Fixture {
+        let root = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let store = newt_core::ConversationStore::new(root.path(), ws.path(), 100).unwrap();
+        let turn = newt_core::TurnPromptContext::ephemeral_operator(
+            conversation_id.to_string(),
+            b"continue".to_vec(),
+            b"continue".to_vec(),
+        );
+        Fixture {
+            _root: root,
+            _ws: ws,
+            store,
+            conversation_id: conversation_id.to_string(),
+            memory: newt_core::MemoryManager::new(),
+            scratchpad_store: newt_core::SessionScratchpadStore::default(),
+            step_ledger: newt_core::SessionStepLedger::default(),
+            pricing: newt_core::PricingConfig::default(),
+            sink: RecordingArtifactSink::default(),
+            turn,
+        }
+    }
+
+    /// The exact shape of the operator's forensic evidence: real tool calls
+    /// happened before the interrupt landed.
+    fn a_tool_event() -> newt_core::ToolEvent {
+        newt_core::ToolEvent {
+            tool: "read_file".to_string(),
+            args_digest: "keys=path;abc123".to_string(),
+            ok: true,
+            duration_ms: Some(42),
+        }
+    }
+
+    /// Test-only [`newt_core::MemoryProvider`] that records what it was
+    /// synced with, sharing its log via `Arc` so the test can still read it
+    /// after the provider moves into the [`newt_core::MemoryManager`] by
+    /// value. Exists to pin the OTHER half of #1963's finding: "memory.sync_all
+    /// is also Ok-only, so the segment is lost to resume context, not just
+    /// forensics" — a persisted `turns` row with no memory sync still loses
+    /// the interrupted segment from what the NEXT turn's context sees.
+    #[derive(Clone, Default)]
+    struct RecordingMemoryProvider(std::sync::Arc<Mutex<Vec<(String, String)>>>);
+
+    impl RecordingMemoryProvider {
+        fn calls(&self) -> Vec<(String, String)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl newt_core::MemoryProvider for RecordingMemoryProvider {
+        fn name(&self) -> &str {
+            "recording_memory_provider"
+        }
+        fn build_messages(
+            &self,
+            _system_prompt: &str,
+            _new_task: &str,
+        ) -> Vec<newt_core::MemMessage> {
+            Vec::new()
+        }
+        async fn sync_turn(
+            &mut self,
+            user: &str,
+            assistant: &str,
+            _metrics: &newt_core::TurnMetrics,
+        ) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((user.to_string(), assistant.to_string()));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelled_turn_persists_a_row_and_outcome_with_real_partial_usage() {
+        let mut f = fixture("conv-cancel-test");
+        // Anti-vacuous half: nothing is there before the call — the assertions
+        // below are about what THIS call produced, not ambient state.
+        assert!(
+            !f.store.exists(&f.conversation_id).unwrap(),
+            "the conversation must not exist before the interrupted turn is persisted"
+        );
+
+        let memory_calls = RecordingMemoryProvider::default();
+        f.memory.add_provider(memory_calls.clone());
+
+        let tool_events = vec![a_tool_event()];
+        let real_usage = newt_core::TokenUsage {
+            input_tokens: 12_345,
+            output_tokens: 678,
+        };
+        let rt = tokio::runtime::Handle::current();
+
+        persist_incomplete_turn(
+            Some(&f.store),
+            &f.conversation_id,
+            None,
+            "continue",
+            "partial streamed answer before the interrupt",
+            &tool_events,
+            &[],
+            Some(real_usage),
+            0,
+            newt_core::TurnEndReason::Cancelled,
+            std::time::Duration::from_millis(4200),
+            "test-model",
+            "http://test-endpoint",
+            &f.pricing,
+            &mut f.memory,
+            &f.scratchpad_store,
+            &f.step_ledger,
+            Some(&f.sink as &dyn newt_core::agentic::PromptArtifactSink),
+            Some(&f.turn),
+            None,
+            &rt,
+            false,
+            false,
+        );
+
+        let record = f.store.load(&f.conversation_id).unwrap();
+        assert_eq!(
+            record.turns.len(),
+            1,
+            "exactly one turns row — not zero (the #1963 bug) and not two (a double write)"
+        );
+        let saved = &record.turns[0];
+        assert_eq!(
+            saved.assistant,
+            "partial streamed answer before the interrupt"
+        );
+        assert_eq!(
+            saved.tokens_in,
+            Some(12_345),
+            "real accumulated usage, not NULL"
+        );
+        assert_eq!(saved.tokens_out, Some(678));
+        assert_eq!(
+            saved.events.len(),
+            1,
+            "the real tool-event ledger, not dropped"
+        );
+        assert_eq!(saved.events[0].tool, "read_file");
+
+        let artifacts = f.sink.artifacts();
+        let outcome = artifacts
+            .iter()
+            .find(|a| a.kind() == newt_core::ArtifactKind::TurnOutcome)
+            .expect("a turn_outcome artifact must be recorded for a cancelled turn");
+        assert_eq!(outcome.metadata()["end_reason"], "cancelled");
+        assert_eq!(outcome.metadata()["usage"]["input_tokens"], 12_345);
+        assert_eq!(outcome.metadata()["usage"]["output_tokens"], 678);
+
+        let synced = memory_calls.calls();
+        assert_eq!(
+            synced.len(),
+            1,
+            "memory.sync_all must run on the cancel path too — it used to be Ok-only, \
+             which lost the interrupted segment from resume context, not just forensics"
+        );
+        assert_eq!(synced[0].1, "partial streamed answer before the interrupt");
+    }
+
+    /// Anti-fabrication twin: a genuine backend error has no accumulated-usage
+    /// channel back to the caller (unlike a cancel, which usually does — see
+    /// the sibling test). `None` must reach the artifact as JSON `null`, never
+    /// a manufactured `0` — a persisted zero would poison the tuner (#1967).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_turn_persists_with_null_usage_never_a_fabricated_zero() {
+        let mut f = fixture("conv-err-test");
+        let tool_events = vec![a_tool_event(), a_tool_event()];
+        let rt = tokio::runtime::Handle::current();
+
+        persist_incomplete_turn(
+            Some(&f.store),
+            &f.conversation_id,
+            None,
+            "continue",
+            "",
+            &tool_events,
+            &[],
+            None,
+            0,
+            newt_core::TurnEndReason::Failed,
+            std::time::Duration::from_millis(900),
+            "test-model",
+            "http://test-endpoint",
+            &f.pricing,
+            &mut f.memory,
+            &f.scratchpad_store,
+            &f.step_ledger,
+            Some(&f.sink as &dyn newt_core::agentic::PromptArtifactSink),
+            Some(&f.turn),
+            None,
+            &rt,
+            false,
+            false,
+        );
+
+        let record = f.store.load(&f.conversation_id).unwrap();
+        assert_eq!(record.turns.len(), 1);
+        let saved = &record.turns[0];
+        assert_eq!(
+            saved.tokens_in, None,
+            "no fabricated usage on a genuine error"
+        );
+        assert_eq!(saved.tokens_out, None);
+        assert_eq!(
+            saved.events.len(),
+            2,
+            "the real tool-event ledger survives the failure"
+        );
+
+        let artifacts = f.sink.artifacts();
+        let outcome = artifacts
+            .iter()
+            .find(|a| a.kind() == newt_core::ArtifactKind::TurnOutcome)
+            .expect("a turn_outcome artifact must be recorded for a failed turn too");
+        assert_eq!(outcome.metadata()["end_reason"], "failed");
+        assert_eq!(
+            outcome.metadata()["usage"],
+            serde_json::Value::Null,
+            "NULL usage is the honest value for an unrecoverable error, not 0"
         );
     }
 }

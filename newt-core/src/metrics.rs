@@ -40,7 +40,7 @@ impl TokenUsage {
 /// completion — even under `NEWT_DEBUG` (the 2026-07-08 ornith:35b
 /// forensics could not tell "cap exhausted" from "classifier missed" from
 /// disk). `None` on paths that do not report it (headless callers, the
-/// Responses-API loop, operator cancels).
+/// Responses-API loop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnEndReason {
@@ -56,6 +56,18 @@ pub enum TurnEndReason {
     RoundCap,
     /// The model produced no usable content (placeholder/diagnostic reply).
     Empty,
+    /// #1963: the operator interrupted the turn (Esc / Ctrl-C) before it
+    /// reached a normal completion. Distinct from `Empty`: the reply may be
+    /// entirely absent, a partial stream the operator already saw, or (via
+    /// the loop's own interrupt checkpoints) real accumulated usage — this
+    /// tells a resumed conversation and a forensic reader that the turn was
+    /// abandoned, not that the model produced nothing.
+    Cancelled,
+    /// #1963: the turn ended in a backend/loop error rather than a
+    /// completion or an operator interrupt. The error text itself is not
+    /// carried here (it is already printed to the session); this exists so
+    /// the turn is still findable and distinguishable from `Completed`.
+    Failed,
 }
 
 /// Full telemetry record for one inference turn.
@@ -152,6 +164,8 @@ impl TurnMetrics {
             }
             Some(TurnEndReason::RoundCap) => format!("{base} · round cap"),
             Some(TurnEndReason::Empty) => format!("{base} · ⚠ empty response"),
+            Some(TurnEndReason::Cancelled) => format!("{base} · ⊘ interrupted"),
+            Some(TurnEndReason::Failed) => format!("{base} · ✗ failed"),
             Some(TurnEndReason::Completed) | None => base,
         }
     }
