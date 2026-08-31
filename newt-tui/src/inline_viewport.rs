@@ -114,6 +114,25 @@ pub(crate) struct AnchoredBackend<W: Write> {
 
 impl<W: Write> AnchoredBackend<W> {
     /// Query-only: answers "where is the cursor?" and never paints a viewport.
+    ///
+    /// **`#[cfg(unix)]` to match its only caller**, exactly as
+    /// [`cursor_position_or_anchor`] below is and for the same stated reason.
+    /// That caller is the cockpit presenter's, and the live cockpit is unix-only
+    /// by construction (`openpty`/`dup2`/termios), so on Windows this function
+    /// has nobody to serve and `-D warnings` correctly calls it dead.
+    ///
+    /// **This is not the lease-taking path, and Windows is not losing a
+    /// viewport.** Inline surfaces reach [`Self::with_lease`] through
+    /// [`inline_terminal`], which is ungated — `config_panel`, `rich_input`
+    /// and `interaction_view` are `rich-tui`-gated only. What is absent on
+    /// Windows is the *cockpit*, not the rescue and not the lease.
+    ///
+    /// An `#[allow(dead_code)]` would have been the smaller edit and the wrong
+    /// one: it says "trust me" and stays silent forever, whereas the cfg names
+    /// which caller justifies the function and becomes a compile error in the
+    /// same commit that gives Windows a cockpit. The boundary should break when
+    /// it drifts.
+    #[cfg(unix)]
     pub(crate) fn new(writer: W) -> Self {
         Self::with_lease(writer, None)
     }
