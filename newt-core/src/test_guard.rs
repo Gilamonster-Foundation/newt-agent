@@ -71,6 +71,7 @@ const ENV_KEYS: &[&str] = &[
     "NEWT_PROVIDER",
     "NEWT_DGX_MODEL",
     "NEWT_OPENAI_API",
+    crate::settings_receipt::RECEIPT_PATH_ENV,
 ];
 
 /// Exclusive access to the process-global operator settings for the duration of a
@@ -91,13 +92,21 @@ pub struct GlobalSettingsGuard {
 
 impl GlobalSettingsGuard {
     /// Acquire the guard, snapshotting the current settings.
+    ///
+    /// It also turns the settings-receipt journal OFF for the duration. A
+    /// setting change is now a durable write (#1981), so a test that flips a
+    /// dial would append to the developer's real `~/.newt/receipts.jsonl` —
+    /// which it did, once, before this line existed. A test that wants to
+    /// inspect the journal points [`crate::settings_receipt::RECEIPT_PATH_ENV`]
+    /// at its own file; the default is silence.
     #[must_use]
     pub fn acquire() -> Self {
         let lock = crate::process_env::lock();
-        let env = ENV_KEYS
+        let env: Vec<(&'static str, Option<String>)> = ENV_KEYS
             .iter()
             .map(|k| (*k, std::env::var(k).ok()))
             .collect();
+        crate::process_env::set_var(crate::settings_receipt::RECEIPT_PATH_ENV, "");
         Self {
             _lock: lock,
             cognition: Some(crate::cognition::snapshot_runtime_state()),

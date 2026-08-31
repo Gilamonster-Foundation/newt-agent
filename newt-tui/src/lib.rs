@@ -55,6 +55,11 @@ mod prompt;
 /// needs a real terminal to observe a terminal property. See the module docs.
 #[cfg(all(test, unix))]
 mod prompt_visibility_test;
+/// #1981: the ONE list of top-level slash commands. Three lists knew this
+/// before and none agreed; see the module doc.
+/// #1981: `/settings` — the typed form the knob verbs are absorbed into.
+mod settings_form;
+mod slash_registry;
 #[cfg(feature = "live-spill")]
 mod spill_view;
 /// #1669 PR-A — the staged tab switch and the one tab-action handler, against
@@ -12643,14 +12648,23 @@ fn dispatch_slash(
         "models" | "probe" | "model" | "backend" | "backends" | "summarizer" | "dgx" => {
             commands::model::dispatch(cmd, arg1, arg2, color, verbose)
         }
+        // #1981: the typed settings form. Absorbs the knob verbs; every route
+        // — form, deep link, deprecated verb — lands on `settings_form::apply`.
+        "settings" => {
+            let ask = |interaction: &newt_core::interaction_surface::SurfaceInteraction| {
+                let window = newt_core::tty::Terminal::suspend_for_prompt();
+                crate::permissions::present_on_terminal(&window, interaction)
+            };
+            let rest = format!("{arg1} {arg2}");
+            for line in settings_form::run(&ask, rest.trim()) {
+                print_newt(&line, color, verbose);
+            }
+            Ok(true)
+        }
         "crew" => commands::crew::dispatch(arg1, arg2, color, verbose),
         "setup" => commands::setup::dispatch(arg1, color, verbose),
         other => {
-            print_newt(
-                &format!("unknown command: /{other}  (try /help)"),
-                color,
-                verbose,
-            );
+            print_newt(&slash_registry::fallthrough_message(other), color, verbose);
             Ok(true)
         }
     }
