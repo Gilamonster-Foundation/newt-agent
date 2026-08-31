@@ -2254,7 +2254,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // #867 Part A: ledger of REAL workspace paths surfaced by tool results,
     // collected as the rounds happen so it survives the cap-exit trim.
     let mut observed_paths = claim_check::ObservedPaths::default();
-    let observed_resolver = claim_check::workspace_resolver(workspace);
+    let mut observed_resolver = claim_check::workspace_resolver(workspace);
     // #1214: HEAD at turn start — the ground truth "did THIS turn actually
     // commit anything" compares against at cap-exit.
     let turn_start_head = claim_check::git_head(workspace);
@@ -3255,7 +3255,16 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     if let Some(slot) = &mut end_reason {
                         **slot = Some(crate::TurnEndReason::Empty);
                     }
+                    return Ok((probe_content, false, accumulated_usage, hallucination_count));
                 }
+                // #1964: this normal (non-cap) finish gets the same claim
+                // check + disclosure gate as a cap-exit summary.
+                let probe_content = finalize_final_text(
+                    probe_content,
+                    workspace,
+                    turn_start_head.as_deref(),
+                    disclosure,
+                );
                 return Ok((probe_content, false, accumulated_usage, hallucination_count));
             }
             // Cargo-style reasoning spinner: TTY-gated (`color`) and opt-out via
@@ -3311,7 +3320,16 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         if let Some(slot) = &mut end_reason {
                             **slot = Some(crate::TurnEndReason::Empty);
                         }
+                        return Ok((probe_content, false, accumulated_usage, hallucination_count));
                     }
+                    // #1964: this normal (non-cap) finish gets the same claim
+                    // check + disclosure gate as a cap-exit summary.
+                    let probe_content = finalize_final_text(
+                        probe_content,
+                        workspace,
+                        turn_start_head.as_deref(),
+                        disclosure,
+                    );
                     return Ok((probe_content, false, accumulated_usage, hallucination_count));
                 }
             };
@@ -3559,6 +3577,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     truncation_suspect,
                     round_est_raw,
                 );
+                // #1964: this normal (non-cap) finish gets the same claim
+                // check + disclosure gate as a cap-exit summary.
+                let probe_content = finalize_final_text(
+                    probe_content,
+                    workspace,
+                    turn_start_head.as_deref(),
+                    disclosure,
+                );
                 return Ok((
                     probe_content,
                     false,
@@ -3583,6 +3609,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 truncation_suspect,
                 round_est_raw,
             );
+            // #1964: this normal (non-cap) finish gets the same claim check
+            // + disclosure gate as a cap-exit summary.
+            let streamed =
+                finalize_final_text(streamed, workspace, turn_start_head.as_deref(), disclosure);
             return Ok((
                 streamed,
                 true,
@@ -3861,7 +3891,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             }
             // #867 Part A: ledger the verified paths this result surfaced
             // BEFORE the offload may spill the text out of the transcript.
-            observed_paths.record(&result, &observed_resolver);
+            observed_paths.record(&result, &mut observed_resolver);
             messages.push(serde_json::json!({
                 "role": "tool",
                 // Step 26.3 (#584): offload an oversized result (redact → spill →
@@ -3912,7 +3942,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         },
     )
     .await?;
-    let text = finalize_cap_exit_text(text, workspace, turn_start_head.as_deref(), disclosure);
+    let text = finalize_final_text(text, workspace, turn_start_head.as_deref(), disclosure);
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }
@@ -5379,10 +5409,15 @@ fn cap_exit_model_reply(
     }
 }
 
-/// Apply the same evidence and disclosure gates to every provider's cap-exit
-/// handoff. The Responses wire used to bypass all three checks even though the
-/// shared summary prompt promised the workspace would be verified.
-fn finalize_cap_exit_text(
+/// Apply the same evidence and disclosure gates to every provider's FINAL
+/// answer for a turn — cap-exit handoff AND normal (no-tool) finish alike
+/// (#1964: this used to run only on the cap-exit path, so a normal finish —
+/// including a fabricated "verified working" report — returned unannotated).
+/// The Responses wire used to bypass all three checks on cap-exit even
+/// though the shared summary prompt promised the workspace would be
+/// verified; the same promise holds for any final answer, not just one
+/// forced out by the round cap.
+fn finalize_final_text(
     text: String,
     workspace: &str,
     turn_start_head: Option<&str>,
@@ -6055,7 +6090,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 
     // #867 Part A: observed-paths ledger (matches the Ollama path).
     let mut observed_paths = claim_check::ObservedPaths::default();
-    let observed_resolver = claim_check::workspace_resolver(workspace);
+    let mut observed_resolver = claim_check::workspace_resolver(workspace);
     // #1214: HEAD at turn start (mirror of the Ollama path).
     let turn_start_head = claim_check::git_head(workspace);
 
@@ -7036,11 +7071,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if let Some(slot) = &mut end_reason {
                 **slot = Some(accepted_reason);
             }
-            let out = if content.is_empty() {
-                "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string()
-            } else {
-                content
-            };
+            if content.is_empty() {
+                let out = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string();
+                return Ok((out, false, accumulated_usage, hallucination_count));
+            }
+            // #1964: this normal (non-cap) finish gets the same claim check
+            // + disclosure gate as a cap-exit summary.
+            let out =
+                finalize_final_text(content, workspace, turn_start_head.as_deref(), disclosure);
             return Ok((out, false, accumulated_usage, hallucination_count));
         }
 
@@ -7352,7 +7390,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 }
             }
             // #867 Part A: ledger verified paths (see the Ollama path).
-            observed_paths.record(&result, &observed_resolver);
+            observed_paths.record(&result, &mut observed_resolver);
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": id,
@@ -7398,7 +7436,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         },
     )
     .await?;
-    let text = finalize_cap_exit_text(text, workspace, turn_start_head.as_deref(), disclosure);
+    let text = finalize_final_text(text, workspace, turn_start_head.as_deref(), disclosure);
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }
@@ -8119,7 +8157,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
 
     // #867 Part A: observed-paths ledger (mirrors the OpenAI path).
     let mut observed_paths = claim_check::ObservedPaths::default();
-    let observed_resolver = claim_check::workspace_resolver(workspace);
+    let mut observed_resolver = claim_check::workspace_resolver(workspace);
     // #1214: HEAD at turn start (mirrors the OpenAI path).
     let turn_start_head = claim_check::git_head(workspace);
 
@@ -8595,11 +8633,18 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 **slot = Some(crate::TurnEndReason::Completed);
             }
             let streamed = printed_live && !model_reply.text.is_empty();
-            let out = if model_reply.text.is_empty() {
-                "the model declined this request (refusal)".to_string()
-            } else {
-                model_reply.text.clone()
-            };
+            if model_reply.text.is_empty() {
+                let out = "the model declined this request (refusal)".to_string();
+                return Ok((out, streamed, accumulated_usage, hallucination_count));
+            }
+            // #1964: this normal (non-cap) finish gets the same claim check
+            // + disclosure gate as a cap-exit summary.
+            let out = finalize_final_text(
+                model_reply.text.clone(),
+                workspace,
+                turn_start_head.as_deref(),
+                disclosure,
+            );
             return Ok((out, streamed, accumulated_usage, hallucination_count));
         }
 
@@ -9005,11 +9050,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // The streamed flag is true iff THIS round's SSE already printed
             // the accepted text live (so the TUI doesn't re-print).
             let streamed = printed_live && !content.is_empty();
-            let out = if content.is_empty() {
-                "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string()
-            } else {
-                content
-            };
+            if content.is_empty() {
+                let out = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string();
+                return Ok((out, streamed, accumulated_usage, hallucination_count));
+            }
+            // #1964: this normal (non-cap) finish gets the same claim check
+            // + disclosure gate as a cap-exit summary.
+            let out =
+                finalize_final_text(content, workspace, turn_start_head.as_deref(), disclosure);
             return Ok((out, streamed, accumulated_usage, hallucination_count));
         }
 
@@ -9296,7 +9344,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 }
             }
             // #867 Part A: ledger verified paths (mirrors the OpenAI path).
-            observed_paths.record(&result, &observed_resolver);
+            observed_paths.record(&result, &mut observed_resolver);
             // The tool result stays `role:"tool"` in the internal shape;
             // `anthropic_wire_messages` folds each consecutive run into ONE
             // user message of tool_result blocks (`tool_use_id` = this id)
@@ -9345,7 +9393,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         },
     )
     .await?;
-    let text = finalize_cap_exit_text(text, workspace, turn_start_head.as_deref(), disclosure);
+    let text = finalize_final_text(text, workspace, turn_start_head.as_deref(), disclosure);
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }
@@ -9804,7 +9852,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // Keep the same cap-exit evidence ledger as the three chat-shaped wires.
     // It must record before result offload/compaction removes the source text.
     let mut observed_paths = claim_check::ObservedPaths::default();
-    let observed_resolver = claim_check::workspace_resolver(workspace);
+    let mut observed_resolver = claim_check::workspace_resolver(workspace);
     let turn_start_head = claim_check::git_head(workspace);
 
     let reasoning = responses_reasoning_field(cognition);
@@ -10045,12 +10093,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             Ok(d) => d,
             Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage }) => {
                 accumulated_usage = merge_round_usage(accumulated_usage, usage);
-                return Ok((
+                // #1964: this normal (non-cap) finish gets the same claim
+                // check + disclosure gate as a cap-exit summary.
+                let out = finalize_final_text(
                     format!("(the model refused the request) {message}"),
-                    false,
-                    accumulated_usage,
-                    hallucination_count,
-                ));
+                    workspace,
+                    turn_start_head.as_deref(),
+                    disclosure,
+                );
+                return Ok((out, false, accumulated_usage, hallucination_count));
             }
             Err(e) => return Err(anyhow::anyhow!("Responses turn not usable: {e}")),
         };
@@ -10097,6 +10148,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             }
             // The decoder guarantees affirmative output here (text or calls); with
             // no calls, `text` is non-empty — return it as the turn's answer.
+            // #1964: this normal (non-cap) finish gets the same claim check
+            // + disclosure gate as a cap-exit summary.
+            let text = finalize_final_text(text, workspace, turn_start_head.as_deref(), disclosure);
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
 
@@ -10367,7 +10421,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     });
                 }
             }
-            observed_paths.record(&result, &observed_resolver);
+            observed_paths.record(&result, &mut observed_resolver);
             input.push(serde_json::json!({
                 "type": "function_call_output",
                 "call_id": call_id,
@@ -10457,7 +10511,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 error = %error,
                 "Responses cap-exit summary validation failed; returning captured progress"
             );
-            let text = finalize_cap_exit_text(
+            let text = finalize_final_text(
                 cap_exit_fallback(
                     max_tool_rounds,
                     cap_accumulated,
@@ -10488,7 +10542,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     error = %error,
                     "Responses cap-exit summary dispatch failed; returning captured progress"
                 );
-                let text = finalize_cap_exit_text(
+                let text = finalize_final_text(
                     cap_exit_fallback(
                         max_tool_rounds,
                         cap_accumulated,
@@ -10520,8 +10574,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 false,
                 progress.as_deref(),
             );
-            let text =
-                finalize_cap_exit_text(text, workspace, turn_start_head.as_deref(), disclosure);
+            let text = finalize_final_text(text, workspace, turn_start_head.as_deref(), disclosure);
             if let Some(slot) = &mut end_reason {
                 **slot = Some(crate::TurnEndReason::RoundCap);
             }
@@ -10532,7 +10585,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 error = %error,
                 "Responses cap-exit summary decode failed; returning captured progress"
             );
-            let text = finalize_cap_exit_text(
+            let text = finalize_final_text(
                 cap_exit_fallback(
                     max_tool_rounds,
                     cap_accumulated,
@@ -10556,7 +10609,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         &decoded.text,
         progress.as_deref(),
     );
-    let text = finalize_cap_exit_text(text, workspace, turn_start_head.as_deref(), disclosure);
+    let text = finalize_final_text(text, workspace, turn_start_head.as_deref(), disclosure);
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }

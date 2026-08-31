@@ -13,12 +13,13 @@
 //! sees exactly what the model said plus what did not check out.
 //!
 //! Pure by construction: extraction is string processing and existence is an
-//! injected `Fn(&str) -> bool` seam, so the unit tier stays fully mocked.
-//! Only the [`annotate_against_workspace`] wiring (called from the two
-//! cap-exit sites in `mod.rs`) touches the real filesystem — and it never
-//! probes outside the workspace root: the fs fence applies to the checker
-//! too, so an absolute or `..`-escaping claim is reported as not-found
-//! rather than stat'd.
+//! injected `FnMut(&str) -> bool` seam, so the unit tier stays fully mocked.
+//! Only the [`annotate_against_workspace`] wiring (called from every final
+//! (no-tool-call) answer a turn produces — cap-exit summary and normal
+//! finish alike, #1964) touches the real filesystem — and it never probes
+//! outside the workspace root: the fs fence applies to the checker too, so
+//! an absolute or `..`-escaping claim is reported as not-found rather than
+//! stat'd.
 
 /// Path-like tokens in assistant prose — the same recognition rule as the
 /// crew planner's claim check (`newt-cli/src/crew.rs::path_tokens`): a token
@@ -56,7 +57,10 @@ pub(crate) fn path_claims(text: &str) -> Vec<String> {
 }
 
 /// The subset of [`path_claims`] that `exists` refutes, in citation order.
-pub(crate) fn missing_claims(text: &str, exists: impl Fn(&str) -> bool) -> Vec<String> {
+/// `exists` is `FnMut` (not `Fn`): [`workspace_resolver`] learns a new base
+/// directory each time a claim verifies, so a later claim in the same text
+/// can resolve under an earlier one's directory (#1970).
+pub(crate) fn missing_claims(text: &str, mut exists: impl FnMut(&str) -> bool) -> Vec<String> {
     path_claims(text)
         .into_iter()
         .filter(|c| !exists(c))
@@ -71,7 +75,7 @@ const LISTED_CLAIMS: usize = 8;
 /// resolve; return `text` unchanged (no annotation, no trailing noise) when
 /// every claim checks out or there are no claims at all. The original prose
 /// is always preserved as an exact prefix — the check labels, never rewrites.
-pub(crate) fn annotate_missing_claims(text: String, exists: impl Fn(&str) -> bool) -> String {
+pub(crate) fn annotate_missing_claims(text: String, exists: impl FnMut(&str) -> bool) -> String {
     let missing = missing_claims(&text, exists);
     if missing.is_empty() {
         return text;
@@ -94,28 +98,54 @@ pub(crate) fn annotate_missing_claims(text: String, exists: impl Fn(&str) -> boo
     )
 }
 
+/// Bound on learned extra bases (below), mirroring [`OBSERVED_CAP`]'s reasoning:
+/// a pathological turn must not make the resolver scan unboundedly.
+const EXTRA_BASES_CAP: usize = 40;
+
 /// The REAL-filesystem claim resolver for `workspace`: a claim resolves when
-/// its lexically-normalized absolute form stays inside the workspace AND
-/// exists on disk. Claims that normalize outside the root (absolute paths
+/// its lexically-normalized absolute form, joined either to the workspace
+/// root OR to a "learned" extra base, stays inside the workspace AND exists
+/// on disk. Claims that normalize outside the root (absolute paths
 /// elsewhere, `..` escapes) are refuted without ever being stat'd — the
 /// checker honors the same workspace fence as the fs tools. Shared by the
 /// cap-exit annotation and the [`ObservedPaths`] ledger.
-pub(crate) fn workspace_resolver(workspace: &str) -> impl Fn(&str) -> bool {
+///
+/// #1970: a bare relative fragment (`src/lib.rs`) cited alongside an earlier
+/// claim that verified under a subdirectory (`agent-voice/agent-voice-tts/Cargo.toml`)
+/// was refuted, even though the intended referent
+/// (`agent-voice/agent-voice-tts/src/lib.rs`) exists — the resolver only
+/// ever tried the workspace root. Every claim this closure verifies now
+/// learns its parent directory as an extra base for claims checked *after*
+/// it (citation order, capped at [`EXTRA_BASES_CAP`]), so a later bare
+/// fragment resolves under the directory an earlier, fully-qualified claim
+/// in the same text already established. A hit under more than one base is
+/// still a verify, never a refutation — this checks existence, not identity.
+pub(crate) fn workspace_resolver(workspace: &str) -> impl FnMut(&str) -> bool {
     let root = super::lexical_normalize(std::path::Path::new(workspace));
+    let mut extra_bases: Vec<std::path::PathBuf> = Vec::new();
     move |claim: &str| {
         let p = std::path::Path::new(claim);
-        let abs = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            root.join(p)
-        };
-        let norm = super::lexical_normalize(&abs);
-        norm.starts_with(&root) && norm.exists()
+        if p.is_absolute() {
+            let norm = super::lexical_normalize(p);
+            return norm.starts_with(&root) && norm.exists();
+        }
+        for base in std::iter::once(&root).chain(extra_bases.iter()) {
+            let norm = super::lexical_normalize(&base.join(p));
+            if norm.starts_with(&root) && norm.exists() {
+                if let Some(parent) = norm.parent().map(std::path::Path::to_path_buf) {
+                    if extra_bases.len() < EXTRA_BASES_CAP && !extra_bases.contains(&parent) {
+                        extra_bases.push(parent);
+                    }
+                }
+                return true;
+            }
+        }
+        false
     }
 }
 
-/// Cap-exit wiring: annotate `text` against the REAL workspace tree via
-/// [`workspace_resolver`].
+/// Final-answer wiring (cap-exit AND normal finish): annotate `text` against
+/// the REAL workspace tree via [`workspace_resolver`].
 pub(crate) fn annotate_against_workspace(text: String, workspace: &str) -> String {
     annotate_missing_claims(text, workspace_resolver(workspace))
 }
@@ -143,7 +173,7 @@ pub(crate) struct ObservedPaths {
 impl ObservedPaths {
     /// Record every claim in `text` that `exists` verifies, skipping
     /// duplicates; a no-op once the cap is reached.
-    pub(crate) fn record(&mut self, text: &str, exists: impl Fn(&str) -> bool) {
+    pub(crate) fn record(&mut self, text: &str, mut exists: impl FnMut(&str) -> bool) {
         for claim in path_claims(text) {
             if self.ordered.len() >= OBSERVED_CAP {
                 return;
@@ -513,5 +543,55 @@ mod tests {
             bad.contains("`/etc/hosts.d/y.rs`"),
             "outside refuted: {bad}"
         );
+    }
+
+    /// #1970 regression, reproduced against this repo's own workspace root
+    /// (the parent of `CARGO_MANIFEST_DIR`, which contains sibling crates —
+    /// the same shape as the reported bug's `agent-voice/agent-voice-tts/`
+    /// subproject under `Gilamonster-Foundation`): `newt-core/Cargo.toml`
+    /// verifies directly at root and its directory is learned; the bare
+    /// fragment `src/lib.rs` cited right after it must now resolve there
+    /// too, instead of being refuted as absent at the workspace root.
+    #[test]
+    fn bare_fragment_resolves_under_an_earlier_verified_claims_directory() {
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("newt-core has a workspace root parent");
+        let ws = ws.to_str().expect("workspace root is valid UTF-8");
+        let text = "see newt-core/Cargo.toml and also src/lib.rs".to_string();
+        let out = annotate_against_workspace(text.clone(), ws);
+        assert_eq!(out, text, "both claims verify, no annotation: {out}");
+    }
+
+    /// Twin of the above: a fragment that is genuinely absent everywhere —
+    /// root and every learned base — still refutes. A false positive would
+    /// be worse than the false refutation this fix closes (#1970's own
+    /// framing: it "teaches operators to ignore refutations").
+    #[test]
+    fn a_genuinely_absent_fragment_still_refutes_even_with_a_learned_base() {
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("newt-core has a workspace root parent");
+        let ws = ws.to_str().expect("workspace root is valid UTF-8");
+        let text = "see newt-core/Cargo.toml and also nope/nope.rs".to_string();
+        let out = annotate_against_workspace(text, ws);
+        assert!(out.contains("⚠ claim check (#867)"), "got: {out}");
+        assert!(out.contains("`nope/nope.rs`"), "got: {out}");
+    }
+
+    /// A claim resolving under more than one base (root AND a learned base)
+    /// is still a verify — ambiguity is never treated as a refutation.
+    #[test]
+    fn a_claim_resolvable_under_multiple_bases_still_verifies() {
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("newt-core has a workspace root parent");
+        let ws = ws.to_str().expect("workspace root is valid UTF-8");
+        // `newt-core/Cargo.toml` verifies at root and learns `newt-core/` as
+        // a base; `Cargo.toml` alone then resolves at BOTH the root (the
+        // workspace's own Cargo.toml) and the learned `newt-core/` base.
+        let text = "see newt-core/Cargo.toml and also Cargo.toml".to_string();
+        let out = annotate_against_workspace(text.clone(), ws);
+        assert_eq!(out, text, "ambiguous-but-real is still a verify: {out}");
     }
 }
