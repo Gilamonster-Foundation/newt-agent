@@ -18,15 +18,21 @@
 //! only. RegionLease (#1986) has landed and a leased inline panel is a later
 //! upgrade; a chooser you drive blind is not a consolidation.
 //!
-//! # One mutation path, which is the point (#1965)
+//! # One mutation path, and now one receipt (#1965)
 //!
-//! [`apply`] is the only place a setting changes, and every route reaches it:
-//! the form, a deep link (`/settings edit-mode vi`), and the deprecated verbs
-//! (`/vi`). That is what makes the receipt tractable — one site to instrument
-//! instead of one per verb. Slash commands reach no receipt path today, which
-//! is how a round-cap escalation to unlimited left no durable record; the
-//! registry counts 33 such commands and this is the first to have a single
-//! chokepoint where that can be fixed.
+//! [`apply`] is the only place a setting changes, and it is PRIVATE.
+//! [`apply_and_record`] is the only way to reach it: the form, a deep link
+//! (`/settings edit-mode vi`), the deprecated verbs (`/vi`), the dial setters
+//! (`/psyche tenacity`) and `/psyche obsessive` all go through it, and each
+//! one writes a content-addressed `newt_core::settings_receipt` line.
+//!
+//! That privacy is the design. Slash commands reached no receipt path at all —
+//! thirty-four commands mutating session state with nothing durable behind
+//! them, which is how a round-cap escalation to effectively unlimited left no
+//! record in config, receipts, turns or artifacts. Collapsing the knob verbs
+//! into one chokepoint is what turned "instrument thirty-four call sites" into
+//! "instrument one", and making the mutation unreachable without the recorder
+//! is what stops the thirty-fifth from reintroducing the gap.
 //!
 //! # The deprecated verbs still work
 //!
@@ -36,6 +42,7 @@
 //! arm in place is what keeps "one mutation path" true rather than aspirational.
 
 use newt_core::interaction_surface::SurfaceInteraction;
+use newt_core::settings_receipt::SettingChange;
 use newt_core::HumanQuestionOutcome;
 use newt_interaction::InteractionDefinition;
 
@@ -259,15 +266,15 @@ pub(crate) fn value_menu(field: Field) -> InteractionDefinition {
 /// **THE ONE MUTATION PATH.** Every route — the form, a deep link, a
 /// deprecated verb, `/psyche tenacity`, `/psyche obsessive` — lands here.
 ///
-/// This is the site a provenance receipt attaches to (#1965). It does not
-/// write one yet, and that is the honest state: collapsing the knob verbs to
-/// one chokepoint is what makes instrumenting them a single change rather than
-/// one per verb.
+/// **Private on purpose.** The receipt attaches in [`apply_and_record`], and a
+/// caller that could reach the write without it would be the #1965 gap with
+/// extra steps. The module's own tests call this directly, because what they
+/// are checking is the mutation, not the record.
 ///
 /// The `#1668` posture marks are made HERE, beside the write, for the same
 /// reason: a caller that sets the dial and forgets to mark the axis leaves the
 /// conversation's operator pin stale, and there is now exactly one caller.
-pub(crate) fn apply(field: Field, value: &str) -> Result<String, String> {
+fn apply(field: Field, value: &str) -> Result<String, String> {
     use newt_core::cognition::{set_cli_cognition, CognitionOverride};
     use newt_core::role_profile::Cognition;
     use newt_core::runtime::{mark_cognition_choice, mark_tenacity_choice};
@@ -325,6 +332,52 @@ pub(crate) fn apply(field: Field, value: &str) -> Result<String, String> {
     Ok(format!("{}: {value}", field.label()))
 }
 
+/// The change a transition is recorded as, or `None` when the registry
+/// declares no destination for this setting.
+///
+/// **This is the production reader of the registry's receipt column.** The
+/// decision is data, not a call site's memory: a field is receipted because
+/// `slash_registry` says where its receipt lands. A `Receipt::Missing` field
+/// writes nothing and stays counted in the #1965 debt, which is the honest
+/// answer — a receipt sent to a destination nobody declared looks like
+/// coverage without being any.
+///
+/// Pure, so the whole decision is exercised with no filesystem: the write
+/// itself belongs to `settings_receipt::record`.
+fn change_for(field: Field, from: &str, to: &str, via: &str) -> Option<SettingChange> {
+    match crate::slash_registry::receipt_for(field.name()) {
+        crate::slash_registry::Receipt::Journal => {
+            Some(SettingChange::new(field.name(), from, to, via))
+        }
+        _ => None,
+    }
+}
+
+/// **THE ONE ROUTE OUT.** Apply a setting and durably record that it happened.
+///
+/// [`apply`] is private precisely so this cannot be bypassed: a caller that
+/// could reach the mutation without the receipt is the #1965 defect with extra
+/// steps, and there were thirty-four of those. `via` is the verb the operator
+/// actually typed — `/vi` and `/settings edit-mode` produce the same setting
+/// and two different events, and the route is the half a reader cannot
+/// reconstruct afterwards.
+///
+/// A no-op (`/vi` when already `vi`) is recorded too. The journal records what
+/// the operator DID, and "asked for vi, was already vi" is a fact about the
+/// session, not noise to be filtered by a rule nobody can see.
+///
+/// Recording is best effort by construction (`settings_receipt::record`
+/// swallows its own failures): failing to observe a change must never undo the
+/// change.
+pub(crate) fn apply_and_record(field: Field, value: &str, via: &str) -> Result<String, String> {
+    let from = field.current();
+    let message = apply(field, value)?;
+    if let Some(change) = change_for(field, &from, &field.current(), via) {
+        let _ = newt_core::settings_receipt::record(change);
+    }
+    Ok(message)
+}
+
 /// What a deprecated verb prints in addition to doing its job.
 pub(crate) fn moved_notice(verb: &str, field: Field) -> String {
     format!(
@@ -353,7 +406,7 @@ pub(crate) fn run(ask: Ask<'_>, rest: &str) -> Vec<String> {
             )];
         };
         if !second.is_empty() {
-            return vec![match apply(field, second) {
+            return vec![match apply_and_record(field, second, "/settings") {
                 Ok(msg) | Err(msg) => msg,
             }];
         }
@@ -386,7 +439,7 @@ fn ask_value(ask: Ask<'_>, field: Field) -> Vec<String> {
     let Some((value, _)) = values.get(index - 1) else {
         return vec!["settings: cancelled".to_string()];
     };
-    vec![match apply(field, value) {
+    vec![match apply_and_record(field, value, "/settings") {
         Ok(msg) | Err(msg) => msg,
     }]
 }
@@ -408,7 +461,14 @@ fn ask_choice(ask: Ask<'_>, definition: &InteractionDefinition) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use newt_core::process_env;
+
+    /// Every test that reaches [`apply_and_record`] holds this. It serializes
+    /// the process-global dials AND turns the receipt journal off, so a unit
+    /// test cannot append to the developer's real `~/.newt/receipts.jsonl` —
+    /// which it did until the guard learned about the journal.
+    fn settings_guard() -> newt_core::test_guard::GlobalSettingsGuard {
+        newt_core::test_guard::GlobalSettingsGuard::acquire()
+    }
 
     /// A scripted operator. The `Ask` seam is injected, so the whole form is
     /// exercised with no terminal, no I/O and no real prompt — the unit tier
@@ -434,7 +494,7 @@ mod tests {
     /// **Deep link: `/settings edit-mode vi` asks nothing and applies.**
     #[test]
     fn a_full_deep_link_applies_without_a_question() {
-        let _lock = process_env::lock();
+        let _g = settings_guard();
         let asked = std::cell::Cell::new(false);
         let ask = |_: &SurfaceInteraction| {
             asked.set(true);
@@ -449,7 +509,7 @@ mod tests {
     /// The two-step form: pick the field, then the value.
     #[test]
     fn the_form_walks_field_then_value() {
-        let _lock = process_env::lock();
+        let _g = settings_guard();
         // "1" selects the first field, "1" selects its first value (vi).
         let out = run(&answering(&["1", "1"]), "");
         assert_eq!(out, vec!["line-editor key bindings: vi".to_string()]);
@@ -460,7 +520,7 @@ mod tests {
     /// that applied unconditionally. Backing out changes nothing.
     #[test]
     fn cancelling_the_form_changes_no_setting() {
-        let _lock = process_env::lock();
+        let _g = settings_guard();
         let _ = apply(Field::EditMode, "nano");
         let before = Field::EditMode.current();
         let out = run(&declining(), "");
@@ -476,7 +536,7 @@ mod tests {
     /// writes nothing.
     #[test]
     fn an_unaccepted_value_is_refused_and_writes_nothing() {
-        let _lock = process_env::lock();
+        let _g = settings_guard();
         let _ = apply(Field::EditMode, "vi");
         let err = apply(Field::EditMode, "ed").expect_err("`ed` is not an edit mode");
         assert!(err.contains("vi, emacs, nano"), "{err}");
@@ -504,7 +564,7 @@ mod tests {
     /// makes them render on the plain scroller, the RichTUI and the web.
     #[test]
     fn the_menus_are_definitions_carrying_every_choice() {
-        let _lock = process_env::lock();
+        let _g = settings_guard();
         let menu = value_menu(Field::EditMode);
         let rendered = newt_core::markup::plain::render(&menu);
         for value in ["vi", "emacs", "nano"] {
@@ -524,7 +584,7 @@ mod tests {
     /// module changed. Each `current()` goes through that module's reader.
     #[test]
     fn each_field_reports_what_its_own_resolver_says() {
-        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        let _g = settings_guard();
         for (field, value) in [
             (Field::EditMode, "nano"),
             (Field::Tenacity, "insistent"),
@@ -607,11 +667,69 @@ mod tests {
     /// for the editor, now that four more fields can be refused.
     #[test]
     fn a_refused_dial_value_changes_nothing() {
-        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        let _g = settings_guard();
         apply(Field::Tenacity, "insistent").expect("a level applies");
         let err = apply(Field::Tenacity, "obsessive").expect_err("not a level");
         assert!(err.contains("relentless"), "{err}");
         assert_eq!(Field::Tenacity.current(), "insistent", "a refusal wrote");
+    }
+
+    /// **The receipt destination is read from the registry, not assumed.**
+    ///
+    /// This is the law that keeps the two files honest with each other: a
+    /// field of `/settings` whose verb the registry has not given a
+    /// destination writes nothing, and the ratchet keeps counting it. You
+    /// cannot add a knob to this form and get provenance by accident.
+    #[test]
+    fn every_field_declares_where_its_receipt_lands() {
+        use crate::slash_registry::{receipt_for, Receipt};
+        for field in Field::ALL {
+            assert_eq!(
+                receipt_for(field.name()),
+                Receipt::Journal,
+                "/settings {} has no declared receipt destination",
+                field.name()
+            );
+            assert!(change_for(*field, "a", "b", "/settings").is_some());
+        }
+        // **Anti-vacuous.** If the column read `Journal` for everything,
+        // reading it would prove nothing. `/rounds` is the #1965 command
+        // itself and is still undeclared; `/help` mutates nothing.
+        assert_eq!(receipt_for("rounds"), Receipt::Missing);
+        assert_eq!(receipt_for("help"), Receipt::None_);
+        assert_eq!(receipt_for("zzznotacommand"), Receipt::Missing);
+    }
+
+    /// The recorded change carries the transition AND the route taken — the
+    /// half of the event a reader cannot reconstruct from the resulting state.
+    #[test]
+    fn the_recorded_change_names_the_route_and_the_transition() {
+        let change = change_for(Field::EditMode, "vi", "emacs", "/vi").expect("declared");
+        assert_eq!(change.setting, "edit-mode");
+        assert_eq!(change.from, "vi");
+        assert_eq!(change.to, "emacs");
+        assert_eq!(change.via, "/vi");
+        assert_eq!(
+            change.schema,
+            newt_core::settings_receipt::SETTING_CHANGE_SCHEMA_V1
+        );
+    }
+
+    /// The recording route applies exactly what the bare mutation would.
+    ///
+    /// The guard holds the journal off, so this creates no filesystem state:
+    /// what it proves is that `apply_and_record` still performs the change,
+    /// not what the written line looks like — which
+    /// `newt_core::settings_receipt`'s own tests own.
+    #[test]
+    fn recording_does_not_change_what_gets_applied() {
+        let _g = settings_guard();
+        let recorded = apply_and_record(Field::Tenacity, "relentless", "/settings")
+            .expect("an offered value applies");
+        assert_eq!(Field::Tenacity.current(), "relentless");
+        apply(Field::Tenacity, "auto").expect("released");
+        let bare = apply(Field::Tenacity, "relentless").expect("an offered value applies");
+        assert_eq!(recorded, bare, "the recorder changed the outcome");
     }
 
     /// The deprecated verbs point at their new home and say they still work —

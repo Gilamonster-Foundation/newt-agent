@@ -60,6 +60,11 @@ pub(crate) enum Disposition {
 pub(crate) enum Receipt {
     /// Read-only: nothing to record.
     None_,
+    /// Recorded as a content-addressed `newt_core::settings_receipt` line.
+    /// `settings_form::apply_and_record` is the writer, and it reads this
+    /// column to decide — a command is receipted because the registry says
+    /// where its receipt lands, not because a call site remembered to.
+    Journal,
     /// Mutates session state and records NOTHING today — #1965.
     Missing,
 }
@@ -76,10 +81,11 @@ pub(crate) struct SlashCommand {
     /// absorbed verb's setting now lives. The exemption this carried in the
     /// previous commit is retired.
     pub(crate) disposition: Disposition,
-    /// Still ratchet-only: this is the #1965 debt, and nothing reads it until
-    /// `settings_form::apply` actually writes a receipt. The exemption is now
-    /// scoped to this ONE field, and names exactly what retires it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Read in PRODUCTION by [`receipt_for`], which is how
+    /// `settings_form::apply_and_record` decides where a change is written.
+    /// The scoped dead-code exemption this carried is retired: the column now
+    /// drives behaviour, and `Receipt::Missing` is the remaining #1965 debt
+    /// rather than the whole state of the world.
     pub(crate) receipt: Receipt,
 }
 
@@ -119,7 +125,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         &["vi", "emacs", "nano"],
         Family::Editor,
         Disposition::Absorb,
-        Receipt::Missing,
+        Receipt::Journal,
     ),
     cmd(
         "memory",
@@ -165,7 +171,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         &[],
         Family::Meta,
         Disposition::Keep,
-        Receipt::Missing,
+        Receipt::Journal,
     ),
     cmd(
         "config",
@@ -456,7 +462,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         &["psyche"],
         Family::Tuning,
         Disposition::Absorb,
-        Receipt::Missing,
+        Receipt::Journal,
     ),
     cmd(
         "detail",
@@ -491,7 +497,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         &[],
         Family::Tuning,
         Disposition::Absorb,
-        Receipt::Missing,
+        Receipt::Journal,
     ),
     cmd(
         "persona",
@@ -540,14 +546,14 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         &[],
         Family::Tuning,
         Disposition::Absorb,
-        Receipt::Missing,
+        Receipt::Journal,
     ),
     cmd(
         "thinking",
         &[],
         Family::Tuning,
         Disposition::Absorb,
-        Receipt::Missing,
+        Receipt::Journal,
     ),
 ];
 
@@ -565,6 +571,17 @@ pub(crate) fn lookup(token: &str) -> Option<&'static SlashCommand> {
     COMMANDS
         .iter()
         .find(|c| c.tokens().any(|t| t.eq_ignore_ascii_case(token)))
+}
+
+/// Where `token`'s state change is durably recorded.
+///
+/// **The production reader of the receipt column.** An unregistered token has
+/// no declared destination, which is the same answer as a registered one whose
+/// destination does not exist yet: do not write. That is deliberate — a
+/// receipt written to a destination nobody declared is worse than no receipt,
+/// because it looks like coverage.
+pub(crate) fn receipt_for(token: &str) -> Receipt {
+    lookup(token).map_or(Receipt::Missing, |c| c.receipt)
 }
 
 /// What to tell an operator whose command fell through `dispatch_slash`.
@@ -802,7 +819,7 @@ mod tests {
             .filter(|c| matches!(c.receipt, Receipt::Missing))
             .count();
         assert!(
-            missing <= 34,
+            missing <= 28,
             "{missing} state-mutating commands record nothing durable — that \
              is more than when #1981 armed this. A new state mutator needs a \
              receipt destination, not another silent write"

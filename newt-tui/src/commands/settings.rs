@@ -20,8 +20,8 @@ use crate::{current_prompt_and_preview, prompt_token_help, strip_one_quote_pair}
 /// that skips it. `Ok` and `Err` collapse to one string because a caller has
 /// nothing different to do with a refusal — the message already says what the
 /// field accepts.
-fn apply_setting(field: Field, value: &str) -> String {
-    match settings_form::apply(field, value) {
+fn apply_setting(field: Field, value: &str, via: &str) -> String {
+    match settings_form::apply_and_record(field, value, via) {
         Ok(msg) | Err(msg) => msg,
     }
 }
@@ -127,7 +127,11 @@ pub(crate) fn dispatch(
             // would make "one mutation path" aspirational rather than true.
             match want {
                 Some(m) => {
-                    print_newt(&apply_setting(Field::EditMode, m), color, verbose);
+                    print_newt(
+                        &apply_setting(Field::EditMode, m, &format!("/{cmd}")),
+                        color,
+                        verbose,
+                    );
                     print_newt(
                         &settings_form::moved_notice(cmd, Field::EditMode),
                         color,
@@ -148,7 +152,7 @@ pub(crate) fn dispatch(
         // performs every one.
         "nudge" => match arg1 {
             "off" => {
-                apply_setting(Field::Nudge, "off");
+                apply_setting(Field::Nudge, "off", "/nudge");
                 print_newt(
                     "action-pressure nudges OFF for this session (narration rescue, \
                      workflow repair steering, plan pushes) — factual corrections stay on",
@@ -157,7 +161,7 @@ pub(crate) fn dispatch(
                 );
             }
             "on" => {
-                apply_setting(Field::Nudge, "on");
+                apply_setting(Field::Nudge, "on", "/nudge");
                 print_newt("action-pressure nudges ON (default)", color, verbose);
             }
             "" | "status" => {
@@ -183,7 +187,11 @@ pub(crate) fn dispatch(
 
         // #1981: ABSORBED into `/settings thinking`.
         "thinking" => match arg1 {
-            "on" | "off" => print_newt(&apply_setting(Field::Thinking, arg1), color, verbose),
+            "on" | "off" => print_newt(
+                &apply_setting(Field::Thinking, arg1, "/thinking"),
+                color,
+                verbose,
+            ),
             _ => print_newt(
                 "usage: /settings thinking <on|off>  (or /thinking <on|off>)",
                 color,
@@ -273,7 +281,7 @@ fn tenacity_command(arg: &str) -> String {
             // #1981: the clear AND the #1668 unpin both live in
             // `settings_form::apply` now — releasing the dial is an operator
             // action, and an action that leaves no record is the #1965 defect.
-            apply_setting(Field::Tenacity, "auto");
+            apply_setting(Field::Tenacity, "auto", "/psyche tenacity");
             format!(
                 "tenacity → auto (override cleared) — now {} (from persona / config / family)",
                 effective_tenacity().label()
@@ -283,7 +291,7 @@ fn tenacity_command(arg: &str) -> String {
             Ok(level) => {
                 // Only a PARSED level reaches the mutation path — the error
                 // arm below mutates nothing and records nothing.
-                apply_setting(Field::Tenacity, level.label());
+                apply_setting(Field::Tenacity, level.label(), "/psyche tenacity");
                 let rounds = if level == Tenacity::Relentless {
                     "; default tool-round budget → effectively unlimited (an explicit `/rounds` override still wins)"
                 } else {
@@ -346,16 +354,16 @@ fn cognition_command(arg: &str) -> String {
         // owns the write AND the #1668 posture mark — including `auto`, which
         // UNPINS the axis and is just as much an operator action.
         "off" | "none" => {
-            apply_setting(Field::Cognition, "off");
+            apply_setting(Field::Cognition, "off", "/psyche cognition");
             "cognition → off — no reasoning controls will be sent".to_string()
         }
         "auto" | "reset" | "persona" => {
-            apply_setting(Field::Cognition, "auto");
+            apply_setting(Field::Cognition, "auto", "/psyche cognition");
             "cognition → auto — following the active persona".to_string()
         }
         other => match other.parse::<Cognition>() {
             Ok(level) => {
-                apply_setting(Field::Cognition, level.label());
+                apply_setting(Field::Cognition, level.label(), "/psyche cognition");
                 format!("cognition → {} — {}", level.label(), level.describe())
             }
             Err(e) => format!("{e}  {usage}"),
@@ -399,8 +407,8 @@ fn psyche_command(rest: &str) -> String {
             newt_core::psyche::OBSESSIVE_COGNITION,
             newt_core::psyche::OBSESSIVE_TENACITY,
         );
-        apply_setting(Field::Cognition, cog.label());
-        apply_setting(Field::Tenacity, ten.label());
+        apply_setting(Field::Cognition, cog.label(), "/psyche obsessive");
+        apply_setting(Field::Tenacity, ten.label(), "/psyche obsessive");
         return format!(
             "obsessive engaged (live): cognition → {}, tenacity → {}, \
              default tool-round budget → effectively unlimited (an explicit \

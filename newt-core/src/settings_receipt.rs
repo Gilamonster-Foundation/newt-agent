@@ -44,8 +44,14 @@ use std::str::FromStr;
 /// Schema tag. Bumping it re-addresses every receipt, by construction.
 pub const SETTING_CHANGE_SCHEMA_V1: &str = "newt.setting-change/v1";
 
-/// Override for where receipts land. Set by tests and by anyone who wants the
-/// journal somewhere other than beside `settings.toml`.
+/// Override for where receipts land, for anyone who wants the journal
+/// somewhere other than beside `settings.toml`.
+///
+/// Set to the **empty string** to turn the journal off entirely. That is not a
+/// courtesy switch — it is what keeps the unit tier honest: a test that
+/// exercised a setting change would otherwise append to the developer's real
+/// `~/.newt/receipts.jsonl`, and `test_guard::GlobalSettingsGuard` sets this
+/// empty for exactly that reason.
 pub const RECEIPT_PATH_ENV: &str = "NEWT_SETTINGS_RECEIPTS";
 
 /// One applied setting change.
@@ -150,12 +156,18 @@ impl SettingReceipt {
 }
 
 /// Where receipts land: `$NEWT_SETTINGS_RECEIPTS`, else `receipts.jsonl` beside
-/// `settings.toml` (`~/.newt/`). `None` when there is no user config dir at
-/// all, which is the one case with nowhere honest to write.
+/// `settings.toml` (so it follows `$NEWT_CONFIG_DIR` like everything else in
+/// `~/.newt`).
+///
+/// `None` — do not write — in two cases: the override is set but empty (the
+/// off switch), or there is no user config dir at all, which is the one case
+/// with nowhere honest to put it.
 #[must_use]
 pub fn receipt_path() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os(RECEIPT_PATH_ENV) {
-        return Some(PathBuf::from(explicit));
+    match std::env::var_os(RECEIPT_PATH_ENV) {
+        Some(explicit) if explicit.is_empty() => return None,
+        Some(explicit) => return Some(PathBuf::from(explicit)),
+        None => {}
     }
     crate::settings::settings_path().map(|p| p.with_file_name("receipts.jsonl"))
 }
@@ -263,6 +275,20 @@ mod tests {
             receipt_path(),
             Some(PathBuf::from("/tmp/newt-settings-receipts-probe.jsonl"))
         );
+        crate::process_env::set_var(RECEIPT_PATH_ENV, "");
+        assert_eq!(receipt_path(), None, "empty must mean off, not the default");
+        crate::process_env::remove_var(RECEIPT_PATH_ENV);
+    }
+
+    /// **The off switch actually stops the write.** Without this, `record`
+    /// could ignore `receipt_path` and the unit tier would quietly append to a
+    /// developer's real `~/.newt/receipts.jsonl` — which is exactly what
+    /// happened before the switch existed.
+    #[test]
+    fn recording_with_the_journal_off_writes_nothing() {
+        let _lock = crate::process_env::lock();
+        crate::process_env::set_var(RECEIPT_PATH_ENV, "");
+        assert!(record(change()).is_none());
         crate::process_env::remove_var(RECEIPT_PATH_ENV);
     }
 }
