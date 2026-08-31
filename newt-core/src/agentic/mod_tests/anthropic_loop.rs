@@ -77,6 +77,22 @@ fn persona_allow() -> &'static [String] {
     ALLOW.as_slice()
 }
 
+/// The loop tests' workspace: a path that deliberately does NOT exist.
+///
+/// These tests are about the LOOP — nudges, wire shapes, retries, round caps —
+/// not about the self-verify gate, which #1943 arms by default. Under
+/// `cargo test` the process's `.` is this crate's own directory, which ships a
+/// `Cargo.toml`, so an armed gate correctly detects `cargo test` and adds a
+/// round to every one of these tests. Pointing them at a workspace that
+/// affords no verification keeps each measuring what it is named for, and
+/// removes an ambient-filesystem dependency they never wanted (#514).
+///
+/// The gate's own wiring is NOT left unproved by this — that would recreate,
+/// in the test suite, exactly the dark gate #1943 exists to end. It is proved
+/// against a workspace that DOES afford a check, by
+/// `an_armed_self_verify_gate_adds_a_round_when_the_workspace_ships_a_check`.
+const NO_CHECKS_WORKSPACE: &str = "newt-core-test-workspace-that-does-not-exist";
+
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
         rewrites_history: true,
@@ -86,7 +102,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         api_key: Some("sk-ant-test"),
         messages,
         task: "do the thing",
-        workspace: ".",
+        workspace: NO_CHECKS_WORKSPACE,
         color: false,
         markdown: false,
         tool_offload: false,

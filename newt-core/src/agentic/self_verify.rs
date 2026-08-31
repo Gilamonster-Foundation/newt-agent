@@ -236,13 +236,46 @@ pub fn commands_from_messages(messages: &[serde_json::Value]) -> Vec<String> {
     out
 }
 
-/// Is the self-verify gate enabled? OFF by default (behaviour-preserving — the
-/// gate changes when a turn is allowed to conclude, so it must be opt-in), turned
-/// on with `NEWT_SELF_VERIFY=1` (the headless bench lane sets it). Kept an env
-/// toggle to match the session-scoped `NEWT_NUDGE` / `NEWT_FULL_ACCESS` pattern.
+/// Is the self-verify gate enabled? **ON by default** (#1943), turned off with
+/// `NEWT_SELF_VERIFY=0` / `off` / `false`.
+///
+/// # Why the default flipped, and what it costs
+///
+/// It shipped opt-in as behaviour-preserving, which was the right call for a
+/// gate nobody had run. The measurement that followed is the argument against
+/// leaving it there: across the evidence session the gate was consulted on
+/// **294 tool calls and evaluated zero times**, because nothing sets the
+/// variable. A guard that is dark by default does not preserve behaviour — it
+/// preserves the failure it was written to catch, while the repository reads
+/// as though the failure is handled.
+///
+/// **This is a behaviour change for every user**, stated plainly rather than
+/// buried: a turn that concludes without running the verification its
+/// workspace ships now gets one more round and a nudge naming what it did not
+/// run. It is capped (`SELF_VERIFY_CAP`), it steps aside on the final round so
+/// it can never burn a turn's last chance, and `/nudge off` disables it along
+/// with every other action nudge. The cost of a false nudge is one wasted
+/// round; the cost of the miss it replaces is a task declared done on a broken
+/// solution, which is this module's reason to exist.
+///
+/// # Off is explicit, and only explicit
+///
+/// Only `0`, `off` and `false` disable. An unrecognised value leaves the gate
+/// ON, because the default is now on and a typo'd opt-out should not silently
+/// restore the dark state this change exists to end — failing toward the gate
+/// being armed is the safe direction for a check whose whole failure mode was
+/// never running. `NEWT_SELF_VERIFY=1` keeps working, so the headless bench
+/// lane that already sets it needs no change.
+///
+/// Kept an env toggle to match the session-scoped `NEWT_NUDGE` /
+/// `NEWT_FULL_ACCESS` pattern.
 pub fn enabled() -> bool {
-    std::env::var("NEWT_SELF_VERIFY")
-        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
+    !std::env::var("NEWT_SELF_VERIFY").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false"
+        )
+    })
 }
 
 /// How many directory levels below the workspace root the scan descends
@@ -658,6 +691,74 @@ mod tests {
             "the walk stopped rather than enumerating the tree: {}",
             names.len()
         );
+    }
+
+    // ---------------------------------------------------------------
+    // #1943 — the gate is armed by default
+    // ---------------------------------------------------------------
+
+    /// RAII restore, so an env-mutating test cannot leak into a sibling even
+    /// if its body panics. Same shape as `flight_recorder`'s.
+    struct EnvRestore {
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn take() -> Self {
+            Self {
+                saved: std::env::var_os("NEWT_SELF_VERIFY"),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => std::env::set_var("NEWT_SELF_VERIFY", v),
+                None => std::env::remove_var("NEWT_SELF_VERIFY"),
+            }
+        }
+    }
+
+    /// **The flip.** With no variable set the gate evaluates — which is the
+    /// whole of #1943: the evidence session consulted it on 294 tool calls and
+    /// evaluated it zero times, because nothing sets the variable.
+    #[serial_test::serial(newt_self_verify_env)]
+    #[test]
+    fn the_gate_is_armed_with_no_environment_variable_set() {
+        let _restore = EnvRestore::take();
+        std::env::remove_var("NEWT_SELF_VERIFY");
+        assert!(
+            enabled(),
+            "unset must mean ON — a guard dark by default preserves the \
+             failure it was written to catch"
+        );
+    }
+
+    /// The anti-vacuous twin: the opt-out is real. Without this, `enabled()`
+    /// could be `true` unconditionally and the test above would still pass.
+    #[serial_test::serial(newt_self_verify_env)]
+    #[test]
+    fn an_explicit_off_still_disables_the_gate() {
+        let _restore = EnvRestore::take();
+        for off in ["0", "off", "false", "OFF", " 0 ", "False"] {
+            std::env::set_var("NEWT_SELF_VERIFY", off);
+            assert!(!enabled(), "NEWT_SELF_VERIFY={off:?} must disable");
+        }
+    }
+
+    /// The existing opt-IN keeps working, so the headless bench lane that
+    /// already sets `NEWT_SELF_VERIFY=1` needs no change — and an
+    /// unrecognised value leaves the gate ON, because a typo'd opt-out must
+    /// not silently restore the dark state this change exists to end.
+    #[serial_test::serial(newt_self_verify_env)]
+    #[test]
+    fn the_old_opt_in_still_enables_and_a_typo_does_not_disable() {
+        let _restore = EnvRestore::take();
+        for on in ["1", "on", "true", "banana", ""] {
+            std::env::set_var("NEWT_SELF_VERIFY", on);
+            assert!(enabled(), "NEWT_SELF_VERIFY={on:?} must leave the gate on");
+        }
     }
 
     #[test]
