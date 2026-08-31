@@ -14,6 +14,7 @@
 // #727: read-only context-budget introspection (the `get_context_remaining`
 // tool) — a pure renderer the agentic loop feeds per-turn budget state into.
 mod budget;
+pub mod digest_fold;
 // #867: path-claim verification for the cap-exit summary (the file-name
 // sibling of the #717 phantom-tool-reach telemetry).
 /// Anthropic `/v1/messages` wire mapping — `pub` so `newt-inference`'s simple
