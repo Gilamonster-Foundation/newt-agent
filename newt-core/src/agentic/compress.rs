@@ -972,8 +972,27 @@ pub(crate) async fn compress(
     let mut prune_config = PruneConfig::default();
     prune_config.keep_last = prune_config.keep_last.max(replay_protected_tail_len);
     let pruned = prune(req.messages, &prune_config);
-    let prune_changed = pruned.chars_reclaimed > 0;
-    let mut pruned = pruned.messages;
+    let mut prune_changed = pruned.chars_reclaimed > 0;
+
+    // (1b) #1992: the digest fold — the one stage here that REMOVES messages,
+    // which is why it lives outside `crate::prune` rather than amending that
+    // module's "no message is ever added or removed" invariant.
+    //
+    // It runs BEFORE the proactive check below on purpose. Structural prune
+    // one-lines a tool result once and then pays its scaffolding forever, which
+    // is #1966's 422 est-tokens/round accretion; folding those aged rounds is
+    // what can keep the floor under the 75% line instead of letting it arrive
+    // there and buy a lossy mass-summarize.
+    let fold = crate::agentic::digest_fold::fold_aged_one_lined_rounds(
+        pruned.messages,
+        &crate::agentic::digest_fold::DigestFoldConfig {
+            keep_last: prune_config.keep_last,
+            ..Default::default()
+        },
+        &|verbatim| stage_compaction_span(req.compaction_store, req.compaction_stage, verbatim),
+    );
+    prune_changed |= fold.rounds_folded > 0;
+    let mut pruned = fold.messages;
     let after_prune = estimate_tokens(&pruned, req.est);
     if !over(after_prune, pruned.len()) {
         // #1966: record the floor reading whenever prune alone would settle
@@ -1130,44 +1149,20 @@ pub(crate) async fn compress(
         // closed `redact_secrets` table `spill:` uses): only the redacted span is
         // ever retained. The summary is demoted from sole replacement to a catalog
         // card over a retrievable span.
-        if let Some(store) = req.compaction_store {
-            let verbatim: String = middle
+        if let Some(handle) = stage_compaction_span(
+            req.compaction_store,
+            req.compaction_stage,
+            &middle
                 .iter()
                 .map(render_message_raw)
                 .collect::<Vec<_>>()
-                .join("\n");
-            // Stage PURELY (the CID is a pure function of the content, so the handle
-            // is known before any commit). Only a genuine stage is advertised.
-            if let Ok(staged) = store.stage(
-                crate::agentic::content_spill::SpillProvenance::CompactionSpan,
-                redact_secrets(&verbatim),
-            ) {
-                let handle = staged.handle();
-                // Advertise the `compaction:<cid>` handle iff the span is actually
-                // installed. In the DIRECT (Chat) path that means committing NOW and
-                // only advertising on success — a failed store must never name a
-                // handle that resolves to nothing (BHV-SPILL-001). In the TRANSACTIONAL
-                // (Responses) path the span is STAGED into the candidate buffer — the
-                // pure CID is valid before commit, and a rejected candidate is discarded
-                // whole, so nothing it named is ever committed.
-                let advertise = match req.compaction_stage {
-                    Some(buffer) => match buffer.lock() {
-                        Ok(mut buf) => {
-                            buf.push(staged);
-                            true
-                        }
-                        Err(_) => false, // poisoned candidate buffer: fail closed
-                    },
-                    None => store.commit_batch(std::slice::from_ref(&staged)).is_ok(),
-                };
-                if advertise {
-                    body.push_str(&format!(
-                        "\n\n[the full verbatim text of this compacted span is retrievable with \
-                         memory_fetch(\"compaction:{handle}\") — use it to recover an exact detail \
-                         this summary dropped, instead of guessing]"
-                    ));
-                }
-            }
+                .join("\n"),
+        ) {
+            body.push_str(&format!(
+                "\n\n[the full verbatim text of this compacted span is retrievable with \
+                 memory_fetch(\"compaction:{handle}\") — use it to recover an exact detail \
+                 this summary dropped, instead of guessing]"
+            ));
         }
         // (4) Assembly with the REFERENCE-ONLY prefix + end marker.
         let mut out = Vec::with_capacity(boundary.head + 1 + (pruned.len() - boundary.tail_start));
@@ -2378,6 +2373,52 @@ pub(crate) fn redact_secrets(input: &str) -> String {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Stage a verbatim span into the session compaction store and return the
+/// `compaction:<cid>` handle IFF it is genuinely installed.
+///
+/// **The one minting site** (#1992). #661 group B built this for the summarize
+/// path; the digest fold needs exactly the same record — a derived turn over a
+/// retrievable verbatim span — and a second encoding of it would be a
+/// content-addressable law violation, not a style choice. Both callers mint
+/// `SpillProvenance::CompactionSpan` through here.
+///
+/// Redact-on-store: only the redacted span is ever retained, through the same
+/// closed table `spill:` uses.
+///
+/// `None` means DO NOT ADVERTISE. A failed store must never name a handle that
+/// resolves to nothing (BHV-SPILL-001), which is why the commit decision and
+/// the handle are returned together rather than left to each caller:
+///
+/// * DIRECT (Chat): commit now, advertise only on success.
+/// * TRANSACTIONAL (Responses): stage into the candidate buffer — the pure CID
+///   is valid before commit, and a rejected candidate is discarded whole, so
+///   nothing it named is ever committed.
+fn stage_compaction_span(
+    store: Option<&dyn crate::agentic::content_spill::SpillStore>,
+    stage: Option<&std::sync::Mutex<Vec<crate::agentic::content_spill::StagedSpill>>>,
+    verbatim: &str,
+) -> Option<String> {
+    let store = store?;
+    let staged = store
+        .stage(
+            crate::agentic::content_spill::SpillProvenance::CompactionSpan,
+            redact_secrets(verbatim),
+        )
+        .ok()?;
+    let handle = staged.handle();
+    let advertise = match stage {
+        Some(buffer) => match buffer.lock() {
+            Ok(mut buf) => {
+                buf.push(staged);
+                true
+            }
+            Err(_) => false, // poisoned candidate buffer: fail closed
+        },
+        None => store.commit_batch(std::slice::from_ref(&staged)).is_ok(),
+    };
+    advertise.then_some(handle)
+}
 
 #[cfg(test)]
 mod tests {

@@ -390,6 +390,37 @@ fn one_line_summary(name: &str, args: Option<&Value>, content: &str) -> String {
     }
 }
 
+/// Does `content` look like a [`one_line_summary`] this module produced?
+///
+/// **Lives beside the builder deliberately (#1992).** The digest fold needs to
+/// know whether a tool result has ALREADY been one-lined — possibly rounds
+/// ago, so it cannot be told by a return value and must read the text. A
+/// recognizer written at the consumer would be a second definition of this
+/// module's output shape, free to drift from the emitter the moment an arm
+/// changes wording. One grammar, one file, and a round-trip test that drives
+/// every arm of the builder through this function.
+///
+/// The grammar every arm shares: a `[name]` tag, then a clause, then
+/// `-> ok,` or `-> error,`. Deliberately conservative — a raw tool result that
+/// happened to open with a bracket still has to carry the arrow-status clause
+/// to be mistaken for a summary, and a false positive here folds away a
+/// verbatim result.
+#[must_use]
+pub fn is_one_line_summary(content: &str) -> bool {
+    let t = content.trim_start();
+    if !t.starts_with('[') {
+        return false;
+    }
+    let Some(rest) = t.split_once("] ").map(|(_, rest)| rest) else {
+        return false;
+    };
+    // One line only: a summary is a summary.
+    if rest.contains('\n') {
+        return false;
+    }
+    rest.contains(" -> ok, ") || rest.contains(" -> error, ")
+}
+
 /// First `max_chars` chars with newlines flattened, `…`-terminated if cut.
 fn excerpt(s: &str, max_chars: usize) -> String {
     let cleaned: String = s
@@ -1327,6 +1358,57 @@ mod tests {
                     "seed {seed}: exact accounting"
                 );
             }
+        }
+    }
+
+    /// **The anti-drift twin (#1992).** Every arm the builder can emit must be
+    /// recognized. If someone rewords an arm and forgets the recognizer, the
+    /// digest fold silently stops folding that tool — a regression that shows
+    /// up as "the floor stopped falling" months later, not as a failure.
+    #[test]
+    fn every_one_liner_the_builder_emits_is_recognized() {
+        let args = serde_json::json!({
+            "command": "npm test", "path": "src/x.rs", "query": "needle",
+            "pattern": "needle", "url": "https://example.invalid/x"
+        });
+        // Every named arm, plus an unnamed one for the `_ =>` default.
+        for name in [
+            "run_command",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "search",
+            "web_fetch",
+            "some_mcp__tool",
+        ] {
+            for body in ["a\nb\nc", "error: it broke"] {
+                let line = one_line_summary(name, Some(&args), body);
+                assert!(
+                    is_one_line_summary(&line),
+                    "builder emitted a summary its own recognizer rejects: {line:?}"
+                );
+            }
+        }
+    }
+
+    /// The twin that stops "recognizes everything". A false positive here folds
+    /// a VERBATIM result away, which is unrecoverable in the wrong direction.
+    #[test]
+    fn raw_tool_output_is_not_mistaken_for_a_summary() {
+        for raw in [
+            "total 12\ndrwxr-xr-x  3 u u 4096 Jan  1 00:00 .",
+            "[INFO] building project\n[INFO] done",
+            "[warn] something -> ok, but over\nmultiple lines",
+            "error: command exited 101\nerror[E0308]: mismatched types",
+            "{\"ok\": true}",
+            "",
+            "[not a summary] no arrow clause here",
+        ] {
+            assert!(
+                !is_one_line_summary(raw),
+                "raw tool output was mistaken for a one-liner: {raw:?}"
+            );
         }
     }
 }
