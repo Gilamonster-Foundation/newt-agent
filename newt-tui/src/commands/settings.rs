@@ -10,7 +10,21 @@
 
 use newt_core::agentic::print_newt;
 
+use crate::settings_form::{self, Field};
 use crate::{current_prompt_and_preview, prompt_token_help, strip_one_quote_pair};
+
+/// Perform one setting change through the single mutation path (#1981) and
+/// return the line it produced.
+///
+/// Every absorbed verb in this module goes through here, and there is no arm
+/// that skips it. `Ok` and `Err` collapse to one string because a caller has
+/// nothing different to do with a refusal — the message already says what the
+/// field accepts.
+fn apply_setting(field: Field, value: &str) -> String {
+    match settings_form::apply(field, value) {
+        Ok(msg) | Err(msg) => msg,
+    }
+}
 
 /// Handle the session-setting command family. Always returns `Ok(true)` (none
 /// of these end the session).
@@ -111,12 +125,9 @@ pub(crate) fn dispatch(
             // `settings_form::apply`, which is the single site a provenance
             // receipt can attach to (#1965). Leaving the old `set_var` here
             // would make "one mutation path" aspirational rather than true.
-            use crate::settings_form::{self, Field};
             match want {
                 Some(m) => {
-                    match settings_form::apply(Field::EditMode, m) {
-                        Ok(msg) | Err(msg) => print_newt(&msg, color, verbose),
-                    }
+                    print_newt(&apply_setting(Field::EditMode, m), color, verbose);
                     print_newt(
                         &settings_form::moved_notice(cmd, Field::EditMode),
                         color,
@@ -131,11 +142,13 @@ pub(crate) fn dispatch(
             }
         }
 
+        // #1981: ABSORBED into `/settings nudge`. The verb keeps its prose —
+        // "nudges OFF for this session" says more than "action-pressure
+        // nudges: off" — but no longer owns a write: `settings_form::apply`
+        // performs every one.
         "nudge" => match arg1 {
             "off" => {
-                // Under the process-env lock (#1850); next turn's ChatCtx
-                // reads it.
-                newt_core::process_env::set_var("NEWT_NUDGE", "off");
+                apply_setting(Field::Nudge, "off");
                 print_newt(
                     "action-pressure nudges OFF for this session (narration rescue, \
                      workflow repair steering, plan pushes) — factual corrections stay on",
@@ -144,29 +157,38 @@ pub(crate) fn dispatch(
                 );
             }
             "on" => {
-                newt_core::process_env::remove_var("NEWT_NUDGE");
+                apply_setting(Field::Nudge, "on");
                 print_newt("action-pressure nudges ON (default)", color, verbose);
             }
             "" | "status" => {
-                let off = std::env::var("NEWT_NUDGE").is_ok_and(|v| v.eq_ignore_ascii_case("off"));
                 print_newt(
                     &format!(
-                        "action-pressure nudges: {}  (/nudge <on|off>)",
-                        if off { "OFF" } else { "on" }
+                        "action-pressure nudges: {}  (/settings nudge <on|off>)",
+                        if settings_form::nudges_off() {
+                            "OFF"
+                        } else {
+                            "on"
+                        }
                     ),
                     color,
                     verbose,
                 );
             }
-            _ => print_newt("usage: /nudge <on|off|status>", color, verbose),
+            _ => print_newt(
+                "usage: /settings nudge <on|off>  (/nudge status shows it)",
+                color,
+                verbose,
+            ),
         },
 
+        // #1981: ABSORBED into `/settings thinking`.
         "thinking" => match arg1 {
-            "on" | "off" => {
-                newt_core::process_env::set_var("NEWT_THINKING", arg1);
-                print_newt(&format!("thinking spinner: {arg1}"), color, verbose);
-            }
-            _ => print_newt("usage: /thinking <on|off>", color, verbose),
+            "on" | "off" => print_newt(&apply_setting(Field::Thinking, arg1), color, verbose),
+            _ => print_newt(
+                "usage: /settings thinking <on|off>  (or /thinking <on|off>)",
+                color,
+                verbose,
+            ),
         },
 
         // #1665: retired top-levels. Redirect WITHOUT mutating — a habitual
@@ -213,7 +235,7 @@ fn explicit_relentless_round_note() -> Option<&'static str> {
 /// [`newt_core::tenacity::effective_tenacity`]). Pure for the show/list/error
 /// paths; the set path mutates the process-global via `set_cli_tenacity`.
 fn tenacity_command(arg: &str) -> String {
-    use newt_core::tenacity::{clear_cli_tenacity, effective_tenacity, set_cli_tenacity, Tenacity};
+    use newt_core::tenacity::{effective_tenacity, Tenacity};
     match arg.trim() {
         "" | "status" | "show" => {
             let t = effective_tenacity();
@@ -248,11 +270,10 @@ fn tenacity_command(arg: &str) -> String {
         // resolves from the persona / config / family again — the undo `/tenacity`
         // previously lacked (a session override could not be released).
         "auto" | "inherit" | "reset" => {
-            clear_cli_tenacity();
-            // #1668: releasing the dial is an operator action too — it UNPINS
-            // the axis so the conversation follows the invocation baseline
-            // again (an unpin the pin would otherwise have no way to express).
-            newt_core::runtime::mark_tenacity_choice(None);
+            // #1981: the clear AND the #1668 unpin both live in
+            // `settings_form::apply` now — releasing the dial is an operator
+            // action, and an action that leaves no record is the #1965 defect.
+            apply_setting(Field::Tenacity, "auto");
             format!(
                 "tenacity → auto (override cleared) — now {} (from persona / config / family)",
                 effective_tenacity().label()
@@ -260,10 +281,9 @@ fn tenacity_command(arg: &str) -> String {
         }
         other => match other.parse::<Tenacity>() {
             Ok(level) => {
-                set_cli_tenacity(level);
-                // #1668: marked beside the setter, so only a PARSED level
-                // pins — the error arm below mutates and marks nothing.
-                newt_core::runtime::mark_tenacity_choice(Some(level));
+                // Only a PARSED level reaches the mutation path — the error
+                // arm below mutates nothing and records nothing.
+                apply_setting(Field::Tenacity, level.label());
                 let rounds = if level == Tenacity::Relentless {
                     "; default tool-round budget → effectively unlimited (an explicit `/rounds` override still wins)"
                 } else {
@@ -288,7 +308,7 @@ fn tenacity_command(arg: &str) -> String {
 /// `cognition:`. Pure for the show/list/error paths; the set paths mutate the
 /// process-global via `set_cli_cognition`.
 fn cognition_command(arg: &str) -> String {
-    use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
+    use newt_core::cognition::{cli_cognition, CognitionOverride};
     use newt_core::role_profile::Cognition;
     let usage = "(/psyche cognition <glancing|pondering|deliberating|contemplating>|off|auto|list)";
     match arg.trim() {
@@ -322,22 +342,20 @@ fn cognition_command(arg: &str) -> String {
             out.push_str("\n  auto           follow the active persona (default)");
             out
         }
+        // #1981: all three set paths go through `settings_form::apply`, which
+        // owns the write AND the #1668 posture mark — including `auto`, which
+        // UNPINS the axis and is just as much an operator action.
         "off" | "none" => {
-            set_cli_cognition(CognitionOverride::Off);
-            // #1668: each of these three is an operator posture action on the
-            // cognition axis — including `auto`, which UNPINS it.
-            newt_core::runtime::mark_cognition_choice(CognitionOverride::Off);
+            apply_setting(Field::Cognition, "off");
             "cognition → off — no reasoning controls will be sent".to_string()
         }
         "auto" | "reset" | "persona" => {
-            set_cli_cognition(CognitionOverride::Unset);
-            newt_core::runtime::mark_cognition_choice(CognitionOverride::Unset);
+            apply_setting(Field::Cognition, "auto");
             "cognition → auto — following the active persona".to_string()
         }
         other => match other.parse::<Cognition>() {
             Ok(level) => {
-                set_cli_cognition(CognitionOverride::Set(level));
-                newt_core::runtime::mark_cognition_choice(CognitionOverride::Set(level));
+                apply_setting(Field::Cognition, level.label());
                 format!("cognition → {} — {}", level.label(), level.describe())
             }
             Err(e) => format!("{e}  {usage}"),
@@ -351,7 +369,7 @@ fn cognition_command(arg: &str) -> String {
 fn retired_dial_redirect(cmd: &str) -> String {
     format!(
         "/{cmd} folded into /psyche — /psyche opens the dial panel; \
-         text: /psyche {cmd} <level>  (nothing changed)"
+         text: /settings {cmd} <level>  (nothing changed)"
     )
 }
 
@@ -373,12 +391,16 @@ fn psyche_command(rest: &str) -> String {
     // Crew is a startup gate (crew_runner is built once at launch), so it can't
     // be turned on mid-session; say so honestly and point at the launch flag.
     if sub.eq_ignore_ascii_case("obsessive") || sub.eq_ignore_ascii_case("obsessive-relentless") {
-        let (cog, ten) = newt_core::psyche::engage_obsessive_dials();
-        // #1668: `obsessive` sets BOTH live dials, so it pins both axes.
-        newt_core::runtime::mark_cognition_choice(newt_core::cognition::CognitionOverride::Set(
-            cog,
-        ));
-        newt_core::runtime::mark_tenacity_choice(Some(ten));
+        // #1981: the posture still means what `psyche` says it means — the
+        // constants are that module's to own — but engaging it is two ordinary
+        // setting changes, so it takes the same path, the same #1668 pins and
+        // the same record as `/settings cognition contemplating` would.
+        let (cog, ten) = (
+            newt_core::psyche::OBSESSIVE_COGNITION,
+            newt_core::psyche::OBSESSIVE_TENACITY,
+        );
+        apply_setting(Field::Cognition, cog.label());
+        apply_setting(Field::Tenacity, ten.label());
         return format!(
             "obsessive engaged (live): cognition → {}, tenacity → {}, \
              default tool-round budget → effectively unlimited (an explicit \
@@ -721,10 +743,14 @@ mod tests {
     #[test]
     fn the_redirect_line_names_both_the_panel_and_the_text_setter() {
         // #1665 review: the redirect wording was previously unasserted anywhere.
+        // #1981 moved the SETTER half to `/settings <dial> <level>` — the panel
+        // is still `/psyche`, because a chooser performs and a setter sets. Both
+        // affordances must still be named, which is what this asserts.
         for cmd in ["tenacity", "cognition"] {
             let line = super::retired_dial_redirect(cmd);
             assert!(line.contains("folded into /psyche"), "{line}");
-            assert!(line.contains(&format!("/psyche {cmd} <level>")), "{line}");
+            assert!(line.contains("/psyche opens the dial panel"), "{line}");
+            assert!(line.contains(&format!("/settings {cmd} <level>")), "{line}");
             assert!(line.contains("(nothing changed)"), "{line}");
         }
     }

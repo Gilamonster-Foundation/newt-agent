@@ -855,6 +855,29 @@ mod tests {
             "nothing is kept — the absorb rule would be 'absorb everything'"
         );
     }
+
+    /// **Every field the form carries is marked absorbed here.**
+    ///
+    /// The form's `Field::name()` IS the registry's command name, so this is a
+    /// real join rather than two lists that look alike. It catches the drift in
+    /// the direction that actually happens: a knob gets added to `/settings`
+    /// and the registry keeps calling its verb a `Keep`, so the consolidation
+    /// count never moves.
+    #[test]
+    fn every_settings_field_is_registered_as_absorbed() {
+        for field in crate::settings_form::Field::ALL {
+            let command = lookup(field.name())
+                .unwrap_or_else(|| panic!("/settings {} is not registered", field.name()));
+            assert_eq!(
+                command.disposition,
+                Disposition::Absorb,
+                "`/{}` is a field of /settings but the registry still calls it \
+                 {:?} — the surface never shrinks if absorbing does not count",
+                command.name,
+                command.disposition
+            );
+        }
+    }
 }
 
 #[cfg(test)]

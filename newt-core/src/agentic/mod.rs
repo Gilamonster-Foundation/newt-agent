@@ -10733,7 +10733,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
 
 /// Whether the reasoning spinner is enabled: `NEWT_THINKING` (set by
 /// `/thinking`) overrides `[tui] thinking`; default on.
-fn thinking_stream_enabled() -> bool {
+///
+/// Public because `/settings thinking` must report what the setting IS, and
+/// this is the one function that owns the precedence. A second reading of
+/// `NEWT_THINKING` in the form would show `on` while `[tui] thinking = "off"`
+/// quietly won (#1981).
+#[must_use]
+pub fn thinking_stream_enabled() -> bool {
     match std::env::var("NEWT_THINKING").ok().as_deref() {
         Some("off") => return false,
         Some("on" | "stream") => return true,

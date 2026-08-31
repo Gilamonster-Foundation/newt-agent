@@ -45,54 +45,138 @@ pub(crate) type Ask<'a> = &'a dyn Fn(&SurfaceInteraction) -> HumanQuestionOutcom
 
 /// A setting `/settings` carries.
 ///
-/// Slice 1 carries editor mode. The tuning dials are NOT here and that is
-/// deliberate: #1665 already folded `/tenacity` and `/cognition` into
-/// `/psyche`, which is a panel — absorbing those means subsuming a panel, and
-/// panels wait on the RegionLease work. See
-/// `docs/decisions/slash_command_inventory.md`.
+/// Two families so far: the editor mode (slice 1) and the effort dials (this
+/// slice). Every one of them is enum-valued with a small closed vocabulary,
+/// which is exactly the shape the operator's line singles out — *a verb that
+/// merely SETS A VALUE is absorbed; a verb that PERFORMS something stays*.
+///
+/// `/psyche` is therefore NOT absorbed: its panel and its status view perform,
+/// and they keep performing. What moved here is its two text setters, which
+/// only ever set. See `docs/decisions/slash_command_target_set.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Field {
     EditMode,
+    Tenacity,
+    Cognition,
+    Thinking,
+    Nudge,
 }
 
 impl Field {
     /// Every field the form offers, menu order.
-    pub(crate) const ALL: &'static [Self] = &[Self::EditMode];
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::EditMode,
+        Self::Tenacity,
+        Self::Cognition,
+        Self::Thinking,
+        Self::Nudge,
+    ];
 
-    /// The deep-link token: `/settings <name> [value]`.
+    /// The deep-link token: `/settings <name> [value]`. This is ALSO the
+    /// registry's command name, which is what lets `apply` ask the registry
+    /// where this setting's receipt lands rather than carrying a second list.
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::EditMode => "edit-mode",
+            Self::Tenacity => "tenacity",
+            Self::Cognition => "cognition",
+            Self::Thinking => "thinking",
+            Self::Nudge => "nudge",
         }
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::EditMode => "line-editor key bindings",
+            Self::Tenacity => "tenacity",
+            Self::Cognition => "cognition",
+            Self::Thinking => "thinking spinner",
+            Self::Nudge => "action-pressure nudges",
         }
     }
 
     /// The allowed values, as `(value, what it means)`.
-    fn values(self) -> &'static [(&'static str, &'static str)] {
+    ///
+    /// The dial levels and their descriptions come from `Tenacity::all()` /
+    /// `Cognition::all()` — the same lists `/psyche … list` renders. A second
+    /// hand-written copy here is how the form and the dial would drift apart
+    /// the first time a level is added.
+    fn values(self) -> Vec<(&'static str, String)> {
+        use newt_core::role_profile::Cognition;
+        use newt_core::Tenacity;
+        let owned = |pairs: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
+            pairs.iter().map(|(v, d)| (*v, (*d).to_string())).collect()
+        };
         match self {
-            Self::EditMode => &[
+            Self::EditMode => owned(&[
                 ("vi", "modal editing (default)"),
                 ("emacs", "emacs-style editing"),
                 ("nano", "nano-style editing"),
-            ],
+            ]),
+            Self::Tenacity => std::iter::once((
+                "auto",
+                "inherit from the persona / config / model family".to_string(),
+            ))
+            .chain(
+                Tenacity::all()
+                    .into_iter()
+                    .map(|t| (t.label(), t.describe())),
+            )
+            .collect(),
+            Self::Cognition => {
+                std::iter::once(("auto", "follow the active persona (default)".to_string()))
+                    .chain(std::iter::once((
+                        "off",
+                        "send no reasoning controls, overriding any persona".to_string(),
+                    )))
+                    .chain(
+                        Cognition::all()
+                            .into_iter()
+                            .map(|c| (c.label(), c.describe().to_string())),
+                    )
+                    .collect()
+            }
+            Self::Thinking => owned(&[
+                ("on", "stream reasoning above the answer (default)"),
+                ("off", "just the answer"),
+            ]),
+            Self::Nudge => owned(&[
+                ("on", "action-pressure steering enabled (default)"),
+                ("off", "no narration rescue / workflow repair / plan pushes"),
+            ]),
         }
     }
 
     /// What this setting is right now, through the one resolver that already
-    /// owns the precedence (env, then `[tui]`, then the default) rather than a
-    /// second reading of it.
-    fn current(self) -> &'static str {
+    /// owns the precedence rather than a second reading of it.
+    ///
+    /// For the dials that means the OVERRIDE, not the effective level: the
+    /// setting is what this form can change, and `auto` is a real, choosable
+    /// value that resolution then fills in.
+    fn current(self) -> String {
+        use newt_core::cognition::{cli_cognition, CognitionOverride};
         match self {
             Self::EditMode => match crate::prompt::resolve_edit_mode() {
                 newt_core::EditMode::Vi => "vi",
                 newt_core::EditMode::Emacs => "emacs",
                 newt_core::EditMode::Nano => "nano",
+            }
+            .to_string(),
+            Self::Tenacity => newt_core::tenacity::cli_tenacity()
+                .map_or("auto", newt_core::Tenacity::label)
+                .to_string(),
+            Self::Cognition => match cli_cognition() {
+                CognitionOverride::Unset => "auto".to_string(),
+                CognitionOverride::Off => "off".to_string(),
+                CognitionOverride::Set(c) => c.label().to_string(),
             },
+            Self::Thinking => if newt_core::agentic::thinking_stream_enabled() {
+                "on"
+            } else {
+                "off"
+            }
+            .to_string(),
+            Self::Nudge => if nudges_off() { "off" } else { "on" }.to_string(),
         }
     }
 
@@ -105,20 +189,33 @@ impl Field {
     }
 
     /// Whether `value` is one this field accepts, normalized.
+    ///
+    /// The alias arms are not politeness — each one was accepted by the verb
+    /// this field absorbed, and absorbing a command must not silently drop an
+    /// affordance operators already type.
     fn accepts(self, value: &str) -> Option<&'static str> {
         let want = value.trim().to_lowercase();
-        // `vim` is an alias operators type; the old `/edit-mode` arm took it,
-        // so absorbing the command must not silently drop it.
-        let want = if self == Self::EditMode && want == "vim" {
-            "vi".to_string()
-        } else {
-            want
+        let want = match (self, want.as_str()) {
+            // `/edit-mode vim`
+            (Self::EditMode, "vim") => "vi",
+            // `/psyche tenacity inherit|reset`
+            (Self::Tenacity, "inherit" | "reset") => "auto",
+            // `/psyche cognition none` / `reset` / `persona`
+            (Self::Cognition, "none") => "off",
+            (Self::Cognition, "reset" | "persona") => "auto",
+            _ => want.as_str(),
         };
         self.values()
-            .iter()
+            .into_iter()
             .find(|(v, _)| *v == want)
-            .map(|(v, _)| *v)
+            .map(|(v, _)| v)
     }
+}
+
+/// The one reading of the nudge dial — `NEWT_NUDGE=off` disables it, anything
+/// else (including unset) leaves it on.
+pub(crate) fn nudges_off() -> bool {
+    std::env::var("NEWT_NUDGE").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
 }
 
 /// The top-level form: which setting to change, each showing its current value.
@@ -145,10 +242,10 @@ pub(crate) fn value_menu(field: Field) -> InteractionDefinition {
     let current = field.current();
     let entries: Vec<(String, String)> = field
         .values()
-        .iter()
+        .into_iter()
         .enumerate()
         .map(|(i, (value, what))| {
-            let mark = if *value == current { "  (current)" } else { "" };
+            let mark = if value == current { "  (current)" } else { "" };
             ((i + 1).to_string(), format!("{value} — {what}{mark}"))
         })
         .collect();
@@ -160,16 +257,25 @@ pub(crate) fn value_menu(field: Field) -> InteractionDefinition {
 }
 
 /// **THE ONE MUTATION PATH.** Every route — the form, a deep link, a
-/// deprecated verb — lands here.
+/// deprecated verb, `/psyche tenacity`, `/psyche obsessive` — lands here.
 ///
 /// This is the site a provenance receipt attaches to (#1965). It does not
-/// write one yet, and that is the honest state: the registry counts 33
-/// state-mutating commands that record nothing, and collapsing four verbs to
-/// one chokepoint is what makes instrumenting them a single change rather
-/// than thirty-three.
+/// write one yet, and that is the honest state: collapsing the knob verbs to
+/// one chokepoint is what makes instrumenting them a single change rather than
+/// one per verb.
+///
+/// The `#1668` posture marks are made HERE, beside the write, for the same
+/// reason: a caller that sets the dial and forgets to mark the axis leaves the
+/// conversation's operator pin stale, and there is now exactly one caller.
 pub(crate) fn apply(field: Field, value: &str) -> Result<String, String> {
+    use newt_core::cognition::{set_cli_cognition, CognitionOverride};
+    use newt_core::role_profile::Cognition;
+    use newt_core::runtime::{mark_cognition_choice, mark_tenacity_choice};
+    use newt_core::tenacity::{clear_cli_tenacity, set_cli_tenacity};
+    use newt_core::Tenacity;
+
     let Some(value) = field.accepts(value) else {
-        let allowed: Vec<&str> = field.values().iter().map(|(v, _)| *v).collect();
+        let allowed: Vec<&str> = field.values().into_iter().map(|(v, _)| v).collect();
         return Err(format!(
             "/settings {} takes one of: {}",
             field.name(),
@@ -177,10 +283,43 @@ pub(crate) fn apply(field: Field, value: &str) -> Result<String, String> {
         ));
     };
     match field {
-        Field::EditMode => {
-            // Under the process-env lock (#1850); the editor is rebuilt right
-            // after a slash command returns, before further input is read.
-            newt_core::process_env::set_var("NEWT_EDIT_MODE", value);
+        // Under the process-env lock (#1850); the editor is rebuilt right
+        // after a slash command returns, before further input is read.
+        Field::EditMode => newt_core::process_env::set_var("NEWT_EDIT_MODE", value),
+        Field::Tenacity => match value.parse::<Tenacity>() {
+            Ok(level) => {
+                set_cli_tenacity(level);
+                mark_tenacity_choice(Some(level));
+            }
+            // `auto` — the only value that does not parse as a level, because
+            // `accepts` already refused everything else.
+            Err(_) => {
+                clear_cli_tenacity();
+                mark_tenacity_choice(None);
+            }
+        },
+        Field::Cognition => {
+            let choice = match value {
+                "auto" => CognitionOverride::Unset,
+                "off" => CognitionOverride::Off,
+                level => level
+                    .parse::<Cognition>()
+                    .map_or(CognitionOverride::Unset, CognitionOverride::Set),
+            };
+            set_cli_cognition(choice);
+            mark_cognition_choice(choice);
+        }
+        Field::Thinking => newt_core::process_env::set_var("NEWT_THINKING", value),
+        // `on` REMOVES the variable rather than setting it, which is what the
+        // absorbed `/nudge on` did: the readers test for `=off`, so an unset
+        // variable and `on` are the same state and only one of them is a
+        // leftover for the next `/nudge status` to explain.
+        Field::Nudge => {
+            if value == "off" {
+                newt_core::process_env::set_var("NEWT_NUDGE", "off");
+            } else {
+                newt_core::process_env::remove_var("NEWT_NUDGE");
+            }
         }
     }
     Ok(format!("{}: {value}", field.label()))
@@ -243,7 +382,8 @@ fn ask_value(ask: Ask<'_>, field: Field) -> Vec<String> {
     let Some(index) = choice.parse::<usize>().ok().filter(|i| *i >= 1) else {
         return vec!["settings: cancelled".to_string()];
     };
-    let Some((value, _)) = field.values().get(index - 1) else {
+    let values = field.values();
+    let Some((value, _)) = values.get(index - 1) else {
         return vec!["settings: cancelled".to_string()];
     };
     vec![match apply(field, value) {
@@ -375,6 +515,103 @@ mod tests {
             "the current value is marked: {rendered}"
         );
         assert_eq!(field_menu().controls.len(), 1, "one choice control");
+    }
+
+    /// **Every dial the form claims reports the value its own resolver owns.**
+    ///
+    /// The knobs are process globals set through four different modules; a
+    /// form that read them by hand would show a stale value the moment one
+    /// module changed. Each `current()` goes through that module's reader.
+    #[test]
+    fn each_field_reports_what_its_own_resolver_says() {
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        for (field, value) in [
+            (Field::EditMode, "nano"),
+            (Field::Tenacity, "insistent"),
+            (Field::Cognition, "deliberating"),
+            (Field::Thinking, "off"),
+            (Field::Nudge, "off"),
+        ] {
+            apply(field, value).expect("an offered value applies");
+            assert_eq!(field.current(), value, "{} did not read back", field.name());
+        }
+        // ...and every one of them goes back, which a write-only global would
+        // not manage.
+        for (field, value) in [
+            (Field::Tenacity, "auto"),
+            (Field::Cognition, "auto"),
+            (Field::Thinking, "on"),
+            (Field::Nudge, "on"),
+        ] {
+            apply(field, value).expect("an offered value applies");
+            assert_eq!(field.current(), value, "{} did not release", field.name());
+        }
+    }
+
+    /// The dial levels come from the dial, not a second list in this file.
+    ///
+    /// Adding a `Tenacity` level must make it choosable here without anyone
+    /// remembering to; a hand-copied list is how `/psyche … list` and the form
+    /// would silently disagree.
+    #[test]
+    fn the_dial_levels_are_the_dials_own() {
+        let offered: Vec<&str> = Field::Tenacity
+            .values()
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect();
+        for level in newt_core::Tenacity::all() {
+            assert!(offered.contains(&level.label()), "{level:?} not offered");
+        }
+        assert!(offered.contains(&"auto"), "the release value is missing");
+        assert_eq!(offered.len(), newt_core::Tenacity::all().len() + 1);
+
+        let offered: Vec<&str> = Field::Cognition
+            .values()
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect();
+        for level in newt_core::role_profile::Cognition::all() {
+            assert!(offered.contains(&level.label()), "{level:?} not offered");
+        }
+        assert!(offered.contains(&"off") && offered.contains(&"auto"));
+    }
+
+    /// **Every alias the absorbed verbs took still resolves.** Each of these
+    /// was reachable before the family moved; absorbing a command must not
+    /// quietly delete an affordance operators already type.
+    #[test]
+    fn the_aliases_the_absorbed_verbs_took_still_resolve() {
+        for (field, typed, want) in [
+            (Field::EditMode, "vim", "vi"),
+            (Field::Tenacity, "inherit", "auto"),
+            (Field::Tenacity, "reset", "auto"),
+            (Field::Cognition, "none", "off"),
+            (Field::Cognition, "reset", "auto"),
+            (Field::Cognition, "persona", "auto"),
+        ] {
+            assert_eq!(
+                field.accepts(typed),
+                Some(want),
+                "/{} {typed} stopped resolving",
+                field.name()
+            );
+        }
+        // Anti-vacuous: `accepts` is not "yes to everything".
+        assert_eq!(Field::Tenacity.accepts("obsessive"), None);
+        assert_eq!(Field::Cognition.accepts("hard"), None);
+        assert_eq!(Field::Thinking.accepts("maybe"), None);
+    }
+
+    /// A refused value on a dial writes nothing — the same law slice 1 pinned
+    /// for the editor, now that four more fields can be refused.
+    #[test]
+    fn a_refused_dial_value_changes_nothing() {
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        apply(Field::Tenacity, "insistent").expect("a level applies");
+        let err = apply(Field::Tenacity, "obsessive").expect_err("not a level");
+        assert!(err.contains("relentless"), "{err}");
+        assert_eq!(Field::Tenacity.current(), "insistent", "a refusal wrote");
     }
 
     /// The deprecated verbs point at their new home and say they still work —
