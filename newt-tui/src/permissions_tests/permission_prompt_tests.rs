@@ -282,6 +282,11 @@ macro_rules! web_gate {
     };
 }
 
+// #1959: constructs a real `PromptWindow` via `Terminal::suspend_for_prompt`,
+// which bumps the SAME process-global counter
+// `headless_and_piped_sessions_never_construct_a_prompt_window` asserts is
+// untouched — serialized against it so the two can never race.
+#[serial_test::serial(prompt_stdin)]
 #[test]
 fn transient_reader_error_recovers_and_esc_resolves_through_the_tty_path() {
     // Reader #1 errors (non-Interrupted); after re-arm, reader #2 yields Esc.
@@ -327,6 +332,8 @@ fn transient_reader_error_recovers_and_esc_resolves_through_the_tty_path() {
     assert!(store.pending_interaction_offer(&conv).unwrap().is_none());
 }
 
+// #1959: see the comment on the previous test — same shared-counter race.
+#[serial_test::serial(prompt_stdin)]
 #[test]
 fn transient_reader_error_does_not_deny_when_a_web_verdict_arrives() {
     // Reader errors, but a web ALLOW is already recorded: the temporary reader
@@ -374,6 +381,8 @@ fn transient_reader_error_does_not_deny_when_a_web_verdict_arrives() {
     );
 }
 
+// #1959: see the comment on `transient_reader_error_recovers_and_esc_resolves_through_the_tty_path`.
+#[serial_test::serial(prompt_stdin)]
 #[test]
 fn reader_failing_until_deadline_denies_without_busy_spin() {
     // The reader can never be re-armed; the loop must NOT busy-spin (it paces
@@ -416,6 +425,8 @@ fn reader_failing_until_deadline_denies_without_busy_spin() {
     );
 }
 
+// #1959: see the comment on `transient_reader_error_recovers_and_esc_resolves_through_the_tty_path`.
+#[serial_test::serial(prompt_stdin)]
 #[test]
 fn web_verdict_and_local_control_resolve_exactly_once() {
     // (a) Web verdict already recorded → a concurrent local Back consumes THAT
@@ -508,6 +519,8 @@ fn web_verdict_and_local_control_resolve_exactly_once() {
     );
 }
 
+// #1959: see the comment on `transient_reader_error_recovers_and_esc_resolves_through_the_tty_path`.
+#[serial_test::serial(prompt_stdin)]
 #[test]
 fn ctrl_c_after_a_recoverable_reader_error_sets_cancel_and_exit() {
     // A reader error, then re-arm, then Ctrl-C/Ctrl-D → run_web_wait returns
@@ -562,6 +575,8 @@ fn ctrl_c_after_a_recoverable_reader_error_sets_cancel_and_exit() {
     );
 }
 
+// #1959: see the comment on `transient_reader_error_recovers_and_esc_resolves_through_the_tty_path`.
+#[serial_test::serial(prompt_stdin)]
 #[test]
 fn repeated_interrupted_keeps_the_reader_and_paces_without_spinning() {
     // EINTR returns immediately; the SAME reader is retried (not dropped) and
@@ -626,6 +641,8 @@ fn repeated_interrupted_keeps_the_reader_and_paces_without_spinning() {
     assert!(sleeps.get() < 10_000, "bounded: {}", sleeps.get());
 }
 
+// #1959: see the comment on `transient_reader_error_recovers_and_esc_resolves_through_the_tty_path`.
+#[serial_test::serial(prompt_stdin)]
 #[test]
 fn an_initial_unsupported_still_retries_and_recovers() {
     // A terminal-loss race at the FIRST acquisition (Unsupported) must NOT
@@ -674,6 +691,8 @@ fn an_initial_unsupported_still_retries_and_recovers() {
     );
 }
 
+// #1959: see the comment on `transient_reader_error_recovers_and_esc_resolves_through_the_tty_path`.
+#[serial_test::serial(prompt_stdin)]
 #[test]
 fn a_post_live_unsupported_keeps_retrying_and_recovers() {
     // A gate built for an interactive session that momentarily loses its
@@ -2069,6 +2088,8 @@ fn close_out_message_reflects_the_rotation_kind() {
 ///
 /// So the terminal operator could abandon the turn but not decide it, while a
 /// browser they might not have open could.
+// #1959: see the comment on `transient_reader_error_recovers_and_esc_resolves_through_the_tty_path`.
+#[serial_test::serial(prompt_stdin)]
 #[test]
 fn a_typed_terminal_answer_decides_the_offer_instead_of_being_dropped() {
     let (_r, _w, store, conv) = store_and_conv();
@@ -2132,6 +2153,8 @@ fn a_typed_terminal_answer_decides_the_offer_instead_of_being_dropped() {
 ///
 /// A losing ABORT may silently hand back the winner's action — the operator
 /// asked to leave, not to decide. A losing ANSWER may not.
+// #1959: see the comment on `transient_reader_error_recovers_and_esc_resolves_through_the_tty_path`.
+#[serial_test::serial(prompt_stdin)]
 #[test]
 fn a_terminal_answer_that_loses_to_the_web_is_told_it_lost() {
     let (_r, _w, store, conv) = store_and_conv();
@@ -2192,6 +2215,8 @@ fn a_terminal_answer_that_loses_to_the_web_is_told_it_lost() {
 
 /// The twin. Without it, a notice emitted unconditionally — on every answer,
 /// winning or losing — would satisfy the test above.
+// #1959: see the comment on `transient_reader_error_recovers_and_esc_resolves_through_the_tty_path`.
+#[serial_test::serial(prompt_stdin)]
 #[test]
 fn a_terminal_answer_that_wins_is_told_nothing() {
     let (_r, _w, store, conv) = store_and_conv();

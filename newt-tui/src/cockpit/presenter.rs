@@ -1350,7 +1350,13 @@ mod terminal_acceptance {
     /// The three properties #1744 turns on, proven on one real terminal with
     /// one cockpit: Ctrl-C's two tiers, a modal opening underneath it, and the
     /// terminal handed back exactly as it was found.
-    #[serial_test::serial(tty_arbiter)]
+    ///
+    /// #1959: also serialized on `prompt_stdin` — this test constructs a real
+    /// `PromptWindow` via `Terminal::suspend_for_prompt`, which bumps the same
+    /// process-global counter
+    /// `permission_prompt_tests::headless_and_piped_sessions_never_construct_a_prompt_window`
+    /// asserts is untouched.
+    #[serial_test::serial(tty_arbiter, prompt_stdin)]
     #[test]
     fn the_cockpit_owns_the_terminal_correctly_and_gives_it_back() {
         let tty = TestTty::install();
