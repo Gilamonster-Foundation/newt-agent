@@ -104,16 +104,27 @@ pub(crate) fn dispatch(
                     _ => None,
                 },
             };
+            // #1981: ABSORBED into `/settings edit-mode`. These verbs still
+            // work — operators have muscle memory, and a removed command that
+            // says "unknown" is worse than the four verbs were — but they no
+            // longer own a mutation of their own. Everything routes through
+            // `settings_form::apply`, which is the single site a provenance
+            // receipt can attach to (#1965). Leaving the old `set_var` here
+            // would make "one mutation path" aspirational rather than true.
+            use crate::settings_form::{self, Field};
             match want {
                 Some(m) => {
-                    // Under the process-env lock (#1850); the editor is
-                    // rebuilt right after this returns, before any further
-                    // input is read.
-                    newt_core::process_env::set_var("NEWT_EDIT_MODE", m);
-                    print_newt(&format!("edit mode: {m}"), color, verbose);
+                    match settings_form::apply(Field::EditMode, m) {
+                        Ok(msg) | Err(msg) => print_newt(&msg, color, verbose),
+                    }
+                    print_newt(
+                        &settings_form::moved_notice(cmd, Field::EditMode),
+                        color,
+                        verbose,
+                    );
                 }
                 None => print_newt(
-                    "usage: /edit-mode <vi|emacs|nano>  (or just /vi, /emacs, /nano)",
+                    "usage: /settings edit-mode <vi|emacs|nano>  (or just /vi, /emacs, /nano)",
                     color,
                     verbose,
                 ),

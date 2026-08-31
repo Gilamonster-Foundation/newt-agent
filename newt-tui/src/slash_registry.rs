@@ -72,13 +72,13 @@ pub(crate) struct SlashCommand {
     /// `|` groups, so they are part of the surface a ratchet must count.
     pub(crate) aliases: &'static [&'static str],
     pub(crate) family: Family,
-    // Read by the ratchet and by the decision doc, not yet by the dispatch:
-    // `disposition` is what `/settings` will consult to build its form, and
-    // `receipt` is the #1965 debt it will pay down. `cfg_attr` rather than a
-    // bare `allow` so the exemption disappears the moment a production reader
-    // exists — and it is scoped to these two fields, not the module.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Read in PRODUCTION by `fallthrough_message`, which names where an
+    /// absorbed verb's setting now lives. The exemption this carried in the
+    /// previous commit is retired.
     pub(crate) disposition: Disposition,
+    /// Still ratchet-only: this is the #1965 debt, and nothing reads it until
+    /// `settings_form::apply` actually writes a receipt. The exemption is now
+    /// scoped to this ONE field, and names exactly what retires it.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) receipt: Receipt,
 }
@@ -155,6 +155,17 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Family::Meta,
         Disposition::Keep,
         Receipt::None_,
+    ),
+    // #1981: the typed settings form the knob verbs are absorbed into. A
+    // Keep: it PERFORMS (it asks and it writes), it does not merely hold a
+    // value. Receipt::Missing because `apply` is the chokepoint where one
+    // will land, and does not yet.
+    cmd(
+        "settings",
+        &[],
+        Family::Meta,
+        Disposition::Keep,
+        Receipt::Missing,
     ),
     cmd(
         "config",
@@ -570,6 +581,11 @@ pub(crate) fn lookup(token: &str) -> Option<&'static SlashCommand> {
 /// "unknown" (#1981), because operators have muscle memory.
 pub(crate) fn fallthrough_message(token: &str) -> String {
     match lookup(token) {
+        // An absorbed setting names its new home, not its old handler.
+        Some(command) if command.disposition == Disposition::Absorb => format!(
+            "/{token} sets a value that now lives in /settings {}",
+            command.name
+        ),
         Some(command) => format!(
             "/{token} is a known command ({:?} family) but nothing handled it \
              here — this is a routing bug, not a typo. Please report it.",
@@ -674,17 +690,27 @@ mod tests {
     ///
     /// Walked from the dispatch, not from `help_lines()`: the help had
     /// already drifted by eleven undocumented commands when this was armed.
+    ///
+    /// **Slice 1 raised these by one, and that is honest rather than a
+    /// weakening.** `/settings` is a net ADDITION: it absorbs the editor-mode
+    /// family, but `/vi`, `/emacs`, `/nano` and `/edit-mode` remain reachable
+    /// as shims, because a removed command that answers "unknown" is worse
+    /// than the four verbs were. The reduction lands when the deprecation
+    /// window closes and the shims are retired — four tokens and one command
+    /// come off then, and this bound comes down with them. Raising a ratchet
+    /// is allowed exactly when the growth is the plan; it is not allowed to
+    /// make a surprise go away.
     #[test]
     fn the_registered_surface_only_shrinks() {
         assert!(
-            COMMANDS.len() <= 64,
+            COMMANDS.len() <= 65,
             "the slash surface GREW to {} commands. #1981 is a reduction: a \
              new command needs an argument for why it is not a field of \
              /settings or a subcommand of an existing verb",
             COMMANDS.len()
         );
         assert!(
-            all_tokens().len() <= 78,
+            all_tokens().len() <= 79,
             "the slash surface GREW to {} tokens",
             all_tokens().len()
         );
@@ -776,7 +802,7 @@ mod tests {
             .filter(|c| matches!(c.receipt, Receipt::Missing))
             .count();
         assert!(
-            missing <= 33,
+            missing <= 34,
             "{missing} state-mutating commands record nothing durable — that \
              is more than when #1981 armed this. A new state mutator needs a \
              receipt destination, not another silent write"
