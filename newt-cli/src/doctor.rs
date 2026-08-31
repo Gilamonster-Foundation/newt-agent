@@ -17,15 +17,43 @@ fn security_posture_lines(report: &SecurityReport) -> Vec<String> {
     lines
 }
 
-pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
+pub async fn run(config_path: Option<&Path>, fix: bool) -> anyhow::Result<()> {
     println!("newt doctor — checking backends\n");
 
+    // #1951: a resolution failure is exactly what doctor exists to diagnose —
+    // `?` here used to end the whole command with that same failure before a
+    // single line of diagnosis printed, which is the defect an operator hit
+    // live (a legacy backend drop-in newt could not attribute). Render it as
+    // a finding and keep going with everything that does not need a resolved
+    // config; only the sections built from `config` below are skipped.
     let config = match config_path {
-        Some(p) => Config::load(p)?,
-        None => Config::resolve()?,
+        Some(p) => Config::load(p),
+        None => Config::resolve(),
+    };
+    let config = match config {
+        Ok(c) => Some(c),
+        Err(e) => {
+            println!("FINDING: config did not resolve — {e}\n");
+            None
+        }
     };
 
-    println!("Configured backends:");
+    // File-level drop-in diagnostics run regardless: they are the ONLY
+    // visibility left once resolution has failed, and per-file rather than
+    // aggregate, so a second bad file is not hidden behind the first the way
+    // `Config::resolve`'s merge (which stops at its first unattributable
+    // file) would hide it.
+    diagnose_backend_dropins(fix, config.is_some()).await;
+
+    let Some(config) = config else {
+        println!(
+            "\n(backend/provider/DGX/MCP checks skipped — config did not resolve; \
+             see the finding above)"
+        );
+        return Ok(());
+    };
+
+    println!("\nConfigured backends:");
     for backend in &config.backends {
         // #1212: probe by the backend's declared KIND via the BackendApi trait
         // — an openai/vLLM backend answers `/v1/models`, not Ollama's
@@ -195,6 +223,158 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Every `<dir>/backends/` directory [`Config::resolve`]'s merge reads, home
+/// before project (the same precedence), returned once each even if the
+/// project config happens to resolve to the same directory as home.
+fn backend_dropin_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = Config::user_config_dir() {
+        dirs.push(dir.join("backends"));
+    }
+    if let Some(proj) = Config::project_config_path() {
+        if let Some(parent) = proj.parent() {
+            let dir = parent.join("backends");
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
+/// `newt doctor`'s file-level backend drop-in diagnostics (#1951): parseable,
+/// attributable (operator config vs probe residue), and shadowed — the three
+/// questions [`Config::resolve`]'s merge answers only implicitly, by either
+/// succeeding or aborting on the first file it cannot place. Doctor answers
+/// them explicitly, per file, so one unattributable drop-in does not hide a
+/// problem in a sibling the way the merge's early return would, and so this
+/// still runs when resolution as a whole failed — which is exactly when it
+/// is needed most (see the finding printed above this in [`run`]).
+///
+/// `config_resolved` gates the live endpoint probe: a resolved config already
+/// probes every merged backend in "Configured backends:" below, so probing
+/// again here would just repeat that output. When resolution failed, that
+/// section never runs at all, and this is the only liveness check an
+/// operator gets.
+async fn diagnose_backend_dropins(fix: bool, config_resolved: bool) {
+    println!("Backend drop-ins:");
+    let mut seen_stems: std::collections::HashMap<String, std::path::PathBuf> =
+        std::collections::HashMap::new();
+    let mut any = false;
+    for dir in backend_dropin_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut paths: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            any = true;
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if let Some(shadowed) = seen_stems.get(stem) {
+                    println!(
+                        "  {} — SHADOWED by {} (same name, lower precedence; never read)",
+                        shadowed.display(),
+                        path.display()
+                    );
+                } else {
+                    seen_stems.insert(stem.to_string(), path.clone());
+                }
+            }
+
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    println!("  {} — FINDING: cannot read ({e})", path.display());
+                    continue;
+                }
+            };
+            match newt_core::classify_backend_dropin(&text) {
+                Ok(ownership) => {
+                    let label = match ownership {
+                        newt_core::DropinOwnership::Operator => "operator",
+                        newt_core::DropinOwnership::Probe => "probe",
+                        _ => "unknown ownership (newer variant than this build knows)",
+                    };
+                    println!("  {} — OK ({label})", path.display());
+                    if !config_resolved {
+                        if let Ok(backend) = toml::from_str::<newt_core::BackendConfig>(&text) {
+                            if !backend.endpoint.is_empty()
+                                && backend.kind != Some(newt_core::BackendKind::Embedded)
+                            {
+                                let status = probe_configured_backend(&backend).await;
+                                println!("    live: {status}");
+                            }
+                        }
+                    }
+                }
+                Err(reason) => {
+                    println!("  {} — FINDING: {reason}", path.display());
+                    if fix {
+                        repair_ambiguous_dropin(&path, &text).await;
+                    }
+                }
+            }
+        }
+    }
+    if !any {
+        println!("  (none)");
+    }
+}
+
+/// Offer the interactive repair for a drop-in doctor could not attribute:
+/// claim it as operator configuration, or discard it as probe residue —
+/// mirroring `newt dgx adopt`'s three-way drift menu (the one existing
+/// non-TUI consumer of [`newt_core::InteractionDefinition`]) rather than
+/// inventing a second convention. Checks `is_tty` itself, before requesting
+/// the terminal, the same way that menu does — a piped or headless run
+/// refuses to guess (C0b) and reports only, exactly as without `--fix`.
+async fn repair_ambiguous_dropin(path: &Path, text: &str) {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() {
+        println!("    --fix needs a terminal to choose — refusing to guess, nothing changed");
+        return;
+    }
+    let menu = newt_core::interaction_form::menu(
+        format!("{}: operator record or probe residue?", path.display()),
+        "carries the old newt-adopt probe marker plus operator-looking fields — \
+         ambiguous, so nothing changes until you choose",
+        &[
+            (
+                "o",
+                "claim as operator config (tag record = \"operator_v1\", keep every field)",
+            ),
+            (
+                "d",
+                "discard as probe residue (delete the file; newt re-probes on next use)",
+            ),
+        ],
+    );
+    let window = newt_core::tty::Terminal::suspend_for_prompt();
+    let picked = newt_core::interaction_terminal::resolve_on_terminal(&window, &menu);
+    match picked.as_ref().map(|id| id.as_str()) {
+        Some("o") => match newt_core::claim_backend_dropin_as_operator(text) {
+            Ok(claimed) => {
+                match newt_core::atomic_fs::ResolvedPath::resolve(path)
+                    .and_then(|dest| dest.atomic_write(claimed.as_bytes()))
+                {
+                    Ok(()) => println!("    fixed: claimed as operator configuration"),
+                    Err(e) => println!("    fix failed: {e:#}"),
+                }
+            }
+            Err(e) => println!("    fix failed: {e}"),
+        },
+        Some("d") => match std::fs::remove_file(path) {
+            Ok(()) => println!("    fixed: deleted (probe residue) — newt re-probes on next use"),
+            Err(e) => println!("    fix failed: {e}"),
+        },
+        _ => println!("    no repair chosen — file left as-is"),
+    }
 }
 
 async fn probe_dgx(dgx: &DgxConfig) {
