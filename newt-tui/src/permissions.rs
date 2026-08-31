@@ -390,16 +390,57 @@ pub(crate) fn prompt_permission_choice(
 /// It denies rather than panicking because this runs with the operator's
 /// answer already in hand; a panic here would take the session down
 /// mid-decision.
-fn decode_answer(definition: &InteractionDefinition, answer: &str) -> PromptChoice {
-    let Some(options) = definition.controls.iter().find_map(|c| match &c.kind {
+/// The typed line resolved against the definition's own option set, or
+/// `None` when it names no offered option.
+///
+/// Split out of [`decode_answer`] rather than duplicated: the key policy
+/// ("a" is allow-once, "A" is allow-permanently, case-exact) lives in
+/// `resolve_typed` and must have exactly one reader. The two callers differ
+/// only in what they do with an unrecognized line.
+fn resolve_answer(definition: &InteractionDefinition, answer: &str) -> Option<PromptChoice> {
+    let options = definition.controls.iter().find_map(|c| match &c.kind {
         newt_core::ControlKind::Choice { options } => Some(options),
         _ => None,
-    }) else {
-        return PromptChoice::Deny;
-    };
+    })?;
     newt_interaction::binding::resolve_typed(options, answer)
         .and_then(|option| action_for_option(option.as_str()))
-        .unwrap_or(PromptChoice::Deny)
+}
+
+fn decode_answer(definition: &InteractionDefinition, answer: &str) -> PromptChoice {
+    // The TERMINAL-ONLY path, where the operator is blocked on answering and
+    // a bare Enter is the documented "deny (default)".
+    resolve_answer(definition, answer).unwrap_or(PromptChoice::Deny)
+}
+
+/// Everything `run_web_wait` touches outside the store and the window.
+///
+/// Bundled rather than passed loose because there are now four of them and
+/// they are one idea: the world the wait loop runs against. Each exists so a
+/// test can drive the loop with no terminal, no wall clock and no real sleep
+/// — and, since C4b, no real stdout either, so "the losing operator was
+/// told" is provable in the mocked tier rather than only in a PTY.
+struct WebWaitIo<'a, 'w> {
+    /// Re-arm the control reader; a fresh one after a transient failure.
+    reacquire: &'a mut dyn FnMut() -> io::Result<Box<dyn ControlReader + 'w>>,
+    /// The clock. Injected so deadline tests need no wall clock (#1953).
+    now: &'a dyn Fn() -> Instant,
+    /// Pace the loop.
+    sleep: &'a mut dyn FnMut(Duration),
+    /// Speak to the operator.
+    notify: &'a mut dyn FnMut(&str),
+}
+
+/// What a losing terminal operator is told.
+///
+/// Pure, so the wording is testable without a terminal; the EMISSION is
+/// proven separately by injecting the sink, because a message nobody sends
+/// is the same defect as no message at all.
+fn lost_to_web_message(mine: PromptChoice, winner: PromptChoice) -> String {
+    format!(
+        "the web answered first — `{}` was applied, not your `{}`",
+        winner.as_str(),
+        mine.as_str()
+    )
 }
 
 fn decision_scope(choice: PromptChoice) -> &'static str {
@@ -672,6 +713,30 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
         // B0b-2 (#1846): publish the OFFER — the definition AND the instance
         // that binds it — so the answer is validated against the offer that
         // was actually published, not one minted at answer time.
+        // C4b (#1944): the offer is open to BOTH surfaces, and its option set
+        // is scoped to the NARROWER of them.
+        //
+        // #1894 framed this as publishing the terminal SUPERSET and having
+        // each view filter what it renders. The inverse is smaller and
+        // safer. One instance means one definition, because the definition
+        // digest is inside the instance's `ContentId` — so the choice is
+        // which audience's option set both surfaces share. Scoping to the
+        // INTERSECTION makes every rendered option answerable by whoever is
+        // looking at it, which turns `binding.rs:462`'s `ActionNotEligible`
+        // from a backstop that fires in normal use into a refusal that is
+        // unreachable by construction. The superset would instead put
+        // `Allow permanently` on the web card and refuse it on submit — a
+        // button that always fails, which is #1536's defect, not a cosmetic
+        // one.
+        //
+        // Nothing regresses. Until now the terminal operator could not
+        // answer AT ALL while the web was attached — only Back/Exit — so
+        // gaining allow-once / session / deny is a strict improvement over
+        // zero. The durable actions (`A`, `D`, `P`) remain available on the
+        // web-detached path, where they always were. Widening the offer to
+        // carry them for BOTH surfaces means a per-view render filter and
+        // moving the web card's goldens; that is a separate slice with its
+        // own visible change, not a rider on this one.
         let definition = permission_definition(req, &self.danger, Audience::Web);
         // D0 (#1878): the renderability precondition that stood here is GONE,
         // on the authority of its own comment — "this is a renderability
@@ -689,7 +754,7 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
             &self.conversation_id,
             &definition,
             tier,
-            &[Audience::Web],
+            &[Audience::Terminal, Audience::Web],
         ) {
             Ok(id) => id,
             Err(_) => return (PromptChoice::Deny, "web-unavailable"),
@@ -704,9 +769,18 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
                     format!("{note}\n{MODAL_CONTROL_HINT}")
                 }
             });
+        // C4b (#1944): RENDER the offer, not just an "awaiting…" line.
+        //
+        // The operator can now answer this, and a capability nobody can see
+        // is the failure this epic keeps paying for. Until now the terminal
+        // showed only that it was waiting, because waiting was all it could
+        // do. It shows the options because it can now act on them, through
+        // the same canonical projection the terminal-only path renders (C0a)
+        // — one definition, one rendering, whichever surface is looking.
         w.notice(&newt_line(
             &format!(
-                "awaiting a decision from the web for `{}`…\n{note}",
+                "{}\n`{}` — you or the web; whoever answers first decides.\n{note}",
+                plain::render(&definition),
                 req.target
             ),
             self.color,
@@ -718,10 +792,18 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
         self.run_web_wait(
             store,
             &request_id,
+            &definition,
             w,
-            move || modal_prompt_controls(w).map(|r| Box::new(r) as Box<dyn ControlReader + '_>),
-            Instant::now,
-            std::thread::sleep,
+            &mut WebWaitIo {
+                reacquire: &mut move || {
+                    modal_prompt_controls(w).map(|r| Box::new(r) as Box<dyn ControlReader + '_>)
+                },
+                now: &Instant::now,
+                sleep: &mut std::thread::sleep,
+                notify: &mut |message| {
+                    w.notice(&newt_line(message, self.color, self.verbose)).ok();
+                },
+            },
         )
     }
 
@@ -749,11 +831,16 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
         &self,
         store: &newt_core::ConversationStore,
         request_id: &str,
+        definition: &InteractionDefinition,
         w: &'w newt_core::tty::PromptWindow,
-        mut reacquire: impl FnMut() -> io::Result<Box<dyn ControlReader + 'w>>,
-        now: impl Fn() -> Instant,
-        mut sleep: impl FnMut(Duration),
+        io_: &mut WebWaitIo<'_, 'w>,
     ) -> (PromptChoice, &'static str) {
+        let WebWaitIo {
+            reacquire,
+            now,
+            sleep,
+            notify,
+        } = io_;
         enum ReaderState<'a> {
             Live(Box<dyn ControlReader + 'a>),
             Retrying { next_attempt: Instant },
@@ -808,7 +895,25 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
                         )
                         .unwrap_or((PromptChoice::Exit, "web-aborted"));
                 }
-                // A typed line or EOF at a web prompt is ignored; we polled.
+                // C4b (#1944): a typed line that names an offered option is
+                // the operator DECIDING, and it contends for the same CAS the
+                // web does.
+                //
+                // Only a RESOLVABLE line decides. An empty line or an
+                // unrecognized key stays ignored, as it is today — this path
+                // deliberately does NOT reuse `decode_answer`'s fail-closed
+                // default. At a terminal-only prompt the operator is blocked
+                // on answering and a bare Enter meaning "deny (default)" is
+                // the documented contract; here there is a second responder
+                // and a deadline, so a bumped Enter silently denying a
+                // request would be a new way to lose work.
+                Some(Ok(Some(ModalLine::Line(answer)))) => {
+                    if let Some(action) = resolve_answer(definition, &answer) {
+                        return self.terminal_answer_choice(store, notify, request_id, action);
+                    }
+                    blocked = true;
+                }
+                // EOF, or a control we do not act on here; we polled.
                 Some(Ok(_)) => blocked = true,
                 Some(Err(e)) => {
                     if e.kind() == io::ErrorKind::Interrupted {
@@ -996,6 +1101,50 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
             .take_interaction_decision(conversation_id, request_id)
             .ok()
             .and_then(|action| action.map(|a| (a, decision_scope(a))))
+    }
+
+    /// Answer the offer AS THE TERMINAL, through the one CAS the web
+    /// contends for.
+    ///
+    /// The mirror of [`Self::web_abort_choice`], and deliberately built the
+    /// same way: try the transition, and if it was already resolved read the
+    /// winner rather than inventing an outcome. What differs is the second
+    /// half — a losing ABORT can hand back the winner's action silently,
+    /// because the operator asked to leave rather than to decide. A losing
+    /// ANSWER cannot: the operator made a decision, and letting the winner's
+    /// verdict pass as theirs is C3b's defect (#1536) with the surfaces
+    /// swapped. So the loser is told, on the terminal, before the value is
+    /// returned.
+    fn terminal_answer_choice(
+        &self,
+        store: &newt_core::ConversationStore,
+        notify: &mut dyn FnMut(&str),
+        request_id: &str,
+        action: PromptChoice,
+    ) -> (PromptChoice, &'static str) {
+        let outcome = store.answer_interaction_offer(
+            &self.conversation_id,
+            request_id,
+            action,
+            Audience::Terminal,
+        );
+        match outcome {
+            Ok(newt_core::store::AnswerOutcome::Answered) => (action, decision_scope(action)),
+            Ok(_) => {
+                // Lost the race, or the offer expired underneath us. Read the
+                // winner in the same way the abort path does.
+                match store.take_interaction_decision(&self.conversation_id, request_id) {
+                    Ok(Some(winner)) => {
+                        notify(&lost_to_web_message(action, winner));
+                        (winner, decision_scope(winner))
+                    }
+                    // Resolved with no readable answer (a cancel, or an
+                    // expiry): fail closed rather than guess.
+                    _ => (PromptChoice::Deny, "web-raced"),
+                }
+            }
+            Err(_) => (PromptChoice::Deny, "web-store-error"),
+        }
     }
 
     fn apply_control(&self, action: PromptChoice) {

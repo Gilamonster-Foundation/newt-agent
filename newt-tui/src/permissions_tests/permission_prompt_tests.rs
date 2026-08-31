@@ -207,6 +207,29 @@ fn stepping_clock(step: Duration) -> impl Fn() -> Instant {
 
 /// Publish a low-danger exec question and return its `request_id`.
 pub(super) fn publish_low_danger(store: &newt_core::ConversationStore, conv: &str) -> String {
+    publish_low_danger_for(store, conv, &[Audience::Web])
+}
+
+/// The same offer, open to both surfaces — what C4b's gate publishes.
+pub(super) fn publish_open_to_both(store: &newt_core::ConversationStore, conv: &str) -> String {
+    publish_low_danger_for(store, conv, &[Audience::Terminal, Audience::Web])
+}
+
+/// The definition `publish_low_danger` publishes, for the wait loop to decode
+/// typed answers against.
+pub(super) fn low_danger_definition() -> InteractionDefinition {
+    permission_definition(
+        &exec_request("bash"),
+        &danger::DangerTable::builtin(),
+        Audience::Web,
+    )
+}
+
+fn publish_low_danger_for(
+    store: &newt_core::ConversationStore,
+    conv: &str,
+    audiences: &[Audience],
+) -> String {
     let req = exec_request("bash");
     let definition = permission_definition(&req, &danger::DangerTable::builtin(), Audience::Web);
     store
@@ -214,7 +237,7 @@ pub(super) fn publish_low_danger(store: &newt_core::ConversationStore, conv: &st
             conv,
             &definition,
             newt_core::interaction_offer::OfferDanger::Low,
-            &[Audience::Web],
+            audiences,
         )
         .unwrap()
 }
@@ -284,15 +307,19 @@ fn transient_reader_error_recovers_and_esc_resolves_through_the_tty_path() {
     let (choice, scope) = gate.run_web_wait(
         &store,
         &request_id,
+        &low_danger_definition(),
         &win,
-        || {
-            readers
-                .pop_front()
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
-                .ok_or_else(broken)
+        &mut WebWaitIo {
+            reacquire: &mut || {
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
+            now: &stepping_clock(Duration::from_millis(50)),
+            sleep: &mut |_d| {},
+            notify: &mut |_m| {},
         },
-        stepping_clock(Duration::from_millis(50)),
-        |_d| {},
     );
     assert_eq!(choice, PromptChoice::Back);
     assert_eq!(scope, "control");
@@ -326,15 +353,19 @@ fn transient_reader_error_does_not_deny_when_a_web_verdict_arrives() {
     let (choice, _scope) = gate.run_web_wait(
         &store,
         &request_id,
+        &low_danger_definition(),
         &win,
-        || {
-            readers
-                .pop_front()
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
-                .ok_or_else(broken)
+        &mut WebWaitIo {
+            reacquire: &mut || {
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
+            now: &stepping_clock(Duration::from_millis(50)),
+            sleep: &mut |_d| {},
+            notify: &mut |_m| {},
         },
-        stepping_clock(Duration::from_millis(50)),
-        |_d| {},
     );
     assert_eq!(
         choice,
@@ -365,10 +396,14 @@ fn reader_failing_until_deadline_denies_without_busy_spin() {
     let (choice, scope) = gate.run_web_wait(
         &store,
         &request_id,
+        &low_danger_definition(),
         &win,
-        || Err::<Box<dyn newt_core::tty::ControlReader>, _>(broken()),
-        stepping_clock(Duration::from_millis(20)),
-        |_d| sleeps.set(sleeps.get() + 1),
+        &mut WebWaitIo {
+            reacquire: &mut || Err::<Box<dyn newt_core::tty::ControlReader>, _>(broken()),
+            now: &stepping_clock(Duration::from_millis(20)),
+            sleep: &mut |_d| sleeps.set(sleeps.get() + 1),
+            notify: &mut |_m| {},
+        },
     );
     assert_eq!(choice, PromptChoice::Deny);
     assert_eq!(scope, "web-timeout");
@@ -407,15 +442,19 @@ fn web_verdict_and_local_control_resolve_exactly_once() {
     let (choice, _s) = gate.run_web_wait(
         &store,
         &request_id,
+        &low_danger_definition(),
         &win,
-        || {
-            readers
-                .pop_front()
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
-                .ok_or_else(broken)
+        &mut WebWaitIo {
+            reacquire: &mut || {
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
+            now: &stepping_clock(Duration::from_millis(50)),
+            sleep: &mut |_d| {},
+            notify: &mut |_m| {},
         },
-        stepping_clock(Duration::from_millis(50)),
-        |_d| {},
     );
     assert_eq!(
         choice,
@@ -443,15 +482,19 @@ fn web_verdict_and_local_control_resolve_exactly_once() {
     let (choice2, _s2) = gate2.run_web_wait(
         &store2,
         &request_id2,
+        &low_danger_definition(),
         &win2,
-        || {
-            readers2
-                .pop_front()
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
-                .ok_or_else(broken)
+        &mut WebWaitIo {
+            reacquire: &mut || {
+                readers2
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
+            now: &stepping_clock(Duration::from_millis(50)),
+            sleep: &mut |_d| {},
+            notify: &mut |_m| {},
         },
-        stepping_clock(Duration::from_millis(50)),
-        |_d| {},
     );
     assert_eq!(choice2, PromptChoice::Back, "local abort won the race");
     // The request is resolved: a later web POST finds nothing to answer.
@@ -492,15 +535,19 @@ fn ctrl_c_after_a_recoverable_reader_error_sets_cancel_and_exit() {
     let (choice, _s) = gate.run_web_wait(
         &store,
         &request_id,
+        &low_danger_definition(),
         &win,
-        || {
-            readers
-                .pop_front()
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
-                .ok_or_else(broken)
+        &mut WebWaitIo {
+            reacquire: &mut || {
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
+            now: &stepping_clock(Duration::from_millis(50)),
+            sleep: &mut |_d| {},
+            notify: &mut |_m| {},
         },
-        stepping_clock(Duration::from_millis(50)),
-        |_d| {},
     );
     assert_eq!(choice, PromptChoice::Exit);
     // ask() applies the control on Back|Exit; Exit sets both signals.
@@ -545,16 +592,20 @@ fn repeated_interrupted_keeps_the_reader_and_paces_without_spinning() {
     let (choice, _s) = gate.run_web_wait(
         &store,
         &request_id,
+        &low_danger_definition(),
         &win,
-        || {
-            reacquired.set(reacquired.get() + 1);
-            readers
-                .pop_front()
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
-                .ok_or_else(broken)
+        &mut WebWaitIo {
+            reacquire: &mut || {
+                reacquired.set(reacquired.get() + 1);
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
+            now: &stepping_clock(Duration::from_millis(50)),
+            sleep: &mut |_d| sleeps.set(sleeps.get() + 1),
+            notify: &mut |_m| {},
         },
-        stepping_clock(Duration::from_millis(50)),
-        |_d| sleeps.set(sleeps.get() + 1),
     );
     assert_eq!(
         choice,
@@ -602,15 +653,19 @@ fn an_initial_unsupported_still_retries_and_recovers() {
     let (choice, _s) = gate.run_web_wait(
         &store,
         &request_id,
+        &low_danger_definition(),
         &win,
-        || {
-            outcomes
-                .pop_front()
-                .unwrap_or_else(|| Err(broken()))
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+        &mut WebWaitIo {
+            reacquire: &mut || {
+                outcomes
+                    .pop_front()
+                    .unwrap_or_else(|| Err(broken()))
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+            },
+            now: &stepping_clock(Duration::from_millis(50)),
+            sleep: &mut |_d| {},
+            notify: &mut |_m| {},
         },
-        stepping_clock(Duration::from_millis(50)),
-        |_d| {},
     );
     assert_eq!(
         choice,
@@ -648,15 +703,19 @@ fn a_post_live_unsupported_keeps_retrying_and_recovers() {
     let (choice, _s) = gate.run_web_wait(
         &store,
         &request_id,
+        &low_danger_definition(),
         &win,
-        || {
-            outcomes
-                .pop_front()
-                .unwrap_or_else(|| Err(broken()))
-                .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+        &mut WebWaitIo {
+            reacquire: &mut || {
+                outcomes
+                    .pop_front()
+                    .unwrap_or_else(|| Err(broken()))
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+            },
+            now: &stepping_clock(Duration::from_millis(50)),
+            sleep: &mut |_d| {},
+            notify: &mut |_m| {},
         },
-        stepping_clock(Duration::from_millis(50)),
-        |_d| {},
     );
     assert_eq!(
         choice,
@@ -1992,5 +2051,188 @@ fn close_out_message_reflects_the_rotation_kind() {
     assert!(
         !end_empty.contains("/resume"),
         "nothing to reopen: {end_empty}"
+    );
+}
+
+/// **C4b (#1944): the terminal is a responder, not just an abort key.**
+///
+/// With the web attached, `run_web_wait` already waits on BOTH sources — it
+/// polls the store every iteration and the control reader alongside it. The
+/// reader already yields `PromptLine::Line`, and `resolve_answer` already
+/// decodes it. The one thing standing between the operator and an answer was
+/// the arm that threw the line away:
+///
+/// ```text
+/// // A typed line or EOF at a web prompt is ignored; we polled.
+/// Some(Ok(_)) => blocked = true,
+/// ```
+///
+/// So the terminal operator could abandon the turn but not decide it, while a
+/// browser they might not have open could.
+#[test]
+fn a_typed_terminal_answer_decides_the_offer_instead_of_being_dropped() {
+    let (_r, _w, store, conv) = store_and_conv();
+    let request_id = publish_open_to_both(&store, &conv);
+    let mut readers: VecDeque<ScriptedReader> =
+        VecDeque::from([ScriptedReader(VecDeque::from([Ok(Some(ModalLine::Line(
+            "a".to_string(),
+        )))]))]);
+    let mut state = PermissionPromptState {
+        web_store: Some(store.clone()),
+        ..Default::default()
+    };
+    let gate = web_gate!(
+        &mut state,
+        conv.clone(),
+        Duration::from_secs(3600),
+        None,
+        None
+    );
+    let win = Terminal::suspend_for_prompt();
+    let (choice, scope) = gate.run_web_wait(
+        &store,
+        &request_id,
+        &low_danger_definition(),
+        &win,
+        &mut WebWaitIo {
+            reacquire: &mut || {
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
+            now: &stepping_clock(Duration::from_millis(50)),
+            sleep: &mut |_d| {},
+            notify: &mut |_m| {},
+        },
+    );
+    assert_eq!(
+        choice,
+        PromptChoice::AllowOnce,
+        "the operator's typed answer did not decide the offer"
+    );
+    assert_eq!(scope, "once");
+    assert!(
+        store.pending_interaction_offer(&conv).unwrap().is_none(),
+        "the terminal answer did not resolve the published offer"
+    );
+    assert_eq!(
+        store.interaction_answered_by(&conv, &request_id).unwrap(),
+        Some(Audience::Terminal),
+        "the audit fact must name the terminal as the responder"
+    );
+}
+
+/// **C4b: a loser must lose visibly, on the terminal too.**
+///
+/// C3b (#1536) found that blanket-redirecting a losing no-JS POST told a web
+/// operator they had won. The broker makes the terminal the other side of
+/// that coin: if the web answers first, the operator who typed an answer must
+/// not be left believing theirs decided it.
+///
+/// A losing ABORT may silently hand back the winner's action — the operator
+/// asked to leave, not to decide. A losing ANSWER may not.
+#[test]
+fn a_terminal_answer_that_loses_to_the_web_is_told_it_lost() {
+    let (_r, _w, store, conv) = store_and_conv();
+    let request_id = publish_open_to_both(&store, &conv);
+    store
+        .answer_interaction_offer(&conv, &request_id, PromptChoice::Deny, Audience::Web)
+        .unwrap();
+    let mut readers: VecDeque<ScriptedReader> =
+        VecDeque::from([ScriptedReader(VecDeque::from([Ok(Some(ModalLine::Line(
+            "a".to_string(),
+        )))]))]);
+    let mut state = PermissionPromptState {
+        web_store: Some(store.clone()),
+        ..Default::default()
+    };
+    let gate = web_gate!(
+        &mut state,
+        conv.clone(),
+        Duration::from_secs(3600),
+        None,
+        None
+    );
+    let win = Terminal::suspend_for_prompt();
+    let mut told: Vec<String> = Vec::new();
+    let (choice, _scope) = gate.run_web_wait(
+        &store,
+        &request_id,
+        &low_danger_definition(),
+        &win,
+        &mut WebWaitIo {
+            reacquire: &mut || {
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
+            now: &stepping_clock(Duration::from_millis(50)),
+            sleep: &mut |_d| {},
+            notify: &mut |m| told.push(m.to_string()),
+        },
+    );
+    assert_eq!(
+        choice,
+        PromptChoice::Deny,
+        "the losing terminal answer was applied instead of the winner's"
+    );
+    assert_eq!(
+        told.len(),
+        1,
+        "the operator was not told they lost: {told:?}"
+    );
+    assert!(
+        told[0].contains("deny") && told[0].contains("allow_once"),
+        "the message must name the winner AND the operator's own answer: {}",
+        told[0]
+    );
+}
+
+/// The twin. Without it, a notice emitted unconditionally — on every answer,
+/// winning or losing — would satisfy the test above.
+#[test]
+fn a_terminal_answer_that_wins_is_told_nothing() {
+    let (_r, _w, store, conv) = store_and_conv();
+    let request_id = publish_open_to_both(&store, &conv);
+    let mut readers: VecDeque<ScriptedReader> =
+        VecDeque::from([ScriptedReader(VecDeque::from([Ok(Some(ModalLine::Line(
+            "a".to_string(),
+        )))]))]);
+    let mut state = PermissionPromptState {
+        web_store: Some(store.clone()),
+        ..Default::default()
+    };
+    let gate = web_gate!(
+        &mut state,
+        conv.clone(),
+        Duration::from_secs(3600),
+        None,
+        None
+    );
+    let win = Terminal::suspend_for_prompt();
+    let mut told: Vec<String> = Vec::new();
+    let (choice, _scope) = gate.run_web_wait(
+        &store,
+        &request_id,
+        &low_danger_definition(),
+        &win,
+        &mut WebWaitIo {
+            reacquire: &mut || {
+                readers
+                    .pop_front()
+                    .map(|r| Box::new(r) as Box<dyn newt_core::tty::ControlReader + '_>)
+                    .ok_or_else(broken)
+            },
+            now: &stepping_clock(Duration::from_millis(50)),
+            sleep: &mut |_d| {},
+            notify: &mut |m| told.push(m.to_string()),
+        },
+    );
+    assert_eq!(choice, PromptChoice::AllowOnce);
+    assert!(
+        told.is_empty(),
+        "an operator who WON was told they lost: {told:?}"
     );
 }
