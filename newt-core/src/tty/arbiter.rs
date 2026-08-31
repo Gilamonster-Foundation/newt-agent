@@ -1380,6 +1380,115 @@ mod tests {
         assert!(try_watch_stdin().is_some(), "released on drop");
     }
 
+    /// **#1959: the seal has exactly two doors, and both gates sit BELOW the
+    /// fork.**
+    ///
+    /// The seal's value is that its doors are enumerated and each is proven.
+    /// A second public constructor is fine; a second constructor that skipped
+    /// the protocol veto or the stdin token would be a hole, and the thing
+    /// that keeps both honest is that they delegate to ONE private builder
+    /// with the gates inside it.
+    ///
+    /// Stated as a source scan rather than a behaviour, because the property
+    /// is structural: "no future door can be added above the gates". A
+    /// behavioural test can only cover the doors that exist today.
+    ///
+    /// Production code only, and cut at the test module — the lesson
+    /// `config_panel::enter_panel_raw_mode_is_the_only_way_in` records the
+    /// hard way: this test lives IN the file it scans, so its own needles
+    /// would otherwise be counted.
+    #[test]
+    fn the_seal_has_exactly_two_doors_and_both_gates_sit_below_the_fork() {
+        let src = include_str!("arbiter.rs");
+        let production = src.split("\n#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            production.len() > 1000,
+            "the production cut read nothing; every count below would be vacuous"
+        );
+
+        assert_eq!(
+            production.matches("pub fn suspend_for_prompt(").count(),
+            1,
+            "the stdout door"
+        );
+        assert_eq!(
+            production.matches("pub fn suspend_for_prompt_to(").count(),
+            1,
+            "the File door (#1959)"
+        );
+        assert_eq!(
+            production
+                .matches("Self::suspend_for_prompt_with_output(")
+                .count(),
+            2,
+            "BOTH public doors must delegate to the one private builder — a \
+             third door, or a door that built a PromptWindow itself, would \
+             bypass the gates below"
+        );
+
+        // Call forms, not names: `prompts_permitted` is also DEFINED here and
+        // discussed in prose, and counting mentions would move whenever
+        // someone edited a comment.
+        let veto = "prompts_permitted(super::caps::protocol_mode())";
+        let acquire = "StdinToken::acquire()";
+        assert_eq!(production.matches(veto).count(), 1, "one veto, one place");
+        assert_eq!(
+            production.matches(acquire).count(),
+            1,
+            "one acquire, one place"
+        );
+
+        let fork = production
+            .find("fn suspend_for_prompt_with_output")
+            .expect("the private builder");
+        assert!(
+            production.find(veto).is_some_and(|at| at > fork),
+            "the protocol veto was hoisted ABOVE the fork — it would then \
+             cover only the door it sits in, and the other would prompt on a \
+             JSON-RPC wire"
+        );
+        assert!(
+            production.find(acquire).is_some_and(|at| at > fork),
+            "the stdin token was hoisted ABOVE the fork — one door would then \
+             ask without exclusive stdin"
+        );
+    }
+
+    /// **#1959: the File door takes the same exclusive stdin token.**
+    ///
+    /// The scan above proves the acquire is shared; this proves what sharing
+    /// it buys, through the same `prompt_stdin_active` observable
+    /// `watcher_and_prompt_exclude_each_other_on_stdin` uses for door one.
+    ///
+    /// `/dev/null` is a real fd, which the unit tier otherwise avoids —
+    /// `PromptOutput::File` takes a `std::fs::File` and offers no seam. It is
+    /// never written to here: the window is constructed and dropped, and the
+    /// assertions are all about stdin.
+    #[cfg(unix)]
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn the_file_door_takes_the_same_exclusive_stdin_token() {
+        assert!(!prompt_stdin_active(), "stdin must start idle");
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null");
+
+        let window = Terminal::suspend_for_prompt_to(sink);
+        assert!(
+            prompt_stdin_active(),
+            "the File door must take the prompt's stdin token, like the stdout door"
+        );
+        assert!(
+            try_watch_stdin().is_none(),
+            "and hold it EXCLUSIVELY — the turn watcher must not read underneath it"
+        );
+
+        drop(window);
+        assert!(!prompt_stdin_active(), "released on drop");
+        assert!(try_watch_stdin().is_some(), "the watcher may read again");
+    }
+
     /// The test stub is inert: it arbitrates nothing, so it cannot leave the
     /// process suspended for every later test.
     #[serial_test::serial(tty_arbiter)]
