@@ -1126,7 +1126,7 @@ mod fallthrough_tests {
 
         let advertised: std::collections::BTreeSet<&str> = crate::help_lines()
             .iter()
-            .filter_map(|l| l.trim_start().split_whitespace().next())
+            .filter_map(|l| l.split_whitespace().next())
             .filter_map(|tok| tok.strip_prefix('/'))
             .collect();
         // Positive read assertion: an empty parse must fail, not pass.
