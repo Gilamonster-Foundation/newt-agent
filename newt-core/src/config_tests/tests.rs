@@ -7,11 +7,20 @@ use std::io::Write;
 /// Test seam for loader semantics: run the backend assembly over
 /// `cfg.backends` plus `dirs` (in order), exactly the way
 /// `resolve_runtime_unpublished` does — effective backends written
-/// back, receipts returned for inspection.
-fn merge_for_test(
+/// back, receipts AND warnings returned for inspection.
+///
+/// #1984: the ONE real implementation. [`merge_for_test`] and
+/// [`merge_for_test_with_warnings`] are thin wrappers over this — the
+/// former preserves the pre-#1984 signature so its ~20 unrelated callers
+/// need no changes; the latter is for the handful of tests that assert on
+/// warning TEXT, which they now read as a returned value instead of
+/// scraping a global tracing subscriber (see the doc on
+/// `BackendAssembly::warnings` in `config.rs` for why that scrape was
+/// flaky).
+fn merge_for_test_inner(
     cfg: &mut Config,
     dirs: &[&Path],
-) -> std::result::Result<Vec<BackendResolutionReceipt>, String> {
+) -> std::result::Result<(Vec<BackendResolutionReceipt>, Vec<String>), String> {
     let mut assembly = BackendAssembly::new(std::mem::take(&mut cfg.backends))?;
     for dir in dirs {
         assembly.merge_dir(dir)?;
@@ -19,60 +28,60 @@ fn merge_for_test(
     if assembly.operator_configured() {
         cfg.backend_fallback = false;
     }
+    let warnings = assembly.warnings().to_vec();
     let (backends, receipts) = assembly.finish();
     cfg.backends = backends;
-    Ok(receipts)
+    Ok((receipts, warnings))
+}
+
+fn merge_for_test(
+    cfg: &mut Config,
+    dirs: &[&Path],
+) -> std::result::Result<Vec<BackendResolutionReceipt>, String> {
+    merge_for_test_inner(cfg, dirs).map(|(receipts, _warnings)| receipts)
+}
+
+fn merge_for_test_with_warnings(
+    cfg: &mut Config,
+    dirs: &[&Path],
+) -> std::result::Result<(Vec<BackendResolutionReceipt>, Vec<String>), String> {
+    merge_for_test_inner(cfg, dirs)
 }
 
 /// Test seam for the CLI-request phase: assembly over `cfg.backends` +
 /// `dirs` + an explicit request — the whole pipeline minus file
-/// layering, receipts returned.
-fn resolve_for_test(
+/// layering, receipts AND warnings returned. Same #1984 wrapper shape as
+/// [`merge_for_test_inner`] above, for the same reason.
+fn resolve_for_test_inner(
     cfg: &mut Config,
     dirs: &[&Path],
     over: Option<BackendOverride>,
-) -> std::result::Result<Vec<BackendResolutionReceipt>, String> {
+) -> std::result::Result<(Vec<BackendResolutionReceipt>, Vec<String>), String> {
     let mut assembly = BackendAssembly::new(std::mem::take(&mut cfg.backends))?;
     for dir in dirs {
         assembly.merge_dir(dir)?;
     }
     let _slot = assembly.apply_request(over, cfg.default_backend.as_deref())?;
+    let warnings = assembly.warnings().to_vec();
     let (backends, receipts) = assembly.finish();
     cfg.backends = backends;
-    Ok(receipts)
+    Ok((receipts, warnings))
 }
 
-/// Capture every WARN+ tracing message emitted by `f` — the loader's
-/// diagnostics are warnings, so "warns here, NOT there" regressions
-/// must observe them, not just return values. Thread-local subscriber:
-/// parallel-test safe.
-fn captured_warnings<T>(f: impl FnOnce() -> T) -> (T, String) {
-    #[derive(Clone, Default)]
-    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for Buf {
-        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(data);
-            Ok(data.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self {
-            self.clone()
-        }
-    }
-    let buf = Buf::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .with_writer(buf.clone())
-        .with_ansi(false)
-        .finish();
-    let out = tracing::subscriber::with_default(subscriber, f);
-    let text = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
-    (out, text)
+fn resolve_for_test(
+    cfg: &mut Config,
+    dirs: &[&Path],
+    over: Option<BackendOverride>,
+) -> std::result::Result<Vec<BackendResolutionReceipt>, String> {
+    resolve_for_test_inner(cfg, dirs, over).map(|(receipts, _warnings)| receipts)
+}
+
+fn resolve_for_test_with_warnings(
+    cfg: &mut Config,
+    dirs: &[&Path],
+    over: Option<BackendOverride>,
+) -> std::result::Result<(Vec<BackendResolutionReceipt>, Vec<String>), String> {
+    resolve_for_test_inner(cfg, dirs, over)
 }
 
 /// Pin the FULL config-resolution environment (`NEWT_CONFIG` removed,
@@ -3490,9 +3499,13 @@ fn exclusive_selection_of_another_backend_emits_no_orphan_probe_warning() {
         endpoint: Some("http://other:9".into()),
         ..Default::default()
     };
-    let (result, warnings) =
-        captured_warnings(|| resolve_for_test(&mut cfg, &[dir.path()], Some(over)));
-    result.unwrap();
+    // #1984: warnings are asserted as RETURNED VALUES now, not scraped off
+    // a global tracing subscriber (see `BackendAssembly::warnings`'s doc in
+    // config.rs). `.join("\n")` keeps every `.contains()`/`!.contains()`
+    // assertion below byte-for-byte unchanged from the pre-#1984 shape.
+    let (_receipts, warnings) =
+        resolve_for_test_with_warnings(&mut cfg, &[dir.path()], Some(over)).unwrap();
+    let warnings = warnings.join("\n");
     assert!(
         !warnings.contains("unconfigured") && !warnings.contains("delete the file"),
         "a valid cache for a disk-declared backend is not an orphan: {warnings}"
@@ -3507,9 +3520,9 @@ fn exclusive_selection_of_another_backend_emits_no_orphan_probe_warning() {
     )
     .unwrap();
     let mut cfg = base();
-    let (result, warnings) =
-        captured_warnings(|| resolve_for_test(&mut cfg, &[mismatch.path()], None));
-    result.unwrap();
+    let (_receipts, warnings) =
+        resolve_for_test_with_warnings(&mut cfg, &[mismatch.path()], None).unwrap();
+    let warnings = warnings.join("\n");
     assert!(
         warnings.contains("does not match"),
         "the real mismatch keeps its warning: {warnings}"
@@ -3519,8 +3532,9 @@ fn exclusive_selection_of_another_backend_emits_no_orphan_probe_warning() {
         backends: vec![],
         ..Default::default()
     };
-    let (result, warnings) = captured_warnings(|| resolve_for_test(&mut cfg, &[dir.path()], None));
-    result.unwrap();
+    let (_receipts, warnings) =
+        resolve_for_test_with_warnings(&mut cfg, &[dir.path()], None).unwrap();
+    let warnings = warnings.join("\n");
     assert!(warnings.contains("unconfigured"), "{warnings}");
 }
 
@@ -3831,8 +3845,10 @@ fn a_both_destination_declaration_is_rejected_everywhere() {
         }],
         ..Default::default()
     };
-    let (result, warnings) = captured_warnings(|| merge_for_test(&mut cfg, &[dir.path()]));
-    result.unwrap();
+    // #1984: warnings as a returned value, not a scraped log — see
+    // `BackendAssembly::warnings`'s doc in config.rs.
+    let (_receipts, warnings) = merge_for_test_with_warnings(&mut cfg, &[dir.path()]).unwrap();
+    let warnings = warnings.join("\n");
     assert!(warnings.contains("ONE destination"), "{warnings}");
     assert_eq!(cfg.backends[0].endpoint, "http://old:1", "prior survives");
 }
@@ -4009,6 +4025,15 @@ fn claiming_refuses_a_record_table() {
 
 /// `model_path = ""` is not a destination: an empty-path drop-in cannot
 /// pass the destination check and strip a valid earlier declaration.
+///
+/// #1984: asserts on the RETURNED warning value, not a scraped log — this
+/// exact test flaked on PR #1982 (which touched zero config files) because
+/// the pre-#1984 `captured_warnings` helper's per-test
+/// `tracing::subscriber::with_default` capture raced tracing's
+/// process-wide callsite interest cache against sibling tests in this file
+/// doing the same thing concurrently; the returned-value shape has no
+/// global dispatcher in the loop to race. See `BackendAssembly::warnings`'s
+/// doc in config.rs for the full mechanism.
 #[test]
 fn an_empty_model_path_dropin_cannot_replace_a_declaration() {
     let dir = tempfile::tempdir().unwrap();
@@ -4026,11 +4051,12 @@ fn an_empty_model_path_dropin_cannot_replace_a_declaration() {
         }],
         ..Default::default()
     };
-    let (result, warnings) = captured_warnings(|| merge_for_test(&mut cfg, &[dir.path()]));
-    result.unwrap();
+    let (_receipts, warnings) = merge_for_test_with_warnings(&mut cfg, &[dir.path()]).unwrap();
     assert!(
-        warnings.contains("neither endpoint nor model_path"),
-        "{warnings}"
+        warnings
+            .iter()
+            .any(|w| w.contains("neither endpoint nor model_path")),
+        "{warnings:?}"
     );
     assert_eq!(cfg.backends[0].endpoint, "http://old:1");
     assert_eq!(cfg.backends[0].model.as_deref(), Some("declared"));
