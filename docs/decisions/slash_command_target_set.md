@@ -75,12 +75,61 @@ change, which the issue's non-goals exclude ("Not a keybinding redesign"). It
 would cut 12 rows off the top-level count while removing no knob and adding no
 provenance, which is the count moving without the problem moving.
 
+## `/rounds`: a correction to this document (#1998)
+
+This section previously read:
+
+> `/rounds` is the command from #1965 itself and is still `Receipt::Missing`.
+> It is not absorbable as written: `double`, `reset`, `config` and `unlimited`
+> are relative and derived operations, not values, so it performs. It needs a
+> receipt destination of its own, not a `/settings` field.
+
+**That was half right and it drew the wrong conclusion.** The premise stands —
+`double` and `unlimited` really are relative operations, not values. But the
+conclusion conflated *the verb's affordances* with *the value it lands on*,
+which is precisely the confusion the `/psyche` row resolves one level up: a
+command is not one thing just because it is one word.
+
+So `/rounds` splits the same way. The verb **performs the derivation** —
+doubles the current effective cap, resolves `unlimited` against it, releases
+the override — and then the **value it resolved to goes through
+`settings_form::apply_and_record`** like every other setting. `/settings rounds
+50` and `/settings rounds auto` work; `/rounds double` still works and now
+leaves a receipt.
+
+Two things that made this possible rather than merely desirable:
+
+- The session override was a **local variable in `run_chat`**, which is why the
+  escalation #1965 documents was unrecoverable: a receipt writer cannot read a
+  local. It moved to `newt_core::tenacity` beside the other three inputs to
+  `resolve_tool_round_limit`, along with the configured baseline it is measured
+  against.
+- The form only knew closed vocabularies. It now also knows a **number**, so a
+  field whose value is `1..=10000` gets a text field instead of a menu — and is
+  still a typed `InteractionDefinition`, so it still renders on the plain
+  scroller, the RichTUI and the web.
+
+The receipt's `from`/`to` carry the whole `ToolRoundLimit` — #1982's derivation
+record, reused rather than re-declared — so the line says *320, from an
+override, over a configured 40, under relentless*, and every one of those
+fields is bound into its content address. The alias actually typed
+(`/rounds`, `/tool-rounds`, `/max-rounds`) is bound in too.
+
+`/rounds show` records nothing. It reads.
+
 ## What is still owed
 
-- `/rounds` is the command from #1965 itself and is still `Receipt::Missing`.
-  It is not absorbable as written: `double`, `reset`, `config` and `unlimited`
-  are relative and derived operations, not values, so it performs. It needs a
-  receipt destination of its own, not a `/settings` field.
+- **The headless `solve` path is still asymmetric, and #1998 does NOT close
+  it.** `newt-cli/src/solve.rs::solve_tool_round_limit` computes the same
+  effective cap and discards the derivation, because solve persists no per-turn
+  records. That is a different gap from this one: this is *an operator changing
+  a setting from the prompt* (an event, now journalled); that is *a run's
+  per-turn derivation* in a path with no turn records at all. Writing solve's
+  resolved cap into the settings journal would conflate "the operator changed a
+  setting" with "a run resolved a cap" and pollute the receipt shape —
+  `--max-rounds` is a flag, already recorded by the invocation carrying it. It
+  closes when solve grows turn persistence, and the comment in that file says
+  so on purpose.
 - The ratchet comes **down** by four tokens and one command when the editor
   shims (`/vi`, `/emacs`, `/nano`, `/edit-mode`) retire at the end of the
   deprecation window. Until then the surface is deliberately one command
@@ -162,10 +211,10 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/posture` | — | Tuning | absorb → `/settings posture` | **none — #1965** |
 | `/prompt` | — | Tuning | absorb → `/settings prompt` | **none — #1965** |
 | `/retrieval` | — | Tuning | absorb → `/settings retrieval` | **none — #1965** |
-| `/rounds` | `/tool-rounds` `/max-rounds` | Tuning | absorb → `/settings rounds` | **none — #1965** |
+| `/rounds` | `/tool-rounds` `/max-rounds` | Tuning | absorb → `/settings rounds` | `~/.newt/receipts.jsonl` |
 | `/tenacity` | — | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
 | `/thinking` | — | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
 
-**65 commands, 79 tokens.** Absorb 17 · keep 45 · panel 3. Receipts: journalled 6 · read-only 31 · **missing 28**.
+**65 commands, 79 tokens.** Absorb 17 · keep 45 · panel 3. Receipts: journalled 7 · read-only 31 · **missing 27**.
 
 <!-- END GENERATED -->

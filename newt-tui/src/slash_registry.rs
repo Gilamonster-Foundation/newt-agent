@@ -539,7 +539,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         &["tool-rounds", "max-rounds"],
         Family::Tuning,
         Disposition::Absorb,
-        Receipt::Missing,
+        Receipt::Journal,
     ),
     cmd(
         "tenacity",
@@ -755,6 +755,37 @@ mod tests {
         );
     }
 
+    /// **The session must not write the round cap behind the recorder** (#1998).
+    ///
+    /// `/rounds` is the one journalled setting whose verb still performs real
+    /// work before the write — it doubles, it resolves `unlimited`, it releases
+    /// — so the write is a separate step a future edit could quietly inline.
+    /// The other four fields are protected by `settings_form::apply` being
+    /// private; this one needs a count, because the setter it would call lives
+    /// in another crate and no visibility rule can reach it.
+    ///
+    /// ONE call is expected: `run_chat`'s reset-to-default at session start,
+    /// which is not an operator decision and correctly records nothing. A
+    /// second one means someone put the mutation back in the dispatch, and the
+    /// escalation stops leaving a receipt again.
+    #[test]
+    fn the_session_writes_the_round_cap_only_through_the_recorder() {
+        let chat = production(include_str!("chat.rs"));
+        let direct = chat.matches("set_session_tool_rounds(").count();
+        assert_eq!(
+            direct, 1,
+            "chat.rs writes the /rounds override directly {direct} times — exactly \
+             one is expected (the session-start reset). An operator's change goes \
+             through settings_form::apply_and_record or it leaves no receipt"
+        );
+        // Anti-vacuous: the recorded route really is the one in use, so the
+        // count above is not 1 because the feature was removed.
+        assert!(
+            chat.contains("settings_form::Field::Rounds"),
+            "no production caller applies the round cap through the form"
+        );
+    }
+
     /// Every registered token is still present in the dispatch.
     ///
     /// Deliberately a weak check, and named as one: containment cannot tell a
@@ -819,7 +850,7 @@ mod tests {
             .filter(|c| matches!(c.receipt, Receipt::Missing))
             .count();
         assert!(
-            missing <= 28,
+            missing <= 27,
             "{missing} state-mutating commands record nothing durable — that \
              is more than when #1981 armed this. A new state mutator needs a \
              receipt destination, not another silent write"

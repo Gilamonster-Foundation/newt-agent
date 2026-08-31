@@ -498,6 +498,32 @@ fn tool_round_limit_commands_parse_expected_forms() {
     assert!(parse_tool_round_limit_command("/rounds many").is_err());
 }
 
+/// **The verb the operator typed survives the parse** (#1998).
+///
+/// All three names reach one handler, so the parser used to drop which one
+/// matched — and then a receipt could only ever say `/rounds`, for a session
+/// where the operator typed `/max-rounds`. The verb is bound into the
+/// receipt's content address, so losing it here loses it everywhere.
+#[test]
+fn the_typed_rounds_verb_survives_the_parse() {
+    for (input, verb, arg) in [
+        ("/rounds 320", "rounds", "320"),
+        ("/tool-rounds 50", "tool-rounds", "50"),
+        ("/max-rounds double", "max-rounds", "double"),
+        ("/rounds", "rounds", ""),
+    ] {
+        assert_eq!(
+            tool_round_limit_command(input),
+            Some((verb, arg)),
+            "`{input}` lost the verb or the argument"
+        );
+    }
+    // Anti-vacuous: a near-miss is still not a rounds command, so the prefix
+    // match has not been loosened into "starts with".
+    assert_eq!(tool_round_limit_command("/roundsx 10"), None);
+    assert_eq!(tool_round_limit_command("/round 10"), None);
+}
+
 #[test]
 fn tool_round_limit_override_resolves_and_reports() {
     use newt_core::Tenacity;

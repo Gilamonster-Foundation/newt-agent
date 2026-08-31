@@ -1741,9 +1741,13 @@ fn session_body(
     #[cfg(feature = "live-spill")]
     let completed_spills =
         std::sync::Arc::new(crate::completed_spill::CompletedSpillArchive::default());
-    // Human-only per-session override for the agentic loop's tool-call round
-    // safety valve. `None` preserves config/model-tuning behavior exactly.
-    let mut max_tool_rounds_override: Option<usize> = None;
+    // #1998: the human-only per-session tool-round override used to be a local
+    // right here, which is why the escalation #1965 documents was unrecoverable
+    // — nothing outside this function could read it. It now lives in
+    // `newt_core::tenacity` beside the other three inputs to
+    // `resolve_tool_round_limit`, so the status line, the psyche summary, the
+    // turn and the receipt writer all read one value.
+    newt_core::tenacity::set_session_tool_rounds(None);
     // Step 24.8 (#559): per-session context-manager override from
     // `/context manager <name>`. `None` defers to `[context].manager`.
     let mut context_manager_override: Option<newt_core::ContextManager> = None;
@@ -4257,24 +4261,45 @@ fn session_body(
                         println!();
                         continue;
                     }
-                    if tool_round_limit_command_arg(&task).is_some() {
+                    if let Some((verb, _)) = tool_round_limit_command(&task) {
                         let configured = cfg
                             .find_model_tuning(&inf_model)
                             .and_then(|t| t.max_tool_rounds)
                             .unwrap_or_else(|| max_tool_rounds(&cfg));
+                        // The baseline an override is measured against, installed
+                        // where it is derived (#1998) — the same move
+                        // `set_active_model_family` makes, and what lets a receipt
+                        // say "over a configured 40" rather than just "320".
+                        newt_core::tenacity::set_configured_tool_rounds(Some(configured));
                         let explicit_tenacity = newt_core::tenacity::cli_tenacity();
                         match parse_tool_round_limit_command(&task) {
                             Ok(command) => {
-                                max_tool_rounds_override = apply_tool_round_limit_command(
+                                let next = apply_tool_round_limit_command(
                                     configured,
                                     explicit_tenacity,
-                                    max_tool_rounds_override,
+                                    newt_core::tenacity::session_tool_rounds(),
                                     command,
                                 );
+                                // #1998: the verb performed the derivation;
+                                // the WRITE goes through the one recorded
+                                // mutation path, with the alias actually typed
+                                // bound into the receipt's address. `Show`
+                                // reads and must not record.
+                                if command != ToolRoundLimitCommand::Show {
+                                    let value = next
+                                        .map_or_else(|| "auto".to_string(), |n| n.to_string());
+                                    if let Err(refusal) = crate::settings_form::apply_and_record(
+                                        crate::settings_form::Field::Rounds,
+                                        &value,
+                                        &format!("/{verb}"),
+                                    ) {
+                                        print_newt(&refusal, color, verbose);
+                                    }
+                                }
                                 let status = tool_round_limit_status(
                                     configured,
                                     explicit_tenacity,
-                                    max_tool_rounds_override,
+                                    newt_core::tenacity::session_tool_rounds(),
                                 );
                                 let status = match command {
                                     ToolRoundLimitCommand::Reset => {
@@ -5871,7 +5896,7 @@ fn session_body(
                                     &snap.summary(),
                                     configured_rounds,
                                     newt_core::tenacity::cli_tenacity(),
-                                    max_tool_rounds_override,
+                                    newt_core::tenacity::session_tool_rounds(),
                                 );
                                 print_newt(&summary, color, verbose);
                             }
@@ -6545,10 +6570,13 @@ fn session_body(
                     // is the number the loop enforces; `tool_round_limit` is the
                     // same value with its provenance, stamped into the turn's
                     // durable outcome so an escalation is recoverable later.
+                    newt_core::tenacity::set_configured_tool_rounds(Some(
+                        configured_max_tool_rounds,
+                    ));
                     let tool_round_limit = effective_tool_round_limit(
                         configured_max_tool_rounds,
                         newt_core::tenacity::cli_tenacity(),
-                        max_tool_rounds_override,
+                        newt_core::tenacity::session_tool_rounds(),
                     );
                     let eff_max_tool_rounds = tool_round_limit.rounds;
                     let eff_workflow_grace_rounds = model_tune
