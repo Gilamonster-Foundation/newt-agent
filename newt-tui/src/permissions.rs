@@ -516,7 +516,15 @@ pub(crate) fn present_on_terminal(
 /// manually wraps only the immutable plain body to the available width. The
 /// editable answer row stays unwrapped and anchored while this wrapper keeps
 /// the chat-only slash-command policy in exactly one place.
-#[cfg(feature = "rich-tui")]
+///
+/// `unix`, not just `rich-tui`: its sole caller is `cockpit::presenter`,
+/// which is unix-only by construction (`openpty`/`dup2`/termios — see
+/// `cockpit/mod.rs`). The gate follows the caller, not the platform, per
+/// #1986's precedent for the same Windows-clippy shape
+/// (`InlineTerminal::new`/`with_lease`) — an `#[allow(dead_code)]` here
+/// would say "trust me" where the cfg says which caller, and goes stale the
+/// moment a Windows cockpit lands.
+#[cfg(all(unix, feature = "rich-tui"))]
 pub(crate) fn present_on_terminal_with_width(
     w: &PromptWindow,
     interaction: &SurfaceInteraction,
