@@ -220,7 +220,7 @@ fn cap_exit_model_reply_only_wraps_real_progress_handoffs() {
 #[test]
 fn cap_exit_finalizer_applies_workspace_claim_checks() {
     let workspace = tempfile::TempDir::new().expect("temp workspace");
-    let text = finalize_cap_exit_text(
+    let text = finalize_final_text(
         "Updated src/definitely_not_present.rs and verified it.".to_string(),
         &workspace.path().to_string_lossy(),
         None,
