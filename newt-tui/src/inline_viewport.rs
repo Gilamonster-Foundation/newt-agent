@@ -422,6 +422,49 @@ mod region_lease_door {
         }
     }
 
+    /// **Every whole-screen writer holds the screen (#1980).**
+    ///
+    /// The collision proof next door shows the ARBITER refuses under a
+    /// whole-screen lease. It does not show that the pager and the splash
+    /// actually take one — it mints the lease itself. This does: entering the
+    /// alternate screen IS claiming every row, so a file that enters it must
+    /// hold a `RegionLease`.
+    ///
+    /// Needle on the call form, as ever (#1924): prose about the alternate
+    /// screen is everywhere in this crate.
+    #[test]
+    fn every_alternate_screen_entry_holds_a_region_lease() {
+        const ENTER: &str = "EnterAlternateScreen)";
+        const HOLDS: &str = "_region: newt_core::tty::RegionLease";
+        let files = sources();
+        assert!(
+            files.len() > 10,
+            "the scan found {} files, so it is not reading the crate",
+            files.len()
+        );
+        let mut entrants = 0;
+        for (name, body) in &files {
+            if !body.contains(ENTER) {
+                continue;
+            }
+            entrants += 1;
+            assert!(
+                body.contains(HOLDS),
+                "{name} enters the alternate screen but holds no `RegionLease`. \
+                 Taking every row without telling the arbiter is what let an \
+                 inline surface open underneath the pager (#1980)."
+            );
+        }
+        // POSITIVE READ ASSERTION: without this, a scan that matched nothing —
+        // a renamed import, a moved file — would report every entrant leased.
+        assert_eq!(
+            entrants, 2,
+            "expected the pager and the splash to be the two alternate-screen \
+             entrants; found {entrants}. A new one must hold the screen, and a \
+             removed one must lower this number."
+        );
+    }
+
     /// Probe one: the needle WOULD fire on a new site. Without this the test
     /// above passes equally well when the needle matches nothing at all.
     #[test]
@@ -446,5 +489,39 @@ mod region_lease_door {
             !prose.contains(DOOR),
             "the needle matches prose, so the guard would flag documentation"
         );
+    }
+}
+
+#[cfg(test)]
+mod screen_lease_collision {
+    use newt_core::tty::{OnCollision, Region, Terminal};
+
+    /// **#1980's observable consequence.** The pager and the splash now hold
+    /// the whole screen, so an inline surface that asks for the bottom rows
+    /// while one is up is refused and degrades (#1952) instead of painting
+    /// through it. Before the sweep the arbiter did not know the screen was
+    /// taken and handed the rows out.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn an_inline_surface_is_refused_while_the_whole_screen_is_held() {
+        let screen = Terminal::lease_region(Region::WholeScreen, OnCollision::SuspendHolder)
+            .expect("the alternate screen is always grantable");
+        assert!(
+            super::lease_bottom_rows(6, OnCollision::Refuse).is_err(),
+            "an inline surface was granted rows the pager owns"
+        );
+        // Shifting cannot rescue it either: there is nowhere above a holder
+        // that occupies every row.
+        assert!(
+            super::lease_bottom_rows(6, OnCollision::Shift).is_err(),
+            "a shift found free rows under a whole-screen holder"
+        );
+
+        // TWIN: the refusal is about the SCREEN being held, not about
+        // refusing always. Release it and the same call succeeds.
+        drop(screen);
+        let rows = super::lease_bottom_rows(6, OnCollision::Refuse)
+            .expect("with the screen free, the inline surface opens");
+        assert!(matches!(rows.region(), Region::Rows { height: 6, .. }));
     }
 }

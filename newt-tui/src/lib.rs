@@ -506,6 +506,18 @@ struct SplashScreenGuard {
     /// when both lived in one closure. Swapping these two lines would invert
     /// it silently.
     _restore: RestoreOnDrop<fn()>,
+    /// **The whole screen, held (#1980).** Declared AFTER `_restore` on
+    /// purpose: this type has no `Drop::drop`, so fields are the only ordering
+    /// there is, and the rows must come back only once the alternate screen has
+    /// been left. Declared BEFORE `_raw` for the reason the comment above
+    /// gives — screen state before line discipline.
+    ///
+    /// `SuspendHolder`: entering the alternate screen genuinely suspends what
+    /// is beneath it, the terminal preserves and restores the primary screen,
+    /// and the policy therefore never refuses. No new failure path here; what
+    /// changes is that a surface minting `Refuse` or `Shift` can now see that
+    /// the screen is taken.
+    _region: newt_core::tty::RegionLease,
     _raw: RawModeGuard,
 }
 
@@ -518,6 +530,11 @@ impl SplashScreenGuard {
     /// itself one of the three leaks.
     fn enter() -> io::Result<Self> {
         let raw = RawModeGuard::enter()?;
+        let region = newt_core::tty::Terminal::lease_region(
+            newt_core::tty::Region::WholeScreen,
+            newt_core::tty::OnCollision::SuspendHolder,
+        )
+        .ok_or_else(|| io::Error::other("the screen could not be leased"))?;
         let guard = Self {
             // Raw mode is NOT in this closure any more — `_raw` owns it. What
             // remains is exactly the splash's own state.
@@ -526,6 +543,7 @@ impl SplashScreenGuard {
                     let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
                 },
             },
+            _region: region,
             _raw: raw,
         };
         // Flush the tty input queue on taking the terminal. This stays HERE and

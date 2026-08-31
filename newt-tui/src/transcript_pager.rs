@@ -345,12 +345,33 @@ mod terminal {
     /// field. Rust drops fields AFTER the `Drop::drop` body, so the screen is
     /// left before raw mode is released — the order this guard already had.
     pub(crate) struct AltScreenGuard {
+        /// **The whole screen, held (#1980).** Entering the alternate screen IS
+        /// taking every row, and until now the arbiter did not know: an inline
+        /// surface could mint the bottom rows while the pager owned the screen.
+        ///
+        /// DECLARATION ORDER IS THE CONTRACT, as for `_raw`. Fields drop AFTER
+        /// `Drop::drop`, so the screen is left first and only then are the rows
+        /// returned — a lease released while the pager was still drawing would
+        /// advertise rows it had not finished with.
+        _region: newt_core::tty::RegionLease,
         _raw: RawModeGuard,
     }
 
     impl AltScreenGuard {
         pub(crate) fn enter() -> io::Result<Self> {
             let raw = RawModeGuard::enter()?;
+            // `SuspendHolder`, and it is the honest policy rather than the
+            // convenient one: the alternate screen genuinely DOES suspend
+            // whatever is beneath it — the primary screen is preserved and
+            // restored by the terminal itself. It therefore never fails, so
+            // this adds no new refusal path and changes no behaviour here.
+            // What changes is elsewhere: a surface minting `Refuse` or `Shift`
+            // now sees that the screen is taken.
+            let region = newt_core::tty::Terminal::lease_region(
+                newt_core::tty::Region::WholeScreen,
+                newt_core::tty::OnCollision::SuspendHolder,
+            )
+            .ok_or_else(|| io::Error::other("the screen could not be leased"))?;
             // Bind the guard BEFORE the fallible `execute!`, so Drop owns the
             // restore from this point on — the same shape `SplashScreenGuard`
             // uses (lib.rs), whose doc records that the hand-rolled rollback
@@ -365,7 +386,10 @@ mod terminal {
             // session on the alternate screen with no owner alive to leave
             // it, for the rest of its life. Reviewer-reproduced against real
             // crossterm on a would-block fd (#1677 review).
-            let guard = Self { _raw: raw };
+            let guard = Self {
+                _region: region,
+                _raw: raw,
+            };
             crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
             Ok(guard)
         }
