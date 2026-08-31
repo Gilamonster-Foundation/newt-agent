@@ -761,6 +761,49 @@ mod tests {
         }
     }
 
+    /// **The gate is satisfied by the ATTEMPT, not by the result** — which is
+    /// what stops it spinning where verification cannot succeed.
+    ///
+    /// It reads the commands the model ISSUED, from the assistant `tool_calls`;
+    /// it never reads a tool result and has no notion of pass or fail. So in an
+    /// environment where the check cannot run — no toolchain, no network, a
+    /// sandbox that refuses exec — the model attempts it once, the attempt
+    /// satisfies the check, and the turn concludes. The cost of an impossible
+    /// verification is ONE extra round, not a nudge every round forever.
+    ///
+    /// The deliberate consequence is that this gate measures "did you try?",
+    /// never "did it pass?". Judging the result would need the tool output and
+    /// a per-tool notion of success, and a gate that guessed at that would be
+    /// the false-confidence failure its own module doc is about.
+    #[test]
+    fn an_attempt_that_fails_still_satisfies_the_check() {
+        let checks = detect_checks(&entries(&["Cargo.toml"]), "");
+        let messages = vec![
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "function": {
+                        "name": "run_command",
+                        "arguments": "{\"command\": \"cargo test --workspace\"}"
+                    }
+                }]
+            }),
+            // The attempt blew up. The gate never looks here, and that is the
+            // property being pinned.
+            serde_json::json!({
+                "role": "tool",
+                "content": "error: no such command: `test`\ncargo: command not found"
+            }),
+        ];
+        let cmds = commands_from_messages(&messages);
+        assert_eq!(
+            verify_gate_nudge(&checks, &cmds),
+            None,
+            "an attempted check satisfies the gate — otherwise a workspace \
+             where the check CANNOT run pays a nudge every round"
+        );
+    }
+
     #[test]
     fn commands_from_messages_reads_run_command_args_both_wire_shapes() {
         let messages = vec![

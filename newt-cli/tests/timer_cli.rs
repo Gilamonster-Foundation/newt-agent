@@ -47,6 +47,36 @@ impl Respond for CaptureThenFinish {
     }
 }
 
+/// Write the solve config both `--run` tests share, pointing at `uri`.
+fn write_solve_config(dir: &std::path::Path, uri: &str) -> std::path::PathBuf {
+    let config_path = dir.join("timer.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"default_backend = "nemotron"
+
+[[backends]]
+name = "nemotron"
+endpoint = "{uri}"
+model = "{NEMOTRON_MODEL}"
+kind = "openai"
+api = "chat_completions"
+
+[backends.capability]
+reasoning_replay_scope = "current_user_turn"
+
+[backends.capability.chat_completions]
+cognition = true
+chat_template_kwargs = true
+parallel_tool_calls = false
+bounded_reasoning_continuation = true
+"#
+        ),
+    )
+    .expect("write explicit solve config");
+    config_path
+}
+
 /// Regression (#1747 blocker 1): `--every 0` must not create a repeating job.
 /// It must fail cleanly with a non-zero exit and a clear message, and persist
 /// nothing — `advance_repeat` would otherwise spin forever once the job is due.
@@ -91,36 +121,19 @@ async fn fire_run_reaches_solve_entry_point() {
         .await;
 
     let fixture = tempfile::tempdir().expect("timer + solve fixture");
-    let config_path = fixture.path().join("timer.toml");
-    std::fs::write(
-        &config_path,
-        format!(
-            r#"default_backend = "nemotron"
-
-[[backends]]
-name = "nemotron"
-endpoint = "{}"
-model = "{NEMOTRON_MODEL}"
-kind = "openai"
-api = "chat_completions"
-
-[backends.capability]
-reasoning_replay_scope = "current_user_turn"
-
-[backends.capability.chat_completions]
-cognition = true
-chat_template_kwargs = true
-parallel_tool_calls = false
-bounded_reasoning_continuation = true
-"#,
-            server.uri()
-        ),
-    )
-    .expect("write explicit solve config");
+    let config_path = write_solve_config(fixture.path(), &server.uri());
 
     let prompt = "check PR #1747 CI is green";
     // Schedule a timer due immediately. A zero *delay* (0s) is allowed — only a
     // zero *repeat* is rejected.
+    //
+    // `current_dir` matters HERE, not on the fire below: `timer schedule`
+    // records `current_dir()` as the timer's workspace and `fire --run` solves
+    // against THAT ("the timer's own workspace, not the beat process's CWD"),
+    // which is what makes a timer scheduled in project X fire against project
+    // X. Scheduling from the test process's cwd therefore pointed the solve at
+    // this crate's own directory — the fixture isolation was incomplete, and
+    // nothing noticed while the self-verify gate was dark (#1943).
     Command::cargo_bin("newt")
         .expect("newt binary")
         .env_remove("NEWT_TEAM")
@@ -129,11 +142,11 @@ bounded_reasoning_continuation = true
         .args(["timer", "schedule", "0s", prompt])
         .arg("--dir")
         .arg(fixture.path())
+        .current_dir(fixture.path())
         .assert()
         .success();
 
     // Fire + run: the due prompt must drive a real solve against the mock.
-    // current_dir is the solve workspace (cwd "." resolves here).
     Command::cargo_bin("newt")
         .expect("newt binary")
         .env_remove("NEWT_TEAM")
@@ -184,35 +197,13 @@ async fn fire_run_drains_all_due_timers() {
         .await;
 
     let fixture = tempfile::tempdir().expect("timer + solve fixture");
-    let config_path = fixture.path().join("timer.toml");
-    std::fs::write(
-        &config_path,
-        format!(
-            r#"default_backend = "nemotron"
-
-[[backends]]
-name = "nemotron"
-endpoint = "{}"
-model = "{NEMOTRON_MODEL}"
-kind = "openai"
-api = "chat_completions"
-
-[backends.capability]
-reasoning_replay_scope = "current_user_turn"
-
-[backends.capability.chat_completions]
-cognition = true
-chat_template_kwargs = true
-parallel_tool_calls = false
-bounded_reasoning_continuation = true
-"#,
-            server.uri()
-        ),
-    )
-    .expect("write explicit solve config");
+    let config_path = write_solve_config(fixture.path(), &server.uri());
 
     let prompts = ["check build A", "check build B", "check build C"];
     for p in &prompts {
+        // `current_dir` on the SCHEDULE, per the note in
+        // `fire_run_reaches_solve_entry_point`: the recorded workspace is what
+        // the solve runs against.
         Command::cargo_bin("newt")
             .expect("newt binary")
             .env_remove("NEWT_TEAM")
@@ -221,6 +212,7 @@ bounded_reasoning_continuation = true
             .args(["timer", "schedule", "0s", p])
             .arg("--dir")
             .arg(fixture.path())
+            .current_dir(fixture.path())
             .assert()
             .success();
     }
@@ -270,5 +262,93 @@ bounded_reasoning_continuation = true
     assert!(
         timers.is_empty(),
         "one-shots removed after success: {timers:?}"
+    );
+}
+
+/// **Scheduled turns are NOT exempt from the self-verify gate** (#1943), and
+/// this is where that policy is written down rather than assumed.
+///
+/// The tempting argument for exemption is that a timer firing at 3am has no
+/// operator to re-prompt. It is a category error: the nudge is addressed to
+/// the MODEL, not to a human. An unattended turn is if anything the one that
+/// most needs the gate, because nobody is watching to catch a task declared
+/// done on a broken solution — and the headless bench lane is the gate's
+/// original consumer, so exempting headless would disable it exactly where it
+/// was built to work.
+///
+/// So a scheduled solve pays the gate like any other turn, and the cost is
+/// pinned here as a NUMBER: a model that concludes without ever attempting the
+/// workspace's verification is nudged `SELF_VERIFY_CAP` (2) times and then
+/// accepted — 3 model calls, never more. The mock here is the worst case by
+/// construction: it answers "done" and never calls a tool. A model that
+/// ATTEMPTS the check pays one extra round instead, because the gate is
+/// satisfied by the attempt and not by its exit status.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scheduled_turn_is_not_exempt_from_the_self_verify_gate() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(CaptureThenFinish {
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let fixture = tempfile::tempdir().expect("timer + solve fixture");
+    let config_path = write_solve_config(fixture.path(), &server.uri());
+    // The one thing that differs from `fire_run_reaches_solve_entry_point`:
+    // this workspace SHIPS a verification.
+    std::fs::write(
+        fixture.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("write a manifest the gate can detect");
+
+    Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["timer", "schedule", "0s", "tidy the parser"])
+        .arg("--dir")
+        .arg(fixture.path())
+        .current_dir(fixture.path())
+        .assert()
+        .success();
+
+    Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["timer", "fire", "--run"])
+        .arg("--dir")
+        .arg(fixture.path())
+        .current_dir(fixture.path())
+        .assert()
+        .success();
+
+    let requests = requests.lock().expect("request capture lock");
+    assert_eq!(
+        requests.len(),
+        3,
+        "a scheduled turn that never attempts the workspace's `cargo test` is \
+         nudged twice and then accepted: 1 + SELF_VERIFY_CAP model calls, and \
+         the cap is what stops it being unbounded"
+    );
+
+    // Anti-vacuous: the extra calls are THIS gate, not some other nudge. The
+    // second request must carry the self-verify text naming what went unrun.
+    let nudged = requests[1]["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .any(|c| c.contains("you have NOT run the verification this task ships"));
+    assert!(
+        nudged,
+        "the extra rounds must be the self-verify gate: {:?}",
+        requests[1]["messages"]
     );
 }
