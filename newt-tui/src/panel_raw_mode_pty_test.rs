@@ -39,7 +39,7 @@
 
 use std::time::{Duration, Instant};
 
-use tests_pty::Pty;
+use tests_pty::{screen_grid, Pty};
 
 use crate::config_panel::PanelRawGuard;
 use crate::prompt_visibility_test::wait_for_child;
@@ -54,6 +54,12 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
 const PANEL_TEST_HEIGHT: u16 = 6;
 const PANEL_SENTINEL: &str = "PANEL-DREW-1950";
 const PANEL_SENTINEL_OK: &str = "PANEL-OPENED-1950";
+
+/// #1977 fixture. The BODY of the panel, distinct from its border: the
+/// operator's report was a visible top border with no rows under it.
+const PANEL_BODY_SENTINEL: &str = "PANEL-BODY-1977";
+/// The competing bottom-pinned viewport, standing in for the rich prompt.
+const PROMPT_SENTINEL: &str = "PROMPT-ROWS-1977";
 
 /// The child half: takes the real terminal exactly as a panel does.
 /// `NEWT_PANEL_PTY_CHILD` selects the lifecycle.
@@ -156,6 +162,89 @@ fn panel_raw_mode_child() {
             // which is the property the rest of this file exists to hold.
             drop(reader);
         }
+        // #1977: TWO bottom-anchored inline viewports, which is the operator's
+        // live report. The competing reader eats the DSR reply, so BOTH take
+        // the anchored fallback and land on the same rows — the environment
+        // the defect was found in, made rather than mocked.
+        "inline_overpainted" => {
+            let _guard = PanelRawGuard::enter().expect("enter raw mode");
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader = {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = crossterm::event::poll(Duration::from_millis(50));
+                        let _ = crossterm::event::read();
+                    }
+                })
+            };
+            std::thread::sleep(Duration::from_millis(150));
+
+            // The PROMPT viewport, as `rich_input` owns it. Same height as
+            // the panel and the same bottom anchor, so the two cover the SAME
+            // rows — which is #1977's geometry. A shorter prompt overlaps only
+            // part of the panel and the assertion below could pass on a row
+            // that was never contested.
+            let mut prompt = crate::inline_viewport::inline_terminal(PANEL_TEST_HEIGHT)
+                .expect("prompt viewport opens");
+            // The content must CHANGE on each paint. ratatui diffs cells and
+            // emits only what differs, so a prompt repainting identical text
+            // writes nothing at all — the first cut of this fixture painted
+            // six times and produced one write, contending with nothing.
+            // EVERY row changes on every paint. ratatui diffs cells, so a
+            // prompt repainting near-identical text rewrites only the columns
+            // that differ — the first cut of this fixture painted six times
+            // and emitted one changed digit, contending with nothing.
+            let paint_prompt = |t: &mut crate::inline_viewport::InlineTerm, tick: usize| {
+                let filled = (0..PANEL_TEST_HEIGHT)
+                    .map(|r| format!("{PROMPT_SENTINEL} r{r} t{tick}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                // `clear` before drawing, because ratatui diffs against its OWN
+                // buffer and this viewport's belief about the screen is stale
+                // the moment another writer touches its rows. That staleness is
+                // the #1977 mechanism itself; a real surface reclaims its rows
+                // on any full redraw (a resize, a mode change), and this is that
+                // redraw made deterministic.
+                t.clear().ok();
+                t.draw(|f| {
+                    f.render_widget(ratatui::widgets::Paragraph::new(filled), f.area());
+                })
+                .ok();
+            };
+            paint_prompt(&mut prompt, 0);
+
+            match crate::config_panel::make_terminal(PANEL_TEST_HEIGHT) {
+                Ok(mut terminal) => {
+                    // The panel fills EVERY row with its body marker, so the
+                    // assertion cannot pass on a row the prompt happens not to
+                    // cover.
+                    let body = (0..PANEL_TEST_HEIGHT)
+                        .map(|r| format!("{PANEL_BODY_SENTINEL} r{r}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(ratatui::widgets::Paragraph::new(body), f.area());
+                        })
+                        .expect("the panel draws");
+                    println!("{PANEL_SENTINEL_OK}");
+                    // The prompt keeps repainting while the panel is open —
+                    // which is what the rich input does, and what makes the
+                    // panel body invisible rather than merely misplaced.
+                    for tick in 1..=5 {
+                        paint_prompt(&mut prompt, tick);
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+                Err(e) => println!("PANEL-FAILED {e}"),
+            }
+            use std::io::Write as _;
+            std::io::stdout().flush().ok();
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            drop(reader);
+        }
+
         other => panic!("unknown child mode {other:?}"),
     }
 }
@@ -335,5 +424,55 @@ fn a_panel_still_opens_when_the_cursor_reply_is_taken_by_another_reader() {
         !out.raw_after,
         "the terminal was left RAW; screen={:?}",
         out.screen
+    );
+}
+
+/// **#1977, red-first.** Two bottom-anchored inline viewports own the same
+/// rows and neither knows about the other, so the prompt's repaints erase the
+/// panel's body. The operator saw a top border and nothing under it, and the
+/// content only reached the screen when Esc's teardown flushed it to
+/// scrollback.
+///
+/// **This asserts on the GRID, not the byte stream, and that distinction is
+/// the whole test.** `drive` accumulates every byte the child emits, and the
+/// panel's body IS emitted — that is why it appeared in scrollback. A
+/// `screen.contains(BODY)` assertion would therefore pass against the very
+/// defect it claims to catch. Only replaying the cursor motions and asking
+/// what is left on the screen can tell "drawn" from "drawn then overpainted".
+#[serial_test::serial(interaction_pty)]
+#[test]
+#[ignore = "real-PTY acceptance tier; weekly, release, and scoped PTY CI only"]
+fn a_panel_body_survives_a_competing_bottom_anchored_viewport() {
+    let out = drive("inline_overpainted");
+    let grid = screen_grid(&out.screen);
+
+    // CONTROL 1: the panel opened at all. Without this a "body missing"
+    // failure could just be #1950 regressing.
+    assert!(
+        out.screen.contains(PANEL_SENTINEL_OK),
+        "the panel never opened, so this says nothing about overpainting; \
+         screen={:?}",
+        out.screen
+    );
+    // CONTROL 2: the competing viewport really painted. If the prompt never
+    // reached the screen there was no contention and a pass is meaningless.
+    assert!(
+        grid.iter().any(|line| line.contains(PROMPT_SENTINEL)),
+        "the competing prompt never painted, so nothing contended; grid={grid:#?}"
+    );
+    // CONTROL 3: the body was emitted. This separates "never drawn" from
+    // "drawn and then overpainted" — the second is #1977, the first is not.
+    assert!(
+        out.screen.contains(PANEL_BODY_SENTINEL),
+        "the panel never drew its body; that is a different bug; screen={:?}",
+        out.screen
+    );
+
+    // THE PROPERTY: emitted is not enough. It has to still be on the screen.
+    assert!(
+        grid.iter().any(|line| line.contains(PANEL_BODY_SENTINEL)),
+        "the panel body was overpainted by the prompt viewport — #1977. It \
+         reached the terminal (control 3) and is gone from the screen; \
+         grid={grid:#?}"
     );
 }
