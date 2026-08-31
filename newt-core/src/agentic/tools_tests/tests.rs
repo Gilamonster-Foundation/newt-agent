@@ -3050,10 +3050,14 @@ fn shell_envelope_without_streams_commits_the_exit_result() {
     let out = shell_envelope_output(&envelope, 50, false, false, None, Some(&mut display));
     display.result(&out);
 
-    assert_eq!(out, "(exit 3)");
+    // #1969: a NONZERO exit is now marked as a failure, because the ledger's
+    // `ok` bit is `tool_result_ok`'s prefix test and `(exit 3)` read as a
+    // success. The bare `(exit N)` rendering survives for exit 0, which is
+    // the case it was written for.
+    assert_eq!(out, "error: command exited 3");
     assert_eq!(
         String::from_utf8(display.into_inner()).unwrap(),
-        "⚙  run_command: exit 3\n▒ (exit 3)\n…\n"
+        "⚙  run_command: exit 3\n▒ error: command exited 3\n…\n"
     );
 }
 

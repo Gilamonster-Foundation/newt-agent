@@ -542,3 +542,48 @@ fn first_line_caps_and_takes_first() {
     assert_eq!(first_line(""), "");
     assert_eq!(first_line(&"x".repeat(500)).chars().count(), 200);
 }
+
+/// **#1969's second consumer, repaired for free.**
+///
+/// `RepeatCallGuard` memoizes a `Failure` only for `!ok`, and `ok` came from
+/// a prefix test that read every failing compile as a success. So the guard
+/// that exists to stop a model re-issuing a dead call was silently disabled
+/// for the single most common failing call in a coding session — the build.
+///
+/// It is not a change to the guard. It is the guard finally being told the
+/// truth about the outcome.
+#[test]
+fn a_failing_build_now_memoizes_and_steers_the_repeat() {
+    let mut g = RepeatCallGuard::default();
+    let args = serde_json::json!({"command": "cargo check -p thing", "cwd": "/w"});
+    // What the shell path renders for a failing compile since #1969.
+    let result = "error: command exited 101\nerror[E0308]: mismatched types\n";
+    let ok = crate::agentic::tools::tool_result_ok(result);
+    assert!(
+        !ok,
+        "the outcome bit is still wrong, so this proves nothing"
+    );
+
+    assert!(g.repeat_steer("run_command", &args).is_none());
+    g.record("run_command", &args, ok, result);
+    let steer = g
+        .repeat_steer("run_command", &args)
+        .expect("a repeated failing build is not steered");
+    assert!(steer.contains("already called"), "{steer}");
+}
+
+/// The twin: a PASSING build stays repeatable. Builds are re-run constantly
+/// and for good reason, so the repair must not memoize success.
+#[test]
+fn a_passing_build_stays_repeatable() {
+    let mut g = RepeatCallGuard::default();
+    let args = serde_json::json!({"command": "cargo check -p thing", "cwd": "/w"});
+    let result = "    Finished dev [unoptimized] target(s) in 0.04s\n";
+    let ok = crate::agentic::tools::tool_result_ok(result);
+    assert!(ok, "a successful build is being read as a failure");
+    g.record("run_command", &args, ok, result);
+    assert!(
+        g.repeat_steer("run_command", &args).is_none(),
+        "a passing build was memoized; re-running a build is legitimate"
+    );
+}

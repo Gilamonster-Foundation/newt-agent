@@ -260,7 +260,9 @@ async fn yolo_runs_the_denied_command_on_the_host_shell() {
     .await;
     assert_eq!(out, "yolo-ok\n");
 
-    // No output ⇒ the same `(exit N)` shape the bridle path produces.
+    // No output ⇒ the same shape the bridle path produces. Since #1969 a
+    // nonzero exit renders as a failure rather than a bare `(exit N)`, which
+    // classified as a success.
     let out = run_tool(
         "run_command",
         serde_json::json!({"command": "exit 3"}),
@@ -268,7 +270,7 @@ async fn yolo_runs_the_denied_command_on_the_host_shell() {
         &caveats,
     )
     .await;
-    assert_eq!(out, "(exit 3)");
+    assert_eq!(out, "error: command exited 3");
 }
 
 /// #726/#945: a verbose `run_command` MUST NOT flood the model's context
@@ -557,10 +559,13 @@ async fn host_shell_envelope_matches_the_bridle_shape() {
     assert!(envelope.get("denied").is_none(), "got: {envelope}");
     assert!(envelope.get("denials").is_none(), "got: {envelope}");
     assert!(!envelope_denied(&envelope));
-    // And the shared formatter renders it like any confined result.
+    // And the shared formatter renders it like any confined result — which
+    // since #1969 means a nonzero exit is marked as a failure ahead of its
+    // output, so the ledger's `ok` bit stops reading a failing command as a
+    // success. The streams themselves are untouched.
     assert_eq!(
         shell_envelope_output(&envelope, 20, false, false, None, None),
-        "out\nerr\n"
+        "error: command exited 3\nout\nerr\n"
     );
 }
 
