@@ -105,3 +105,8 @@ The consolidation target and the per-command disposition
 destination for every surviving state-mutator (#1965), build on this table.
 The one line that decides each row: **a verb that merely SETS A VALUE is
 absorbed; a verb that PERFORMS something stays.**
+
+That decision is now written down, one row per command, in
+[`slash_command_target_set.md`](slash_command_target_set.md) — generated from
+`slash_registry::COMMANDS` rather than copied out of this document, so the two
+cannot drift apart.

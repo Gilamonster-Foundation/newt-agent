@@ -897,6 +897,136 @@ mod tests {
     }
 }
 
+/// **The decision doc's table, rendered from this registry** (#1981
+/// deliverable 2).
+///
+/// `docs/decisions/slash_command_target_set.md` records one row per command:
+/// absorb / keep / delete, and where every surviving state-mutator's receipt
+/// lands. It is GENERATED, never hand-written — a second hand-maintained list
+/// of sixty-five commands is precisely the drift this slice exists to kill,
+/// and it would be stale within a PR.
+///
+/// Rows are sorted by family then name so that reordering `COMMANDS` does not
+/// churn the document.
+#[cfg(test)]
+mod target_set_doc {
+    use super::*;
+
+    const DOC: &str = include_str!("../../docs/decisions/slash_command_target_set.md");
+    const BEGIN: &str = "<!-- BEGIN GENERATED: slash_registry::COMMANDS -->";
+    const END: &str = "<!-- END GENERATED -->";
+
+    fn disposition_cell(command: &SlashCommand) -> String {
+        match command.disposition {
+            Disposition::Absorb => format!("absorb → `/settings {}`", command.name),
+            Disposition::Keep => "keep — it performs".to_string(),
+            Disposition::Panel => "panel — a chooser, needs a region (#1979)".to_string(),
+        }
+    }
+
+    fn receipt_cell(command: &SlashCommand) -> &'static str {
+        match command.receipt {
+            Receipt::None_ => "— read-only",
+            Receipt::Journal => "`~/.newt/receipts.jsonl`",
+            Receipt::Missing => "**none — #1965**",
+        }
+    }
+
+    fn table() -> String {
+        let mut rows: Vec<&SlashCommand> = COMMANDS.iter().collect();
+        rows.sort_by_key(|c| (format!("{:?}", c.family), c.name));
+        let mut out =
+            String::from("| command | also typed as | family | disposition | receipt |\n");
+        out.push_str("|---|---|---|---|---|\n");
+        for command in &rows {
+            let aliases = if command.aliases.is_empty() {
+                "—".to_string()
+            } else {
+                command
+                    .aliases
+                    .iter()
+                    .map(|a| format!("`/{a}`"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            out.push_str(&format!(
+                "| `/{}` | {aliases} | {:?} | {} | {} |\n",
+                command.name,
+                command.family,
+                disposition_cell(command),
+                receipt_cell(command),
+            ));
+        }
+        let count = |d: Disposition| COMMANDS.iter().filter(|c| c.disposition == d).count();
+        let receipts = |r: Receipt| COMMANDS.iter().filter(|c| c.receipt == r).count();
+        out.push_str(&format!(
+            "\n**{} commands, {} tokens.** Absorb {} · keep {} · panel {}. \
+             Receipts: journalled {} · read-only {} · **missing {}**.\n",
+            COMMANDS.len(),
+            all_tokens().len(),
+            count(Disposition::Absorb),
+            count(Disposition::Keep),
+            count(Disposition::Panel),
+            receipts(Receipt::Journal),
+            receipts(Receipt::None_),
+            receipts(Receipt::Missing),
+        ));
+        out
+    }
+
+    fn generated_block(doc: &str) -> &str {
+        let start = doc.find(BEGIN).expect("the doc has no generated block") + BEGIN.len();
+        let end = doc.find(END).expect("the generated block is not closed");
+        doc[start..end].trim_matches('\n')
+    }
+
+    /// **The doc and the registry cannot disagree.**
+    ///
+    /// Run with `UPDATE_DOCS=1` to regenerate after changing `COMMANDS`. The
+    /// default path reads the doc through `include_str!`, so the check itself
+    /// touches no filesystem.
+    #[test]
+    fn the_target_set_doc_is_generated_from_this_registry() {
+        let want = table();
+        if std::env::var_os("UPDATE_DOCS").is_some() {
+            let path = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../docs/decisions/slash_command_target_set.md"
+            );
+            let current = std::fs::read_to_string(path).expect("the doc exists");
+            let start = current.find(BEGIN).expect("marker") + BEGIN.len();
+            let end = current.find(END).expect("marker");
+            let updated = format!("{}\n{want}\n{}", &current[..start], &current[end..]);
+            std::fs::write(path, updated).expect("writable");
+            return;
+        }
+        assert_eq!(
+            generated_block(DOC),
+            want.trim_end(),
+            "docs/decisions/slash_command_target_set.md is stale — regenerate \
+             it with `UPDATE_DOCS=1 cargo test -p newt-tui \
+             the_target_set_doc_is_generated_from_this_registry`"
+        );
+    }
+
+    /// **Anti-vacuous twin.** Comparing an empty block to an empty table would
+    /// pass forever. The generated block is real, and it says the things the
+    /// decision doc exists to say.
+    #[test]
+    fn the_generated_block_is_not_empty() {
+        let block = generated_block(DOC);
+        assert!(block.len() > 2_000, "{} bytes is not 65 rows", block.len());
+        for needle in [
+            "`/settings edit-mode`",
+            "keep — it performs",
+            "**none — #1965**",
+            "`~/.newt/receipts.jsonl`",
+        ] {
+            assert!(block.contains(needle), "the doc never says {needle}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod fallthrough_tests {
     use super::*;
