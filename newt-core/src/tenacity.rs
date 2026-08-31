@@ -156,7 +156,7 @@ impl ToolRoundLimitSource {
 /// number while dropping where it came from — the number and its justification
 /// are one value. That is the same move as `#1908`'s: make the lossy call
 /// impossible to write rather than remember to write it correctly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRoundLimit {
     /// The limit actually enforced this turn.
     pub rounds: usize,
@@ -316,6 +316,23 @@ static ACTIVE_FAMILY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(N
 // (review P1#3: a declared persona tenacity is now actually applied, not just
 // rendered). `None` when no persona / the persona declares none.
 static PERSONA_TENACITY: std::sync::Mutex<Option<Tenacity>> = std::sync::Mutex::new(None);
+// #1998: the two inputs to `resolve_tool_round_limit` that were NOT here.
+//
+// Three of its four inputs have always been process globals in this module.
+// The fourth — the `/rounds` session override — was a local variable inside
+// `run_chat`, which is exactly what #1965's evidence complains about: "the
+// effective limit is recomputed per dispatch … and a session-local
+// `max_tool_rounds_override` echoed only to the truncated alternate-screen
+// terminal". A local cannot be read by a receipt writer, by a status line, or
+// by anything outside the one function that declares it, which is why the
+// number that ran a session to round 320 was unrecoverable afterwards.
+//
+// `CONFIGURED_TOOL_ROUNDS` is the config/model-tuned baseline the override is
+// derived AGAINST, installed by the session when the active model settles —
+// the same shape and the same reason as `ACTIVE_FAMILY` above. With both here,
+// the whole derivation is computable from anywhere.
+static SESSION_TOOL_ROUNDS: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+static CONFIGURED_TOOL_ROUNDS: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
 
 std::thread_local! {
     /// A driven turn resolves tenacity before crossing onto its dedicated
@@ -474,9 +491,67 @@ pub struct TenacityRuntimeSnapshot {
     persona: Option<Tenacity>,
     config: Option<TenacityConfig>,
     active_family: Option<String>,
+    session_rounds: Option<usize>,
+    configured_rounds: Option<usize>,
 }
 
-/// Snapshot all four tenacity-resolution globals (see [`TenacityRuntimeSnapshot`]).
+/// Install (or clear, with `None`) the operator's session tool-round override —
+/// what `/rounds <n>` sets and `/rounds reset` releases.
+///
+/// This is the OUTERMOST input to [`resolve_tool_round_limit`]. Call it only
+/// where the change is an operator decision, and record that decision: an
+/// escalation here is the exact event #1965 was filed about.
+pub fn set_session_tool_rounds(rounds: Option<usize>) {
+    if let Ok(mut slot) = SESSION_TOOL_ROUNDS.lock() {
+        *slot = rounds;
+    }
+}
+
+/// The operator's session tool-round override, if one is installed.
+#[must_use]
+pub fn session_tool_rounds() -> Option<usize> {
+    SESSION_TOOL_ROUNDS.lock().ok().and_then(|s| *s)
+}
+
+/// Install the config/model-tuned round cap for the ACTIVE model — the
+/// baseline an override is measured against. Called by the session wherever it
+/// already derives that number, the same way `set_active_model_family` is.
+pub fn set_configured_tool_rounds(rounds: usize) {
+    if let Ok(mut slot) = CONFIGURED_TOOL_ROUNDS.lock() {
+        *slot = Some(rounds);
+    }
+}
+
+/// The installed config/model baseline, or `None` when no session has settled
+/// a model yet.
+///
+/// Deliberately NOT defaulted to 40. A receipt that says "configured 40" when
+/// nothing installed a baseline is a confident lie about where a number came
+/// from, which is the failure this whole line exists to stop; `None` says
+/// "unknown", and callers render that honestly.
+#[must_use]
+pub fn configured_tool_rounds() -> Option<usize> {
+    CONFIGURED_TOOL_ROUNDS.lock().ok().and_then(|s| *s)
+}
+
+/// The cap a turn would run under right now, **with its derivation**, from the
+/// globals alone (#1998).
+///
+/// `None` only when no baseline has been installed — see
+/// [`configured_tool_rounds`]. This is what lets a receipt carry the whole
+/// `ToolRoundLimit` rather than a bare number, without the writer needing the
+/// config, the model card, or the session's locals.
+#[must_use]
+pub fn session_tool_round_limit() -> Option<ToolRoundLimit> {
+    Some(resolve_tool_round_limit(
+        configured_tool_rounds()?,
+        cli_tenacity(),
+        session_tool_rounds(),
+    ))
+}
+
+/// Snapshot every tenacity-resolution global (see [`TenacityRuntimeSnapshot`]) —
+/// including the two round-cap inputs #1998 moved here.
 #[doc(hidden)]
 #[must_use]
 pub fn snapshot_runtime_state() -> TenacityRuntimeSnapshot {
@@ -485,10 +560,12 @@ pub fn snapshot_runtime_state() -> TenacityRuntimeSnapshot {
         persona: PERSONA_TENACITY.lock().ok().and_then(|s| *s),
         config: TENACITY_CONFIG.lock().ok().and_then(|s| s.clone()),
         active_family: ACTIVE_FAMILY.lock().ok().and_then(|s| s.clone()),
+        session_rounds: session_tool_rounds(),
+        configured_rounds: configured_tool_rounds(),
     }
 }
 
-/// Restore all four tenacity-resolution globals from a snapshot (see
+/// Restore every tenacity-resolution global from a snapshot (see
 /// [`TenacityRuntimeSnapshot`]). Total: every input is overwritten, so a test
 /// that installed a config / family / override is fully undone.
 #[doc(hidden)]
@@ -505,11 +582,80 @@ pub fn restore_runtime_state(snapshot: TenacityRuntimeSnapshot) {
     if let Ok(mut s) = ACTIVE_FAMILY.lock() {
         *s = snapshot.active_family;
     }
+    if let Ok(mut s) = SESSION_TOOL_ROUNDS.lock() {
+        *s = snapshot.session_rounds;
+    }
+    if let Ok(mut s) = CONFIGURED_TOOL_ROUNDS.lock() {
+        *s = snapshot.configured_rounds;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The round-cap globals are readable from outside `run_chat`** — which
+    /// is the whole point of moving them (#1998). A local could not be read by
+    /// a receipt writer, which is why the escalation that produced #1965 was
+    /// unrecoverable.
+    #[test]
+    fn the_session_override_and_its_baseline_round_trip() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        set_session_tool_rounds(None);
+        assert_eq!(session_tool_rounds(), None, "no override by default");
+        set_session_tool_rounds(Some(320));
+        assert_eq!(session_tool_rounds(), Some(320));
+        set_session_tool_rounds(None);
+        assert_eq!(session_tool_rounds(), None, "the override releases");
+
+        set_configured_tool_rounds(40);
+        assert_eq!(configured_tool_rounds(), Some(40));
+    }
+
+    /// **The whole derivation is computable from the globals alone.**
+    ///
+    /// This is the capability the receipt needs: `320, from an override, over
+    /// a configured 40` without the writer holding the config, the model card
+    /// or the session's locals.
+    #[test]
+    fn the_derivation_is_computable_from_the_globals() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        set_configured_tool_rounds(40);
+        set_cli_tenacity(Tenacity::Relentless);
+        set_session_tool_rounds(Some(320));
+
+        let limit = session_tool_round_limit().expect("a baseline is installed");
+        assert_eq!(limit.rounds, 320);
+        assert_eq!(limit.source, ToolRoundLimitSource::Override);
+        assert_eq!(limit.configured, 40);
+        assert_eq!(limit.tenacity, Some(Tenacity::Relentless));
+        assert!(limit.is_escalated(), "320 over a configured 40");
+
+        // Releasing the override changes which input won — the field that
+        // makes the record an explanation rather than a number.
+        set_session_tool_rounds(None);
+        let limit = session_tool_round_limit().expect("a baseline is installed");
+        assert_eq!(limit.source, ToolRoundLimitSource::Tenacity);
+        assert_eq!(limit.configured, 40);
+    }
+
+    /// **An uninstalled baseline says so, rather than guessing 40.**
+    ///
+    /// Anti-vacuous twin for the two above: if this returned a default, every
+    /// assertion about `configured` would hold over a receipt that invented
+    /// the number it claims the limit was measured against.
+    #[test]
+    fn no_baseline_means_no_derivation_not_a_default() {
+        let _g = crate::test_guard::GlobalSettingsGuard::acquire();
+        if let Ok(mut slot) = CONFIGURED_TOOL_ROUNDS.lock() {
+            *slot = None;
+        }
+        assert_eq!(configured_tool_rounds(), None);
+        assert!(
+            session_tool_round_limit().is_none(),
+            "a derivation without a baseline would be a confident invention"
+        );
+    }
 
     #[test]
     fn standard_is_the_behaviour_preserving_default() {
@@ -738,9 +884,10 @@ mod tests {
 
     #[test]
     fn snapshot_restore_round_trips_every_tenacity_resolution_global() {
-        // CR3 area 4: the guard must isolate ALL FOUR inputs to effective_tenacity
-        // — CLI override, persona layer, TENACITY_CONFIG, ACTIVE_FAMILY. Exercise
-        // the exact snapshot/restore the guard's Drop runs.
+        // CR3 area 4: the guard must isolate every input to effective_tenacity —
+        // CLI override, persona layer, TENACITY_CONFIG, ACTIVE_FAMILY — and, since
+        // #1998, the two round-cap globals as well. Exercise the exact
+        // snapshot/restore the guard's Drop runs.
         use crate::test_guard::GlobalSettingsGuard;
         let _g = GlobalSettingsGuard::acquire(); // serialize + final cleanup
 
@@ -749,6 +896,7 @@ mod tests {
         set_persona_tenacity(None);
         set_tenacity_config(TenacityConfig::default());
         set_active_model_family(None);
+        set_session_tool_rounds(None);
         let snap = snapshot_runtime_state();
 
         // Mutate every axis.
@@ -759,6 +907,8 @@ mod tests {
             &[("nemotron", Tenacity::Relentless)],
         ));
         set_active_model_family(Some("nemotron".to_string()));
+        set_session_tool_rounds(Some(320));
+        set_configured_tool_rounds(40);
         assert_eq!(cli_tenacity(), Some(Tenacity::Relentless));
         assert_eq!(persona_tenacity(), Some(Tenacity::Insistent));
         assert!(tenacity_config().is_some_and(|c| !c.families.is_empty()));
@@ -774,6 +924,11 @@ mod tests {
             "TENACITY_CONFIG restored (the gap the piecemeal guard missed)"
         );
         assert_eq!(active_model_family(), None, "ACTIVE_FAMILY restored");
+        assert_eq!(
+            session_tool_rounds(),
+            None,
+            "the /rounds override restored — a leaked 320 would escalate the next test"
+        );
     }
 
     #[test]
