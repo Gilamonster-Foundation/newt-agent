@@ -3,10 +3,19 @@
 
 use newt_core::agentic::print_newt;
 
-use crate::run_crew_edit;
+use crate::{run_crew_edit_with_ask, SlashAsk};
 
 /// Handle the `/crew` command family. Always returns `Ok(true)`.
-pub(crate) fn dispatch(arg1: &str, arg2: &str, color: bool, verbose: bool) -> anyhow::Result<bool> {
+///
+/// `ask` is the seam the form's questions are presented through — the
+/// session's surface in-session, this terminal otherwise.
+pub(crate) fn dispatch(
+    arg1: &str,
+    arg2: &str,
+    color: bool,
+    verbose: bool,
+    ask: SlashAsk<'_>,
+) -> anyhow::Result<bool> {
     match arg1 {
         // `/crew edit [name]` runs the same interactive settings form as
         // `newt crew --edit`. read_turn() drops the rich surface to cooked
@@ -14,7 +23,7 @@ pub(crate) fn dispatch(arg1: &str, arg2: &str, color: bool, verbose: bool) -> an
         // in-session for both surfaces (no raw-mode wrestling here).
         "edit" => {
             let name = (!arg2.is_empty()).then_some(arg2);
-            if let Err(e) = run_crew_edit(name, color) {
+            if let Err(e) = run_crew_edit_with_ask(name, color, ask) {
                 print_newt(&format!("crew edit failed: {e}"), color, verbose);
             }
         }

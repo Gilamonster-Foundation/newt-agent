@@ -563,9 +563,14 @@ fn status_options() -> Option<String> {
 ///
 /// The header is `[YYYY-MM-DD HH:MM:SS] vi --INSERT-- <model> @ <endpoint>` plus
 /// an optional `[options]` session-override block. The clock + editor mode update
-/// live (the event loop redraws every frame). `active` (the line has content)
-/// brightens the mode word; colors favor light/high-luminance tones (the
-/// accessibility default).
+/// live (the event loop redraws every frame). `active` brightens the mode
+/// word; colors favor light/high-luminance tones (the accessibility default).
+///
+/// `active` is "this row has content AND chat owns the keyboard". Both halves
+/// matter: a blocking modal leaves the mounted header visible underneath it,
+/// and a mode word still burning in the live accent there is a second thing on
+/// screen claiming the keyboard. The chevron recedes
+/// ([`prompt_line_with_focus`]); so must this.
 fn header_line(
     editor: &Editor,
     model: &str,
@@ -574,7 +579,9 @@ fn header_line(
     session: &str,
     active: bool,
 ) -> Line<'static> {
-    let accent = Color::Rgb(255, 165, 90);
+    // ONE accent, shared with the chevron: two constants for one signal is
+    // how they drift apart.
+    let accent = Color::from(newt_core::tty::ACTIVE_INPUT_CT);
     let dim = Color::DarkGray;
     let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut spans: Vec<Span> = vec![Span::styled(format!("[{stamp}]"), Style::default().fg(dim))];
@@ -918,7 +925,7 @@ fn draw(
             status.endpoint,
             status.gauge,
             status.session,
-            !empty,
+            !empty && input_focused,
         )),
         header_area,
     );
@@ -3675,6 +3682,55 @@ mod tests {
             Some(Color::from(newt_core::tty::ACTIVE_INPUT_CT))
         );
         assert_eq!(inactive.spans[0].style.fg, Some(Color::DarkGray));
+    }
+
+    /// **Exactly one prompt on screen is live.** The receding chevron is
+    /// asserted above at line level; this asserts it at FRAME level, which is
+    /// the form the operator actually reported — two chevrons both painted in
+    /// the live accent, with nothing saying which one owned the keyboard.
+    /// Scanning every cell means a future row that reintroduces the accent
+    /// while a modal is up fails here, not in a screenshot.
+    #[test]
+    fn no_cell_carries_the_live_accent_while_a_modal_owns_the_keyboard() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let editor = vi_editor();
+        let textarea = TextArea::new(vec!["a draft that survives".to_string()]);
+        let accent = Color::from(newt_core::tty::ACTIVE_INPUT_CT);
+
+        let render = |chat_inactive: bool| {
+            let (width, height) = (60_u16, 4_u16);
+            let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &textarea,
+                    &editor,
+                    Some(1),
+                    RichStatus {
+                        chat_inactive,
+                        ..RichStatus::default()
+                    },
+                );
+            })
+            .unwrap();
+            let buf = term.backend().buffer();
+            (0..height)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .filter(|&(x, y)| buf.cell((x, y)).unwrap().style().fg == Some(accent))
+                .count()
+        };
+
+        assert!(
+            render(false) > 0,
+            "the mounted chat chevron is accented while it owns the keyboard"
+        );
+        assert_eq!(
+            render(true),
+            0,
+            "a modal owns the keyboard: nothing beneath it may still read as live"
+        );
     }
 
     #[test]

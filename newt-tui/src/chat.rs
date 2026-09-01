@@ -6172,12 +6172,19 @@ fn session_body(
                         println!();
                         continue;
                     }
-                    let cont = dispatch_slash(
+                    // A form's questions go through the SAME seam the
+                    // permission gate uses, so the cockpit dims the mounted
+                    // chevron, reserves the modal's rows, and stops repainting
+                    // its clock while the operator answers. Asking on this
+                    // thread's terminal instead is what left two live prompts
+                    // painted over each other.
+                    let cont = dispatch_slash_with_ask(
                         &task,
                         workspace,
                         color,
                         verbose,
                         markdown_enabled(&cfg, color, markdown_override),
+                        Some(&ask_surface),
                     )?;
                     surface.save_history();
                     // Skip config reload and terminal reinit when exiting — unnecessary
