@@ -1095,4 +1095,83 @@ mod fallthrough_tests {
         assert_eq!(lookup("PSYCHE").map(|c| c.name), Some("cognition"));
         assert!(lookup("zzznotacommand").is_none());
     }
+
+    /// #2001: `/settings` shipped in #1994 reachable but ADVERTISED NOWHERE —
+    /// absent from `help_lines()`, which also seeds the palette, so typing it
+    /// got palette-completed into `/crew edit`. The inventory called this
+    /// drift class out ("the dispatch outgrew the help") and #1994 then added
+    /// an instance of it. This ratchet makes the drift a test failure: a
+    /// registry command either LEADS a help line or is enumerated below, and
+    /// the list may only shrink.
+    #[test]
+    fn every_registry_command_is_advertised_or_ratcheted() {
+        // Exact set, not a count: membership names the debt (F0d discipline).
+        // Remove rows as commands gain help lines; NEVER add one for a new
+        // command — new commands ship advertised.
+        const KNOWN_UNADVERTISED: &[&str] = &[
+            // The inventory's "advertised nowhere" set (#1994 §1), verbatim.
+            "callees",
+            "callers",
+            "cognition",
+            "detail",
+            "edit-mode",
+            "hierarchy",
+            "implementations",
+            "markdown",
+            "rename",
+            "tab",
+            "tenacity",
+            "undo-lock",
+        ];
+
+        let advertised: std::collections::BTreeSet<&str> = crate::help_lines()
+            .iter()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter_map(|tok| tok.strip_prefix('/'))
+            .collect();
+        // Positive read assertion: an empty parse must fail, not pass.
+        assert!(
+            advertised.len() >= 20,
+            "help_lines() parse collapsed: only {} slash tokens",
+            advertised.len()
+        );
+
+        let missing: Vec<&str> = COMMANDS
+            .iter()
+            .map(|c| c.name)
+            .filter(|n| !advertised.contains(n) && !KNOWN_UNADVERTISED.contains(n))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "registry commands with no help_lines() row (add the row, or argue \
+             a KNOWN_UNADVERTISED entry in review): {missing:?}"
+        );
+        // The ratchet only shrinks: a row that gained a help line must leave.
+        let stale: Vec<&str> = KNOWN_UNADVERTISED
+            .iter()
+            .copied()
+            .filter(|n| advertised.contains(n))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "now advertised — remove from the list: {stale:?}"
+        );
+    }
+
+    /// The slash surface must be deduplicated: one token, one command. The
+    /// registry's `lookup` is first-match, so a duplicate token would win
+    /// silently by declaration order — this makes it a test failure instead.
+    /// Mutation-proved: `settings` claiming `config`'s token goes red with
+    /// "token `/config` claimed by both `settings` and `config`".
+    #[test]
+    fn no_token_resolves_to_two_commands() {
+        let mut seen: std::collections::BTreeMap<&str, &str> = Default::default();
+        for c in COMMANDS {
+            for t in c.tokens() {
+                if let Some(prev) = seen.insert(t, c.name) {
+                    panic!("token `/{t}` claimed by both `{prev}` and `{}`", c.name);
+                }
+            }
+        }
+    }
 }

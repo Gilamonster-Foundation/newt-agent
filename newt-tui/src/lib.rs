@@ -12548,6 +12548,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /backend <openai|ollama> [model] - text form: switch the wire kind (e.g. /backend ollama deepseek-r1)",
         "  /backends [name]         - alias of /backend; text list stays: bare lists (piped/lean), /backends <name> switches",
         "  /thinking <on|off>       - toggle the reasoning spinner for this session",
+        "  /settings [field value]  - the settings form: edit-mode + effort dials + rounds; every applied change writes a receipt (#1981)",
         "  /probe [model|all]       - classify tool use, context window, thinking, calibration (all = re-probe every model; Esc cancels)",
         "  /probe window [model]    - empirical input-boundary search (records max input at High confidence)",
         "  /probe reset             - wipe all learned probe values (conformance, windows, calibration)",
