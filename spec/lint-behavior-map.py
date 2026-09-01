@@ -38,7 +38,12 @@ Also enforced: valid status vocabulary; status<->refs consistency (rust=tested
 needs rust refs; lean in {spec,proven} needs resolving lean refs; tla=checked
 needs a checked spec ref; conformance=full needs every prerequisite layer);
 required fields; duplicate section headers; duplicate refs; zero and ambiguous
-(multi-match) resolutions.
+(multi-match) resolutions; and the tier cross-check (G5,
+docs/decisions/key_ladder_crate.md §5) — a `rust_tests` ref's optional `tier`
+field must agree with whether Cargo actually runs the test: `tier = "unit"`
+(the per-PR lane) on a test carrying `#[ignore]` is a hard error, since that
+test never runs in `cargo test --workspace` and the ref would otherwise claim
+coverage the repo does not have.
 
 Usage:  python3 spec/lint-behavior-map.py [--strict] [--map P] [--repo D] [--lean-dir D]
 Exit 0 = clean (per mode); 1 = at least one hard error.
@@ -158,6 +163,17 @@ def _is_test_attr(body: str) -> bool:
     return last == "test" or head in _TEST_ATTR_NAMES or last in _TEST_ATTR_NAMES
 
 
+def _is_ignore_attr(body: str) -> bool:
+    """True if an attribute body is `ignore` or `ignore = "reason"` — the
+    Cargo/rustc marker (`#[ignore]` / `#[ignore = "..."]`) that excludes a
+    `#[test]` fn from the default `cargo test` run. Split on `=` too (unlike
+    `_is_test_attr`, which never sees one): the reason string's own content is
+    already dropped by `_strip_rust`'s string state, leaving `ignore = ` (or
+    `ignore =`) as the body."""
+    head = re.split(r"[(\s=]", body.strip(), maxsplit=1)[0]
+    return head == "ignore"
+
+
 def _attrs_before(s: str, p: int) -> list[str]:
     """Attribute bodies attached to the item whose keyword starts at index `p`,
     walking back over intervening whitespace and modifier keywords (pub/async/…)."""
@@ -198,14 +214,18 @@ def _fn_is_test(s: str, kw_start: int) -> bool:
     return any(_is_test_attr(a) for a in _attrs_before(s, kw_start))
 
 
-def rust_test_defs(text: str) -> list[tuple[tuple[str, ...], str]]:
-    """[(in-file module path, fn name)] for TEST-ATTRIBUTED fns only, tracking
-    `mod X { … }` nesting by depth. A `fn` without a recognized test attribute is
-    NOT returned — so a rust_tests ref cannot resolve to something Cargo won't run."""
+def rust_test_defs(text: str) -> list[tuple[tuple[str, ...], str, bool]]:
+    """[(in-file module path, fn name, is_ignored)] for TEST-ATTRIBUTED fns only,
+    tracking `mod X { … }` nesting by depth. A `fn` without a recognized test
+    attribute is NOT returned — so a rust_tests ref cannot resolve to something
+    Cargo won't run. `is_ignored` (G5, docs/decisions/key_ladder_crate.md §5) is
+    whether the SAME attribute cluster also carries `#[ignore]` — the tier
+    cross-check's only source of truth, read off this one scan rather than a
+    second pass over the file."""
     lex = _strip_rust(text)
     s = "".join(c for c, _ in lex)
     depths = [d for _, d in lex]
-    defs: list[tuple[tuple[str, ...], str]] = []
+    defs: list[tuple[tuple[str, ...], str, bool]] = []
     modstack: list[tuple[str, int]] = []  # (name, body_depth)
     for m in re.finditer(
         r"\bmod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{|\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\b|\}", s
@@ -224,7 +244,8 @@ def rust_test_defs(text: str) -> list[tuple[tuple[str, ...], str]]:
             # never runs, so it must not satisfy a rust_tests ref.
             scope_depth = modstack[-1][1] if modstack else 0
             if depth_here == scope_depth:
-                defs.append((tuple(nm for nm, _ in modstack), m.group(2)))
+                ignored = any(_is_ignore_attr(a) for a in _attrs_before(s, m.start()))
+                defs.append((tuple(nm for nm, _ in modstack), m.group(2), ignored))
     return defs
 
 
@@ -337,6 +358,14 @@ class Linter:
         self.errors: list[str] = []
         self.warnings: list[str] = []
         self._lean_cache: list[str] | None = None
+        # G5 tier cross-check (key_ladder_crate.md §5) positive-read counters:
+        # `tier_refs_declared` counts every rust_tests ref carrying a `tier`
+        # field; `tier_refs_checked` counts how many of those actually got their
+        # ignored-status compared (i.e. resolved to exactly one definition). If
+        # refs declare `tier` but NONE get checked, the scan itself is broken —
+        # see `run()`.
+        self.tier_refs_declared = 0
+        self.tier_refs_checked = 0
 
     def err(self, bhv: str, msg: str) -> None:
         self.errors.append(f"{bhv}: {msg}")
@@ -385,14 +414,19 @@ class Linter:
     def resolve_lean(self, ref: dict) -> int:
         return self.lean_declset().count(f"{ref['module']}.{ref['symbol']}")
 
-    def resolve_rust_test(self, ref: dict) -> int | None:
+    def resolve_rust_test(self, ref: dict) -> tuple[int | None, bool | None]:
+        """(match count, ignored). `ignored` is only meaningful when the ref
+        resolves to exactly one definition; a zero or ambiguous match yields
+        `None` — `check_resolvable` already reports those as errors, so the tier
+        cross-check has nothing further to say about them."""
         p = self.repo / ref["path"]
         if not p.exists():
-            return None
+            return None, None
         parts = ref["symbol"].split("::")
         parents, leaf = tuple(parts[:-1]), parts[-1]
         defs = rust_test_defs(p.read_text(encoding="utf-8", errors="replace"))
-        return sum(1 for mp, fn in defs if fn == leaf and mp == parents)
+        matches = [ig for mp, fn, ig in defs if fn == leaf and mp == parents]
+        return len(matches), (matches[0] if len(matches) == 1 else None)
 
     def resolve_production(self, ref: dict) -> int | None:
         p = self.repo / ref["path"]
@@ -411,6 +445,27 @@ class Linter:
                               + (f" (pending PR #{pending}, and --strict)" if pending else ""))
         elif count > 1:
             self.err(bhv, f"{label} is AMBIGUOUS ({count} matches)")
+
+    def check_rust_tier(self, bhv: str, ref: dict, ignored: bool | None) -> None:
+        """G5 (docs/decisions/key_ladder_crate.md §5): `tier` on a rust_tests ref
+        claims which lane runs the test. `tier = "unit"` claims the per-PR gate
+        (`cargo test --workspace`, ci.yml); Cargo never runs an `#[ignore]`d test
+        there. So a `tier = "unit"` ref pointing at an ignored test — whether
+        because it was authored that way, or because `#[ignore]` was added later
+        without updating `tier` — claims per-PR coverage the repo does not have.
+        `tier` is otherwise advisory (most refs carry none); a ref with no `tier`
+        makes no per-PR claim and is skipped here."""
+        tier = ref.get("tier")
+        if tier is None:
+            return
+        self.tier_refs_declared += 1
+        if ignored is None:
+            return  # unresolved/ambiguous ref — already reported by check_resolvable
+        self.tier_refs_checked += 1
+        if tier == "unit" and ignored:
+            label = f"rust_tests {ref['path']}::{ref['symbol']}"
+            self.err(bhv, f"{label} is tier = \"unit\" (claims the per-PR gate) "
+                          "but is #[ignore]d — never runs there")
 
     def check_tla_ref(self, bhv: str, ref: dict) -> None:
         """A tla ref must name a spec + an invariant that is BOTH defined as an
@@ -492,7 +547,9 @@ class Linter:
         for r in rust_refs:
             if not (r.get("path") and r.get("symbol")):
                 self.err(bhv, f"rust_tests ref needs `path` and `symbol`: {r}"); continue
-            self.check_resolvable(bhv, "rust_tests", r, self.resolve_rust_test(r))
+            count, ignored = self.resolve_rust_test(r)
+            self.check_resolvable(bhv, "rust_tests", r, count)
+            self.check_rust_tier(bhv, r, ignored)
         for r in prod_refs:
             if not (r.get("path") and r.get("symbol")):
                 self.err(bhv, f"production ref needs `path` and `symbol`: {r}"); continue
@@ -516,6 +573,19 @@ class Linter:
             return 1
         for bhv in bhvs:
             self.check_contract(bhv, data[bhv])
+
+        # Positive-read assertion for the G5 tier cross-check: an absence-check
+        # fails OPEN (anything that shrinks what got scanned makes it MORE likely
+        # to pass), so it is not enough that no `tier = "unit"` ref was found
+        # ignored — the map declares `tier` refs at all, so the scan must have
+        # actually resolved at least one of them. Zero checked despite refs
+        # declaring `tier` means the scan collapsed (a renamed field, a broken
+        # resolver, an empty file list), not that everything is fine.
+        if self.tier_refs_declared and not self.tier_refs_checked:
+            self.errors.append(
+                "tier cross-check: rust_tests refs declare `tier` but none resolved "
+                "to a real test definition — the tier/#[ignore] scan may have "
+                "collapsed (G5, docs/decisions/key_ladder_crate.md §5)")
 
         if self.warnings:
             print(f"[warn ] {len(self.warnings)} pending-PR advisory reference(s):", file=sys.stderr)

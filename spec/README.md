@@ -32,7 +32,11 @@ behaviors the constitution admits.
   zero/ambiguous/duplicate refs, invalid status, a missing required field, and an
   unmet `conformance = "full"`. A `rust_tests` ref must resolve to a fn carrying a
   recognized **test attribute** (`#[test]`, `#[tokio::test]`, …) — deleting the
-  attribute orphans the ref even though the fn remains. A `tla` ref must name an
+  attribute orphans the ref even though the fn remains. A `rust_tests` ref's
+  optional `tier` field is cross-checked against `#[ignore]`: `tier = "unit"`
+  (the per-PR lane) on an ignored test is an ERROR, since Cargo never runs it in
+  `cargo test --workspace` and the ref would otherwise claim per-PR coverage the
+  repo does not have (key_ladder_crate.md §5, "G5"). A `tla` ref must name an
   invariant that is both **defined** as an operator in `<spec>.tla` and
   **declared** in an `INVARIANT` line of `<spec>.cfg`. Lean refs are resolved
   against the **whole `formal/` layer** — every lake lib, not just `NewtPolicy/` —
