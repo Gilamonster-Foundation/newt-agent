@@ -1,0 +1,87 @@
+# The cockpit's Esc / Ctrl-C precedence ladder — rungs 2..7 of the table in
+# docs/decisions/esc_and_vi_contract.md §4, as DATA rather than as a `match`.
+#
+# Read by `newt-tui/src/esc_ladder.rs` through `include_str!`, so this file is
+# compiled into the binary and a malformed table is a test failure here, never
+# an operator's broken keyboard.
+#
+# ORDER IS THE CONTRACT. `Ladder::resolve` scans the rungs top to bottom and
+# the first LIVE claimant wins, so moving a row changes behaviour. The order
+# below is the ADR's, and `precedence_ladder`'s own `order_is_load_bearing`
+# test is what keeps that from being a set.
+#
+# ADDING A CLAIMANT: add the row here AND an accessor beside the state it reads
+# (`Vi::claims` / `Editor::claims` / `MountedEditor::claim_set`). A row with no
+# accessor can never fire; the conformance test in `rich_input.rs`
+# (`every_ladder_claimant_is_reachable_from_the_editors_own_state`) fails the PR
+# rather than letting the rung sit dead.
+#
+# WHAT IS DELIBERATELY ABSENT:
+#
+#   * rung 1, the permission/ask modal. It can never be live: on
+#     `SurfaceRequest::Interact` the presenter blocks INSIDE `handle_request`
+#     and never reaches `poll_keys`, so the modal's own `event::read()` loop
+#     has the keyboard. A dead rung would make the conformance test above pass
+#     on a constant.
+#   * the live-spill explore mode (#1704). Its ladder is the classic watcher's;
+#     the two cursor-relative spill renderers are not constructed under the
+#     cockpit (see `cockpit/mod.rs`).
+#   * a staged / double / timed Esc, and any rebindable keymap. Rejected in the
+#     ADR (§4 "Do not add a staged Esc", §6 Q3) — this table is not the place to
+#     reintroduce them.
+#   * `ctrl-d`. `0x04` is already `TurnKey::HalfPageDown` in the vi nav decoder
+#     and `Step::Eof` at an empty prompt; making it a hatch trigger is a
+#     behaviour change no ADR authorizes (§8 Q4).
+
+schema = 1
+
+# Esc reaches the hatch only when EVERY rung below declined — that is rung 7.
+# It is `fallthrough`, not `reserved`, and the difference is the whole design:
+# a reserved trigger outranks the rungs, a fallthrough trigger is what is left
+# after them.
+fallthrough = ["esc"]
+
+# Ctrl-C is reserved: it escapes while a turn runs no matter which rung is
+# live, so rungs 2..6 can never strand the operator. Idle, it is `Unbound` and
+# the editor's draft-clear still owns it.
+[hatch]
+action = "interrupt"
+reserved = ["ctrl-c"]
+
+# 2 — the slash-command palette swallows Esc to close.
+[[rung]]
+claimant = "palette"
+triggers = ["esc"]
+action = "close palette"
+
+# 3 — a pending vi `[y/N]` (today only `:wq`/`:x`) answers with the next key.
+[[rung]]
+claimant = "vi-confirm"
+triggers = ["esc"]
+action = "cancel [y/N]"
+
+# 4 — an open vi `:` ex line cancels back to NORMAL.
+[[rung]]
+claimant = "vi-ex"
+triggers = ["esc"]
+action = "cancel :"
+
+# 5 — vi INSERT. Esc here is an EDITING TRANSITION, not a cancel; this is the
+# one rung every comparable harness agrees on.
+[[rung]]
+claimant = "vi-insert"
+triggers = ["esc"]
+action = "NORMAL"
+
+# 6 — vi NORMAL with a half-typed sequence: a pending operator (`d`), a
+# building count (`2`), or a one-shot i_CTRL-O. Esc cancels the sequence and
+# stays in NORMAL.
+#
+# THIS ROW IS WHERE NEWT BEATS CODEX. Codex subtracts only insert-mode escape
+# from its interrupt predicate, so a mid-turn `d` then Esc kills the turn
+# (`bottom_pane/mod.rs` returns before the composer's operator-pending branch).
+# newt already tracks pending/count/insert_normal, so honouring them is a row.
+[[rung]]
+claimant = "vi-pending"
+triggers = ["esc"]
+action = "cancel operator"

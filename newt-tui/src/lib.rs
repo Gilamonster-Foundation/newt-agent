@@ -135,6 +135,12 @@ mod palette;
 mod backend_panel;
 #[cfg(feature = "rich-tui")]
 mod vi;
+// #2005: the Esc / Ctrl-C precedence table (`assets/esc_ladder.toml`) plus the
+// key→trigger-name mapping the `precedence-ladder` crate deliberately does not
+// own. Gated with the surfaces whose claimants it ranks — palette, vi, cockpit
+// presenter — so the lean / piped / wyvern paths never compile it in.
+#[cfg(feature = "rich-tui")]
+mod esc_ladder;
 // #1669: the cockpit — the terminal owned by the UI thread for the whole
 // session, editor mounted while a turn runs, session output relayed through a
 // pty. The live presenter is unix (fd capture via `dup2`/`openpty`); the module

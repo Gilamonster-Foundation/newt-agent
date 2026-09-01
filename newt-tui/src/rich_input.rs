@@ -255,6 +255,25 @@ impl Editor {
         self.vi.reset_for_new_line();
     }
 
+    /// Register this editor's Esc-ladder claims (#2005).
+    ///
+    /// **The `edit` gate is mandatory, not defensive.** `Editor` carries a
+    /// `Vi` in ALL modes — `Editor::new` builds one unconditionally and
+    /// `Vi::new` starts in `Mode::Insert` — and `Editor::input` gates every vi
+    /// dispatch on `self.edit == Edit::Vi`. Without the same gate here,
+    /// `vi-insert` would claim Esc permanently under emacs and nano, where the
+    /// key is a silent no-op and rung 7 is exactly what should own it.
+    ///
+    /// emacs' armed `C-x` prefix needs no rung: the only key that completes it
+    /// is Ctrl-C, which the hatch reserves, so the ladder preserves today's
+    /// behaviour (the presenter's interrupt already preempted `C-x C-c`
+    /// mid-turn) without a row.
+    fn claims(&self, c: &mut precedence_ladder::ClaimSet) {
+        if self.edit == Edit::Vi {
+            self.vi.claims(c);
+        }
+    }
+
     /// Handle one key. Submit / interrupt / EOF and the continuation-aware Enter
     /// are shared by both modes via the [`crate::footer_continues`] classifier.
     fn input(&mut self, key: KeyEvent, ta: &mut TextArea) -> Step {
@@ -1771,6 +1790,28 @@ impl MountedEditor {
         std::mem::replace(&mut self.editor.vi, Vi::new())
     }
 
+    /// Which Esc-ladder claimants this mount has live right now (#2005).
+    ///
+    /// The registration point for every Esc consumer inside the editor, and
+    /// the reason the presenter's arm is one predicate instead of a call
+    /// ordering across five files. A new surface that wants Esc — PR8's rich
+    /// `/settings` shell is the next one — adds a row to
+    /// `assets/esc_ladder.toml` and a line here, rather than a sixth
+    /// independent `event::read()` loop; the conformance test below fails the
+    /// PR if it adds the row and forgets the line.
+    ///
+    /// Cockpit-only, hence the `cfg`: the classic driver's editor does not
+    /// exist while a turn runs, so it has nothing to rank.
+    #[cfg(unix)]
+    pub(crate) fn claim_set(&self) -> precedence_ladder::ClaimSet {
+        let mut c = precedence_ladder::ClaimSet::default();
+        if self.palette.is_open() {
+            c.claiming("palette");
+        }
+        self.editor.claims(&mut c);
+        c
+    }
+
     /// Tell the editor whether a turn is running, for the `^C` half of the
     /// mode hint (#2006). Cockpit-only: the classic driver's editor is not
     /// alive during a turn, so its `false` is already the truth — hence the
@@ -3001,6 +3042,95 @@ mod tests {
     }
     fn special(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// G3(a), the registration conformance test (#2005): every claimant the
+    /// shipped table names must be REACHABLE from a real key sequence through
+    /// the editor's own accessors.
+    ///
+    /// Reachability, not spelling, is the point. A test that asserted the five
+    /// names appear somewhere in the source would pass on a `claims` that can
+    /// never fire; this one types the keys an operator types and reads the
+    /// claim set back, so a rung with no accessor — or an accessor guarded on
+    /// a condition that is never true — fails the PR that adds it.
+    #[cfg(unix)]
+    #[test]
+    fn every_ladder_claimant_is_reachable_from_the_editors_own_state() {
+        // The key sequence that puts a fresh vi mount into each claiming
+        // state, straight out of `esc_and_vi_contract.md` §4.
+        let reach: &[(&str, &[KeyEvent])] = &[
+            // A fresh vi mount IS in INSERT, so no keys at all.
+            ("vi-insert", &[]),
+            ("palette", &[key('/')]),
+            ("vi-pending", &[special(KeyCode::Esc), key('d')]),
+            ("vi-ex", &[special(KeyCode::Esc), key(':')]),
+            (
+                "vi-confirm",
+                &[
+                    special(KeyCode::Esc),
+                    key(':'),
+                    key('w'),
+                    key('q'),
+                    special(KeyCode::Enter),
+                ],
+            ),
+        ];
+        for (claimant, keys) in reach {
+            let mut mounted = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "");
+            let mut sink = RecordingSink::default();
+            for k in *keys {
+                mounted.on_event(Event::Key(*k), &mut sink).unwrap();
+            }
+            assert!(
+                mounted.claim_set().is_live(claimant),
+                "`{claimant}` is a rung in assets/esc_ladder.toml but nothing \
+                 in Vi::claims / Editor::claims / MountedEditor::claim_set \
+                 reports it — the rung can never fire"
+            );
+        }
+
+        // Both directions. The loop above proves every listed name is
+        // reachable; this proves the LIST is the table, so adding a rung
+        // without an accessor (or an accessor without a rung) is a red PR
+        // rather than a dead row nobody notices.
+        let mut reachable: Vec<&str> = reach.iter().map(|(name, _)| *name).collect();
+        reachable.sort_unstable();
+        let mut table: Vec<&str> = crate::esc_ladder::ESC_LADDER.claimants().collect();
+        table.sort_unstable();
+        assert_eq!(
+            reachable, table,
+            "the ladder's claimants and the states this test can reach have \
+             drifted apart"
+        );
+
+        // ANTI-VACUOUS TWIN: an idle vi mount in NORMAL claims NOTHING, so the
+        // assertions above cannot be passing on a `claim_set` that names
+        // everything unconditionally — which would swallow the interrupt at
+        // every rung and reproduce exactly the defect #2005 fixes.
+        let mut normal = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "");
+        let mut sink = RecordingSink::default();
+        normal
+            .on_event(Event::Key(special(KeyCode::Esc)), &mut sink)
+            .unwrap();
+        assert_eq!(
+            normal.claim_set().names().collect::<Vec<_>>(),
+            Vec::<&str>::new(),
+            "vi NORMAL with nothing pending must decline Esc — that decline IS \
+             rung 7"
+        );
+
+        // ANTI-VACUOUS TWIN, second half: the `edit == Edit::Vi` gate in
+        // `Editor::claims`. `Editor` carries a `Vi` in every mode and it
+        // starts in INSERT, so without the gate an emacs mount would claim
+        // `vi-insert` forever and Esc would never reach the hatch there.
+        for (name, edit) in [("emacs", Edit::Emacs), ("nano", Edit::Nano)] {
+            let mounted = MountedEditor::new(edit, Some(1), Vec::new(), "");
+            assert_eq!(
+                mounted.claim_set().names().collect::<Vec<_>>(),
+                Vec::<&str>::new(),
+                "{name} carries a Vi in INSERT; it must not claim Esc"
+            );
+        }
     }
 
     fn vi_editor() -> Editor {
