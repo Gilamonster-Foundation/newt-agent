@@ -139,7 +139,15 @@ mod vi;
 // key→trigger-name mapping the `precedence-ladder` crate deliberately does not
 // own. Gated with the surfaces whose claimants it ranks — palette, vi, cockpit
 // presenter — so the lean / piped / wyvern paths never compile it in.
-#[cfg(feature = "rich-tui")]
+//
+// `unix` as well, because the only NON-TEST consumer is the cockpit
+// presenter's key loop and `cockpit`'s live half is unix-gated
+// (`cockpit/mod.rs:39` — fd capture via `dup2`/`openpty`). Without it the
+// Windows build compiles the table and every claim accessor with no caller,
+// and `-D warnings` turns four dead-code lints into a failed build. Matching
+// the gate to the callers keeps the boundary a compile error when it drifts,
+// rather than an `allow` that hides the drift.
+#[cfg(all(unix, feature = "rich-tui"))]
 mod esc_ladder;
 // #2005: the real-PTY acceptance for the rung above — Esc during a running
 // turn interrupts from vi NORMAL, and does NOT from vi INSERT or from a
