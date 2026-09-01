@@ -3133,6 +3133,37 @@ mod tests {
         }
     }
 
+    /// `vi-pending` is an OR of three separate fields, and the conformance
+    /// test above only reaches one of them — so dropping either of the other
+    /// two would go unnoticed there. Each is a live operator sequence: type a
+    /// count and press Esc, or use i_CTRL-O and press Esc, and rung 6 must
+    /// still outrank the interrupt. Without this, a mutation removing
+    /// `count > 0` means typing `2` mid-turn and pressing Esc kills the turn
+    /// instead of cancelling the count.
+    #[cfg(unix)]
+    #[test]
+    fn every_vi_pending_contributor_claims_esc() {
+        for (what, keys) in [
+            ("a pending operator", vec![special(KeyCode::Esc), key('d')]),
+            ("a building count", vec![special(KeyCode::Esc), key('2')]),
+            // i_CTRL-O leaves mode == Normal with the one-shot armed, so it
+            // must land on `vi-pending` and NOT on `vi-insert`.
+            ("i_CTRL-O", vec![ctrl('o')]),
+        ] {
+            let mut mounted = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "");
+            let mut sink = RecordingSink::default();
+            for k in keys {
+                mounted.on_event(Event::Key(k), &mut sink).unwrap();
+            }
+            assert_eq!(
+                mounted.claim_set().names().collect::<Vec<_>>(),
+                vec!["vi-pending"],
+                "{what} must claim rung 6 alone — not nothing (the turn dies \
+                 mid-sequence) and not vi-insert as well"
+            );
+        }
+    }
+
     fn vi_editor() -> Editor {
         Editor::new(Edit::Vi)
     }
