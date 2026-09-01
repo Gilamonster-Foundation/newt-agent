@@ -1962,6 +1962,66 @@ mod terminal_acceptance {
                 !is_canonical(0),
                 "the cockpit's raw mode survives the panel"
             );
+
+            // ---- the rows come back on the paths nobody plans for ----
+            //
+            // Release-on-drop is the whole synchronization mechanism, so the
+            // paths worth proving are the ones with no drawing in them at all:
+            // a panel that fails before its first frame, and a session that
+            // vanishes between asking for rows and taking them. Either would
+            // strand the presenter parked on rows nobody will release, which
+            // presents as a frozen cockpit rather than as an error.
+            let (early_reply, early_window) =
+                std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
+            let early = std::thread::spawn(move || {
+                // Took the rows, drew nothing, gave them straight back — the
+                // shape of a panel whose seed was empty or whose terminal
+                // failed to build.
+                drop(early_window.recv().expect("the presenter answers"));
+            });
+            cockpit
+                .handle_request(SurfaceRequest::Panel {
+                    rows: 6,
+                    reply: early_reply,
+                })
+                .expect("an undrawn panel still returns");
+            early.join().expect("early-drop panel");
+            assert!(
+                !cockpit.chat_inactive,
+                "focus returns when a panel drops its window without drawing"
+            );
+
+            // And the session that disappears mid-ask: the reply send fails,
+            // which must undo the reservation rather than park on it.
+            let (orphan_reply, orphan_window) =
+                std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
+            drop(orphan_window);
+            cockpit
+                .handle_request(SurfaceRequest::Panel {
+                    rows: 6,
+                    reply: orphan_reply,
+                })
+                .expect("a vanished session is not a presenter error");
+            assert!(
+                !cockpit.chat_inactive,
+                "a panel request nobody received must not leave chat dimmed"
+            );
+            assert_eq!(
+                cockpit.editor.draft(),
+                draft,
+                "the chat draft survives both panel failure paths"
+            );
+            // The block is still live: it repaints on demand rather than
+            // having been left in the modal's reserved geometry.
+            let before_repaint = tty.painted().len();
+            cockpit.dirty = true;
+            cockpit
+                .draw()
+                .expect("the cockpit still paints after a failed panel");
+            assert!(
+                tty.painted().len() > before_repaint,
+                "the cockpit block is still live after the panel failure paths"
+            );
         }
 
         // ---- and the terminal comes back, exactly ----
