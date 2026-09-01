@@ -603,6 +603,32 @@ pub(crate) struct Presenter {
     _raw: newt_core::tty::raw_mode::RawModeGuard,
 }
 
+/// The seam `esc_ladder_pty_test`'s child half drives the cockpit through.
+///
+/// It exists because that test cannot use [`Presenter::run`] — `run` needs a
+/// live session channel — and must not open-code the loop body, which would be
+/// a second implementation of the thing under test. Two methods, both thin:
+/// one turn of the loop, and the exact predicate input the production arm
+/// reads. Everything else the test needs is already `pub(crate)`.
+#[cfg(test)]
+impl Presenter {
+    /// One turn of [`Presenter::run`]'s body, minus the request channel:
+    /// relay whatever the session printed, take one bounded look at the
+    /// keyboard, repaint.
+    pub(crate) fn pump(&mut self) -> io::Result<()> {
+        self.drain_pty()?;
+        self.poll_keys()?;
+        self.draw()
+    }
+
+    /// The live claim set — the same value [`Presenter::escapes`] resolves
+    /// against, so the test observes the production input rather than a
+    /// test-only twin of it.
+    pub(crate) fn claims(&self) -> precedence_ladder::ClaimSet {
+        self.editor.claim_set()
+    }
+}
+
 /// The cockpit does not paint through the arbiter — its rows are on the real
 /// terminal, outside the pty the arbiter's writers see — but registering
 /// gives it the one thing it needs from the arbiter: the `suspended` edge.
@@ -762,7 +788,7 @@ impl Presenter {
         Ok(())
     }
 
-    fn handle_request(&mut self, req: SurfaceRequest) -> io::Result<()> {
+    pub(crate) fn handle_request(&mut self, req: SurfaceRequest) -> io::Result<()> {
         match req {
             SurfaceRequest::ReadLine { prompt: _, reply } => {
                 // A confirmed `:wq` submitted its turn last time; now that the

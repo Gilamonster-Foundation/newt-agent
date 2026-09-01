@@ -141,6 +141,12 @@ mod vi;
 // presenter — so the lean / piped / wyvern paths never compile it in.
 #[cfg(feature = "rich-tui")]
 mod esc_ladder;
+// #2005: the real-PTY acceptance for the rung above — Esc during a running
+// turn interrupts from vi NORMAL, and does NOT from vi INSERT or from a
+// half-typed operator. NOT `#[ignore]`d: it is the primary per-PR guard, and a
+// guard that runs in no lane is decoration.
+#[cfg(all(test, unix, feature = "rich-tui"))]
+mod esc_ladder_pty_test;
 // #1669: the cockpit — the terminal owned by the UI thread for the whole
 // session, editor mounted while a turn runs, session output relayed through a
 // pty. The live presenter is unix (fd capture via `dup2`/`openpty`); the module
