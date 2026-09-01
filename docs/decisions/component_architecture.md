@@ -98,7 +98,7 @@ compiles against it. Measured at `be5647e5`:
 | `precedence-ladder` | which claimant owns a key right now | real, published `0.1.0-rc.1` |
 | card → family | typed metadata into the effort dials, never the model name | real |
 | `CompactionSpan` | derived context provably tied to its source | real |
-| **context manager** | **nothing, on cowork drives** | **broken** |
+| **context manager** | **no summarizer, store, or cross-turn state on cowork drives** | **partial** |
 | **`newt-tui` exports** | **`run_code`, and nothing else** | **broken** |
 | **`newt-cli` dispatch** | **public, and unconsumed** | **broken** |
 | theme tokens | — | does not exist |
@@ -272,15 +272,42 @@ plain data.
 
 ## 5. The two layers still being designed
 
-**The context manager.** Roughly 8,500 lines across `compress.rs` (5,696),
-`prune.rs` (1,414), `content_spill.rs` (876) and `digest_fold.rs` (483) — a
-three-stage pipeline whose spans are content-addressed and retrievable by
-handle. The operator's ask is that it become *"its own component ... pluggable
-... something we can configure and change based on our needs."* The open
-questions are the plugin boundary, the authority confinement (a context
-strategy decides what the model sees — it is a capability, not a formatter),
-and whether it can host #1766's typed operations rather than foreclose them.
-**Design in flight; this document will be amended.**
+**The context manager — and the design came back "no", correctly.**
+
+Two corrections to earlier drafts of this document, verified at source:
+
+1. **Cowork drives are not running bare.** `compress_state: None` falls back
+   to a per-turn local (`agentic/mod.rs:2025`, `None => &mut
+   local_compress_state`); trigger, prune, boundary and assembly all run.
+   What is lost is the **summarizer, the compaction store, and cross-turn
+   state** — a real gap, but a narrower one than "no context management".
+2. **A pluggable context manager already exists, one layer up.**
+   `MemoryProvider` (`newt-core/src/memory.rs`) is `Send + Sync`,
+   `#[async_trait]`, config-selected by `[memory] provider`, with three
+   shipping kinds — `RollingWindow`, `TokenBudget`, `Summarizing` — and a
+   composition root in `newt-tui/src/chat.rs`. Only `Summarizing` writes
+   compaction back into durable history.
+
+The layer proposals kept trying to seam — `compress()` — is the **per-turn
+emergency fit guard**, whose output is dropped at turn end. A plugin there is
+a plugin for the fit guard, not for context management. And no credible second
+strategy exists at that layer: `AppendOnly`, cited by every proposal as the
+alternative that proves the seam, is a harness-wide **invariant** read at
+three sites, two of which are not compaction stages at all.
+
+So the recommendation is: wire what exists, fix the bugs beneath it, and build
+the seam when a fourth strategy is actually worth writing — the zero-LLM
+family (sliding window, clear-tool-results, dedupe-file-reads, clamp-oversized)
+is the honest candidate. Preconditions and the boundary, recorded so the next
+attempt does not re-derive them, are in the context-manager decision doc.
+
+One confinement finding is worth carrying here because it generalizes: "the
+stage is synchronous and holds no store handle, therefore it cannot reach the
+filesystem or network" is **false in Rust** — a sync `fn` in the same binary
+has `std::fs`, `std::process::Command` and blocking sockets. The only
+confinement that survives a hostile stage is **output-side validation by the
+host**. Any boundary this line ships must be described that way or not
+described at all.
 
 **The theme layer.** The missing stylesheet. Semantic tokens rather than
 literals, degradation from truecolor through 256 and 16 to `NO_COLOR`, and a
