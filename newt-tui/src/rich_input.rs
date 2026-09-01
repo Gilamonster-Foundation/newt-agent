@@ -255,6 +255,11 @@ impl Editor {
         self.vi.reset_for_new_line();
     }
 
+    // `unix` with the ladder it feeds (`lib.rs` `mod esc_ladder`): the only
+    // non-test consumer is the cockpit presenter, whose live half is unix-only,
+    // so on Windows this accessor would compile with no caller and `-D
+    // warnings` would fail the build on the dead code.
+    #[cfg(unix)]
     /// Register this editor's Esc-ladder claims (#2005).
     ///
     /// **The `edit` gate is mandatory, not defensive.** `Editor` carries a
@@ -1802,6 +1807,11 @@ impl MountedEditor {
     ///
     /// Cockpit-only, hence the `cfg`: the classic driver's editor does not
     /// exist while a turn runs, so it has nothing to rank.
+    #[cfg(unix)]
+    // `unix` with the ladder it feeds (`lib.rs` `mod esc_ladder`): the only
+    // non-test consumer is the cockpit presenter, whose live half is unix-only,
+    // so on Windows this accessor would compile with no caller and `-D
+    // warnings` would fail the build on the dead code.
     #[cfg(unix)]
     pub(crate) fn claim_set(&self) -> precedence_ladder::ClaimSet {
         let mut c = precedence_ladder::ClaimSet::default();

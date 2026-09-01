@@ -110,6 +110,11 @@ impl Vi {
         self.insert_normal = false;
     }
 
+    // `unix` with the ladder it feeds (`lib.rs` `mod esc_ladder`): the only
+    // non-test consumer is the cockpit presenter, whose live half is unix-only,
+    // so on Windows this accessor would compile with no caller and `-D
+    // warnings` would fail the build on the dead code.
+    #[cfg(unix)]
     /// Register which Esc-ladder rungs this vi state is claiming right now
     /// (#2005, `assets/esc_ladder.toml` rungs 3–6).
     ///
