@@ -25,9 +25,9 @@ use precedence_ladder::Ladder;
 /// The shipped Esc ladder.
 ///
 /// `expect` is honest here rather than a hidden panic risk: the table is
-/// `include_str!`d, so it is fixed at compile time and
-/// [`the_shipped_table_parses_and_has_no_dead_rows`] proves this exact string
-/// parses on every `cargo test`. There is no input path an operator can take
+/// `include_str!`d, so it is fixed at compile time and this module's
+/// `the_shipped_table_parses_and_has_no_dead_rows` test proves this exact
+/// string parses on every `cargo test`. There is no input path an operator can take
 /// that reaches a different table.
 pub(crate) static ESC_LADDER: LazyLock<Ladder> = LazyLock::new(|| {
     Ladder::from_toml(include_str!("../assets/esc_ladder.toml"))

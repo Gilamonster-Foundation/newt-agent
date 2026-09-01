@@ -81,8 +81,13 @@ fn esc_ladder_child() {
     if std::env::var_os("NEWT_ESC_LADDER_PTY_CHILD").is_none() {
         return;
     }
-    let dir = std::env::temp_dir().join(format!("newt-esc-ladder-pty-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("the child's isolated state dir");
+    // The parent's per-run directory, not one of our own: it already isolates
+    // the child from ~/.newt, and the parent removes it at the end — a second
+    // directory here would be one the parent cannot name and so would never
+    // clean up.
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("NEWT_CONFIG_DIR").expect("the parent supplies the isolated state dir"),
+    );
     let surface =
         crate::rich_input::RichSurface::new(Some(dir.join("history"))).expect("rich surface");
     let mut cockpit = crate::cockpit::Presenter::open(surface).expect("the cockpit takes the pty");
