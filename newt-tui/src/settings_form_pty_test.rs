@@ -79,7 +79,10 @@ fn the_settings_form_renders_picks_applies_and_receipts() {
     // DSR) while polling the RENDERED screen for a marker.
     let mut transcript = String::new();
     let mut answered_dsr = false;
-    let mut wait_on_grid = |marker: &str| -> String {
+    // Wait until `marker` appears on the RENDERED grid. `row_only` additionally
+    // requires it on a numbered `[n] …` option row, so a mention in a hint or a
+    // status line cannot satisfy the wait.
+    let mut wait_on_grid_inner = |marker: &str, row_only: bool| -> String {
         let deadline = Instant::now() + REACH_TIMEOUT;
         loop {
             let screen = pty.screen();
@@ -89,7 +92,13 @@ fn the_settings_form_renders_picks_applies_and_receipts() {
                 answered_dsr = true;
             }
             let grid = screen_grid(&screen).join("\n");
-            if grid.contains(marker) {
+            let hit = if row_only {
+                grid.lines()
+                    .any(|l| l.trim_start().starts_with('[') && l.contains(marker))
+            } else {
+                grid.contains(marker)
+            };
+            if hit {
                 return grid;
             }
             assert!(
@@ -101,6 +110,7 @@ fn the_settings_form_renders_picks_applies_and_receipts() {
     };
 
     // 1. The bare form: every field label visible on the grid.
+    let mut wait_on_grid = |m: &str| wait_on_grid_inner(m, false);
     let menu = wait_on_grid(FIELD_LABELS[FIELD_LABELS.len() - 1]);
     for label in FIELD_LABELS {
         assert!(
@@ -110,15 +120,31 @@ fn the_settings_form_renders_picks_applies_and_receipts() {
     }
 
     // 2. Pick field [1] (edit-mode) by number, exactly as an operator types.
+    //
+    //    Wait for an OPTION row, not for the word: the vi mode hint advertises
+    //    `/nano /emacs` (`rich_input.rs` `mode_hint`), so waiting on a bare
+    //    "nano" can return while the FIELD menu is still up — the hint matched,
+    //    not the value menu — and the pick below then reads a digit off the
+    //    hint and submits a wrong choice, leaving no receipt. That is the CI
+    //    failure this fixes (#2006's turn-conditional hint changed the timing
+    //    that had been hiding it).
     pty.type_in("1\r");
-    let values = wait_on_grid("nano");
+    let values = wait_on_grid_inner("nano", true);
 
     // 3. Pick `nano` by ITS number, read off the rendered menu rather than
     //    assumed — the menu's order is the form's business, not this test's.
+    //
+    //    The row must be an OPTION row, not merely a line containing "nano":
+    //    the vi mode hint advertises `/nano /emacs` (rich_input.rs `mode_hint`),
+    //    so a bare `contains("nano")` matches the hint, reads a digit out of a
+    //    timestamp, and submits a wrong choice. This test passed on #2004 only
+    //    because the hint happened to sit outside the captured grid; #2006's
+    //    turn-conditional hint moved it in, which is the good kind of luck —
+    //    a latent brittleness surfacing while someone is watching.
     let nano_row = values
         .lines()
-        .find(|l| l.contains("nano"))
-        .expect("a nano row was on the grid");
+        .find(|l| l.trim_start().starts_with('[') && l.contains("nano"))
+        .expect("a numbered `[n] … nano …` option row was on the grid");
     let number: String = nano_row
         .chars()
         .skip_while(|c| !c.is_ascii_digit())

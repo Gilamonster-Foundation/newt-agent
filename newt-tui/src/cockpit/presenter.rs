@@ -766,12 +766,18 @@ impl Presenter {
             SurfaceRequest::Reload { reply } => {
                 let result = self.surface.reload();
                 let draft = self.editor.draft();
+                // #2006: a `/vi`·`/emacs`·`/nano` reload rebuilds the mount,
+                // and the vi mode/jumplist/`;`-target ride across it the same
+                // way the draft above does.
+                let vi = self.editor.take_vi();
                 self.editor = MountedEditor::new(
                     self.surface.edit(),
                     self.surface.gutter(),
                     self.surface.history(),
                     &draft,
                 );
+                self.editor.adopt_vi(vi);
+                self.editor.set_turn_running(self.turn.is_some());
                 let _ = reply.send(result);
                 self.dirty = true;
             }
@@ -804,6 +810,9 @@ impl Presenter {
                     hard,
                     presses: 0,
                 });
+                // #2006: the mode hint may advertise `^C interrupt` exactly
+                // while that is true.
+                self.editor.set_turn_running(true);
                 self.dirty = true;
             }
             // C1 (#1862): the cockpit owns the terminal, so it presents the
@@ -879,6 +888,7 @@ impl Presenter {
             }
             SurfaceRequest::TurnEnded => {
                 self.turn = None;
+                self.editor.set_turn_running(false);
                 newt_core::tty::set_interrupt_pending(false);
                 self.dirty = true;
             }

@@ -87,6 +87,29 @@ impl Vi {
         }
     }
 
+    /// The line is over — sent with Enter, or thrown away with Ctrl-C (#2006).
+    ///
+    /// **What resets is exactly the mid-keystroke scratch**: a half-typed
+    /// operator/`f`-target/`r`, a building count, an open `:` line, an
+    /// unanswered `[y/N]`, and a one-shot i_CTRL-O. All of those describe a
+    /// command against a buffer that no longer exists; carrying an armed `f`
+    /// across Enter would silently eat the operator's next `i`.
+    ///
+    /// **What does NOT reset is session state**: the mode, the jumplist, and
+    /// the `;`/`,` repeat target. The operator put themselves in NORMAL for a
+    /// reason and sending a line is not a reason to undo it — so there is no
+    /// mode transition here at all, chosen over codex's reset-to-NORMAL and
+    /// reedline's reset-to-INSERT. Before #2006 this was
+    /// `self.vi = Vi::new()`, which reset all nine fields as a side effect of
+    /// rebuilding the editor rather than as anything anyone decided.
+    pub(crate) fn reset_for_new_line(&mut self) {
+        self.pending = Pending::None;
+        self.count = 0;
+        self.ex = None;
+        self.confirm = None;
+        self.insert_normal = false;
+    }
+
     fn take_count(&mut self) -> usize {
         let n = self.count.max(1);
         self.count = 0;

@@ -246,6 +246,15 @@ impl Editor {
         }
     }
 
+    /// The line is over — sent, or abandoned with Ctrl-C. Drops the
+    /// mid-sequence scratch of BOTH modal layers (emacs' armed `C-x` prefix,
+    /// vi's pending operator/count/ex) and keeps everything that is session
+    /// state; see [`Vi::reset_for_new_line`] for what that is and why.
+    fn reset_for_new_line(&mut self) {
+        self.cx_pending = false;
+        self.vi.reset_for_new_line();
+    }
+
     /// Handle one key. Submit / interrupt / EOF and the continuation-aware Enter
     /// are shared by both modes via the [`crate::footer_continues`] classifier.
     fn input(&mut self, key: KeyEvent, ta: &mut TextArea) -> Step {
@@ -287,8 +296,7 @@ impl Editor {
                 // me a clean line" reflex.
                 KeyCode::Char('c') => {
                     *ta = new_textarea(self.edit);
-                    self.vi = Vi::new();
-                    self.cx_pending = false;
+                    self.reset_for_new_line();
                     self.vi.msg = Some("Ctrl-C to interrupt · Ctrl-D to exit".to_string());
                     return Step::Continue;
                 }
@@ -382,19 +390,27 @@ impl Editor {
 
     /// The dim, clears-on-type hint shown on an empty line — the editor mode plus
     /// how to switch. vi is the default; `/nano` and `/emacs` are advertised.
-    fn mode_hint(&self) -> &'static str {
-        match self.edit {
+    ///
+    /// The `^C` half is **turn-conditional** (#2006, contract doc §3 item 4):
+    /// Ctrl-C only interrupts while a turn is running, and at an idle prompt it
+    /// clears the draft (see the `KeyCode::Char('c')` arm in [`Editor::input`]).
+    /// The hint used to promise `^C interrupt` at both, so the affordance and
+    /// the behavior now share one condition instead of drifting apart.
+    fn mode_hint(&self, turn_running: bool) -> String {
+        let head = match self.edit {
             Edit::Vi => match self.vi.mode {
-                Mode::Insert => {
-                    "vi INSERT — Esc: NORMAL · :help · /nano /emacs · ^C interrupt · ^D exit"
-                }
-                Mode::Normal => {
-                    "vi NORMAL — i: insert · :cmd · /nano /emacs · ^C interrupt · ^D exit"
-                }
+                Mode::Insert => "vi INSERT — Esc: NORMAL · :help · /nano /emacs",
+                Mode::Normal => "vi NORMAL — i: insert · :cmd · /nano /emacs",
             },
-            Edit::Emacs => "emacs — Enter sends · Ctrl-h help · /vi /nano · ^C interrupt · ^D exit",
-            Edit::Nano => "nano — Enter sends · ^G help · /vi /emacs · ^C interrupt · ^D exit",
-        }
+            Edit::Emacs => "emacs — Enter sends · Ctrl-h help · /vi /nano",
+            Edit::Nano => "nano — Enter sends · ^G help · /vi /emacs",
+        };
+        let ctrl_c = if turn_running {
+            "^C interrupt"
+        } else {
+            "^C clear"
+        };
+        format!("{head} · {ctrl_c} · ^D exit")
     }
 
     /// The status-header mode word (issue #527): `vi --INSERT--` / `vi --NORMAL--`
@@ -841,6 +857,9 @@ struct RichStatus<'a> {
     /// A blocking modal owns the keyboard while the mounted chat editor stays
     /// visible underneath it. Only the marker recedes; the draft remains.
     chat_inactive: bool,
+    /// #2006: whether a turn is running, which is what decides whether the
+    /// mode hint may advertise `^C interrupt`.
+    turn_running: bool,
 }
 
 fn draw(
@@ -1006,7 +1025,7 @@ fn draw(
         return;
     }
     let prompt = prompt_line_with_focus(editor, true, input_focused);
-    let hint = empty.then(|| editor.mode_hint());
+    let hint = empty.then(|| editor.mode_hint(status.turn_running));
     if g >= GUTTER_W {
         // Wide gutter (opt-in): prompt in a fixed left column, input to its
         // right — continuation lines align under the input at column `g`.
@@ -1017,7 +1036,15 @@ fn draw(
     } else {
         // Overhang (the default): the prompt prefixes the FIRST input row inline
         // (`❯ this`); continuation rows hang-indent by `g` columns (default 1).
-        draw_overhang(f, input_area, &prompt, shown, g, hint, input_focused);
+        draw_overhang(
+            f,
+            input_area,
+            &prompt,
+            shown,
+            g,
+            hint.as_deref(),
+            input_focused,
+        );
     }
 }
 
@@ -1382,6 +1409,16 @@ pub(crate) struct RichSurface {
     tabs: Vec<crate::tab_bar::TabCell>,
     /// #1671: the session display name shown in the header, refreshed per turn.
     session: String,
+    /// #2006: the vi session state, parked between reads.
+    ///
+    /// The classic driver rebuilds its whole editor once per read *by design*,
+    /// so the mode/jumplist/`;`-target cannot live on a long-lived editor the
+    /// way they do under the cockpit — the surface holds them instead, and
+    /// [`RichSurface::event_loop`] hands them to each mount and takes them
+    /// back. `Cell` for the same reason `pending_end_quit` is one: the event
+    /// loop runs behind `&self`. `Cell::take` needs only `Option`'s `Default`,
+    /// so `Vi` stays non-`Clone`.
+    vi: Cell<Option<Vi>>,
 }
 
 /// RAII owner of the rich surface's terminal modes: raw mode **and** bracketed
@@ -1464,6 +1501,7 @@ impl RichSurface {
             background_jobs: Vec::new(),
             tabs: Vec::new(),
             session: String::new(),
+            vi: Cell::new(None),
         })
     }
 
@@ -1551,7 +1589,12 @@ impl RichSurface {
             self.history(),
             typed_ahead.trim_end_matches('\n'),
         );
-        loop {
+        // #2006: this mount is one read old, but the operator's vi mode,
+        // jumplist and `;`-target are not. Adopt what the last read parked.
+        if let Some(vi) = self.vi.take() {
+            me.adopt_vi(vi);
+        }
+        let outcome = loop {
             let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
             let want = me.wanted_rows(term_w, term_h, &self.chrome());
             if want != cur_h {
@@ -1574,18 +1617,23 @@ impl RichSurface {
             let evt = event::read()?;
             match me.on_event(evt, &mut terminal)? {
                 None => {}
-                Some(EditorOutcome::Line(body)) => return Ok(ReadOutcome::Line(body)),
+                Some(EditorOutcome::Line(body)) => break ReadOutcome::Line(body),
                 Some(EditorOutcome::LineThenQuit(body)) => {
                     // Submit this turn now; the end-and-quit fires on the NEXT
                     // read once the turn has run to completion.
                     self.arm_end_quit();
-                    return Ok(ReadOutcome::Line(body));
+                    break ReadOutcome::Line(body);
                 }
-                Some(EditorOutcome::EndAndQuit) => return Ok(ReadOutcome::EndAndQuit),
-                Some(EditorOutcome::Tab(action)) => return Ok(ReadOutcome::Tab(action)),
-                Some(EditorOutcome::Eof) => return Ok(ReadOutcome::Eof),
+                Some(EditorOutcome::EndAndQuit) => break ReadOutcome::EndAndQuit,
+                Some(EditorOutcome::Tab(action)) => break ReadOutcome::Tab(action),
+                Some(EditorOutcome::Eof) => break ReadOutcome::Eof,
             }
-        }
+        };
+        // Park the vi state for the next read (#2006). The arms above `break`
+        // rather than `return` so there is exactly ONE way out of the loop and
+        // no arm can be added that forgets to hand the state on.
+        self.vi.set(Some(me.take_vi()));
+        Ok(outcome)
     }
 }
 
@@ -1664,6 +1712,11 @@ pub(crate) struct MountedEditor {
     /// you type; ↑/↓ (C-p/C-n) move; Tab/Enter complete (never submit); Esc
     /// closes.
     palette: PaletteState,
+    /// Whether a harness turn is running right now — the one condition the
+    /// mode hint's `^C` half is allowed to depend on (#2006). The cockpit
+    /// mirrors its `turn` here; the classic driver leaves it `false`, which is
+    /// correct there because that driver's editor only exists between turns.
+    turn_running: bool,
 }
 
 impl MountedEditor {
@@ -1695,7 +1748,36 @@ impl MountedEditor {
             hist_pos,
             stash: String::new(),
             palette,
+            turn_running: false,
         }
+    }
+
+    /// Adopt the vi state the mount this one replaces was carrying (#2006).
+    ///
+    /// Two drivers rebuild a live editor and must not cost the operator their
+    /// mode, jumplist or `;`/`,` target while doing it: the classic
+    /// per-read loop, which is torn down and rebuilt every turn *by design*,
+    /// and `SurfaceRequest::Reload`, which already carries the draft across
+    /// the same seam. The cockpit's steady state needs neither — its editor
+    /// stays mounted.
+    pub(crate) fn adopt_vi(&mut self, vi: Vi) {
+        self.editor.vi = vi;
+    }
+
+    /// Hand this mount's vi state to the mount replacing it; see
+    /// [`MountedEditor::adopt_vi`]. What is left behind is a fresh `Vi`, so a
+    /// spent mount cannot keep driving stale state.
+    pub(crate) fn take_vi(&mut self) -> Vi {
+        std::mem::replace(&mut self.editor.vi, Vi::new())
+    }
+
+    /// Tell the editor whether a turn is running, for the `^C` half of the
+    /// mode hint (#2006). Cockpit-only: the classic driver's editor is not
+    /// alive during a turn, so its `false` is already the truth — hence the
+    /// `cfg`, without which this is dead code on the Windows classic build.
+    #[cfg(unix)]
+    pub(crate) fn set_turn_running(&mut self, running: bool) {
+        self.turn_running = running;
     }
 
     /// Replace the history (a `/vi`·`/emacs` reload rebuilds the editor; the
@@ -1762,7 +1844,9 @@ impl MountedEditor {
                 shown.cursor(),
                 resolve_gutter(self.gutter, term_w),
                 term_w,
-                empty.then(|| self.editor.mode_hint()),
+                empty
+                    .then(|| self.editor.mode_hint(self.turn_running))
+                    .as_deref(),
             )
             .0
             .len() as u16
@@ -1803,6 +1887,7 @@ impl MountedEditor {
                 background_jobs: chrome.background_jobs,
                 palette: Some(&self.palette),
                 chat_inactive,
+                turn_running: self.turn_running,
             },
         );
     }
@@ -1962,9 +2047,14 @@ impl MountedEditor {
     /// A submitted line is committed to scrollback; the editor starts fresh
     /// for the next one. The classic driver tears the whole editor down here
     /// anyway; the cockpit keeps it mounted, so it must reset explicitly.
+    ///
+    /// #2006: this used to be `self.editor = Editor::new(self.edit)`, which
+    /// reset the vi mode, jumplist and `;`/`,` target as debris from a rebuild
+    /// rather than as a decision. What a submit ends is now enumerated in one
+    /// place — [`Editor::reset_for_new_line`].
     fn reset_after_submit(&mut self) {
         self.textarea = new_textarea(self.edit);
-        self.editor = Editor::new(self.edit);
+        self.editor.reset_for_new_line();
         self.pending_ex_echo = None;
         self.hist_pos = self.history.len();
         self.stash.clear();
@@ -3438,9 +3528,9 @@ mod tests {
 
     #[test]
     fn mode_hint_advertises_the_other_editor_modes() {
-        assert!(vi_editor().mode_hint().contains("INSERT"));
-        assert!(vi_editor().mode_hint().contains("/nano"));
-        assert!(vi_editor().mode_hint().contains("/emacs"));
+        assert!(vi_editor().mode_hint(false).contains("INSERT"));
+        assert!(vi_editor().mode_hint(false).contains("/nano"));
+        assert!(vi_editor().mode_hint(false).contains("/emacs"));
     }
 
     #[test]
@@ -4173,5 +4263,185 @@ mod tests {
         let mut s = RichSurface::new(None).unwrap();
         s.add_history("ephemeral");
         s.save_history(); // must not panic
+    }
+
+    // ── #2006: vi state is SESSION state, not per-line state ───────────────
+
+    /// Drive one key into a mounted editor, discarding the scrollback it emits.
+    fn mounted_key(mounted: &mut MountedEditor, sink: &mut RecordingSink, key: KeyEvent) {
+        mounted.on_event(Event::Key(key), sink).unwrap();
+    }
+
+    /// Drive a run of plain chars into a mounted editor.
+    fn mounted_chars(mounted: &mut MountedEditor, sink: &mut RecordingSink, s: &str) {
+        for c in s.chars() {
+            mounted_key(mounted, sink, key(c));
+        }
+    }
+
+    fn sink_text(sink: &RecordingSink) -> String {
+        sink.batches
+            .iter()
+            .flatten()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn vi_mode_survives_a_submit() {
+        // #2006: Enter sends a line; it does not put the operator back in
+        // INSERT behind their back.
+        let mut mounted = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "hi");
+        let mut sink = RecordingSink::default();
+        mounted_key(&mut mounted, &mut sink, special(KeyCode::Esc)); // → NORMAL
+        assert_eq!(mounted.editor.label(), "vi N");
+        mounted_key(&mut mounted, &mut sink, special(KeyCode::Enter)); // submit
+        assert_eq!(
+            mounted.editor.label(),
+            "vi N",
+            "the mode the operator chose outlives the line they sent"
+        );
+    }
+
+    #[test]
+    fn vi_jumplist_survives_a_submit() {
+        // #2006: `Editor::new` threw the jumplist away with the mode.
+        let mut mounted = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "a\nb\nc");
+        let mut sink = RecordingSink::default();
+        mounted_key(&mut mounted, &mut sink, special(KeyCode::Esc)); // → NORMAL
+        mounted_chars(&mut mounted, &mut sink, "gg"); // records a jump origin
+        mounted_key(&mut mounted, &mut sink, special(KeyCode::Enter)); // submit
+        sink.batches.clear();
+        mounted_chars(&mut mounted, &mut sink, ":jumps");
+        mounted_key(&mut mounted, &mut sink, special(KeyCode::Enter));
+        let text = sink_text(&sink);
+        assert!(text.contains("jumps  back:"), ":jumps reported: {text:?}");
+        assert!(
+            !text.contains("back: —"),
+            "the jump recorded before the submit is still there: {text:?}"
+        );
+    }
+
+    #[test]
+    fn vi_last_find_survives_a_submit() {
+        // #2006: `;` repeats the last `f`/`t` — across a submit too.
+        let mut mounted = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "hello world");
+        let mut sink = RecordingSink::default();
+        mounted_key(&mut mounted, &mut sink, special(KeyCode::Esc)); // → NORMAL
+        mounted_chars(&mut mounted, &mut sink, "0fw"); // find 'w'
+        assert_eq!(mounted.textarea.cursor().1, 6, "`fw` landed on the 'w'");
+        mounted_key(&mut mounted, &mut sink, special(KeyCode::Enter)); // submit
+        mounted_key(&mut mounted, &mut sink, special(KeyCode::Esc)); // NORMAL either way
+        mounted_chars(&mut mounted, &mut sink, "i"); // → INSERT
+        mounted_chars(&mut mounted, &mut sink, "hello world");
+        mounted_key(&mut mounted, &mut sink, special(KeyCode::Esc)); // → NORMAL
+        mounted_chars(&mut mounted, &mut sink, "0;"); // repeat the find
+        assert_eq!(
+            mounted.textarea.cursor().1,
+            6,
+            "`;` still knows what `f` was looking for"
+        );
+    }
+
+    #[test]
+    fn vi_pending_sequence_does_not_survive_a_submit() {
+        // The other half of #2006's decision: mode/jumplist/last_find are
+        // session state, but a half-typed `f`/`d`/count belongs to the line
+        // that was just sent. An `f` left armed would eat the next `i`.
+        let mut mounted = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "hi");
+        let mut sink = RecordingSink::default();
+        mounted_key(&mut mounted, &mut sink, special(KeyCode::Esc)); // → NORMAL
+        mounted_chars(&mut mounted, &mut sink, "f"); // awaiting a search target
+        mounted_key(&mut mounted, &mut sink, special(KeyCode::Enter)); // submit
+        mounted_chars(&mut mounted, &mut sink, "iabc");
+        assert_eq!(
+            mounted.textarea.lines(),
+            ["abc"],
+            "`i` opened INSERT; it was not swallowed as a stale search target"
+        );
+    }
+
+    #[test]
+    fn vi_ctrl_c_at_an_idle_prompt_keeps_the_mode() {
+        // #2006: `self.vi = Vi::new()` flipped a NORMAL operator into INSERT.
+        // Real vim's `i_CTRL-C` is insert→normal; it is never normal→insert.
+        let mut ed = vi_editor();
+        let mut ta = new_textarea(Edit::Vi);
+        type_chars(&mut ed, &mut ta, "hi");
+        ed.input(special(KeyCode::Esc), &mut ta); // → NORMAL
+        ed.input(ctrl('c'), &mut ta);
+        assert_eq!(ta.lines(), [""], "Ctrl-C still clears the draft");
+        assert_eq!(ed.label(), "vi N", "…and leaves the mode alone");
+    }
+
+    #[test]
+    fn vi_ctrl_c_still_cancels_a_pending_sequence() {
+        // Guards the replacement for the deleted `Vi::new()`: the draft is
+        // gone, so an operator/search pending against it must go too.
+        let mut ed = vi_editor();
+        let mut ta = new_textarea(Edit::Vi);
+        type_chars(&mut ed, &mut ta, "hi");
+        ed.input(special(KeyCode::Esc), &mut ta); // → NORMAL
+        ed.input(key('f'), &mut ta); // awaiting a search target
+        ed.input(ctrl('c'), &mut ta);
+        type_chars(&mut ed, &mut ta, "iabc");
+        assert_eq!(
+            ta.lines(),
+            ["abc"],
+            "`i` opened INSERT; the pending `f` did not eat it"
+        );
+    }
+
+    #[test]
+    fn vi_a_fresh_mount_still_starts_in_insert() {
+        // The twin of the tests above: "persists" must not become "always
+        // NORMAL". A session that has never pressed Esc opens in INSERT.
+        let mounted = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "");
+        assert_eq!(mounted.editor.label(), "vi I");
+    }
+
+    #[test]
+    fn vi_state_hands_off_across_a_remount() {
+        // The seam the classic per-read driver and `SurfaceRequest::Reload`
+        // use: a rebuilt mount adopts the outgoing one's vi state.
+        let mut old = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "hello world");
+        let mut sink = RecordingSink::default();
+        mounted_key(&mut old, &mut sink, special(KeyCode::Esc)); // → NORMAL
+        mounted_chars(&mut old, &mut sink, "0fw"); // find 'w'
+
+        let mut new = MountedEditor::new(Edit::Vi, Some(1), Vec::new(), "hello world");
+        new.adopt_vi(old.take_vi());
+        assert_eq!(new.editor.label(), "vi N", "the mode came across");
+        mounted_chars(&mut new, &mut sink, "0;");
+        assert_eq!(
+            new.textarea.cursor().1,
+            6,
+            "…and so did the `;` repeat target"
+        );
+        assert_eq!(old.editor.label(), "vi I", "the outgoing mount is spent");
+    }
+
+    #[test]
+    fn mode_hint_promises_an_interrupt_only_while_a_turn_runs() {
+        // Contract doc §3 item 4: at an idle prompt Ctrl-C clears the draft,
+        // it does not interrupt anything. The affordance and the behavior
+        // share one condition.
+        for editor in [vi_editor(), emacs_editor(), nano_editor()] {
+            let running = editor.mode_hint(true);
+            let idle = editor.mode_hint(false);
+            assert!(
+                running.contains("^C interrupt"),
+                "a running turn advertises the interrupt: {running:?}"
+            );
+            assert!(
+                idle.contains("^C clear") && !idle.contains("interrupt"),
+                "an idle prompt advertises what Ctrl-C actually does: {idle:?}"
+            );
+        }
+        let mut normal = vi_editor();
+        let mut ta = new_textarea(Edit::Vi);
+        normal.input(special(KeyCode::Esc), &mut ta);
+        assert!(normal.mode_hint(false).contains("^C clear"));
     }
 }
