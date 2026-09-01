@@ -549,14 +549,15 @@ invariant = "EscCancels"
 [[BHV-PROMPT-002.refs.tla]]
 spec = "PromptControls"
 invariant = "ControlsExit"
-# Tier metadata (advisory, #1536): `tier` distinguishes a per-PR gating test
-# (`unit` — runs in ci.yml's `cargo test --workspace`) from a weekly/release
-# integration test (`integration` — `#[ignore]`d out of the per-PR run, executed
+# Tier metadata (#1536): `tier` distinguishes a per-PR gating test (`unit` —
+# runs in ci.yml's `cargo test --workspace`) from a weekly/release integration
+# test (`integration` — `#[ignore]`d out of the per-PR run, executed
 # single-threaded by .github/workflows/newt-tui-pty.yml). It makes explicit that
 # BHV-PROMPT-002's real-PTY grounding does NOT gate every PR while its mocked
-# reader tests DO — so an ignored test never looks like a per-PR gate. Mechanical
-# enforcement (linter cross-check that an `#[ignore]`d ref is `tier=integration`)
-# is the tracked follow-up when tier metadata lands in the linter.
+# reader tests DO — so an ignored test never looks like a per-PR gate.
+# Mechanically enforced by lint-behavior-map.py's tier cross-check (G5,
+# docs/decisions/key_ladder_crate.md §5): a `tier = "unit"` ref pointing at a
+# `#[ignore]`d test is a hard error.
 [[BHV-PROMPT-002.refs.rust_tests]]
 path = "newt-tui/src/prompt_visibility_test.rs"
 symbol = "permission_prompt_controls_are_immediate_and_distinct"

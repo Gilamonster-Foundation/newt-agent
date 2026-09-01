@@ -425,5 +425,76 @@ run_multilean("symlink aliasing a .lake build copy cannot satisfy a reference",
               ref_module="NewtPolicy.Generated", ref_symbol="generated_thm",
               want_exit=1, want_msg="does not resolve")
 
+# ── G5 tier cross-check (docs/decisions/key_ladder_crate.md §5) ──────────────
+# The map's real tier vocabulary is "unit" | "integration" (BHV-PROMPT-002 in
+# the live behavior-map.toml): "unit" claims the per-PR gate
+# (`cargo test --workspace`, ci.yml); Cargo never runs an `#[ignore]`d test
+# there. Under that binary vocabulary "#[ignore]d must not be tier=unit" and
+# "tier=unit must not be #[ignore]d" are the SAME predicate — `tier == "unit"
+# and ignored` — so both fixtures below drive it through the two syntactic
+# forms `#[ignore]` takes in real Rust, proving the SCAN catches it (not just
+# a field lookup), plus anti-vacuous twins for the two pairings that must stay
+# green and a fixture for the linter's own positive-read assertion.
+TIER_MAP = """\
+schema = 3
+[BHV-TIER-001]
+description = "a tier-claimed test"
+[BHV-TIER-001.status]
+lean = "none"
+rust = "tested"
+tla = "none"
+trace = "none"
+conformance = "partial"
+[[BHV-TIER-001.refs.rust_tests]]
+path = "r.rs"
+symbol = "m::foo"
+tier = "unit"
+"""
+
+# 32. A tier="unit" ref (claims the per-PR gate) pointing at a bare `#[ignore]`d
+#     test: red before the fix (verified against the unmodified linter, see PR
+#     body) — the test never runs in `cargo test --workspace`.
+run_case("tier=unit ref pointing at a bare #[ignore]d test fails",
+         mapping=TIER_MAP,
+         rust="mod m {\n    #[test]\n    #[ignore]\n    fn foo() {}\n}\npub fn prod() {}\n",
+         want_exit=1, want_msg='tier = "unit"')
+
+# 33. Same rule, the OTHER `#[ignore]` spelling — `#[ignore = "reason"]`. Proves
+#     the scan reads the attribute NAME, not a bare-token string match (the
+#     reason string's own bytes are dropped by `_strip_rust`'s string state, so
+#     a naive "contains ignore" check on raw text would work here anyway; this
+#     is the case that would catch a regression to that shortcut).
+run_case("tier=unit ref pointing at #[ignore = \"reason\"] fails",
+         mapping=TIER_MAP,
+         rust="mod m {\n    #[test]\n    #[ignore = \"flaky in CI\"]\n"
+              "    fn foo() {}\n}\npub fn prod() {}\n",
+         want_exit=1, want_msg='tier = "unit"')
+
+# 34. Anti-vacuous twin: the SAME tier="unit" ref against a NON-ignored test
+#     must stay green — the check must not fire on `tier` alone.
+run_case("tier=unit ref pointing at a non-ignored test stays green",
+         mapping=TIER_MAP,
+         rust="mod m {\n    #[test]\n    fn foo() {}\n}\npub fn prod() {}\n",
+         want_exit=0)
+
+# 35. Anti-vacuous twin: tier="integration" paired with an #[ignore]d test is
+#     the CORRECT pairing (weekly/release lane, not per-PR) and must stay green
+#     — this is BHV-PROMPT-002's real shape in the live map.
+run_case("tier=integration ref pointing at an ignored test stays green",
+         mapping=TIER_MAP.replace('tier = "unit"', 'tier = "integration"'),
+         rust="mod m {\n    #[test]\n    #[ignore]\n    fn foo() {}\n}\npub fn prod() {}\n",
+         want_exit=0)
+
+# 36. Positive-read assertion: a `tier`-bearing ref that never resolves to a
+#     real definition must not let the tier scan pass silently on zero
+#     comparisons — the linter reports the scan found nothing to check, not
+#     merely that the ref itself is unresolved (an absence-check fails OPEN;
+#     this is the check that a renamed field or a broken resolver still fails
+#     loudly rather than silently certifying nothing).
+run_case("a tier ref with nothing to resolve trips the positive-read assertion",
+         mapping=TIER_MAP.replace('path = "r.rs"', 'path = "missing.rs"'),
+         rust="mod m {\n    #[test]\n    fn foo() {}\n}\npub fn prod() {}\n",
+         want_exit=1, want_msg="scan may have collapsed")
+
 print(f"\n{_pass} passed, {_fail} failed")
 sys.exit(1 if _fail else 0)
