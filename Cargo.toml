@@ -123,6 +123,27 @@ age = { version = "0.11", features = ["armor"] }
 # newt-interaction; the crate now owns it, so the bare door is a warning
 # (and, under -D warnings, a build failure) rather than a choice.
 content-addressable = "0.1.2"
+# The key-precedence ladder (#2005, docs/decisions/key_ladder_crate.md §1): who
+# owns a trigger right now, as a pure predicate over a TOML table. Extracted to
+# its own repo rather than a newt module because a foreign TUI must be able to
+# pin a keystroke predicate without pinning newt's whole release train.
+#
+# TEMPORARY GIT PIN, and it is a knowing exception to the rule stated for
+# `content-addressable` six lines up ("never a git/path pin"). The crate is not
+# on crates.io yet — its publish is gated on train slice C3 — so there is no
+# release to name. Two consequences, both deliberate:
+#
+#   * the rev is EXACT, never a branch, so the build is reproducible; and
+#   * `version` is carried alongside `git`, so `cargo publish` rewrites this to
+#     a plain registry dependency the moment 0.1.0 lands. Without it the dep
+#     resolves as `req = "*"`, which `release.yml`'s `check-publish-order`
+#     pre-flight flags as an error ("no version requirement") — the v0.7.2
+#     blind spot.
+#
+# `cargo publish -p newt-tui` CANNOT SUCCEED until precedence-ladder 0.1.0 is on
+# crates.io. Dropping `git`/`rev` for a bare `= "0.1"` is the one-line change
+# that closes it; do it in the same PR that consumes the published release.
+precedence-ladder = { git = "https://github.com/Gilamonster-Foundation/precedence-ladder", rev = "88bac8a98283edf41274681dc5c20657c5d034d3", version = "0.1" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }

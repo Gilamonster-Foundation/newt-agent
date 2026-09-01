@@ -28,8 +28,23 @@
 //! permission prompt keep working unchanged: `PromptWindow` takes stdin, the
 //! token is refused, this loop backs off; when the window closes the modal's
 //! raw-mode guard has restored cooked mode, so raw mode is re-asserted on the
-//! `suspended` false edge. Ctrl-C during a turn interrupts (Esc belongs to
-//! vi); the second press escalates, matching the watcher.
+//! `suspended` false edge.
+//!
+//! # Who owns Esc
+//!
+//! Ctrl-C during a turn interrupts, and so does **Esc** — the second press
+//! escalates, matching the watcher. This file used to say *"(Esc belongs to
+//! vi)"*, and that sentence was the whole of #2005: the classic surface had
+//! shipped Esc-interrupt with the same tiers since `lib.rs`'s watcher, and the
+//! cockpit deliberately declined to port it, leaving vi the one newt surface
+//! where the conventional interrupt key did nothing. vim's own definition of
+//! NORMAL-mode Esc, once nothing is pending, is a harmless no-op, so rung 7
+//! costs the vi operator nothing they had.
+//!
+//! The order is a TABLE, not a call chain: `assets/esc_ladder.toml`, resolved
+//! by [`Presenter::escapes`]. vi INSERT still owns Esc (it is an editing
+//! transition), and so does a half-typed operator or count — that rung is
+//! where newt beats codex, which kills the turn on a mid-turn `d` then Esc.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -40,7 +55,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::MoveTo;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::style::{
     Attribute, Color as CColor, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
@@ -588,6 +603,32 @@ pub(crate) struct Presenter {
     _raw: newt_core::tty::raw_mode::RawModeGuard,
 }
 
+/// The seam `esc_ladder_pty_test`'s child half drives the cockpit through.
+///
+/// It exists because that test cannot use [`Presenter::run`] — `run` needs a
+/// live session channel — and must not open-code the loop body, which would be
+/// a second implementation of the thing under test. Two methods, both thin:
+/// one turn of the loop, and the exact predicate input the production arm
+/// reads. Everything else the test needs is already `pub(crate)`.
+#[cfg(test)]
+impl Presenter {
+    /// One turn of [`Presenter::run`]'s body, minus the request channel:
+    /// relay whatever the session printed, take one bounded look at the
+    /// keyboard, repaint.
+    pub(crate) fn pump(&mut self) -> io::Result<()> {
+        self.drain_pty()?;
+        self.poll_keys()?;
+        self.draw()
+    }
+
+    /// The live claim set — the same value [`Presenter::escapes`] resolves
+    /// against, so the test observes the production input rather than a
+    /// test-only twin of it.
+    pub(crate) fn claims(&self) -> precedence_ladder::ClaimSet {
+        self.editor.claim_set()
+    }
+}
+
 /// The cockpit does not paint through the arbiter — its rows are on the real
 /// terminal, outside the pty the arbiter's writers see — but registering
 /// gives it the one thing it needs from the arbiter: the `suspended` edge.
@@ -747,7 +788,7 @@ impl Presenter {
         Ok(())
     }
 
-    fn handle_request(&mut self, req: SurfaceRequest) -> io::Result<()> {
+    pub(crate) fn handle_request(&mut self, req: SurfaceRequest) -> io::Result<()> {
         match req {
             SurfaceRequest::ReadLine { prompt: _, reply } => {
                 // A confirmed `:wq` submitted its turn last time; now that the
@@ -977,24 +1018,15 @@ impl Presenter {
                 let editor_rows = self.editor.wanted_rows(cols, rows, &self.surface.chrome());
                 self.screen.resize(cols, rows, editor_rows, status_rows)
             }
-            Event::Key(key)
-                if key.kind == KeyEventKind::Press
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('c')
-                    && self.turn.is_some() =>
-            {
-                // Ctrl-C during a turn interrupts — the draft is kept. The
-                // first press asks; the second forces. Same tiers as the
-                // watcher, and the spinner label acknowledges within a tick.
-                if let Some(turn) = self.turn.as_mut() {
-                    turn.presses += 1;
-                    if turn.presses == 1 {
-                        turn.cancel.store(true, Ordering::SeqCst);
-                        newt_core::tty::set_interrupt_pending(true);
-                    } else {
-                        turn.hard.store(true, Ordering::SeqCst);
-                    }
-                }
+            // #2005: the ladder decides, from `assets/esc_ladder.toml`. This
+            // arm replaced a hand-written Ctrl-C predicate; it is the SAME
+            // interrupt, widened to Esc, not a second mechanism beside it.
+            //
+            // `KeyEventKind::Press` is load-bearing: without it, under the
+            // kitty protocol the matching release event counts as a second
+            // press and the operator's FIRST Ctrl-C force-stops the turn.
+            Event::Key(key) if key.kind == KeyEventKind::Press && self.escapes(&key) => {
+                self.escape_during_turn();
                 Ok(())
             }
             other => {
@@ -1004,6 +1036,74 @@ impl Presenter {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// Does this key press reach the operator's escape hatch right now?
+    ///
+    /// The whole precedence decision, in one readable predicate — codex's
+    /// lesson (`bottom_pane/mod.rs:1310-1324`) with codex's own bug fixed. The
+    /// conjuncts codex spells out by hand are rows in
+    /// `assets/esc_ladder.toml`, and the claims come from accessors that live
+    /// beside the state they read, so a new Esc consumer cannot be forgotten
+    /// here.
+    ///
+    /// Two rungs are worth reading off the table rather than trusting prose:
+    /// `ctrl-c` is RESERVED, so it escapes from every claim state while a turn
+    /// runs and rungs 2–6 can never strand the operator; `esc` is
+    /// FALLTHROUGH, so it escapes only once palette, `[y/N]`, `:`, INSERT and
+    /// a pending operator have all declined.
+    ///
+    /// The permission modal is absent from the table because it is
+    /// structurally unreachable from here, not because it was overlooked: on
+    /// `SurfaceRequest::Interact` this presenter blocks INSIDE
+    /// `handle_request` and never returns to `poll_keys` until the modal has
+    /// answered.
+    fn escapes(&self, key: &crossterm::event::KeyEvent) -> bool {
+        let Some(trigger) = crate::esc_ladder::trigger_name(key) else {
+            return false;
+        };
+        let claiming = self.editor.claim_set();
+        matches!(
+            crate::esc_ladder::ESC_LADDER.resolve(
+                trigger,
+                &precedence_ladder::Situation {
+                    claiming: &claiming,
+                    work_running: self.turn.is_some(),
+                },
+            ),
+            precedence_ladder::Verdict::Escape { .. }
+        )
+    }
+
+    /// Interrupt the running turn. The draft is kept; the first press asks,
+    /// the second forces. Same tiers as the classic watcher, and the spinner
+    /// label acknowledges within a tick.
+    ///
+    /// **Private, with exactly one caller** (guard G1,
+    /// `docs/decisions/key_ladder_crate.md` §5). Delete the ladder arm in
+    /// `on_event` and this becomes dead code, which `cargo clippy -D warnings`
+    /// fails on. That is a lint and not a theorem — making this `pub` or
+    /// giving it a second caller voids it — so it is the cheap guard, not the
+    /// primary one; `esc_ladder_pty_test` is the primary one.
+    ///
+    /// The press COUNTER stays here, in the consumer, deliberately: both newt
+    /// surfaces already count and reset correctly (`TurnStarted` builds a
+    /// fresh `Turn`), and a copy inside the ladder crate would be a second
+    /// reset path.
+    fn escape_during_turn(&mut self) {
+        // Total rather than trusting the caller: `escapes` only returns true
+        // while `work_running`, so this is unreachable, and an `unwrap` here
+        // would be a panic waiting on a future refactor.
+        let Some(turn) = self.turn.as_mut() else {
+            return;
+        };
+        turn.presses += 1;
+        if turn.presses == 1 {
+            turn.cancel.store(true, Ordering::SeqCst);
+            newt_core::tty::set_interrupt_pending(true);
+        } else {
+            turn.hard.store(true, Ordering::SeqCst);
         }
     }
 

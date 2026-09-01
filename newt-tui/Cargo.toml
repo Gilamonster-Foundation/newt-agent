@@ -26,6 +26,16 @@ newt-tools.workspace = true
 newt-skills.workspace = true
 newt-mcp-client.workspace = true
 anyhow.workspace = true
+# #2005 rung 7: the Esc/Ctrl-C precedence table. The crate decodes no keys and
+# owns no terminal — `esc_ladder.rs` supplies the trigger NAME and the claim
+# set, and the ladder answers who owns it. See assets/esc_ladder.toml.
+#
+# Optional + gated by `rich-tui`, exactly like tui-textarea below: every
+# claimant it ranks (palette, vi, the cockpit presenter) is rich-only, so the
+# lean / piped / headless / wyvern builds must not link it. A crate that exists
+# so a foreign TUI need not pin newt's release train has no business being
+# unconditional in newt's own headless tier.
+precedence-ladder = { workspace = true, optional = true }
 # The TUI's `McpTools` bridge impl (the newt_core::agentic seam) is an
 # async trait — see newt-tui/src/mcp.rs.
 async-trait.workspace = true
@@ -77,7 +87,7 @@ live-spill = []
 # status row, live clock, multi-line vi/emacs editing. OFF by default — the
 # lean crossterm box is the only surface compiled unless this is enabled, and
 # the `is_terminal()` runtime gate still applies on top of the feature.
-rich-tui = ["dep:tui-textarea"]
+rich-tui = ["dep:tui-textarea", "dep:precedence-ladder"]
 
 # In-process candle summarizer (#661 group C): routes the (now DEFAULT) embedded
 # summarizer through newt-inference's engine. Enabled by the workspace default

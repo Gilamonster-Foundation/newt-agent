@@ -129,7 +129,13 @@ fn the_settings_form_renders_picks_applies_and_receipts() {
     //    failure this fixes (#2006's turn-conditional hint changed the timing
     //    that had been hiding it).
     pty.type_in("1\r");
-    let values = wait_on_grid_inner("nano", true);
+    // #2017: anchor on text only the VALUE menu can render. "nano" alone is
+    // ambiguous — the FIELD menu row reads `[1] line-editor key bindings —
+    // currently nano` on a fresh config, and it is also a numbered row, so
+    // even a `[n] …` anchor matches it and the pick submits the wrong number.
+    // "nano-style editing" is the value option's own description
+    // (`settings_form.rs` `Field::EditMode`) and appears nowhere else.
+    let values = wait_on_grid_inner("nano-style editing", true);
 
     // 3. Pick `nano` by ITS number, read off the rendered menu rather than
     //    assumed — the menu's order is the form's business, not this test's.
@@ -143,8 +149,8 @@ fn the_settings_form_renders_picks_applies_and_receipts() {
     //    a latent brittleness surfacing while someone is watching.
     let nano_row = values
         .lines()
-        .find(|l| l.trim_start().starts_with('[') && l.contains("nano"))
-        .expect("a numbered `[n] … nano …` option row was on the grid");
+        .find(|l| l.trim_start().starts_with('[') && l.contains("nano-style editing"))
+        .expect("a numbered `[n] … nano-style editing` option row was on the grid");
     let number: String = nano_row
         .chars()
         .skip_while(|c| !c.is_ascii_digit())

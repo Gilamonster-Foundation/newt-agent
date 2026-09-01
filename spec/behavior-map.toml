@@ -1242,3 +1242,76 @@ symbol = "resolution::the_store_refuses_a_reused_idempotency_key"
 [[BHV-INTERACTION-006.refs.production]]
 path = "newt-core/src/interaction_resolution.rs"
 symbol = "resolve"
+
+# ───────────────────────── Esc precedence / the escape hatch ──────────────────
+
+# #2005. The ADR is docs/decisions/esc_and_vi_contract.md §4 (the policy) and
+# docs/decisions/key_ladder_crate.md (the mechanism).
+#
+# `lean = "none"` is an HONEST GAP, not an oversight. The resolver's algebra IS
+# proven — `Precedence.declining_rung_is_transparent` and `Precedence.resolve_hatch`
+# in the `precedence-ladder` crate — but those theorems live in another
+# repository, and lint-behavior-map.py resolves a `refs.lean` module under this
+# repo's formal/ tree. A symlink out of the repo is SILENTLY SKIPPED by the
+# path check, which would be a green proving nothing. So the crate is named in
+# prose and claimed in no status field. Closing it needs a
+# `refs.upstream { crate, version, symbol }` ref kind; that is a follow-up, not
+# this train.
+
+[BHV-ESC-001]
+description = "Esc reaches the operator's interrupt only when every claimant above it declined — palette, vi [y/N], vi ex line, vi INSERT, and a pending vi operator/count each own it first — while Ctrl-C is reserved and reaches the interrupt from every one of those states, so no claimant can strand the operator."
+[BHV-ESC-001.status]
+lean = "none"
+rust = "tested"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-ESC-001.refs.tla]]
+spec = "KeyContexts"
+invariant = "EveryActiveContextHasAHatch"
+[[BHV-ESC-001.refs.rust_tests]]
+path = "newt-tui/src/esc_ladder.rs"
+symbol = "tests::esc_reaches_the_hatch_only_when_every_claimant_declined"
+tier = "unit"
+# The registration half: a rung with no accessor can never fire, and an
+# accessor with no rung is unreachable. Checked by REACHABILITY — the test
+# types the keys an operator types — so it cannot pass on a name that is merely
+# spelled somewhere.
+[[BHV-ESC-001.refs.rust_tests]]
+path = "newt-tui/src/rich_input.rs"
+symbol = "tests::every_ladder_claimant_is_reachable_from_the_editors_own_state"
+tier = "unit"
+[[BHV-ESC-001.refs.production]]
+path = "newt-tui/src/cockpit/presenter.rs"
+symbol = "escapes"
+
+[BHV-ESC-002]
+description = "Esc during a running turn, with every claimant above it declined, interrupts the turn: the first press asks (cancel + the interrupt acknowledgment the spinner shows), the second forces. Same key, same tiers, on the cockpit as on the classic surface."
+# WHAT THIS ROW CAN AND CANNOT CATCH, on the record so no PR body overstates it:
+# `refs.production` resolves via rust_definition_count, a regex for
+# `fn <symbol>` — DEFINITIONS ONLY, never call sites. Deleting the presenter's
+# match arm while leaving `escape_during_turn` defined keeps this row green.
+# The arm deletion is caught by clippy (the fn becomes dead code under
+# -D warnings) and the BEHAVIOUR by the PTY test below. The registry catches a
+# rename or a deletion of the symbol, and nothing else.
+[BHV-ESC-002.status]
+lean = "none"
+rust = "tested"
+tla = "checked"
+trace = "none"
+conformance = "partial"
+[[BHV-ESC-002.refs.tla]]
+spec = "KeyContexts"
+invariant = "PreemptionIsTotal"
+# tier = "unit" and it is TRUE: this real-PTY test is deliberately not
+# `#[ignore]`d, so it runs in ci.yml's `cargo test --workspace` like any mocked
+# test. That claim is mechanically enforced (#2015) — if anyone ever silences
+# the flake by adding `#[ignore]`, the tier cross-check fails the PR instead of
+# letting this row keep claiming a per-PR gate that no longer exists.
+[[BHV-ESC-002.refs.rust_tests]]
+path = "newt-tui/src/esc_ladder_pty_test.rs"
+symbol = "esc_interrupts_a_running_turn_from_vi_normal_but_never_from_vi_insert"
+tier = "unit"
+[[BHV-ESC-002.refs.production]]
+path = "newt-tui/src/cockpit/presenter.rs"
+symbol = "escape_during_turn"

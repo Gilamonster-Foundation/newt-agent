@@ -135,6 +135,26 @@ mod palette;
 mod backend_panel;
 #[cfg(feature = "rich-tui")]
 mod vi;
+// #2005: the Esc / Ctrl-C precedence table (`assets/esc_ladder.toml`) plus the
+// key→trigger-name mapping the `precedence-ladder` crate deliberately does not
+// own. Gated with the surfaces whose claimants it ranks — palette, vi, cockpit
+// presenter — so the lean / piped / wyvern paths never compile it in.
+//
+// `unix` as well, because the only NON-TEST consumer is the cockpit
+// presenter's key loop and `cockpit`'s live half is unix-gated
+// (`cockpit/mod.rs:39` — fd capture via `dup2`/`openpty`). Without it the
+// Windows build compiles the table and every claim accessor with no caller,
+// and `-D warnings` turns four dead-code lints into a failed build. Matching
+// the gate to the callers keeps the boundary a compile error when it drifts,
+// rather than an `allow` that hides the drift.
+#[cfg(all(unix, feature = "rich-tui"))]
+mod esc_ladder;
+// #2005: the real-PTY acceptance for the rung above — Esc during a running
+// turn interrupts from vi NORMAL, and does NOT from vi INSERT or from a
+// half-typed operator. NOT `#[ignore]`d: it is the primary per-PR guard, and a
+// guard that runs in no lane is decoration.
+#[cfg(all(test, unix, feature = "rich-tui"))]
+mod esc_ladder_pty_test;
 // #1669: the cockpit — the terminal owned by the UI thread for the whole
 // session, editor mounted while a turn runs, session output relayed through a
 // pty. The live presenter is unix (fd capture via `dup2`/`openpty`); the module

@@ -110,6 +110,44 @@ impl Vi {
         self.insert_normal = false;
     }
 
+    // `unix` with the ladder it feeds (`lib.rs` `mod esc_ladder`): the only
+    // non-test consumer is the cockpit presenter, whose live half is unix-only,
+    // so on Windows this accessor would compile with no caller and `-D
+    // warnings` would fail the build on the dead code.
+    #[cfg(unix)]
+    /// Register which Esc-ladder rungs this vi state is claiming right now
+    /// (#2005, `assets/esc_ladder.toml` rungs 3–6).
+    ///
+    /// **This lives here, beside the fields, on purpose.** The presenter could
+    /// have reached in and asked five questions, and that is exactly the shape
+    /// that rots: the sixth Esc consumer gets added to `Vi` and nobody edits
+    /// the predicate two files away, so the ladder silently stops describing
+    /// the editor. `pending`, `count` and `insert_normal` are private to this
+    /// file and stay private — an accessor a new consumer must pass through is
+    /// cheaper than five getters it can forget.
+    ///
+    /// Note the mode split, which is the whole of #2005's headline behaviour:
+    /// INSERT claims Esc (it is an editing transition), NORMAL does not — and
+    /// NORMAL *with* a half-typed sequence claims it again as `vi-pending`,
+    /// one rung above the interrupt.
+    pub(crate) fn claims(&self, c: &mut precedence_ladder::ClaimSet) {
+        if self.confirm.is_some() {
+            c.claiming("vi-confirm");
+        }
+        if self.ex.is_some() {
+            c.claiming("vi-ex");
+        }
+        if self.mode == Mode::Insert {
+            c.claiming("vi-insert");
+        }
+        // i_CTRL-O leaves `mode == Normal` with `insert_normal` armed, so it
+        // lands here rather than on `vi-insert` — which is right: Esc must end
+        // the one-shot, not interrupt the turn.
+        if self.pending != Pending::None || self.count > 0 || self.insert_normal {
+            c.claiming("vi-pending");
+        }
+    }
+
     fn take_count(&mut self) -> usize {
         let n = self.count.max(1);
         self.count = 0;
