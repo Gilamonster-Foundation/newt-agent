@@ -390,19 +390,27 @@ impl Editor {
 
     /// The dim, clears-on-type hint shown on an empty line — the editor mode plus
     /// how to switch. vi is the default; `/nano` and `/emacs` are advertised.
-    fn mode_hint(&self) -> &'static str {
-        match self.edit {
+    ///
+    /// The `^C` half is **turn-conditional** (#2006, contract doc §3 item 4):
+    /// Ctrl-C only interrupts while a turn is running, and at an idle prompt it
+    /// clears the draft (see the `KeyCode::Char('c')` arm in [`Editor::input`]).
+    /// The hint used to promise `^C interrupt` at both, so the affordance and
+    /// the behavior now share one condition instead of drifting apart.
+    fn mode_hint(&self, turn_running: bool) -> String {
+        let head = match self.edit {
             Edit::Vi => match self.vi.mode {
-                Mode::Insert => {
-                    "vi INSERT — Esc: NORMAL · :help · /nano /emacs · ^C interrupt · ^D exit"
-                }
-                Mode::Normal => {
-                    "vi NORMAL — i: insert · :cmd · /nano /emacs · ^C interrupt · ^D exit"
-                }
+                Mode::Insert => "vi INSERT — Esc: NORMAL · :help · /nano /emacs",
+                Mode::Normal => "vi NORMAL — i: insert · :cmd · /nano /emacs",
             },
-            Edit::Emacs => "emacs — Enter sends · Ctrl-h help · /vi /nano · ^C interrupt · ^D exit",
-            Edit::Nano => "nano — Enter sends · ^G help · /vi /emacs · ^C interrupt · ^D exit",
-        }
+            Edit::Emacs => "emacs — Enter sends · Ctrl-h help · /vi /nano",
+            Edit::Nano => "nano — Enter sends · ^G help · /vi /emacs",
+        };
+        let ctrl_c = if turn_running {
+            "^C interrupt"
+        } else {
+            "^C clear"
+        };
+        format!("{head} · {ctrl_c} · ^D exit")
     }
 
     /// The status-header mode word (issue #527): `vi --INSERT--` / `vi --NORMAL--`
@@ -849,6 +857,9 @@ struct RichStatus<'a> {
     /// A blocking modal owns the keyboard while the mounted chat editor stays
     /// visible underneath it. Only the marker recedes; the draft remains.
     chat_inactive: bool,
+    /// #2006: whether a turn is running, which is what decides whether the
+    /// mode hint may advertise `^C interrupt`.
+    turn_running: bool,
 }
 
 fn draw(
@@ -1014,7 +1025,7 @@ fn draw(
         return;
     }
     let prompt = prompt_line_with_focus(editor, true, input_focused);
-    let hint = empty.then(|| editor.mode_hint());
+    let hint = empty.then(|| editor.mode_hint(status.turn_running));
     if g >= GUTTER_W {
         // Wide gutter (opt-in): prompt in a fixed left column, input to its
         // right — continuation lines align under the input at column `g`.
@@ -1025,7 +1036,15 @@ fn draw(
     } else {
         // Overhang (the default): the prompt prefixes the FIRST input row inline
         // (`❯ this`); continuation rows hang-indent by `g` columns (default 1).
-        draw_overhang(f, input_area, &prompt, shown, g, hint, input_focused);
+        draw_overhang(
+            f,
+            input_area,
+            &prompt,
+            shown,
+            g,
+            hint.as_deref(),
+            input_focused,
+        );
     }
 }
 
@@ -1693,6 +1712,11 @@ pub(crate) struct MountedEditor {
     /// you type; ↑/↓ (C-p/C-n) move; Tab/Enter complete (never submit); Esc
     /// closes.
     palette: PaletteState,
+    /// Whether a harness turn is running right now — the one condition the
+    /// mode hint's `^C` half is allowed to depend on (#2006). The cockpit
+    /// mirrors its `turn` here; the classic driver leaves it `false`, which is
+    /// correct there because that driver's editor only exists between turns.
+    turn_running: bool,
 }
 
 impl MountedEditor {
@@ -1724,6 +1748,7 @@ impl MountedEditor {
             hist_pos,
             stash: String::new(),
             palette,
+            turn_running: false,
         }
     }
 
@@ -1744,6 +1769,15 @@ impl MountedEditor {
     /// spent mount cannot keep driving stale state.
     pub(crate) fn take_vi(&mut self) -> Vi {
         std::mem::replace(&mut self.editor.vi, Vi::new())
+    }
+
+    /// Tell the editor whether a turn is running, for the `^C` half of the
+    /// mode hint (#2006). Cockpit-only: the classic driver's editor is not
+    /// alive during a turn, so its `false` is already the truth — hence the
+    /// `cfg`, without which this is dead code on the Windows classic build.
+    #[cfg(unix)]
+    pub(crate) fn set_turn_running(&mut self, running: bool) {
+        self.turn_running = running;
     }
 
     /// Replace the history (a `/vi`·`/emacs` reload rebuilds the editor; the
@@ -1810,7 +1844,9 @@ impl MountedEditor {
                 shown.cursor(),
                 resolve_gutter(self.gutter, term_w),
                 term_w,
-                empty.then(|| self.editor.mode_hint()),
+                empty
+                    .then(|| self.editor.mode_hint(self.turn_running))
+                    .as_deref(),
             )
             .0
             .len() as u16
@@ -1851,6 +1887,7 @@ impl MountedEditor {
                 background_jobs: chrome.background_jobs,
                 palette: Some(&self.palette),
                 chat_inactive,
+                turn_running: self.turn_running,
             },
         );
     }
@@ -3491,9 +3528,9 @@ mod tests {
 
     #[test]
     fn mode_hint_advertises_the_other_editor_modes() {
-        assert!(vi_editor().mode_hint().contains("INSERT"));
-        assert!(vi_editor().mode_hint().contains("/nano"));
-        assert!(vi_editor().mode_hint().contains("/emacs"));
+        assert!(vi_editor().mode_hint(false).contains("INSERT"));
+        assert!(vi_editor().mode_hint(false).contains("/nano"));
+        assert!(vi_editor().mode_hint(false).contains("/emacs"));
     }
 
     #[test]
@@ -4383,5 +4420,28 @@ mod tests {
             "…and so did the `;` repeat target"
         );
         assert_eq!(old.editor.label(), "vi I", "the outgoing mount is spent");
+    }
+
+    #[test]
+    fn mode_hint_promises_an_interrupt_only_while_a_turn_runs() {
+        // Contract doc §3 item 4: at an idle prompt Ctrl-C clears the draft,
+        // it does not interrupt anything. The affordance and the behavior
+        // share one condition.
+        for editor in [vi_editor(), emacs_editor(), nano_editor()] {
+            let running = editor.mode_hint(true);
+            let idle = editor.mode_hint(false);
+            assert!(
+                running.contains("^C interrupt"),
+                "a running turn advertises the interrupt: {running:?}"
+            );
+            assert!(
+                idle.contains("^C clear") && !idle.contains("interrupt"),
+                "an idle prompt advertises what Ctrl-C actually does: {idle:?}"
+            );
+        }
+        let mut normal = vi_editor();
+        let mut ta = new_textarea(Edit::Vi);
+        normal.input(special(KeyCode::Esc), &mut ta);
+        assert!(normal.mode_hint(false).contains("^C clear"));
     }
 }

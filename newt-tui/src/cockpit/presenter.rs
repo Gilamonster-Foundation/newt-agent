@@ -777,6 +777,7 @@ impl Presenter {
                     &draft,
                 );
                 self.editor.adopt_vi(vi);
+                self.editor.set_turn_running(self.turn.is_some());
                 let _ = reply.send(result);
                 self.dirty = true;
             }
@@ -809,6 +810,9 @@ impl Presenter {
                     hard,
                     presses: 0,
                 });
+                // #2006: the mode hint may advertise `^C interrupt` exactly
+                // while that is true.
+                self.editor.set_turn_running(true);
                 self.dirty = true;
             }
             // C1 (#1862): the cockpit owns the terminal, so it presents the
@@ -884,6 +888,7 @@ impl Presenter {
             }
             SurfaceRequest::TurnEnded => {
                 self.turn = None;
+                self.editor.set_turn_running(false);
                 newt_core::tty::set_interrupt_pending(false);
                 self.dirty = true;
             }
