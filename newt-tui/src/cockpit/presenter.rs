@@ -766,12 +766,17 @@ impl Presenter {
             SurfaceRequest::Reload { reply } => {
                 let result = self.surface.reload();
                 let draft = self.editor.draft();
+                // #2006: a `/vi`·`/emacs`·`/nano` reload rebuilds the mount,
+                // and the vi mode/jumplist/`;`-target ride across it the same
+                // way the draft above does.
+                let vi = self.editor.take_vi();
                 self.editor = MountedEditor::new(
                     self.surface.edit(),
                     self.surface.gutter(),
                     self.surface.history(),
                     &draft,
                 );
+                self.editor.adopt_vi(vi);
                 let _ = reply.send(result);
                 self.dirty = true;
             }
