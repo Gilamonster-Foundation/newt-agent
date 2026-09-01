@@ -59,6 +59,12 @@ mod prompt_visibility_test;
 /// before and none agreed; see the module doc.
 /// #1981: `/settings` — the typed form the knob verbs are absorbed into.
 mod settings_form;
+/// #2002 — the PTY acceptance that WORKS the `/settings` form end to end:
+/// menu rendered on the grid, a field picked by number, a value applied, and
+/// the receipt read back off disk. Same tier and same reasoning as its
+/// siblings above; it grounds the mocked `settings_form` unit tests.
+#[cfg(all(test, unix, feature = "rich-tui"))]
+mod settings_form_pty_test;
 mod slash_registry;
 #[cfg(feature = "live-spill")]
 mod spill_view;
