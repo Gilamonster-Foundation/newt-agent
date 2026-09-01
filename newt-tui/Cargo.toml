@@ -26,6 +26,10 @@ newt-tools.workspace = true
 newt-skills.workspace = true
 newt-mcp-client.workspace = true
 anyhow.workspace = true
+# #2005 rung 7: the Esc/Ctrl-C precedence table. The crate decodes no keys and
+# owns no terminal — `esc_ladder.rs` supplies the trigger NAME and the claim
+# set, and the ladder answers who owns it. See assets/esc_ladder.toml.
+precedence-ladder.workspace = true
 # The TUI's `McpTools` bridge impl (the newt_core::agentic seam) is an
 # async trait — see newt-tui/src/mcp.rs.
 async-trait.workspace = true
