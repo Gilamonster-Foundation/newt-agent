@@ -143,3 +143,37 @@ fn the_crew_form_asks_through_a_seam_rather_than_its_own_terminal() {
         "the /crew arm must forward the session's seam"
     );
 }
+
+/// **A panel asks the surface for rows before it draws.**
+///
+/// The `/backends` defect: `backend_panel` built a ratatui terminal on
+/// `io::stdout()`, but under the cockpit fd 1 is a pty slave (`PtyCapture`
+/// `dup2`s it there to capture stray output), so the panel painted into the
+/// capture and came back as a squashed transcript row — and its `ESC[6n`
+/// cursor probe could never be answered, because the presenter's reader owns
+/// stdin. Both symptoms end at the same missing question: *whose terminal is
+/// this?*
+///
+/// The real-terminal half is proven by the cockpit's acceptance test, which
+/// paints through a lent window and asserts the bytes reach an actual pty. This
+/// is the fast half: the wiring that gets a panel there at all, which is a
+/// missing ARGUMENT and therefore invisible to a type checker.
+#[test]
+fn a_panel_asks_the_surface_for_rows_before_it_draws() {
+    let chat = include_str!("../chat.rs").replace([' ', '\n'], "");
+    assert!(
+        chat.contains("letpanel_window=surface.open_panel(backend_panel::PANEL_HEIGHT);"),
+        "the /backend arm must ask its surface for rows"
+    );
+    assert!(
+        chat.contains("persist,remove,panel_window,"),
+        "the window must reach the panel, not be dropped on the floor"
+    );
+
+    let panel = include_str!("../backend_panel.rs").replace([' ', '\n'], "");
+    assert!(
+        panel.contains("Some(window)=>window.terminal()?,")
+            && panel.contains("None=>make_terminal(PANEL_HEIGHT)?,"),
+        "a lent window wins over the stdout path, and only its absence falls back"
+    );
+}

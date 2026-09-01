@@ -51,15 +51,50 @@
 //! removing. The seam ratatui actually calls is the **backend**, so the rule
 //! lives in one `Backend` implementation and every inline surface inherits it.
 
-use std::io::{self, Stdout, Write};
+use std::io::{self, Write};
 
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::Cell;
 use ratatui::layout::{Position, Size};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
+/// Where an inline surface's bytes go.
+///
+/// **Two destinations, ONE terminal type.** A panel opened from the plain
+/// prompt writes to `stdout`; a panel opened under the cockpit must NOT, because
+/// the cockpit has `dup2`'d a pty slave onto fd 1 to capture stray output
+/// (`cockpit::pty::PtyCapture`) — bytes written there are drained by the capture
+/// and re-emitted as flattened transcript rows, which is exactly how
+/// `/backends` came out as a single squashed border line. That panel writes to
+/// a clone of the REAL terminal instead.
+///
+/// Expressed as one enum rather than a generic parameter on purpose: every
+/// panel loop stays written against a single `Term`, so routing a panel to the
+/// cockpit is a constructor change and not a rewrite of its loop.
+pub(crate) enum PanelOut {
+    Stdout(io::Stdout),
+    /// A clone of the real terminal, handed over by the cockpit presenter.
+    Tty(std::fs::File),
+}
+
+impl Write for PanelOut {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Stdout(w) => w.write(buf),
+            Self::Tty(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stdout(w) => w.flush(),
+            Self::Tty(w) => w.flush(),
+        }
+    }
+}
+
 /// The terminal type every inline surface in this crate uses.
-pub(crate) type InlineTerm = Terminal<AnchoredBackend<Stdout>>;
+pub(crate) type InlineTerm = Terminal<AnchoredBackend<PanelOut>>;
 
 /// Say it once per process, before anything paints.
 ///
@@ -260,9 +295,35 @@ pub(crate) fn inline_terminal(lease: newt_core::tty::RegionLease) -> io::Result<
         }
     };
     Terminal::with_options(
-        AnchoredBackend::with_lease(io::stdout(), Some(lease)),
+        AnchoredBackend::with_lease(PanelOut::Stdout(io::stdout()), Some(lease)),
         TerminalOptions {
             viewport: Viewport::Inline(height),
+        },
+    )
+}
+
+/// A panel drawn into rows the COCKPIT already reserved, on the real terminal.
+///
+/// Three differences from [`inline_terminal`], each of them the fix for a
+/// symptom the operator saw:
+///
+/// - **`Viewport::Fixed`, not `Inline`.** The presenter says which rows this
+///   panel owns, so nothing has to ask the terminal where the cursor is. That
+///   removes the `ESC[6n` round trip entirely — under the cockpit it could
+///   never be answered (the presenter's reader owns stdin), which is where
+///   `⚠ terminal did not report the cursor position` came from.
+/// - **The real tty, not fd 1.** See [`PanelOut`].
+/// - **No lease of its own.** The rows belong to the presenter's modal
+///   reservation, which outlives this terminal and is released by the window
+///   the caller holds — one owner for the rows, not two.
+pub(crate) fn cockpit_panel_terminal(
+    out: std::fs::File,
+    area: ratatui::layout::Rect,
+) -> io::Result<InlineTerm> {
+    Terminal::with_options(
+        AnchoredBackend::with_lease(PanelOut::Tty(out), None),
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
         },
     )
 }
@@ -308,7 +369,7 @@ pub(crate) fn lease_bottom_rows(
 /// What is absent on Windows is the *cockpit*, not the rescue.
 #[cfg(unix)]
 pub(crate) fn cursor_position_or_anchor() -> Position {
-    let mut backend = AnchoredBackend::new(io::stdout());
+    let mut backend = AnchoredBackend::new(PanelOut::Stdout(io::stdout()));
     // `get_cursor_position` above already rescues; this is the last resort if
     // even the rescue's own `size()` path errors, and it is the only remaining
     // answer.

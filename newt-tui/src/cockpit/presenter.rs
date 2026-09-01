@@ -927,6 +927,74 @@ impl Presenter {
                 modal_cleanup?;
                 repaint?;
             }
+            // The panel sibling of `Interact`. Same reservation, same focus
+            // transfer, same repaint — the difference is only WHO draws in the
+            // reserved rows: the presenter renders a semantic interaction
+            // itself, while a panel is lent the rows and draws its own loop on
+            // the session thread. This arm PARKS the presenter for that whole
+            // time, which is what keeps two writers off one terminal and
+            // leaves the keyboard to the panel.
+            SurfaceRequest::Panel { rows, reply } => {
+                let panel_output = match self.screen.tty.try_clone() {
+                    Ok(tty) => tty,
+                    // A failed clone is not fatal: tell the session there are
+                    // no rows and let it keep its own path, exactly as a lean
+                    // surface would answer.
+                    Err(_) => {
+                        let _ = reply.send(None);
+                        return Ok(());
+                    }
+                };
+                // Apply pending geometry first, so the panel reserves rows
+                // against the block that will actually be painted.
+                if self.dirty {
+                    self.draw()?;
+                }
+                let reservation = self.screen.reserve_modal_rows(rows)?;
+                self.chat_inactive = true;
+                if reservation.chat_visible {
+                    if let Err(error) = self.draw() {
+                        self.chat_inactive = false;
+                        return Err(error);
+                    }
+                }
+                // The panel owns the keyboard from here. `released` wakes this
+                // thread when the window drops — normally, on `?`, or on an
+                // unwind — so the rows cannot be stranded by a panel that
+                // returns through a path nobody thought about.
+                let (release, released) = std::sync::mpsc::sync_channel(1);
+                let window = crate::session_worker::PanelWindow::new(
+                    panel_output,
+                    reservation.start,
+                    reservation.rows,
+                    self.screen.cols,
+                    Some(release),
+                );
+                if reply.send(Some(window)).is_err() {
+                    // The session vanished between asking and receiving. Undo
+                    // the reservation rather than parking forever.
+                    self.chat_inactive = false;
+                    let cleanup = self.screen.cleanup_modal(&reservation);
+                    let _ = self.screen.term.clear();
+                    let _ = self.draw();
+                    return cleanup;
+                }
+                // Park. A `RecvError` means the window was dropped without a
+                // send — the same "the panel is done" signal, reached by a
+                // path that could not send. Either way: clean up.
+                let _ = released.recv();
+                let modal_cleanup = self.screen.cleanup_modal(&reservation);
+                self.chat_inactive = false;
+                // The panel wrote outside ratatui's diff, so the mounted block
+                // is repainted from a clean buffer — the same restore the
+                // modal path performs, and the reason the header comes back.
+                let repaint = (|| {
+                    self.screen.term.clear()?;
+                    self.draw()
+                })();
+                modal_cleanup?;
+                repaint?;
+            }
             SurfaceRequest::TurnEnded => {
                 self.turn = None;
                 self.editor.set_turn_running(false);
@@ -1811,6 +1879,88 @@ mod terminal_acceptance {
             assert!(
                 !is_canonical(0),
                 "the cockpit's raw mode survives the modal"
+            );
+
+            // ---- and a PANEL is lent rows on the REAL terminal ----
+            //
+            // The `/backends` defect, at the level only a real terminal can
+            // show it: a panel that draws to fd 1 under a mounted cockpit
+            // paints into the pty CAPTURE, not onto the screen, and comes back
+            // as flattened transcript rows. Nothing mocked can observe that,
+            // because the mock IS the capture. Here the panel draws through the
+            // window the presenter lends it, and the bytes must appear on the
+            // terminal the operator is looking at.
+            //
+            // The painter runs on its own thread because `handle_request` PARKS
+            // until the window drops — that parking is the mechanism keeping
+            // two writers off one terminal, so the test has to exercise it
+            // rather than sidestep it.
+            let (panel_reply, panel_window) =
+                std::sync::mpsc::sync_channel::<Option<crate::session_worker::PanelWindow>>(1);
+            let painter = std::thread::spawn(move || {
+                let window = panel_window
+                    .recv()
+                    .expect("the presenter answers the panel request")
+                    .expect("a mounted cockpit has rows to lend");
+                let mut term = window.terminal().expect("a terminal over the lent rows");
+                term.draw(|f| {
+                    f.render_widget(
+                        ratatui::widgets::Paragraph::new("PANEL BODY ON THE REAL TERMINAL"),
+                        f.area(),
+                    );
+                })
+                .expect("the panel paints");
+                drop(term);
+                // Dropping the window is the release; the presenter is parked
+                // on it.
+                drop(window);
+            });
+            let panel_plan = plan_modal_reservation(cockpit.screen.top, cockpit.screen.rows, 6);
+            assert!(
+                panel_plan.chat_visible,
+                "acceptance must exercise a panel with the inactive chat still \
+                 visible: {panel_plan:?}"
+            );
+            let before_panel = tty.painted().len();
+            cockpit
+                .handle_request(SurfaceRequest::Panel {
+                    rows: 6,
+                    reply: panel_reply,
+                })
+                .expect("the presenter lends the panel its rows");
+            painter.join().expect("panel painter");
+            let panel_delta = tty.painted()[before_panel..].to_string();
+            // Ratatui emits a cursor move per painted run, so the body arrives
+            // as words rather than one string. What matters is that they
+            // arrive AT ALL (they would be swallowed by the capture) and that
+            // they land in the rows the presenter reserved.
+            let mut panel_move = Vec::new();
+            queue!(panel_move, MoveTo(0, panel_plan.start)).expect("panel cursor bytes");
+            let panel_move = String::from_utf8(panel_move).expect("panel cursor bytes are UTF-8");
+            assert!(
+                panel_delta.contains(&panel_move),
+                "the panel must be placed in its reserved rows above chat; \
+                 expected {panel_move:?}, painted: {panel_delta:?}"
+            );
+            for word in ["PANEL", "BODY", "REAL", "TERMINAL"] {
+                assert!(
+                    panel_delta.contains(word),
+                    "the panel's bytes must reach the real terminal, not the \
+                     cockpit's fd 1 capture; missing {word:?}: {panel_delta:?}"
+                );
+            }
+            assert!(
+                !cockpit.chat_inactive,
+                "keyboard focus returns to chat when the panel window drops"
+            );
+            assert_eq!(
+                cockpit.editor.draft(),
+                draft,
+                "the chat draft survives a panel"
+            );
+            assert!(
+                !is_canonical(0),
+                "the cockpit's raw mode survives the panel"
             );
         }
 
