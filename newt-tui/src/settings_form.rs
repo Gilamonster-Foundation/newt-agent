@@ -66,7 +66,7 @@ pub(crate) type Ask<'a> = &'a dyn Fn(&SurfaceInteraction) -> HumanQuestionOutcom
 /// surface for those. The round cap is a NUMBER, so it gets a text field —
 /// widening the form rather than bolting a second dispatch beside it, which is
 /// what forced `/rounds` to keep its own unrecorded write until now.
-enum ValueSpace {
+pub(crate) enum ValueSpace {
     /// A closed vocabulary, rendered as a menu of `(value, what it means)`.
     Choice(Vec<(&'static str, String)>),
     /// A number in `min..=max`, plus one token that RELEASES the setting back
@@ -113,7 +113,7 @@ impl Field {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::EditMode => "line-editor key bindings",
             Self::Tenacity => "tenacity",
@@ -130,7 +130,7 @@ impl Field {
     /// `Cognition::all()` — the same lists `/psyche … list` renders. A second
     /// hand-written copy here is how the form and the dial would drift apart
     /// the first time a level is added.
-    fn value_space(self) -> ValueSpace {
+    pub(crate) fn value_space(self) -> ValueSpace {
         use newt_core::role_profile::Cognition;
         use newt_core::Tenacity;
         let owned = |pairs: &[(&'static str, &str)]| -> ValueSpace {
@@ -193,7 +193,7 @@ impl Field {
     /// For the dials that means the OVERRIDE, not the effective level: the
     /// setting is what this form can change, and `auto` is a real, choosable
     /// value that resolution then fills in.
-    fn current(self) -> String {
+    pub(crate) fn current(self) -> String {
         use newt_core::cognition::cli_cognition;
         match self {
             Self::EditMode => match crate::prompt::resolve_edit_mode() {
@@ -248,7 +248,7 @@ impl Field {
     /// The alias arms are not politeness — each one was accepted by the verb
     /// this field absorbed, and absorbing a command must not silently drop an
     /// affordance operators already type.
-    fn accepts(self, value: &str) -> Option<String> {
+    pub(crate) fn accepts(self, value: &str) -> Option<String> {
         let want = value.trim().to_lowercase();
         let want = match (self, want.as_str()) {
             // `/edit-mode vim`
@@ -294,7 +294,7 @@ impl Field {
 
     /// What this field accepts, said in one line — the refusal message, and the
     /// text field's hint.
-    fn accepts_hint(self) -> String {
+    pub(crate) fn accepts_hint(self) -> String {
         match self.value_space() {
             ValueSpace::Choice(values) => values
                 .into_iter()

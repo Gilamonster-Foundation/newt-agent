@@ -5645,6 +5645,50 @@ fn session_body(
                     // (Shared by the psyche panel gate here and the backend
                     // panel gate below, #1667.)
                     let panel_tokens: Vec<&str> = slash_body.split_whitespace().collect();
+                    // Bare `/settings` IS the panel on a rich-tui TTY — the
+                    // chooser `slash_registry` has classified this family as
+                    // since #1981, now that #1986/#2020 supply a region to draw
+                    // in. Everything else keeps the typed form: a deep link
+                    // (`/settings rounds 40`) is one write with no question to
+                    // ask, and a piped / headless / lean session has no region,
+                    // which the plain-scroller rule requires keep working.
+                    #[cfg(feature = "rich-tui")]
+                    if panel_tokens.as_slice() == ["settings"]
+                        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+                    {
+                        let window = surface.open_panel(settings_panel::panel_height());
+                        match settings_panel::run(window) {
+                            Ok(lines) => {
+                                for line in lines {
+                                    print_newt(&line, color, verbose);
+                                }
+                            }
+                            // A panel that could not open is not a dead end:
+                            // say why once and let the typed form ask, rather
+                            // than leaving the operator with no way to change a
+                            // setting on this terminal.
+                            Err(error) => {
+                                print_newt(
+                                    &format!(
+                                        "settings panel unavailable ({error}); asking instead"
+                                    ),
+                                    color,
+                                    verbose,
+                                );
+                                // The session's existing seam — the same one
+                                // `dispatch_slash_with_ask` hands the form, so
+                                // the fallback asks exactly where a `/settings`
+                                // typed anywhere else would.
+                                for line in crate::settings_form::run(&ask_surface, "") {
+                                    print_newt(&line, color, verbose);
+                                }
+                            }
+                        }
+                        cfg = crate::resolve_runtime_or_default();
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
                     // TWO routes open this panel, and the receipt records which
                     // one the operator typed — so the route is captured here,
                     // where the distinction still exists, rather than guessed
