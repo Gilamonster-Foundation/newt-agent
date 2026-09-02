@@ -1236,6 +1236,28 @@ pub(crate) trait InputSurface {
         &mut self,
         interaction: &newt_core::interaction_surface::SurfaceInteraction,
     ) -> newt_core::HumanQuestionOutcome;
+
+    /// **Lend a panel `rows` rows on the real terminal, if this surface has
+    /// any to lend.**
+    ///
+    /// `None` — the default — means "draw yourself the way you always have".
+    /// That is the honest answer for every surface without a cockpit: a lean
+    /// or piped run has no reserved region to give, and a panel there keeps
+    /// its stdout path. The cockpit overrides it, and it is the ONLY surface
+    /// that can, because it is the only one that took fd 1 away from the
+    /// process in the first place.
+    ///
+    /// `rich-tui`-gated with the panels it serves: a lean build compiles no
+    /// panel and no cockpit, so there is nothing to lend rows to.
+    ///
+    /// Defaulted rather than required, unlike `present_interaction` above,
+    /// because the default is a real behavior rather than a silent hole — and
+    /// `session_worker`'s proxy-forwarding test still catches a `RemoteSurface`
+    /// that forgets to forward it.
+    #[cfg(feature = "rich-tui")]
+    fn open_panel(&mut self, _rows: u16) -> Option<crate::session_worker::PanelWindow> {
+        None
+    }
 }
 
 /// M (#1819): re-derive the AUTOMATIC bundle/profile pick from the CURRENT
@@ -6031,6 +6053,12 @@ fn session_body(
                                 })
                                 .map_err(|e| format!("{e:#}"))
                         };
+                        // Rows on the real terminal when a cockpit is
+                        // mounted; `None` on every other surface, which keeps
+                        // the panel's own stdout path. Held for the panel's
+                        // whole life — dropping it is what releases the rows
+                        // and repaints the chat block.
+                        let panel_window = surface.open_panel(backend_panel::PANEL_HEIGHT);
                         let close = match backend_panel::run(
                             backend_panel::PanelSeed {
                                 options,
@@ -6039,6 +6067,7 @@ fn session_body(
                             },
                             persist,
                             remove,
+                            panel_window,
                         ) {
                             Ok(close) => close,
                             // A mid-panel terminal failure still hands back the

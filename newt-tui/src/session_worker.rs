@@ -108,6 +108,111 @@ pub(crate) enum SurfaceRequest {
         interaction: Box<newt_core::interaction_surface::SurfaceInteraction>,
         reply: SyncSender<newt_core::HumanQuestionOutcome>,
     },
+    /// **Lend this session rows on the REAL terminal, for a panel.**
+    ///
+    /// `rich-tui`-gated, like every panel it serves. `inline_viewport`,
+    /// `backend_panel` and `cockpit` are all gated already, so a lean /
+    /// headless / wyvern build has no panel to lend rows TO and no cockpit to
+    /// lend them — a seam compiled in there would be a request nothing can
+    /// send and nothing can serve. The cfg names which build justifies it,
+    /// rather than an `#[allow(dead_code)]` saying "trust me"
+    /// (`inline_viewport`'s precedent).
+    ///
+    /// The sibling of `Interact`, for the surfaces that draw themselves. A
+    /// panel is a ratatui event loop over closures that capture the session's
+    /// config and its filesystem writers — `!Send`, and not expressible as a
+    /// `SurfaceInteraction` — so the loop cannot be moved to the UI thread the
+    /// way a semantic interaction is. What CAN move is the terminal: the
+    /// presenter reserves the rows, hands back a [`PanelWindow`] onto the real
+    /// tty, and parks until the window is dropped.
+    ///
+    /// `None` means "no cockpit here" — a lean or piped surface has no rows to
+    /// lend, and the caller keeps its existing stdout path.
+    #[cfg(feature = "rich-tui")]
+    Panel {
+        rows: u16,
+        reply: SyncSender<Option<PanelWindow>>,
+    },
+}
+
+/// Rows on the real terminal, lent to a panel for as long as this lives.
+///
+/// Gated with the panels it serves — see [`SurfaceRequest::Panel`].
+///
+/// **Why a window and not a callback.** The cockpit owns fd 1 (it `dup2`s a
+/// pty slave over it to capture stray output), so a panel that draws to stdout
+/// paints into the capture and comes out as flattened transcript rows — the
+/// `/backends` defect. Handing back a clone of the real tty plus the rows it
+/// may use puts the panel on the actual screen without moving its `!Send` loop
+/// anywhere.
+///
+/// **Drop is the release.** The presenter is parked on this window's release
+/// channel; when the panel ends — normally, by `?`, or by a panic unwinding
+/// through it — the drop wakes the presenter to clean up the rows and repaint.
+/// There is no "remember to close it" for a caller to get wrong.
+#[cfg(feature = "rich-tui")]
+#[derive(Debug)]
+pub(crate) struct PanelWindow {
+    /// A clone of the real terminal, NOT fd 1.
+    out: std::fs::File,
+    /// First row of the lent region (0-based), and how many rows it spans.
+    /// `rows` is what the presenter could actually spare, which on a short
+    /// terminal is fewer than the panel asked for — [`Self::terminal`] fixes
+    /// the viewport to what was granted, so a panel draws what fits rather
+    /// than painting outside the region it was lent.
+    top: u16,
+    rows: u16,
+    cols: u16,
+    /// Dropped to wake the parked presenter. `None` only in tests that build a
+    /// window with nobody waiting on it.
+    _release: Option<SyncSender<()>>,
+}
+
+#[cfg(feature = "rich-tui")]
+impl PanelWindow {
+    /// Build a window over `out`, releasing `release` when dropped.
+    ///
+    /// **`#[cfg(unix)]` to match its only caller**, exactly as
+    /// `inline_viewport::cursor_position_or_anchor` is and for the same
+    /// reason: that caller is the cockpit presenter, and the live cockpit is
+    /// unix-only by construction (`openpty`/`dup2`/termios — see
+    /// `cockpit/mod.rs`). On Windows nothing can mint a window until a ConPTY
+    /// cockpit lands (#1746), so this is dead there and `-D warnings` is right
+    /// to say so.
+    ///
+    /// Windows is NOT losing the panel seam: `terminal()` below is ungated, so
+    /// a Windows cockpit gets a working window the moment it can construct
+    /// one — and this cfg becomes a compile error in the same commit that
+    /// gives it that ability, which is the point. An `#[allow(dead_code)]`
+    /// would say "trust me" and stay silent forever.
+    #[cfg(unix)]
+    pub(crate) fn new(
+        out: std::fs::File,
+        top: u16,
+        rows: u16,
+        cols: u16,
+        release: Option<SyncSender<()>>,
+    ) -> Self {
+        Self {
+            out,
+            top,
+            rows,
+            cols,
+            _release: release,
+        }
+    }
+
+    /// A ratatui terminal fixed to exactly the lent rows.
+    ///
+    /// # Errors
+    ///
+    /// The tty could not be cloned, or the terminal could not be built.
+    pub(crate) fn terminal(&self) -> std::io::Result<crate::inline_viewport::InlineTerm> {
+        crate::inline_viewport::cockpit_panel_terminal(
+            self.out.try_clone()?,
+            ratatui::layout::Rect::new(0, self.top, self.cols, self.rows),
+        )
+    }
 }
 
 impl SurfaceRequest {
@@ -117,6 +222,13 @@ impl SurfaceRequest {
     /// what keeps a turn from round-tripping to the UI thread for every status
     /// update it publishes.
     pub(crate) fn expects_reply(&self) -> bool {
+        // A panel request parks the PRESENTER on rows the session must give
+        // back, so it expects a reply for a stronger reason than the rest:
+        // getting this one wrong is a hang, not a missing value.
+        #[cfg(feature = "rich-tui")]
+        if matches!(self, Self::Panel { .. }) {
+            return true;
+        }
         matches!(
             self,
             Self::ReadLine { .. } | Self::Reload { .. } | Self::Interact { .. }
@@ -253,6 +365,16 @@ impl crate::chat::InputSurface for RemoteSurface {
         self.notify(SurfaceRequest::TurnEnded);
     }
 
+    #[cfg(feature = "rich-tui")]
+    fn open_panel(&mut self, rows: u16) -> Option<PanelWindow> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        // A UI thread that cannot lend rows is not an error: the caller keeps
+        // its own stdout path, exactly as it does on a lean surface.
+        self.ask(|reply| SurfaceRequest::Panel { rows, reply }, rx, tx)
+            .ok()
+            .flatten()
+    }
+
     fn present_interaction(
         &mut self,
         interaction: &newt_core::interaction_surface::SurfaceInteraction,
@@ -309,6 +431,10 @@ pub(crate) fn pump_surface(
             SurfaceRequest::TurnEnded => surface.turn_ended(),
             SurfaceRequest::Interact { interaction, reply } => {
                 let _ = reply.send(surface.present_interaction(&interaction));
+            }
+            #[cfg(feature = "rich-tui")]
+            SurfaceRequest::Panel { rows, reply } => {
+                let _ = reply.send(surface.open_panel(rows));
             }
         }
     }
@@ -506,6 +632,18 @@ mod tests {
             reply: itx,
         }
         .expects_reply());
+        // And a FOURTH, for the same reason: a panel request that did not
+        // expect a reply would post the ask and walk away, leaving the
+        // presenter parked on rows nobody will ever release.
+        #[cfg(feature = "rich-tui")]
+        {
+            let (ptx, _prx) = std::sync::mpsc::sync_channel(1);
+            assert!(SurfaceRequest::Panel {
+                rows: 10,
+                reply: ptx,
+            }
+            .expects_reply());
+        }
         assert!(!SurfaceRequest::SaveHistory.expects_reply());
         assert!(!SurfaceRequest::AddHistory("x".into()).expects_reply());
         assert!(!SurfaceRequest::SetBackgroundJobs(Vec::new()).expects_reply());
@@ -603,6 +741,12 @@ mod tests {
     /// If you add a further method to `InputSurface`, this test fails until
     /// the proxy forwards it. That is the point; do not relax the count.
     ///
+    /// The panel seam took it from ten to eleven with `open_panel`. That one
+    /// IS defaulted (a surface with no cockpit has no rows to lend, which is a
+    /// real answer rather than a hole), so it is exactly the shape this test
+    /// was written for: a proxy that forgot to forward it would compile, and
+    /// every panel would silently keep painting into the cockpit's capture.
+    ///
     /// C1 (#1862) took it from nine to ten with `present_interaction`. That
     /// method is REQUIRED rather than defaulted, so the silent-death case
     /// cannot arise for it — a proxy that forgot it would not compile. This
@@ -632,12 +776,14 @@ mod tests {
             surface.turn_started(flag(), flag());
             surface.turn_ended();
             surface.present_interaction(&an_interaction());
+            #[cfg(feature = "rich-tui")]
+            surface.open_panel(10);
         }
 
         let seen = served.join().expect("terminal thread");
         assert_eq!(
             seen.observed(),
-            10,
+            CountingSurface::METHODS,
             "every InputSurface method must cross the proxy; missing: {:?}",
             seen.missing()
         );
@@ -791,10 +937,18 @@ mod tests {
         turn_started: usize,
         turn_ended: usize,
         present_interaction: usize,
+        #[cfg(feature = "rich-tui")]
+        open_panel: usize,
     }
 
     impl CountingSurface {
-        fn each(&self) -> [(&'static str, usize); 10] {
+        /// The lean build has no panel seam, so it has one fewer method to
+        /// forward. The count follows the BUILD rather than being relaxed to
+        /// the smaller number for both — a rich build that dropped a
+        /// forwarding impl must still fail here.
+        const METHODS: usize = if cfg!(feature = "rich-tui") { 11 } else { 10 };
+
+        fn each(&self) -> Vec<(&'static str, usize)> {
             [
                 ("read_line", self.read_line),
                 ("add_history", self.add_history),
@@ -806,7 +960,10 @@ mod tests {
                 ("turn_started", self.turn_started),
                 ("turn_ended", self.turn_ended),
                 ("present_interaction", self.present_interaction),
+                #[cfg(feature = "rich-tui")]
+                ("open_panel", self.open_panel),
             ]
+            .to_vec()
         }
         fn observed(&self) -> usize {
             self.each().iter().filter(|(_, n)| *n > 0).count()
@@ -821,6 +978,15 @@ mod tests {
     }
 
     impl crate::chat::InputSurface for CountingSurface {
+        #[cfg(feature = "rich-tui")]
+        /// A counting surface has no terminal to lend, so it answers `None` —
+        /// the same honest answer a lean surface gives. What is under test is
+        /// that the call CROSSED, not that rows came back.
+        fn open_panel(&mut self, _rows: u16) -> Option<PanelWindow> {
+            self.open_panel += 1;
+            None
+        }
+
         fn present_interaction(
             &mut self,
             _interaction: &newt_core::interaction_surface::SurfaceInteraction,

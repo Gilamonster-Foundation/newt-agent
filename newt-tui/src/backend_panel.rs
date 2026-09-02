@@ -998,7 +998,7 @@ pub(crate) fn saved_note(name: &str, path: &std::path::Path, also_inline: bool) 
 }
 
 /// Bordered block (2) + up to six rows + a hint/command/status row.
-const PANEL_HEIGHT: u16 = 10;
+pub(crate) const PANEL_HEIGHT: u16 = 10;
 
 fn draw(f: &mut ratatui::Frame, state: &PanelState) {
     let title = match &state.mode {
@@ -1091,6 +1091,7 @@ pub(crate) fn run(
     seed: PanelSeed,
     mut persist: impl FnMut(&BackendEdit) -> BackendSaveResult,
     mut remove: impl FnMut(&str) -> Result<String, String>,
+    window: Option<crate::session_worker::PanelWindow>,
 ) -> Result<PanelClose, PanelRunError> {
     if seed.options.is_empty() {
         return Ok(PanelClose::cancelled());
@@ -1102,7 +1103,14 @@ pub(crate) fn run(
     let loop_result = {
         let _raw = PanelRawGuard::enter()?;
         (|| -> io::Result<()> {
-            let mut terminal = make_terminal(PANEL_HEIGHT)?;
+            // Under the cockpit the presenter lends this panel rows on the
+            // REAL terminal; everywhere else it takes the bottom rows of
+            // stdout as it always has. The loop below is identical either
+            // way — one `Term`, two destinations.
+            let mut terminal = match window.as_ref() {
+                Some(window) => window.terminal()?,
+                None => make_terminal(PANEL_HEIGHT)?,
+            };
             terminal.clear()?;
             loop {
                 terminal.draw(|f| draw(f, &state))?;
