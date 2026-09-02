@@ -51,16 +51,13 @@
 //! [`PanelState`] is pure (no terminal, no I/O) and unit-tested; the raw-mode
 //! loop ([`run`]) mirrors `config_panel::run`.
 
+use crossterm::event::KeyCode;
 use std::io;
-use std::time::Duration;
-
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use newt_core::BackendKind;
 
 use crate::config_panel::{
-    clamp_step, command_line, hint_line, make_terminal, render_panel, status_line, Dial,
-    PanelRawGuard, RowView,
+    clamp_step, command_line, hint_line, render_panel, status_line, Dial, RowView,
 };
 
 /// What applying a chooser pick means — a NAMED `[[backends]]` entry (the
@@ -1089,93 +1086,98 @@ fn finish(
 /// the loop's post-command refresh.
 pub(crate) fn run(
     seed: PanelSeed,
-    mut persist: impl FnMut(&BackendEdit) -> BackendSaveResult,
-    mut remove: impl FnMut(&str) -> Result<String, String>,
+    persist: impl FnMut(&BackendEdit) -> BackendSaveResult,
+    remove: impl FnMut(&str) -> Result<String, String>,
     window: Option<crate::session_worker::PanelWindow>,
 ) -> Result<PanelClose, PanelRunError> {
     if seed.options.is_empty() {
         return Ok(PanelClose::cancelled());
     }
-    let mut state = PanelState::new(seed);
-    let mut applied = false;
-    // The same conversion as `config_panel::run` (#1889), and the same shape:
-    // this panel carried the identical bare-statement restore.
-    let loop_result = {
-        let _raw = PanelRawGuard::enter()?;
-        (|| -> io::Result<()> {
-            // Under the cockpit the presenter lends this panel rows on the
-            // REAL terminal; everywhere else it takes the bottom rows of
-            // stdout as it always has. The loop below is identical either
-            // way — one `Term`, two destinations.
-            let mut terminal = match window.as_ref() {
-                Some(window) => window.terminal()?,
-                None => make_terminal(PANEL_HEIGHT)?,
-            };
-            terminal.clear()?;
-            loop {
-                terminal.draw(|f| draw(f, &state))?;
-                if !event::poll(Duration::from_millis(250))? {
-                    continue;
-                }
-                let Event::Key(key) = event::read()? else {
-                    continue;
-                };
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                if state.in_command() {
-                    match key.code {
-                        KeyCode::Char(c) if !ctrl => state.command_char(c),
-                        KeyCode::Backspace => state.command_backspace(),
-                        KeyCode::Esc => state.cancel_command(),
-                        KeyCode::Enter => {
-                            if let Some(apply) = state.run_command(&mut remove) {
-                                applied = apply;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                } else if state.in_form() {
-                    match key.code {
-                        KeyCode::Up => state.form_nav(-1),
-                        KeyCode::Down => state.form_nav(1),
-                        KeyCode::Left => state.form_cycle(-1),
-                        KeyCode::Right => state.form_cycle(1),
-                        KeyCode::Backspace => state.form_backspace(),
-                        KeyCode::Enter => {
-                            state.submit_form(&mut persist);
-                        }
-                        KeyCode::Esc => state.cancel_form(),
-                        KeyCode::Char(c) if !ctrl => state.form_input(c),
-                        _ => {}
-                    }
-                } else {
-                    match key.code {
-                        KeyCode::Left => state.cycle(-1),
-                        KeyCode::Right => state.cycle(1),
-                        KeyCode::Char('e') => state.begin_edit(),
-                        KeyCode::Char('a') => state.begin_add(),
-                        KeyCode::Char('d') => state.begin_remove(),
-                        KeyCode::Char(':') => state.begin_command(""),
-                        KeyCode::Enter => {
-                            applied = true;
-                            break;
-                        }
-                        KeyCode::Esc | KeyCode::Char('q') => {
-                            applied = false;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            terminal.clear()?;
-            Ok(())
-        })()
+    let mut screen = BackendScreen {
+        state: PanelState::new(seed),
+        persist,
+        remove,
     };
-    finish(loop_result, applied, &state)
+    // Under the cockpit the presenter lends this panel rows on the REAL
+    // terminal; everywhere else the driver takes the bottom rows of stdout as
+    // it always has. One `Option`, decided in one place.
+    let driven = crate::panel::drive(&mut screen, PANEL_HEIGHT, window.as_ref());
+    match driven {
+        Ok(applied) => finish(Ok(()), applied, &screen.state),
+        // Nothing was applied — the loop never reached its exit — but the
+        // add/edit/remove notes are real and already on disk, so they are
+        // still reported.
+        Err(error) => finish(Err(error), false, &screen.state),
+    }
+}
+
+/// The backend chooser as a [`crate::panel::Screen`]. Three key tables, one
+/// per mode, exactly as the loop had them — what left is the terminal
+/// lifecycle around them.
+struct BackendScreen<P, R>
+where
+    P: FnMut(&BackendEdit) -> BackendSaveResult,
+    R: FnMut(&str) -> Result<String, String>,
+{
+    state: PanelState,
+    persist: P,
+    remove: R,
+}
+
+impl<P, R> crate::panel::Screen for BackendScreen<P, R>
+where
+    P: FnMut(&BackendEdit) -> BackendSaveResult,
+    R: FnMut(&str) -> Result<String, String>,
+{
+    fn draw(&self, frame: &mut ratatui::Frame) {
+        draw(frame, &self.state);
+    }
+
+    fn key(&mut self, code: KeyCode, ctrl: bool) -> crate::panel::Flow {
+        use crate::panel::Flow;
+        if self.state.in_command() {
+            match code {
+                KeyCode::Char(c) if !ctrl => self.state.command_char(c),
+                KeyCode::Backspace => self.state.command_backspace(),
+                KeyCode::Esc => self.state.cancel_command(),
+                KeyCode::Enter => {
+                    if let Some(apply) = self.state.run_command(&mut self.remove) {
+                        return Flow::Close(apply);
+                    }
+                }
+                _ => {}
+            }
+            return Flow::Stay;
+        }
+        if self.state.in_form() {
+            match code {
+                KeyCode::Up => self.state.form_nav(-1),
+                KeyCode::Down => self.state.form_nav(1),
+                KeyCode::Left => self.state.form_cycle(-1),
+                KeyCode::Right => self.state.form_cycle(1),
+                KeyCode::Backspace => self.state.form_backspace(),
+                KeyCode::Enter => {
+                    self.state.submit_form(&mut self.persist);
+                }
+                KeyCode::Esc => self.state.cancel_form(),
+                KeyCode::Char(c) if !ctrl => self.state.form_input(c),
+                _ => {}
+            }
+            return Flow::Stay;
+        }
+        match code {
+            KeyCode::Left => self.state.cycle(-1),
+            KeyCode::Right => self.state.cycle(1),
+            KeyCode::Char('e') => self.state.begin_edit(),
+            KeyCode::Char('a') => self.state.begin_add(),
+            KeyCode::Char('d') => self.state.begin_remove(),
+            KeyCode::Char(':') => self.state.begin_command(""),
+            KeyCode::Enter => return Flow::Close(true),
+            KeyCode::Esc | KeyCode::Char('q') => return Flow::Close(false),
+            _ => {}
+        }
+        Flow::Stay
+    }
 }
 
 #[cfg(test)]

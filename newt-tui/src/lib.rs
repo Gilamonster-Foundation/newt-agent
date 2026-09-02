@@ -129,6 +129,11 @@ mod config_panel;
 // piped / wyvern paths never compile it in.
 #[cfg(feature = "rich-tui")]
 mod palette;
+// The ONE inline-panel driver — raw mode, viewport, repaint cadence — shared by
+// every panel, so a third panel cannot inherit a third copy of the event loop
+// `/psyche` and `/backends` were each carrying.
+#[cfg(feature = "rich-tui")]
+mod panel;
 // The backend chooser/editor panel (#1667) — same grammar, same gating; its
 // persistence rides the setup wizard's crash-safe lock + plan machinery.
 #[cfg(feature = "rich-tui")]

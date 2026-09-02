@@ -170,10 +170,19 @@ fn a_panel_asks_the_surface_for_rows_before_it_draws() {
         "the window must reach the panel, not be dropped on the floor"
     );
 
+    // The window→terminal choice moved into `panel::drive` when the two
+    // duplicate panel loops were collapsed into one driver, so the guard
+    // follows it: the panel passes its window along, and the DRIVER is the one
+    // place that decides between lent rows and the stdout fallback.
     let panel = include_str!("../backend_panel.rs").replace([' ', '\n'], "");
     assert!(
-        panel.contains("Some(window)=>window.terminal()?,")
-            && panel.contains("None=>make_terminal(PANEL_HEIGHT)?,"),
+        panel.contains("crate::panel::drive(&mutscreen,PANEL_HEIGHT,window.as_ref())"),
+        "the panel must hand its lent window to the driver"
+    );
+    let driver = include_str!("../panel.rs").replace([' ', '\n'], "");
+    assert!(
+        driver.contains("Some(window)=>window.terminal()?,")
+            && driver.contains("None=>make_terminal(height)?,"),
         "a lent window wins over the stdout path, and only its absence falls back"
     );
 }
