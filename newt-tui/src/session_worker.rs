@@ -110,6 +110,14 @@ pub(crate) enum SurfaceRequest {
     },
     /// **Lend this session rows on the REAL terminal, for a panel.**
     ///
+    /// `rich-tui`-gated, like every panel it serves. `inline_viewport`,
+    /// `backend_panel` and `cockpit` are all gated already, so a lean /
+    /// headless / wyvern build has no panel to lend rows TO and no cockpit to
+    /// lend them — a seam compiled in there would be a request nothing can
+    /// send and nothing can serve. The cfg names which build justifies it,
+    /// rather than an `#[allow(dead_code)]` saying "trust me"
+    /// (`inline_viewport`'s precedent).
+    ///
     /// The sibling of `Interact`, for the surfaces that draw themselves. A
     /// panel is a ratatui event loop over closures that capture the session's
     /// config and its filesystem writers — `!Send`, and not expressible as a
@@ -120,6 +128,7 @@ pub(crate) enum SurfaceRequest {
     ///
     /// `None` means "no cockpit here" — a lean or piped surface has no rows to
     /// lend, and the caller keeps its existing stdout path.
+    #[cfg(feature = "rich-tui")]
     Panel {
         rows: u16,
         reply: SyncSender<Option<PanelWindow>>,
@@ -127,6 +136,8 @@ pub(crate) enum SurfaceRequest {
 }
 
 /// Rows on the real terminal, lent to a panel for as long as this lives.
+///
+/// Gated with the panels it serves — see [`SurfaceRequest::Panel`].
 ///
 /// **Why a window and not a callback.** The cockpit owns fd 1 (it `dup2`s a
 /// pty slave over it to capture stray output), so a panel that draws to stdout
@@ -139,6 +150,7 @@ pub(crate) enum SurfaceRequest {
 /// channel; when the panel ends — normally, by `?`, or by a panic unwinding
 /// through it — the drop wakes the presenter to clean up the rows and repaint.
 /// There is no "remember to close it" for a caller to get wrong.
+#[cfg(feature = "rich-tui")]
 #[derive(Debug)]
 pub(crate) struct PanelWindow {
     /// A clone of the real terminal, NOT fd 1.
@@ -156,6 +168,7 @@ pub(crate) struct PanelWindow {
     _release: Option<SyncSender<()>>,
 }
 
+#[cfg(feature = "rich-tui")]
 impl PanelWindow {
     /// Build a window over `out`, releasing `release` when dropped.
     pub(crate) fn new(
@@ -179,7 +192,6 @@ impl PanelWindow {
     /// # Errors
     ///
     /// The tty could not be cloned, or the terminal could not be built.
-    #[cfg(feature = "rich-tui")]
     pub(crate) fn terminal(&self) -> std::io::Result<crate::inline_viewport::InlineTerm> {
         crate::inline_viewport::cockpit_panel_terminal(
             self.out.try_clone()?,
@@ -195,12 +207,16 @@ impl SurfaceRequest {
     /// what keeps a turn from round-tripping to the UI thread for every status
     /// update it publishes.
     pub(crate) fn expects_reply(&self) -> bool {
+        // A panel request parks the PRESENTER on rows the session must give
+        // back, so it expects a reply for a stronger reason than the rest:
+        // getting this one wrong is a hang, not a missing value.
+        #[cfg(feature = "rich-tui")]
+        if matches!(self, Self::Panel { .. }) {
+            return true;
+        }
         matches!(
             self,
-            Self::ReadLine { .. }
-                | Self::Reload { .. }
-                | Self::Interact { .. }
-                | Self::Panel { .. }
+            Self::ReadLine { .. } | Self::Reload { .. } | Self::Interact { .. }
         )
     }
 }
@@ -334,6 +350,7 @@ impl crate::chat::InputSurface for RemoteSurface {
         self.notify(SurfaceRequest::TurnEnded);
     }
 
+    #[cfg(feature = "rich-tui")]
     fn open_panel(&mut self, rows: u16) -> Option<PanelWindow> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         // A UI thread that cannot lend rows is not an error: the caller keeps
@@ -400,6 +417,7 @@ pub(crate) fn pump_surface(
             SurfaceRequest::Interact { interaction, reply } => {
                 let _ = reply.send(surface.present_interaction(&interaction));
             }
+            #[cfg(feature = "rich-tui")]
             SurfaceRequest::Panel { rows, reply } => {
                 let _ = reply.send(surface.open_panel(rows));
             }
@@ -602,12 +620,15 @@ mod tests {
         // And a FOURTH, for the same reason: a panel request that did not
         // expect a reply would post the ask and walk away, leaving the
         // presenter parked on rows nobody will ever release.
-        let (ptx, _prx) = std::sync::mpsc::sync_channel(1);
-        assert!(SurfaceRequest::Panel {
-            rows: 10,
-            reply: ptx,
+        #[cfg(feature = "rich-tui")]
+        {
+            let (ptx, _prx) = std::sync::mpsc::sync_channel(1);
+            assert!(SurfaceRequest::Panel {
+                rows: 10,
+                reply: ptx,
+            }
+            .expects_reply());
         }
-        .expects_reply());
         assert!(!SurfaceRequest::SaveHistory.expects_reply());
         assert!(!SurfaceRequest::AddHistory("x".into()).expects_reply());
         assert!(!SurfaceRequest::SetBackgroundJobs(Vec::new()).expects_reply());
@@ -740,13 +761,14 @@ mod tests {
             surface.turn_started(flag(), flag());
             surface.turn_ended();
             surface.present_interaction(&an_interaction());
+            #[cfg(feature = "rich-tui")]
             surface.open_panel(10);
         }
 
         let seen = served.join().expect("terminal thread");
         assert_eq!(
             seen.observed(),
-            11,
+            CountingSurface::METHODS,
             "every InputSurface method must cross the proxy; missing: {:?}",
             seen.missing()
         );
@@ -900,11 +922,18 @@ mod tests {
         turn_started: usize,
         turn_ended: usize,
         present_interaction: usize,
+        #[cfg(feature = "rich-tui")]
         open_panel: usize,
     }
 
     impl CountingSurface {
-        fn each(&self) -> [(&'static str, usize); 11] {
+        /// The lean build has no panel seam, so it has one fewer method to
+        /// forward. The count follows the BUILD rather than being relaxed to
+        /// the smaller number for both — a rich build that dropped a
+        /// forwarding impl must still fail here.
+        const METHODS: usize = if cfg!(feature = "rich-tui") { 11 } else { 10 };
+
+        fn each(&self) -> Vec<(&'static str, usize)> {
             [
                 ("read_line", self.read_line),
                 ("add_history", self.add_history),
@@ -916,8 +945,10 @@ mod tests {
                 ("turn_started", self.turn_started),
                 ("turn_ended", self.turn_ended),
                 ("present_interaction", self.present_interaction),
+                #[cfg(feature = "rich-tui")]
                 ("open_panel", self.open_panel),
             ]
+            .to_vec()
         }
         fn observed(&self) -> usize {
             self.each().iter().filter(|(_, n)| *n > 0).count()
@@ -932,6 +963,7 @@ mod tests {
     }
 
     impl crate::chat::InputSurface for CountingSurface {
+        #[cfg(feature = "rich-tui")]
         /// A counting surface has no terminal to lend, so it answers `None` —
         /// the same honest answer a lean surface gives. What is under test is
         /// that the call CROSSED, not that rows came back.

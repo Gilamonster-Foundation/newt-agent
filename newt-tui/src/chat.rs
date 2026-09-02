@@ -1247,10 +1247,14 @@ pub(crate) trait InputSurface {
     /// that can, because it is the only one that took fd 1 away from the
     /// process in the first place.
     ///
+    /// `rich-tui`-gated with the panels it serves: a lean build compiles no
+    /// panel and no cockpit, so there is nothing to lend rows to.
+    ///
     /// Defaulted rather than required, unlike `present_interaction` above,
     /// because the default is a real behavior rather than a silent hole — and
     /// `session_worker`'s proxy-forwarding test still catches a `RemoteSurface`
     /// that forgets to forward it.
+    #[cfg(feature = "rich-tui")]
     fn open_panel(&mut self, _rows: u16) -> Option<crate::session_worker::PanelWindow> {
         None
     }
