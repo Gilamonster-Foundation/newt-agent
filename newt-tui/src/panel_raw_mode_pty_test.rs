@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use tests_pty::{screen_grid, Pty};
 
-use crate::config_panel::PanelRawGuard;
+use crate::panel::PanelRawGuard;
 use crate::prompt_visibility_test::wait_for_child;
 
 const CHILD_TEST: &str = "panel_raw_mode_pty_test::panel_raw_mode_child";
@@ -131,7 +131,7 @@ fn panel_raw_mode_child() {
             // Let the reader reach its blocking read before the panel asks.
             std::thread::sleep(Duration::from_millis(150));
 
-            match crate::config_panel::make_terminal(PANEL_TEST_HEIGHT) {
+            match crate::panel::make_terminal(PANEL_TEST_HEIGHT) {
                 Ok(mut terminal) => {
                     // RENDERS, not merely constructs. A terminal that was
                     // built and then drew nothing would leave the operator
@@ -219,7 +219,7 @@ fn panel_raw_mode_child() {
             };
             paint_prompt(&mut prompt, 0);
 
-            match crate::config_panel::make_terminal(PANEL_TEST_HEIGHT) {
+            match crate::panel::make_terminal(PANEL_TEST_HEIGHT) {
                 Ok(mut terminal) => {
                     // The panel fills EVERY row with its body marker, so the
                     // assertion cannot pass on a row the prompt happens not to

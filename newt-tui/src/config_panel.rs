@@ -54,10 +54,8 @@
 //! TUI-drive tested.
 
 use std::io;
-use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use newt_core::tty::raw_mode::RawModeGuard;
+use crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -66,8 +64,6 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
 use newt_core::role_profile::Cognition;
 use newt_core::tenacity::{clear_cli_tenacity, cli_tenacity, set_cli_tenacity, Tenacity};
-
-pub(crate) type Term = crate::inline_viewport::InlineTerm;
 
 /// The cognition dial's ladder of OVERRIDE positions (auto/inherit → off → levels).
 const COGNITION_LADDER: &[CognitionOverride] = &[
@@ -789,64 +785,6 @@ pub(crate) fn clamp_step(i: usize, dir: i32, len: usize) -> usize {
 /// Bordered block (2) + six rows + a hint/command/status row.
 const PANEL_HEIGHT: u16 = 10;
 
-/// Restore the terminal on EVERY exit path of a panel — return, error, panic.
-///
-/// **RAII, not happy-path control flow**, and that distinction is the whole
-/// point (#1889). Both panels used to call `enable_raw_mode()` and then
-/// `disable_raw_mode()` as a STATEMENT after the loop closure. An error return
-/// reached it; a **panic unwound straight past**, leaving the operator in a
-/// shell with no echo and no line discipline — a session that looks broken,
-/// recoverable only with `reset`.
-///
-/// `SplashScreenGuard`'s doc (#1411) enumerated the crate's raw-mode pairs and
-/// called the splash "the only one with no guard at all". These two panels
-/// were not in that count. This is the conversion.
-///
-/// The guard binds BEFORE the fallible call — the ordering
-/// `AltScreenGuard::enter` pays for and `InlineGuard::enter` repeats: from that
-/// point the restore is owed regardless of what the next line does.
-///
-/// `enter_panel_raw_mode_is_the_only_way_in` pins that neither panel reaches
-/// past this type to crossterm; `panel_raw_mode_pty_test` proves the Drop
-/// against a real tty, from a parent that outlives the panicking child.
-///
-/// **SUBSUMED onto [`RawModeGuard`] (#1905).** This owned raw mode and nothing
-/// else, through crossterm's `enable_raw_mode`/`disable_raw_mode` — which keep
-/// ONE process-global "mode prior to raw" and so restore to a fixed state
-/// rather than to what this guard found. C2b (#1891) hit that as a live defect
-/// in `InlineGuard`: an inner frame closing handed the terminal back to cooked
-/// while the outer frame was still up. `RawModeGuard` captures the prior
-/// termios at `enter` and restores exactly that, so nesting composes.
-///
-/// A newtype rather than a plain alias, because the panels' own tests and the
-/// PTY child name this type, and because the doc above is about the panels.
-pub(crate) struct PanelRawGuard {
-    _raw: RawModeGuard,
-}
-
-impl PanelRawGuard {
-    pub(crate) fn enter() -> io::Result<Self> {
-        Ok(Self {
-            _raw: RawModeGuard::enter()?,
-        })
-    }
-}
-
-/// #1950: through the ONE inline constructor, so a terminal that will not
-/// answer `ESC[6n` anchors the panel instead of refusing to open it. This is
-/// the site the operator reported (`/backends`, which shares this function).
-/// #1979: leases its rows with [`OnCollision::Shift`]. A panel opens while the
-/// prompt viewport is live and bottom-pinned, so asking for the bottom rows
-/// outright is #1977 — the panel drew and the prompt's next repaint erased its
-/// body. Shifting mints the nearest free rows ABOVE the holder, which is the
-/// anchor-above-the-prompt fix expressed as the mint's policy rather than as a
-/// special case in the fallback.
-pub(crate) fn make_terminal(height: u16) -> io::Result<Term> {
-    let lease =
-        crate::inline_viewport::lease_bottom_rows(height, newt_core::tty::OnCollision::Shift)?;
-    crate::inline_viewport::inline_terminal(lease)
-}
-
 fn draw(f: &mut ratatui::Frame, state: &PanelState) {
     let bottom = if let Mode::Command(buf) = &state.mode {
         command_line(buf)
@@ -982,73 +920,64 @@ pub(crate) fn row_styles(selected: bool, editable: bool) -> (Style, Style) {
 /// browse-and-leave visit must be indistinguishable from never opening it.
 pub(crate) fn run(
     seed: PanelSeed,
-    mut persist: impl FnMut(&str, &str, bool) -> SaveResult,
+    persist: impl FnMut(&str, &str, bool) -> SaveResult,
 ) -> io::Result<PanelOutcome> {
-    let mut state = PanelState::new(seed);
-    let mut applied = false;
-    // Scoped so the restore lands exactly where the old bare
-    // `disable_raw_mode()` statement did — same ordering, now owed from Drop.
-    let loop_result = {
-        let _raw = PanelRawGuard::enter()?;
-        (|| -> io::Result<()> {
-            let mut terminal = make_terminal(PANEL_HEIGHT)?;
-            terminal.clear()?;
-            loop {
-                terminal.draw(|f| draw(f, &state))?;
-                if !event::poll(Duration::from_millis(250))? {
-                    continue;
-                }
-                let Event::Key(key) = event::read()? else {
-                    continue;
-                };
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                if state.in_command() {
-                    match key.code {
-                        KeyCode::Char(c) => state.command_char(c),
-                        KeyCode::Backspace => state.command_backspace(),
-                        KeyCode::Esc => state.cancel_command(),
-                        KeyCode::Enter => {
-                            if let Some(apply) = state.run_command(&mut persist) {
-                                applied = apply;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                } else {
-                    match key.code {
-                        KeyCode::Up => state.up(),
-                        KeyCode::Down => state.down(),
-                        KeyCode::Left => state.cycle(-1),
-                        KeyCode::Right => state.cycle(1),
-                        KeyCode::Char('s') if ctrl => state.begin_command("w "),
-                        KeyCode::Char(':') => state.begin_command(""),
-                        KeyCode::Enter => {
-                            applied = true;
-                            break;
-                        }
-                        KeyCode::Esc | KeyCode::Char('q') => {
-                            applied = false;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            terminal.clear()?;
-            Ok(())
-        })()
+    let mut screen = PsycheScreen {
+        state: PanelState::new(seed),
+        persist,
     };
-    loop_result?;
+    // Scoped inside `panel::drive`, whose raw-mode guard restores exactly
+    // where the old bare `disable_raw_mode()` statement did (#1889).
+    let applied = crate::panel::drive(&mut screen, PANEL_HEIGHT, None)?;
 
     // Commit order (review-3 §1): the persona file was already persisted inside
     // the loop (via `persist`). Now apply the dials — but ONLY on an explicit
     // apply — then hand the persona action to the caller, which applies it, reroutes
     // the backend, recomputes, and reports from fresh runtime state.
-    Ok(close_outcome(applied, &state))
+    Ok(close_outcome(applied, &screen.state))
+}
+
+/// The psyche panel as a [`crate::panel::Screen`]: its state, its writer, and
+/// its key table. Everything else the loop used to do is the driver's.
+struct PsycheScreen<P: FnMut(&str, &str, bool) -> SaveResult> {
+    state: PanelState,
+    persist: P,
+}
+
+impl<P: FnMut(&str, &str, bool) -> SaveResult> crate::panel::Screen for PsycheScreen<P> {
+    fn draw(&self, frame: &mut ratatui::Frame) {
+        draw(frame, &self.state);
+    }
+
+    fn key(&mut self, code: KeyCode, ctrl: bool) -> crate::panel::Flow {
+        use crate::panel::Flow;
+        if self.state.in_command() {
+            match code {
+                KeyCode::Char(c) => self.state.command_char(c),
+                KeyCode::Backspace => self.state.command_backspace(),
+                KeyCode::Esc => self.state.cancel_command(),
+                KeyCode::Enter => {
+                    if let Some(apply) = self.state.run_command(&mut self.persist) {
+                        return Flow::Close(apply);
+                    }
+                }
+                _ => {}
+            }
+            return Flow::Stay;
+        }
+        match code {
+            KeyCode::Up => self.state.up(),
+            KeyCode::Down => self.state.down(),
+            KeyCode::Left => self.state.cycle(-1),
+            KeyCode::Right => self.state.cycle(1),
+            KeyCode::Char('s') if ctrl => self.state.begin_command("w "),
+            KeyCode::Char(':') => self.state.begin_command(""),
+            KeyCode::Enter => return Flow::Close(true),
+            KeyCode::Esc | KeyCode::Char('q') => return Flow::Close(false),
+            _ => {}
+        }
+        Flow::Stay
+    }
 }
 
 /// The panel's exit contract, factored out of the raw-mode loop so it is
@@ -1081,76 +1010,6 @@ fn close_outcome(applied: bool, state: &PanelState) -> PanelOutcome {
 
 #[cfg(test)]
 mod tests {
-    /// **The structural half of #1889.** The PTY test proves `PanelRawGuard`
-    /// restores; this proves the panels go through it.
-    ///
-    /// Without it the two tests together are still vacuous in the way that
-    /// matters: a guard can be correct and unused, which is exactly the state
-    /// these files were in before — `enable_raw_mode()` called directly, the
-    /// restore a statement a panic skips. Counted over the source because the
-    /// property is "no other path exists", and absence is not observable by
-    /// calling something.
-    #[test]
-    fn enter_panel_raw_mode_is_the_only_way_in() {
-        // PRODUCTION code only, and not merely for tidiness: this test lives
-        // IN config_panel.rs, so `include_str!` pulls in its own needles and
-        // the first run read 2 enables where there is one. Cutting at the
-        // test module is also the right scope — the property is that no
-        // production path reaches raw mode except through the guard.
-        //
-        // #1898 hardened the cut: the version that shipped here split at the
-        // FIRST `#[cfg(test)]` anywhere and fell back to "" when it found
-        // none. `rich_input.rs` has an inline one 700 lines early, and "" makes
-        // every `count() == 0` assertion pass having read nothing.
-        let config = crate::production_source(include_str!("config_panel.rs"));
-        let backend = crate::production_source(include_str!("backend_panel.rs"));
-        // Count CALL forms, not the name: the guard's own doc comment
-        // discusses `enable_raw_mode()` and `disable_raw_mode()` in prose, and
-        // a test that counted mentions would move every time someone edited a
-        // comment — noise that trains people to adjust the number.
-        // #1905 SUBSUMED the raw half onto `RawModeGuard`, so the count that
-        // was "exactly one" is now "none" in BOTH files. The one nesting-aware
-        // owner lives in newt-core; a bare crossterm call reappearing here
-        // would be a second owner restoring to a fixed state rather than to
-        // what it found — the defect C2b hit in `InlineGuard`.
-        assert_eq!(
-            config.matches("enable_raw_mode()?").count(),
-            0,
-            "raw mode comes from RawModeGuard, never crossterm directly"
-        );
-        assert_eq!(
-            config.matches("disable_raw_mode();").count(),
-            0,
-            "…and is released by the field, never by a statement here"
-        );
-        assert!(
-            config.contains("_raw: RawModeGuard"),
-            "PanelRawGuard must HOLD a RawModeGuard — composition, not a \
-             reimplementation"
-        );
-        assert_eq!(
-            backend.matches("enable_raw_mode(").count(),
-            0,
-            "backend_panel must reach raw mode only through PanelRawGuard"
-        );
-        assert_eq!(
-            backend.matches("disable_raw_mode(").count(),
-            0,
-            "a bare disable in backend_panel means a restore that a panic skips"
-        );
-        // The guard itself must still be a Drop obligation. A guard whose
-        // restore moved into an inherent method would satisfy every count
-        // above and leak on unwind again.
-        // No `impl Drop for PanelRawGuard` any more, and its absence is the
-        // point: the restore is the FIELD's, so there is nothing here to
-        // forget. A hand-written Drop reappearing would mean a second restore
-        // racing the field's.
-        assert!(
-            !config.contains("impl Drop for PanelRawGuard"),
-            "the restore is RawModeGuard's; a Drop impl here would be a second one"
-        );
-    }
-
     use super::*;
     use newt_core::test_guard::GlobalSettingsGuard;
 
