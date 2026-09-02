@@ -107,6 +107,41 @@ The three broken rows are not architectural failures; they are **missing
 exports**. The layering is sound and the foundation crates are published. What
 is absent is the `pub`.
 
+### A seam can be bypassed as easily as it can be missing
+
+That framing was half the picture, and #2019 supplied the other half within a
+day of this document being written.
+
+`/settings` and `/crew edit` — both on the *converged* typed path, both built
+on the seam this document praises — had each acquired their **own** prompt
+window through `Terminal::suspend_for_prompt()` while the cockpit still had a
+chat editor mounted below. One private console path beside a seam that already
+existed. Three operator-visible defects fell out of it: two chevrons painted in
+the live accent with nothing on screen saying which owned the keyboard; a modal
+with no rows reserved for it, through which the mounted header kept repainting
+its clock every 250 ms; and a corrupted surface afterwards.
+
+The provenance matters more than the bug. That call was introduced by #1994 —
+the `/settings` consolidation — reviewed and merged as correct wiring. The
+seam was published, documented, and used by the very code that walked around
+it.
+
+**So exporting a seam does not establish it.** A published API is an
+invitation, not a constraint, and the failure mode is not "nobody could reach
+the seam" but "a new surface reached past it." The ownership table in §3
+already assigns row arbitration to the host; #2019 is what ignoring that row
+costs.
+
+**The mechanism that does establish a seam is a conformance check**, and this
+repository already has one working example: the Esc ladder's two-way
+reachability test fails the build when a rung has no live accessor *and* when
+an accessor has no rung. Nothing equivalent guards terminal acquisition, and
+`suspend_for_prompt()` currently has **17 non-test call sites**. Whether that
+warrants a call-site ratchet — the way the region ratchet counts inline
+viewport constructions — is left open in §8, but the asymmetry is worth
+stating: we guard *which claimant owns a key* far more strictly than *which
+surface owns the terminal*.
+
 ---
 
 ## 3. Example seam — the prompt component
@@ -368,3 +403,10 @@ README, and cutting `precedence-ladder` 0.1.0 — which is already blocking
 5. **Where does the phone browser live** — this line, or someone else's?
    Recommendation: defer until the sheet exists; it is the layer that makes a
    third browser cheap.
+6. **Should terminal acquisition get a conformance guard?** `suspend_for_prompt()`
+   has 17 non-test call sites and no ratchet; #2019 shows one of them was wrong
+   for a day without any check noticing. Recommendation: yes, but as a
+   *registration* check rather than a count — a surface that takes the terminal
+   declares itself, and a taker with no declaration fails the build. A bare
+   count would have passed #2019 unchanged, since the call site already
+   existed.
