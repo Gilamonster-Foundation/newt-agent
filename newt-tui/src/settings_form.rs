@@ -194,7 +194,7 @@ impl Field {
     /// setting is what this form can change, and `auto` is a real, choosable
     /// value that resolution then fills in.
     fn current(self) -> String {
-        use newt_core::cognition::{cli_cognition, CognitionOverride};
+        use newt_core::cognition::cli_cognition;
         match self {
             Self::EditMode => match crate::prompt::resolve_edit_mode() {
                 newt_core::EditMode::Vi => "vi",
@@ -202,14 +202,10 @@ impl Field {
                 newt_core::EditMode::Nano => "nano",
             }
             .to_string(),
-            Self::Tenacity => newt_core::tenacity::cli_tenacity()
-                .map_or("auto", newt_core::Tenacity::label)
-                .to_string(),
-            Self::Cognition => match cli_cognition() {
-                CognitionOverride::Unset => "auto".to_string(),
-                CognitionOverride::Off => "off".to_string(),
-                CognitionOverride::Set(c) => c.label().to_string(),
-            },
+            // Through the one dial→token mapping, which the typed doors also
+            // use to report what they changed.
+            Self::Tenacity => tenacity_token(newt_core::tenacity::cli_tenacity()),
+            Self::Cognition => cognition_token(cli_cognition()),
             Self::Thinking => if newt_core::agentic::thinking_stream_enabled() {
                 "on"
             } else {
@@ -376,10 +372,8 @@ pub(crate) fn value_menu(field: Field) -> InteractionDefinition {
 /// reason: a caller that sets the dial and forgets to mark the axis leaves the
 /// conversation's operator pin stale, and there is now exactly one caller.
 fn apply(field: Field, value: &str) -> Result<String, String> {
-    use newt_core::cognition::{set_cli_cognition, CognitionOverride};
+    use newt_core::cognition::CognitionOverride;
     use newt_core::role_profile::Cognition;
-    use newt_core::runtime::{mark_cognition_choice, mark_tenacity_choice};
-    use newt_core::tenacity::{clear_cli_tenacity, set_cli_tenacity};
     use newt_core::Tenacity;
 
     let Some(value) = field.accepts(value) else {
@@ -394,29 +388,18 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         // Under the process-env lock (#1850); the editor is rebuilt right
         // after a slash command returns, before further input is read.
         Field::EditMode => newt_core::process_env::set_var("NEWT_EDIT_MODE", value),
-        Field::Tenacity => match value.parse::<Tenacity>() {
-            Ok(level) => {
-                set_cli_tenacity(level);
-                mark_tenacity_choice(Some(level));
-            }
-            // `auto` — the only value that does not parse as a level, because
-            // `accepts` already refused everything else.
-            Err(_) => {
-                clear_cli_tenacity();
-                mark_tenacity_choice(None);
-            }
-        },
-        Field::Cognition => {
-            let choice = match value {
-                "auto" => CognitionOverride::Unset,
-                "off" => CognitionOverride::Off,
-                level => level
-                    .parse::<Cognition>()
-                    .map_or(CognitionOverride::Unset, CognitionOverride::Set),
-            };
-            set_cli_cognition(choice);
-            mark_cognition_choice(choice);
-        }
+        // `auto` is the only value that does not parse as a level, because
+        // `accepts` already refused everything else. Both dials parse their
+        // token and hand it to the SAME writer the typed door uses, so the two
+        // routes cannot drift in what they set or what they pin.
+        Field::Tenacity => write_tenacity(value.parse::<Tenacity>().ok()),
+        Field::Cognition => write_cognition(match value {
+            "auto" => CognitionOverride::Unset,
+            "off" => CognitionOverride::Off,
+            level => level
+                .parse::<Cognition>()
+                .map_or(CognitionOverride::Unset, CognitionOverride::Set),
+        }),
         Field::Thinking => newt_core::process_env::set_var("NEWT_THINKING", value),
         // `on` REMOVES the variable rather than setting it, which is what the
         // absorbed `/nudge on` did: the readers test for `=off`, so an unset
@@ -480,12 +463,149 @@ fn change_for(
 /// swallows its own failures): failing to observe a change must never undo the
 /// change.
 pub(crate) fn apply_and_record(field: Field, value: &str, via: &str) -> Result<String, String> {
+    recorded(field, via, || apply(field, value)).map(|(message, _)| message)
+}
+
+/// Snapshot the setting, run the write, record what moved.
+///
+/// The recording half of [`apply_and_record`], factored out because there is
+/// now a second door — a TYPED one, for callers that hold a dial rather than a
+/// token (see [`apply_cognition`]). Two doors, ONE recorder: a second copy of
+/// this five-line dance is exactly how one of them would quietly stop
+/// journalling.
+fn recorded<T>(
+    field: Field,
+    via: &str,
+    write: impl FnOnce() -> Result<T, String>,
+) -> Result<(T, Option<SettingChange>), String> {
     let from = field.value_now();
-    let message = apply(field, value)?;
-    if let Some(change) = change_for(field, from, field.value_now(), via) {
+    let applied = write()?;
+    let change = change_for(field, from, field.value_now(), via);
+    if let Some(change) = change.clone() {
         let _ = newt_core::settings_receipt::record(change);
     }
-    Ok(message)
+    Ok((applied, change))
+}
+
+/// **The typed door, for a caller holding a dial rather than a token.**
+///
+/// The `/psyche` panel has a `CognitionOverride` in hand and used to write it
+/// straight through `set_cli_cognition`, which is the #1965 gap in the one
+/// place best positioned to know better: a panel that changes a dial and
+/// leaves no receipt. The obvious fix — render the dial to a token and call
+/// [`apply_and_record`] — buys a `Result` the panel cannot report (its apply
+/// runs inside `close_outcome`, which has no error arm), so an unaccepted
+/// token would silently drop the operator's change. A typed door has no such
+/// failure mode: the value is already the thing the runtime stores.
+///
+/// Same writer, same recorder, same posture mark as the token path — it is
+/// literally the arm [`apply`] runs, called directly.
+///
+/// **`rich-tui`, to match its only caller.** The panel is the thing that holds
+/// a typed dial, and the panel does not exist in a lean / headless / wyvern
+/// build. The token door stays ungated, because slash commands do.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn apply_cognition(
+    choice: newt_core::cognition::CognitionOverride,
+    via: &str,
+) -> String {
+    journalled_cognition(choice, via).0
+}
+
+/// [`apply_cognition`], also handing back the change it journalled.
+///
+/// **The change is returned so a test can SEE which setting was recorded.**
+/// Without it the `Field` handed to [`recorded`] is unguarded: swapping
+/// `Field::Cognition` for `Field::Tenacity` here leaves the runtime state
+/// right, the returned message right (it is built from an explicit label),
+/// and every source-scanning guard passing — while the journal gains a false
+/// `tenacity` row whose from and to are equal, and the operator's real
+/// cognition change is recorded nowhere. An adversarial review ran exactly
+/// that mutation against the whole suite and got 1289 green.
+///
+/// It cannot be observed through the journal in the unit tier, deliberately:
+/// `GlobalSettingsGuard` blanks `RECEIPT_PATH_ENV` so tests write no files.
+/// Returning the value is what makes the claim checkable without one.
+#[cfg(feature = "rich-tui")]
+fn journalled_cognition(
+    choice: newt_core::cognition::CognitionOverride,
+    via: &str,
+) -> (String, Option<SettingChange>) {
+    // Infallible by construction, so the `Result` is unwrapped rather than
+    // returned: `write_cognition` cannot fail, and a caller forced to handle
+    // an impossible error would invent a behaviour for it.
+    recorded(Field::Cognition, via, || {
+        write_cognition(choice);
+        // The message reads the resolver, which is the ONE place that renders
+        // a dial as its token — a second rendering here would be a second
+        // opinion about what `auto` is called.
+        Ok(format!(
+            "{}: {}",
+            Field::Cognition.label(),
+            Field::Cognition.current()
+        ))
+    })
+    .unwrap_or_else(|never| (never, None))
+}
+
+/// The typed door for tenacity. `None` releases the override — `auto`.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn apply_tenacity(level: Option<newt_core::Tenacity>, via: &str) -> String {
+    journalled_tenacity(level, via).0
+}
+
+/// [`apply_tenacity`], also handing back the change it journalled — see
+/// [`journalled_cognition`] for why that is returned rather than inferred.
+#[cfg(feature = "rich-tui")]
+fn journalled_tenacity(
+    level: Option<newt_core::Tenacity>,
+    via: &str,
+) -> (String, Option<SettingChange>) {
+    recorded(Field::Tenacity, via, || {
+        write_tenacity(level);
+        Ok(format!(
+            "{}: {}",
+            Field::Tenacity.label(),
+            Field::Tenacity.current()
+        ))
+    })
+    .unwrap_or_else(|never| (never, None))
+}
+
+/// The runtime write for cognition, and the posture mark that must accompany
+/// it. Private: every route in reaches it through [`recorded`].
+fn write_cognition(choice: newt_core::cognition::CognitionOverride) {
+    newt_core::cognition::set_cli_cognition(choice);
+    // #1668: setting a dial pins its axis as an operator preference.
+    newt_core::runtime::mark_cognition_choice(choice);
+}
+
+fn write_tenacity(level: Option<newt_core::Tenacity>) {
+    match level {
+        Some(level) => newt_core::tenacity::set_cli_tenacity(level),
+        None => newt_core::tenacity::clear_cli_tenacity(),
+    }
+    newt_core::runtime::mark_tenacity_choice(level);
+}
+
+/// The vocabulary token for a dial position — the same string the menu offers
+/// and `accepts` takes.
+///
+/// **The one mapping**, called by [`Field::current`] rather than duplicated
+/// there. It was written as a second copy of that arm; a review named it, and
+/// two renderings of "what is this dial called" is precisely how one of them
+/// starts saying `inherit` where the other says `auto`.
+fn cognition_token(choice: newt_core::cognition::CognitionOverride) -> String {
+    use newt_core::cognition::CognitionOverride;
+    match choice {
+        CognitionOverride::Unset => "auto".to_string(),
+        CognitionOverride::Off => "off".to_string(),
+        CognitionOverride::Set(level) => level.label().to_string(),
+    }
+}
+
+fn tenacity_token(level: Option<newt_core::Tenacity>) -> String {
+    level.map_or_else(|| "auto".to_string(), |l| l.label().to_string())
 }
 
 /// What a deprecated verb prints in addition to doing its job.
@@ -1013,6 +1133,155 @@ mod tests {
         apply(Field::Tenacity, "auto").expect("released");
         let bare = apply(Field::Tenacity, "relentless").expect("an offered value applies");
         assert_eq!(recorded, bare, "the recorder changed the outcome");
+    }
+
+    /// **Every dial position is a token the form would accept.**
+    ///
+    /// The load-bearing guard for the typed door. `apply_cognition` /
+    /// `apply_tenacity` report the change using a token, and `change_for`
+    /// records that token as the new value — so a dial position whose token
+    /// the form does not offer would journal a value `/settings cognition`
+    /// could never be given. The two vocabularies derive from the same
+    /// `Cognition::all()` / `Tenacity::all()` labels; this is what keeps that
+    /// true after someone adds a ladder position to one of them.
+    // Guards the typed door, which the lean build has no panel to call.
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn every_dial_position_is_a_token_the_form_offers() {
+        use newt_core::cognition::CognitionOverride;
+        use newt_core::role_profile::Cognition;
+        use newt_core::Tenacity;
+
+        let mut cognition = vec![CognitionOverride::Unset, CognitionOverride::Off];
+        cognition.extend(Cognition::all().iter().copied().map(CognitionOverride::Set));
+        for choice in cognition {
+            let token = cognition_token(choice);
+            assert!(
+                Field::Cognition.accepts(&token).is_some(),
+                "cognition dial position {choice:?} renders {token:?}, which the form refuses"
+            );
+        }
+
+        let mut tenacity: Vec<Option<Tenacity>> = vec![None];
+        tenacity.extend(Tenacity::all().iter().copied().map(Some));
+        for level in tenacity {
+            let token = tenacity_token(level);
+            assert!(
+                Field::Tenacity.accepts(&token).is_some(),
+                "tenacity dial position {level:?} renders {token:?}, which the form refuses"
+            );
+        }
+    }
+
+    /// **The receipt names the setting the door was asked to change, and the
+    /// route the operator took.**
+    ///
+    /// The guard an adversarial review earned: with the `Field` handed to
+    /// `recorded` unobserved, swapping `Field::Cognition` for
+    /// `Field::Tenacity` inside `apply_cognition` left the runtime state
+    /// right, the returned message right, and all 1289 tests green — while
+    /// the journal gained a false `tenacity` row (from == to) and the
+    /// operator's real cognition change was recorded nowhere. Exactly the
+    /// #1965 gap this change closes, with a fabricated entry on top.
+    ///
+    /// Asserted through the DOOR, on the change the door produced. A test
+    /// that called `change_for(Field::Cognition, ..)` beside it would supply
+    /// the very field the door was supposed to choose, and could not catch
+    /// the swap. Filesystem-free: `settings_guard` blanks the receipt path, so
+    /// what is checked is the change that WOULD be written.
+    ///
+    /// **Grounded by `settings_form_pty_test`**, which drives the token door
+    /// against a real `receipts.jsonl` and proves `record` actually appends.
+    /// This test owns the half that one cannot vary — which setting and which
+    /// route each door names — and that one owns the half this cannot see.
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn each_typed_door_journals_its_own_setting_and_route() {
+        use newt_core::cognition::CognitionOverride;
+        use newt_core::role_profile::Cognition;
+        let _g = settings_guard();
+
+        apply(Field::Cognition, "off").expect("arrange");
+        let (_, change) =
+            journalled_cognition(CognitionOverride::Set(Cognition::all()[0]), "/psyche edit");
+        let change = change.expect("cognition declares a journal destination");
+        assert_eq!(change.setting, "cognition", "the door journals ITS setting");
+        assert_eq!(change.via, "/psyche edit", "the route is the one taken");
+        assert_eq!(change.from.to_string(), "off");
+        assert_eq!(change.to.to_string(), Cognition::all()[0].label());
+
+        apply(Field::Tenacity, "standard").expect("arrange");
+        let (_, change) = journalled_tenacity(None, "/psyche");
+        let change = change.expect("tenacity declares a journal destination");
+        assert_eq!(change.setting, "tenacity");
+        assert_eq!(change.via, "/psyche");
+        assert_eq!(change.from.to_string(), "standard");
+        assert_eq!(change.to.to_string(), "auto", "None releases the override");
+    }
+
+    /// **The two doors apply the same thing.**
+    ///
+    /// A typed caller and a token caller must be indistinguishable in what
+    /// they leave behind, or the panel and the slash verb would drift into
+    /// two settings wearing one name. Asserted on the runtime state AND on
+    /// the reported message, since the message is what a receipt records.
+    // Guards the typed door, which the lean build has no panel to call.
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn the_typed_door_and_the_token_door_agree() {
+        use newt_core::cognition::CognitionOverride;
+        use newt_core::role_profile::Cognition;
+        use newt_core::Tenacity;
+        let _g = settings_guard();
+
+        // EVERY ladder position, not a sample: the panel offers all of them,
+        // so a position the two doors disagree about is one an operator can
+        // actually reach.
+        let mut cognition = vec![
+            (CognitionOverride::Unset, "auto".to_string()),
+            (CognitionOverride::Off, "off".to_string()),
+        ];
+        cognition.extend(
+            Cognition::all()
+                .iter()
+                .map(|c| (CognitionOverride::Set(*c), c.label().to_string())),
+        );
+        for (choice, token) in cognition {
+            let token = token.as_str();
+            // Start from somewhere else, so each door has something to change.
+            apply(Field::Cognition, "off").expect("arrange");
+            let typed = apply_cognition(choice, "/psyche");
+            let after_typed = Field::Cognition.current();
+
+            apply(Field::Cognition, "off").expect("arrange");
+            let by_token =
+                apply_and_record(Field::Cognition, token, "/settings").expect("offered token");
+            assert_eq!(
+                Field::Cognition.current(),
+                after_typed,
+                "same runtime state"
+            );
+            assert_eq!(typed, by_token, "same reported change");
+        }
+
+        let mut tenacity = vec![(None, "auto".to_string())];
+        tenacity.extend(
+            Tenacity::all()
+                .iter()
+                .map(|t| (Some(*t), t.label().to_string())),
+        );
+        for (level, token) in tenacity {
+            let token = token.as_str();
+            apply(Field::Tenacity, "standard").expect("arrange");
+            let typed = apply_tenacity(level, "/psyche");
+            let after_typed = Field::Tenacity.current();
+
+            apply(Field::Tenacity, "standard").expect("arrange");
+            let by_token =
+                apply_and_record(Field::Tenacity, token, "/settings").expect("offered token");
+            assert_eq!(Field::Tenacity.current(), after_typed, "same runtime state");
+            assert_eq!(typed, by_token, "same reported change");
+        }
     }
 
     /// The deprecated verbs point at their new home and say they still work —

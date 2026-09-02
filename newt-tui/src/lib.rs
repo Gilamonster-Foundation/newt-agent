@@ -291,8 +291,12 @@ pub(crate) fn run_crew_edit_with_ask(
 /// headless) — print a short note pointing at the text `/psyche` view and return
 /// `Cancelled`. The panel applies (only the changed) dials through the same
 /// setters the flags / slash commands use; `persist` (the caller's closure, which
-/// owns the `PersonaStore`) is the ONLY filesystem I/O, so a failed save keeps the
-/// panel open without mutating the runtime (review-3 §1). The caller acts on the
+/// owns the `PersonaStore`) is the only filesystem I/O the panel's TRANSACTION
+/// depends on, so a failed save keeps the panel open without mutating the
+/// runtime (review-3 §1). Not the only I/O it performs any more: applying a dial
+/// now appends a settings receipt (#1965), which is best-effort by construction
+/// — `settings_receipt::record` swallows its own failures, because failing to
+/// observe a change must never undo it. The caller acts on the
 /// returned outcome — applying the persona action, rerouting, and reporting from
 /// fresh runtime state. **Rich-tui only** — the lean build has no ratatui surface,
 /// so the `/psyche edit` handler prints the fallback directly. See

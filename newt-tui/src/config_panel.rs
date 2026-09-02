@@ -61,9 +61,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use newt_core::cognition::{cli_cognition, set_cli_cognition, CognitionOverride};
+use newt_core::cognition::{cli_cognition, CognitionOverride};
 use newt_core::role_profile::Cognition;
-use newt_core::tenacity::{clear_cli_tenacity, cli_tenacity, set_cli_tenacity, Tenacity};
+use newt_core::tenacity::{cli_tenacity, Tenacity};
 
 /// The cognition dial's ladder of OVERRIDE positions (auto/inherit → off → levels).
 const COGNITION_LADDER: &[CognitionOverride] = &[
@@ -112,6 +112,15 @@ pub(crate) struct ModelChoice {
 /// personas + the active one, the operator baseline backend, the
 /// config/family tenacity base, and the served-model list + active model.
 pub(crate) struct PanelSeed {
+    /// The route the operator actually typed — `/psyche` or `/psyche edit`,
+    /// both of which open this panel (see `chat.rs`'s `wants_psyche_panel`).
+    ///
+    /// Carried rather than assumed: it is what the settings receipt records as
+    /// `via`, and the whole value of that column is being the half of the
+    /// event a reader cannot reconstruct from the resulting state. Hardcoding
+    /// `/psyche` here would journal a route the operator never typed for half
+    /// the ways in — a false record, which is worse than none.
+    pub via: &'static str,
     pub personas: Vec<PersonaChoice>,
     pub current_persona: Option<String>,
     pub backend: Option<String>,
@@ -218,6 +227,8 @@ pub(crate) enum PanelOutcome {
 /// Persistence is injected into [`PanelState::run_command`] as a closure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PanelState {
+    /// The route that opened this panel, recorded as the receipt's `via`.
+    via: &'static str,
     sel: usize,
     /// `NONE` at index 0, then the available persona names (parallel to
     /// [`Self::personas`] shifted by one).
@@ -261,6 +272,7 @@ impl PanelState {
     /// everything; the panel stays network- and config-free.
     pub(crate) fn new(seed: PanelSeed) -> Self {
         let PanelSeed {
+            via,
             mut personas,
             current_persona,
             backend,
@@ -312,6 +324,7 @@ impl PanelState {
             .and_then(|c| persona_opts.iter().position(|n| n == c))
             .unwrap_or(0);
         Self {
+            via,
             sel: 0,
             persona_opts,
             personas,
@@ -376,25 +389,40 @@ impl PanelState {
         }
     }
 
-    /// Apply ONLY the dials the operator changed. `auto`/`inherit` CLEARS the
-    /// override so the value returns to persona/config resolution. Called by
-    /// [`run`] only after an explicit apply (Enter / a `:wq` whose save landed).
+    /// Apply the dials the operator moved — **through the one mutation path,
+    /// which is what writes the receipt** (#1965).
+    ///
+    /// `auto`/`inherit` CLEARS the override so the value returns to
+    /// persona/config resolution. Called by [`run`] only after an explicit
+    /// apply (Enter / a `:wq` whose save landed).
+    ///
+    /// This used to call `set_cli_cognition` / `set_cli_tenacity` /
+    /// `clear_cli_tenacity` directly. It was the last live bypass of
+    /// `settings_form::apply_and_record`, and the worst-placed one: a panel
+    /// whose entire job is changing dials, leaving nothing durable behind. The
+    /// slash verbs it duplicates (`/psyche cognition`, `/psyche tenacity`) have
+    /// been journalling since #1981, so the same change made two ways produced
+    /// a record only one way — the exact shape of the audit finding that an
+    /// unlimited round cap left no trace.
+    ///
+    /// `via` is the route the panel was OPENED by — `/psyche` or `/psyche
+    /// edit`, both of which land here — carried in on [`PanelSeed`] rather
+    /// than hardcoded. The route is the half of the event a reader cannot
+    /// reconstruct from the resulting state, so a receipt naming a command the
+    /// operator never typed is a false record rather than a rounding error.
+    ///
+    /// Only DIRTY dials are touched, unchanged: #1668's posture marks say the
+    /// operator moved THIS axis, so an untouched row of the panel must pin
+    /// nothing — and a receipt for a dial nobody touched would be a false
+    /// entry in the journal. (The model spinner's pick is marked on the
+    /// `/model` path the caller routes it through, after that path's
+    /// served-validation gate.)
     pub(crate) fn apply(&self) {
         if self.cognition.is_dirty() {
-            set_cli_cognition(self.cognition.value());
-            // #1668: the panel's DIRTY dials are operator posture actions —
-            // exactly the axes the operator moved, so an untouched row of the
-            // panel never pins anything. (The model spinner's pick is marked
-            // on the `/model` path the caller routes it through, after that
-            // path's served-validation gate.)
-            newt_core::runtime::mark_cognition_choice(self.cognition.value());
+            let _ = crate::settings_form::apply_cognition(self.cognition.value(), self.via);
         }
         if self.tenacity.is_dirty() {
-            match self.tenacity.value() {
-                Some(t) => set_cli_tenacity(t),
-                None => clear_cli_tenacity(),
-            }
-            newt_core::runtime::mark_tenacity_choice(self.tenacity.value());
+            let _ = crate::settings_form::apply_tenacity(self.tenacity.value(), self.via);
         }
     }
 
@@ -1011,6 +1039,10 @@ fn close_outcome(applied: bool, state: &PanelState) -> PanelOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The setters the panel no longer calls: tests still use them to ARRANGE
+    // runtime state, which is not the same as writing a setting.
+    use newt_core::cognition::set_cli_cognition;
+    use newt_core::tenacity::{clear_cli_tenacity, set_cli_tenacity};
     use newt_core::test_guard::GlobalSettingsGuard;
 
     fn choice(
@@ -1045,6 +1077,7 @@ mod tests {
         current_model: &str,
     ) -> PanelSeed {
         PanelSeed {
+            via: "/psyche",
             personas,
             current_persona: current.map(str::to_string),
             backend: Some("sol".to_string()),
@@ -1097,6 +1130,44 @@ mod tests {
     /// #1668: a panel apply marks a posture ACTION for exactly its DIRTY dials
     /// — so browsing the panel (bare `/psyche` opens it) can never pin, and a
     /// one-dial edit cannot drag the other dial's ambient value into the pin.
+    /// **The panel cannot reach a dial except through the recorder** (#1965).
+    ///
+    /// `PanelState::apply` used to call `set_cli_cognition` /
+    /// `set_cli_tenacity` / `clear_cli_tenacity` directly — the last live
+    /// bypass of `settings_form`'s one mutation path, and the worst-placed
+    /// one: a panel whose whole job is moving dials, leaving nothing durable
+    /// behind, while the slash verbs it duplicates had been journalling since
+    /// #1981.
+    ///
+    /// Counted over PRODUCTION source because the property is "no other path
+    /// exists", and absence is not observable by calling something. The
+    /// behavioural half — that the dials still move, and that only the dirty
+    /// ones pin a preference — is the test below and
+    /// `close_outcome_downgrades_a_noop_enter_and_applies_a_real_one`.
+    #[test]
+    fn the_panel_writes_dials_only_through_the_recorded_path() {
+        let source = crate::production_source(include_str!("config_panel.rs"));
+        for setter in [
+            "set_cli_cognition(",
+            "set_cli_tenacity(",
+            "clear_cli_tenacity(",
+            "mark_cognition_choice(",
+            "mark_tenacity_choice(",
+        ] {
+            assert_eq!(
+                source.matches(setter).count(),
+                0,
+                "`{setter}` writes a setting with no receipt; go through \
+                 settings_form::apply_cognition / apply_tenacity"
+            );
+        }
+        assert!(
+            source.contains("settings_form::apply_cognition")
+                && source.contains("settings_form::apply_tenacity"),
+            "the panel must apply its dials through the recording path"
+        );
+    }
+
     #[test]
     fn apply_marks_a_preference_action_only_for_the_dirty_dials() {
         use newt_core::runtime::drain_preference_actions;
