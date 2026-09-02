@@ -152,7 +152,7 @@
       "pattern": "^[A-Za-z0-9_-]+$"
     },
     "ControlKind": {
-      "description": "How a control accepts input.\n\n`Choice` carries its options inline because they belong to it: one field, N mutually-exclusive answers. Modelling each option as its own control would make [`Requirement`] incoherent — under \"the response must include this control\", answering an allow would require also answering the deny.",
+      "description": "How a control accepts input.\n\n`Choice` carries its options inline because they belong to it: one field, N mutually-exclusive answers. Modelling each option as its own control would make [`Requirement`] incoherent — under \"the response must include this control\", answering an allow would require also answering the deny.\n\n# A kind is a MEANING; an affordance is not a kind\n\nThe line this vocabulary is drawn on, because the HTML input catalog it mirrors does not draw it and copying that list variant-for-variant would have produced twenty-two.\n\nA kind earns its place when it changes what a well-formed ANSWER is — `#c0ffee` is a color and not a date, and no surface may accept it as one. It does not earn a place merely by suggesting a different widget: a slider and a typed number accept the same answers, so [`Range`](Self::Range) is separate from [`Number`](Self::Number) only because a bounded-and-stepped value space IS different (its bounds are mandatory), not because one draws as a slider.\n\nWhat this excludes, deliberately:\n\n- `button`, `submit`, `reset`, `image` — form ACTIONS. A definition's actions are its [`SemanticRole`]s; a submit button that carried its own meaning would be a second authority vocabulary. - `hidden` — not a control at all. A value the operator cannot see is not a thing they answered, and putting one here would let a surface claim an answer nobody gave. - `radio`, `checkbox`, `password`, `select` — already spelled [`Choice`](Self::Choice), [`Toggle`](Self::Toggle), [`Secret`](Self::Secret) and [`Choice`](Self::Choice) again. `<select>` and a radio group are one meaning with two presentations.\n\n# Every kind here is answerable by typing\n\nNone of these mint a [`SurfaceFeature`] demand (see `downgrade::intrinsic_demands`), and that is deliberate rather than unfinished. A date answered by typing `2026-09-01` is a satisfied date, so a surface with no calendar widget has NOT failed to present the question — it presented it plainly. Only [`Secret`](Self::Secret) demands a feature, because it changes what may be DISCLOSED rather than how something is drawn. Minting a demand per kind would make plain and headless surfaces refuse questions they can answer perfectly well, which is law 5 pointed at the wrong axis.",
       "oneOf": [
         {
           "description": "Pick exactly one of the options offered.",
@@ -181,7 +181,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Free text.",
+          "description": "Free text.\n\n**Deliberately still a unit variant.** HTML spells five flavours of text — `email`, `url`, `tel`, `search`, plain — and carrying one here as `Text { format }` would re-encode the most common kind in the vocabulary: a unit variant is the dag-cbor string `\"text\"`, a struct variant is a map. That breaks `tests/data/interaction-vectors.json`, whose frozen canonical bytes are DECODED rather than rebuilt, and the external-consumer corpus answering them — the compatibility fixtures CLAUDE.md names as what a rewrite is written against.\n\nThe flavours differ, in a terminal, only in what counts as valid. That is not worth re-addressing every definition ever written. If one earns its own kind later it can be ADDED as a new variant, which breaks nothing — the way `Number`, `Temporal`, `Color` and `Path` were.",
           "type": "string",
           "enum": [
             "text"
@@ -200,6 +200,150 @@
           "enum": [
             "secret"
           ]
+        },
+        {
+          "description": "A whole number, optionally bounded and stepped.\n\n**Integers, and that is a decision.** A binary float cannot be canonically encoded without deciding what to do about `NaN` and `-0.0`, and this vocabulary is content-addressed — two encodings of one value would be two identities. Every number newt asks for today (a round cap, a port, a timeout, a percentage) is integral. A fractional control is a later, separate decision, and it will carry its digits as a decimal STRING rather than reopening this one.",
+          "type": "object",
+          "required": [
+            "number"
+          ],
+          "properties": {
+            "number": {
+              "type": "object",
+              "properties": {
+                "max": {
+                  "description": "Largest acceptable value, inclusive.",
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64"
+                },
+                "min": {
+                  "description": "Smallest acceptable value, inclusive.",
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64"
+                },
+                "step": {
+                  "description": "The grid the value must sit on, counted from `min` (or from zero when unbounded below). `None` accepts any integer in range.",
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A number on a bounded, stepped scale — HTML's `range`.\n\nDistinct from [`Number`](Self::Number) because its bounds are MANDATORY: a slider without ends is not a slider, and a surface that draws one needs both to draw anything at all.",
+          "type": "object",
+          "required": [
+            "range"
+          ],
+          "properties": {
+            "range": {
+              "type": "object",
+              "required": [
+                "max",
+                "min",
+                "step"
+              ],
+              "properties": {
+                "max": {
+                  "description": "Largest acceptable value, inclusive.",
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "min": {
+                  "description": "Smallest acceptable value, inclusive.",
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "step": {
+                  "description": "The grid the value must sit on, counted from `min`.",
+                  "type": "integer",
+                  "format": "int64"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A point in time at the given precision.",
+          "type": "object",
+          "required": [
+            "temporal"
+          ],
+          "properties": {
+            "temporal": {
+              "type": "object",
+              "required": [
+                "precision"
+              ],
+              "properties": {
+                "precision": {
+                  "description": "How much of a moment is being asked for.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/TemporalPrecision"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "An sRGB color, written `#rrggbb`.",
+          "type": "string",
+          "enum": [
+            "color"
+          ]
+        },
+        {
+          "description": "A filesystem path.\n\nThe protocol says what is being NAMED, never whether it exists: an existence check is the host's business, is racy by nature, and would make a definition's validity depend on the machine reading it.",
+          "type": "object",
+          "required": [
+            "path"
+          ],
+          "properties": {
+            "path": {
+              "type": "object",
+              "required": [
+                "kind"
+              ],
+              "properties": {
+                "accept": {
+                  "description": "Extensions or globs a surface may filter by — HTML's `accept`. Advisory: a surface that ignores it still collects a valid answer.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "kind": {
+                  "description": "Whether the path names a file or a directory.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/PathKind"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -279,6 +423,25 @@
       "minLength": 1,
       "pattern": "^[A-Za-z0-9_-]+$"
     },
+    "PathKind": {
+      "description": "What a [`ControlKind::Path`] control points at.",
+      "oneOf": [
+        {
+          "description": "A single file.",
+          "type": "string",
+          "enum": [
+            "file"
+          ]
+        },
+        {
+          "description": "A directory.",
+          "type": "string",
+          "enum": [
+            "directory"
+          ]
+        }
+      ]
+    },
     "Requirement": {
       "description": "Whether something is REQUIRED to present or answer an interaction faithfully, or merely preferred.\n\nThis is the axis ADR law 5 turns on: *unknown REQUIRED behavior fails closed; unknown OPTIONAL behavior degrades visibly.* Without it a consumer that cannot satisfy a demand has only one move for both cases, and whichever it picks is wrong half the time — silently dropping a mandatory secret field, or refusing a document that merely wanted a diagram.\n\nOne vocabulary, deliberately: controls and surface features both use it, so a wire consumer learns the distinction once. On a control it means \"the response must answer this FIELD\" — which is only coherent because a choice is one field with many options, not many fields.",
       "oneOf": [
@@ -341,6 +504,46 @@
     "SurfaceFeature": {
       "type": "string",
       "minLength": 1
+    },
+    "TemporalPrecision": {
+      "description": "How much of a point in time a [`ControlKind::Temporal`] control asks for.\n\nHTML's `date`, `time`, `datetime-local`, `month` and `week` — five input types that differ only in precision, so they are five configurations of one kind rather than five kinds.",
+      "oneOf": [
+        {
+          "description": "A calendar date: `YYYY-MM-DD`.",
+          "type": "string",
+          "enum": [
+            "date"
+          ]
+        },
+        {
+          "description": "A wall-clock time: `HH:MM` or `HH:MM:SS`.",
+          "type": "string",
+          "enum": [
+            "time"
+          ]
+        },
+        {
+          "description": "A local date and time: `YYYY-MM-DDTHH:MM[:SS]`.",
+          "type": "string",
+          "enum": [
+            "date-time"
+          ]
+        },
+        {
+          "description": "A calendar month: `YYYY-MM`.",
+          "type": "string",
+          "enum": [
+            "month"
+          ]
+        },
+        {
+          "description": "An ISO week: `YYYY-Www`.",
+          "type": "string",
+          "enum": [
+            "week"
+          ]
+        }
+      ]
     }
   }
 }
