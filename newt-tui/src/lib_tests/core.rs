@@ -1173,6 +1173,14 @@ fn slash_help_returns_true() {
 }
 
 #[test]
+fn slash_parts_ignore_extra_whitespace_before_model_name() {
+    assert_eq!(
+        slash_parts("/model  Ornith-1.5-35B-Q8_0"),
+        ("model", "Ornith-1.5-35B-Q8_0", "")
+    );
+}
+
+#[test]
 fn help_request_recognizes_every_form() {
     assert_eq!(help_request("/models --help").as_deref(), Some("models"));
     assert_eq!(help_request("/models -h").as_deref(), Some("models"));
