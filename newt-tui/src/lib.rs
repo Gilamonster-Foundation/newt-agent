@@ -138,6 +138,10 @@ mod panel;
 // persistence rides the setup wizard's crash-safe lock + plan machinery.
 #[cfg(feature = "rich-tui")]
 mod backend_panel;
+// Assembling the backend chooser — its options and its two filesystem writers
+// — in ONE place, now that `/backends` is not its only caller.
+#[cfg(feature = "rich-tui")]
+mod backend_chooser;
 #[cfg(feature = "rich-tui")]
 mod vi;
 // #2005: the Esc / Ctrl-C precedence table (`assets/esc_ladder.toml`) plus the

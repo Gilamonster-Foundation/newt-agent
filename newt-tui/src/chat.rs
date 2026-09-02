@@ -5957,130 +5957,14 @@ fn session_body(
                     if matches!(panel_tokens.as_slice(), ["backend"] | ["backends"])
                         && std::io::IsTerminal::is_terminal(&std::io::stdout())
                     {
-                        use backend_panel::{BackendOption, BackendSelection, BackendSource};
-                        // Chooser options: every configured backend — the exact
-                        // set `/backends <name>` can switch to — tagged with
-                        // WHERE its definition lives (the panel writes only
-                        // ~/.newt/backends drop-ins), plus the bare wire-kind
-                        // fallbacks the `/backend <openai|ollama>` form supports.
-                        let names_in = |path: Option<std::path::PathBuf>| -> std::collections::HashSet<String> {
-                            path.map(|p| setup::panel_backend_file_names(&p).into_iter().collect())
-                                .unwrap_or_default()
-                        };
-                        let dropins = names_in(newt_core::Config::user_config_path());
-                        // `Config::merge_disk_backends` merges the PROJECT
-                        // `.newt/backends` LAST (last-wins), so a name defined
-                        // in both resolves to the project file: editing or
-                        // removing the user drop-in would be a silent no-op and
-                        // a phantom delete (review §3). Mark those read-only.
-                        let project_dropins = names_in(newt_core::Config::project_config_path());
-                        // A same-named inline [[backends]] entry keeps supplying
-                        // whatever the drop-in omits (review §4).
-                        let inline: std::collections::HashSet<String> =
-                            newt_core::Config::user_config_path()
-                                .map(|p| setup::inline_backend_names(&p).into_iter().collect())
-                                .unwrap_or_default();
-                        let mut options: Vec<BackendOption> = cfg
-                            .backends
-                            .iter()
-                            .map(|b| BackendOption {
-                                name: b.name.clone(),
-                                selection: BackendSelection::Named(b.name.clone()),
-                                source: if project_dropins.contains(&b.name) {
-                                    BackendSource::ShadowedByProject
-                                } else if !dropins.contains(&b.name) {
-                                    BackendSource::Inline
-                                } else if inline.contains(&b.name) {
-                                    BackendSource::UserDropInOverInline
-                                } else {
-                                    BackendSource::UserDropIn
-                                },
-                                kind: b.kind,
-                                endpoint: b.endpoint.clone(),
-                                model: b.model.clone(),
-                                api_key_env: b.api_key_env.clone(),
-                                api_key_file: b.api_key_file.clone(),
-                            })
-                            .collect();
-                        for kind in ["ollama", "openai"] {
-                            options.push(BackendOption::kind_fallback(kind));
-                        }
-                        let active_idx = match active_backend_name(&cfg) {
-                            Some(n) => options.iter().position(
-                                |o| matches!(&o.selection, BackendSelection::Named(m) if *m == n),
-                            ),
-                            // No named match (env-shim / kind-forced session):
-                            // mark the kind fallback the session resolves to.
-                            None => resolve_backend_choice(&cfg).ok().and_then(|choice| {
-                                let k = choice.kind.label();
-                                options.iter().position(
-                                    |o| matches!(o.selection, BackendSelection::Kind(s) if s == k),
-                                )
-                            }),
-                        };
-                        // Persistence is I/O-INJECTED (config_panel review-3 §1):
-                        // these closures are the panel's ONLY filesystem writes,
-                        // both riding the setup wizard's crash-safe lock + plan
-                        // machinery (#1660) — never a second write path. A
-                        // failure keeps the panel open with a visible status.
-                        let persist = |edit: &backend_panel::BackendEdit| {
-                            let Some(path) = newt_core::Config::user_config_path() else {
-                                return backend_panel::BackendSaveResult::Failed(
-                                    "no user config directory".to_string(),
-                                );
-                            };
-                            match setup::persist_panel_backend(&path, edit) {
-                                // A save with an after-commit sync WARNING is a
-                                // save: the bytes are on disk, so the note says
-                                // so instead of claiming the edit failed
-                                // (review §10).
-                                Ok(saved) => backend_panel::BackendSaveResult::Saved {
-                                    note: std::iter::once(backend_panel::saved_note(
-                                        &edit.name,
-                                        &saved.path,
-                                        inline.contains(&edit.name),
-                                    ))
-                                    .chain(saved.warnings)
-                                    .collect::<Vec<_>>()
-                                    .join(" — "),
-                                },
-                                Err(e) => {
-                                    backend_panel::BackendSaveResult::Failed(format!("{e:#}"))
-                                }
-                            }
-                        };
-                        // The in-loop `:d` never repoints `default_backend`: the
-                        // panel routes a default/active removal through the
-                        // one-transaction close below, and setup refuses here as
-                        // a second line of defence.
-                        let remove = |name: &str| -> Result<String, String> {
-                            let path = newt_core::Config::user_config_path()
-                                .ok_or_else(|| "no user config directory".to_string())?;
-                            setup::remove_panel_backend(&path, name, None)
-                                .map(|notes| {
-                                    std::iter::once(format!("removed backend '{name}'"))
-                                        .chain(notes)
-                                        .collect::<Vec<_>>()
-                                        .join(" — ")
-                                })
-                                .map_err(|e| format!("{e:#}"))
-                        };
-                        // Rows on the real terminal when a cockpit is
-                        // mounted; `None` on every other surface, which keeps
-                        // the panel's own stdout path. Held for the panel's
-                        // whole life — dropping it is what releases the rows
-                        // and repaints the chat block.
+                        use backend_panel::BackendSelection;
+                        // Rows on the real terminal when a cockpit is mounted;
+                        // `None` on every other surface, which keeps the
+                        // panel's own stdout path. Held for the panel's whole
+                        // life — dropping it is what releases the rows and
+                        // repaints the chat block.
                         let panel_window = surface.open_panel(backend_panel::PANEL_HEIGHT);
-                        let close = match backend_panel::run(
-                            backend_panel::PanelSeed {
-                                options,
-                                active: active_idx,
-                                default_backend: cfg.default_backend.clone(),
-                            },
-                            persist,
-                            remove,
-                            panel_window,
-                        ) {
+                        let close = match backend_chooser::choose(&cfg, panel_window) {
                             Ok(close) => close,
                             // A mid-panel terminal failure still hands back the
                             // file operations that already committed, so they

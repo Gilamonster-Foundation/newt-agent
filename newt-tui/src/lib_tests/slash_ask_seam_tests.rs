@@ -166,8 +166,8 @@ fn a_panel_asks_the_surface_for_rows_before_it_draws() {
         "the /backend arm must ask its surface for rows"
     );
     assert!(
-        chat.contains("persist,remove,panel_window,"),
-        "the window must reach the panel, not be dropped on the floor"
+        chat.contains("backend_chooser::choose(&cfg,panel_window)"),
+        "the window must reach the chooser, not be dropped on the floor"
     );
 
     // The window→terminal choice moved into `panel::drive` when the two
