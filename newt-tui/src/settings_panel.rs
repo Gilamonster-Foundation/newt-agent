@@ -35,7 +35,7 @@
 //! can and asks the questions where it cannot, and `/settings <field> <value>`
 //! stays a deep link on every surface.
 
-use crossterm::event::KeyCode;
+use crate::panel::Key;
 use ratatui::text::Line;
 
 use crate::config_panel::{clamp_step, hint_line, render_panel, ModelChoice, RowView};
@@ -425,12 +425,12 @@ impl Screen for SettingsPanel {
         render_panel(frame, " settings ", &self.view_rows(), bottom, 26, 12);
     }
 
-    fn key(&mut self, code: KeyCode, _ctrl: bool) -> Flow {
-        match code {
-            KeyCode::Up => self.sel = clamp_step(self.sel, -1, self.rows.len()),
-            KeyCode::Down => self.sel = clamp_step(self.sel, 1, self.rows.len()),
-            KeyCode::Left | KeyCode::Right => {
-                let dir = if code == KeyCode::Left { -1 } else { 1 };
+    fn key(&mut self, key: Key) -> Flow {
+        match key {
+            Key::Up => self.sel = clamp_step(self.sel, -1, self.rows.len()),
+            Key::Down => self.sel = clamp_step(self.sel, 1, self.rows.len()),
+            Key::Left | Key::Right => {
+                let dir = if key == Key::Left { -1 } else { 1 };
                 match self.rows.get_mut(self.sel) {
                     Some(Row::Setting(row)) => row.cycle(dir),
                     Some(Row::Model(row)) => row.cycle(dir),
@@ -438,7 +438,7 @@ impl Screen for SettingsPanel {
                     Some(Row::Door(_)) | None => {}
                 }
             }
-            KeyCode::Enter => {
+            Key::Enter => {
                 // Enter on a door WALKS THROUGH it; Enter anywhere else applies
                 // and closes. Both close this panel — the difference is what
                 // the caller does next, which is why it is reported rather
@@ -446,7 +446,9 @@ impl Screen for SettingsPanel {
                 self.walk_through = matches!(self.rows.get(self.sel), Some(Row::Door(_)));
                 return Flow::Close(true);
             }
-            KeyCode::Esc | KeyCode::Char('q') => return Flow::Close(false),
+            // `Char` is plain by construction, so Ctrl-Q no longer cancels —
+            // the flag used to be discarded here entirely.
+            Key::Esc | Key::Char('q') => return Flow::Close(false),
             _ => {}
         }
         Flow::Stay
@@ -591,10 +593,10 @@ mod tests {
     fn selection_clamps_at_both_ends() {
         let _g = GlobalSettingsGuard::acquire();
         let mut panel = panel();
-        panel.key(KeyCode::Up, false);
+        panel.key(Key::Up);
         assert_eq!(panel.sel, 0, "already at the top");
         for _ in 0..panel.rows.len() * 2 {
-            panel.key(KeyCode::Down, false);
+            panel.key(Key::Down);
         }
         assert_eq!(panel.sel, panel.rows.len() - 1, "stops at the bottom");
     }
@@ -611,7 +613,7 @@ mod tests {
         };
         // Walk right past the end; every value seen must be an offered one.
         for _ in 0..offered.len() + 2 {
-            panel.key(KeyCode::Right, false);
+            panel.key(Key::Right);
             let value = &row_of(&panel, Field::EditMode).value;
             assert!(offered.contains(&value.as_str()), "{value} is not offered");
         }
@@ -680,10 +682,10 @@ mod tests {
         let opened = row_of(&panel, Field::EditMode).value.clone();
         while row_of(&panel, Field::EditMode).value == opened {
             panel.sel = index_of(&panel, Field::EditMode);
-            panel.key(KeyCode::Right, false);
+            panel.key(Key::Right);
             if row_of(&panel, Field::EditMode).value == opened {
-                panel.key(KeyCode::Left, false);
-                panel.key(KeyCode::Left, false);
+                panel.key(Key::Left);
+                panel.key(Key::Left);
             }
         }
         let dialled = row_of(&panel, Field::EditMode).value.clone();
@@ -705,10 +707,14 @@ mod tests {
     fn enter_applies_and_escape_cancels() {
         let _g = GlobalSettingsGuard::acquire();
         let mut panel = panel();
-        assert_eq!(panel.key(KeyCode::Enter, false), Flow::Close(true));
-        assert_eq!(panel.key(KeyCode::Esc, false), Flow::Close(false));
-        assert_eq!(panel.key(KeyCode::Char('q'), false), Flow::Close(false));
-        assert_eq!(panel.key(KeyCode::Char('x'), false), Flow::Stay);
+        assert_eq!(panel.key(Key::Enter), Flow::Close(true));
+        assert_eq!(panel.key(Key::Esc), Flow::Close(false));
+        assert_eq!(panel.key(Key::Char('q')), Flow::Close(false));
+        assert_eq!(panel.key(Key::Char('x')), Flow::Stay);
+        // Ctrl-Q is not `q`. This panel used to discard the control flag
+        // entirely, so it cancelled — and Ctrl-Q is flow control on some
+        // terminals, which made it a cancel the operator never typed.
+        assert_eq!(panel.key(Key::Ctrl('q')), Flow::Stay);
     }
 
     /// The panel is as tall as it has rows, so a new setting widens it rather
@@ -734,7 +740,7 @@ mod tests {
 
         // Slide to it.
         while panel.sel < door {
-            panel.key(KeyCode::Down, false);
+            panel.key(Key::Down);
         }
         let view = &panel.view_rows()[door];
         assert_eq!(view.value, "sol", "the door shows the current backend");
@@ -743,11 +749,11 @@ mod tests {
 
         // ←→ on a door changes nothing, so a stray arrow cannot silently
         // repoint the backend.
-        panel.key(KeyCode::Right, false);
-        panel.key(KeyCode::Left, false);
+        panel.key(Key::Right);
+        panel.key(Key::Left);
         assert_eq!(panel.view_rows()[door].value, "sol");
 
-        assert_eq!(panel.key(KeyCode::Enter, false), Flow::Close(true));
+        assert_eq!(panel.key(Key::Enter), Flow::Close(true));
         assert!(panel.walk_through, "Enter on the door walks through it");
     }
 
@@ -759,7 +765,7 @@ mod tests {
         let _g = GlobalSettingsGuard::acquire();
         let mut panel = panel();
         panel.sel = index_of(&panel, Field::Tenacity);
-        assert_eq!(panel.key(KeyCode::Enter, false), Flow::Close(true));
+        assert_eq!(panel.key(Key::Enter), Flow::Close(true));
         assert!(!panel.walk_through);
     }
 
@@ -772,19 +778,19 @@ mod tests {
         let mut panel = panel();
         panel.sel = index_of(&panel, Field::Thinking);
         let opened = row_of(&panel, Field::Thinking).value.clone();
-        panel.key(KeyCode::Right, false);
-        panel.key(KeyCode::Left, false);
-        panel.key(KeyCode::Right, false);
+        panel.key(Key::Right);
+        panel.key(Key::Left);
+        panel.key(Key::Right);
         let dialled = row_of(&panel, Field::Thinking).value.clone();
         if dialled == opened {
             // A two-value dial that landed back where it started proves
             // nothing; step it once more.
-            panel.key(KeyCode::Left, false);
+            panel.key(Key::Left);
         }
         assert_ne!(row_of(&panel, Field::Thinking).value, opened);
 
         panel.sel = door_index(&panel);
-        panel.key(KeyCode::Enter, false);
+        panel.key(Key::Enter);
         assert!(panel.walk_through);
         let applied = panel.commit();
         assert_eq!(applied.len(), 1, "the dialled row applied: {applied:?}");
@@ -814,16 +820,16 @@ mod tests {
         assert!(!model_row(&panel).is_dirty());
         assert_eq!(panel.picked_model(), None, "nothing picked yet");
 
-        panel.key(KeyCode::Right, false);
+        panel.key(Key::Right);
         assert_eq!(model_row(&panel).name(), "nemotron:30b");
         assert!(model_row(&panel).is_dirty());
         assert_eq!(panel.picked_model(), Some("nemotron:30b".to_string()));
 
         // Clamps rather than wrapping, like every other dial here.
-        panel.key(KeyCode::Right, false);
+        panel.key(Key::Right);
         assert_eq!(model_row(&panel).name(), "nemotron:30b");
-        panel.key(KeyCode::Left, false);
-        panel.key(KeyCode::Left, false);
+        panel.key(Key::Left);
+        panel.key(Key::Left);
         assert_eq!(model_row(&panel).name(), "qwen3.5:397b");
         assert!(!model_row(&panel).is_dirty(), "back where it started");
         assert_eq!(panel.picked_model(), None, "so nothing is picked");
@@ -855,7 +861,7 @@ mod tests {
         assert_eq!(model_row(&panel).name(), "qwen3.5:397b", "still shown");
         assert!(!model_row(&panel).dialable());
 
-        panel.key(KeyCode::Right, false);
+        panel.key(Key::Right);
         assert_eq!(model_row(&panel).name(), "qwen3.5:397b", "unmoved");
         assert_eq!(panel.picked_model(), None);
 
@@ -880,7 +886,7 @@ mod tests {
         let _g = GlobalSettingsGuard::acquire();
         let mut panel = panel();
         panel.sel = model_index(&panel);
-        panel.key(KeyCode::Right, false);
+        panel.key(Key::Right);
         // `commit` is the SETTINGS writer; it must not have touched the model.
         assert!(
             panel.commit().is_empty(),
@@ -900,8 +906,8 @@ mod tests {
             !selected.provenance.is_empty(),
             "the selected row explains its value"
         );
-        panel.key(KeyCode::Right, false);
-        panel.key(KeyCode::Down, false);
+        panel.key(Key::Right);
+        panel.key(Key::Down);
         let moved_off = &panel.view_rows()[0];
         assert!(
             moved_off.provenance.starts_with("was "),

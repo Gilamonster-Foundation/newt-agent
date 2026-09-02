@@ -58,6 +58,63 @@ pub(crate) enum Flow {
     Close(bool),
 }
 
+/// One key press, with the control modifier ALREADY FOLDED IN.
+///
+/// **This exists so that a plain-character binding cannot fire with control
+/// held.** The driver used to hand a table `(KeyCode, ctrl: bool)`, and the
+/// four tables then gave four different answers to the same question: the
+/// backend chooser guarded `Char(c) if !ctrl` in two arms and left `e`, `a`,
+/// `d`, `:` and `q` unguarded; the psyche panel's command line took any
+/// `Char(c)`, so Ctrl-S typed a literal `s` into the line Ctrl-S is meant to
+/// SAVE from; and the settings panel discarded the flag entirely, so Ctrl-Q
+/// cancelled.
+///
+/// Every one of those is the same defect, and guarding eight match arms would
+/// have fixed eight instances of it while leaving the ninth to whoever writes
+/// the next panel. Here `Char('q')` means the operator pressed `q` — the
+/// wrong reading is not expressible, and a binding that WANTS control says
+/// [`Key::Ctrl`].
+///
+/// The vocabulary is `newtui::Key`'s, deliberately: when the panels move to
+/// that crate this type is deleted rather than translated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Key {
+    Up,
+    Down,
+    Left,
+    Right,
+    Enter,
+    Esc,
+    Backspace,
+    Tab,
+    /// A printable character, pressed WITHOUT control.
+    Char(char),
+    /// A character with control held.
+    Ctrl(char),
+    /// A key no panel in this crate binds. Carried rather than dropped so a
+    /// table can match `_` once, and so the driver stays free of policy.
+    Other,
+}
+
+impl Key {
+    /// Fold a crossterm key event into this vocabulary.
+    fn from_event(code: KeyCode, ctrl: bool) -> Self {
+        match (code, ctrl) {
+            (KeyCode::Char(c), true) => Self::Ctrl(c),
+            (KeyCode::Char(c), false) => Self::Char(c),
+            (KeyCode::Up, _) => Self::Up,
+            (KeyCode::Down, _) => Self::Down,
+            (KeyCode::Left, _) => Self::Left,
+            (KeyCode::Right, _) => Self::Right,
+            (KeyCode::Enter, _) => Self::Enter,
+            (KeyCode::Esc, _) => Self::Esc,
+            (KeyCode::Backspace, _) => Self::Backspace,
+            (KeyCode::Tab, _) => Self::Tab,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// A panel: something that draws itself and answers keys.
 ///
 /// The whole surface a panel must implement to be driven. Note what is
@@ -67,9 +124,8 @@ pub(crate) trait Screen {
     /// Render the current state into the panel's rows.
     fn draw(&self, frame: &mut ratatui::Frame);
 
-    /// Handle one key press. `ctrl` is pre-extracted because every existing
-    /// key table needed it and each was extracting it identically.
-    fn key(&mut self, code: KeyCode, ctrl: bool) -> Flow;
+    /// Handle one key press.
+    fn key(&mut self, key: Key) -> Flow;
 }
 
 /// Restore the terminal on EVERY exit path of a panel — return, error, panic.
@@ -175,7 +231,7 @@ pub(crate) fn drive(
                     continue;
                 }
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                if let Flow::Close(apply) = screen.key(key.code, ctrl) {
+                if let Flow::Close(apply) = screen.key(Key::from_event(key.code, ctrl)) {
                     applied = apply;
                     break;
                 }
@@ -289,20 +345,46 @@ mod tests {
     /// [`drive`] itself is not.
     #[derive(Default)]
     struct Recorder {
-        seen: Vec<(KeyCode, bool)>,
-        close_on: Option<(KeyCode, bool)>,
+        seen: Vec<Key>,
+        close_on: Option<(Key, bool)>,
     }
 
     impl Screen for Recorder {
         fn draw(&self, _frame: &mut ratatui::Frame) {}
 
-        fn key(&mut self, code: KeyCode, ctrl: bool) -> Flow {
-            self.seen.push((code, ctrl));
+        fn key(&mut self, key: Key) -> Flow {
+            self.seen.push(key);
             match self.close_on {
-                Some((c, applied)) if c == code => Flow::Close(applied),
+                Some((c, applied)) if c == key => Flow::Close(applied),
                 _ => Flow::Stay,
             }
         }
+    }
+
+    /// **A plain-character binding cannot fire with control held.**
+    ///
+    /// The whole reason this vocabulary exists. Four key tables previously
+    /// answered this differently — two guarded `Char(c) if !ctrl`, one did not
+    /// guard its command line (so Ctrl-S typed a literal `s` into the line
+    /// Ctrl-S opens), and one discarded the flag entirely (so Ctrl-Q
+    /// cancelled). Folding control into the key makes the wrong reading
+    /// inexpressible instead of guarded eight times.
+    #[test]
+    fn control_is_folded_into_the_key_rather_than_carried_beside_it() {
+        assert_eq!(Key::from_event(KeyCode::Char('q'), false), Key::Char('q'));
+        assert_eq!(Key::from_event(KeyCode::Char('q'), true), Key::Ctrl('q'));
+        assert_ne!(
+            Key::from_event(KeyCode::Char('s'), true),
+            Key::Char('s'),
+            "Ctrl-S must not be readable as a plain `s`"
+        );
+        // A non-character key ignores the modifier: no panel binds Ctrl-Up,
+        // and inventing a distinction nothing uses would grow the vocabulary
+        // for nothing.
+        assert_eq!(Key::from_event(KeyCode::Up, true), Key::Up);
+        assert_eq!(Key::from_event(KeyCode::Esc, true), Key::Esc);
+        // Anything unbound arrives as one arm a table matches once.
+        assert_eq!(Key::from_event(KeyCode::F(7), false), Key::Other);
     }
 
     /// `Flow` says one thing, and a panel cannot accidentally say it by
@@ -310,34 +392,31 @@ mod tests {
     #[test]
     fn a_close_carries_whether_the_operator_applied() {
         let mut screen = Recorder {
-            close_on: Some((KeyCode::Enter, true)),
+            close_on: Some((Key::Enter, true)),
             ..Recorder::default()
         };
-        assert_eq!(screen.key(KeyCode::Up, false), Flow::Stay);
-        assert_eq!(screen.key(KeyCode::Enter, false), Flow::Close(true));
+        assert_eq!(screen.key(Key::Up), Flow::Stay);
+        assert_eq!(screen.key(Key::Enter), Flow::Close(true));
 
         let mut cancelled = Recorder {
-            close_on: Some((KeyCode::Esc, false)),
+            close_on: Some((Key::Esc, false)),
             ..Recorder::default()
         };
-        assert_eq!(cancelled.key(KeyCode::Esc, false), Flow::Close(false));
+        assert_eq!(cancelled.key(Key::Esc), Flow::Close(false));
         assert_eq!(
             cancelled.seen,
-            vec![(KeyCode::Esc, false)],
+            vec![Key::Esc],
             "the screen sees the key it closed on"
         );
     }
 
-    /// The ctrl flag reaches the screen, because every key table needed it
-    /// and each was extracting it from `KeyModifiers` identically.
+    /// Control reaches the screen as part of the key, so a table that binds
+    /// `Char('s')` and one that binds `Ctrl('s')` are reading two things.
     #[test]
     fn the_screen_is_told_about_control() {
         let mut screen = Recorder::default();
-        screen.key(KeyCode::Char('s'), true);
-        screen.key(KeyCode::Char('s'), false);
-        assert_eq!(
-            screen.seen,
-            vec![(KeyCode::Char('s'), true), (KeyCode::Char('s'), false)]
-        );
+        screen.key(Key::Ctrl('s'));
+        screen.key(Key::Char('s'));
+        assert_eq!(screen.seen, vec![Key::Ctrl('s'), Key::Char('s')]);
     }
 }
