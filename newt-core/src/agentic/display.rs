@@ -484,6 +484,30 @@ pub(crate) fn spill_summary() -> bool {
     SPILL_SUMMARY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether a mouse click reaches the live viewport — the `[tui] mouse_viewport`
+/// opt-in AND the capability gate, resolved once by the surface that mounts the
+/// frame. Same process-wide-knob precedent as `SPILL_LINES` / `SPILL_SUMMARY`
+/// above: seeded per turn where the guard is taken, read at the marker site.
+///
+/// It exists so a fold marker cannot promise a click on a surface where nothing
+/// is listening for one. Default off, which is also the config default.
+static MOUSE_RECOVERY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record whether mouse capture is live, from the surface that took the guard.
+pub fn set_mouse_recovery(on: bool) {
+    MOUSE_RECOVERY.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The recovery a MOUNTED live viewport may honestly advertise: a click only
+/// when capture is actually on, otherwise the keys that always work.
+pub fn interactive_recovery() -> Recovery<'static> {
+    if MOUSE_RECOVERY.load(std::sync::atomic::Ordering::Relaxed) {
+        Recovery::Click
+    } else {
+        Recovery::Keys
+    }
+}
+
 /// The one place that names the recovery path out of a truncated view (#1433).
 ///
 /// Every truncation marker interpolates THIS, so a third one cannot silently
@@ -493,15 +517,126 @@ pub(crate) fn spill_summary() -> bool {
 /// live binding table so a rebind can never desync a hint.
 pub(crate) const SPILL_RECOVERY_HINT: &str = "/spill N raises this view";
 
+/// How the operator gets hidden content back.
+///
+/// **Derived from the surface, never chosen at a call site.** A marker must
+/// not advertise an affordance the surface does not have, and the two surfaces
+/// genuinely differ: the committed excerpt is durable scrollback that OUTLIVES
+/// the viewport which could answer a keypress, so it can only name a command.
+/// A mounted live viewport is the one place `space` is a true statement.
+///
+/// This is the fix for a real operator report (#1263): the inert committed
+/// excerpt shares the ▲/▒/▓ glyphs with the live scroller, so it masqueraded as
+/// interactive and the operator sat pressing keys at printed text. Encoding the
+/// answer in a type means the lie cannot be re-typed at a sixth call site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Recovery<'a> {
+    /// Durable scrollback, a pipe, or a headless run — nothing here listens,
+    /// so name the command that raises the view. Carries its own text because
+    /// a Rich surface that retained the body substitutes the EXACT recovery
+    /// (`/spill open 7`) for the generic [`SPILL_RECOVERY_HINT`].
+    Command(&'a str),
+    /// A live viewport is mounted: Space expands it.
+    Keys,
+    /// …and mouse capture is on (`[tui] mouse_viewport`), so a click lands too.
+    Click,
+}
+
+impl Default for Recovery<'_> {
+    fn default() -> Self {
+        Self::Command(SPILL_RECOVERY_HINT)
+    }
+}
+
+impl Recovery<'_> {
+    /// The handle, as the operator would perform it.
+    pub fn handle(&self) -> &str {
+        match self {
+            Self::Command(cmd) => cmd,
+            Self::Keys => "space to expand",
+            Self::Click => "click or space to expand",
+        }
+    }
+}
+
+/// What is hidden, in the units it was hidden by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hidden {
+    /// Logical lines of the output.
+    Lines(usize),
+    /// Wrapped display rows of ONE very long line — the #1433 pathological
+    /// case, where "lines" would be a lie (there is only one).
+    Rows(usize),
+}
+
+/// The ONE rendering of "there is more, and here is how to get it."
+///
+/// Before this type, `display.rs` carried FIVE hand-written phrasings of that
+/// one sentence — `{n} lines omitted`, `{n} more lines above`, `{n} wrapped
+/// rows omitted`, `▲ {n} lines · {tail}`, and `… ({n} more lines hidden)` —
+/// each with its own separator, its own verb, and its own idea of the noun. A
+/// sixth was always one edit away, and the count and the recovery hint could
+/// drift apart independently. Per the repo's reuse discipline, the fix is not
+/// to correct five sites but to leave one.
+///
+/// Renders as `{count} {noun} hidden  [{handle}]`: what happened, then the
+/// handle you can reach for, visually separated. The bracket is the promise —
+/// it is only ever filled with something the surface can actually do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Fold<'a> {
+    hidden: Hidden,
+    recovery: Recovery<'a>,
+}
+
+impl<'a> Fold<'a> {
+    pub fn lines(hidden: usize, recovery: Recovery<'a>) -> Self {
+        Self {
+            hidden: Hidden::Lines(hidden),
+            recovery,
+        }
+    }
+
+    pub fn rows(hidden: usize, recovery: Recovery<'a>) -> Self {
+        Self {
+            hidden: Hidden::Rows(hidden),
+            recovery,
+        }
+    }
+
+    /// The marker text, WITHOUT a leading glyph — each call site owns its own
+    /// (`▲` for hidden-above, `…` for a preview tail), because the glyph
+    /// carries direction and only the site knows the direction.
+    pub fn marker(&self) -> String {
+        let (count, noun) = match self.hidden {
+            Hidden::Lines(n) => (n, if n == 1 { "line" } else { "lines" }),
+            Hidden::Rows(n) => (
+                n,
+                if n == 1 {
+                    "wrapped row"
+                } else {
+                    "wrapped rows"
+                },
+            ),
+        };
+        format!("{count} {noun} hidden  [{}]", self.recovery.handle())
+    }
+}
+
+impl std::fmt::Display for Fold<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.marker())
+    }
+}
+
 pub(crate) fn spill_view_lines(output: &str, view: usize, columns: usize) -> Vec<String> {
-    spill_view_lines_with_hint(output, view, columns, SPILL_RECOVERY_HINT)
+    spill_view_lines_with_hint(output, view, columns, Recovery::default())
 }
 
 fn spill_view_lines_with_hint(
     output: &str,
     view: usize,
     columns: usize,
-    recovery_hint: &str,
+    recovery: Recovery<'_>,
 ) -> Vec<String> {
     // #1433: the budget is spent in RENDERED rows, not logical lines — counting
     // lines let one 4000-char diagnostic consume an unbounded number of them.
@@ -552,7 +687,7 @@ fn spill_view_lines_with_hint(
     // multi-line case for the same reason — the decisive part of one huge
     // line (a JSON blob, a base64 payload) is not reliably at its end either.
     if used > view && kept == 1 {
-        return spill_wide_line_head_and_tail(lines[0], view, content_width, recovery_hint);
+        return spill_wide_line_head_and_tail(lines[0], view, content_width, recovery);
     }
 
     if start == 0 {
@@ -578,7 +713,7 @@ fn spill_view_lines_with_hint(
         // both ends. Not a realistic operator setting — fall back to the
         // pre-#1973 pure-tail shape using the already-computed full walk.
         let tail = &lines[start..];
-        let mut out = vec![format!("▲ {start} more lines above · {recovery_hint}")];
+        let mut out = vec![format!("▲ {}", Fold::lines(start, recovery))];
         for (i, l) in tail.iter().enumerate() {
             let glyph = if i + 1 == tail.len() { '▓' } else { '▒' };
             out.push(format!("{glyph} {l}"));
@@ -643,7 +778,7 @@ fn spill_view_lines_with_hint(
     // ▲/▒/▓ glyphs with the live viewport, so without this hint it masqueraded
     // as the interactive scroller (the diagnosed operator tried to expand it in
     // scrollback). Name the real recovery path at the point of use.
-    out.push(format!("▲ {hidden} lines omitted · {recovery_hint}"));
+    out.push(format!("▲ {}", Fold::lines(hidden, recovery)));
     let tail_start = lines.len() - tail_kept;
     for (i, l) in lines[tail_start..].iter().enumerate() {
         let glyph = if i + 1 == tail_kept { '▓' } else { '▒' };
@@ -662,7 +797,7 @@ fn spill_wide_line_head_and_tail(
     line: &str,
     view: usize,
     content_width: usize,
-    recovery_hint: &str,
+    recovery: Recovery<'_>,
 ) -> Vec<String> {
     let wrapped = wrap_to_width(line, content_width);
     let content_budget = view.saturating_sub(1).max(1);
@@ -676,7 +811,7 @@ fn spill_wide_line_head_and_tail(
         out.push(format!("▒ {row}"));
     }
     if hidden > 0 {
-        out.push(format!("▲ {hidden} wrapped rows omitted · {recovery_hint}"));
+        out.push(format!("▲ {}", Fold::rows(hidden, recovery)));
     }
     for (i, row) in wrapped[tail_start..].iter().enumerate() {
         let glyph = if i + 1 == tail_budget { '▓' } else { '▒' };
@@ -721,14 +856,14 @@ pub(crate) fn spills_past(output: &str, view: usize, columns: usize) -> bool {
 /// Uses [`SPILL_RECOVERY_HINT`] when no retained result ID is available; Rich
 /// renderers replace it with the exact `/spill open <id>` recovery command.
 pub(crate) fn spill_summary_line(output: &str, view: usize, columns: usize) -> Option<String> {
-    spill_summary_line_with_hint(output, view, columns, SPILL_RECOVERY_HINT)
+    spill_summary_line_with_hint(output, view, columns, Recovery::default())
 }
 
 fn spill_summary_line_with_hint(
     output: &str,
     view: usize,
     columns: usize,
-    recovery_hint: &str,
+    recovery: Recovery<'_>,
 ) -> Option<String> {
     if !spills_past(output, view, columns) {
         return None;
@@ -740,18 +875,17 @@ fn spill_summary_line_with_hint(
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("");
-    let head = format!("▲ {total} lines");
-    let hint = format!(" · {recovery_hint}");
+    let head = format!("▲ {}", Fold::lines(total, recovery));
     // Space left for the tail, in chars (the excerpt path also emits unwrapped
     // text and lets the terminal soft-wrap; here we just keep the marker
     // visually one row in the common case). The 4 covers the " · " separator
     // and a possible `…` cut marker.
-    let avail = columns.saturating_sub(head.chars().count() + hint.chars().count() + 4);
+    let avail = columns.saturating_sub(head.chars().count() + 4);
     let tail_len = tail.chars().count();
     // Drop the tail only when the row can't fit a MEANINGFUL piece of it —
     // a tail that fits outright is always shown, however short.
     if avail < 8 && avail < tail_len {
-        return Some(format!("{head}{hint}"));
+        return Some(head);
     }
     let shown: String = tail.chars().take(avail).collect();
     let ellipsis = if shown.chars().count() < tail_len {
@@ -759,7 +893,7 @@ fn spill_summary_line_with_hint(
     } else {
         ""
     };
-    Some(format!("{head} · {shown}{ellipsis}{hint}"))
+    Some(format!("{head} · {shown}{ellipsis}"))
 }
 
 /// Injected writer for one tool's operator-facing audit block. Production uses
@@ -871,7 +1005,9 @@ impl<W: Write> ToolDisplay<W> {
             .completed_spill_renderer
             .as_ref()
             .and_then(|renderer| renderer.retain_completed(output));
-        let recovery_hint = retained_id.map(|id| format!("/spill open {id} opens this result"));
+        // Just the command — it lands inside the fold marker's `[...]`, which
+        // already frames it as the handle to reach for.
+        let recovery_hint = retained_id.map(|id| format!("/spill open {id}"));
 
         // The static excerpt is ALWAYS committed first — it is the canonical
         // transcript record on every tier, and it must never depend on an
@@ -883,13 +1019,17 @@ impl<W: Write> ToolDisplay<W> {
         // that fits the budget, and `/spill 0` (unbounded), keep the normal
         // render — `spill_summary_line` returns `None` for both.
         let rendered = if let Some(recovery_hint) = recovery_hint.as_deref() {
+            // Committed scrollback outlives the viewport, so this text may only
+            // ever name a COMMAND — never `space`, which would stop being true
+            // the moment the next canonical write dismisses the frame.
+            let recovery = Recovery::Command(recovery_hint);
             self.summary
                 .then(|| {
-                    spill_summary_line_with_hint(output, self.spill_lines, self.cols, recovery_hint)
+                    spill_summary_line_with_hint(output, self.spill_lines, self.cols, recovery)
                 })
                 .flatten()
                 .unwrap_or_else(|| {
-                    spill_view_lines_with_hint(output, self.spill_lines, self.cols, recovery_hint)
+                    spill_view_lines_with_hint(output, self.spill_lines, self.cols, recovery)
                         .join("\n")
                 })
         } else {
@@ -952,9 +1092,7 @@ impl<W: Write + Send> ToolPresentation for ToolDisplay<W> {
             if !rendered.is_empty() {
                 rendered.push('\n');
             }
-            rendered.push_str(&format!(
-                "  … ({hidden} more lines hidden · {SPILL_RECOVERY_HINT})"
-            ));
+            rendered.push_str(&format!("  … {}", Fold::lines(hidden, Recovery::default())));
         }
         if rendered.is_empty() {
             return;
@@ -1139,7 +1277,7 @@ mod tests {
             "the wide line's 3-row cost must still exclude b/c — only the \
              1-row head (a) and the wide tail fit the split budget:\n{out:#?}"
         );
-        assert!(out.iter().any(|l| l.contains("lines omitted")), "{out:#?}");
+        assert!(out.iter().any(|l| l.contains("lines hidden")), "{out:#?}");
         assert!(
             out.iter().any(|l| l.contains(SPILL_RECOVERY_HINT)),
             "every truncation marker names the way out:\n{out:#?}"
@@ -1169,7 +1307,7 @@ mod tests {
             big,
             vec![
                 "▒ l1",
-                "▲ 3 lines omitted · /spill N raises this view",
+                "▲ 3 lines hidden  [/spill N raises this view]",
                 "▓ l5",
                 "…"
             ]
@@ -1191,7 +1329,7 @@ mod tests {
             spill_view_lines(output, 3, 80),
             vec![
                 "▒ l1",
-                "▲ 3 lines omitted · /spill N raises this view",
+                "▲ 3 lines hidden  [/spill N raises this view]",
                 "▓ l5",
                 "…"
             ]
@@ -1358,7 +1496,7 @@ mod tests {
     fn summary_line_collapses_only_spilled_results() {
         // Spilled: one line with count + tail + hint.
         let line = spill_summary_line("l1\nl2\nl3\nl4\nl5", 3, 80).expect("5 > 3 collapses");
-        assert_eq!(line, "▲ 5 lines · l5 · /spill N raises this view");
+        assert_eq!(line, "▲ 5 lines hidden  [/spill N raises this view] · l5");
 
         // Tail skips trailing blank lines — the last NON-EMPTY line informs.
         let line = spill_summary_line("l1\nl2\nl3\nerror: boom\n\n", 3, 80).unwrap();
@@ -1387,7 +1525,7 @@ mod tests {
 
         // Pathologically narrow: tail dropped, count + hint intact.
         let line = spill_summary_line(&wide, 3, 20).unwrap();
-        assert_eq!(line, "▲ 4 lines · /spill N raises this view");
+        assert_eq!(line, "▲ 4 lines hidden  [/spill N raises this view]");
     }
 
     /// `ToolDisplay` in summary mode commits the collapse marker INSTEAD of the
@@ -1399,7 +1537,7 @@ mod tests {
         display.result("l1\nl2\nl3\nl4\nl5");
         let out = String::from_utf8(display.writer).unwrap();
         assert!(
-            out.contains("▲ 5 lines · l5 · /spill N raises this view"),
+            out.contains("▲ 5 lines hidden  [/spill N raises this view] · l5"),
             "the marker committed: {out:?}"
         );
         assert!(

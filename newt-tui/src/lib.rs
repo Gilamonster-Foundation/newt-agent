@@ -11637,6 +11637,10 @@ pub(crate) fn with_live_spill_watch<T>(
     // its `Drop` is a direct stdout write (NOT a renderer write), so the rule-7
     // abandon path (contractually I/O-free through the renderer) still releases.
     // `None` on the keyboard tier / opt-out; nothing is emitted then.
+    // Tell the marker vocabulary whether a click is a true statement here, so
+    // a fold can advertise one only where something is listening (#1263).
+    #[cfg(any(feature = "rich-tui", feature = "live-spill"))]
+    newt_core::agentic::set_mouse_recovery(mouse);
     #[cfg(any(feature = "rich-tui", feature = "live-spill"))]
     let _mouse_capture = crate::mouse::MouseCaptureGuard::maybe(mouse);
     #[cfg(not(any(feature = "rich-tui", feature = "live-spill")))]

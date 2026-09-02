@@ -192,8 +192,9 @@ pub use crew_attest::{crew_authz, crew_step_up_policy, CrewAuthz, Presence};
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
 pub use cw_overflow::{parse_context_window_error, recover_context_window_400};
 pub use display::{
-    fmt_token_gauge, fmt_tokens_compact, gauge_level, newt_line, print_harness_notice,
-    print_list_item, print_newt, set_spill_lines, set_spill_summary, GaugeLevel, NEWT_ORANGE_CT,
+    fmt_token_gauge, fmt_tokens_compact, gauge_level, interactive_recovery, newt_line,
+    print_harness_notice, print_list_item, print_newt, set_mouse_recovery, set_spill_lines,
+    set_spill_summary, Fold, GaugeLevel, Hidden, Recovery, NEWT_ORANGE_CT,
 };
 pub use driver::{
     HeadlessCodeSearch, TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,

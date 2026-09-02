@@ -399,8 +399,7 @@ pub(crate) fn complaints() -> &'static [String] {
 }
 
 fn resolved() -> &'static (Theme, Vec<String>) {
-    static THEME: std::sync::OnceLock<(Theme, Vec<String>)> =
-        std::sync::OnceLock::new();
+    static THEME: std::sync::OnceLock<(Theme, Vec<String>)> = std::sync::OnceLock::new();
     THEME.get_or_init(|| from_env(std::env::var("NEWT_THEME").ok().as_deref()))
 }
 
@@ -519,9 +518,12 @@ mod tests {
     /// one place that would explain it.
     #[test]
     fn a_bad_pair_is_named_and_the_rest_still_applies() {
-        let (themed, complaints) =
-            from_env(Some("dim=gray,nonsense=red,accent=puce,bare-word"));
-        assert_eq!(themed.color(Role::Dim), Color::Gray, "the good pair applied");
+        let (themed, complaints) = from_env(Some("dim=gray,nonsense=red,accent=puce,bare-word"));
+        assert_eq!(
+            themed.color(Role::Dim),
+            Color::Gray,
+            "the good pair applied"
+        );
         assert_eq!(complaints.len(), 3, "{complaints:?}");
         assert!(complaints.iter().any(|c| c.contains("nonsense")));
         assert!(complaints.iter().any(|c| c.contains("puce")));

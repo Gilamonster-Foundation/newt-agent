@@ -32,7 +32,10 @@ struct RenderState {
 
 struct OutputState {
     writer: TerminalWriter,
-    painted_line_widths: Vec<usize>,
+    /// The exact lines last painted, kept so a later erase can re-wrap them at
+    /// whatever width the terminal is NOW and rewind the right number of rows.
+    /// Widths alone were not enough — see [`physical_rows`].
+    painted_lines: Vec<String>,
     painted_generation: Option<u64>,
     /// Arbiter registration (#1410). Present for the real stdout viewport;
     /// `None` for the `#[cfg(test)]` in-memory renderers, which register
@@ -207,7 +210,7 @@ impl LiveSpillRenderer {
             })),
             output: Arc::new(Mutex::new(OutputState {
                 writer,
-                painted_line_widths: Vec::new(),
+                painted_lines: Vec::new(),
                 painted_generation: None,
                 registration: None,
             })),
@@ -409,7 +412,7 @@ impl newt_core::tty::Ephemeral for LiveSpillRenderer {
     /// Erase whatever generation is currently painted.
     ///
     /// Idempotent by construction: `erase_output` clears both
-    /// `painted_line_widths` and `painted_generation`, and the guard below then
+    /// `painted_lines` and `painted_generation`, and the guard below then
     /// makes every subsequent call write zero bytes — the same shape as
     /// `LineLease::erase`.
     ///
@@ -419,8 +422,8 @@ impl newt_core::tty::Ephemeral for LiveSpillRenderer {
     /// the question and the operator's typed answer, deleting both. A wedged
     /// stdout blocks everything anyway; a skipped erase corrupts.
     fn erase(&self) {
-        // Re-sync geometry BEFORE reading `columns`. `erase_output` divides
-        // `painted_line_widths` by it to recover the physical row count, so a
+        // Re-sync geometry BEFORE reading `columns`. `erase_output` re-wraps
+        // `painted_lines` at it to recover the physical row count, so a
         // stale width makes `MoveUp` land *inside* the frame and strands the
         // rows above it permanently (nothing else clears them — the erase
         // discards its own bookkeeping unconditionally). `finish` takes exactly
@@ -701,7 +704,7 @@ fn paint_generation(
     };
 
     // Each explicit line may occupy more physical rows after the terminal
-    // reflows it at a narrower width. `painted_line_widths` preserves enough
+    // reflows it at a narrower width. `painted_lines` preserves enough
     // information for the next erase to rewind that resized footprint.
     let mut batch = Vec::new();
     if color {
@@ -727,7 +730,7 @@ fn paint_generation(
         discard_generation(&mut output, generation);
         return;
     }
-    output.painted_line_widths = lines.iter().map(|line| rendered_width(line)).collect();
+    output.painted_lines.clone_from(&lines);
     output.painted_generation = Some(generation);
 }
 
@@ -789,14 +792,14 @@ fn erase_output(
     abandoned_through: &AtomicU64,
     generation: u64,
 ) {
-    if output.painted_line_widths.is_empty() {
+    if output.painted_lines.is_empty() {
         output.painted_generation = None;
         return;
     }
     let physical_rows = output
-        .painted_line_widths
+        .painted_lines
         .iter()
-        .map(|width| (*width).max(1).div_ceil(columns.max(1)))
+        .map(|line| physical_rows(line, columns))
         .sum::<usize>();
     let mut batch = Vec::new();
     let _ = queue!(
@@ -808,13 +811,13 @@ fn erase_output(
     let _ = output
         .writer
         .write_batch(&batch, || !is_abandoned(abandoned_through, generation));
-    output.painted_line_widths.clear();
+    output.painted_lines.clear();
     output.painted_generation = None;
 }
 
 fn discard_generation(output: &mut OutputState, generation: u64) {
     if output.painted_generation == Some(generation) {
-        output.painted_line_widths.clear();
+        output.painted_lines.clear();
         output.painted_generation = None;
     }
 }
@@ -823,30 +826,65 @@ fn is_abandoned(abandoned_through: &AtomicU64, generation: u64) -> bool {
     generation <= abandoned_through.load(Ordering::Acquire)
 }
 
+/// Terminal cells one character occupies. Combining marks attach to the
+/// previous cell (0); ASCII and the frame's own glyph vocabulary are narrow;
+/// everything else is assumed double-width.
+fn char_cells(ch: char) -> usize {
+    if matches!(
+        ch,
+        '\u{0300}'..='\u{036f}'
+            | '\u{1ab0}'..='\u{1aff}'
+            | '\u{1dc0}'..='\u{1dff}'
+            | '\u{20d0}'..='\u{20ff}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{fe20}'..='\u{fe2f}'
+            | '\u{e0100}'..='\u{e01ef}'
+    ) {
+        0
+    } else if ch.is_ascii() || matches!(ch, '…' | '▲' | '▼' | '▒' | '▓' | '⧉' | '▣' | '\u{fffd}')
+    {
+        1
+    } else {
+        2
+    }
+}
+
 #[allow(dead_code)]
 fn rendered_width(text: &str) -> usize {
-    text.chars()
-        .map(|ch| {
-            if matches!(
-                ch,
-                '\u{0300}'..='\u{036f}'
-                    | '\u{1ab0}'..='\u{1aff}'
-                    | '\u{1dc0}'..='\u{1dff}'
-                    | '\u{20d0}'..='\u{20ff}'
-                    | '\u{fe00}'..='\u{fe0f}'
-                    | '\u{fe20}'..='\u{fe2f}'
-                    | '\u{e0100}'..='\u{e01ef}'
-            ) {
-                0
-            } else if ch.is_ascii()
-                || matches!(ch, '…' | '▲' | '▼' | '▒' | '▓' | '⧉' | '▣' | '\u{fffd}')
-            {
-                1
-            } else {
-                2
-            }
-        })
-        .sum()
+    text.chars().map(char_cells).sum()
+}
+
+/// Physical rows one painted line occupies at `columns`, **by the terminal's
+/// own wrapping rule**.
+///
+/// This replaced `width.div_ceil(columns)`, which is wrong for any line
+/// carrying a double-width glyph: such a glyph cannot straddle the right
+/// margin, so the terminal breaks the line EARLY and leaves a cell unused. The
+/// arithmetic then under-counts, `MoveUp` lands inside the old frame, and the
+/// rows above it are stranded forever — nothing else clears them, because the
+/// erase discards its own bookkeeping unconditionally.
+///
+/// Found by the boundary legend: `⧉ Space to expand · ↑↓ scroll` is 32 cells
+/// and reflows to FIVE rows at width 8, not the four `div_ceil` predicts,
+/// because `↑` and `↓` each refuse to split. Two such lines in a frame stranded
+/// exactly two rows. The previous legend was two cells shorter and happened to
+/// wrap where the arithmetic agreed, so the defect sat behind a passing test.
+fn physical_rows(text: &str, columns: usize) -> usize {
+    let columns = columns.max(1);
+    let mut rows = 1usize;
+    let mut used = 0usize;
+    for cells in text.chars().map(char_cells) {
+        // A zero-width mark never forces a break; it rides the cell before it.
+        // Nor does anything break an ALREADY-empty row: a glyph wider than the
+        // whole terminal has nowhere further to go, and breaking before it
+        // would count a row that never gets written.
+        if cells > 0 && used > 0 && used + cells > columns {
+            rows += 1;
+            used = 0;
+        }
+        used += cells;
+    }
+    rows
 }
 
 // ========================================================================
@@ -920,9 +958,9 @@ impl CompletedSpillRenderer for LiveSpillRenderer {
             return 0;
         }
         output_state
-            .painted_line_widths
+            .painted_lines
             .iter()
-            .map(|width| (*width).max(1).div_ceil(columns))
+            .map(|line| physical_rows(line, columns))
             .sum()
     }
 
@@ -1491,7 +1529,7 @@ mod tests {
                 "▒ b",
                 "▒ c",
                 "▓ d",
-                "⧉ Space expands · ↑↓ scroll"
+                "⧉ Space to expand · ↑↓ scroll"
             ]
         );
 
@@ -1723,11 +1761,20 @@ mod tests {
             assert!(display_width(&line) < 8, "row escaped width: {line:?}");
         }
         let rendered = String::from_utf8_lossy(&writer.0.lock().unwrap()).into_owned();
-        // #1263: the boundary rows now carry the key legend (~27 cols), so at
-        // the shrunken width 8 the OLD frame reflows to 14 physical rows —
-        // the erase must cover all of them (was 8 with bare-glyph boundaries).
+        // #1263: the boundary rows carry the key legend, so at the shrunken
+        // width 8 the OLD frame reflows to 16 physical rows — the erase must
+        // cover all of them (was 8 with bare-glyph boundaries).
+        //
+        // 16, not the 14 this once expected: each 32-cell legend takes FIVE
+        // rows at width 8, not four, because `↑` and `↓` are double-width and
+        // refuse to straddle the margin. `physical_rows` wraps the way the
+        // terminal does; the old `width.div_ceil(columns)` under-counted by one
+        // row per legend and stranded two. The ScreenModel in
+        // `width_shrink_erases_…` independently reflows the same frame and
+        // agrees: 5 + 8 + 1 + 1 + 1 + 1 + 5 = 22 there, 5 + 2 + 1 + 1 + 1 + 1 +
+        // 5 = 16 here.
         assert!(
-            rendered.contains("\u{1b}[14A"),
+            rendered.contains("\u{1b}[16A"),
             "old reflowed frame was not fully erased before resize: {rendered:?}"
         );
     }
@@ -1765,6 +1812,42 @@ mod tests {
             screen.nonempty_rows().is_empty(),
             "ESC[2K must still clear the entire row"
         );
+    }
+
+    /// A double-width glyph cannot straddle the right margin, so the terminal
+    /// breaks the line EARLY and leaves the last cell unused — which makes the
+    /// line taller than `width.div_ceil(columns)` predicts.
+    ///
+    /// That arithmetic was what the erase used to rewind a reflowed frame, so
+    /// it moved `MoveUp` too few rows and stranded the top of the old frame
+    /// permanently (nothing else clears it; the erase drops its bookkeeping
+    /// unconditionally). It survived because the boundary legend happened to
+    /// wrap where the arithmetic agreed; two characters of new legend text
+    /// pushed it over and the stale rows appeared.
+    #[test]
+    fn wide_glyphs_wrap_early_so_rows_exceed_the_width_over_columns_estimate() {
+        use super::{physical_rows, rendered_width};
+
+        // 32 cells: `⧉`+`▲`-family glyphs are narrow, but `↑` and `↓` are not.
+        let legend = "⧉ Space to expand · ↑↓ scroll";
+        assert_eq!(rendered_width(legend), 32);
+        // The arithmetic the erase used to trust.
+        assert_eq!(32usize.div_ceil(8), 4);
+        // What a terminal actually does — one row more, because `↑` will not
+        // split across the margin.
+        assert_eq!(physical_rows(legend, 8), 5);
+
+        // All-narrow text still agrees with the simple division, so the fix is
+        // not a blanket +1.
+        assert_eq!(physical_rows("abcdefghijkl", 8), 2);
+        assert_eq!(physical_rows("abcdefgh", 8), 1);
+        // A zero-width combining mark rides the cell before it, never forcing
+        // a break of its own.
+        assert_eq!(physical_rows("abcdefgh\u{0301}", 8), 1);
+        // An empty line still occupies the row it was printed on.
+        assert_eq!(physical_rows("", 8), 1);
+        // A single glyph wider than the terminal cannot be split any further.
+        assert_eq!(physical_rows("↑↑", 1), 2);
     }
 
     #[test]
@@ -1862,7 +1945,7 @@ mod tests {
         assert_eq!(renderer.snapshot_lines().len(), 5);
         assert_eq!(
             renderer.snapshot_lines().last().map(String::as_str),
-            Some("⧉ Space expands · ↑↓ scroll")
+            Some("⧉ Space to expand · ↑↓ scroll")
         );
     }
 

@@ -1057,8 +1057,7 @@ fn draw(
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     line,
-                    Style::default()
-                        .fg(crate::theme::active().color(crate::theme::Role::Dim)),
+                    Style::default().fg(crate::theme::active().color(crate::theme::Role::Dim)),
                 ))),
                 tab_area,
             );

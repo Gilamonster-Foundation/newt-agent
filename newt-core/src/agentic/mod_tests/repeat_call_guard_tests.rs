@@ -22,7 +22,7 @@ fn loop_owned_tool_results_share_one_complete_spill_block() {
         String::from_utf8(repeated).unwrap(),
         "⚙  find: . (name=*.rs, type=f)\n\
              ▒ a.rs\n\
-             ▲ 2 lines omitted · /spill N raises this view\n\
+             ▲ 2 lines hidden  [/spill N raises this view]\n\
              ▓ d.rs\n\
              …\n"
     );
