@@ -425,6 +425,42 @@ pub(crate) fn dispatch(
     Ok(true)
 }
 
+/// The models the active backend serves, tagged with their cached conformance
+/// symbols — the option list behind every model SPINNER.
+///
+/// Lifted out of `chat.rs`'s `/psyche` block when `/settings` grew a model row,
+/// because the alternative was a second fetch-and-tag assembled from the same
+/// three pieces (`resolve_backend_choice` -> `fetch_models_for` ->
+/// `probe::load_cache`). Two of those would be two answers to "what can this
+/// backend serve", and their tags would drift the moment one learned a new
+/// conformance symbol.
+///
+/// **The fetch happens HERE, not in a panel.** A network call inside a draw
+/// loop blocks the terminal for as long as the backend takes to answer; every
+/// panel that shows models takes this list as data, resolved before it opens.
+/// `None` — unreachable, or no backend resolved — means the row renders and
+/// will not dial, which is #1666's rule.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn served_choices(
+    cfg: &newt_core::ResolvedConfig,
+) -> Option<Vec<crate::config_panel::ModelChoice>> {
+    let choice = crate::resolve_backend_choice(cfg).ok()?;
+    let names = fetch_models_for(&choice.url, choice.kind, choice.api_key.as_deref()).ok()?;
+    let cache = probe::load_cache();
+    Some(
+        names
+            .into_iter()
+            .map(|name| {
+                let tag = cache
+                    .get(&probe::cap_key(newt_core::Serving::Multiplexer, "", &name))
+                    .map(|e| e.conformance.symbol().to_string())
+                    .unwrap_or_default();
+                crate::config_panel::ModelChoice { name, tag }
+            })
+            .collect(),
+    )
+}
+
 /// Switch the session to a coarse backend WIRE KIND — the single application
 /// path shared by `/backend <openai|ollama> [model]` and the backend panel's
 /// bare-kind fallback rows (#1667), extracted verbatim from the slash arm so

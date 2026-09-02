@@ -38,11 +38,12 @@
 use crossterm::event::KeyCode;
 use ratatui::text::Line;
 
-use crate::config_panel::{clamp_step, hint_line, render_panel, status_line, RowView};
+use crate::config_panel::{clamp_step, hint_line, render_panel, status_line, ModelChoice, RowView};
 use crate::panel::{Flow, Screen};
 use crate::settings_form::{Field, ValueSpace};
 
-/// Bordered block (2) + one row per field + the backend door + a hint row.
+/// Bordered block (2) + one row per field + the model dial + the backend door
+/// + a hint row.
 ///
 /// Derived from the field count rather than a constant, so adding a setting
 /// widens the panel instead of silently scrolling one off the bottom. When the
@@ -51,9 +52,9 @@ use crate::settings_form::{Field, ValueSpace};
 /// tabs, and not before: today's six rows fit, and paging them behind a tab
 /// strip would be navigation cost for no gain.
 pub(crate) fn panel_height() -> u16 {
-    // Every field, plus the backend door.
-    u16::try_from(Field::ALL.len() + 1)
-        .unwrap_or(7)
+    // Every field, plus the model dial and the backend door.
+    u16::try_from(Field::ALL.len() + 2)
+        .unwrap_or(8)
         .saturating_add(3)
 }
 
@@ -70,6 +71,79 @@ struct DrillIn {
     /// walk through it.
     value: String,
     hint: &'static str,
+}
+
+/// The model row: a dial over what the active backend actually serves.
+///
+/// Its own kind rather than a `Field`, because a model is not a knob with a
+/// closed vocabulary — the options are whatever the backend answered with when
+/// the panel opened, and applying one is a NETWORK-VALIDATED switch that
+/// `/model` already owns. Folding it into `settings_form` would drag a
+/// ten-second blocking fetch into the fully-mocked unit tier, which the testing
+/// strategy forbids for good reason.
+struct ModelRow {
+    /// What the backend serves, or `None` when it could not be reached. A
+    /// `None` row renders and refuses to dial — #1666's rule, so an
+    /// unreachable backend cannot silently look like "no models".
+    options: Option<Vec<ModelChoice>>,
+    at: usize,
+    /// The model the session resolved when the panel opened.
+    opened_as: String,
+}
+
+impl ModelRow {
+    fn new(options: Option<Vec<ModelChoice>>, current: String) -> Self {
+        // The ACTIVE model is always selectable, even when the served list
+        // omits it (stale list, model just unloaded) — otherwise opening the
+        // panel would silently reposition the dial and Enter could apply a
+        // model nobody chose. The same guarantee `/psyche`'s spinner makes.
+        let options = options.map(|mut list| {
+            if !current.is_empty() && !list.iter().any(|m| m.name == current) {
+                list.push(ModelChoice {
+                    name: current.clone(),
+                    tag: "(not served)".to_string(),
+                });
+            }
+            list
+        });
+        let at = options
+            .as_ref()
+            .and_then(|list| list.iter().position(|m| m.name == current))
+            .unwrap_or(0);
+        Self {
+            options,
+            at,
+            opened_as: current,
+        }
+    }
+
+    fn name(&self) -> String {
+        self.options
+            .as_ref()
+            .and_then(|list| list.get(self.at))
+            .map_or_else(|| self.opened_as.clone(), |m| m.name.clone())
+    }
+
+    fn tag(&self) -> String {
+        self.options
+            .as_ref()
+            .and_then(|list| list.get(self.at))
+            .map_or_else(String::new, |m| m.tag.clone())
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.name() != self.opened_as
+    }
+
+    fn dialable(&self) -> bool {
+        self.options.as_ref().is_some_and(|list| list.len() > 1)
+    }
+
+    fn cycle(&mut self, dir: i32) {
+        if let Some(list) = self.options.as_ref().filter(|l| !l.is_empty()) {
+            self.at = clamp_step(self.at, dir, list.len());
+        }
+    }
 }
 
 /// One row: a field, and the value the operator has dialled to so far.
@@ -164,6 +238,7 @@ impl SettingRow {
 /// Either kind of row, in one list, because ↑↓ walks them together.
 enum Row {
     Setting(SettingRow),
+    Model(ModelRow),
     Door(DrillIn),
 }
 
@@ -171,6 +246,7 @@ impl Row {
     fn label(&self) -> &'static str {
         match self {
             Self::Setting(row) => row.field.label(),
+            Self::Model(_) => "model",
             Self::Door(door) => door.label,
         }
     }
@@ -178,6 +254,7 @@ impl Row {
     fn value(&self) -> String {
         match self {
             Self::Setting(row) => row.value.clone(),
+            Self::Model(model) => model.name(),
             Self::Door(door) => door.value.clone(),
         }
     }
@@ -186,15 +263,27 @@ impl Row {
 /// What the panel wants to happen after it closes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
-    /// Lines to print. Empty means the operator changed nothing.
-    Applied(Vec<String>),
-    /// Apply these, then open the backend chooser.
+    /// Lines to print, and the model the operator dialled to (if any).
+    ///
+    /// The model pick is REPORTED, not applied. `/model` validates a name
+    /// against what the backend actually serves, suggests a near-miss, and
+    /// refuses an unserved one — a network round trip the caller already owns.
+    /// A panel that applied it would be a second, unvalidated switch.
+    Applied {
+        lines: Vec<String>,
+        model: Option<String>,
+    },
+    /// Apply these, then open the backend chooser. A model dialled on the way
+    /// through is carried too, for the same reason a setting is.
     ///
     /// The pick is NOT applied here. Choosing a backend reroutes the session,
     /// refreshes runtime state and reports from it — the caller's job, and
     /// already written once for `/backends`. A panel that did it again would
     /// be the second place that knows how a session switches backends.
-    OpenBackends(Vec<String>),
+    OpenBackends {
+        lines: Vec<String>,
+        model: Option<String>,
+    },
 }
 
 pub(crate) struct SettingsPanel {
@@ -209,12 +298,17 @@ impl SettingsPanel {
     /// `backend` is the session's current backend, for the door's value. `None`
     /// when there is nothing to show — the row still opens the chooser, which
     /// is exactly where an operator with no backend needs to go.
-    pub(crate) fn new(backend: Option<String>) -> Self {
+    pub(crate) fn new(
+        backend: Option<String>,
+        models: Option<Vec<ModelChoice>>,
+        current_model: String,
+    ) -> Self {
         let mut rows: Vec<Row> = Field::ALL
             .iter()
             .copied()
             .map(|field| Row::Setting(SettingRow::new(field)))
             .collect();
+        rows.push(Row::Model(ModelRow::new(models, current_model)));
         rows.push(Row::Door(DrillIn {
             label: "backend",
             value: backend.unwrap_or_else(|| "(none)".to_string()),
@@ -231,7 +325,15 @@ impl SettingsPanel {
     fn settings(&self) -> impl Iterator<Item = &SettingRow> {
         self.rows.iter().filter_map(|row| match row {
             Row::Setting(row) => Some(row),
-            Row::Door(_) => None,
+            Row::Model(_) | Row::Door(_) => None,
+        })
+    }
+
+    /// The model the operator dialled to, if they moved it.
+    fn picked_model(&self) -> Option<String> {
+        self.rows.iter().find_map(|row| match row {
+            Row::Model(model) if model.is_dirty() => Some(model.name()),
+            _ => None,
         })
     }
 
@@ -242,6 +344,23 @@ impl SettingsPanel {
             .map(|(i, row)| {
                 let selected = i == self.sel;
                 let (provenance, editable) = match row {
+                    Row::Model(model) => (
+                        if selected && !model.dialable() {
+                            // Says WHY it will not dial. A row that simply
+                            // refused the arrow keys would read as broken.
+                            match model.options {
+                                None => "the active backend could not be listed".to_string(),
+                                Some(_) => "the backend serves only this one".to_string(),
+                            }
+                        } else if selected {
+                            model.tag()
+                        } else if model.is_dirty() {
+                            format!("was {}", model.opened_as)
+                        } else {
+                            model.tag()
+                        },
+                        model.dialable(),
+                    ),
                     Row::Setting(setting) => (
                         if selected {
                             setting.meaning()
@@ -307,8 +426,11 @@ impl Screen for SettingsPanel {
             KeyCode::Down => self.sel = clamp_step(self.sel, 1, self.rows.len()),
             KeyCode::Left | KeyCode::Right => {
                 let dir = if code == KeyCode::Left { -1 } else { 1 };
-                if let Some(Row::Setting(row)) = self.rows.get_mut(self.sel) {
-                    row.cycle(dir);
+                match self.rows.get_mut(self.sel) {
+                    Some(Row::Setting(row)) => row.cycle(dir),
+                    Some(Row::Model(row)) => row.cycle(dir),
+                    // A door does not dial.
+                    Some(Row::Door(_)) | None => {}
                 }
                 // The hint returns once a dial moves: a stale refusal beside a
                 // value the operator has since changed reads as a live verdict
@@ -341,28 +463,42 @@ impl Screen for SettingsPanel {
 /// The terminal could not be taken, built, polled, read or repainted.
 pub(crate) fn run(
     backend: Option<String>,
+    models: Option<Vec<ModelChoice>>,
+    current_model: String,
     window: Option<crate::session_worker::PanelWindow>,
 ) -> std::io::Result<Outcome> {
-    let mut panel = SettingsPanel::new(backend);
+    let mut panel = SettingsPanel::new(backend, models, current_model);
     let applied = crate::panel::drive(&mut panel, panel_height(), window.as_ref())?;
     if !applied {
-        return Ok(Outcome::Applied(vec!["settings: cancelled".to_string()]));
+        return Ok(Outcome::Applied {
+            lines: vec!["settings: cancelled".to_string()],
+            model: None,
+        });
     }
     let messages = panel.commit();
+    let model = panel.picked_model();
     if panel.walk_through {
         // Pending dial changes are applied on the way through, not discarded:
         // the operator asked for both, and dropping half of it because they
         // left by a different door would be a surprise.
-        return Ok(Outcome::OpenBackends(messages));
+        return Ok(Outcome::OpenBackends {
+            lines: messages,
+            model,
+        });
     }
     // An Enter that changed nothing is indistinguishable from Esc, which is
     // `/psyche`'s rule (#1665) for the same reason: a bare `/settings` opens
-    // this panel, so browsing must never look like an edit.
-    Ok(Outcome::Applied(if messages.is_empty() {
-        vec!["settings: cancelled".to_string()]
-    } else {
-        messages
-    }))
+    // this panel, so browsing must never look like an edit. A model pick
+    // counts as a change even though its message comes from the caller that
+    // applies it.
+    Ok(Outcome::Applied {
+        lines: if messages.is_empty() && model.is_none() {
+            vec!["settings: cancelled".to_string()]
+        } else {
+            messages
+        },
+        model,
+    })
 }
 
 #[cfg(test)]
@@ -370,8 +506,39 @@ mod tests {
     use super::*;
     use newt_core::test_guard::GlobalSettingsGuard;
 
+    fn models(names: &[&str]) -> Option<Vec<ModelChoice>> {
+        Some(
+            names
+                .iter()
+                .map(|n| ModelChoice {
+                    name: (*n).to_string(),
+                    tag: String::new(),
+                })
+                .collect(),
+        )
+    }
+
     fn panel() -> SettingsPanel {
-        SettingsPanel::new(Some("sol".to_string()))
+        SettingsPanel::new(
+            Some("sol".to_string()),
+            models(&["qwen3.5:397b", "nemotron:30b"]),
+            "qwen3.5:397b".to_string(),
+        )
+    }
+
+    fn model_index(panel: &SettingsPanel) -> usize {
+        panel
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Model(_)))
+            .expect("the model row exists")
+    }
+
+    fn model_row(panel: &SettingsPanel) -> &ModelRow {
+        match &panel.rows[model_index(panel)] {
+            Row::Model(row) => row,
+            _ => unreachable!("model_index found it"),
+        }
     }
 
     fn row_of(panel: &SettingsPanel, field: Field) -> &SettingRow {
@@ -625,6 +792,100 @@ mod tests {
             row_of(&panel, Field::Thinking).value,
             "and the setting actually moved"
         );
+    }
+
+    /// **←→ picks a model from what the backend actually serves.**
+    ///
+    /// The ask: *"when picking a model I want to use arrow keys to select the
+    /// model."* The list is data the caller resolved before the panel opened —
+    /// a fetch in a draw loop would freeze the terminal for as long as the
+    /// backend took to answer.
+    #[test]
+    fn the_model_row_dials_the_served_list() {
+        let _g = GlobalSettingsGuard::acquire();
+        let mut panel = panel();
+        panel.sel = model_index(&panel);
+        assert_eq!(
+            model_row(&panel).name(),
+            "qwen3.5:397b",
+            "opens on the active"
+        );
+        assert!(!model_row(&panel).is_dirty());
+        assert_eq!(panel.picked_model(), None, "nothing picked yet");
+
+        panel.key(KeyCode::Right, false);
+        assert_eq!(model_row(&panel).name(), "nemotron:30b");
+        assert!(model_row(&panel).is_dirty());
+        assert_eq!(panel.picked_model(), Some("nemotron:30b".to_string()));
+
+        // Clamps rather than wrapping, like every other dial here.
+        panel.key(KeyCode::Right, false);
+        assert_eq!(model_row(&panel).name(), "nemotron:30b");
+        panel.key(KeyCode::Left, false);
+        panel.key(KeyCode::Left, false);
+        assert_eq!(model_row(&panel).name(), "qwen3.5:397b");
+        assert!(!model_row(&panel).is_dirty(), "back where it started");
+        assert_eq!(panel.picked_model(), None, "so nothing is picked");
+    }
+
+    /// **The ACTIVE model is always selectable**, even when the served list
+    /// omits it — a stale list or a model just unloaded. Without the ghost the
+    /// dial would silently reposition on open, and Enter would apply a model
+    /// nobody chose. `/psyche`'s spinner makes the same guarantee (#1666).
+    #[test]
+    fn an_unserved_active_model_is_still_the_opening_position() {
+        let row = ModelRow::new(models(&["a", "b"]), "gone-from-the-list".to_string());
+        assert_eq!(
+            row.name(),
+            "gone-from-the-list",
+            "opens on the active model"
+        );
+        assert!(!row.is_dirty(), "and that is not a change");
+        assert_eq!(row.tag(), "(not served)", "said out loud, not hidden");
+    }
+
+    /// A backend that could not be listed renders the row and REFUSES to dial,
+    /// saying why. A row that just ignored the arrows would read as broken.
+    #[test]
+    fn an_unlistable_backend_shows_the_row_and_will_not_dial() {
+        let _g = GlobalSettingsGuard::acquire();
+        let mut panel = SettingsPanel::new(Some("sol".into()), None, "qwen3.5:397b".into());
+        panel.sel = model_index(&panel);
+        assert_eq!(model_row(&panel).name(), "qwen3.5:397b", "still shown");
+        assert!(!model_row(&panel).dialable());
+
+        panel.key(KeyCode::Right, false);
+        assert_eq!(model_row(&panel).name(), "qwen3.5:397b", "unmoved");
+        assert_eq!(panel.picked_model(), None);
+
+        let view = &panel.view_rows()[model_index(&panel)];
+        assert!(!view.editable, "no dial chrome on a row that cannot dial");
+        assert!(
+            view.provenance.contains("could not be listed"),
+            "it says why: {:?}",
+            view.provenance
+        );
+
+        // A single-model backend is the same shape: nothing to choose between.
+        let one = SettingsPanel::new(Some("sol".into()), models(&["only"]), "only".into());
+        assert!(!model_row(&one).dialable());
+    }
+
+    /// A model pick is REPORTED, never applied here — `/model` validates the
+    /// name against what the backend serves and refuses an unserved one. The
+    /// panel carrying that out itself would be a second, unvalidated switch.
+    #[test]
+    fn the_model_pick_is_reported_not_applied() {
+        let _g = GlobalSettingsGuard::acquire();
+        let mut panel = panel();
+        panel.sel = model_index(&panel);
+        panel.key(KeyCode::Right, false);
+        // `commit` is the SETTINGS writer; it must not have touched the model.
+        assert!(
+            panel.commit().is_empty(),
+            "a model pick is not a settings write"
+        );
+        assert_eq!(panel.picked_model(), Some("nemotron:30b".to_string()));
     }
 
     /// The selected row explains itself, and a changed row says what it was —

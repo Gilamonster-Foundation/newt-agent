@@ -5662,18 +5662,42 @@ fn session_body(
                     if panel_tokens.as_slice() == ["settings"]
                         && std::io::IsTerminal::is_terminal(&std::io::stdout())
                     {
+                        // Resolved BEFORE the panel opens, like /psyche's
+                        // spinner: the list is a network fetch, and a panel
+                        // that made one in its draw loop would freeze the
+                        // terminal for as long as the backend took to answer.
+                        let models = commands::model::served_choices(&cfg);
+                        let current_model = resolve_backend_choice(&cfg)
+                            .ok()
+                            .map(|c| c.display_model().to_string())
+                            .unwrap_or_default();
                         let window = surface.open_panel(settings_panel::panel_height());
-                        match settings_panel::run(active_backend_name(&cfg), window) {
+                        match settings_panel::run(
+                            active_backend_name(&cfg),
+                            models,
+                            current_model,
+                            window,
+                        ) {
                             Ok(outcome) => {
-                                let lines = match outcome {
-                                    settings_panel::Outcome::Applied(lines) => lines,
-                                    settings_panel::Outcome::OpenBackends(lines) => {
+                                let (lines, model) = match outcome {
+                                    settings_panel::Outcome::Applied { lines, model } => {
+                                        (lines, model)
+                                    }
+                                    settings_panel::Outcome::OpenBackends { lines, model } => {
                                         walked_to_backends = true;
-                                        lines
+                                        (lines, model)
                                     }
                                 };
                                 for line in lines {
                                     print_newt(&line, color, verbose);
+                                }
+                                // The pick goes through `/model`'s own path,
+                                // which validates the name against what the
+                                // backend serves and refuses (with a
+                                // suggestion) if it does not — the same
+                                // handling `/psyche`'s spinner pick gets.
+                                if let Some(model) = model {
+                                    commands::model::apply_model_choice(&model, color, verbose);
                                 }
                             }
                             // A panel that could not open is not a dead end:
@@ -5786,29 +5810,13 @@ fn session_body(
                             // seam /models uses, tagged with cached conformance
                             // symbols. An unreachable backend → None → the row
                             // renders but won't dial.
+                            // #1666: the model spinner's option list — fetched
+                            // HERE (the panel stays network-free) via the same
+                            // seam /models uses, tagged with cached conformance
+                            // symbols. An unreachable backend → None → the row
+                            // renders but won't dial.
                             let panel_choice = resolve_backend_choice(&cfg).ok();
-                            let served_models = panel_choice
-                                .as_ref()
-                                .and_then(|pc| {
-                                    fetch_models_for(&pc.url, pc.kind, pc.api_key.as_deref()).ok()
-                                })
-                                .map(|names| {
-                                    let cache = probe::load_cache();
-                                    names
-                                        .into_iter()
-                                        .map(|name| {
-                                            let tag = cache
-                                                .get(&probe::cap_key(
-                                                    newt_core::Serving::Multiplexer,
-                                                    "",
-                                                    &name,
-                                                ))
-                                                .map(|e| e.conformance.symbol().to_string())
-                                                .unwrap_or_default();
-                                            config_panel::ModelChoice { name, tag }
-                                        })
-                                        .collect::<Vec<_>>()
-                                });
+                            let served_models = commands::model::served_choices(&cfg);
                             let outcome = run_psyche_panel(
                                 config_panel::PanelSeed {
                                     via: psyche_route.unwrap_or("/psyche"),
