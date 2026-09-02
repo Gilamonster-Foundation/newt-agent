@@ -69,6 +69,19 @@ fn the_settings_form_renders_picks_applies_and_receipts() {
     .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
     .env("NEWT_SETTINGS_PTY_CHILD", "form")
     .env("NEWT_CONFIG_DIR", &home)
+    // **The child must not inherit a blanked receipt path.**
+    //
+    // `GlobalSettingsGuard` sets `NEWT_SETTINGS_RECEIPTS=""` process-globally
+    // so mocked tests write no journal — and an empty override makes
+    // `receipt_path()` return `None`. A child spawned while some other test in
+    // this binary holds that guard inherits the blank, writes no receipt, and
+    // fails here with a NotFound that names the wrong culprit.
+    //
+    // Removing the variable rather than setting it keeps what this test is
+    // FOR: the receipt landing beside `settings.toml` by the default
+    // derivation from `NEWT_CONFIG_DIR`. Pinning an explicit path would make
+    // the assertion pass without exercising that derivation at all.
+    .env_remove(newt_core::settings_receipt::RECEIPT_PATH_ENV)
     .stdin(pty.slave_stdio())
     .stdout(pty.slave_stdio())
     .stderr(std::process::Stdio::null())
