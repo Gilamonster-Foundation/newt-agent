@@ -1264,7 +1264,9 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> newt_core:
                 }
             }
             // The sole prompt seam suspends every competing terminal writer.
-            let w = Terminal::suspend_for_prompt();
+            let w = Terminal::suspend_for_prompt(
+                newt_core::tty::TerminalTaker::PermissionAuthorization,
+            );
             let (choice, scope) = match &web {
                 Some(store) => self.await_web_decision(store, &w, req),
                 None => {
@@ -1439,7 +1441,8 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> newt_core:
         let outcome = match self.ask_surface {
             Some(ask) => ask(&interaction),
             None => {
-                let w = Terminal::suspend_for_prompt();
+                let w =
+                    Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionQuestion);
                 present_on_terminal(&w, &interaction)
             }
         };

@@ -4292,7 +4292,7 @@ fn codex_env_allowed(detected: &str) -> bool {
         //
         // EOF (`Ok(0)`) is folded in deliberately: an operator who closes the
         // stream has not adopted the environment, and `_ =>` is exactly that.
-        let window = newt_core::tty::Terminal::suspend_for_prompt();
+        let window = newt_core::tty::Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::CodexEnvAdoption);
         let mut line = String::new();
         let _ = window
             .ask(&format!(
@@ -12720,7 +12720,8 @@ pub(crate) type SlashAsk<'a> = &'a dyn Fn(
 pub(crate) fn ask_on_this_terminal(
     interaction: &newt_core::interaction_surface::SurfaceInteraction,
 ) -> newt_core::HumanQuestionOutcome {
-    let window = newt_core::tty::Terminal::suspend_for_prompt();
+    let window =
+        newt_core::tty::Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::SlashForm);
     crate::permissions::present_on_terminal(&window, interaction)
 }
 

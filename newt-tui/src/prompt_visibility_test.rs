@@ -85,7 +85,9 @@ fn prompt_scenario_child() {
     }
 
     if controls {
-        let window = newt_core::tty::Terminal::suspend_for_prompt();
+        let window = newt_core::tty::Terminal::suspend_for_prompt(
+            newt_core::tty::TerminalTaker::RichSurfaceModal,
+        );
         let definition = permission_definition(
             &web_fetch_request("example.com"),
             &danger::DangerTable::builtin(),

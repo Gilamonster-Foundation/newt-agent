@@ -422,7 +422,9 @@ fn confirm_or_bail(question: &str, action: &str, yes: bool) -> anyhow::Result<()
     // across two of them cannot be arbitrated against the ephemeral rows the
     // window just erased. The `is_terminal` bail above still fires first for
     // the piped case, so nothing that used to reach stderr now goes missing.
-    let window = newt_core::tty::Terminal::suspend_for_prompt();
+    let window = newt_core::tty::Terminal::suspend_for_prompt(
+        newt_core::tty::TerminalTaker::PlainCliConfirm,
+    );
     if newt_core::interaction_terminal::confirmed_on_terminal(
         &window,
         &newt_core::interaction_form::confirm(question, "", "yes, go ahead", "no, stop"),

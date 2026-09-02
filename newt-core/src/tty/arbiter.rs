@@ -273,6 +273,135 @@ pub enum OnCollision {
     Refuse,
 }
 
+/// **A surface that may take the WHOLE terminal**, and what it does when
+/// another surface already holds rows.
+///
+/// # Why this is an argument rather than a predicate
+///
+/// `regions` decides who owns rows; [`Terminal::suspend_for_prompt`] hands out
+/// the terminal. Until #2027 the second never asked the first, which is #2019:
+/// `/settings` took its own prompt window while the cockpit had an editor
+/// mounted below, and the arbiter — holding both halves in this one file — had
+/// no opinion. A ratchet on the NUMBER of acquisitions would have passed that
+/// PR unchanged, because the call site already existed; what was wrong was the
+/// context it ran in.
+///
+/// So the declaration is **required**, and it is written AT the acquisition,
+/// beside the state that justifies it — the same placement rule the Esc
+/// ladder's claim accessors follow (`assets/esc_ladder.toml`: *"add the row
+/// here AND an accessor beside the state it reads"*), and for the same reason:
+/// a "who is asking?" predicate kept in this file goes stale the moment
+/// someone adds a consumer.
+///
+/// Two directions are guarded, and neither is a count:
+///
+/// * an acquisition that declares nothing **does not compile** — the argument
+///   is not optional (`tests/ui/suspend_for_prompt_requires_a_taker.rs`);
+/// * a variant with no production acquisition fails
+///   `tests/terminal_taker_registry.rs`, so a taker cannot sit here dead.
+///
+/// # What CANNOT be typed away
+///
+/// Only the declaration is static. *Whether rows are held* is dynamic and
+/// cross-stack by construction — this module's opening paragraph is the
+/// argument: "a spinner and a permission prompt sit in different call stacks,
+/// so no purely-static scheme can relate them". The collision is therefore a
+/// runtime refusal at every one of the call sites, and saying otherwise would
+/// be claiming a guarantee we do not have.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TerminalTaker {
+    /// The cockpit presenter's `SurfaceRequest::Interact` arm. It **is** the
+    /// region holder (`Screen::region`) and has already reserved the modal's
+    /// rows and receded the chat chevron, so taking them is the whole point.
+    CockpitModal,
+    /// The permission gate's authorization prompt (`PromptPermissionGate::ask`).
+    /// Runs on the session thread under a live cockpit, whose presenter holds
+    /// the block's rows and quiesces itself on this suspension — see
+    /// `cockpit/presenter.rs`'s "Threads and stdin": the window takes stdin,
+    /// the watcher token is refused, the key loop backs off. A deliberate
+    /// row-taker, and one of only two.
+    PermissionAuthorization,
+    /// `PromptPermissionGate::ask_question`'s fallback, for a gate that has no
+    /// surface seam (#1862 C1). A gate that HAS one never reaches here.
+    PermissionQuestion,
+    /// `RichSurface::present_interaction` — the classic rich surface's own
+    /// terminal adapter. Its editor lease is taken per `read_turn` and is not
+    /// held while an interaction is presented, so nothing should be holding
+    /// rows underneath it.
+    RichSurfaceModal,
+    /// `LeanSurface::present_interaction`, the plain-scroller twin.
+    LeanSurfaceModal,
+    /// `ask_on_this_terminal` — a slash form's ask for a caller that owns the
+    /// terminal outright (the plain CLI, `newt crew edit`). **This is #2019's
+    /// site.** A session passes its surface seam instead; if this is somehow
+    /// reached under a mounted surface, refusing is the correct answer.
+    SlashForm,
+    /// The setup wizard's operator prompt, which runs before any surface is
+    /// mounted.
+    SetupWizard,
+    /// The Codex-compat `OPENAI_*` adoption question, asked at most once per
+    /// process on a TTY.
+    CodexEnvAdoption,
+    /// A `newt <subcommand>` confirmation on the plain CLI — dock, doctor,
+    /// ocap, dgx, mcp-probe. No session is mounted on these paths; the process
+    /// owns the terminal outright.
+    PlainCliConfirm,
+}
+
+impl TerminalTaker {
+    /// Every declared taker. Walked by `tests/terminal_taker_registry.rs`,
+    /// which fails when a row here has no production acquisition.
+    pub const ALL: &'static [Self] = &[
+        Self::CockpitModal,
+        Self::PermissionAuthorization,
+        Self::PermissionQuestion,
+        Self::RichSurfaceModal,
+        Self::LeanSurfaceModal,
+        Self::SlashForm,
+        Self::SetupWizard,
+        Self::CodexEnvAdoption,
+        Self::PlainCliConfirm,
+    ];
+
+    /// The variant's name as it is written at the acquisition — the token the
+    /// registry test matches. Exhaustive on purpose: a new variant does not
+    /// compile until it is named here, which is where the author meets
+    /// [`TerminalTaker::ALL`] and [`TerminalTaker::on_held_rows`].
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::CockpitModal => "CockpitModal",
+            Self::PermissionAuthorization => "PermissionAuthorization",
+            Self::PermissionQuestion => "PermissionQuestion",
+            Self::RichSurfaceModal => "RichSurfaceModal",
+            Self::LeanSurfaceModal => "LeanSurfaceModal",
+            Self::SlashForm => "SlashForm",
+            Self::SetupWizard => "SetupWizard",
+            Self::CodexEnvAdoption => "CodexEnvAdoption",
+            Self::PlainCliConfirm => "PlainCliConfirm",
+        }
+    }
+
+    /// What this surface declared about rows another surface holds.
+    ///
+    /// [`OnCollision`] rather than a fresh vocabulary: "take the rows, the
+    /// holder is quiesced" and "refuse, and let the caller degrade" are
+    /// already named there, and a second enum for the same two intents is the
+    /// sprawl `CLAUDE.md` records five spinners' worth of.
+    /// [`OnCollision::Shift`] is unrepresentable here — a prompt window is the
+    /// whole terminal and has nowhere to move to — and
+    /// `no_taker_declares_a_shift` pins that.
+    #[must_use]
+    pub const fn on_held_rows(self) -> OnCollision {
+        match self {
+            // The two deliberate row-takers. Both are quiesced by this very
+            // suspension; see each variant's doc.
+            Self::CockpitModal | Self::PermissionAuthorization => OnCollision::SuspendHolder,
+            _ => OnCollision::Refuse,
+        }
+    }
+}
+
 /// Exclusive ownership of a range of terminal rows.
 ///
 /// The N-row sibling of [`LineLease`], NOT its generalisation, and the
@@ -650,10 +779,17 @@ impl Terminal {
     /// this function seizing stdin and erasing the screen before anyone could
     /// refuse.
     ///
+    /// **And it consults `regions`** (#2027). `taker` is the caller's declared
+    /// claim on the terminal; when it declared [`OnCollision::Refuse`] and
+    /// another surface holds rows, this hands back a REFUSED window rather
+    /// than taking stdin and erasing the screen out from under it. That is
+    /// #1952's degrade-don't-die: the caller gets an inert window whose `ask`
+    /// and `read_line` error with what happened, and it degrades.
+    ///
     /// Everything after this point is guaranteed a clean bottom row, and the
     /// shared ticker paints nothing until the returned window is dropped.
-    pub fn suspend_for_prompt() -> PromptWindow {
-        Self::suspend_for_prompt_with_output(PromptOutput::Stdout)
+    pub fn suspend_for_prompt(taker: TerminalTaker) -> PromptWindow {
+        Self::suspend_for_prompt_with_output(PromptOutput::Stdout, taker)
     }
 
     /// [`Terminal::suspend_for_prompt`] with an explicit terminal output.
@@ -665,18 +801,28 @@ impl Terminal {
     /// [`PromptWindow::ask`] and [`PromptWindow::notice`] directly to that
     /// file. Ownership is moved into the window so the destination remains
     /// alive for the entire prompt.
-    pub fn suspend_for_prompt_to(output: File) -> PromptWindow {
-        Self::suspend_for_prompt_with_output(PromptOutput::File(output))
+    pub fn suspend_for_prompt_to(output: File, taker: TerminalTaker) -> PromptWindow {
+        Self::suspend_for_prompt_with_output(PromptOutput::File(output), taker)
     }
 
-    fn suspend_for_prompt_with_output(output: PromptOutput) -> PromptWindow {
+    fn suspend_for_prompt_with_output(output: PromptOutput, taker: TerminalTaker) -> PromptWindow {
         // Counted before the veto ON PURPOSE: a protocol-mode caller reaching
         // this seam is exactly what an operator would want to see in
         // `prompt_windows_constructed`, and silently not counting the attempt
-        // would hide the misbehaving caller this veto exists to contain.
+        // would hide the misbehaving caller this veto exists to contain. A
+        // row-refused attempt counts for the same reason.
         SUSPENSIONS.fetch_add(1, Ordering::SeqCst);
         if !prompts_permitted(super::caps::protocol_mode()) {
             return PromptWindow::vetoed(output);
+        }
+        // 0. #2027: is anybody holding rows, and did this caller say it would
+        //    take them? Ahead of the stdin token deliberately — refusing after
+        //    seizing stdin would block the holder on a window that then
+        //    refuses to speak, which is the misrender traded for a hang.
+        if taker.on_held_rows() == OnCollision::Refuse {
+            if let Some(held) = lock().regions.first().map(|(_, region)| *region) {
+                return PromptWindow::refused_rows(output, taker, held);
+            }
         }
         // 1. Take stdin FIRST and block until the turn watcher's read finishes,
         //    so we never erase the screen and then wait to be allowed to ask.
@@ -705,7 +851,7 @@ impl Terminal {
             resume: live,
             output,
             live: true,
-            vetoed: false,
+            refusal: None,
         }
     }
 }
@@ -876,10 +1022,44 @@ pub struct PromptWindow {
     /// `false` for the test stub: it arbitrates nothing and must not clear the
     /// process-wide suspend flag on drop.
     live: bool,
-    /// Protocol mode (#1866): fd 1 may be a JSON-RPC wire, so this window
-    /// emits zero bytes and refuses to read. Distinct from `live` — the test
-    /// stub arbitrates nothing but is still allowed to speak.
-    vetoed: bool,
+    /// `Some` when this window may not speak at all — protocol mode (#1866) or
+    /// a refused acquisition (#2027). Distinct from `live`: the test stub
+    /// arbitrates nothing but is still allowed to speak.
+    refusal: Option<Refusal>,
+}
+
+/// Why an inert window will not speak. Both arms mean the same thing to the
+/// caller — *there is nobody at the other end of this window* — for two
+/// different reasons, and each says which in its error.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Refusal {
+    /// Protocol mode (#1866): fd 1 may be a JSON-RPC wire.
+    Protocol,
+    /// #2027: another surface holds terminal rows and this taker declared
+    /// [`OnCollision::Refuse`].
+    RowsHeld(TerminalTaker, Region),
+}
+
+impl Refusal {
+    /// The refusal a caller meets. `NotConnected` for both, because that is
+    /// what is true either way: no operator is reachable through this window.
+    fn error(self, action: &str) -> io::Error {
+        let because = match self {
+            Self::Protocol => "fd 1 is a machine protocol channel and there is \
+                 no operator to answer"
+                .to_string(),
+            Self::RowsHeld(taker, held) => format!(
+                "another surface holds {held:?} and `{}` declared it would not \
+                 take rows it does not own — ask through that surface's own \
+                 seam instead",
+                taker.name()
+            ),
+        };
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!("refusing to {action}: {because}"),
+        )
+    }
 }
 
 impl PromptWindow {
@@ -891,25 +1071,26 @@ impl PromptWindow {
     /// is not reachable from outside. This adds a third *internal* shape, not
     /// a fourth door.
     fn vetoed(output: PromptOutput) -> Self {
+        Self::inert(output, Refusal::Protocol)
+    }
+
+    /// #2027: a window refused because another surface holds rows and the
+    /// taker declared it would not take them. Structurally identical to the
+    /// protocol veto — ONE inert shape, two reasons — so a refusal cannot
+    /// accidentally acquire half the capability the veto denies.
+    fn refused_rows(output: PromptOutput, taker: TerminalTaker, held: Region) -> Self {
+        Self::inert(output, Refusal::RowsHeld(taker, held))
+    }
+
+    fn inert(output: PromptOutput, refusal: Refusal) -> Self {
         Self {
             _seal: Seal,
             stdin: None,
             resume: Vec::new(),
             output,
             live: false,
-            vetoed: true,
+            refusal: Some(refusal),
         }
-    }
-
-    /// The refusal a vetoed window returns. `NotConnected` because that is
-    /// what is true: there is no operator on the other end of a JSON-RPC wire.
-    fn no_operator(action: &str) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::NotConnected,
-            format!(
-                "refusing to {action} in protocol mode — fd 1 is a machine                  protocol channel and there is no operator to answer"
-            ),
-        )
     }
 
     /// The ONLY sanctioned way to write a question.
@@ -921,8 +1102,8 @@ impl PromptWindow {
         // LOUDLY, unlike `notice` below. A question that cannot be asked must
         // not report success: a caller that believed it had asked would go on
         // to block for an answer that is never coming.
-        if self.vetoed {
-            return Err(Self::no_operator("ask"));
+        if let Some(refusal) = self.refusal {
+            return Err(refusal.error("ask"));
         }
         self.output.write_text(text, false)
     }
@@ -946,8 +1127,8 @@ impl PromptWindow {
         // means "no human at all". Protocol mode is the second, and returning
         // EOF here would synthesise an answer nobody gave — which A3 settled
         // is not what failing closed means.
-        if self.vetoed {
-            return Err(Self::no_operator("read an answer"));
+        if let Some(refusal) = self.refusal {
+            return Err(refusal.error("read an answer"));
         }
         io::stdin().read_line(buf)
     }
@@ -959,7 +1140,7 @@ impl PromptWindow {
         // SILENTLY, unlike `ask` above, and for `Notice::emit`'s reason: a
         // notice is informational and dropping it is the documented protocol-
         // mode behaviour. Nobody is waiting on its return value.
-        if self.vetoed {
+        if self.refusal.is_some() {
             return Ok(());
         }
         self.output.write_text(text, true)
@@ -985,7 +1166,7 @@ impl PromptWindow {
             resume: Vec::new(),
             output: PromptOutput::Stdout,
             live: false,
-            vetoed: false,
+            refusal: None,
         }
     }
 }
@@ -1102,6 +1283,7 @@ mod tests {
         Terminal::register(9_002, &dynamic);
         let window = Terminal::suspend_for_prompt_to(
             output.reopen().expect("independent prompt output handle"),
+            TerminalTaker::PlainCliConfirm,
         );
 
         assert_eq!(
@@ -1159,7 +1341,7 @@ mod tests {
         // `File`s become their sole owners.
         let (mut master, output) =
             unsafe { (File::from_raw_fd(master_fd), File::from_raw_fd(slave_fd)) };
-        let window = Terminal::suspend_for_prompt_to(output);
+        let window = Terminal::suspend_for_prompt_to(output, TerminalTaker::PlainCliConfirm);
 
         assert!(
             window.output_is_terminal(),
@@ -1267,7 +1449,7 @@ mod tests {
 
         assert_eq!(c.erased.load(Ordering::SeqCst), 0);
         {
-            let w = Terminal::suspend_for_prompt();
+            let w = Terminal::suspend_for_prompt(TerminalTaker::PlainCliConfirm);
             assert_eq!(
                 c.erased.load(Ordering::SeqCst),
                 1,
@@ -1289,7 +1471,7 @@ mod tests {
     #[test]
     fn a_live_prompt_window_makes_painting_a_no_op() {
         let lease = Terminal::lease_with_caps(LineCaps::Own, Sink::Stdout).expect("lease");
-        let w = Terminal::suspend_for_prompt();
+        let w = Terminal::suspend_for_prompt(TerminalTaker::PlainCliConfirm);
         lease.paint(|_w| Ok(()));
         assert!(
             !lease.painted.load(Ordering::SeqCst),
@@ -1491,7 +1673,7 @@ mod tests {
             .open("/dev/null")
             .expect("/dev/null");
 
-        let window = Terminal::suspend_for_prompt_to(sink);
+        let window = Terminal::suspend_for_prompt_to(sink, TerminalTaker::PlainCliConfirm);
         assert!(
             prompt_stdin_active(),
             "the File door must take the prompt's stdin token, like the stdout door"
@@ -1548,7 +1730,7 @@ mod tests {
             "the stub must not emit lifecycle events"
         );
 
-        let w = Terminal::suspend_for_prompt();
+        let w = Terminal::suspend_for_prompt(TerminalTaker::PlainCliConfirm);
         drop(w);
         drop(sub);
         assert_eq!(
@@ -1717,6 +1899,167 @@ mod tests {
         );
         drop(prompt);
         drop(reclaimed);
+    }
+
+    /// **#2027 (red-first): #2019's shape, at the arbiter.**
+    ///
+    /// `/settings` acquired its own prompt window while the cockpit had an
+    /// editor mounted below it — two live chevrons, a modal with no rows
+    /// reserved, and a header repainting through the question every 250 ms.
+    /// Every one of those follows from the same fact: this file decides who
+    /// owns ROWS and, separately, hands out the TERMINAL, and the second half
+    /// never asked the first.
+    ///
+    /// So: a surface holds rows, and somebody who did not declare that it
+    /// would take them asks for a prompt window. Nothing may have been taken.
+    /// Asserted on stdin ownership and the suspend flag rather than on bytes,
+    /// so the failing run emits nothing onto a sibling test's terminal.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_bare_acquisition_is_refused_while_a_surface_holds_rows() {
+        let _held = Terminal::lease_region(rows(18, 6), OnCollision::Refuse).expect("holder");
+        let window = Terminal::suspend_for_prompt(TerminalTaker::SlashForm);
+        assert!(
+            !prompt_stdin_active(),
+            "a refused acquisition must not have taken stdin"
+        );
+        assert!(
+            !suspended(),
+            "a refused acquisition must not have quiesced the holder"
+        );
+        assert!(
+            window.ask("question > ").is_err(),
+            "a refused window must not report a question it never wrote"
+        );
+        assert!(
+            window.read_line_into(&mut String::new()).is_err(),
+            "and must ERROR rather than synthesise an EOF nobody typed"
+        );
+        assert!(
+            window.notice("fyi").is_ok(),
+            "a notice is informational and is dropped silently, as under the veto"
+        );
+        drop(window);
+        assert!(
+            !suspended(),
+            "dropping a refused window must not clear a flag it never set"
+        );
+    }
+
+    /// **ANTI-VACUOUS TWIN (rows).** The refusal above is about the OVERLAP,
+    /// not about `SlashForm` never getting a window. With no holder the same
+    /// taker acquires for real — stdin taken, ephemerals erased, the window
+    /// able to speak. Without this, `on_held_rows` could return `Refuse`
+    /// unconditionally and every prompt in the process would be silently dead.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn and_the_same_taker_acquires_when_nobody_holds_rows() {
+        let counter = counter();
+        let dynamic: Arc<dyn Ephemeral> = counter.clone();
+        Terminal::register(9_027, &dynamic);
+
+        let window = Terminal::suspend_for_prompt(TerminalTaker::SlashForm);
+        assert!(prompt_stdin_active(), "an uncontested taker owns stdin");
+        assert!(suspended(), "and quiesces every registered ephemeral");
+        assert_eq!(counter.erased.load(Ordering::SeqCst), 1);
+        assert!(window.ask("").is_ok(), "and may speak");
+        drop(window);
+        assert!(!prompt_stdin_active());
+    }
+
+    /// **ANTI-VACUOUS TWIN (declaration).** `SuspendHolder` is the OTHER legal
+    /// move: a caller that has already quiesced the holder — the cockpit
+    /// presenter, which holds the rows itself — takes them deliberately. If
+    /// the region check ignored the declaration, this would refuse too and the
+    /// cockpit's modal (and every mid-turn permission prompt under it) would
+    /// stop reaching the operator.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_declared_row_taker_acquires_while_a_surface_holds_rows() {
+        let _held = Terminal::lease_region(rows(18, 6), OnCollision::Refuse).expect("holder");
+        let window = Terminal::suspend_for_prompt(TerminalTaker::CockpitModal);
+        assert!(
+            prompt_stdin_active(),
+            "a declared SuspendHolder taker must still get the terminal"
+        );
+        assert!(suspended(), "and must still quiesce the holder");
+        assert!(window.ask("").is_ok(), "and must be able to speak");
+        drop(window);
+    }
+
+    /// A refused acquisition is still COUNTED. §6.10's default-deny witness is
+    /// "no prompt was ever constructed"; hiding the attempts of a caller that
+    /// is reaching past a surface would hide exactly the caller this guard
+    /// exists to name — the same reasoning the protocol veto records.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_refused_acquisition_is_still_counted() {
+        let _held = Terminal::lease_region(rows(18, 6), OnCollision::Refuse).expect("holder");
+        let before = prompt_windows_constructed();
+        drop(Terminal::suspend_for_prompt(TerminalTaker::SlashForm));
+        assert_eq!(
+            prompt_windows_constructed(),
+            before + 1,
+            "a refused attempt must remain visible in the counter"
+        );
+    }
+
+    /// The registry is complete, distinct, and each row says what it does.
+    ///
+    /// `name` is an exhaustive match, so a new variant cannot be added without
+    /// visiting it — and the count below is what makes the author visit
+    /// [`TerminalTaker::ALL`] in the same edit.
+    #[test]
+    fn the_taker_table_is_complete_and_distinct() {
+        assert_eq!(
+            TerminalTaker::ALL.len(),
+            9,
+            "a variant was added without reaching ALL, which the registry test walks"
+        );
+        let mut names: Vec<&str> = TerminalTaker::ALL.iter().map(|t| t.name()).collect();
+        names.sort_unstable();
+        let listed = names.len();
+        names.dedup();
+        assert_eq!(names.len(), listed, "two takers share a name: {names:?}");
+    }
+
+    /// **`Shift` is not a terminal policy.** A prompt window is the whole
+    /// terminal; there is nowhere above it to move to. The type cannot say so
+    /// (it reuses `OnCollision`, which is right — a second two-variant enum
+    /// for the same two intents is the sprawl the reuse discipline forbids),
+    /// so the table says it here.
+    #[test]
+    fn no_taker_declares_a_shift() {
+        for taker in TerminalTaker::ALL {
+            assert_ne!(
+                taker.on_held_rows(),
+                OnCollision::Shift,
+                "`{}` declared Shift, which a whole-terminal take cannot honour",
+                taker.name()
+            );
+        }
+    }
+
+    /// **The ratchet, and it is not a call-site count.**
+    ///
+    /// #2027 records why counting acquisitions is the wrong guard: it would
+    /// have passed #2019 unchanged, because the call site already existed.
+    /// What is worth counting is the ESCAPE HATCH — takers that take rows
+    /// another surface owns. Two are justified today, each documented on its
+    /// variant. **This number may only go DOWN.** A third is how the
+    /// declaration turns back into a formality.
+    #[test]
+    fn exactly_two_takers_take_rows_they_do_not_own() {
+        let deliberate: Vec<&str> = TerminalTaker::ALL
+            .iter()
+            .filter(|t| t.on_held_rows() == OnCollision::SuspendHolder)
+            .map(|t| t.name())
+            .collect();
+        assert_eq!(
+            deliberate,
+            vec!["CockpitModal", "PermissionAuthorization"],
+            "the set of takers that take rows they do not own may only shrink"
+        );
     }
 
     /// A relocation is sometimes a REPORT, not a request (#1980).

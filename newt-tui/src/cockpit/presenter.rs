@@ -899,7 +899,10 @@ impl Presenter {
                 // its bytes would wait in the capture until this same loop
                 // returned from the read — a prompt visible only after it was
                 // answered.
-                let window = newt_core::tty::Terminal::suspend_for_prompt_to(prompt_output);
+                let window = newt_core::tty::Terminal::suspend_for_prompt_to(
+                    prompt_output,
+                    newt_core::tty::TerminalTaker::CockpitModal,
+                );
                 let (outcome, prompt_notice) = crate::permissions::present_on_terminal_with_width(
                     &window,
                     &interaction,
@@ -1869,7 +1872,9 @@ mod terminal_acceptance {
             // modal take raw mode from the real termios instead of crossterm's
             // global, and the cockpit is exactly the second raw-mode owner
             // that broke it. Here the cockpit genuinely holds fd 0/1.
-            let window = newt_core::tty::Terminal::suspend_for_prompt();
+            let window = newt_core::tty::Terminal::suspend_for_prompt(
+                newt_core::tty::TerminalTaker::RichSurfaceModal,
+            );
             {
                 let _reader = newt_core::tty::modal_prompt_controls(&window)
                     .expect("the modal takes the terminal from under the cockpit");

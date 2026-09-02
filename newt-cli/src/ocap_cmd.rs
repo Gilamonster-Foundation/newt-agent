@@ -99,7 +99,9 @@ fn run_revoke_credential(
 
     // The capability, not a flag: a session with no terminal cannot obtain one,
     // so it reaches the default-deny arm below instead of revoking unattended.
-    let window = newt_core::tty::Terminal::suspend_for_prompt();
+    let window = newt_core::tty::Terminal::suspend_for_prompt(
+        newt_core::tty::TerminalTaker::PlainCliConfirm,
+    );
     if !newt_core::interaction_terminal::confirmed_on_terminal(
         &window,
         &newt_core::interaction_form::confirm(

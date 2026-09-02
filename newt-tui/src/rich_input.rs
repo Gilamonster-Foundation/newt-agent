@@ -2133,7 +2133,9 @@ impl InputSurface for RichSurface {
         &mut self,
         interaction: &newt_core::interaction_surface::SurfaceInteraction,
     ) -> newt_core::HumanQuestionOutcome {
-        let window = newt_core::tty::Terminal::suspend_for_prompt();
+        let window = newt_core::tty::Terminal::suspend_for_prompt(
+            newt_core::tty::TerminalTaker::RichSurfaceModal,
+        );
         let (outcome, canonical) = match crate::interaction_view::present(interaction) {
             Ok(pair) => pair,
             Err(_) => return crate::permissions::present_on_terminal(&window, interaction),

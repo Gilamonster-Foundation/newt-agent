@@ -619,7 +619,9 @@ mod tests {
     fn a_prompt_window_during_the_tool_does_not_keep_the_row_after_it_returns() {
         let spinner = ToolSpinner::from_spinner(Some(own_spinner("request_user_input…")));
         {
-            let _window = crate::tty::Terminal::suspend_for_prompt();
+            let _window = crate::tty::Terminal::suspend_for_prompt(
+                crate::tty::TerminalTaker::PlainCliConfirm,
+            );
             // The tool answers; the window closes first (as `ask_question`
             // scopes it), then the tool returns and the funnel drops the
             // spinner.
@@ -639,7 +641,8 @@ mod tests {
     #[test]
     fn a_window_that_outlives_the_spinner_frees_the_row_when_it_drops() {
         let spinner = ToolSpinner::from_spinner(Some(own_spinner("ask…")));
-        let window = crate::tty::Terminal::suspend_for_prompt();
+        let window =
+            crate::tty::Terminal::suspend_for_prompt(crate::tty::TerminalTaker::PlainCliConfirm);
         drop(spinner);
         drop(window);
         assert!(row_is_free(), "the row must be free once both are gone");
