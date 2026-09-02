@@ -406,12 +406,6 @@ impl Editor {
         }
     }
 
-    /// In vi NORMAL mode the prompt indicator is a highlighted `:` instead of
-    /// `❯`. False for emacs/nano and for vi INSERT.
-    fn is_vi_normal(&self) -> bool {
-        self.edit == Edit::Vi && self.vi.mode == Mode::Normal
-    }
-
     /// The dim, clears-on-type hint shown on an empty line — the editor mode plus
     /// how to switch. vi is the default; `/nano` and `/emacs` are advertised.
     ///
@@ -776,10 +770,13 @@ fn cancel_hidden_bang_selection(textarea: &mut TextArea<'_>) {
     }
 }
 
-/// The input-row indicator (below [`header_line`]): `❯ ` for input/INSERT, a bold
-/// bright `: ` for vi NORMAL, `:cmd` for an open ex-line, or the `[y/N]`
-/// confirmation. The input begins right after it, so the cursor anchors here and
-/// the dim mode hint (drawn by `draw_overhang` on an empty line) sits after it.
+/// The input-row indicator (below [`header_line`]): `❯ ` for the input line in
+/// either vi mode, `:cmd` for an OPEN ex-line, or the `[y/N]` confirmation. The
+/// input begins right after it, so the cursor anchors here and the dim mode
+/// hint (drawn by `draw_overhang` on an empty line) sits after it.
+///
+/// The `:` is reserved for a command line the operator actually opened. See
+/// [`prompt_line_with_focus`].
 fn prompt_line(editor: &Editor, ex_inline: bool) -> Line<'static> {
     prompt_line_with_focus(editor, ex_inline, true)
 }
@@ -806,13 +803,6 @@ fn prompt_line_with_focus(editor: &Editor, ex_inline: bool, focused: bool) -> Li
     } else {
         Color::DarkGray
     };
-    let bold_hi = Style::default()
-        .fg(if focused {
-            Color::LightYellow
-        } else {
-            Color::DarkGray
-        })
-        .add_modifier(Modifier::BOLD);
     // An open ex-line is inline only on a single-line buffer; a multi-line
     // `:`-command moves to its own bottom row (#531; see `draw`).
     if ex_inline {
@@ -820,11 +810,14 @@ fn prompt_line_with_focus(editor: &Editor, ex_inline: bool, focused: bool) -> Li
             return command_line_with_focus(CommandKind::Ex, ex, focused);
         }
     }
-    if editor.is_vi_normal() {
-        Line::from(Span::styled(": ", bold_hi))
-    } else {
-        Line::from(Span::styled("❯ ", Style::default().fg(accent)))
-    }
+    // **NORMAL is not command-line mode.** The `:` belongs to an OPEN ex line
+    // and nothing else — in vi you press `:` to get one, and until you do the
+    // buffer looks exactly as it does in INSERT. Painting `:` for the whole of
+    // NORMAL said "you are typing a command" to an operator who was not, and
+    // the way out of it looked like backing out of a command rather than
+    // pressing `i`. The mode is carried where vi carries it: the status line
+    // (`vi --NORMAL--` in the header) and the mode hint.
+    Line::from(Span::styled("❯ ", Style::default().fg(accent)))
 }
 
 /// The `:`-command text to render on a dedicated **bottom** row (vi-style) —
@@ -3760,21 +3753,63 @@ mod tests {
         assert!(vi_editor().mode_hint(false).contains("/emacs"));
     }
 
+    /// **The `:` belongs to an OPEN ex line, and to nothing else.**
+    ///
+    /// vi's own semantics, which this surface used to contradict: NORMAL mode
+    /// showed a highlighted `:` as its prompt indicator, so an operator who
+    /// had pressed Esc was looking at what vi only ever shows for a command
+    /// line they had not opened. Worse, the way OUT of it read as backing out
+    /// of a command rather than as pressing `i`.
+    ///
+    /// In vi the buffer looks the same in NORMAL as in INSERT; the mode lives
+    /// in the status line (`-- INSERT --`) and in the cursor. So the chevron
+    /// stays in both modes, and the `:` appears exactly when `:` is pressed.
     #[test]
-    fn native_status_row_uses_colon_for_vi_normal_not_arrow() {
-        let mut normal = vi_editor();
+    fn only_an_open_ex_line_shows_the_colon() {
         let mut ta = TextArea::default();
+
+        // INSERT: the chevron.
+        assert!(row_text(&vi_editor()).starts_with('❯'));
+
+        // NORMAL: still the chevron, and NOT a command line.
+        let mut normal = vi_editor();
         normal.input(special(KeyCode::Esc), &mut ta); // INSERT → NORMAL
         let row = row_text(&normal);
-        assert!(!row.contains('❯'), "NORMAL drops the ❯ for `:`: {row:?}");
-        // An open ex-line shows the typed command (still no ❯).
+        assert!(
+            row.starts_with('❯'),
+            "NORMAL keeps the input chevron: {row:?}"
+        );
+        assert!(
+            !row.trim_start().starts_with(':'),
+            "NORMAL is not command-line mode: {row:?}"
+        );
+
+        // The mode is still discoverable — where vi keeps it.
+        assert!(
+            header_text(&normal, "m", "e").contains("vi --NORMAL--"),
+            "the header carries the mode"
+        );
+        assert!(
+            normal.mode_hint(false).contains("i: insert"),
+            "the hint says how to get back to typing"
+        );
+
+        // `:` opens the ex line, and THEN the colon shows with the command.
         let mut ex = vi_editor();
         ex.input(special(KeyCode::Esc), &mut ta);
         ex.input(key(':'), &mut ta);
         ex.input(key('w'), &mut ta);
         let exrow = row_text(&ex);
         assert!(exrow.contains(":w"), "ex line shows the command: {exrow:?}");
-        assert!(!exrow.contains('❯'));
+        assert!(!exrow.contains('❯'), "the ex line owns the row: {exrow:?}");
+
+        // Esc closes the ex line and lands back in NORMAL — chevron, no colon.
+        ex.input(special(KeyCode::Esc), &mut ta);
+        let back = row_text(&ex);
+        assert!(
+            back.starts_with('❯') && !back.contains(":w"),
+            "Esc closes the command line, back to the input row: {back:?}"
+        );
     }
 
     #[test]
