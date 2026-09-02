@@ -32,6 +32,25 @@ fn a_prompt_window_cannot_be_constructed_outside_newt_core_tty() {
     );
 }
 
+/// **#2027, the type-level half of the terminal-taker registration.**
+///
+/// The registry test (`terminal_taker_registry.rs`) proves both directions of
+/// the declaration ↔ acquisition correspondence, but one of those directions
+/// is only interesting if the argument is genuinely required. Making the taker
+/// optional — a `Default`, an overload, a convenience door — would leave the
+/// registry proving a correspondence over a set anyone can opt out of. This is
+/// the twin that keeps it honest, in the same shape and the same harness as
+/// the seal's three cases above, because it is the same kind of claim: a wrong
+/// call does not compile.
+#[test]
+fn a_prompt_window_cannot_be_acquired_without_declaring_the_taker() {
+    assert_compile_fails(
+        "tests/ui/suspend_for_prompt_requires_a_taker.rs",
+        6,
+        &["suspend_for_prompt", "argument"],
+    );
+}
+
 fn assert_compile_fails(fixture: &str, line: usize, needles: &[&str]) {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let fixture_path = manifest_dir.join(fixture);
