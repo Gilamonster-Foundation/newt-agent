@@ -1364,7 +1364,9 @@ mod tests {
         let before = writer.0.lock().unwrap().len();
         assert!(before > 0, "the frame painted before the prompt");
 
-        let window = newt_core::tty::Terminal::suspend_for_prompt();
+        let window = newt_core::tty::Terminal::suspend_for_prompt(
+            newt_core::tty::TerminalTaker::RichSurfaceModal,
+        );
         // The arbiter erased us on the way in; that write is expected.
         let after_erase = writer.0.lock().unwrap().len();
 
@@ -1401,7 +1403,9 @@ mod tests {
         renderer.start(1);
         renderer.write(1, ToolOutputStream::Stdout, b"a\nb\nc\n");
 
-        let window = newt_core::tty::Terminal::suspend_for_prompt();
+        let window = newt_core::tty::Terminal::suspend_for_prompt(
+            newt_core::tty::TerminalTaker::RichSurfaceModal,
+        );
         let after_prompt = writer.0.lock().unwrap().len();
         renderer.write(1, ToolOutputStream::Stdout, b"d\ne\nf\n");
 
@@ -1462,7 +1466,9 @@ mod tests {
         // registration were a strong one, or the handle leaked, this would
         // paint into a dropped writer's buffer or panic.
         let before = writer.0.lock().unwrap().len();
-        let window = newt_core::tty::Terminal::suspend_for_prompt();
+        let window = newt_core::tty::Terminal::suspend_for_prompt(
+            newt_core::tty::TerminalTaker::RichSurfaceModal,
+        );
         drop(window);
         assert_eq!(
             writer.0.lock().unwrap().len(),

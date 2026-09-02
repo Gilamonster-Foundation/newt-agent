@@ -308,7 +308,7 @@ fn transient_reader_error_recovers_and_esc_resolves_through_the_tty_path() {
         None,
         None
     );
-    let win = Terminal::suspend_for_prompt();
+    let win = Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionAuthorization);
     let (choice, scope) = gate.run_web_wait(
         &store,
         &request_id,
@@ -356,7 +356,7 @@ fn transient_reader_error_does_not_deny_when_a_web_verdict_arrives() {
         None,
         None
     );
-    let win = Terminal::suspend_for_prompt();
+    let win = Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionAuthorization);
     let (choice, _scope) = gate.run_web_wait(
         &store,
         &request_id,
@@ -400,7 +400,7 @@ fn reader_failing_until_deadline_denies_without_busy_spin() {
         None,
         None
     );
-    let win = Terminal::suspend_for_prompt();
+    let win = Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionAuthorization);
     let sleeps = std::cell::Cell::new(0u32);
     let (choice, scope) = gate.run_web_wait(
         &store,
@@ -449,7 +449,7 @@ fn web_verdict_and_local_control_resolve_exactly_once() {
         None,
         None
     );
-    let win = Terminal::suspend_for_prompt();
+    let win = Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionAuthorization);
     let (choice, _s) = gate.run_web_wait(
         &store,
         &request_id,
@@ -489,7 +489,7 @@ fn web_verdict_and_local_control_resolve_exactly_once() {
         None,
         None
     );
-    let win2 = Terminal::suspend_for_prompt();
+    let win2 = Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionAuthorization);
     let (choice2, _s2) = gate2.run_web_wait(
         &store2,
         &request_id2,
@@ -544,7 +544,7 @@ fn ctrl_c_after_a_recoverable_reader_error_sets_cancel_and_exit() {
         Some(&cancel),
         Some(&exit)
     );
-    let win = Terminal::suspend_for_prompt();
+    let win = Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionAuthorization);
     let (choice, _s) = gate.run_web_wait(
         &store,
         &request_id,
@@ -601,7 +601,7 @@ fn repeated_interrupted_keeps_the_reader_and_paces_without_spinning() {
         None,
         None
     );
-    let win = Terminal::suspend_for_prompt();
+    let win = Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionAuthorization);
     let reacquired = std::cell::Cell::new(0u32);
     let sleeps = std::cell::Cell::new(0u32);
     let (choice, _s) = gate.run_web_wait(
@@ -666,7 +666,7 @@ fn an_initial_unsupported_still_retries_and_recovers() {
         None,
         None
     );
-    let win = Terminal::suspend_for_prompt();
+    let win = Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionAuthorization);
     let (choice, _s) = gate.run_web_wait(
         &store,
         &request_id,
@@ -718,7 +718,7 @@ fn a_post_live_unsupported_keeps_retrying_and_recovers() {
         None,
         None
     );
-    let win = Terminal::suspend_for_prompt();
+    let win = Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionAuthorization);
     let (choice, _s) = gate.run_web_wait(
         &store,
         &request_id,
@@ -2109,7 +2109,7 @@ fn a_typed_terminal_answer_decides_the_offer_instead_of_being_dropped() {
         None,
         None
     );
-    let win = Terminal::suspend_for_prompt();
+    let win = Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionAuthorization);
     let (choice, scope) = gate.run_web_wait(
         &store,
         &request_id,
@@ -2177,7 +2177,7 @@ fn a_terminal_answer_that_loses_to_the_web_is_told_it_lost() {
         None,
         None
     );
-    let win = Terminal::suspend_for_prompt();
+    let win = Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionAuthorization);
     let mut told: Vec<String> = Vec::new();
     let (choice, _scope) = gate.run_web_wait(
         &store,
@@ -2236,7 +2236,7 @@ fn a_terminal_answer_that_wins_is_told_nothing() {
         None,
         None
     );
-    let win = Terminal::suspend_for_prompt();
+    let win = Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::PermissionAuthorization);
     let mut told: Vec<String> = Vec::new();
     let (choice, _scope) = gate.run_web_wait(
         &store,

@@ -355,7 +355,9 @@ async fn repair_ambiguous_dropin(path: &Path, text: &str) {
             ),
         ],
     );
-    let window = newt_core::tty::Terminal::suspend_for_prompt();
+    let window = newt_core::tty::Terminal::suspend_for_prompt(
+        newt_core::tty::TerminalTaker::PlainCliConfirm,
+    );
     let picked = newt_core::interaction_terminal::resolve_on_terminal(&window, &menu);
     match picked.as_ref().map(|id| id.as_str()) {
         Some("o") => match newt_core::claim_backend_dropin_as_operator(text) {

@@ -141,7 +141,8 @@ fn interaction_view_child() {
 
             let interaction = fixture_interaction();
             let outcome = {
-                let _window = Terminal::suspend_for_prompt();
+                let _window =
+                    Terminal::suspend_for_prompt(newt_core::tty::TerminalTaker::RichSurfaceModal);
                 crate::interaction_view::present(&interaction).expect("the frame runs")
             };
             drop(spinner);

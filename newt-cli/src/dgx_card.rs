@@ -290,7 +290,9 @@ pub async fn run(cmd: CardCmd, config_path: Option<&Path>) -> anyhow::Result<()>
             // interaction lane, and F0a is where it arrives. `render_menu`
             // and `parse_selection` are gone with it: the entries are options
             // and `resolve_typed` resolves them.
-            let window = newt_core::tty::Terminal::suspend_for_prompt();
+            let window = newt_core::tty::Terminal::suspend_for_prompt(
+                newt_core::tty::TerminalTaker::PlainCliConfirm,
+            );
             let rows: Vec<(String, String)> = entries
                 .iter()
                 .enumerate()

@@ -636,7 +636,9 @@ fn setup(
         // obtain a speaking window at all, so `ask` errors here instead of
         // printing a question onto a JSON-RPC wire and blocking for an answer
         // that is never coming.
-        let window = newt_core::tty::Terminal::suspend_for_prompt();
+        let window = newt_core::tty::Terminal::suspend_for_prompt(
+            newt_core::tty::TerminalTaker::PlainCliConfirm,
+        );
         // EOF is not consent, and it is no longer this site's job to remember
         // that: `confirmed_on_terminal` refuses every outcome that is not an
         // affirmative answer. The `matches!` this replaces was fail-closed by
@@ -2481,7 +2483,9 @@ async fn adopt_cmd(
                 // enter. Both land on `Report` (change nothing), so it was
                 // fail-closed but not honest. `None` now means "no answer",
                 // for either reason, and says so in one place.
-                let window = newt_core::tty::Terminal::suspend_for_prompt();
+                let window = newt_core::tty::Terminal::suspend_for_prompt(
+                    newt_core::tty::TerminalTaker::PlainCliConfirm,
+                );
                 // The three choices are OPTIONS now, so `a`/`adopt` are an
                 // accelerator and an id rather than two strings a private
                 // match had to know about. `resolve_on_terminal` folds EOF, a

@@ -69,7 +69,9 @@ impl Operator<'static> {
     pub(super) fn terminal() -> Self {
         Self {
             ask: Box::new(|interaction| {
-                let window = newt_core::tty::Terminal::suspend_for_prompt();
+                let window = newt_core::tty::Terminal::suspend_for_prompt(
+                    newt_core::tty::TerminalTaker::SetupWizard,
+                );
                 crate::permissions::present_on_terminal(&window, interaction)
             }),
             say: Box::new(|line| println!("{line}")),

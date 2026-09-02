@@ -148,7 +148,9 @@ fn run_approve(
 
     // Terminal-gated (the capability, not a flag): a session with no terminal
     // cannot obtain the window and falls through to the decline arm.
-    let window = newt_core::tty::Terminal::suspend_for_prompt();
+    let window = newt_core::tty::Terminal::suspend_for_prompt(
+        newt_core::tty::TerminalTaker::PlainCliConfirm,
+    );
     window.notice(&format!(
         "dock approval for `{label}`\n  peer agent fp : {}\n  peer pubkey   : {}…\n  key words     : {}\nThe peer's newt-web prints these SAME words when it binds its dock service —\nconfirm they match before approving (a cross-check of the peer's key, not a\ntwo-party anti-MITM SAS: same-operator trust is already proven by the mesh handshake).",
         &peer_fp[..16.min(peer_fp.len())],
@@ -202,7 +204,9 @@ fn run_revoke(
     let config_path = config_path(config)?;
     let root_key = load_root(operator_key_path)?;
 
-    let window = newt_core::tty::Terminal::suspend_for_prompt();
+    let window = newt_core::tty::Terminal::suspend_for_prompt(
+        newt_core::tty::TerminalTaker::PlainCliConfirm,
+    );
     if !newt_core::interaction_terminal::confirmed_on_terminal(
         &window,
         &newt_core::interaction_form::confirm(
@@ -236,7 +240,9 @@ fn run_revoke_all(
     let config_path = config_path(config)?;
     let root_key = load_root(operator_key_path)?;
 
-    let window = newt_core::tty::Terminal::suspend_for_prompt();
+    let window = newt_core::tty::Terminal::suspend_for_prompt(
+        newt_core::tty::TerminalTaker::PlainCliConfirm,
+    );
     if !newt_core::interaction_terminal::confirmed_on_terminal(
         &window,
         &newt_core::interaction_form::confirm(

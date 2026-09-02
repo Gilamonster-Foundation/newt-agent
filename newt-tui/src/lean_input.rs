@@ -383,7 +383,9 @@ impl InputSurface for LeanSurface {
         &mut self,
         interaction: &newt_core::interaction_surface::SurfaceInteraction,
     ) -> newt_core::HumanQuestionOutcome {
-        let window = newt_core::tty::Terminal::suspend_for_prompt();
+        let window = newt_core::tty::Terminal::suspend_for_prompt(
+            newt_core::tty::TerminalTaker::LeanSurfaceModal,
+        );
         crate::permissions::present_on_terminal(&window, interaction)
     }
 

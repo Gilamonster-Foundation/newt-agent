@@ -108,7 +108,7 @@ fn notice_under_prompt_window_child() {
             .expect("spinner");
     std::thread::sleep(DWELL);
     {
-        let window = Terminal::suspend_for_prompt();
+        let window = Terminal::suspend_for_prompt(crate::tty::TerminalTaker::PlainCliConfirm);
         window.ask(QUESTION).expect("the question reaches the pty");
         std::thread::sleep(Duration::from_millis(100));
         notice().emit(LineCaps::Own, Sink::Stdout, true);
@@ -132,7 +132,7 @@ fn legacy_notice_under_prompt_window_child() {
             .expect("spinner");
     std::thread::sleep(DWELL);
     {
-        let window = Terminal::suspend_for_prompt();
+        let window = Terminal::suspend_for_prompt(crate::tty::TerminalTaker::PlainCliConfirm);
         window.ask(QUESTION).expect("the question reaches the pty");
         std::thread::sleep(Duration::from_millis(100));
         // ---- the deleted implementation, exactly as it stood ----
@@ -165,7 +165,7 @@ fn protocol_mode_prompt_child() {
     }
     super::caps::enter_protocol_mode();
 
-    let window = Terminal::suspend_for_prompt();
+    let window = Terminal::suspend_for_prompt(crate::tty::TerminalTaker::PlainCliConfirm);
 
     // Deliberately NOT asserted yet. Asserting here would short-circuit the
     // child on the very mutation this test exists to catch, and the parent
@@ -229,7 +229,8 @@ fn protocol_mode_prompt_child() {
         );
         std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) })
     };
-    let window = Terminal::suspend_for_prompt_to(terminal);
+    let window =
+        Terminal::suspend_for_prompt_to(terminal, crate::tty::TerminalTaker::PlainCliConfirm);
     let asked = window.ask(QUESTION);
     let mut buf = String::new();
     let read = window.read_line_into(&mut buf);

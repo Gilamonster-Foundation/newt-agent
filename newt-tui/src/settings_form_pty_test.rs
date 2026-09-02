@@ -31,7 +31,9 @@ fn settings_form_child() {
         return;
     }
     let ask = |interaction: &newt_core::interaction_surface::SurfaceInteraction| {
-        let window = newt_core::tty::Terminal::suspend_for_prompt();
+        let window = newt_core::tty::Terminal::suspend_for_prompt(
+            newt_core::tty::TerminalTaker::RichSurfaceModal,
+        );
         crate::permissions::present_on_terminal(&window, interaction)
     };
     for line in crate::settings_form::run(&ask, "") {
