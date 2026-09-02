@@ -134,6 +134,11 @@ mod palette;
 // `/psyche` and `/backends` were each carrying.
 #[cfg(feature = "rich-tui")]
 mod panel;
+// `/settings` as a chooser (slash_registry's `Disposition::Panel`), over the
+// same driver and the same chrome as /psyche and /backends. The typed form
+// stays for every surface that has no region to draw in.
+#[cfg(feature = "rich-tui")]
+mod settings_panel;
 // The backend chooser/editor panel (#1667) — same grammar, same gating; its
 // persistence rides the setup wizard's crash-safe lock + plan machinery.
 #[cfg(feature = "rich-tui")]
