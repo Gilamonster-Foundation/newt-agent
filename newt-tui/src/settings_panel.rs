@@ -38,7 +38,7 @@
 use crossterm::event::KeyCode;
 use ratatui::text::Line;
 
-use crate::config_panel::{clamp_step, hint_line, render_panel, status_line, ModelChoice, RowView};
+use crate::config_panel::{clamp_step, hint_line, render_panel, ModelChoice, RowView};
 use crate::panel::{Flow, Screen};
 use crate::settings_form::{Field, ValueSpace};
 
@@ -289,7 +289,6 @@ pub(crate) enum Outcome {
 pub(crate) struct SettingsPanel {
     rows: Vec<Row>,
     sel: usize,
-    status: Option<String>,
     /// Set by Enter on a door; read by [`run`] once the panel closes.
     walk_through: bool,
 }
@@ -317,7 +316,6 @@ impl SettingsPanel {
         Self {
             rows,
             sel: 0,
-            status: None,
             walk_through: false,
         }
     }
@@ -413,10 +411,17 @@ impl SettingsPanel {
 
 impl Screen for SettingsPanel {
     fn draw(&self, frame: &mut ratatui::Frame) {
-        let bottom: Line = match &self.status {
-            Some(status) => status_line(status),
-            None => hint_line("↑↓ select · ←→ change · Enter apply · Esc cancel"),
-        };
+        // A hint, and nothing else. There is deliberately no status line: this
+        // panel cannot fail while it is open. Every value it offers comes from
+        // the field's own vocabulary, so a dial cannot land on something to
+        // refuse, and the writes happen after it closes — a refusal there is
+        // the CALLER's line to print, where the operator is already looking.
+        //
+        // The first cut had a `status: Option<String>` that nothing ever set,
+        // which meant a `Some(..)` render arm that could not be reached. Found
+        // by three independent designs of the isolation harness, all asking the
+        // same question: which states can this component actually be in?
+        let bottom: Line = hint_line("↑↓ select · ←→ change · Enter apply · Esc cancel");
         render_panel(frame, " settings ", &self.view_rows(), bottom, 26, 12);
     }
 
@@ -432,10 +437,6 @@ impl Screen for SettingsPanel {
                     // A door does not dial.
                     Some(Row::Door(_)) | None => {}
                 }
-                // The hint returns once a dial moves: a stale refusal beside a
-                // value the operator has since changed reads as a live verdict
-                // on the new one.
-                self.status = None;
             }
             KeyCode::Enter => {
                 // Enter on a door WALKS THROUGH it; Enter anywhere else applies
