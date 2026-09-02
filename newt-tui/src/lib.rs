@@ -266,6 +266,21 @@ pub fn run_crew_edit(name: Option<&str>, color: bool) -> anyhow::Result<()> {
     crew_form::run_edit(name, color)
 }
 
+/// [`run_crew_edit`], asking through the session's surface seam (#1862 C1)
+/// rather than this thread's terminal. `/crew edit` uses this; the `newt crew
+/// edit` CLI, which owns the terminal, uses [`run_crew_edit`].
+///
+/// # Errors
+///
+/// Propagates a crew write failure.
+pub(crate) fn run_crew_edit_with_ask(
+    name: Option<&str>,
+    color: bool,
+    ask: SlashAsk<'_>,
+) -> anyhow::Result<()> {
+    crew_form::run_edit_with_ask(name, color, ask)
+}
+
 /// Open the harness config panel (#14) for the psyche operator dials and return
 /// its [`config_panel::PanelOutcome`], or — when stdout is not a TTY (piped /
 /// headless) — print a short note pointing at the text `/psyche` view and return
@@ -620,6 +635,10 @@ impl SplashScreenGuard {
 #[cfg(test)]
 #[path = "lib_tests/splash_guard_tests.rs"]
 mod splash_guard_tests;
+
+#[cfg(test)]
+#[path = "lib_tests/slash_ask_seam_tests.rs"]
+mod slash_ask_seam_tests;
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -12666,14 +12685,57 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
     ]
 }
 
+/// How a slash command that needs an ANSWER reaches the operator.
+///
+/// The same shape as `permissions.rs`'s `ask_surface` and `crew_form`'s
+/// `Ask`, deliberately: a form needs exactly what a permission question needs.
+/// Widening the existing seam is the reuse discipline; a second console path
+/// is what produced two live prompts on one screen.
+pub(crate) type SlashAsk<'a> = &'a dyn Fn(
+    &newt_core::interaction_surface::SurfaceInteraction,
+) -> newt_core::HumanQuestionOutcome;
+
+/// The fallback ask for a caller that owns the terminal outright (the plain
+/// CLI path, and every test). A cockpit session must NOT use this: it writes
+/// under a mounted chat editor that keeps repainting its clock and its live
+/// chevron over the question. Sessions pass their surface seam instead.
+pub(crate) fn ask_on_this_terminal(
+    interaction: &newt_core::interaction_surface::SurfaceInteraction,
+) -> newt_core::HumanQuestionOutcome {
+    let window = newt_core::tty::Terminal::suspend_for_prompt();
+    crate::permissions::present_on_terminal(&window, interaction)
+}
+
 /// Dispatch a `/command` line. Returns `true` to keep the session alive,
 /// `false` to exit.
+///
+/// Terminal-owning form: any question is asked on THIS terminal. A session
+/// with a mounted surface calls [`dispatch_slash_with_ask`] instead.
+///
+/// Production has exactly one slash call site (`chat.rs`) and it always has a
+/// surface, so this convenience form is the test/CLI shape.
+#[cfg(test)]
 fn dispatch_slash(
     input: &str,
     workspace: &str,
     color: bool,
     verbose: bool,
     markdown: bool,
+) -> anyhow::Result<bool> {
+    dispatch_slash_with_ask(input, workspace, color, verbose, markdown, None)
+}
+
+/// [`dispatch_slash`], with the surface seam a session presents questions
+/// through (#1862 C1). `ask = Some(..)` routes a form's questions to the
+/// thread that owns the terminal, which is what dims the chat chevron,
+/// reserves the modal's rows, and freezes the header clock for the duration.
+fn dispatch_slash_with_ask(
+    input: &str,
+    workspace: &str,
+    color: bool,
+    verbose: bool,
+    markdown: bool,
+    ask: Option<SlashAsk<'_>>,
 ) -> anyhow::Result<bool> {
     // Strip leading slash and split into at most 3 tokens.
     let body = input.trim_start_matches('/');
@@ -12696,17 +12758,20 @@ fn dispatch_slash(
         // #1981: the typed settings form. Absorbs the knob verbs; every route
         // — form, deep link, deprecated verb — lands on `settings_form::apply`.
         "settings" => {
-            let ask = |interaction: &newt_core::interaction_surface::SurfaceInteraction| {
-                let window = newt_core::tty::Terminal::suspend_for_prompt();
-                crate::permissions::present_on_terminal(&window, interaction)
-            };
+            // The seam the session supplied, or this terminal when there is no
+            // session to ask through. ONE ask path either way.
+            let fallback = ask_on_this_terminal;
+            let ask: SlashAsk<'_> = ask.unwrap_or(&fallback);
             let rest = format!("{arg1} {arg2}");
-            for line in settings_form::run(&ask, rest.trim()) {
+            for line in settings_form::run(ask, rest.trim()) {
                 print_newt(&line, color, verbose);
             }
             Ok(true)
         }
-        "crew" => commands::crew::dispatch(arg1, arg2, color, verbose),
+        "crew" => {
+            let fallback = ask_on_this_terminal;
+            commands::crew::dispatch(arg1, arg2, color, verbose, ask.unwrap_or(&fallback))
+        }
         "setup" => commands::setup::dispatch(arg1, color, verbose),
         other => {
             print_newt(&slash_registry::fallthrough_message(other), color, verbose);

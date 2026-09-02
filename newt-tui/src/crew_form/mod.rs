@@ -50,17 +50,29 @@ fn crews_dir() -> PathBuf {
 /// # Errors
 ///
 /// Propagates a write failure from [`save_crew`].
-pub fn run_edit(name: Option<&str>, _color: bool) -> anyhow::Result<()> {
+pub fn run_edit(name: Option<&str>, color: bool) -> anyhow::Result<()> {
+    // No session, so this caller owns the terminal outright.
+    run_edit_with_ask(name, color, &crate::ask_on_this_terminal)
+}
+
+/// [`run_edit`], asking through a caller-supplied seam.
+///
+/// An in-session `/crew edit` MUST pass the session's surface seam. Acquiring a
+/// prompt window here instead writes underneath a mounted chat editor that goes
+/// on repainting its clock and its live chevron over the question — the same
+/// defect `/settings` had.
+///
+/// # Errors
+///
+/// Propagates a write failure from [`save_crew`].
+pub fn run_edit_with_ask(
+    name: Option<&str>,
+    _color: bool,
+    ask: crate::SlashAsk<'_>,
+) -> anyhow::Result<()> {
     let cfg = Config::resolve().unwrap_or_default();
     let dir = crews_dir();
-    // Byte-identical to `LeanSurface`/`RichSurface::present_interaction`: the
-    // window is acquired per prompt by whoever owns the terminal, and the
-    // rendering + read is the one terminal adapter.
-    let ask = |interaction: &SurfaceInteraction| {
-        let window = newt_core::tty::Terminal::suspend_for_prompt();
-        crate::permissions::present_on_terminal(&window, interaction)
-    };
-    for line in edit_and_save(&ask, &cfg, name, &dir)?.report() {
+    for line in edit_and_save(ask, &cfg, name, &dir)?.report() {
         println!("{line}");
     }
     Ok(())
