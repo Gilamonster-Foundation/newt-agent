@@ -55,7 +55,7 @@
 
 use std::io;
 
-use crossterm::event::KeyCode;
+use crate::panel::Key;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -994,14 +994,17 @@ impl<P: FnMut(&str, &str, bool) -> SaveResult> crate::panel::Screen for PsycheSc
         draw(frame, &self.state);
     }
 
-    fn key(&mut self, code: KeyCode, ctrl: bool) -> crate::panel::Flow {
+    fn key(&mut self, key: Key) -> crate::panel::Flow {
         use crate::panel::Flow;
         if self.state.in_command() {
-            match code {
-                KeyCode::Char(c) => self.state.command_char(c),
-                KeyCode::Backspace => self.state.command_backspace(),
-                KeyCode::Esc => self.state.cancel_command(),
-                KeyCode::Enter => {
+            match key {
+                // `Char` is now a PLAIN character by construction, so a second
+                // Ctrl-S while the line is open no longer types a literal `s`
+                // into the line Ctrl-S opened.
+                Key::Char(c) => self.state.command_char(c),
+                Key::Backspace => self.state.command_backspace(),
+                Key::Esc => self.state.cancel_command(),
+                Key::Enter => {
                     if let Some(apply) = self.state.run_command(&mut self.persist) {
                         return Flow::Close(apply);
                     }
@@ -1010,15 +1013,17 @@ impl<P: FnMut(&str, &str, bool) -> SaveResult> crate::panel::Screen for PsycheSc
             }
             return Flow::Stay;
         }
-        match code {
-            KeyCode::Up => self.state.up(),
-            KeyCode::Down => self.state.down(),
-            KeyCode::Left => self.state.cycle(-1),
-            KeyCode::Right => self.state.cycle(1),
-            KeyCode::Char('s') if ctrl => self.state.begin_command("w "),
-            KeyCode::Char(':') => self.state.begin_command(""),
-            KeyCode::Enter => return Flow::Close(true),
-            KeyCode::Esc | KeyCode::Char('q') => return Flow::Close(false),
+        match key {
+            Key::Up => self.state.up(),
+            Key::Down => self.state.down(),
+            Key::Left => self.state.cycle(-1),
+            Key::Right => self.state.cycle(1),
+            // An explicit control binding, said in the pattern rather than in
+            // a guard beside it.
+            Key::Ctrl('s') => self.state.begin_command("w "),
+            Key::Char(':') => self.state.begin_command(""),
+            Key::Enter => return Flow::Close(true),
+            Key::Esc | Key::Char('q') => return Flow::Close(false),
             _ => {}
         }
         Flow::Stay

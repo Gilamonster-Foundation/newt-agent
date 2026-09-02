@@ -51,7 +51,7 @@
 //! [`PanelState`] is pure (no terminal, no I/O) and unit-tested; the raw-mode
 //! loop ([`run`]) mirrors `config_panel::run`.
 
-use crossterm::event::KeyCode;
+use crate::panel::Key;
 use std::io;
 
 use newt_core::BackendKind;
@@ -1133,14 +1133,14 @@ where
         draw(frame, &self.state);
     }
 
-    fn key(&mut self, code: KeyCode, ctrl: bool) -> crate::panel::Flow {
+    fn key(&mut self, key: Key) -> crate::panel::Flow {
         use crate::panel::Flow;
         if self.state.in_command() {
-            match code {
-                KeyCode::Char(c) if !ctrl => self.state.command_char(c),
-                KeyCode::Backspace => self.state.command_backspace(),
-                KeyCode::Esc => self.state.cancel_command(),
-                KeyCode::Enter => {
+            match key {
+                Key::Char(c) => self.state.command_char(c),
+                Key::Backspace => self.state.command_backspace(),
+                Key::Esc => self.state.cancel_command(),
+                Key::Enter => {
                     if let Some(apply) = self.state.run_command(&mut self.remove) {
                         return Flow::Close(apply);
                     }
@@ -1150,30 +1150,31 @@ where
             return Flow::Stay;
         }
         if self.state.in_form() {
-            match code {
-                KeyCode::Up => self.state.form_nav(-1),
-                KeyCode::Down => self.state.form_nav(1),
-                KeyCode::Left => self.state.form_cycle(-1),
-                KeyCode::Right => self.state.form_cycle(1),
-                KeyCode::Backspace => self.state.form_backspace(),
-                KeyCode::Enter => {
+            match key {
+                Key::Up => self.state.form_nav(-1),
+                Key::Down => self.state.form_nav(1),
+                Key::Left => self.state.form_cycle(-1),
+                Key::Right => self.state.form_cycle(1),
+                Key::Backspace => self.state.form_backspace(),
+                Key::Enter => {
                     self.state.submit_form(&mut self.persist);
                 }
-                KeyCode::Esc => self.state.cancel_form(),
-                KeyCode::Char(c) if !ctrl => self.state.form_input(c),
+                Key::Esc => self.state.cancel_form(),
+                Key::Char(c) => self.state.form_input(c),
                 _ => {}
             }
             return Flow::Stay;
         }
-        match code {
-            KeyCode::Left => self.state.cycle(-1),
-            KeyCode::Right => self.state.cycle(1),
-            KeyCode::Char('e') => self.state.begin_edit(),
-            KeyCode::Char('a') => self.state.begin_add(),
-            KeyCode::Char('d') => self.state.begin_remove(),
-            KeyCode::Char(':') => self.state.begin_command(""),
-            KeyCode::Enter => return Flow::Close(true),
-            KeyCode::Esc | KeyCode::Char('q') => return Flow::Close(false),
+        match key {
+            Key::Left => self.state.cycle(-1),
+            Key::Right => self.state.cycle(1),
+            // Plain by construction: Ctrl-E no longer opens the edit form.
+            Key::Char('e') => self.state.begin_edit(),
+            Key::Char('a') => self.state.begin_add(),
+            Key::Char('d') => self.state.begin_remove(),
+            Key::Char(':') => self.state.begin_command(""),
+            Key::Enter => return Flow::Close(true),
+            Key::Esc | Key::Char('q') => return Flow::Close(false),
             _ => {}
         }
         Flow::Stay
@@ -1650,6 +1651,29 @@ mod tests {
             state.status.as_deref().is_some_and(|s| !s.is_empty()),
             "and the refusal is explained"
         );
+    }
+
+    /// Ctrl-E is not `e`. The chooser's action keys were unguarded, so a
+    /// control chord opened the edit form — while its command and form arms
+    /// WERE guarded. That divergence inside one file is what the folded key
+    /// vocabulary ends.
+    #[test]
+    fn a_control_chord_does_not_trigger_the_action_keys() {
+        for chord in [Key::Ctrl('e'), Key::Ctrl('a'), Key::Ctrl('d')] {
+            let mut screen = BackendScreen {
+                state: panel(),
+                persist: ok_persist(),
+                remove: ok_remove(),
+            };
+            assert_eq!(
+                crate::panel::Screen::key(&mut screen, chord),
+                crate::panel::Flow::Stay
+            );
+            assert!(
+                !screen.state.in_form() && !screen.state.in_command(),
+                "{chord:?} must not open a mode"
+            );
+        }
     }
 
     #[test]
