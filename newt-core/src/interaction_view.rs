@@ -150,14 +150,12 @@ impl InteractionView {
                         });
                     }
                 }
-                ControlKind::Text => push_field(&mut rows, &control.label, ""),
-                ControlKind::Toggle => push_field(&mut rows, &control.label, " [y/n]"),
-                // A secret shows its LABEL and never its value (ADR D1), and
-                // says so — the same wording the plain projection uses, so a
-                // surface switch cannot change what a secret field claims.
-                ControlKind::Secret => {
-                    push_field(&mut rows, &control.label, " (secret, not echoed)");
-                }
+                // Every non-choice kind shows its label plus what the KIND
+                // advertises. The suffix table is `ControlKind::hint`, shared
+                // with the plain projection — a secret says " (secret, not
+                // echoed)" on BOTH surfaces because there is one table, not
+                // because two lists happen to agree today (ADR D1).
+                kind => push_field(&mut rows, &control.label, &kind.hint()),
             }
         }
 
@@ -425,6 +423,36 @@ mod c2 {
             (ControlKind::Text, "path:"),
             (ControlKind::Toggle, "path: [y/n]"),
             (ControlKind::Secret, "path: (secret, not echoed)"),
+            (
+                ControlKind::Number {
+                    min: Some(1),
+                    max: Some(10),
+                    step: None,
+                },
+                "path: [an integer in 1..=10]",
+            ),
+            (
+                ControlKind::Range {
+                    min: 0,
+                    max: 100,
+                    step: 5,
+                },
+                "path: [0..=100]",
+            ),
+            (
+                ControlKind::Temporal {
+                    precision: newt_interaction::TemporalPrecision::Date,
+                },
+                "path: [YYYY-MM-DD]",
+            ),
+            (ControlKind::Color, "path: [#rrggbb]"),
+            (
+                ControlKind::Path {
+                    kind: newt_interaction::PathKind::File,
+                    accept: Vec::new(),
+                },
+                "path: [file path]",
+            ),
         ] {
             let d = InteractionDefinition::new(
                 InteractionKind::Form,

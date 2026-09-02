@@ -135,20 +135,15 @@ pub fn render(definition: &InteractionDefinition) -> String {
 fn control_line(control: &Control) -> Option<String> {
     match &control.kind {
         ControlKind::Choice { options } => Some(choice_lines(options)),
-        ControlKind::Text => labelled_field(control, ""),
-        // `[y/n]`, never `[y/N]`. The house style elsewhere used to
-        // capitalize the default — `sas_confirm` did until F0c (#1928)
-        // retired its builder — and this
-        // projection must advertise none: the epic's global acceptance
-        // criterion is that headless modes never CHOOSE A DEFAULT, and a
-        // rendered default is how one gets chosen by accident.
-        ControlKind::Toggle => labelled_field(control, " [y/n]"),
-        // A secret shows its LABEL and never its value (ADR D1). The value
-        // cannot leak here by construction — `ControlKind::Secret` carries
-        // none, and a submitted secret travels as `ControlValue::Secret {
-        // reference }` on the RESPONSE, which this renderer never sees. The
-        // marker exists so no surface treats the field as ordinary text.
-        ControlKind::Secret => labelled_field(control, " (secret, not echoed)"),
+        // Every other kind renders as `label` + what the KIND advertises —
+        // ` [y/n]`, ` (secret, not echoed)`, ` [YYYY-MM-DD]`. That suffix table
+        // lives on `ControlKind::hint` because this module and
+        // `interaction_view` both need it, and two copies is how a kind ends up
+        // rendering as a bare label on one surface only.
+        //
+        // The pre-existing strings are unchanged, which is load-bearing: this
+        // projection is a byte-identity contract.
+        kind => labelled_field(control, &kind.hint()),
     }
 }
 
@@ -485,6 +480,36 @@ mod c0b {
             (ControlKind::Text, "body\nfield:"),
             (ControlKind::Toggle, "body\nfield: [y/n]"),
             (ControlKind::Secret, "body\nfield: (secret, not echoed)"),
+            (
+                ControlKind::Number {
+                    min: Some(1),
+                    max: Some(10),
+                    step: None,
+                },
+                "body\nfield: [an integer in 1..=10]",
+            ),
+            (
+                ControlKind::Range {
+                    min: 0,
+                    max: 100,
+                    step: 5,
+                },
+                "body\nfield: [0..=100]",
+            ),
+            (
+                ControlKind::Temporal {
+                    precision: newt_interaction::TemporalPrecision::Date,
+                },
+                "body\nfield: [YYYY-MM-DD]",
+            ),
+            (ControlKind::Color, "body\nfield: [#rrggbb]"),
+            (
+                ControlKind::Path {
+                    kind: newt_interaction::PathKind::File,
+                    accept: Vec::new(),
+                },
+                "body\nfield: [file path]",
+            ),
         ] {
             let def = definition(
                 InteractionKind::Form,

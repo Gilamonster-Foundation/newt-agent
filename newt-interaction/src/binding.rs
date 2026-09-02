@@ -207,6 +207,23 @@ pub enum Refusal {
         /// The kind the value carries.
         found: &'static str,
     },
+    /// The value is the control's kind, but not a well-formed one of it —
+    /// `not-a-date` for a date, `11` for a number capped at 10.
+    ///
+    /// Distinct from [`WrongControlType`](Self::WrongControlType) on purpose:
+    /// that one is a responder answering the wrong FIELD SHAPE, which is a
+    /// protocol error, while this is a human typing something that is not what
+    /// was asked for. A surface can correct the second inline and can do
+    /// nothing about the first.
+    #[error("control `{control}` expects {expected}, but got `{found}`")]
+    MalformedValue {
+        /// The control answered.
+        control: String,
+        /// What a well-formed answer looks like.
+        expected: String,
+        /// What was submitted.
+        found: String,
+    },
     /// The chosen option is not one the control offers.
     #[error("control `{control}` does not offer option `{option}`")]
     UnknownOption {
@@ -241,6 +258,11 @@ fn kind_name(kind: &ControlKind) -> &'static str {
         ControlKind::Text => "text",
         ControlKind::Toggle => "toggle",
         ControlKind::Secret => "secret",
+        ControlKind::Number { .. } => "number",
+        ControlKind::Range { .. } => "range",
+        ControlKind::Temporal { .. } => "temporal",
+        ControlKind::Color => "color",
+        ControlKind::Path { .. } => "path",
     }
 }
 
@@ -325,9 +347,25 @@ fn check_value(control: &Control, value: &ControlValue) -> Result<Option<OptionI
                 })
             }
         }
-        (ControlKind::Text, ControlValue::Text { .. })
-        | (ControlKind::Toggle, ControlValue::Toggle { .. })
+        (ControlKind::Toggle, ControlValue::Toggle { .. })
         | (ControlKind::Secret, ControlValue::Secret { .. }) => Ok(None),
+        // **The value-shaped kinds all travel as text, and are checked here.**
+        //
+        // One variant on the wire rather than one per kind, for the same
+        // reason HTML gives every input a string value: a `ControlValue` per
+        // kind would put the definition's meaning in two places and let a
+        // response claim a shape the control never declared. What the control
+        // declares is what the answer is measured against — `check_text` is
+        // the single implementation, shared with every surface that wants to
+        // validate as you type.
+        (kind, ControlValue::Text { text }) if kind.travels_as_text() => kind
+            .check_text(text)
+            .map(|()| None)
+            .map_err(|expected| Refusal::MalformedValue {
+                control: control.id.as_str().to_string(),
+                expected,
+                found: text.clone(),
+            }),
         _ => Err(Refusal::WrongControlType {
             control: control.id.as_str().to_string(),
             expected: kind_name(&control.kind),
