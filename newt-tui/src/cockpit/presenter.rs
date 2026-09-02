@@ -2021,16 +2021,38 @@ mod terminal_acceptance {
                 draft,
                 "the chat draft survives both panel failure paths"
             );
-            // The block is still live: it repaints on demand rather than
-            // having been left in the modal's reserved geometry.
+            // **The block is still LIVE after both failure paths** — it takes
+            // input and paints it, rather than being stuck in the geometry the
+            // failed panel reserved.
+            //
+            // Proven by typing something new, not by `dirty = true` + a length
+            // comparison. Ratatui diffs its buffer: a redraw of unchanged
+            // content emits a handful of trailing bytes and nothing else, so
+            // the length check was asserting almost nothing — and what little
+            // it did assert raced the responder thread's drain, which is how
+            // it failed under coverage instrumentation. New text can only
+            // reach the terminal through a live block, and
+            // `wait_for_painted_after` reads at a point where the drain has
+            // caught up.
             let before_repaint = tty.painted().len();
-            cockpit.dirty = true;
+            {
+                let (editor, screen) = (&mut cockpit.editor, &mut cockpit.screen);
+                editor
+                    .on_event(Event::Paste(" and still alive".into()), screen)
+                    .expect("the mounted editor still takes input");
+            }
             cockpit
                 .draw()
                 .expect("the cockpit still paints after a failed panel");
             assert!(
-                tty.painted().len() > before_repaint,
-                "the cockpit block is still live after the panel failure paths"
+                tty.wait_for_painted_after(
+                    before_repaint,
+                    "alive",
+                    std::time::Duration::from_secs(2)
+                ),
+                "the cockpit block is still live after the panel failure paths \
+                 (waited 2s): {:?}",
+                &tty.painted()[before_repaint..]
             );
         }
 
