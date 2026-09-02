@@ -804,10 +804,27 @@ fn sanitize_name(s: &str) -> String {
         .collect()
 }
 
-/// Clamped (non-wrapping) spinner step — shared with the backend panel (#1667).
+/// Clamped (non-wrapping) spinner step — shared by every panel dial.
+///
+/// **Total, including on an empty list.** The obvious form,
+/// `(i + dir).clamp(0, len - 1)`, PANICS at `len == 0`: that is `clamp(0, -1)`,
+/// and `clamp` requires `min <= max`. No caller reaches it today, and each one
+/// is safe for a different reason — the backend chooser always carries two
+/// unremovable kind fallbacks, the psyche panel filters an empty model list to
+/// `None`, the settings panel guards both dial paths, and the ladders are
+/// consts. Four accidents of construction, none of them stated, all of them
+/// one refactor from being wrong.
+///
+/// So the helper is made total rather than each caller made careful: an empty
+/// list has no positions, and the only honest answer for "where is the cursor"
+/// is 0. That is CLAUDE.md's rule — prefer making a bug unrepresentable over
+/// fixing each site — applied to the one place that can enforce it.
 pub(crate) fn clamp_step(i: usize, dir: i32, len: usize) -> usize {
-    let n = len as i32;
-    (i as i32 + dir).clamp(0, n - 1) as usize
+    let Some(last) = len.checked_sub(1) else {
+        return 0;
+    };
+    let n = i32::try_from(last).unwrap_or(i32::MAX);
+    (i32::try_from(i).unwrap_or(i32::MAX) + dir).clamp(0, n) as usize
 }
 
 /// Bordered block (2) + six rows + a hint/command/status row.
@@ -1130,6 +1147,37 @@ mod tests {
     /// #1668: a panel apply marks a posture ACTION for exactly its DIRTY dials
     /// — so browsing the panel (bare `/psyche` opens it) can never pin, and a
     /// one-dial edit cannot drag the other dial's ambient value into the pin.
+    /// **The dial step is total**, including on the empty list no caller
+    /// reaches today.
+    ///
+    /// The naive `clamp(0, len - 1)` panics at `len == 0` — `clamp` requires
+    /// `min <= max`. Every current caller is safe for a DIFFERENT reason (two
+    /// unremovable kind fallbacks; an empty model list filtered to `None`; two
+    /// guarded dial paths; const ladders), which is four unstated accidents
+    /// rather than one enforced rule. This is the rule.
+    #[test]
+    fn the_dial_step_is_total_and_clamps_at_both_ends() {
+        // The case that used to panic.
+        assert_eq!(clamp_step(0, 1, 0), 0, "an empty list has no positions");
+        assert_eq!(clamp_step(0, -1, 0), 0);
+        assert_eq!(clamp_step(7, 1, 0), 0, "even from a stale index");
+
+        // A one-item list is a fixed point in both directions.
+        assert_eq!(clamp_step(0, 1, 1), 0);
+        assert_eq!(clamp_step(0, -1, 1), 0);
+
+        // And the ordinary case still clamps rather than wrapping.
+        assert_eq!(clamp_step(0, -1, 3), 0, "the floor holds");
+        assert_eq!(clamp_step(2, 1, 3), 2, "the ceiling holds");
+        assert_eq!(clamp_step(1, 1, 3), 2);
+        assert_eq!(clamp_step(1, -1, 3), 0);
+
+        // A stale index above the end walks back into range rather than
+        // reaching further out — the shape a shrinking list produces.
+        assert_eq!(clamp_step(9, -1, 3), 2);
+        assert_eq!(clamp_step(9, 1, 3), 2);
+    }
+
     /// **The panel cannot reach a dial except through the recorder** (#1965).
     ///
     /// `PanelState::apply` used to call `set_cli_cognition` /

@@ -1559,6 +1559,99 @@ mod tests {
         assert!(k.status.as_deref().unwrap().contains("named backend"));
     }
 
+    /// **`selected()` indexes without a bounds check, and this is why that is
+    /// safe.**
+    ///
+    /// `&self.options[self.pick.value()]` (`:466`) is reached from `draw` on
+    /// every repaint. Two invariants keep it in range, and neither was
+    /// asserted anywhere — they were true by accident of construction, which
+    /// is the state a helper is in right before someone changes it:
+    ///
+    /// 1. **The option list is never empty.** `run` refuses an empty seed, and
+    ///    the two kind fallbacks are `KindToggle`, which `editable()` excludes
+    ///    and `remove_command` refuses — as is any `Inline` entry. So `len >= 2`
+    ///    no matter how many drop-ins are deleted.
+    /// 2. **`remove_option` keeps the spinner in range**, repositioning it
+    ///    when the removed row was at or before it.
+    ///
+    /// Driven to exhaustion rather than argued: remove every removable option,
+    /// checking both invariants after each one.
+    #[test]
+    fn the_spinner_stays_in_range_however_many_options_are_removed() {
+        let mut state = panel();
+        let mut removals = 0;
+
+        // Walk the spinner to the end first, so removals happen with the
+        // cursor ABOVE the removed index — the arm that repositions.
+        for _ in 0..state.options.len() {
+            state.cycle(1);
+        }
+
+        while let Some(name) = state
+            .options
+            .iter()
+            .find(|o| o.editable())
+            .map(|o| o.name.clone())
+        {
+            let idx = state.named_index(&name).expect("just found it");
+            state.remove_option(idx);
+            removals += 1;
+
+            assert!(
+                !state.options.is_empty(),
+                "the kind fallbacks are unremovable, so the list cannot empty"
+            );
+            assert!(
+                state.pick.value() < state.options.len(),
+                "the spinner points past the end after removing `{name}` \
+                 ({} of {})",
+                state.pick.value(),
+                state.options.len()
+            );
+            // The unguarded index in `selected()`, exercised for real.
+            let _ = state.selected();
+        }
+
+        assert!(
+            removals >= 2,
+            "the fixture has removable options to exhaust"
+        );
+        assert!(
+            state.options.iter().all(|o| !o.editable()),
+            "what remains is exactly what cannot be removed"
+        );
+        // Which is MORE than the kind fallbacks: an `Inline` entry is not
+        // editable either, so it survives too. The floor is "every
+        // non-editable option", and writing `2` here would have pinned a
+        // fixture detail rather than the invariant.
+        assert!(state.options.len() >= 2, "at least the two kind fallbacks");
+        // And the dial still moves at the floor of that list.
+        state.cycle(1);
+        state.cycle(-1);
+        let _ = state.selected();
+    }
+
+    /// The refusal that makes invariant 1 hold: a kind fallback cannot be
+    /// removed, so the list has a floor of two.
+    #[test]
+    fn a_kind_fallback_cannot_be_removed() {
+        let mut state = panel();
+        let mut remove = ok_remove();
+        state.begin_command("");
+        for c in "d ollama".chars() {
+            state.command_char(c);
+        }
+        assert_eq!(state.run_command(&mut remove), None, "stays open");
+        assert!(
+            state.options.iter().any(|o| o.name == "ollama"),
+            "the fallback survives the delete"
+        );
+        assert!(
+            state.status.as_deref().is_some_and(|s| !s.is_empty()),
+            "and the refusal is explained"
+        );
+    }
+
     #[test]
     fn remove_nonactive_deletes_via_injected_closure_and_stays_open() {
         let mut s = panel();
