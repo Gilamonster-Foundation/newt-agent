@@ -1719,6 +1719,39 @@ mod tests {
         drop(reclaimed);
     }
 
+    /// **#2027 (red-first): #2019's shape, at the arbiter.**
+    ///
+    /// `/settings` acquired its own prompt window while the cockpit had an
+    /// editor mounted below it — two live chevrons, a modal with no rows
+    /// reserved, and a header repainting through the question every 250 ms.
+    /// Every one of those follows from the same fact: this file decides who
+    /// owns ROWS and, separately, hands out the TERMINAL, and the second half
+    /// never asked the first.
+    ///
+    /// So: a surface holds rows, and somebody who did not declare that it
+    /// would take them asks for a prompt window. Nothing may have been taken.
+    /// Asserted on stdin ownership and the suspend flag rather than on bytes,
+    /// so the failing run emits nothing onto a sibling test's terminal.
+    #[serial_test::serial(tty_arbiter)]
+    #[test]
+    fn a_bare_acquisition_is_refused_while_a_surface_holds_rows() {
+        let _held = Terminal::lease_region(rows(18, 6), OnCollision::Refuse).expect("holder");
+        let window = Terminal::suspend_for_prompt();
+        assert!(
+            !prompt_stdin_active(),
+            "a refused acquisition must not have taken stdin"
+        );
+        assert!(
+            !suspended(),
+            "a refused acquisition must not have quiesced the holder"
+        );
+        assert!(
+            window.ask("question > ").is_err(),
+            "a refused window must not report a question it never wrote"
+        );
+        drop(window);
+    }
+
     /// A relocation is sometimes a REPORT, not a request (#1980).
     ///
     /// The cockpit presenter recomputes its top from the terminal's new size
