@@ -5645,10 +5645,21 @@ fn session_body(
                     // (Shared by the psyche panel gate here and the backend
                     // panel gate below, #1667.)
                     let panel_tokens: Vec<&str> = slash_body.split_whitespace().collect();
-                    let wants_psyche_panel = panel_tokens.as_slice() == ["psyche", "edit"]
-                        || (panel_tokens.as_slice() == ["psyche"]
-                            && cfg!(feature = "rich-tui")
-                            && std::io::IsTerminal::is_terminal(&std::io::stdout()));
+                    // TWO routes open this panel, and the receipt records which
+                    // one the operator typed — so the route is captured here,
+                    // where the distinction still exists, rather than guessed
+                    // inside the panel.
+                    let psyche_route = match panel_tokens.as_slice() {
+                        ["psyche", "edit"] => Some("/psyche edit"),
+                        ["psyche"]
+                            if cfg!(feature = "rich-tui")
+                                && std::io::IsTerminal::is_terminal(&std::io::stdout()) =>
+                        {
+                            Some("/psyche")
+                        }
+                        _ => None,
+                    };
+                    let wants_psyche_panel = psyche_route.is_some();
                     if wants_psyche_panel {
                         // The harness config panel (#14): a transient overlay for
                         // the psyche operator dials. It applies dials through the
@@ -5741,6 +5752,7 @@ fn session_body(
                                 });
                             let outcome = run_psyche_panel(
                                 config_panel::PanelSeed {
+                                    via: psyche_route.unwrap_or("/psyche"),
                                     personas,
                                     current_persona,
                                     backend,
