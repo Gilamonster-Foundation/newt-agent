@@ -1704,6 +1704,15 @@ mod terminal_acceptance {
                 expected_reservation.chat_visible,
                 "acceptance must exercise reserved rows with the inactive chat still visible: {expected_reservation:?}"
             );
+            // Where THIS round's bytes begin. The assertions below ask what
+            // the modal wrote, and the buffer also holds what everything
+            // before it wrote — including, when the harness orders the two
+            // serialized cockpit tests the other way round (which coverage
+            // instrumentation does), the previous test's terminal RESTORE.
+            // That restore legitimately re-enables line wrap, so a whole-buffer
+            // scan for `EnableLineWrap` was reading another test's teardown as
+            // this modal's behavior.
+            let before_modal_round = tty.painted().len();
             let typer = tty.type_when_painted("Prompt — Cockpit modal visible?", b"yes\r");
             let (reply, answer) = std::sync::mpsc::sync_channel(1);
             cockpit
@@ -1779,8 +1788,9 @@ mod terminal_acceptance {
             queue!(enable_wrap, EnableLineWrap).expect("enable-wrap bytes");
             let enable_wrap = String::from_utf8(enable_wrap).expect("wrap bytes are UTF-8");
             assert!(
-                !painted.contains(&enable_wrap),
-                "a modal must keep terminal autowrap disabled so a long answer cannot spill into chat: {painted:?}"
+                !painted[before_modal_round..].contains(&enable_wrap),
+                "a modal must keep terminal autowrap disabled so a long answer cannot spill into chat: {:?}",
+                &painted[before_modal_round..]
             );
 
             // A slash command entered in a modal backs out to chat and leaves

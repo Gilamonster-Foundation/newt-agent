@@ -171,6 +171,21 @@ pub(crate) struct PanelWindow {
 #[cfg(feature = "rich-tui")]
 impl PanelWindow {
     /// Build a window over `out`, releasing `release` when dropped.
+    ///
+    /// **`#[cfg(unix)]` to match its only caller**, exactly as
+    /// `inline_viewport::cursor_position_or_anchor` is and for the same
+    /// reason: that caller is the cockpit presenter, and the live cockpit is
+    /// unix-only by construction (`openpty`/`dup2`/termios — see
+    /// `cockpit/mod.rs`). On Windows nothing can mint a window until a ConPTY
+    /// cockpit lands (#1746), so this is dead there and `-D warnings` is right
+    /// to say so.
+    ///
+    /// Windows is NOT losing the panel seam: `terminal()` below is ungated, so
+    /// a Windows cockpit gets a working window the moment it can construct
+    /// one — and this cfg becomes a compile error in the same commit that
+    /// gives it that ability, which is the point. An `#[allow(dead_code)]`
+    /// would say "trust me" and stay silent forever.
+    #[cfg(unix)]
     pub(crate) fn new(
         out: std::fs::File,
         top: u16,
