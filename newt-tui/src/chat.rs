@@ -5652,13 +5652,26 @@ fn session_body(
                     // (`/settings rounds 40`) is one write with no question to
                     // ask, and a piped / headless / lean session has no region,
                     // which the plain-scroller rule requires keep working.
+                    // Set by the settings panel's backend row, and the only
+                    // reason that arm does not `continue`: the operator walked
+                    // through a door, so the `/backends` arm below runs as if
+                    // they had typed it — one commit path, not two.
+                    #[cfg(feature = "rich-tui")]
+                    let mut walked_to_backends = false;
                     #[cfg(feature = "rich-tui")]
                     if panel_tokens.as_slice() == ["settings"]
                         && std::io::IsTerminal::is_terminal(&std::io::stdout())
                     {
                         let window = surface.open_panel(settings_panel::panel_height());
-                        match settings_panel::run(window) {
-                            Ok(lines) => {
+                        match settings_panel::run(active_backend_name(&cfg), window) {
+                            Ok(outcome) => {
+                                let lines = match outcome {
+                                    settings_panel::Outcome::Applied(lines) => lines,
+                                    settings_panel::Outcome::OpenBackends(lines) => {
+                                        walked_to_backends = true;
+                                        lines
+                                    }
+                                };
                                 for line in lines {
                                     print_newt(&line, color, verbose);
                                 }
@@ -5685,9 +5698,11 @@ fn session_body(
                             }
                         }
                         cfg = crate::resolve_runtime_or_default();
-                        surface.save_history();
-                        println!();
-                        continue;
+                        if !walked_to_backends {
+                            surface.save_history();
+                            println!();
+                            continue;
+                        }
                     }
                     // TWO routes open this panel, and the receipt records which
                     // one the operator typed — so the route is captured here,
@@ -5998,7 +6013,8 @@ fn session_body(
                     // dispatch_slash unchanged: the text list, the named switch,
                     // and the kind toggle keep working exactly as before.
                     #[cfg(feature = "rich-tui")]
-                    if matches!(panel_tokens.as_slice(), ["backend"] | ["backends"])
+                    if (walked_to_backends
+                        || matches!(panel_tokens.as_slice(), ["backend"] | ["backends"]))
                         && std::io::IsTerminal::is_terminal(&std::io::stdout())
                     {
                         use backend_panel::BackendSelection;

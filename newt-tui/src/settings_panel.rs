@@ -42,7 +42,7 @@ use crate::config_panel::{clamp_step, hint_line, render_panel, status_line, RowV
 use crate::panel::{Flow, Screen};
 use crate::settings_form::{Field, ValueSpace};
 
-/// Bordered block (2) + one row per field + a hint/status row.
+/// Bordered block (2) + one row per field + the backend door + a hint row.
 ///
 /// Derived from the field count rather than a constant, so adding a setting
 /// widens the panel instead of silently scrolling one off the bottom. When the
@@ -51,13 +51,29 @@ use crate::settings_form::{Field, ValueSpace};
 /// tabs, and not before: today's six rows fit, and paging them behind a tab
 /// strip would be navigation cost for no gain.
 pub(crate) fn panel_height() -> u16 {
-    u16::try_from(Field::ALL.len())
-        .unwrap_or(6)
+    // Every field, plus the backend door.
+    u16::try_from(Field::ALL.len() + 1)
+        .unwrap_or(7)
         .saturating_add(3)
 }
 
+/// A row that ENTERS another panel instead of holding a value.
+///
+/// The operator's ask — *"I want to slide to the /backends as one of the
+/// settings I can choose"* — is a row, not a tab and not a nested pane. It
+/// renders without the `‹ ›` dial chrome (`editable: false`), which is the
+/// panel's existing way of saying "←→ does nothing here"; Enter opens the
+/// chooser.
+struct DrillIn {
+    label: &'static str,
+    /// What the setting is right now, so the row is worth reading before you
+    /// walk through it.
+    value: String,
+    hint: &'static str,
+}
+
 /// One row: a field, and the value the operator has dialled to so far.
-struct Row {
+struct SettingRow {
     field: Field,
     /// The vocabulary, when the field has one. Empty for a number.
     options: Vec<&'static str>,
@@ -74,7 +90,7 @@ struct Row {
     bounds: Option<(usize, usize, &'static str)>,
 }
 
-impl Row {
+impl SettingRow {
     fn new(field: Field) -> Self {
         let current = field.current();
         let (options, describe, bounds) = match field.value_space() {
@@ -145,37 +161,115 @@ impl Row {
     }
 }
 
+/// Either kind of row, in one list, because ↑↓ walks them together.
+enum Row {
+    Setting(SettingRow),
+    Door(DrillIn),
+}
+
+impl Row {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Setting(row) => row.field.label(),
+            Self::Door(door) => door.label,
+        }
+    }
+
+    fn value(&self) -> String {
+        match self {
+            Self::Setting(row) => row.value.clone(),
+            Self::Door(door) => door.value.clone(),
+        }
+    }
+}
+
+/// What the panel wants to happen after it closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    /// Lines to print. Empty means the operator changed nothing.
+    Applied(Vec<String>),
+    /// Apply these, then open the backend chooser.
+    ///
+    /// The pick is NOT applied here. Choosing a backend reroutes the session,
+    /// refreshes runtime state and reports from it — the caller's job, and
+    /// already written once for `/backends`. A panel that did it again would
+    /// be the second place that knows how a session switches backends.
+    OpenBackends(Vec<String>),
+}
+
 pub(crate) struct SettingsPanel {
     rows: Vec<Row>,
     sel: usize,
     status: Option<String>,
+    /// Set by Enter on a door; read by [`run`] once the panel closes.
+    walk_through: bool,
 }
 
 impl SettingsPanel {
-    pub(crate) fn new() -> Self {
+    /// `backend` is the session's current backend, for the door's value. `None`
+    /// when there is nothing to show — the row still opens the chooser, which
+    /// is exactly where an operator with no backend needs to go.
+    pub(crate) fn new(backend: Option<String>) -> Self {
+        let mut rows: Vec<Row> = Field::ALL
+            .iter()
+            .copied()
+            .map(|field| Row::Setting(SettingRow::new(field)))
+            .collect();
+        rows.push(Row::Door(DrillIn {
+            label: "backend",
+            value: backend.unwrap_or_else(|| "(none)".to_string()),
+            hint: "Enter: choose, edit, add or remove a backend",
+        }));
         Self {
-            rows: Field::ALL.iter().copied().map(Row::new).collect(),
+            rows,
             sel: 0,
             status: None,
+            walk_through: false,
         }
+    }
+
+    fn settings(&self) -> impl Iterator<Item = &SettingRow> {
+        self.rows.iter().filter_map(|row| match row {
+            Row::Setting(row) => Some(row),
+            Row::Door(_) => None,
+        })
     }
 
     fn view_rows(&self) -> Vec<RowView> {
         self.rows
             .iter()
             .enumerate()
-            .map(|(i, row)| RowView {
-                label: row.field.label(),
-                value: row.value.clone(),
-                provenance: if i == self.sel {
-                    row.meaning()
-                } else if row.is_dirty() {
-                    format!("was {}", row.opened_as)
-                } else {
-                    String::new()
-                },
-                selected: i == self.sel,
-                editable: true,
+            .map(|(i, row)| {
+                let selected = i == self.sel;
+                let (provenance, editable) = match row {
+                    Row::Setting(setting) => (
+                        if selected {
+                            setting.meaning()
+                        } else if setting.is_dirty() {
+                            format!("was {}", setting.opened_as)
+                        } else {
+                            String::new()
+                        },
+                        // Dial chrome (`‹ value ›`) means ←→ moves this.
+                        true,
+                    ),
+                    Row::Door(door) => (
+                        if selected {
+                            door.hint.to_string()
+                        } else {
+                            String::new()
+                        },
+                        // No chrome: a door is walked through, not dialled.
+                        false,
+                    ),
+                };
+                RowView {
+                    label: row.label(),
+                    value: row.value(),
+                    provenance,
+                    selected,
+                    editable,
+                }
             })
             .collect()
     }
@@ -187,8 +281,7 @@ impl SettingsPanel {
     /// good changes because a fifth was malformed would be a transaction the
     /// operator never asked for.
     fn commit(&self) -> Vec<String> {
-        self.rows
-            .iter()
+        self.settings()
             .filter(|row| row.is_dirty())
             .map(|row| {
                 match crate::settings_form::apply_and_record(row.field, &row.value, "/settings") {
@@ -214,7 +307,7 @@ impl Screen for SettingsPanel {
             KeyCode::Down => self.sel = clamp_step(self.sel, 1, self.rows.len()),
             KeyCode::Left | KeyCode::Right => {
                 let dir = if code == KeyCode::Left { -1 } else { 1 };
-                if let Some(row) = self.rows.get_mut(self.sel) {
+                if let Some(Row::Setting(row)) = self.rows.get_mut(self.sel) {
                     row.cycle(dir);
                 }
                 // The hint returns once a dial moves: a stale refusal beside a
@@ -222,7 +315,14 @@ impl Screen for SettingsPanel {
                 // on the new one.
                 self.status = None;
             }
-            KeyCode::Enter => return Flow::Close(true),
+            KeyCode::Enter => {
+                // Enter on a door WALKS THROUGH it; Enter anywhere else applies
+                // and closes. Both close this panel — the difference is what
+                // the caller does next, which is why it is reported rather
+                // than acted on here.
+                self.walk_through = matches!(self.rows.get(self.sel), Some(Row::Door(_)));
+                return Flow::Close(true);
+            }
             KeyCode::Esc | KeyCode::Char('q') => return Flow::Close(false),
             _ => {}
         }
@@ -240,22 +340,29 @@ impl Screen for SettingsPanel {
 ///
 /// The terminal could not be taken, built, polled, read or repainted.
 pub(crate) fn run(
+    backend: Option<String>,
     window: Option<crate::session_worker::PanelWindow>,
-) -> std::io::Result<Vec<String>> {
-    let mut panel = SettingsPanel::new();
+) -> std::io::Result<Outcome> {
+    let mut panel = SettingsPanel::new(backend);
     let applied = crate::panel::drive(&mut panel, panel_height(), window.as_ref())?;
     if !applied {
-        return Ok(vec!["settings: cancelled".to_string()]);
+        return Ok(Outcome::Applied(vec!["settings: cancelled".to_string()]));
     }
     let messages = panel.commit();
+    if panel.walk_through {
+        // Pending dial changes are applied on the way through, not discarded:
+        // the operator asked for both, and dropping half of it because they
+        // left by a different door would be a surprise.
+        return Ok(Outcome::OpenBackends(messages));
+    }
     // An Enter that changed nothing is indistinguishable from Esc, which is
     // `/psyche`'s rule (#1665) for the same reason: a bare `/settings` opens
     // this panel, so browsing must never look like an edit.
-    Ok(if messages.is_empty() {
+    Ok(Outcome::Applied(if messages.is_empty() {
         vec!["settings: cancelled".to_string()]
     } else {
         messages
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -264,15 +371,32 @@ mod tests {
     use newt_core::test_guard::GlobalSettingsGuard;
 
     fn panel() -> SettingsPanel {
-        SettingsPanel::new()
+        SettingsPanel::new(Some("sol".to_string()))
     }
 
-    fn row_of(panel: &SettingsPanel, field: Field) -> &Row {
+    fn row_of(panel: &SettingsPanel, field: Field) -> &SettingRow {
+        panel
+            .settings()
+            .find(|r| r.field == field)
+            .expect("the field has a row")
+    }
+
+    fn index_of(panel: &SettingsPanel, field: Field) -> usize {
         panel
             .rows
             .iter()
-            .find(|r| r.field == field)
+            .position(|r| matches!(r, Row::Setting(row) if row.field == field))
             .expect("the field has a row")
+    }
+
+    /// The door is the LAST row, so ↓ from the bottom setting reaches it —
+    /// which is what "slide to the backends" means with a keyboard.
+    fn door_index(panel: &SettingsPanel) -> usize {
+        panel
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Door(_)))
+            .expect("the backend door exists")
     }
 
     /// Every field the form offers gets a row, in the form's order. A panel
@@ -282,8 +406,12 @@ mod tests {
     fn every_field_has_a_row() {
         let _g = GlobalSettingsGuard::acquire();
         let panel = panel();
-        assert_eq!(panel.rows.len(), Field::ALL.len());
-        for (row, field) in panel.rows.iter().zip(Field::ALL) {
+        assert_eq!(
+            panel.settings().count(),
+            Field::ALL.len(),
+            "one row per field, plus the door"
+        );
+        for (row, field) in panel.settings().zip(Field::ALL) {
             assert_eq!(row.field, *field);
             assert_eq!(row.value, field.current(), "a row opens on the live value");
         }
@@ -297,10 +425,10 @@ mod tests {
         let mut panel = panel();
         panel.key(KeyCode::Up, false);
         assert_eq!(panel.sel, 0, "already at the top");
-        for _ in 0..Field::ALL.len() * 2 {
+        for _ in 0..panel.rows.len() * 2 {
             panel.key(KeyCode::Down, false);
         }
-        assert_eq!(panel.sel, Field::ALL.len() - 1, "stops at the bottom");
+        assert_eq!(panel.sel, panel.rows.len() - 1, "stops at the bottom");
     }
 
     /// ←→ walks a field's OWN vocabulary — the one `settings_form` publishes,
@@ -335,7 +463,7 @@ mod tests {
             ValueSpace::Number { min, max, release } => (min, max, release),
             ValueSpace::Choice(_) => panic!("the round cap is a number"),
         };
-        let mut row = Row::new(Field::Rounds);
+        let mut row = SettingRow::new(Field::Rounds);
 
         row.value = min.to_string();
         row.cycle(-1);
@@ -370,7 +498,7 @@ mod tests {
     fn an_untouched_panel_submits_nothing() {
         let _g = GlobalSettingsGuard::acquire();
         let panel = panel();
-        assert!(panel.rows.iter().all(|r| !r.is_dirty()));
+        assert!(panel.settings().all(|r| !r.is_dirty()));
         assert!(panel.commit().is_empty(), "nothing to apply");
     }
 
@@ -383,12 +511,7 @@ mod tests {
         // Move the edit-mode dial off whatever it opened on.
         let opened = row_of(&panel, Field::EditMode).value.clone();
         while row_of(&panel, Field::EditMode).value == opened {
-            let sel = panel
-                .rows
-                .iter()
-                .position(|r| r.field == Field::EditMode)
-                .expect("edit-mode has a row");
-            panel.sel = sel;
+            panel.sel = index_of(&panel, Field::EditMode);
             panel.key(KeyCode::Right, false);
             if row_of(&panel, Field::EditMode).value == opened {
                 panel.key(KeyCode::Left, false);
@@ -423,9 +546,85 @@ mod tests {
     /// The panel is as tall as it has rows, so a new setting widens it rather
     /// than falling off the bottom.
     #[test]
-    fn the_panel_is_sized_by_its_field_count() {
-        let expected = u16::try_from(Field::ALL.len()).expect("few fields") + 3;
-        assert_eq!(panel_height(), expected);
+    fn the_panel_is_sized_by_its_row_count() {
+        let _g = GlobalSettingsGuard::acquire();
+        let rows = u16::try_from(panel().rows.len()).expect("few rows");
+        assert_eq!(panel_height(), rows + 3);
+    }
+
+    /// **The door is a row you slide to, and Enter walks through it.**
+    ///
+    /// The operator's ask in its own words: *"I want to slide to the /backends
+    /// as one of the settings I can choose."* So it is the last row, reachable
+    /// by ↓, and Enter on it reports `OpenBackends` rather than applying.
+    #[test]
+    fn the_backend_row_is_a_door_not_a_dial() {
+        let _g = GlobalSettingsGuard::acquire();
+        let mut panel = panel();
+        let door = door_index(&panel);
+        assert_eq!(door, panel.rows.len() - 1, "the door is the last row");
+
+        // Slide to it.
+        while panel.sel < door {
+            panel.key(KeyCode::Down, false);
+        }
+        let view = &panel.view_rows()[door];
+        assert_eq!(view.value, "sol", "the door shows the current backend");
+        assert!(!view.editable, "no `‹ ›` chrome: ←→ does not cycle a door");
+        assert!(view.provenance.contains("Enter"), "{:?}", view.provenance);
+
+        // ←→ on a door changes nothing, so a stray arrow cannot silently
+        // repoint the backend.
+        panel.key(KeyCode::Right, false);
+        panel.key(KeyCode::Left, false);
+        assert_eq!(panel.view_rows()[door].value, "sol");
+
+        assert_eq!(panel.key(KeyCode::Enter, false), Flow::Close(true));
+        assert!(panel.walk_through, "Enter on the door walks through it");
+    }
+
+    /// Enter on a SETTING is an apply, not a walk-through — the flag is set
+    /// per keypress, so arriving at Enter from a dial cannot open a panel the
+    /// operator did not ask for.
+    #[test]
+    fn enter_on_a_setting_does_not_open_the_chooser() {
+        let _g = GlobalSettingsGuard::acquire();
+        let mut panel = panel();
+        panel.sel = index_of(&panel, Field::Tenacity);
+        assert_eq!(panel.key(KeyCode::Enter, false), Flow::Close(true));
+        assert!(!panel.walk_through);
+    }
+
+    /// Walking through the door still APPLIES what was dialled on the way.
+    /// The operator asked for both; dropping half because they left by a
+    /// different door would be a surprise.
+    #[test]
+    fn changes_made_before_the_door_are_applied_on_the_way_through() {
+        let _g = GlobalSettingsGuard::acquire();
+        let mut panel = panel();
+        panel.sel = index_of(&panel, Field::Thinking);
+        let opened = row_of(&panel, Field::Thinking).value.clone();
+        panel.key(KeyCode::Right, false);
+        panel.key(KeyCode::Left, false);
+        panel.key(KeyCode::Right, false);
+        let dialled = row_of(&panel, Field::Thinking).value.clone();
+        if dialled == opened {
+            // A two-value dial that landed back where it started proves
+            // nothing; step it once more.
+            panel.key(KeyCode::Left, false);
+        }
+        assert_ne!(row_of(&panel, Field::Thinking).value, opened);
+
+        panel.sel = door_index(&panel);
+        panel.key(KeyCode::Enter, false);
+        assert!(panel.walk_through);
+        let applied = panel.commit();
+        assert_eq!(applied.len(), 1, "the dialled row applied: {applied:?}");
+        assert_eq!(
+            Field::Thinking.current(),
+            row_of(&panel, Field::Thinking).value,
+            "and the setting actually moved"
+        );
     }
 
     /// The selected row explains itself, and a changed row says what it was —
