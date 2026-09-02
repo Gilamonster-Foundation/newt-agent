@@ -549,48 +549,122 @@ fn status_options() -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-/// The rich surface's live view (issue #527): a status HEADER row
-/// ([`header_line`]) over an input-indicator row ([`prompt_line`]), plus a
-/// harness-background row when work is live. The PS1 token prompt
-/// (`[tui] prompt`) is the LEAN surface's job (it lands in logfiles); the rich
-/// surface renders these instead.
+/// The rich surface's live view, in **three regions plus an activity row**.
 ///
-/// The header is `[YYYY-MM-DD HH:MM:SS] vi --INSERT-- <model> @ <endpoint>` plus
-/// an optional `[options]` session-override block. The clock + editor mode update
-/// live (the event loop redraws every frame). `active` brightens the mode
-/// word; colors favor light/high-luminance tones (the accessibility default).
+/// ```text
+/// ⠋ thinking                                   activity — only while something runs
+/// [session] a conversation                     HEADER: which conversation this is
+/// ❯ what you are typing                        TEXTAREA
+/// [18:43:48] vi --INSERT-- model @ ep  28k/28k FOOTER: what the machine is doing
+/// ```
+///
+/// # Why the split, and why the footer is at the BOTTOM
+///
+/// These were one row. It carried the timestamp, the mode word, the session
+/// name, the model, the gauge — and an echo of the draft, directly above the
+/// line already showing that draft. Fusing identity with machine state gave a
+/// row with no single owner, which is how it grew an echo nobody would have
+/// added on purpose.
+///
+/// Split by ownership: the header says WHICH CONVERSATION THIS IS, the footer
+/// says WHAT THE MACHINE IS DOING, and the draft appears once — on the line you
+/// are typing it.
+///
+/// The footer sits BELOW the input because an English reader's eye returns to
+/// the lower left. Status anchored there is found without hunting; the same
+/// information floated into another corner is a radiator you have to go and
+/// look at, which is the worst place for something that changes constantly. (A
+/// right-to-left locale would anchor lower-right — the rule is "where the eye
+/// lands", not "left".)
+///
+/// # And no horizontal rules
+///
+/// No region is separated by a `─────` run. A full-width rule is a word-wrap
+/// hazard at every terminal width and buys nothing adjacency does not already
+/// give: the rows are next to each other, which is what makes them regions.
+fn header_line(session: &str, headline: &str) -> Line<'static> {
+    let theme = crate::theme::active();
+    let mut spans: Vec<Span> = Vec::new();
+    // #1671: the session name is ALWAYS visible — a mid-luminance grey so it
+    // reads without shouting (accessibility default: no saturated darks).
+    if !session.is_empty() {
+        spans.push(Span::styled(
+            format!("[{session}]"),
+            Style::default().fg(theme.color(crate::theme::Role::Muted)),
+        ));
+    }
+    if !headline.is_empty() {
+        let gap = if spans.is_empty() { "" } else { " " };
+        spans.push(Span::styled(
+            format!("{gap}{headline}"),
+            Style::default().fg(theme.color(crate::theme::Role::Text)),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// How many rows the header needs at this width.
+///
+/// Wrapped, not truncated: a long conversation name is worth reading, and a
+/// header that silently cut one off would be the same lie a fold without a
+/// count tells. One row minimum, so the region never collapses to nothing and
+/// take the input's place with it.
+fn header_height(session: &str, headline: &str, cols: u16) -> u16 {
+    let width = usize::from(cols.max(1));
+    let text: String = header_line(session, headline)
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    u16::try_from(newt_core::tty::wrap_line(&text, width).len())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// How many rows the modal slot needs — zero when there is no modal.
+///
+/// Zero rows means the layout is byte-identical to a session that never opened
+/// one, which is what keeps "a modal has a fixed home" from costing a row to
+/// everyone who is not looking at a modal.
+fn modal_height(modal: Option<&[Line<'static>]>, cols: u16) -> u16 {
+    let width = usize::from(cols.max(1));
+    modal.map_or(0, |lines| {
+        let rows: usize = lines
+            .iter()
+            .map(|line| {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                newt_core::tty::wrap_line(&text, width).len().max(1)
+            })
+            .sum();
+        u16::try_from(rows).unwrap_or(u16::MAX)
+    })
+}
+
+/// The footer: what the machine is doing, anchored at the lower left.
 ///
 /// `active` is "this row has content AND chat owns the keyboard". Both halves
-/// matter: a blocking modal leaves the mounted header visible underneath it,
+/// matter: a blocking modal leaves the mounted footer visible underneath it,
 /// and a mode word still burning in the live accent there is a second thing on
 /// screen claiming the keyboard. The chevron recedes
 /// ([`prompt_line_with_focus`]); so must this.
-fn header_line(
+fn footer_line(
     editor: &Editor,
     model: &str,
     endpoint: &str,
     gauge: Option<(u32, u32)>,
-    session: &str,
     active: bool,
 ) -> Line<'static> {
-    // ONE accent, shared with the chevron: two constants for one signal is
-    // how they drift apart.
-    let accent = Color::from(newt_core::tty::ACTIVE_INPUT_CT);
-    let dim = Color::DarkGray;
+    let theme = crate::theme::active();
+    // ONE accent, shared with the chevron: two constants for one signal is how
+    // they drift apart.
+    let accent = theme.color(crate::theme::Role::Accent);
+    let dim = theme.color(crate::theme::Role::Dim);
     let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut spans: Vec<Span> = vec![Span::styled(format!("[{stamp}]"), Style::default().fg(dim))];
     spans.push(Span::styled(
         format!(" {}", editor.header_mode()),
         Style::default().fg(if active { accent } else { dim }),
     ));
-    // #1671: the session name is ALWAYS visible — a mid-luminance grey so it
-    // reads without shouting (accessibility default: no saturated darks).
-    if !session.is_empty() {
-        spans.push(Span::styled(
-            format!(" {session} ·"),
-            Style::default().fg(Color::Gray),
-        ));
-    }
     if !model.is_empty() {
         let loc = if endpoint.is_empty() {
             model.to_string()
@@ -609,9 +683,11 @@ fn header_line(
         if budget > 0 {
             let g = newt_core::agentic::fmt_token_gauge(used, budget);
             let c = match newt_core::agentic::gauge_level(used, budget) {
-                newt_core::agentic::GaugeLevel::Ok => Color::Green,
-                newt_core::agentic::GaugeLevel::Warn => Color::Rgb(200, 140, 0),
-                newt_core::agentic::GaugeLevel::Critical => Color::Red,
+                newt_core::agentic::GaugeLevel::Ok => theme.color(crate::theme::Role::GaugeOk),
+                newt_core::agentic::GaugeLevel::Warn => theme.color(crate::theme::Role::GaugeWarn),
+                newt_core::agentic::GaugeLevel::Critical => {
+                    theme.color(crate::theme::Role::GaugeCritical)
+                }
             };
             spans.push(Span::styled(format!("  {g}"), Style::default().fg(c)));
         }
@@ -647,9 +723,10 @@ impl CommandKind {
 
     fn marker_style_with_focus(self, focused: bool) -> Style {
         let color = if focused {
+            let theme = crate::theme::active();
             match self {
-                Self::Bang => Color::LightMagenta,
-                Self::Ex => Color::LightYellow,
+                Self::Bang => theme.color(crate::theme::Role::CommandBang),
+                Self::Ex => theme.color(crate::theme::Role::CommandEx),
             }
         } else {
             Color::DarkGray
@@ -849,12 +926,16 @@ fn background_line(jobs: &[BackgroundJob], frame: usize) -> Option<Line<'static>
     };
     let labels = active.join(", ");
     let spinner = newt_core::tty::SPINNER_FRAMES[frame % newt_core::tty::SPINNER_FRAMES.len()];
+    let theme = crate::theme::active();
     Some(Line::from(vec![
         Span::styled(
             format!("{spinner} background{count}"),
-            Style::default().fg(Color::Rgb(255, 165, 90)),
+            Style::default().fg(theme.color(crate::theme::Role::Thinking)),
         ),
-        Span::styled(format!(" · {labels}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(" · {labels}"),
+            Style::default().fg(theme.color(crate::theme::Role::Dim)),
+        ),
     ]))
 }
 
@@ -868,8 +949,20 @@ struct RichStatus<'a> {
     endpoint: &'a str,
     gauge: Option<(u32, u32)>,
     /// #1671: the conversation's display name — title, `#shortid`, or
-    /// "ephemeral". Empty hides the span (tests pin the legacy header).
+    /// "ephemeral". Empty hides the span.
     session: &'a str,
+    /// The modal's rendered lines, or `None` when none is open.
+    ///
+    /// Lines rather than a widget: the surface OWNS where a modal goes, and a
+    /// caller that could hand over a widget could hand over one that positions
+    /// itself — which is the freedom this design exists to remove.
+    modal: Option<&'a [Line<'static>]>,
+    /// The header's free text beside the name: what this conversation IS.
+    ///
+    /// Separate from `session` because they answer different questions — the
+    /// name is an identifier the operator can type at `/tab`, the headline is
+    /// prose. Empty renders nothing rather than an empty bracket.
+    headline: &'a str,
     background_jobs: &'a [BackgroundJob],
     /// The slash-command palette (#1674), rendered above the input row while
     /// open. `None`/closed → the layout is byte-identical to the pre-palette
@@ -907,20 +1000,87 @@ fn draw(
     // "active" = the line has content, so the header mode word brightens and the
     // dim mode hint clears as you type. The hint shows only on an empty line.
     let empty = buffer_is_empty(textarea);
-    // The status header stays on row 0. A live harness task reserves the final
-    // row below the prompt/input; otherwise the input keeps the full remainder.
-    let [header_area, body_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+    // SIX rows, top to bottom: activity, header, textarea, modal, footer, tabs.
+    //
+    //   ⠋ thinking                              only while something runs
+    //   [session] a conversation                identity
+    //   ❯ what you are typing                   the textarea
+    //     a modal, when one is open             beneath the prompt
+    //   [18:43] vi --INSERT-- model  28k/28k    machine state, lower-left
+    //   [1 chat][2 review]                      only with two or more tabs
+    //
+    // The activity row leads because it is the thing that APPEARS and
+    // disappears; putting a row that comes and goes between the input and its
+    // footer would shift both under the operator's hands. The footer anchors
+    // last because an English reader's eye returns to the lower left.
+    let activity = background_line(status.background_jobs, background_frame());
+    // #1669 PR-B: the tab bar is the OUTERMOST row — below the clock, at the
+    // physical bottom edge. The frame nests outward: body, prompt, modal,
+    // this-tab's machine state, then the set of tabs. Everything above the bar
+    // belongs to the selected tab, so the bar is the container and sits
+    // outside its contents. Zero rows for fewer than two tabs, unchanged, so a
+    // single-conversation session still ends at the clock.
+    let tab_rows = crate::tab_bar::bar_rows(status.tabs);
+    // The header and the modal slot GROW, the way the input already does. The
+    // clock does not: it is the anchor, always the last row, which is what
+    // makes the whole block readable from one fixed place.
+    let header_rows = header_height(status.session, status.headline, area.width);
+    let modal_rows = modal_height(status.modal, area.width);
+    let rows = [
+        Constraint::Length(u16::from(activity.is_some())),
+        Constraint::Length(header_rows),
+        Constraint::Min(1),
+        Constraint::Length(modal_rows),
+        Constraint::Length(1),
+        Constraint::Length(tab_rows),
+    ];
+    let [activity_area, header_area, body_area, modal_area, footer_area, tab_area] =
+        Layout::vertical(rows).areas(area);
+    // **A modal appears in ONE place, every time.** Beneath the prompt, above
+    // the clock — it never floats, never centres, never follows the cursor.
+    // A dialog that moves is one the operator has to FIND, and having to hunt
+    // for the thing demanding an answer is the whole complaint against
+    // editors that place them dynamically.
+    //
+    // It grows downward from the input and pushes the block's top into
+    // scrollback, so the prompt stays where the hands are.
+    if modal_rows > 0 {
+        if let Some(lines) = status.modal {
+            f.render_widget(
+                Paragraph::new(lines.to_vec()).wrap(ratatui::widgets::Wrap { trim: false }),
+                modal_area,
+            );
+        }
+    }
+    if tab_rows > 0 {
+        if let Some(line) = crate::tab_bar::layout_tab_cells(status.tabs, tab_area.width) {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    line,
+                    Style::default()
+                        .fg(crate::theme::active().color(crate::theme::Role::Dim)),
+                ))),
+                tab_area,
+            );
+        }
+    }
+    if let Some(line) = activity {
+        f.render_widget(Paragraph::new(line), activity_area);
+    }
     f.render_widget(
-        Paragraph::new(header_line(
+        Paragraph::new(header_line(status.session, status.headline))
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        header_area,
+    );
+    f.render_widget(
+        Paragraph::new(footer_line(
             editor,
             status.model,
             status.endpoint,
             status.gauge,
-            status.session,
             !empty && input_focused,
         )),
-        header_area,
+        footer_area,
     );
     // The slash-command palette (#1674) sits directly above the input row,
     // inside the same inline region — no second surface, no second event loop.
@@ -934,39 +1094,9 @@ fn draw(
         }
         _ => body_area,
     };
-    // #1669 PR-B: carve the tab bar off the BOTTOM first, so it is the last
-    // row of the inline region regardless of what else is showing. Zero rows
-    // for fewer than two tabs means the remaining layout is byte-identical to
-    // the pre-bar surface — no `Layout` call, not even a zero-height one.
-    let (body_area, tab_area) = if crate::tab_bar::bar_rows(status.tabs) > 0 {
-        let [rest, bar] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(body_area);
-        (rest, Some(bar))
-    } else {
-        (body_area, None)
-    };
-    if let Some(bar) = tab_area {
-        if let Some(line) = crate::tab_bar::layout_tab_cells(status.tabs, bar.width) {
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    line,
-                    Style::default().fg(Color::DarkGray),
-                ))),
-                bar,
-            );
-        }
-    }
-    let background = background_line(status.background_jobs, background_frame());
-    let (input_area, background_area) = if background.is_some() {
-        let [input_area, background_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(body_area);
-        (input_area, Some(background_area))
-    } else {
-        (body_area, None)
-    };
-    if let (Some(line), Some(background_area)) = (background, background_area) {
-        f.render_widget(Paragraph::new(line), background_area);
-    }
+    // The activity row and the tab bar are their own regions above, so the
+    // input keeps the whole remainder rather than giving up its last line.
+    let input_area = body_area;
     let g = resolve_gutter(gutter, input_area.width);
 
     // #531: a `:`-command on a multi-line buffer renders on its own row at the
@@ -1513,6 +1643,13 @@ impl Drop for RawPasteGuard {
 
 impl RichSurface {
     pub(crate) fn new(history_path: Option<PathBuf>) -> anyhow::Result<Self> {
+        // Say once, at startup, what was wrong with `NEWT_THEME`. A theme that
+        // silently half-applies looks like a rendering bug everywhere except
+        // the one place that would explain it — and the operator who set the
+        // variable is the only person who can fix it.
+        for complaint in crate::theme::complaints() {
+            eprintln!("⚠ theme: {complaint}");
+        }
         Ok(Self {
             edit: current_edit(),
             history_path,
@@ -1539,14 +1676,22 @@ impl RichSurface {
         self.event_loop()
     }
 
-    /// The chrome the header/tab bar/background row draw from — everything
-    /// the surface knows that is not the editor's own state.
+    /// The chrome the four regions draw from — everything the surface knows
+    /// that is not the editor's own state.
     pub(crate) fn chrome(&self) -> Chrome<'_> {
         Chrome {
             model: &self.model,
             endpoint: &self.endpoint,
             gauge: self.gauge,
             session: &self.session,
+            // Empty for now: this change is the LAYOUT. Giving the header
+            // prose in the same commit would make a re-arrangement and a new
+            // content source one diff, and the second one invisible.
+            headline: "",
+            // The presenter still reserves its own rows above the block;
+            // moving it into this slot is the next step, and doing both in one
+            // change would put a layout and a modal rewrite in one diff.
+            modal: None,
             background_jobs: &self.background_jobs,
             tabs: &self.tabs,
         }
@@ -1669,6 +1814,11 @@ pub(crate) struct Chrome<'a> {
     pub(crate) endpoint: &'a str,
     pub(crate) gauge: Option<(u32, u32)>,
     pub(crate) session: &'a str,
+    /// The header's prose beside the name. Empty until a caller supplies one,
+    /// which keeps this change to LAYOUT rather than smuggling in new content.
+    pub(crate) headline: &'a str,
+    /// A modal's lines, rendered beneath the prompt and above the clock.
+    pub(crate) modal: Option<&'a [Line<'static>]>,
     pub(crate) background_jobs: &'a [BackgroundJob],
     pub(crate) tabs: &'a [crate::tab_bar::TabCell],
 }
@@ -1902,8 +2052,9 @@ impl MountedEditor {
             .0
             .len() as u16
         };
-        // #531 ex-bottom row + #527 status header row + an optional
-        // harness-background row all contribute to the inline viewport.
+        // #531 ex-bottom row + the two chrome rows (header above the input,
+        // footer below it) + an optional activity row all contribute to the
+        // inline viewport.
         let background_extra =
             u16::from(chrome.background_jobs.iter().any(BackgroundJob::is_running));
         // #1669 PR-B: the tab bar is the LAST row of the inline region —
@@ -1911,7 +2062,11 @@ impl MountedEditor {
         // two tabs, which is what keeps the single-conversation surface
         // byte-identical.
         let tab_extra = crate::tab_bar::bar_rows(chrome.tabs);
-        let base = (rows + ex_extra).clamp(1, MAX_INPUT_ROWS) + 1 + background_extra + tab_extra;
+        // `+ 2`, not `+ 1`: the header and the footer are separate regions
+        // now. Counting one would let the footer eat the input's last row on
+        // a tight terminal — which is precisely how the layout change first
+        // showed up in the tests.
+        let base = (rows + ex_extra).clamp(1, MAX_INPUT_ROWS) + 2 + background_extra + tab_extra;
         // #1674: the palette viewport gets what the terminal can spare
         // above the input (capped inside `viewport_rows`), never squeezing
         // the input's own rows. 0 while closed → the height math (and the
@@ -1935,6 +2090,8 @@ impl MountedEditor {
                 endpoint: chrome.endpoint,
                 gauge: chrome.gauge,
                 session: chrome.session,
+                headline: chrome.headline,
+                modal: chrome.modal,
                 background_jobs: chrome.background_jobs,
                 palette: Some(&self.palette),
                 chat_inactive,
@@ -2426,7 +2583,7 @@ mod tests {
         let editor = emacs_editor();
         let textarea = TextArea::new(vec!["! date".to_string()]);
 
-        let (row, styles) = rendered_row(&textarea, &editor, 40, 2, 1);
+        let (row, styles) = rendered_row(&textarea, &editor, 40, 3, 1);
 
         assert!(
             row.starts_with("! date"),
@@ -2448,7 +2605,7 @@ mod tests {
         let textarea = TextArea::new(vec!["! date".to_string()]);
 
         for gutter in [None, Some(30)] {
-            let (row, _) = rendered_row_with(&textarea, &editor, 80, 2, 1, gutter, false);
+            let (row, _) = rendered_row_with(&textarea, &editor, 80, 3, 1, gutter, false);
             assert!(
                 row.starts_with("! date"),
                 "gutter {gutter:?} split the marker from its command: {row:?}"
@@ -2459,6 +2616,8 @@ mod tests {
     #[test]
     fn special_command_rendering_bang_height_uses_command_geometry_for_every_gutter() {
         let chrome = Chrome {
+            headline: "",
+            modal: None,
             model: "",
             endpoint: "",
             gauge: None,
@@ -2485,7 +2644,8 @@ mod tests {
                 )
                 .0
                 .len() as u16;
-                let expected = drawn_rows.clamp(1, MAX_INPUT_ROWS) + 1;
+                // `+ 2`: the header above the input and the footer below it.
+                let expected = drawn_rows.clamp(1, MAX_INPUT_ROWS) + 2;
 
                 assert_eq!(
                     mounted.wanted_rows(80, 30, &chrome),
@@ -2504,14 +2664,14 @@ mod tests {
         for hidden_col in 0..3 {
             textarea.move_cursor(CursorMove::Jump(0, hidden_col));
             assert_eq!(
-                rendered_cursor_with(&textarea, &editor, 40, 2, Some(30)),
+                rendered_cursor_with(&textarea, &editor, 40, 3, Some(30)),
                 (0, 1),
                 "cursor on hidden prefix column {hidden_col} belongs on the visible ! marker"
             );
         }
         textarea.move_cursor(CursorMove::Jump(0, 3));
         assert_eq!(
-            rendered_cursor_with(&textarea, &editor, 40, 2, Some(30)),
+            rendered_cursor_with(&textarea, &editor, 40, 3, Some(30)),
             (1, 1),
             "cursor immediately after the source ! belongs after the visible marker"
         );
@@ -2522,7 +2682,7 @@ mod tests {
         let bang_editor = emacs_editor();
         let bang_textarea = TextArea::new(vec!["! date".to_string()]);
         let (_, bang_styles) =
-            rendered_row_with(&bang_textarea, &bang_editor, 40, 2, 1, Some(1), true);
+            rendered_row_with(&bang_textarea, &bang_editor, 40, 3, 1, Some(1), true);
         assert_eq!(bang_styles[0].fg, Some(Color::DarkGray));
         assert_eq!(bang_styles[0].bg, Some(INACTIVE_COMMAND_BG));
 
@@ -2531,7 +2691,7 @@ mod tests {
         ex_editor.input(special(KeyCode::Esc), &mut ex_textarea);
         ex_editor.input(key(':'), &mut ex_textarea);
         type_chars(&mut ex_editor, &mut ex_textarea, "help");
-        let (_, ex_styles) = rendered_row_with(&ex_textarea, &ex_editor, 40, 2, 1, Some(1), true);
+        let (_, ex_styles) = rendered_row_with(&ex_textarea, &ex_editor, 40, 3, 1, Some(1), true);
         assert_eq!(ex_styles[0].fg, Some(Color::DarkGray));
         assert_eq!(ex_styles[0].bg, Some(INACTIVE_COMMAND_BG));
     }
@@ -2806,7 +2966,7 @@ mod tests {
         editor.input(key(':'), &mut textarea);
         type_chars(&mut editor, &mut textarea, "help");
 
-        let (row, styles) = rendered_row(&textarea, &editor, 40, 2, 1);
+        let (row, styles) = rendered_row(&textarea, &editor, 40, 3, 1);
         assert!(row.starts_with(":help"), "ex command owns the row: {row:?}");
         assert!(
             !row.contains("draft"),
@@ -2821,8 +2981,10 @@ mod tests {
     #[test]
     fn special_command_rendering_vi_ex_cursor_uses_terminal_cells() {
         for (lines, height, expected_y) in [
-            (vec!["draft".to_string()], 2, 1),
-            (vec!["draft".to_string(), "second".to_string()], 3, 2),
+            // height, expected cursor row. Both grow by one for the footer,
+            // and the row itself is offset by the header above the input.
+            (vec!["draft".to_string()], 3, 1),
+            (vec!["draft".to_string(), "second".to_string()], 4, 2),
         ] {
             let mut editor = vi_editor();
             let mut textarea = TextArea::new(lines);
@@ -3278,7 +3440,7 @@ mod tests {
     /// Two tabs claim exactly one row, at the BOTTOM of the region, and the
     /// rows above are untouched.
     #[test]
-    fn two_tabs_add_one_bottom_row_and_disturb_nothing_above() {
+    fn two_tabs_add_one_row_below_the_clock() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let ed = emacs_editor();
@@ -3317,14 +3479,26 @@ mod tests {
 
         let none = render(&[]);
         let two = render(&[cell(1, "build", true), cell(2, "deploy", false)]);
+        // The bar is the OUTERMOST row: everything above it belongs to the
+        // selected tab, so the container sits outside its contents. The clock
+        // stays directly above it — the last row of the tab's own frame.
         assert!(
             two[4].contains("1:build") && two[4].contains("2:deploy"),
-            "the bar is the LAST row: {:?}",
+            "the bar is the bottom-most row: {:?}",
             two[4]
         );
-        assert_eq!(none[0], two[0], "the status header is untouched by the bar");
         assert!(
-            !none[4].contains("1:build"),
+            two[3].contains("emacs"),
+            "the clock sits directly above the bar: {:?}",
+            two[3]
+        );
+        assert!(
+            none[4].contains("emacs"),
+            "with one tab the clock is the last row: {:?}",
+            none[4]
+        );
+        assert!(
+            !none.iter().any(|row| row.contains("1:build")),
             "sanity: the no-tab frame has no bar"
         );
     }
@@ -3356,10 +3530,11 @@ mod tests {
                 .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
                 .collect::<String>()
         };
+        // Bottom of the INPUT region — which is one row above the footer.
         assert!(
-            row(3).starts_with(":wq"),
-            "command on the bottom row: {:?}",
-            row(3)
+            row(2).starts_with(":wq"),
+            "command on the input region's bottom row: {:?}",
+            row(2)
         );
         assert!(
             row(1).contains("hello"),
@@ -3404,12 +3579,13 @@ mod tests {
         term.draw(|f| draw(f, &ta, &ed, Some(25), RichStatus::default()))
             .unwrap(); // 25 >= GUTTER_W (19)
         let buf = term.backend().buffer();
+        // Bottom of the INPUT region — one row above the footer.
         let last: String = (0..80)
-            .map(|x| buf.cell((x, 3)).unwrap().symbol().to_string())
+            .map(|x| buf.cell((x, 2)).unwrap().symbol().to_string())
             .collect();
         assert!(
             last.starts_with(":wq"),
-            "command on the bottom row (wide gutter): {last:?}"
+            "command on the input region's bottom row (wide gutter): {last:?}"
         );
     }
 
@@ -3461,10 +3637,16 @@ mod tests {
             "description rides beside the command: {:?}",
             row(1)
         );
-        // The input row (bottom) still shows the typed line on the prompt.
+        // The input still shows the typed line — one row above the footer,
+        // which is now what occupies the bottom.
         assert!(
-            row(h - 1).contains("❯ /model"),
+            row(h - 2).contains("❯ /model"),
             "input row intact below the palette: {:?}",
+            row(h - 2)
+        );
+        assert!(
+            row(h - 1).contains("nano"),
+            "and the footer is the last row: {:?}",
             row(h - 1)
         );
     }
@@ -3478,7 +3660,8 @@ mod tests {
         let ta = TextArea::new(vec!["this".to_string(), "more".to_string()]);
         // Width 80 so the full status header fits (it clips on a narrow term);
         // height 3: row 0 = status header (#527), rows 1-2 = the input.
-        let mut term = Terminal::new(TestBackend::new(80, 3)).unwrap();
+        // Header, two input rows, footer.
+        let mut term = Terminal::new(TestBackend::new(80, 4)).unwrap();
         // gutter = 1 → the overhang layout (the default).
         term.draw(|f| {
             draw(
@@ -3500,11 +3683,11 @@ mod tests {
                 .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
                 .collect::<String>()
         };
-        // Row 0: the status header (two-line layout, #527).
+        // Machine state is the FOOTER's, on the last row — it used to lead.
         assert!(
-            row(0).contains("vi --INSERT--") && row(0).contains("m @ http://e:1"),
-            "header row carries mode + model @ endpoint: {:?}",
-            row(0)
+            row(3).contains("vi --INSERT--") && row(3).contains("m @ http://e:1"),
+            "footer row carries mode + model @ endpoint: {:?}",
+            row(3)
         );
         // Row 1: the prompt prefixes the first input line inline (`❯ this`).
         assert!(
@@ -3521,14 +3704,15 @@ mod tests {
     }
 
     #[test]
-    fn running_background_job_renders_on_the_bottom_row_below_the_prompt() {
+    fn a_running_job_leads_the_layout_rather_than_shifting_the_input() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
         let editor = vi_editor();
         let textarea = TextArea::default();
         let job = BackgroundJob::start("indexing repository");
-        let mut term = Terminal::new(TestBackend::new(80, 3)).unwrap();
+        // Four regions when a job runs: activity, header, input, footer.
+        let mut term = Terminal::new(TestBackend::new(80, 4)).unwrap();
         term.draw(|f| {
             draw(
                 f,
@@ -3551,10 +3735,19 @@ mod tests {
                 .collect::<String>()
         };
 
-        assert!(row(1).contains('❯'), "the prompt stays above the job row");
+        // The activity row LEADS the layout now. It was bottom-anchored, which
+        // put a row that appears and disappears directly under the input —
+        // shifting the input and its footer under the operator's hands every
+        // time a job started or finished. At the top it displaces nothing they
+        // are looking at.
         assert!(
-            row(2).contains("background") && row(2).contains("indexing repository"),
-            "the live job occupies the bottom row: {:?}",
+            row(0).contains("background") && row(0).contains("indexing repository"),
+            "the live job leads: {:?}",
+            row(0)
+        );
+        assert!(
+            row(2).contains('\u{276f}'),
+            "the prompt sits below the activity row and the header: {:?}",
             row(2)
         );
     }
@@ -3593,51 +3786,85 @@ mod tests {
             .collect()
     }
 
-    fn header_text(editor: &Editor, model: &str, endpoint: &str) -> String {
-        header_line(editor, model, endpoint, None, "", true)
+    fn footer_text(editor: &Editor, model: &str, endpoint: &str) -> String {
+        footer_line(editor, model, endpoint, None, true)
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect()
     }
 
-    /// #1671: the session name is always visible in the header — between the
-    /// mode word and `model @ endpoint` — and an empty name (the default)
-    /// keeps the legacy header byte-identical.
-    #[test]
-    fn header_always_shows_the_session_name() {
-        let ed = vi_editor();
-        let text = |session: &str| -> String {
-            header_line(&ed, "kimi-k3", "https://api.example", None, session, true)
-                .spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect()
-        };
+    fn header_text(session: &str, headline: &str) -> String {
+        header_line(session, headline)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
 
-        let named = text("mesh docking");
-        assert!(named.contains(" mesh docking ·"), "{named}");
-        // Name precedes the model @ endpoint block.
-        assert!(
-            named.find("mesh docking").unwrap() < named.find("kimi-k3").unwrap(),
-            "{named}"
-        );
+    /// **The header answers "which conversation is this", and nothing else.**
+    ///
+    /// #1671's session name lives here. What used to sit beside it — the
+    /// timestamp, the mode word, the model, the gauge — moved to the footer,
+    /// because a row carrying both identity and machine state had no single
+    /// owner, and grew an echo of the draft that the line below it was already
+    /// showing.
+    #[test]
+    fn the_header_carries_identity_and_nothing_else() {
+        let named = header_text("mesh docking", "");
+        assert!(named.contains("[mesh docking]"), "{named}");
 
         // The untitled form (#shortid) and the ephemeral marker render too.
-        assert!(text("#a1b2c3d4").contains(" #a1b2c3d4 ·"));
-        assert!(text("ephemeral").contains(" ephemeral ·"));
+        assert!(header_text("#a1b2c3d4", "").contains("[#a1b2c3d4]"));
+        assert!(header_text("ephemeral", "").contains("[ephemeral]"));
 
-        // Empty = the legacy header, unchanged.
-        let legacy = text("");
-        assert!(!legacy.contains(" ·"), "{legacy}");
-        assert!(legacy.contains("kimi-k3 @ https://api.example"), "{legacy}");
+        // Prose sits beside the name, separated by a space — no bracket, no rule.
+        let with_prose = header_text("mesh docking", "wiring the dock");
+        assert_eq!(with_prose, "[mesh docking] wiring the dock");
+
+        // Neither half is mandatory, and an absent half renders NOTHING rather
+        // than an empty bracket or a stray separator.
+        assert_eq!(header_text("", "just prose"), "just prose");
+        assert_eq!(header_text("solo", ""), "[solo]");
+        assert_eq!(header_text("", ""), "");
+
+        // Machine state is the footer's, and must not have followed the name.
+        for absent in ["vi", "@", "k/"] {
+            assert!(
+                !with_prose.contains(absent),
+                "`{absent}` belongs to the footer: {with_prose}"
+            );
+        }
+    }
+
+    /// **No region is separated by a horizontal rule.**
+    ///
+    /// A full-width `─────` run is a word-wrap hazard at every terminal width,
+    /// and adjacency already says these rows are regions. Asserted because a
+    /// rule is the obvious thing to reach for when someone later wants the
+    /// regions to "read as separate".
+    #[test]
+    fn no_region_draws_a_horizontal_rule() {
+        let ed = vi_editor();
+        let rows = [
+            header_text("session", "headline"),
+            footer_text(&ed, "model", "http://endpoint"),
+        ];
+        for row in rows {
+            for rule in ['\u{2500}', '\u{2501}', '\u{2550}', '_'] {
+                assert!(
+                    !row.contains(&rule.to_string().repeat(4)),
+                    "a run of `{rule}` is a rule: {row}"
+                );
+            }
+        }
     }
 
     #[test]
     fn header_shows_context_budget_gauge_when_known() {
         let ed = vi_editor();
         let text = |g| -> String {
-            header_line(&ed, "m", "e", g, "", true)
+            footer_line(&ed, "m", "e", g, true)
                 .spans
                 .iter()
                 .map(|s| s.content.as_ref())
@@ -3729,9 +3956,9 @@ mod tests {
     }
 
     #[test]
-    fn header_shows_datetime_mode_and_model_endpoint() {
+    fn the_footer_shows_datetime_mode_and_model_endpoint() {
         let insert = vi_editor(); // starts in INSERT
-        let h = header_text(&insert, "nemotron-3-nano:30b", "http://REDACTED-HOST:11434");
+        let h = footer_text(&insert, "nemotron-3-nano:30b", "http://REDACTED-HOST:11434");
         assert!(h.starts_with('['), "datetime stamp: {h:?}");
         assert!(h.contains("vi --INSERT--"), "{h:?}");
         assert!(
@@ -3742,10 +3969,10 @@ mod tests {
         let mut normal = vi_editor();
         let mut ta = TextArea::default();
         normal.input(special(KeyCode::Esc), &mut ta);
-        assert!(header_text(&normal, "m", "e").contains("vi --NORMAL--"));
+        assert!(footer_text(&normal, "m", "e").contains("vi --NORMAL--"));
         // emacs/nano show the bare editor name; empty model omits the `@`.
-        assert!(header_text(&emacs_editor(), "m", "e").contains("emacs"));
-        assert!(!header_text(&insert, "", "").contains('@'));
+        assert!(footer_text(&emacs_editor(), "m", "e").contains("emacs"));
+        assert!(!footer_text(&insert, "", "").contains('@'));
     }
 
     #[test]
@@ -3788,7 +4015,7 @@ mod tests {
 
         // The mode is still discoverable — where vi keeps it.
         assert!(
-            header_text(&normal, "m", "e").contains("vi --NORMAL--"),
+            footer_text(&normal, "m", "e").contains("vi --NORMAL--"),
             "the header carries the mode"
         );
         assert!(

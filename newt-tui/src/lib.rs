@@ -129,6 +129,11 @@ mod config_panel;
 // piped / wyvern paths never compile it in.
 #[cfg(feature = "rich-tui")]
 mod palette;
+// One table of named roles, so a colour is chosen once and named everywhere —
+// the answer to a census of thirty-odd literals across nine files, including
+// `DarkGray` twenty times beside `DarkGrey` thirteen.
+#[cfg(feature = "rich-tui")]
+mod theme;
 // The ONE inline-panel driver — raw mode, viewport, repaint cadence — shared by
 // every panel, so a third panel cannot inherit a third copy of the event loop
 // `/psyche` and `/backends` were each carrying.
