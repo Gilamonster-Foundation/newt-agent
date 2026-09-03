@@ -12756,12 +12756,7 @@ fn dispatch_slash_with_ask(
     markdown: bool,
     ask: Option<SlashAsk<'_>>,
 ) -> anyhow::Result<bool> {
-    // Strip leading slash and split into at most 3 tokens.
-    let body = input.trim_start_matches('/');
-    let mut parts = body.splitn(3, ' ');
-    let cmd = parts.next().unwrap_or("");
-    let arg1 = parts.next().unwrap_or("").trim();
-    let arg2 = parts.next().unwrap_or("").trim();
+    let (cmd, arg1, arg2) = slash_parts(input);
 
     match cmd {
         "exit" | "quit" | "help" | "version" | "workspace" | "config" => {
@@ -12797,6 +12792,19 @@ fn dispatch_slash_with_ask(
             Ok(true)
         }
     }
+}
+
+/// Split a slash command into its verb and first two arguments.
+///
+/// Whitespace between fields is syntax, not an empty argument: `/model  name`
+/// must take the same path as `/model name`. The final field keeps embedded
+/// whitespace so commands whose second argument is free text retain it.
+fn slash_parts(input: &str) -> (&str, &str, &str) {
+    let body = input.trim_start_matches('/').trim_start();
+    let (cmd, rest) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
+    let rest = rest.trim_start();
+    let (arg1, arg2) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    (cmd, arg1, arg2.trim())
 }
 
 /// Fetch model names from an Ollama endpoint's `/api/tags`.
