@@ -392,10 +392,14 @@ jobs:
       # the workspace test above. Re-run just those probes with --nocapture so
       # the ADR can quote a real CI transcript instead of a local claim. Cheap:
       # the binaries are already built.
+      #
+      # The probes are `#[ignore]`d (they mutate process-global console state /
+      # spawn subprocesses and so cannot run in the parallel workspace suite),
+      # so `--include-ignored` is required to run them here, single-threaded.
       - name: ConPTY feasibility probe evidence (#1746)
         if: always()
         run: |
-          cargo test -p newt-tui --features rich-tui cockpit::conpty_probe -- --nocapture --test-threads=1
+          cargo test -p newt-tui --features rich-tui cockpit::conpty_probe -- --include-ignored --nocapture --test-threads=1
       - name: Windows AppContainer evidence
         if: always()
         env:
