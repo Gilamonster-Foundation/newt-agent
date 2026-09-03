@@ -7584,10 +7584,24 @@ fn session_body(
                                         // completed tool output viewport. Only on Rich TUI + live-spill.
                                         #[cfg(all(feature = "rich-tui", feature = "live-spill"))]
                                         completed_spill_renderer: if surface_is_rich {
-                                            live_spill.as_ref().map(|spill| {
-                                                spill.clone()
-                                                    as std::sync::Arc<dyn newt_core::agentic::CompletedSpillRenderer>
-                                            })
+                                            // The live renderer when there is one; the bare
+                                            // ARCHIVE when there is not. Under the cockpit
+                                            // `live_spill` is deliberately None — the presenter
+                                            // drops the cursor motion a viewport paints with —
+                                            // and that used to take retention down with it, so
+                                            // no id was minted and history could not be
+                                            // reopened at all. Retention does not need a
+                                            // screen.
+                                            Some(live_spill
+                                                .as_ref()
+                                                .map(|spill| {
+                                                    spill.clone()
+                                                        as std::sync::Arc<dyn newt_core::agentic::CompletedSpillRenderer>
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    completed_spills.clone()
+                                                        as std::sync::Arc<dyn newt_core::agentic::CompletedSpillRenderer>
+                                                }))
                                         } else {
                                             None
                                         },
