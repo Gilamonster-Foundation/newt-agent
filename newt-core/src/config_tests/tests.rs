@@ -755,13 +755,17 @@ fn shell_commands_default_on_mutations_default_off_and_round_trip() {
 }
 
 #[test]
-fn thinking_mode_defaults_to_stream_and_round_trips() {
+fn thinking_mode_defaults_to_fold_and_round_trips() {
+    // The default is BOUNDED reasoning. `stream` still names the old unbounded
+    // trickle, so an operator who wants every line back writes one word.
     let cfg: TuiConfig = toml::from_str("").unwrap();
-    assert_eq!(cfg.thinking, ThinkingMode::Stream);
+    assert_eq!(cfg.thinking, ThinkingMode::Fold);
     let cfg: TuiConfig = toml::from_str("thinking = \"off\"").unwrap();
     assert_eq!(cfg.thinking, ThinkingMode::Off);
     let cfg: TuiConfig = toml::from_str("thinking = \"stream\"").unwrap();
     assert_eq!(cfg.thinking, ThinkingMode::Stream);
+    let cfg: TuiConfig = toml::from_str("thinking = \"fold\"").unwrap();
+    assert_eq!(cfg.thinking, ThinkingMode::Fold);
 }
 
 // ── profile composition (technique library) ────────────────────────

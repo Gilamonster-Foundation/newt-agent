@@ -7295,6 +7295,18 @@ fn session_body(
                     let committed_view =
                         committed_spill_lines(surface_is_rich, configured_spill_lines);
                     newt_core::set_spill_lines(committed_view);
+                    // Time markers are for a transcript a human SCROLLS. A
+                    // piped or headless run is bytes something else will diff,
+                    // and a wall clock there makes that comparison unstable —
+                    // so the cadence is the operator's setting on the
+                    // interactive surface and hard 0 everywhere else. Same
+                    // shape, and the same argument, as `set_spill_summary`
+                    // below.
+                    newt_core::set_time_marker_secs(if surface_is_rich {
+                        crate::time_marker_secs(&cfg)
+                    } else {
+                        0
+                    });
                     // Under the cockpit the live viewport is not constructed:
                     // it paints with cursor motion the presenter drops by design
                     // (v1). The tool spinner (#1727) covers liveness meanwhile.

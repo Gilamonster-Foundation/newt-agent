@@ -161,6 +161,10 @@ impl SpinnerState {
             .record(SPINNER_TASK, at, &Durable::Note(detail_note(line)));
     }
 
+    fn elapsed(&self) -> Duration {
+        self.start.elapsed()
+    }
+
     /// The producer's own clock, in the units the sink takes. `progress` reads
     /// no clock; the spinner always did.
     fn at_ms(elapsed: Duration) -> u64 {
@@ -287,6 +291,16 @@ impl Spinner {
         });
         register(&state);
         Some(Self { state })
+    }
+
+    /// How long this spinner has been running.
+    ///
+    /// The caller reads THIS rather than starting its own `Instant`, because
+    /// this is the clock that already survives a `set_label` — the one the
+    /// operator has been watching count up. A second clock beside it would
+    /// disagree the moment the label changed.
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.state.elapsed()
     }
 
     /// Change the stage text without resetting the clock

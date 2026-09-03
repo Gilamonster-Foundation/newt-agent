@@ -47,7 +47,7 @@ const FIELD_LABELS: &[&str] = &[
     "line-editor key bindings",
     "tenacity",
     "cognition",
-    "thinking spinner",
+    "reasoning display",
     "action-pressure nudges",
     "tool-call round limit",
 ];

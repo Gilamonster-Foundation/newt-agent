@@ -508,6 +508,187 @@ pub fn interactive_recovery() -> Recovery<'static> {
     }
 }
 
+/// Which interval boundary `elapsed` falls in — the ONE statement of "how
+/// often is often enough", shared by the turn heartbeat and the transcript's
+/// time markers.
+///
+/// Integer division on purpose: it makes the cadence **non-catch-up**. A turn
+/// that blocks for an hour inside one tool call crosses one boundary, not
+/// twelve, so the caller emits a single line when it returns rather than a wall
+/// of them at exactly the moment the operator is trying to read what happened.
+///
+/// Pure — it reads no clock. Production hands it an `elapsed`; a test states
+/// the time. Two callers keep their own "have I announced this boundary yet"
+/// because their lifetimes differ (one per turn, one per process), but neither
+/// gets to have its own opinion about where the boundaries are.
+pub(crate) fn cadence_boundary(
+    elapsed: std::time::Duration,
+    interval: std::time::Duration,
+) -> Option<u64> {
+    if interval.is_zero() {
+        return None;
+    }
+    Some(elapsed.as_secs() / interval.as_secs().max(1))
+}
+
+/// Seconds between committed time markers; 0 = off.
+///
+/// **Off by default, seeded per turn by the surface** — the same shape as
+/// `SPILL_SUMMARY` above, and for the same reason. A wall clock in stdout makes
+/// byte-exact capture unstable, and the piped / headless / `newt solve` paths
+/// are exactly where that matters, so those keep today's output unchanged while
+/// an interactive operator gets the markers.
+static TIME_MARKER_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The last boundary a marker was committed for. Process-wide, because
+/// `ToolDisplay` is constructed fresh for every tool call and BOTH emitters
+/// (the real dispatcher and the synthetic-result path) must share one cadence
+/// or they interleave into a stutter.
+static TIME_MARKER_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set the time-marker cadence, from the surface that knows whether its output
+/// is a transcript a human reads or bytes something else will diff.
+pub fn set_time_marker_secs(secs: u64) {
+    TIME_MARKER_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+    // Seed the boundary to NOW rather than to zero. This runs once per turn,
+    // and the turn echo has just committed its own `[YYYY-MM-DD HH:MM:SS]` a
+    // row or two above — so resetting to zero would fire a marker on the first
+    // tool call of every turn, restating a time the operator can still see.
+    // What is worth marking is an interval that passes INSIDE a turn.
+    let seeded = cadence_boundary(
+        marker_epoch().elapsed(),
+        std::time::Duration::from_secs(secs),
+    )
+    .unwrap_or(0);
+    TIME_MARKER_EMITTED.store(seeded, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// When this process started, for the elapsed the cadence is measured against.
+fn marker_epoch() -> std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
+}
+
+/// Claim the marker due at `elapsed`, if one is — at most once per boundary
+/// however many callers race for it.
+///
+/// Pure over `elapsed` and `interval`; the atomic is the only state, and the
+/// compare-exchange is what makes "at most one" true rather than merely likely.
+fn claim_time_marker(elapsed: std::time::Duration, interval: std::time::Duration) -> bool {
+    let Some(boundary) = cadence_boundary(elapsed, interval) else {
+        return false;
+    };
+    let mut seen = TIME_MARKER_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
+    while boundary > seen {
+        match TIME_MARKER_EMITTED.compare_exchange_weak(
+            seen,
+            boundary,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => seen = actual,
+        }
+    }
+    false
+}
+
+/// The marker itself, given an already-formatted wall clock.
+///
+/// `[14:32]` and not a rule, for three reasons: the bracketed stamp is already
+/// this transcript's vocabulary (the turn echo commits
+/// `[YYYY-MM-DD HH:MM:SS]`), brackets still read as a marker with `color:
+/// false` — which is the piped case, where a bare grey `14:32` would look like
+/// output — and a full-width rule is a word-wrap hazard that says nothing the
+/// brackets do not. The date is already on the turn's own row, so inside a turn
+/// `%H:%M` is the right register.
+pub(crate) fn time_marker_line(hhmm: &str) -> String {
+    format!("[{hhmm}]")
+}
+
+/// A reasoning block, bounded the way a tool result is.
+///
+/// The problem it solves is the one `SPILL_SUMMARY` already names for tools: a
+/// wall of grey buries the conversation spine. A thinking model that reasons
+/// for four hundred lines committed four hundred dim lines to scrollback, and
+/// then the answer arrived somewhere below the fold of the operator's screen.
+///
+/// So reasoning gets the treatment tool output gets, from the same parts: the
+/// first `[tui] spill_lines` rows commit as before, the rest are retained
+/// instead of printed, and one closing line names how long the model thought
+/// and how much is behind the fold — through [`Fold`], so it cannot become a
+/// sixth phrasing, and through the archive, so `/spill open <id>` is a real
+/// offer rather than a gesture.
+#[derive(Debug, Default)]
+pub struct ThinkingFold {
+    /// Rows already committed to scrollback, against the `spill_lines` budget.
+    shown: usize,
+    /// Everything the model said, for the archive. Only grows past the budget
+    /// — under it the line is already in scrollback and this is the copy that
+    /// makes the whole block reopenable.
+    body: String,
+    /// Lines held back, i.e. what the fold is hiding.
+    hidden: usize,
+}
+
+impl ThinkingFold {
+    /// Offer one completed reasoning line. Returns whether the caller should
+    /// PRINT it — false once the budget is spent, at which point the line has
+    /// been retained instead.
+    pub fn offer(&mut self, line: &str, budget: usize) -> bool {
+        self.body.push_str(line);
+        self.body.push('\n');
+        // `spill_lines == 0` is "unbounded" everywhere else in this file, and
+        // it means the same here: nothing is ever held back.
+        if budget == 0 || self.shown < budget {
+            self.shown += 1;
+            return true;
+        }
+        self.hidden += 1;
+        false
+    }
+
+    /// Everything the model said, for retention.
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    /// Whether anything was said at all.
+    pub fn is_empty(&self) -> bool {
+        self.body.is_empty()
+    }
+
+    /// The closing line, or `None` when the model did not reason.
+    ///
+    /// `Thought for 41s` alone when nothing was held back — there is no fold to
+    /// announce, and offering a handle that opens what is already on screen is
+    /// noise. With a fold, the count and the handle follow it.
+    pub fn closing_line(
+        &self,
+        elapsed: std::time::Duration,
+        recovery: Recovery<'_>,
+    ) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let head = format!("Thought for {}", fmt_duration(elapsed));
+        if self.hidden == 0 {
+            return Some(head);
+        }
+        Some(format!("{head} · {}", Fold::lines(self.hidden, recovery)))
+    }
+}
+
+/// `41s`, `2m 5s`, `1h 3m` — the register the operator reads elapsed in.
+fn fmt_duration(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    match (secs / 3600, (secs % 3600) / 60, secs % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m {s}s"),
+        (h, m, _) => format!("{h}h {m}m"),
+    }
+}
+
 /// The one place that names the recovery path out of a truncated view (#1433).
 ///
 /// Every truncation marker interpolates THIS, so a third one cannot silently
@@ -959,6 +1140,13 @@ impl<W: Write> ToolDisplay<W> {
         if let Some(renderer) = &self.completed_spill_renderer {
             renderer.erase();
         }
+        // A dim wall-clock marker, at most once per cadence interval, so a long
+        // transcript is navigable by time without a stamp on every row.
+        //
+        // AFTER the erase above and BEFORE the header: the erase rewinds
+        // relative to the cursor, so a committed line underneath it breaks that
+        // math — the same ordering the header itself already depends on.
+        self.time_marker();
         let lines = tool_call_lines(name, detail, self.cols);
         for (i, line) in lines.iter().enumerate() {
             if self.color {
@@ -991,6 +1179,35 @@ impl<W: Write> ToolDisplay<W> {
             }
         }
         self.writer.flush().ok();
+    }
+
+    /// Commit the time marker if the cadence says one is due.
+    ///
+    /// Writes through `self.writer`, NOT through `Notice::emit`, which returns
+    /// zero bytes at `LineCaps::None` — every piped / headless run, which is
+    /// the one place a transcript most needs to say when things happened. This
+    /// gives the marker exactly the header's own reach and exactly the header's
+    /// own protocol-mode protection.
+    fn time_marker(&mut self) {
+        let secs = TIME_MARKER_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        if !claim_time_marker(
+            marker_epoch().elapsed(),
+            std::time::Duration::from_secs(secs),
+        ) {
+            return;
+        }
+        let line = time_marker_line(&chrono::Local::now().format("%H:%M").to_string());
+        if self.color {
+            execute!(
+                &mut self.writer,
+                SetForegroundColor(CtColor::DarkGrey),
+                Print(format!("{line}\n")),
+                ResetColor,
+            )
+            .ok();
+        } else {
+            writeln!(&mut self.writer, "{line}").ok();
+        }
     }
 
     pub(crate) fn result(&mut self, output: &str) {
@@ -2012,6 +2229,165 @@ mod tests {
             terminal.contents().contains("interrupted"),
             "the static excerpt still committed"
         );
+    }
+
+    /// The reasoning block spends the SAME budget a committed tool result
+    /// spends, so `/spill 5` is one dial rather than two.
+    #[test]
+    fn a_reasoning_fold_shows_the_budget_and_retains_the_rest() {
+        use std::time::Duration;
+
+        let mut fold = super::ThinkingFold::default();
+        let shown: Vec<bool> = (1..=10)
+            .map(|i| fold.offer(&format!("line {i}"), 3))
+            .collect();
+        assert_eq!(
+            shown,
+            [true, true, true, false, false, false, false, false, false, false],
+            "the first three print, the rest are held"
+        );
+
+        // Everything is retained, printed or not — the archived body is the
+        // WHOLE block, which is what makes reopening it worth the offer.
+        assert_eq!(fold.body().lines().count(), 10);
+        assert!(fold.body().starts_with("line 1\n"));
+        assert!(fold.body().ends_with("line 10\n"));
+
+        let line = fold
+            .closing_line(
+                Duration::from_secs(41),
+                super::Recovery::Command("/spill open 7"),
+            )
+            .expect("the model reasoned, so there is a line");
+        assert_eq!(line, "Thought for 41s · 7 lines hidden  [/spill open 7]");
+    }
+
+    /// Nothing held back means nothing to announce: offering a handle that
+    /// opens what is already on screen is noise, not help.
+    #[test]
+    fn a_reasoning_fold_that_hid_nothing_says_only_how_long_it_thought() {
+        use std::time::Duration;
+
+        let mut fold = super::ThinkingFold::default();
+        assert!(fold.offer("a short thought", 3));
+        assert_eq!(
+            fold.closing_line(Duration::from_secs(1), super::Recovery::default()),
+            Some("Thought for 1s".to_string())
+        );
+
+        // And a model that did not reason at all closes nothing.
+        let quiet = super::ThinkingFold::default();
+        assert!(quiet.is_empty());
+        assert_eq!(
+            quiet.closing_line(Duration::from_secs(9), super::Recovery::default()),
+            None
+        );
+    }
+
+    /// `spill_lines = 0` is "unbounded" everywhere else in this file, and it
+    /// has to mean the same here — that is what `[tui] thinking = "stream"`
+    /// rides to keep the historical trickle.
+    #[test]
+    fn a_zero_budget_holds_nothing_back() {
+        use std::time::Duration;
+
+        let mut fold = super::ThinkingFold::default();
+        for i in 0..50 {
+            assert!(fold.offer(&format!("line {i}"), 0), "every line prints");
+        }
+        assert_eq!(
+            fold.closing_line(Duration::from_secs(3), super::Recovery::default()),
+            Some("Thought for 3s".to_string()),
+            "no fold to announce"
+        );
+    }
+
+    #[test]
+    fn elapsed_reads_in_the_register_the_operator_thinks_in() {
+        use std::time::Duration;
+
+        assert_eq!(super::fmt_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(super::fmt_duration(Duration::from_secs(41)), "41s");
+        assert_eq!(super::fmt_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(super::fmt_duration(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(super::fmt_duration(Duration::from_secs(125)), "2m 5s");
+        assert_eq!(super::fmt_duration(Duration::from_secs(3_600)), "1h 0m");
+        assert_eq!(super::fmt_duration(Duration::from_secs(3_780)), "1h 3m");
+    }
+
+    /// The cadence is deliberately NON-catch-up: crossing many boundaries at
+    /// once yields one marker, not one per boundary. A turn that blocks for an
+    /// hour inside a single tool call must not return with twelve stamps at
+    /// exactly the moment the operator is trying to read what happened.
+    #[test]
+    fn the_cadence_boundary_is_shared_and_does_not_catch_up() {
+        use std::time::Duration;
+
+        // Off is off — this is the piped/headless posture and the default.
+        assert_eq!(
+            super::cadence_boundary(Duration::from_secs(9_999), Duration::ZERO),
+            None
+        );
+
+        // Boundaries are intervals elapsed, so a caller comparing against what
+        // it last announced advances by ONE however far the clock jumped.
+        let five = Duration::from_secs(300);
+        assert_eq!(
+            super::cadence_boundary(Duration::from_secs(0), five),
+            Some(0)
+        );
+        assert_eq!(
+            super::cadence_boundary(Duration::from_secs(299), five),
+            Some(0),
+            "still inside the first interval"
+        );
+        assert_eq!(
+            super::cadence_boundary(Duration::from_secs(300), five),
+            Some(1)
+        );
+        assert_eq!(
+            super::cadence_boundary(Duration::from_secs(3_600), five),
+            Some(12),
+            "an hour is one boundary number, not twelve emissions"
+        );
+
+        // A sub-second interval cannot divide by zero.
+        assert_eq!(
+            super::cadence_boundary(Duration::from_secs(7), Duration::from_millis(1)),
+            Some(7)
+        );
+    }
+
+    /// The marker must carry its meaning with `color: false`, because that is
+    /// the piped case — a bare grey `14:32` would read as output. Brackets are
+    /// already this transcript's timestamp vocabulary (the turn echo commits
+    /// `[YYYY-MM-DD HH:MM:SS]`), and they survive a monochrome capture.
+    #[test]
+    fn the_marker_is_a_bracketed_stamp_not_a_rule() {
+        let line = super::time_marker_line("14:32");
+        assert_eq!(line, "[14:32]");
+        assert!(
+            !line.contains('─') && !line.contains('-'),
+            "no rule: a full-width one is a word-wrap hazard and says nothing \
+             the brackets do not"
+        );
+    }
+
+    /// Off by default, and the header is byte-identical when it is off — which
+    /// is what keeps every exact-transcript golden green and the
+    /// piped/headless path stable.
+    #[test]
+    fn no_cadence_means_the_header_bytes_are_unchanged() {
+        super::set_time_marker_secs(0);
+        let mut display = super::ToolDisplay::new(Vec::new(), false, 80, 3, false);
+        display.call("run_command", "ls -la");
+        let committed = String::from_utf8(display.into_inner()).unwrap();
+        let expected = format!(
+            "{}\n",
+            tool_call_lines("run_command", "ls -la", 80).join("\n")
+        );
+        assert_eq!(committed, expected, "no marker, no change");
+        assert!(!committed.contains('['), "nothing stamped: {committed:?}");
     }
 
     /// Without a renderer, the static path is BYTE-FOR-BYTE unchanged — the

@@ -1519,10 +1519,23 @@ fn default_semantic_top_k() -> usize {
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingMode {
     /// Cargo-style: reasoning streams as dim scrolled lines (kept in
-    /// scrollback) with an ephemeral spinner line pinned at the bottom. The
-    /// default — but only on a TTY; a pipe / `newt worker` shows nothing.
-    #[default]
+    /// scrollback) with an ephemeral spinner line pinned at the bottom. On a
+    /// TTY only; a pipe / `newt worker` shows nothing.
+    ///
+    /// Unbounded: a model that reasons for four hundred lines commits four
+    /// hundred lines, which is what [`Self::Fold`] exists to stop.
     Stream,
+    /// The default. Like [`Self::Stream`], but BOUNDED: the first
+    /// `[tui] spill_lines` rows of reasoning commit as before, the rest are
+    /// retained instead of printed, and the block closes with one line naming
+    /// how long the model thought and how much is behind the fold.
+    ///
+    /// The same treatment tool output already gets, applied to reasoning —
+    /// same budget, same `Fold` vocabulary, same `/spill open <id>` recovery —
+    /// because "a wall of grey that buries the conversation spine" is the same
+    /// problem whichever side produced it.
+    #[default]
+    Fold,
     /// No reasoning display at all (the answer still streams normally).
     Off,
 }
@@ -1669,6 +1682,19 @@ pub struct TuiConfig {
     /// `tool_output_lines` preview setting does not override it.
     #[serde(default = "default_spill_lines")]
     pub spill_lines: usize,
+
+    /// Seconds between dim `[HH:MM]` markers committed above tool calls, so a
+    /// long transcript can be read for WHEN as well as what. At most one marker
+    /// per interval however long the gap — a turn that blocks for an hour emits
+    /// one line when it returns, not twelve.
+    ///
+    /// Default: 300 (five minutes), and it applies to the INTERACTIVE surface
+    /// only. Piped, headless and `newt solve` runs commit no markers whatever
+    /// this says, because a wall clock in stdout makes byte-exact capture
+    /// unstable and those are the paths where that matters. Set to 0 to turn
+    /// them off interactively too.
+    #[serde(default = "default_time_marker_secs")]
+    pub time_marker_secs: u64,
 
     /// Maximum number of tool-call rounds the model may take within a single
     /// turn before the agent forces a final, tools-disabled completion. Each
@@ -1861,6 +1887,10 @@ pub struct TuiConfig {
 
 fn default_spill_lines() -> usize {
     3
+}
+
+fn default_time_marker_secs() -> u64 {
+    300
 }
 
 fn default_tool_output_lines() -> usize {
@@ -2649,6 +2679,7 @@ impl Default for TuiConfig {
             thinking: ThinkingMode::Stream,
             tool_output_lines: default_tool_output_lines(),
             spill_lines: default_spill_lines(),
+            time_marker_secs: default_time_marker_secs(),
             max_tool_rounds: default_max_tool_rounds(),
             workflow_grace_rounds: default_workflow_grace_rounds(),
             narration_nudge_cap: default_narration_nudge_cap(),
