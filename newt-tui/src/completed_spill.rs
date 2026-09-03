@@ -135,9 +135,66 @@ impl CompletedSpillArchive {
     }
 }
 
+/// Retention WITHOUT an inline viewport.
+///
+/// The two halves of `CompletedSpillRenderer` are independent capabilities —
+/// keeping a body so `/spill open <id>` can reopen it later has nothing to do
+/// with painting rows on the screen right now — but only `LiveSpillRenderer`
+/// implemented the trait, so a surface that could not paint got neither.
+///
+/// That is what broke history under the cockpit. `terminal_owns_turn`
+/// suppresses `LiveSpillRenderer` entirely (the presenter drops the cursor
+/// motion it paints with), which took the ARCHIVE down with it: no body was
+/// retained, no id was minted, so every committed excerpt fell back to the
+/// generic `/spill N raises this view` and `/spill last` answered "that spill
+/// is not retained in this bounded session archive" for a result still on
+/// screen. The operator's report was exactly right — live spill worked, dead
+/// spill could not be expanded — and the cause was that retention had been
+/// welded to rendering.
+///
+/// `render_completed` returns 0, which the trait already defines as "the
+/// viewport could not take the screen". That is the truth here, not a stub.
+impl newt_core::agentic::CompletedSpillRenderer for CompletedSpillArchive {
+    fn retain_completed(&self, output: &str) -> Option<u64> {
+        Some(self.retain(output))
+    }
+
+    fn render_completed(&self, _output: &str, _width: usize, _max_height: usize) -> usize {
+        0
+    }
+
+    /// Never. This archive paints nothing, so there is never a frame on screen
+    /// — and saying otherwise would invite a rewind over rows it does not own.
+    fn is_active(&self) -> bool {
+        false
+    }
+
+    /// Nothing to rewind. The committed excerpt above is the whole record here.
+    fn erase(&self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cockpit regression: an archive alone must mint ids, so a committed
+    /// excerpt can name a real `/spill open <id>` on a surface that cannot
+    /// paint an inline viewport.
+    #[test]
+    fn the_archive_alone_retains_and_declines_to_paint() {
+        use newt_core::agentic::CompletedSpillRenderer;
+
+        let archive = CompletedSpillArchive::default();
+        assert_eq!(archive.retain_completed("first\n"), Some(1));
+        assert_eq!(archive.retain_completed("second\n"), Some(2));
+        assert_eq!(archive.get(1).unwrap().lines(), &["first"]);
+        assert_eq!(archive.latest().unwrap().id(), 2);
+        assert_eq!(
+            archive.render_completed("first\n", 80, 10),
+            0,
+            "no rows painted — the surface that uses this cannot take the screen"
+        );
+    }
 
     #[test]
     fn ids_are_stable_and_latest_tracks_the_newest_result() {

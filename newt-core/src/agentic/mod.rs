@@ -192,8 +192,10 @@ pub use crew_attest::{crew_authz, crew_step_up_policy, CrewAuthz, Presence};
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
 pub use cw_overflow::{parse_context_window_error, recover_context_window_400};
 pub use display::{
-    fmt_token_gauge, fmt_tokens_compact, gauge_level, newt_line, print_harness_notice,
-    print_list_item, print_newt, set_spill_lines, set_spill_summary, GaugeLevel, NEWT_ORANGE_CT,
+    fmt_token_gauge, fmt_tokens_compact, gauge_level, interactive_recovery, newt_line,
+    print_harness_notice, print_list_item, print_newt, set_mouse_recovery, set_spill_lines,
+    set_spill_summary, set_time_marker_secs, Fold, GaugeLevel, Hidden, Recovery, ThinkingFold,
+    NEWT_ORANGE_CT,
 };
 pub use driver::{
     HeadlessCodeSearch, TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
@@ -3302,6 +3304,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 leading_reasoning,
                 cancel,
                 markdown,
+                completed_spill_renderer.clone(),
             )
             .await
             {
@@ -5307,15 +5310,18 @@ impl TurnHeartbeat {
     /// not twelve. Catching up would turn a quiet signal into a wall of text
     /// at exactly the moment the operator is trying to read what happened.
     fn due(&mut self, elapsed: std::time::Duration, interval: std::time::Duration) -> bool {
-        if interval.is_zero() {
-            return false;
+        // The boundary rule is `display::cadence_boundary` — shared with the
+        // transcript's time markers so the two cannot drift into two different
+        // ideas of "often enough". What stays here is only this heartbeat's own
+        // record of what it has already said, which is per-turn where the
+        // marker's is per-process.
+        match display::cadence_boundary(elapsed, interval) {
+            Some(boundary) if boundary > self.emitted => {
+                self.emitted = boundary;
+                true
+            }
+            _ => false,
         }
-        let boundary = elapsed.as_secs() / interval.as_secs().max(1);
-        if boundary > self.emitted {
-            self.emitted = boundary;
-            return true;
-        }
-        false
     }
 }
 
@@ -6456,6 +6462,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // out and lets `round` advance, so recovery never consumes a tool-capable
         // round (critical at hard_tool_rounds == 1 or near the cap): the recovered
         // request is re-sent WITH tools, never demoted to the tools-disabled summary.
+        // How long the model actually took, read off the spinner the operator
+        // was watching rather than a second clock started beside it. Assigned
+        // inside the retry loop below, where the spinner is still alive.
+        let mut thought_for;
         let (json, round_est_raw): (serde_json::Value, usize) = loop {
             let wire_messages = openai_chat_wire_messages(&messages)?;
 
@@ -6566,6 +6576,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 },
             )
             .await;
+            thought_for = spinner
+                .as_ref()
+                .map_or(std::time::Duration::ZERO, crate::tty::Spinner::elapsed);
             drop(spinner);
             match dispatch {
                 Ok(j) => break (j, round_est_raw),
@@ -6769,6 +6782,22 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 color,
             );
         }
+        // …and now SHOW it. This wire is non-streaming (`"stream": false`
+        // above), so until this the operator's only evidence a thinking model
+        // had reasoned at all was a `--debug` line counting the characters it
+        // threw away. On a reasoning model that is most of what the turn did.
+        //
+        // Same fold as the streaming path and as a tool result: the first
+        // `spill_lines` rows commit, the rest are retained behind
+        // `/spill open <id>`, and one line says how long it took.
+        commit_reasoning_fold(
+            separate_reasoning
+                .map(str::to_string)
+                .or_else(|| inline_reasoning.clone()),
+            thought_for,
+            completed_spill_renderer.as_deref(),
+            color,
+        );
         let native_calls = message["tool_calls"].as_array();
         // Recover tool calls emitted as content instead of the native field —
         // the #1 weak-model failure (see `tool_recovery`). Mirror of the Ollama
@@ -7581,6 +7610,9 @@ struct AnthropicDispatch<'a> {
     retry: &'a RetryPolicy,
     color: bool,
     markdown: bool,
+    /// Where a folded reasoning body is retained, so the closing line's
+    /// `/spill open <id>` names something real rather than gesturing at it.
+    retain: Option<&'a std::sync::Arc<dyn CompletedSpillRenderer>>,
 }
 
 /// One `/v1/messages` dispatch → one decoded [`anthropic_wire::AnthropicRound`].
@@ -7702,6 +7734,16 @@ async fn anthropic_dispatch_round(
             .markdown
             .then(|| MarkdownStreamWriter::new(io::stdout(), RenderOpts { color: true, cols }));
         let mut acc = anthropic_wire::SseAccumulator::new();
+        // The same bounded reasoning block the other two wires commit. Anthropic
+        // streams thinking as its own SSE action rather than inline `<think>`,
+        // but the operator-facing question — "how much of this do I want in my
+        // scrollback" — is identical, so it gets the identical answer.
+        let anth_budget = if thinking_mode() == crate::ThinkingMode::Fold {
+            display::spill_lines()
+        } else {
+            0
+        };
+        let mut anth_reason = ReasoningTrickle::default();
         let mut started = false;
         let mut transport_break: Option<String> = None;
         let mut resp = resp;
@@ -7718,9 +7760,17 @@ async fn anthropic_dispatch_round(
                         match action {
                             anthropic_wire::StreamAction::TextDelta(t) => {
                                 if !started {
-                                    // The answer is starting — tear the
-                                    // spinner down first (stream_response's
-                                    // display convention).
+                                    // The answer is starting — close the
+                                    // reasoning block while the spinner's clock
+                                    // is still readable, then tear it down
+                                    // (stream_response's display convention).
+                                    if let Some(sp) = spinner.as_ref() {
+                                        anth_reason.close(
+                                            sp.elapsed(),
+                                            d.retain.map(std::sync::Arc::as_ref),
+                                            d.color,
+                                        );
+                                    }
                                     drop(spinner.take());
                                     if d.color {
                                         execute!(
@@ -7744,7 +7794,7 @@ async fn anthropic_dispatch_round(
                             }
                             anthropic_wire::StreamAction::ThinkingDelta(t) => {
                                 if let Some(sp) = spinner.as_ref() {
-                                    sp.detail(&t);
+                                    anth_reason.feed(sp, &t, anth_budget);
                                 }
                             }
                         }
@@ -8123,6 +8173,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         retry: &retry,
         color,
         markdown,
+        retain: completed_spill_renderer.as_ref(),
     };
     // Tool advertisement gating — mirrors the OpenAI path.
     let advertise_save_note = note_sink.is_some();
@@ -10755,23 +10806,177 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
 /// `NEWT_THINKING` in the form would show `on` while `[tui] thinking = "off"`
 /// quietly won (#1981).
 #[must_use]
-pub fn thinking_stream_enabled() -> bool {
+pub fn thinking_mode() -> crate::ThinkingMode {
     match std::env::var("NEWT_THINKING").ok().as_deref() {
-        Some("off") => return false,
-        Some("on" | "stream") => return true,
+        Some("off") => return crate::ThinkingMode::Off,
+        // `stream` asks for the UNBOUNDED cargo-style trickle by name; plain
+        // `on` asks to see the reasoning and gets the bounded default.
+        Some("stream") => return crate::ThinkingMode::Stream,
+        Some("on" | "fold") => return crate::ThinkingMode::Fold,
         _ => {}
     }
     crate::Config::resolve()
         .ok()
         .and_then(|c| c.tui)
-        .map(|t| t.thinking == crate::ThinkingMode::Stream)
-        .unwrap_or(true)
+        .map(|t| t.thinking)
+        .unwrap_or_default()
+}
+
+/// Whether reasoning is displayed AT ALL — the spinner gate.
+///
+/// Deliberately not `mode == Stream`. Both display modes show the live
+/// spinner; they differ only in how much of the body reaches scrollback. When
+/// `Fold` was added, leaving this as an equality against `Stream` would have
+/// turned the new DEFAULT into "no thinking spinner, ever" with no compile
+/// error anywhere — the gate-collapse this split exists to prevent.
+#[must_use]
+pub fn thinking_stream_enabled() -> bool {
+    thinking_mode() != crate::ThinkingMode::Off
+}
+
+/// Commit a complete reasoning body as a fold block.
+///
+/// The non-streaming half of the same treatment `ReasoningTrickle` gives a
+/// stream: a whole body arrives at once, so the budget is spent in one pass
+/// rather than line by line. Both end at the same closing line, and both route
+/// the count through [`display::Fold`], so the two wires cannot drift into two
+/// different ways of saying the same thing.
+fn commit_reasoning_fold(
+    reasoning: Option<String>,
+    elapsed: std::time::Duration,
+    retain: Option<&dyn CompletedSpillRenderer>,
+    color: bool,
+) {
+    if thinking_mode() == crate::ThinkingMode::Off {
+        return;
+    }
+    let Some(reasoning) = reasoning.filter(|r| !r.trim().is_empty()) else {
+        return;
+    };
+    let budget = if thinking_mode() == crate::ThinkingMode::Fold {
+        display::spill_lines()
+    } else {
+        0
+    };
+    let mut fold = display::ThinkingFold::default();
+    let mut shown: Vec<String> = Vec::new();
+    for line in reasoning.lines().filter(|l| !l.trim().is_empty()) {
+        if fold.offer(line, budget) {
+            shown.push(format!("  {line}"));
+        }
+    }
+    // Retain BEFORE printing the handle, so the id names a body that is already
+    // there rather than one that is about to be.
+    let retained = retain.and_then(|r| r.retain_completed(fold.body()));
+    let hint = retained.map(|id| format!("/spill open {id}"));
+    let recovery = hint
+        .as_deref()
+        .map_or_else(display::Recovery::default, display::Recovery::Command);
+    if let Some(closing) = fold.closing_line(elapsed, recovery) {
+        shown.push(closing);
+    }
+    if shown.is_empty() {
+        return;
+    }
+    let block = shown.join("\n");
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::DarkGrey),
+            Print(format!("{block}\n")),
+            ResetColor,
+        )
+        .ok();
+    } else {
+        println!("{block}");
+    }
+    io::stdout().flush().ok();
+}
+
+/// The streaming half of a [`ThinkingFold`]: it owns the partial-line buffer
+/// and the decision of what reaches the spinner.
+///
+/// The split matters because reasoning arrives in token-sized chunks with no
+/// respect for line boundaries, while the budget is counted in LINES. This
+/// holds the tail until its newline — the same shape `Spinner::detail` already
+/// uses internally, and the reason the two must not both buffer.
+#[derive(Default)]
+struct ReasoningTrickle {
+    fold: display::ThinkingFold,
+    /// Partial line awaiting its newline.
+    partial: String,
+}
+
+impl ReasoningTrickle {
+    /// Feed a chunk. Completed lines within the budget go to the spinner (which
+    /// commits them dim); the rest are retained by the fold and never printed.
+    fn feed(&mut self, spinner: &crate::tty::Spinner, chunk: &str, budget: usize) {
+        self.partial.push_str(chunk);
+        while let Some(nl) = self.partial.find('\n') {
+            let line: String = self.partial.drain(..=nl).collect();
+            let trimmed = line.trim_end_matches(['\n', '\r']).to_string();
+            if trimmed.trim().is_empty() {
+                continue;
+            }
+            if self.fold.offer(&trimmed, budget) {
+                // Hand back the newline `detail` splits on, so the spinner's
+                // own buffering sees exactly one complete line.
+                spinner.detail(&format!("{trimmed}\n"));
+            }
+        }
+    }
+
+    /// Commit the closing line, retaining the body so its handle is real.
+    ///
+    /// Written straight to stdout rather than through the spinner, because the
+    /// spinner is about to be torn down and this line is durable transcript,
+    /// not progress.
+    fn close(
+        &mut self,
+        elapsed: std::time::Duration,
+        retain: Option<&dyn CompletedSpillRenderer>,
+        color: bool,
+    ) {
+        if !self.partial.trim().is_empty() {
+            let tail = std::mem::take(&mut self.partial);
+            self.fold.offer(tail.trim_end(), 0);
+        }
+        if self.fold.is_empty() {
+            return;
+        }
+        // Retain FIRST: the handle the line prints has to name a body that is
+        // already there, or the offer is a lie for as long as the race lasts.
+        let retained = retain.and_then(|r| r.retain_completed(self.fold.body()));
+        let hint = retained.map(|id| format!("/spill open {id}"));
+        let recovery = hint
+            .as_deref()
+            .map_or_else(display::Recovery::default, display::Recovery::Command);
+        let Some(line) = self.fold.closing_line(elapsed, recovery) else {
+            return;
+        };
+        if color {
+            execute!(
+                io::stdout(),
+                SetForegroundColor(CtColor::DarkGrey),
+                Print(format!("{line}\n")),
+                ResetColor,
+            )
+            .ok();
+        } else {
+            println!("{line}");
+        }
+        io::stdout().flush().ok();
+    }
 }
 
 /// Stream an Ollama NDJSON response, printing tokens as they arrive.
 /// Returns `(accumulated_text, token_usage)`.
 /// Token usage is extracted from the final chunk (`done: true`).
 /// `show_thinking` opts into the cargo-style reasoning spinner (TTY only).
+/// `retain` is where a folded reasoning body is kept so its `/spill open <id>`
+/// handle names something real; `None` on a surface with no archive, and the
+/// fold then degrades to naming the generic command rather than lying about
+/// what can be reopened.
 async fn stream_response(
     resp: reqwest::Response,
     color: bool,
@@ -10779,6 +10984,7 @@ async fn stream_response(
     leading_reasoning: bool,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     markdown: bool,
+    retain: Option<std::sync::Arc<dyn CompletedSpillRenderer>>,
 ) -> anyhow::Result<(String, Option<crate::TokenUsage>)> {
     // The ONE spinner (`newt_core::tty`). `legacy_caps` preserves today's
     // gating exactly; the shared 100ms OS-thread ticker replaces the old
@@ -10793,6 +10999,12 @@ async fn stream_response(
     let mut full = String::new();
     let mut started = false;
     let mut usage: Option<crate::TokenUsage> = None;
+    // The reasoning block: bounded by the SAME budget committed tool results
+    // spend, so `/spill 5` sets both and the operator has one dial rather than
+    // two. `Stream` keeps the historical unbounded trickle by passing 0.
+    let fold_mode = thinking_mode() == crate::ThinkingMode::Fold;
+    let spill_budget = if fold_mode { display::spill_lines() } else { 0 };
+    let mut reason = ReasoningTrickle::default();
     // Step 25.3 (#568): when markdown is active, route the *visible* token stream
     // through the block-aware writer (inline lines render per completed line;
     // fences/tables hold until they close). The accumulated `full` stays RAW —
@@ -10830,20 +11042,34 @@ async fn stream_response(
             let (token, reasoning) = think.feed_split(raw);
             // Surface reasoning live (cargo-style) — both the inline `<think>`
             // span the filter just split out AND any separate `thinking` field.
+            //
+            // In `Fold` mode the trickle is BOUNDED: `reason` decides, per
+            // completed line, whether it still fits the `spill_lines` budget.
+            // Lines past it are retained rather than printed, so the block can
+            // be reopened whole instead of burying the answer under it. This
+            // is also where the Ollama path stopped DROPPING the body — before
+            // it went to the spinner and nowhere else, so a fold here would
+            // have had nothing to expand into.
             if let Some(sp) = spinner.as_ref() {
                 if !reasoning.is_empty() {
-                    sp.detail(&reasoning);
+                    reason.feed(sp, &reasoning, spill_budget);
                 }
                 if let Some(t) = json["message"]["thinking"].as_str() {
                     if !t.is_empty() {
-                        sp.detail(t);
+                        reason.feed(sp, t, spill_budget);
                     }
                 }
             }
             let token = token.as_str();
             if !token.is_empty() {
                 if !started {
-                    // The answer is starting — tear the spinner down first.
+                    // The answer is starting — close the reasoning block, then
+                    // tear the spinner down. In that order: the closing line
+                    // reads the spinner's own clock, which is the one the
+                    // operator has been watching count up.
+                    if let Some(sp) = spinner.as_ref() {
+                        reason.close(sp.elapsed(), retain.as_deref(), color);
+                    }
                     drop(spinner.take());
                     if color {
                         execute!(

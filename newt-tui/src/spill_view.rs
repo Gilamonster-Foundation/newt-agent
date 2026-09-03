@@ -661,9 +661,33 @@ fn boundary_text(gutter: Gutter) -> String {
         // the bare ⧉/▣ glyph told nobody the frame was interactive (its keys
         // were hinted only in /help), so the inert completed excerpt could
         // masquerade as this scroller. Honest labeling, still a plain scroller.
-        Gutter::Expand => "Space expands · ↑↓ scroll".to_string(),
+        //
+        // The VERB comes from the shared recovery vocabulary rather than a
+        // literal, so this row cannot claim a handle the surface does not have
+        // — and, the reason it changed, so it MENTIONS the click when clicking
+        // works. `[tui] mouse_viewport` shipped wired but unadvertised: the
+        // legend said "Space to expand" on a frame that had been answering
+        // clicks the whole time, so nobody discovered the affordance.
+        //
+        // The COUNT deliberately stays on the ▲/▼ direction rows. Whenever this
+        // row renders with anything hidden, the opposite row already states how
+        // much (`boundary` is only chosen where that direction hides nothing),
+        // so repeating it here would print the same number twice.
+        Gutter::Expand => format!("{} · ↑↓ scroll", expand_verb()),
         Gutter::Collapse => "Space collapses · ↑↓ scroll".to_string(),
         _ => String::new(),
+    }
+}
+
+/// "Space to expand" / "Click or space to expand", sentence-cased for the row.
+fn expand_verb() -> String {
+    let handle = newt_core::agentic::interactive_recovery()
+        .handle()
+        .to_string();
+    let mut chars = handle.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => handle,
     }
 }
 
@@ -782,7 +806,7 @@ mod tests {
                 "▒ l3",
                 "▒ l4",
                 "▓ l5",
-                "⧉ Space expands · ↑↓ scroll",
+                "⧉ Space to expand · ↑↓ scroll",
             ]
         );
     }
@@ -844,7 +868,7 @@ mod tests {
         assert_eq!(
             frame.lines(),
             [
-                "⧉ Space expands · ↑↓ scroll",
+                "⧉ Space to expand · ↑↓ scroll",
                 "▓ l1",
                 "▒ l2",
                 "▒ l3",
@@ -986,7 +1010,7 @@ mod tests {
                 "▒ fourth",
                 "▒ fifth",
                 "▓ sixth",
-                "⧉ Space expands · ↑↓ scroll"
+                "⧉ Space to expand · ↑↓ scroll"
             ]
         );
 
@@ -1002,7 +1026,7 @@ mod tests {
 
         view.toggle_expanded();
         assert_eq!(view.frame().content.len(), 3);
-        assert_eq!(view.frame().bottom.line, "⧉ Space expands · ↑↓ scroll");
+        assert_eq!(view.frame().bottom.line, "⧉ Space to expand · ↑↓ scroll");
     }
 
     #[test]
@@ -1062,7 +1086,7 @@ mod tests {
         feed_lines(&mut view, &["l1", "l2", "l3", "l4", "l5"]);
         let frame = view.frame();
         assert!(
-            frame.bottom.line.contains("Space expands"),
+            frame.bottom.line.contains("Space to expand"),
             "collapsed boundary must carry the key legend: {:?}",
             frame.bottom.line
         );
@@ -1135,7 +1159,7 @@ mod tests {
                 "▒ l4",
                 "▒ l5",
                 "▓ l6",
-                "⧉ Space expands · ↑↓ scroll",
+                "⧉ Space to expand · ↑↓ scroll",
             ]
         );
 
@@ -1143,7 +1167,7 @@ mod tests {
         assert_eq!(
             view.frame().lines(),
             [
-                "⧉ Space expands · ↑↓ scroll",
+                "⧉ Space to expand · ↑↓ scroll",
                 "▓ l3",
                 "▒ l4",
                 "▒ l5",

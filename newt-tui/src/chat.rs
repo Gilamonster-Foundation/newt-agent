@@ -7289,6 +7289,18 @@ fn session_body(
                     let committed_view =
                         committed_spill_lines(surface_is_rich, configured_spill_lines);
                     newt_core::set_spill_lines(committed_view);
+                    // Time markers are for a transcript a human SCROLLS. A
+                    // piped or headless run is bytes something else will diff,
+                    // and a wall clock there makes that comparison unstable —
+                    // so the cadence is the operator's setting on the
+                    // interactive surface and hard 0 everywhere else. Same
+                    // shape, and the same argument, as `set_spill_summary`
+                    // below.
+                    newt_core::set_time_marker_secs(if surface_is_rich {
+                        crate::time_marker_secs(&cfg)
+                    } else {
+                        0
+                    });
                     // Under the cockpit the live viewport is not constructed:
                     // it paints with cursor motion the presenter drops by design
                     // (v1). The tool spinner (#1727) covers liveness meanwhile.
@@ -7577,10 +7589,24 @@ fn session_body(
                                         // completed tool output viewport. Only on Rich TUI + live-spill.
                                         #[cfg(all(feature = "rich-tui", feature = "live-spill"))]
                                         completed_spill_renderer: if surface_is_rich {
-                                            live_spill.as_ref().map(|spill| {
-                                                spill.clone()
-                                                    as std::sync::Arc<dyn newt_core::agentic::CompletedSpillRenderer>
-                                            })
+                                            // The live renderer when there is one; the bare
+                                            // ARCHIVE when there is not. Under the cockpit
+                                            // `live_spill` is deliberately None — the presenter
+                                            // drops the cursor motion a viewport paints with —
+                                            // and that used to take retention down with it, so
+                                            // no id was minted and history could not be
+                                            // reopened at all. Retention does not need a
+                                            // screen.
+                                            Some(live_spill
+                                                .as_ref()
+                                                .map(|spill| {
+                                                    spill.clone()
+                                                        as std::sync::Arc<dyn newt_core::agentic::CompletedSpillRenderer>
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    completed_spills.clone()
+                                                        as std::sync::Arc<dyn newt_core::agentic::CompletedSpillRenderer>
+                                                }))
                                         } else {
                                             None
                                         },

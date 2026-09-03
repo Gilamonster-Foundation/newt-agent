@@ -135,6 +135,11 @@ mod config_panel;
 // piped / wyvern paths never compile it in.
 #[cfg(feature = "rich-tui")]
 mod palette;
+// One table of named roles, so a colour is chosen once and named everywhere —
+// the answer to a census of thirty-odd literals across nine files, including
+// `DarkGray` twenty times beside `DarkGrey` thirteen.
+#[cfg(feature = "rich-tui")]
+mod theme;
 // The ONE inline-panel driver — raw mode, viewport, repaint cadence — shared by
 // every panel, so a third panel cannot inherit a third copy of the event loop
 // `/psyche` and `/backends` were each carrying.
@@ -8821,6 +8826,13 @@ fn spill_lines(cfg: &newt_core::Config) -> usize {
     cfg.tui.as_ref().map(|t| t.spill_lines).unwrap_or(3)
 }
 
+/// Seconds between committed `[HH:MM]` transcript markers — mirrors
+/// [`spill_lines`], including its "config absent means the documented default"
+/// shape.
+fn time_marker_secs(cfg: &newt_core::Config) -> u64 {
+    cfg.tui.as_ref().map(|t| t.time_marker_secs).unwrap_or(300)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpillCommand {
     Status,
@@ -11688,6 +11700,10 @@ pub(crate) fn with_live_spill_watch<T>(
     // its `Drop` is a direct stdout write (NOT a renderer write), so the rule-7
     // abandon path (contractually I/O-free through the renderer) still releases.
     // `None` on the keyboard tier / opt-out; nothing is emitted then.
+    // Tell the marker vocabulary whether a click is a true statement here, so
+    // a fold can advertise one only where something is listening (#1263).
+    #[cfg(any(feature = "rich-tui", feature = "live-spill"))]
+    newt_core::agentic::set_mouse_recovery(mouse);
     #[cfg(any(feature = "rich-tui", feature = "live-spill"))]
     let _mouse_capture = crate::mouse::MouseCaptureGuard::maybe(mouse);
     #[cfg(not(any(feature = "rich-tui", feature = "live-spill")))]
@@ -12029,10 +12045,16 @@ optional field. Same form as `newt crew --edit`.
         }
         "thinking" => {
             "\
-/thinking <on|off> — toggle the live reasoning spinner for this session
+/thinking <fold|stream|off> — how much of the model's reasoning you see
 
-On (default on a TTY): chain-of-thought streams dimmed above the answer while
-the model works. Off: just the answer. Persist with [tui] thinking in config."
+  fold    (default) the first `/spill N` rows of reasoning, then one line
+          saying how long it thought and what is behind the fold, reopenable
+          with the `/spill open <id>` it names
+  stream  every line, unbounded — the historical cargo-style trickle
+  off     just the answer
+
+`on` is an alias for `fold`. Reasoning is dimmed and sits above the answer
+either way; TTY only. Persist with [tui] thinking in config."
         }
         "tenacity" => {
             "\
@@ -12659,7 +12681,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /backend                 - backend panel on a rich TTY: choose · edit · add · remove",
         "  /backend <openai|ollama> [model] - text form: switch the wire kind (e.g. /backend ollama deepseek-r1)",
         "  /backends [name]         - alias of /backend; text list stays: bare lists (piped/lean), /backends <name> switches",
-        "  /thinking <on|off>       - toggle the reasoning spinner for this session",
+        "  /thinking <fold|stream|off> - how much of the model's reasoning you see",
         "  /settings [field value]  - the settings form: edit-mode + effort dials + rounds; every applied change writes a receipt (#1981)",
         "  /probe [model|all]       - classify tool use, context window, thinking, calibration (all = re-probe every model; Esc cancels)",
         "  /probe window [model]    - empirical input-boundary search (records max input at High confidence)",

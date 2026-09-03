@@ -873,7 +873,7 @@ async fn find_command_and_full_result_share_the_spill_boundary() {
         rendered,
         "⚙  find: . (name=*.rs, type=f)\n\
              ▒ a.rs\n\
-             ▲ 3 lines omitted · /spill N raises this view\n\
+             ▲ 3 lines hidden  [/spill N raises this view]\n\
              ▓ e.rs\n\
              …\n"
     );

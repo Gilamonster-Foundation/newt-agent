@@ -118,7 +118,7 @@ impl Field {
             Self::EditMode => "line-editor key bindings",
             Self::Tenacity => "tenacity",
             Self::Cognition => "cognition",
-            Self::Thinking => "thinking spinner",
+            Self::Thinking => "reasoning display",
             Self::Nudge => "action-pressure nudges",
             Self::Rounds => "tool-call round limit",
         }
@@ -168,7 +168,11 @@ impl Field {
                     .collect(),
             ),
             Self::Thinking => owned(&[
-                ("on", "stream reasoning above the answer (default)"),
+                (
+                    "fold",
+                    "bounded reasoning, then how long it thought (default)",
+                ),
+                ("stream", "every reasoning line, unbounded"),
                 ("off", "just the answer"),
             ]),
             Self::Nudge => owned(&[
@@ -206,10 +210,12 @@ impl Field {
             // use to report what they changed.
             Self::Tenacity => tenacity_token(newt_core::tenacity::cli_tenacity()),
             Self::Cognition => cognition_token(cli_cognition()),
-            Self::Thinking => if newt_core::agentic::thinking_stream_enabled() {
-                "on"
-            } else {
-                "off"
+            // Three states now, so this reports the mode rather than
+            // collapsing `fold` and `stream` into one "on".
+            Self::Thinking => match newt_core::agentic::thinking_mode() {
+                newt_core::ThinkingMode::Fold => "fold",
+                newt_core::ThinkingMode::Stream => "stream",
+                newt_core::ThinkingMode::Off => "off",
             }
             .to_string(),
             Self::Nudge => if nudges_off() { "off" } else { "on" }.to_string(),
@@ -255,6 +261,9 @@ impl Field {
             (Self::EditMode, "vim") => "vi",
             // `/psyche tenacity inherit|reset`
             (Self::Tenacity, "inherit" | "reset") => "auto",
+            // `/thinking on` predates the three-way vocabulary and meant
+            // "show me the reasoning". It still does; that is now `fold`.
+            (Self::Thinking, "on") => "fold",
             // `/psyche cognition none` / `reset` / `persona`
             (Self::Cognition, "none") => "off",
             (Self::Cognition, "reset" | "persona") => "auto",
@@ -864,7 +873,7 @@ mod tests {
         for (field, value) in [
             (Field::Tenacity, "auto"),
             (Field::Cognition, "auto"),
-            (Field::Thinking, "on"),
+            (Field::Thinking, "fold"),
             (Field::Nudge, "on"),
         ] {
             apply(field, value).expect("an offered value applies");
