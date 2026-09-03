@@ -28,6 +28,19 @@ use std::os::unix::io::{FromRawFd, RawFd};
 pub struct Pty {
     master: RawFd,
     slave: RawFd,
+    /// Bytes the child has written, collected by a background reader and
+    /// handed to [`Pty::screen`] on demand.
+    ///
+    /// **Somebody has to be listening while the child talks.** `screen()` was
+    /// once the only reader, and consumers call it after the child exits — so
+    /// nothing drained the pty while the child ran. Past the kernel's buffer
+    /// (~1 KiB on macOS) the child blocked in `write`, never reached its own
+    /// read, and the consumer reported a timeout over a half-drawn screen. The
+    /// symptom looked like a dead child; the cause was a deaf harness.
+    ///
+    /// A real terminal drains continuously, and so does the cockpit's own
+    /// reader. This makes the harness behave like the thing it stands in for.
+    drained: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 impl Pty {
@@ -56,7 +69,38 @@ impl Pty {
             };
             libc::ioctl(slave, libc::TIOCSWINSZ, &ws);
 
-            Self { master, slave }
+            // From here the drain is the SOLE reader of the master, and it
+            // reads BLOCKING.
+            //
+            // `screen()` must therefore never touch the fd. An earlier attempt
+            // had it flip the master to `O_NONBLOCK` to sweep up a tail; the
+            // drain's next read then returned `EAGAIN`, the thread took that
+            // for EOF and exited, and after the first `screen()` nothing
+            // drained again. One reader, one blocking mode, no flag races.
+            //
+            // Detached on purpose: it ends when the master closes, which is
+            // what `Drop` does. A join handle would have to be threaded
+            // through every consumer to buy nothing.
+            let drained = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = drained.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = libc::read(master, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len());
+                    if n <= 0 {
+                        return;
+                    }
+                    sink.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .extend_from_slice(&buf[..n as usize]);
+                }
+            });
+
+            Self {
+                master,
+                slave,
+                drained,
+            }
         }
     }
 
@@ -73,26 +117,22 @@ impl Pty {
     /// exited (or after a deliberate settling delay) or the screen may be
     /// partial.
     pub fn screen(&self) -> String {
-        unsafe {
-            let flags = libc::fcntl(self.master, libc::F_GETFL);
-            libc::fcntl(self.master, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-        let mut out = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = unsafe {
-                libc::read(
-                    self.master,
-                    buf.as_mut_ptr().cast::<libc::c_void>(),
-                    buf.len(),
-                )
-            };
-            if n <= 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..n as usize]);
-        }
-        String::from_utf8_lossy(&out).into_owned()
+        // Give the drain a moment to catch up. A caller reading the instant a
+        // child exits would otherwise race bytes still in flight — the same
+        // race the old read-at-the-end had, now visible because the reading
+        // happens on another thread rather than hidden inside this call.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // TAKE, do not peek. The contract every consumer relies on is "the
+        // bytes not yet returned": `settings_form_pty_test` reads in a loop and
+        // accumulates its own transcript, so re-returning the whole history
+        // would hand it each earlier frame again.
+        //
+        // Deliberately does not touch the fd — see the drain's note above.
+        let mut drained = self
+            .drained
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&std::mem::take(&mut *drained)).into_owned()
     }
 
     /// Change the pty's window size mid-test — the resize probe for
@@ -251,4 +291,105 @@ pub fn screen_grid(screen: &str) -> Vec<String> {
     grid.into_iter()
         .map(|l| l.into_iter().collect::<String>().trim_end().to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Wait for a child, or give up. Deliberately not `child.wait()`: the
+    /// defect under test is a child that never exits, and a test that hangs
+    /// forever reports nothing.
+    fn wait(child: &mut std::process::Child, budget: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => return None,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        None
+    }
+
+    /// **A child may write more than the pty buffer holds before anyone
+    /// reads.** That is the whole defect this harness had.
+    ///
+    /// `screen()` used to be the only reader, and consumers call it after the
+    /// child exits — so nothing drained while the child ran. Past the kernel's
+    /// pty buffer (~1 KiB on macOS) the child blocked in `write`, never
+    /// reached its own read, and every consumer reported it as a timeout with
+    /// a half-drawn screen. The bug looked like "the child died"; it was "the
+    /// harness stopped listening".
+    ///
+    /// 64 KiB is far past any plausible buffer, so this fails loudly on a
+    /// harness that does not drain rather than depending on one platform's
+    /// exact size.
+    #[test]
+    fn a_child_writing_past_the_pty_buffer_is_not_deadlocked_by_the_harness() {
+        let pty = Pty::open();
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            // `yes` is unbounded; `head -c` bounds it without needing seq.
+            .arg("yes newt | head -c 65536; printf 'ALL-WRITTEN'")
+            .stdout(pty.slave_stdio())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the writer");
+
+        let status = wait(&mut child, Duration::from_secs(10));
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "the child never finished writing — the harness is not draining, \
+             so it blocked in `write` long before it could exit"
+        );
+
+        let screen = pty.screen();
+        assert!(
+            screen.contains("ALL-WRITTEN"),
+            "the tail of a large write must survive; got {} bytes",
+            screen.len()
+        );
+        assert!(
+            screen.len() >= 65536,
+            "every byte the child wrote must be readable; got {}",
+            screen.len()
+        );
+    }
+
+    /// `screen()` returns the bytes NOT YET RETURNED, not the whole history.
+    ///
+    /// `settings_form_pty_test` reads in a loop and accumulates its own
+    /// transcript, so a `screen()` that re-returned everything would hand it
+    /// each earlier frame again and its grid would be assembled from the
+    /// transcript rather than the screen. The drain changes who empties the
+    /// pty, never what a caller sees.
+    #[test]
+    fn screen_returns_only_what_has_not_been_returned_before() {
+        let pty = Pty::open();
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("printf FIRST; sleep 0.4; printf SECOND")
+            .stdout(pty.slave_stdio())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the writer");
+
+        // Long enough for FIRST to land and short enough to precede SECOND.
+        std::thread::sleep(Duration::from_millis(200));
+        let first = pty.screen();
+        assert!(first.contains("FIRST"), "first read: {first:?}");
+        assert!(!first.contains("SECOND"), "read the future: {first:?}");
+
+        assert!(wait(&mut child, Duration::from_secs(10)).is_some());
+        let second = pty.screen();
+        assert!(second.contains("SECOND"), "second read: {second:?}");
+        assert!(
+            !second.contains("FIRST"),
+            "a byte was returned twice: {second:?}"
+        );
+    }
 }
