@@ -32,7 +32,8 @@
 //! now alive *especially* when the thing it covers is stuck, which is the whole
 //! point of a spinner.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::borrow::Cow;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -57,37 +58,74 @@ const TICK: Duration = Duration::from_millis(100);
 
 /// Process-wide "the user asked to interrupt" signal.
 ///
-/// Set by the TUI's keyboard watcher the moment Esc/Ctrl-C trips the graceful
-/// cancel flag, cleared when the turn ends. The spinner reads it on every
-/// frame and swaps its stage label for [`INTERRUPT_LABEL`], so the press is
-/// acknowledged on screen within one tick (~100 ms) — through the line the
-/// spinner already owns, never a second terminal writer (the #1312 rule).
-/// Without this, a graceful cancel is invisible until the turn reaches its
-/// next checkpoint and the whole TUI reads as hung.
-static INTERRUPT_PENDING: AtomicBool = AtomicBool::new(false);
+/// Bumped by the TUI's keyboard watcher on EVERY interrupt press (Esc or
+/// Ctrl-C — the 1st, 2nd and Nth), cleared when the turn ends. The spinner
+/// reads it on every frame and swaps its stage label for the acknowledgment
+/// ([`interrupt_label`]), so each press is acknowledged on screen within one
+/// tick (~100 ms) — through the line the spinner already owns, never a second
+/// terminal writer (the #1312 rule). Without this, a graceful cancel is
+/// invisible until the turn reaches its next checkpoint and the whole TUI
+/// reads as hung.
+///
+/// A COUNT rather than a flag (#2010): a repeated press used to raise a
+/// second flag that nothing acted on until the turn returned, so the 2nd and
+/// 10th press were indistinguishable from the 1st — precisely the "will not
+/// immediately respond" the operator reported. The first press already drops
+/// the in-flight request and any running tool future (`cancellable` in
+/// `agentic`), so there is nothing more for a second press to force; what it
+/// is owed is an honest, immediate "heard — already stopping".
+static INTERRUPT_PRESSES: AtomicU32 = AtomicU32::new(0);
 
-/// The acknowledgment label shown in place of the stage label while an
-/// interrupt is pending.
-pub const INTERRUPT_LABEL: &str = "interrupting… (press Ctrl-C again to force)";
+/// The acknowledgment label shown in place of the stage label after the
+/// first interrupt press. Later presses append their count — see
+/// [`interrupt_label`].
+pub const INTERRUPT_LABEL: &str = "interrupting…";
 
-/// Flag/clear the pending-interrupt acknowledgment. The TUI watcher sets it on
-/// the first Esc/Ctrl-C; the turn wrapper clears it when the turn hands back.
+/// The label for `presses` interrupt presses (≥ 1): the plain acknowledgment
+/// for the first, and an honest "already stopping" carrying the count for
+/// every press after it, so a repeat is visibly heard rather than absorbed.
+fn interrupt_label(presses: u32) -> Cow<'static, str> {
+    if presses <= 1 {
+        Cow::Borrowed(INTERRUPT_LABEL)
+    } else {
+        Cow::Owned(format!(
+            "{INTERRUPT_LABEL} (×{presses} heard — already stopping)"
+        ))
+    }
+}
+
+/// Record one interrupt press and return the running count for this turn.
+/// The TUI watchers call it on every Esc/Ctrl-C; the spinner renders the
+/// count on its next tick.
+pub fn note_interrupt_press() -> u32 {
+    INTERRUPT_PRESSES.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// Flag/clear the pending-interrupt acknowledgment: `true` counts as one
+/// press, `false` resets the count. The turn wrapper clears it when the turn
+/// hands back.
 pub fn set_interrupt_pending(on: bool) {
-    INTERRUPT_PENDING.store(on, Ordering::SeqCst);
+    INTERRUPT_PRESSES.store(u32::from(on), Ordering::SeqCst);
 }
 
 /// Whether an interrupt acknowledgment is currently pending.
 pub fn interrupt_pending() -> bool {
-    INTERRUPT_PENDING.load(Ordering::SeqCst)
+    interrupt_presses() > 0
+}
+
+/// How many interrupt presses this turn has acknowledged so far.
+pub fn interrupt_presses() -> u32 {
+    INTERRUPT_PRESSES.load(Ordering::SeqCst)
 }
 
 /// The stage label a frame should actually show: the caller's label normally,
-/// the interrupt acknowledgment while a cancel is pending. Pure for testing.
-fn effective_label(label: &str, interrupted: bool) -> &str {
-    if interrupted {
-        INTERRUPT_LABEL
+/// the interrupt acknowledgment (with its press count) while a cancel is
+/// pending. Pure for testing.
+fn effective_label(label: &str, presses: u32) -> Cow<'_, str> {
+    if presses == 0 {
+        Cow::Borrowed(label)
     } else {
-        label
+        interrupt_label(presses)
     }
 }
 
@@ -147,7 +185,7 @@ impl SpinnerState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        Frame::new(effective_label(&label, interrupt_pending()))
+        Frame::new(effective_label(&label, interrupt_presses()))
             .after(self.start.elapsed())
             .with_units(self.chars.load(Ordering::SeqCst) as u64)
     }
@@ -424,18 +462,48 @@ mod tests {
     /// caller's own label is untouched and returns when the flag clears.
     #[test]
     fn a_pending_interrupt_overrides_the_stage_label() {
-        assert_eq!(effective_label("thinking…", false), "thinking…");
-        assert_eq!(effective_label("thinking…", true), INTERRUPT_LABEL);
+        assert_eq!(effective_label("thinking…", 0), "thinking…");
+        assert_eq!(effective_label("thinking…", 1), INTERRUPT_LABEL);
     }
 
-    /// The process-wide flag round-trips and clears (serial: global state).
+    /// #2010: a repeated press is visibly different from the first — the
+    /// label carries the count and says the turn is already stopping, so the
+    /// operator can tell a slow cancel from a dropped keystroke.
+    #[test]
+    fn a_repeated_press_is_labelled_with_its_count() {
+        assert_eq!(
+            effective_label("thinking…", 2),
+            "interrupting… (×2 heard — already stopping)"
+        );
+        assert_eq!(
+            effective_label("thinking…", 7),
+            "interrupting… (×7 heard — already stopping)"
+        );
+    }
+
+    /// The process-wide count round-trips and clears (serial: global state).
     #[serial_test::serial(interrupt_pending)]
     #[test]
     fn interrupt_pending_flag_sets_and_clears() {
         set_interrupt_pending(true);
         assert!(interrupt_pending());
+        assert_eq!(interrupt_presses(), 1);
         set_interrupt_pending(false);
         assert!(!interrupt_pending());
+        assert_eq!(interrupt_presses(), 0);
+    }
+
+    /// Every press counts, from a clean turn: 1, 2, 3 — and a clear resets.
+    #[serial_test::serial(interrupt_pending)]
+    #[test]
+    fn every_interrupt_press_is_counted() {
+        set_interrupt_pending(false);
+        assert_eq!(note_interrupt_press(), 1);
+        assert_eq!(note_interrupt_press(), 2);
+        assert_eq!(note_interrupt_press(), 3);
+        assert_eq!(interrupt_presses(), 3);
+        set_interrupt_pending(false);
+        assert_eq!(interrupt_presses(), 0);
     }
 
     /// The gate is honored end to end: no capability ⇒ no spinner object at
@@ -647,8 +715,15 @@ mod tests {
     fn a_pending_interrupt_reaches_the_view_through_the_frame() {
         let sp = Spinner::start_with_caps(LineCaps::Own, "thinking…", Sink::Stdout, false)
             .expect("spinner");
-        set_interrupt_pending(true);
+        set_interrupt_pending(false);
+        note_interrupt_press();
         assert_eq!(sp.state.current_frame().label, INTERRUPT_LABEL);
+        // #2010: the second press changes the frame too — it is not absorbed.
+        note_interrupt_press();
+        assert_eq!(
+            sp.state.current_frame().label,
+            "interrupting… (×2 heard — already stopping)"
+        );
         set_interrupt_pending(false);
         assert_eq!(sp.state.current_frame().label, "thinking…");
     }

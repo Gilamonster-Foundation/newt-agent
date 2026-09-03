@@ -55,6 +55,12 @@ mod prompt;
 /// needs a real terminal to observe a terminal property. See the module docs.
 #[cfg(all(test, unix))]
 mod prompt_visibility_test;
+// #2010: press-time acknowledgement on a real terminal — every Ctrl-C (1st,
+// 2nd, Nth) changes the rendered grid WHILE the turn is still blocked. Same
+// self-re-exec tier as `prompt_visibility_test`; not `#[ignore]`d, because the
+// assertion is structural ("on screen while still running"), not a stopwatch.
+#[cfg(all(test, unix))]
+mod interrupt_ack_pty_test;
 /// #1981: the ONE list of top-level slash commands. Three lists knew this
 /// before and none agreed; see the module doc.
 /// #1981: `/settings` — the typed form the knob verbs are absorbed into.
@@ -11210,14 +11216,12 @@ mod interrupt_tests {
         let mut pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
         let cancel = AtomicBool::new(false);
-        let hard = AtomicBool::new(false);
         let stop = AtomicBool::new(false);
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 watch_for_interrupt_fd(
                     pipe[0],
                     &cancel,
-                    &hard,
                     &stop,
                     None,
                     newt_core::EditMode::Nano,
@@ -11258,8 +11262,7 @@ mod interrupt_tests {
         use std::sync::atomic::AtomicBool;
         newt_core::tty::set_interrupt_pending(true);
         let cancel = AtomicBool::new(false);
-        let hard = AtomicBool::new(false);
-        let ran = super::with_interrupt_watch(false, &cancel, &hard, || {
+        let ran = super::with_interrupt_watch(false, &cancel, || {
             assert!(
                 !newt_core::tty::interrupt_pending(),
                 "cleared before the turn body runs"
@@ -11312,14 +11315,12 @@ mod interrupt_tests {
         let mut pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
         let cancel = AtomicBool::new(false);
-        let hard = AtomicBool::new(false);
         let stop = AtomicBool::new(false);
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 watch_for_interrupt_fd(
                     pipe[0],
                     &cancel,
-                    &hard,
                     &stop,
                     None,
                     newt_core::EditMode::Nano,
@@ -11344,13 +11345,74 @@ mod interrupt_tests {
             libc::close(pipe[1]);
         }
         assert!(cancel.load(Ordering::Relaxed), "graceful cancel tripped");
-        assert!(
-            !hard.load(Ordering::Relaxed),
-            "one press is never a force-stop"
+        assert_eq!(
+            newt_core::tty::interrupt_presses(),
+            1,
+            "the acknowledgment count is raised for the spinner"
         );
-        assert!(
-            newt_core::tty::interrupt_pending(),
-            "the acknowledgment flag is raised for the spinner"
+        newt_core::tty::set_interrupt_pending(false);
+    }
+
+    /// #2010: EVERY press is acknowledged, not just the first. The watcher
+    /// bumps the process-wide press count the spinner renders, so a 2nd
+    /// Ctrl-C changes the label within a tick instead of being absorbed into
+    /// a flag nothing read until the turn returned.
+    #[serial_test::serial(prompt_stdin, interrupt_pending)]
+    #[test]
+    fn every_ctrl_c_press_is_counted_for_the_spinner() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        newt_core::tty::set_interrupt_pending(false);
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let cancel = AtomicBool::new(false);
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                watch_for_interrupt_fd(
+                    pipe[0],
+                    &cancel,
+                    &stop,
+                    None,
+                    newt_core::EditMode::Nano,
+                    false,
+                    10,
+                    100,
+                );
+            });
+            let press = || {
+                assert_eq!(
+                    unsafe { libc::write(pipe[1], [0x03u8].as_ptr().cast(), 1) },
+                    1
+                );
+            };
+            let wait_for = |presses: u32| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(1);
+                while newt_core::tty::interrupt_presses() < presses
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+            press();
+            wait_for(1);
+            press();
+            wait_for(2);
+            press();
+            wait_for(3);
+            stop.store(true, Ordering::Relaxed);
+            assert_eq!(unsafe { libc::write(pipe[1], b"x".as_ptr().cast(), 1) }, 1);
+        });
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        assert!(cancel.load(Ordering::Relaxed), "graceful cancel tripped");
+        assert_eq!(
+            newt_core::tty::interrupt_presses(),
+            3,
+            "the 2nd and 3rd presses are heard, not absorbed"
         );
         newt_core::tty::set_interrupt_pending(false);
     }
@@ -11411,7 +11473,6 @@ mod interrupt_tests {
         let mut pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
         let cancel = AtomicBool::new(false);
-        let hard = AtomicBool::new(false);
         let stop = AtomicBool::new(false);
         let spill = RecordingSpill::default();
         std::thread::scope(|scope| {
@@ -11419,7 +11480,6 @@ mod interrupt_tests {
                 watch_for_interrupt_fd(
                     pipe[0],
                     &cancel,
-                    &hard,
                     &stop,
                     Some(&spill),
                     newt_core::EditMode::Nano,
@@ -11458,7 +11518,6 @@ mod interrupt_tests {
         assert_eq!(spill.up.load(Ordering::Relaxed), 1);
         assert_eq!(spill.toggled.load(Ordering::Relaxed), 1);
         assert!(!cancel.load(Ordering::Relaxed));
-        assert!(!hard.load(Ordering::Relaxed));
     }
 
     /// #1704: while the spill viewport is in explore mode (scrolled back off the
@@ -11521,7 +11580,6 @@ mod interrupt_tests {
         let mut pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
         let cancel = AtomicBool::new(false);
-        let hard = AtomicBool::new(false);
         let stop = AtomicBool::new(false);
         let spill = ExploringSpill {
             exploring: AtomicBool::new(true),
@@ -11532,7 +11590,6 @@ mod interrupt_tests {
                 watch_for_interrupt_fd(
                     pipe[0],
                     &cancel,
-                    &hard,
                     &stop,
                     Some(&spill),
                     newt_core::EditMode::Nano,
@@ -11600,7 +11657,6 @@ mod interrupt_tests {
 pub(crate) fn with_live_spill_watch<T>(
     enabled: bool,
     cancel: &std::sync::atomic::AtomicBool,
-    hard: &std::sync::atomic::AtomicBool,
     mouse: bool,
     spill: Option<&dyn SpillInput>,
     f: impl FnOnce() -> T,
@@ -11679,7 +11735,7 @@ pub(crate) fn with_live_spill_watch<T>(
         // returns promptly once the guard fires, and the scope joins it before
         // restoring the tty.
         let _stop_watcher = StopOnExit(&stop);
-        s.spawn(|| watch_for_interrupt(cancel, hard, &stop, spill, mode, mouse));
+        s.spawn(|| watch_for_interrupt(cancel, &stop, spill, mode, mouse));
         f()
     })
 }
@@ -11688,7 +11744,6 @@ pub(crate) fn with_live_spill_watch<T>(
 pub(crate) fn with_live_spill_watch<T>(
     _enabled: bool,
     _cancel: &std::sync::atomic::AtomicBool,
-    _hard: &std::sync::atomic::AtomicBool,
     _mouse: bool,
     _spill: Option<&dyn SpillInput>,
     f: impl FnOnce() -> T,
@@ -11700,21 +11755,20 @@ pub(crate) fn with_live_spill_watch<T>(
 pub(crate) fn with_interrupt_watch<T>(
     enabled: bool,
     cancel: &std::sync::atomic::AtomicBool,
-    hard: &std::sync::atomic::AtomicBool,
     f: impl FnOnce() -> T,
 ) -> T {
     // No live spill viewport ⇒ no mouse tier.
-    with_live_spill_watch(enabled, cancel, hard, false, None, f)
+    with_live_spill_watch(enabled, cancel, false, None, f)
 }
 
 /// Poll stdin while the turn runs; trip `cancel` on the first interrupt (a lone
-/// Esc or Ctrl-C) and `hard` on a second Ctrl-C (force-stop). Keeps watching so
-/// a follow-up press escalates, until `stop` is set (the turn finished) —
-/// polling with a 100 ms timeout so it never blocks past the turn's end.
+/// Esc or Ctrl-C) and count EVERY press for the spinner's acknowledgment
+/// (#2010). Keeps watching so a follow-up press is heard, until `stop` is set
+/// (the turn finished) — polling with a 100 ms timeout so it never blocks
+/// past the turn's end.
 #[cfg(unix)]
 fn watch_for_interrupt(
     cancel: &std::sync::atomic::AtomicBool,
-    hard: &std::sync::atomic::AtomicBool,
     stop: &std::sync::atomic::AtomicBool,
     spill: Option<&dyn SpillInput>,
     mode: newt_core::EditMode,
@@ -11723,7 +11777,6 @@ fn watch_for_interrupt(
     watch_for_interrupt_fd(
         libc::STDIN_FILENO,
         cancel,
-        hard,
         stop,
         spill,
         mode,
@@ -11738,7 +11791,6 @@ fn watch_for_interrupt(
 fn watch_for_interrupt_fd(
     fd: libc::c_int,
     cancel: &std::sync::atomic::AtomicBool,
-    hard: &std::sync::atomic::AtomicBool,
     stop: &std::sync::atomic::AtomicBool,
     spill: Option<&dyn SpillInput>,
     mode: newt_core::EditMode,
@@ -11749,7 +11801,6 @@ fn watch_for_interrupt_fd(
     use std::sync::atomic::Ordering;
     use std::time::Duration;
     let mut buf = [0u8; 64];
-    let mut presses = 0u32;
     // #1303 step 5 + FIX F: bind the decoder to the session's editor keybinding,
     // but activate the mode-aware nav keys ONLY when `mode_nav` (the mouse
     // opt-in) is on — the base keys (`↑`/`↓`/`Space`/`Enter`) work either way.
@@ -11825,19 +11876,17 @@ fn watch_for_interrupt_fd(
             dispatch_turn_keys(&mut decoder, bytes, spill);
         }
         if interrupt {
-            presses += 1;
-            if presses == 1 {
-                // 1st: graceful interrupt — the turn stops at its next
-                // checkpoint and hands control back to the prompt. Acknowledge
-                // on screen immediately (the spinner swaps its label within one
-                // tick) so a graceful cancel never reads as a hang.
-                newt_core::tty::set_interrupt_pending(true);
-                cancel.store(true, Ordering::Relaxed);
-            } else {
-                // 2nd+ Ctrl-C: force-stop. Repeated presses are absorbed; the
-                // prompt returns either way.
-                hard.store(true, Ordering::Relaxed);
-            }
+            // Graceful interrupt: the turn drops its in-flight request or tool
+            // future (`cancellable` in `agentic`) and hands control back to
+            // the prompt. `cancel` is a one-way latch, so a repeat is
+            // harmless — and it is COUNTED (#2010): the spinner swaps its
+            // label within one tick on the 1st press and shows the running
+            // count on every press after it, so a slow cancel never reads as
+            // a dropped keystroke. There is no second tier: the first press
+            // already aborts everything a second one could, so a repeat is
+            // honestly answered with "heard — already stopping".
+            cancel.store(true, Ordering::Relaxed);
+            newt_core::tty::note_interrupt_press();
         }
     }
     // Persistent-prompt phase 1: whatever the decoder classified as text (not

@@ -414,6 +414,11 @@ impl Editor {
     /// clears the draft (see the `KeyCode::Char('c')` arm in [`Editor::input`]).
     /// The hint used to promise `^C interrupt` at both, so the affordance and
     /// the behavior now share one condition instead of drifting apart.
+    ///
+    /// The `^D` half is **idle-only** by the same rule (#2010): the session
+    /// reads a line only between turns, so mid-turn Ctrl-D exits nothing —
+    /// it is answered with a note instead (see [`MountedEditor::on_event`]).
+    /// The hint used to promise `^D exit` during a turn too.
     fn mode_hint(&self, turn_running: bool) -> String {
         let head = match self.edit {
             Edit::Vi => match self.vi.mode {
@@ -423,12 +428,12 @@ impl Editor {
             Edit::Emacs => "emacs — Enter sends · Ctrl-h help · /vi /nano",
             Edit::Nano => "nano — Enter sends · ^G help · /vi /emacs",
         };
-        let ctrl_c = if turn_running {
+        let keys = if turn_running {
             "^C interrupt"
         } else {
-            "^C clear"
+            "^C clear · ^D exit"
         };
-        format!("{head} · {ctrl_c} · ^D exit")
+        format!("{head} · {keys}")
     }
 
     /// The status-header mode word (issue #527): `vi --INSERT--` / `vi --NORMAL--`
@@ -1693,6 +1698,11 @@ impl ScrollbackSink for Term {
     }
 }
 
+/// The note an exit key earns while a turn is running (#2010): the key is
+/// inert here, and silence was the defect.
+const TURN_RUNNING_EXIT_NOTE: &str =
+    "turn running — Ctrl-C interrupts it · Ctrl-D exits at the prompt";
+
 /// What one event did, when it did something the driver must act on.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum EditorOutcome {
@@ -2032,7 +2042,20 @@ impl MountedEditor {
         .then(|| self.editor.ex().map(str::to_string))
         .flatten();
         let confirmation_was_pending = self.editor.confirm_prompt().is_some();
-        let step = self.editor.input(key, &mut self.textarea);
+        let step = match self.editor.input(key, &mut self.textarea) {
+            // #2010: an exit key (Ctrl-D, nano `^X`, emacs `C-x C-c`, vi
+            // `:q`) while a turn runs has nobody to deliver an EOF to — the
+            // session is not reading — and used to be dropped on the floor.
+            // Answer it at press time, through the note channel, with where
+            // exit and interrupt actually live. Whether it should instead
+            // escalate to an interrupt is the operator's call (#2010 item 3),
+            // so this pins only that the press is heard.
+            Step::Eof if self.turn_running => {
+                self.editor.vi.msg = Some(TURN_RUNNING_EXIT_NOTE.to_string());
+                Step::Continue
+            }
+            step => step,
+        };
         cancel_hidden_bang_selection(&mut self.textarea);
         if let Some(ex) = executed_ex {
             // `:wq`/`:x` has only requested confirmation at this point; it has
@@ -4707,5 +4730,54 @@ mod tests {
         let mut ta = new_textarea(Edit::Vi);
         normal.input(special(KeyCode::Esc), &mut ta);
         assert!(normal.mode_hint(false).contains("^C clear"));
+    }
+
+    /// #2010: the `^D` half is idle-only, by the same rule as `^C`. During a
+    /// turn the session is not reading, so Ctrl-D exits nothing — a hint
+    /// that promised `^D exit` there was the invisible behaviour the
+    /// operator reported.
+    #[test]
+    fn mode_hint_promises_an_exit_only_while_idle() {
+        for editor in [vi_editor(), emacs_editor(), nano_editor()] {
+            let idle = editor.mode_hint(false);
+            let running = editor.mode_hint(true);
+            assert!(
+                idle.contains("^D exit"),
+                "an idle prompt advertises the exit: {idle:?}"
+            );
+            assert!(
+                !running.contains("^D"),
+                "a running turn must not promise an exit it cannot take: {running:?}"
+            );
+        }
+    }
+
+    /// #2010: Ctrl-D while a turn runs is acknowledged AT PRESS TIME — a
+    /// scrollback note saying where exit lives — and is NOT an `Eof` for the
+    /// presenter to drop on the floor. Idle, the same key is the EOF it
+    /// always was. (Whether a mid-turn Ctrl-D should escalate to an
+    /// interrupt is the operator's call; this pins only that it is heard.)
+    #[test]
+    fn ctrl_d_during_a_turn_is_acknowledged_not_dropped() {
+        let mut mounted = MountedEditor::new(Edit::Nano, Some(1), Vec::new(), "");
+        let mut sink = RecordingSink::default();
+        // The field, not `set_turn_running`: that setter is unix-only (its
+        // one caller is the cockpit), and this rule holds on every platform.
+        mounted.turn_running = true;
+        let outcome = mounted.on_event(Event::Key(ctrl('d')), &mut sink).unwrap();
+        assert_eq!(outcome, None, "mid-turn Ctrl-D is not an EOF");
+        let notes: Vec<String> = sink.batches.iter().flatten().map(line_text).collect();
+        assert!(
+            notes.iter().any(|l| l.contains("Ctrl-C interrupts")),
+            "the press is answered with where exit and interrupt live: {notes:?}"
+        );
+
+        mounted.turn_running = false;
+        let outcome = mounted.on_event(Event::Key(ctrl('d')), &mut sink).unwrap();
+        assert_eq!(
+            outcome,
+            Some(EditorOutcome::Eof),
+            "idle Ctrl-D is still EOF"
+        );
     }
 }

@@ -88,12 +88,11 @@ pub(crate) enum SurfaceRequest {
     },
     SetBackgroundJobs(Vec<BackgroundJob>),
     SetTabs(Vec<crate::tab_bar::TabCell>),
-    /// #1669 cockpit: a turn is starting; these are the flags the session
-    /// races its work against, so the terminal can trip them from Ctrl-C.
+    /// #1669 cockpit: a turn is starting; this is the flag the session
+    /// races its work against, so the terminal can trip it from Ctrl-C.
     /// A surface that does not read keys during a turn ignores this.
     TurnStarted {
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        hard: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
     /// The turn is over: whatever Ctrl-C meant, it means nothing now.
     TurnEnded,
@@ -353,12 +352,8 @@ impl crate::chat::InputSurface for RemoteSurface {
         self.notify(SurfaceRequest::SetTabs(tabs));
     }
 
-    fn turn_started(
-        &mut self,
-        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        hard: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        self.notify(SurfaceRequest::TurnStarted { cancel, hard });
+    fn turn_started(&mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.notify(SurfaceRequest::TurnStarted { cancel });
     }
 
     fn turn_ended(&mut self) {
@@ -427,7 +422,7 @@ pub(crate) fn pump_surface(
             } => surface.set_runtime_context(&model, &endpoint, gauge, &session),
             SurfaceRequest::SetBackgroundJobs(jobs) => surface.set_background_jobs(jobs),
             SurfaceRequest::SetTabs(tabs) => surface.set_tabs(tabs),
-            SurfaceRequest::TurnStarted { cancel, hard } => surface.turn_started(cancel, hard),
+            SurfaceRequest::TurnStarted { cancel } => surface.turn_started(cancel),
             SurfaceRequest::TurnEnded => surface.turn_ended(),
             SurfaceRequest::Interact { interaction, reply } => {
                 let _ = reply.send(surface.present_interaction(&interaction));
@@ -773,7 +768,7 @@ mod tests {
             surface.reload().expect("served");
             surface.read_line("› ").expect("served");
             let flag = || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            surface.turn_started(flag(), flag());
+            surface.turn_started(flag());
             surface.turn_ended();
             surface.present_interaction(&an_interaction());
             #[cfg(feature = "rich-tui")]
@@ -1018,11 +1013,7 @@ mod tests {
         fn set_tabs(&mut self, _tabs: Vec<crate::tab_bar::TabCell>) {
             self.tabs += 1;
         }
-        fn turn_started(
-            &mut self,
-            _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-            _hard: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        ) {
+        fn turn_started(&mut self, _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {
             self.turn_started += 1;
         }
         fn turn_ended(&mut self) {

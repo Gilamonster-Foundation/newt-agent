@@ -126,7 +126,8 @@ worth stating so nobody builds the old plan later:
   watcher forwards ground bytes to the mounted editor" is replaced by the
   terminal thread reading the keyboard itself, under the same arbiter stdin
   token the watcher used — which is what keeps a mid-turn `PromptWindow`
-  working unchanged. Ctrl-C interrupts (first press asks, second forces);
+  working unchanged. Ctrl-C interrupts (every press is counted and
+  acknowledged on the spinner label, #2010);
   **Esc belongs to vi**, a deliberate change from the watcher's lone-Esc
   cancel.
 
