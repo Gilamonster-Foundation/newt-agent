@@ -1202,16 +1202,11 @@ pub(crate) trait InputSurface {
     /// still compiling. `session_worker::tests::the_proxy_forwards_every_
     /// surface_method` exists to make that fail loudly instead.
     fn set_tabs(&mut self, _tabs: Vec<crate::tab_bar::TabCell>) {}
-    /// #1669 cockpit: a turn is starting, and these are the flags it races
-    /// its work against. A surface that reads the keyboard WHILE a turn runs
-    /// (the cockpit) trips them from Ctrl-C; every other surface leaves the
+    /// #1669 cockpit: a turn is starting, and this is the flag it races its
+    /// work against. A surface that reads the keyboard WHILE a turn runs
+    /// (the cockpit) trips it from Ctrl-C; every other surface leaves the
     /// keyboard to the session's own watcher and ignores this.
-    fn turn_started(
-        &mut self,
-        _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        _hard: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
-    }
+    fn turn_started(&mut self, _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {}
     /// The turn is over: whatever Ctrl-C meant, it means nothing now.
     fn turn_ended(&mut self) {}
 
@@ -7171,11 +7166,10 @@ fn session_body(
                     let turn_cancel =
                         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let turn_exit = std::sync::atomic::AtomicBool::new(false);
-                    let turn_hard = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     // Paired with `turn_ended` right after the blocking call
                     // below. A `?` between them ends the session, which ends
                     // the terminal's turn state with it, so no guard is needed.
-                    surface.turn_started(turn_cancel.clone(), turn_hard.clone());
+                    surface.turn_started(turn_cancel.clone());
                     // Build the gate whenever the session has a usable TTY — NOT
                     // only when authorization prompting is on. `ask_question`
                     // (request_user_input) needs a present operator; permission
@@ -7399,7 +7393,6 @@ fn session_body(
                     let response = with_live_spill_watch(
                         interruptible,
                         &turn_cancel,
-                        &turn_hard,
                         mouse_tier,
                         spill_input,
                         || {
@@ -7703,12 +7696,12 @@ fn session_body(
                         newt_core::lifecycle::emit(
                             newt_core::lifecycle::LifecycleEvent::TurnCancelled,
                         );
-                        let note = if turn_hard.load(std::sync::atomic::Ordering::Relaxed) {
-                            "⊘ stopped — back to you"
-                        } else {
-                            "⊘ interrupted — back to you"
-                        };
-                        print_newt(note, color, verbose);
+                        // #2010: one note, whatever the press count — the
+                        // count was acknowledged at press time through the
+                        // spinner label, which is where the operator was
+                        // looking. A flag read only here, to relabel this
+                        // line, was the "nobody acts on it" the issue named.
+                        print_newt("⊘ interrupted — back to you", color, verbose);
                         println!();
                         // #1963: every interrupt checkpoint in the four wire
                         // loops returns `Ok` with whatever it actually

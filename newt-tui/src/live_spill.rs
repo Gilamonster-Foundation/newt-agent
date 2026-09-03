@@ -1272,19 +1272,16 @@ mod tests {
         let mut pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
         let cancel = Arc::new(AtomicBool::new(false));
-        let hard = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let (done_tx, done_rx) = mpsc::channel();
         let watcher = {
             let renderer = renderer.clone();
             let cancel = cancel.clone();
-            let hard = hard.clone();
             let stop = stop.clone();
             std::thread::spawn(move || {
                 crate::watch_for_interrupt_fd(
                     pipe[0],
                     &cancel,
-                    &hard,
                     &stop,
                     Some(renderer.as_ref()),
                     newt_core::EditMode::Nano,

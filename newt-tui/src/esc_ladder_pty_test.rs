@@ -92,14 +92,12 @@ fn esc_ladder_child() {
         crate::rich_input::RichSurface::new(Some(dir.join("history"))).expect("rich surface");
     let mut cockpit = crate::cockpit::Presenter::open(surface).expect("the cockpit takes the pty");
 
-    // The real flags the session races against — the same `Arc<AtomicBool>`
-    // pair `chat.rs` hands the surface on `TurnStarted`.
+    // The real flag the session races against — the same `Arc<AtomicBool>`
+    // `chat.rs` hands the surface on `TurnStarted`.
     let cancel = Arc::new(AtomicBool::new(false));
-    let hard = Arc::new(AtomicBool::new(false));
     cockpit
         .handle_request(crate::session_worker::SurfaceRequest::TurnStarted {
             cancel: Arc::clone(&cancel),
-            hard: Arc::clone(&hard),
         })
         .expect("a turn starts");
 
@@ -150,16 +148,17 @@ fn esc_ladder_child() {
         cancel.load(Ordering::SeqCst)
     });
     let line = format!(
-        "normal-esc cancel={} hard={} ack={}",
+        "normal-esc cancel={} presses={}",
         cancel.load(Ordering::SeqCst),
-        hard.load(Ordering::SeqCst),
-        newt_core::tty::interrupt_pending()
+        newt_core::tty::interrupt_presses()
     );
     say(&mut cockpit, &line);
 
-    // ---- the second press forces, exactly as Ctrl-C's second press does. ----
-    settle(&mut cockpit, "second-esc", |_| hard.load(Ordering::SeqCst));
-    let line = format!("second-esc hard={}", hard.load(Ordering::SeqCst));
+    // ---- the second press is heard, exactly as Ctrl-C's second press is. ----
+    settle(&mut cockpit, "second-esc", |_| {
+        newt_core::tty::interrupt_presses() >= 2
+    });
+    let line = format!("second-esc presses={}", newt_core::tty::interrupt_presses());
     say(&mut cockpit, &line);
 }
 
@@ -309,19 +308,21 @@ fn esc_interrupts_a_running_turn_from_vi_normal_but_never_from_vi_insert() {
     );
 
     // 3. vi NORMAL, nothing pending, turn running: Esc reaches the hatch.
-    //    `ack=true` is the operator-visible half — the flag the spinner reads
-    //    to swap its stage label, so the press is acknowledged on screen
-    //    rather than only in a bool.
+    //    `presses=1` is the operator-visible half — the count the spinner
+    //    reads to swap its stage label, so the press is acknowledged on
+    //    screen rather than only in a bool.
     pty.type_in("\u{1b}");
     wait_for(
-        &format!("{TAG} normal-esc cancel=true hard=false ack=true"),
+        &format!("{TAG} normal-esc cancel=true presses=1"),
         Where::Committed,
     );
 
-    // 4. The second press forces, same tiers as Ctrl-C and as the classic
-    //    watcher. `hard=false` above is what makes this non-trivial.
+    // 4. The second press is HEARD (#2010): the count the spinner renders
+    //    is 2, so the operator sees a different label, not the same one.
+    //    Same as Ctrl-C and as the classic watcher. `presses=1` above is
+    //    what makes this non-trivial.
     pty.type_in("\u{1b}");
-    wait_for(&format!("{TAG} second-esc hard=true"), Where::Committed);
+    wait_for(&format!("{TAG} second-esc presses=2"), Where::Committed);
 
     let status =
         wait_for_child(&mut child, EXIT_TIMEOUT).expect("the child exited within the timeout");

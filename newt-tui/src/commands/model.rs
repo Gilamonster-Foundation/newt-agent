@@ -184,12 +184,9 @@ pub(crate) fn dispatch(
                 // we check at each model boundary (a single model still finishes;
                 // the remaining ones are skipped). Only on a TTY.
                 let probe_cancel = std::sync::atomic::AtomicBool::new(false);
-                // The probe sweep only needs graceful cancel; a 2nd Ctrl-C trips
-                // this (ignored here) and cancel already stops the sweep.
-                let probe_hard = std::sync::atomic::AtomicBool::new(false);
                 let probe_interruptible = io::stdin().is_terminal() && io::stdout().is_terminal();
                 let mut probed = 0usize;
-                with_interrupt_watch(probe_interruptible, &probe_cancel, &probe_hard, || {
+                with_interrupt_watch(probe_interruptible, &probe_cancel, || {
                     for model in &targets {
                         if probe_cancel.load(std::sync::atomic::Ordering::Relaxed) {
                             print_newt(

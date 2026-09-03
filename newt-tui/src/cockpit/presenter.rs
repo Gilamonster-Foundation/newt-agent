@@ -32,8 +32,9 @@
 //!
 //! # Who owns Esc
 //!
-//! Ctrl-C during a turn interrupts, and so does **Esc** — the second press
-//! escalates, matching the watcher. This file used to say *"(Esc belongs to
+//! Ctrl-C during a turn interrupts, and so does **Esc** — every press is
+//! counted and acknowledged on screen (#2010), matching the watcher. This
+//! file used to say *"(Esc belongs to
 //! vi)"*, and that sentence was the whole of #2005: the classic surface had
 //! shipped Esc-interrupt with the same tiers since `lib.rs`'s watcher, and the
 //! cockpit deliberately declined to port it, leaving vi the one newt surface
@@ -548,11 +549,9 @@ fn line_to_ansi(line: &Line<'_>) -> io::Result<Row> {
     Ok(out)
 }
 
-/// A turn in flight: the flags the session races its work against.
+/// A turn in flight: the flag the session races its work against.
 struct Turn {
     cancel: Arc<AtomicBool>,
-    hard: Arc<AtomicBool>,
-    presses: u32,
 }
 
 /// The cockpit's owner of the terminal, the keyboard and the editor.
@@ -845,12 +844,8 @@ impl Presenter {
                 self.surface.set_tabs(tabs);
                 self.dirty = true;
             }
-            SurfaceRequest::TurnStarted { cancel, hard } => {
-                self.turn = Some(Turn {
-                    cancel,
-                    hard,
-                    presses: 0,
-                });
+            SurfaceRequest::TurnStarted { cancel } => {
+                self.turn = Some(Turn { cancel });
                 // #2006: the mode hint may advertise `^C interrupt` exactly
                 // while that is true.
                 self.editor.set_turn_running(true);
@@ -1095,7 +1090,7 @@ impl Presenter {
             //
             // `KeyEventKind::Press` is load-bearing: without it, under the
             // kitty protocol the matching release event counts as a second
-            // press and the operator's FIRST Ctrl-C force-stops the turn.
+            // press and the operator's FIRST Ctrl-C is acknowledged as two.
             Event::Key(key) if key.kind == KeyEventKind::Press && self.escapes(&key) => {
                 self.escape_during_turn();
                 Ok(())
@@ -1147,9 +1142,12 @@ impl Presenter {
         )
     }
 
-    /// Interrupt the running turn. The draft is kept; the first press asks,
-    /// the second forces. Same tiers as the classic watcher, and the spinner
-    /// label acknowledges within a tick.
+    /// Interrupt the running turn. The draft is kept; every press trips the
+    /// same one-way `cancel` and is COUNTED for the spinner label, which
+    /// acknowledges within a tick — the 1st as "interrupting…", the Nth as
+    /// "×N heard — already stopping" (#2010). Same as the classic watcher.
+    /// There is no second tier: the first press already drops the in-flight
+    /// request and tool future, so a repeat has nothing left to force.
     ///
     /// **Private, with exactly one caller** (guard G1,
     /// `docs/decisions/key_ladder_crate.md` §5). Delete the ladder arm in
@@ -1158,24 +1156,19 @@ impl Presenter {
     /// giving it a second caller voids it — so it is the cheap guard, not the
     /// primary one; `esc_ladder_pty_test` is the primary one.
     ///
-    /// The press COUNTER stays here, in the consumer, deliberately: both newt
-    /// surfaces already count and reset correctly (`TurnStarted` builds a
-    /// fresh `Turn`), and a copy inside the ladder crate would be a second
-    /// reset path.
+    /// The press COUNTER lives in `newt_core::tty`, the spinner's owner,
+    /// deliberately: it is what the label renders, both newt surfaces bump
+    /// the same one, and `TurnEnded` is its one reset path — a copy here or
+    /// inside the ladder crate would be a second count to keep in step.
     fn escape_during_turn(&mut self) {
         // Total rather than trusting the caller: `escapes` only returns true
         // while `work_running`, so this is unreachable, and an `unwrap` here
         // would be a panic waiting on a future refactor.
-        let Some(turn) = self.turn.as_mut() else {
+        let Some(turn) = self.turn.as_ref() else {
             return;
         };
-        turn.presses += 1;
-        if turn.presses == 1 {
-            turn.cancel.store(true, Ordering::SeqCst);
-            newt_core::tty::set_interrupt_pending(true);
-        } else {
-            turn.hard.store(true, Ordering::SeqCst);
-        }
+        turn.cancel.store(true, Ordering::SeqCst);
+        newt_core::tty::note_interrupt_press();
     }
 
     fn on_outcome(&mut self, outcome: EditorOutcome) {
@@ -1612,13 +1605,11 @@ mod terminal_acceptance {
             assert!(!is_canonical(0), "the cockpit runs the terminal raw");
             assert!(!echoes(0), "and the kernel is not echoing over the editor");
 
-            // ---- Ctrl-C: first press asks, second forces ----
+            // ---- Ctrl-C: every press trips the cancel and is counted ----
             let cancel = Arc::new(AtomicBool::new(false));
-            let hard = Arc::new(AtomicBool::new(false));
             cockpit
                 .handle_request(SurfaceRequest::TurnStarted {
                     cancel: Arc::clone(&cancel),
-                    hard: Arc::clone(&hard),
                 })
                 .expect("a turn starts");
 
@@ -1628,22 +1619,23 @@ mod terminal_acceptance {
                 cancel.load(Ordering::SeqCst),
                 "first press trips the cancel the session races against"
             );
-            assert!(
-                !hard.load(Ordering::SeqCst),
-                "first press must NOT force — that is the second press"
-            );
-            // Operator-observable: this is the flag the spinner reads to swap
+            // Operator-observable: this is the count the spinner reads to swap
             // its stage label, so the press is acknowledged on screen.
-            assert!(
-                newt_core::tty::interrupt_pending(),
+            assert_eq!(
+                newt_core::tty::interrupt_presses(),
+                1,
                 "first press raises the acknowledgment the operator sees"
             );
 
             tty.type_bytes(CTRL_C);
             cockpit.poll_keys().expect("second Ctrl-C");
-            assert!(
-                hard.load(Ordering::SeqCst),
-                "second press forces the turn down"
+            // #2010: the second press is HEARD — it bumps the count the
+            // spinner renders, so it is visibly different from the first
+            // instead of being absorbed into a flag read after the turn.
+            assert_eq!(
+                newt_core::tty::interrupt_presses(),
+                2,
+                "the second press is acknowledged at press time"
             );
 
             cockpit
