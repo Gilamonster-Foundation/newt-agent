@@ -595,14 +595,14 @@ fn header_line(session: &str, headline: &str) -> Line<'static> {
     if !session.is_empty() {
         spans.push(Span::styled(
             format!("[{session}]"),
-            Style::default().fg(theme.color(crate::theme::Role::Muted)),
+            Style::default().fg(crate::theme::color(crate::theme::Role::Muted)),
         ));
     }
     if !headline.is_empty() {
         let gap = if spans.is_empty() { "" } else { " " };
         spans.push(Span::styled(
             format!("{gap}{headline}"),
-            Style::default().fg(theme.color(crate::theme::Role::Text)),
+            Style::default().fg(crate::theme::color(crate::theme::Role::Text)),
         ));
     }
     Line::from(spans)
@@ -662,8 +662,8 @@ fn footer_line(
     let theme = crate::theme::active();
     // ONE accent, shared with the chevron: two constants for one signal is how
     // they drift apart.
-    let accent = theme.color(crate::theme::Role::Accent);
-    let dim = theme.color(crate::theme::Role::Dim);
+    let accent = crate::theme::color(crate::theme::Role::Accent);
+    let dim = crate::theme::color(crate::theme::Role::Dim);
     let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let mut spans: Vec<Span> = vec![Span::styled(format!("[{stamp}]"), Style::default().fg(dim))];
     spans.push(Span::styled(
@@ -688,10 +688,14 @@ fn footer_line(
         if budget > 0 {
             let g = newt_core::agentic::fmt_token_gauge(used, budget);
             let c = match newt_core::agentic::gauge_level(used, budget) {
-                newt_core::agentic::GaugeLevel::Ok => theme.color(crate::theme::Role::GaugeOk),
-                newt_core::agentic::GaugeLevel::Warn => theme.color(crate::theme::Role::GaugeWarn),
+                newt_core::agentic::GaugeLevel::Ok => {
+                    crate::theme::color(crate::theme::Role::GaugeOk)
+                }
+                newt_core::agentic::GaugeLevel::Warn => {
+                    crate::theme::color(crate::theme::Role::GaugeWarn)
+                }
                 newt_core::agentic::GaugeLevel::Critical => {
-                    theme.color(crate::theme::Role::GaugeCritical)
+                    crate::theme::color(crate::theme::Role::GaugeCritical)
                 }
             };
             spans.push(Span::styled(format!("  {g}"), Style::default().fg(c)));
@@ -730,8 +734,8 @@ impl CommandKind {
         let color = if focused {
             let theme = crate::theme::active();
             match self {
-                Self::Bang => theme.color(crate::theme::Role::CommandBang),
-                Self::Ex => theme.color(crate::theme::Role::CommandEx),
+                Self::Bang => crate::theme::color(crate::theme::Role::CommandBang),
+                Self::Ex => crate::theme::color(crate::theme::Role::CommandEx),
             }
         } else {
             Color::DarkGray
@@ -935,11 +939,11 @@ fn background_line(jobs: &[BackgroundJob], frame: usize) -> Option<Line<'static>
     Some(Line::from(vec![
         Span::styled(
             format!("{spinner} background{count}"),
-            Style::default().fg(theme.color(crate::theme::Role::Thinking)),
+            Style::default().fg(crate::theme::color(crate::theme::Role::Thinking)),
         ),
         Span::styled(
             format!(" · {labels}"),
-            Style::default().fg(theme.color(crate::theme::Role::Dim)),
+            Style::default().fg(crate::theme::color(crate::theme::Role::Dim)),
         ),
     ]))
 }
@@ -1062,7 +1066,7 @@ fn draw(
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     line,
-                    Style::default().fg(crate::theme::active().color(crate::theme::Role::Dim)),
+                    Style::default().fg(crate::theme::color(crate::theme::Role::Dim)),
                 ))),
                 tab_area,
             );

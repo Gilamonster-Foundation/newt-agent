@@ -56,6 +56,8 @@ pub mod raw_mode;
 /// spinner so the renderer can own it. The concurrency rules moved verbatim.
 mod row;
 pub mod spinner;
+/// The one table of named colour roles, shared by every surface in the line.
+pub mod theme;
 pub mod widgets;
 pub mod width;
 

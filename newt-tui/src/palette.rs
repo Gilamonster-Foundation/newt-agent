@@ -434,7 +434,7 @@ pub(crate) fn palette_lines(state: &PaletteState) -> Vec<Line<'static>> {
     // duplication was fixed in `header_line` (#2019) and reappeared here,
     // because nothing NAMED the colour.
     let theme = crate::theme::active();
-    let accent = theme.color(crate::theme::Role::Accent);
+    let accent = crate::theme::color(crate::theme::Role::Accent);
     let end = (state.scroll + state.viewport).min(state.matched.len());
     state.matched[state.scroll..end]
         .iter()
@@ -446,22 +446,22 @@ pub(crate) fn palette_lines(state: &PaletteState) -> Vec<Line<'static>> {
                 (
                     Span::styled("❯ ", Style::default().fg(accent)),
                     Style::default()
-                        .fg(theme.color(crate::theme::Role::Emphasis))
+                        .fg(crate::theme::color(crate::theme::Role::Emphasis))
                         .add_modifier(Modifier::BOLD),
-                    Style::default().fg(theme.color(crate::theme::Role::Muted)),
+                    Style::default().fg(crate::theme::color(crate::theme::Role::Muted)),
                 )
             } else {
                 (
                     Span::raw("  "),
                     Style::default(),
-                    Style::default().fg(theme.color(crate::theme::Role::Dim)),
+                    Style::default().fg(crate::theme::color(crate::theme::Role::Dim)),
                 )
             };
             let mut spans = vec![marker, Span::styled(e.cmd.clone(), cmd_style)];
             if !e.args.is_empty() {
                 spans.push(Span::styled(
                     format!(" {}", e.args),
-                    Style::default().fg(theme.color(crate::theme::Role::Dim)),
+                    Style::default().fg(crate::theme::color(crate::theme::Role::Dim)),
                 ));
             }
             let pad = col.saturating_sub(head_w(e)) + 2;

@@ -871,11 +871,11 @@ pub(crate) fn render_panel(
     // argument one level in.
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.color(crate::theme::Role::ModalBorder)))
+        .border_style(Style::default().fg(crate::theme::color(crate::theme::Role::ModalBorder)))
         .title(Span::styled(
             title.to_string(),
             Style::default()
-                .fg(theme.color(crate::theme::Role::ModalTitle))
+                .fg(crate::theme::color(crate::theme::Role::ModalTitle))
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -922,7 +922,7 @@ pub(crate) fn command_line(buf: &str) -> Line<'static> {
     Line::from(Span::styled(
         format!(":{buf}▏"),
         Style::default()
-            .fg(crate::theme::active().color(crate::theme::Role::Ok))
+            .fg(crate::theme::color(crate::theme::Role::Ok))
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -932,7 +932,7 @@ pub(crate) fn status_line(status: &str) -> Line<'static> {
     Line::from(Span::styled(
         status.to_string(),
         Style::default()
-            .fg(crate::theme::active().color(crate::theme::Role::Identity))
+            .fg(crate::theme::color(crate::theme::Role::Identity))
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -958,10 +958,10 @@ pub(crate) fn row_styles(selected: bool, editable: bool) -> (Style, Style) {
         let theme = crate::theme::active();
         (
             Style::default()
-                .fg(theme.color(crate::theme::Role::SelectedLabel))
+                .fg(crate::theme::color(crate::theme::Role::SelectedLabel))
                 .add_modifier(Modifier::BOLD),
             Style::default()
-                .fg(theme.color(crate::theme::Role::SelectedValue))
+                .fg(crate::theme::color(crate::theme::Role::SelectedValue))
                 .add_modifier(Modifier::BOLD),
         )
     } else if editable {
@@ -1099,11 +1099,10 @@ mod tests {
     /// theme that silently does nothing.
     #[test]
     fn panel_chrome_reads_its_colours_from_the_theme() {
-        use crate::theme::{active, Role};
+        use crate::theme::Role;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let theme = active();
         let rows = vec![
             RowView {
                 label: "persona",
@@ -1132,7 +1131,7 @@ mod tests {
         assert_eq!(corner.symbol(), "┌", "the box still draws");
         assert_eq!(
             corner.fg,
-            theme.color(Role::ModalBorder),
+            crate::theme::color(Role::ModalBorder),
             "the border is themed, not left at the terminal default"
         );
         assert_ne!(
@@ -1146,7 +1145,7 @@ mod tests {
             .map(|x| buf.cell((x, 0)).unwrap())
             .find(|c| c.symbol() == "s")
             .expect("the title renders on the top edge");
-        assert_eq!(titled.fg, theme.color(Role::ModalTitle));
+        assert_eq!(titled.fg, crate::theme::color(Role::ModalTitle));
 
         // The selected row's label and value take the two roles this file's
         // literals originally named.
@@ -1155,24 +1154,26 @@ mod tests {
             .iter()
             .find(|c| c.symbol() == "p")
             .expect("the selected label renders");
-        assert_eq!(label.fg, theme.color(Role::SelectedLabel));
+        assert_eq!(label.fg, crate::theme::color(Role::SelectedLabel));
         let value = row
             .iter()
             .find(|c| c.symbol() == "‹")
             .expect("the selected row carries dial chrome");
-        assert_eq!(value.fg, theme.color(Role::SelectedValue));
+        assert_eq!(value.fg, crate::theme::color(Role::SelectedValue));
     }
 
     /// The two shared bottom lines take the other two once-orphaned roles.
     #[test]
     fn bottom_lines_read_their_colours_from_the_theme() {
-        use crate::theme::{active, Role};
+        use crate::theme::Role;
 
-        let theme = active();
         let ex = command_line("w");
-        assert_eq!(ex.spans[0].style.fg, Some(theme.color(Role::Ok)));
+        assert_eq!(ex.spans[0].style.fg, Some(crate::theme::color(Role::Ok)));
         let status = status_line("saved");
-        assert_eq!(status.spans[0].style.fg, Some(theme.color(Role::Identity)));
+        assert_eq!(
+            status.spans[0].style.fg,
+            Some(crate::theme::color(Role::Identity))
+        );
     }
 
     fn choice(
