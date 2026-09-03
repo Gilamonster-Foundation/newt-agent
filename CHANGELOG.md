@@ -9,6 +9,26 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Fixed — every interrupt press is acknowledged at press time (#2010)
+
+- **Repeated Ctrl-C / Esc is heard, not absorbed.** The 2nd and Nth press used
+  to set a `hard` flag whose only reader ran *after* the turn returned, to pick
+  the wording of a note — so a repeat was indistinguishable from the first
+  press until the turn yielded on its own. The interrupt acknowledgment in
+  `newt_core::tty` is now a **press count** both surfaces (the classic watcher
+  and the cockpit) bump on every press, and the spinner label renders it
+  within a tick: `interrupting…` on the first, `interrupting… (×N heard —
+  already stopping)` after. The `hard` flag is deleted: the first press already
+  drops the in-flight request and any running tool future (`cancellable`), so a
+  second press had nothing left to force — it is now advertised honestly.
+- **Ctrl-D during a turn is answered, and the hint stops promising it.** The
+  cockpit's status hint said `^D exit` while a turn ran, but a mid-turn exit
+  key was dropped on the floor. The `^D exit` half is now idle-only (the same
+  rule `^C` follows since #2006), and a mid-turn exit key earns a scrollback
+  note saying where interrupt and exit actually live. Its during-turn
+  *meaning* is unchanged — inert on the cockpit, half-page-down in the classic
+  vi nav tier — pending the operator's call on escalation.
+
 ### Security — OCAP enforcement-floor (epic #749)
 
 Hardening on the still-unreleased 0.8.0 line: closing the remaining OPEN
