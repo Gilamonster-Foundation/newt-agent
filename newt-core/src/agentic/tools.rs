@@ -4734,6 +4734,25 @@ async fn execute_tool_inner(
 
         "lifecycle" => {
             let phase_key = args.get("phase").and_then(|v| v.as_str()).unwrap_or("");
+            // A model that learned `lifecycle` as a task-state reporter in
+            // another harness sends `{event|status|state, message}` and no
+            // phase. Listing build phases at it is a dead end; name the tools
+            // that own that vocabulary instead (same coaching posture as
+            // `catalog::resolve_tool_alias`).
+            if phase_key.is_empty()
+                && ["event", "status", "state"]
+                    .iter()
+                    .any(|k| args.get(k).is_some())
+            {
+                return "error: lifecycle runs a project build phase (setup, format, \
+                        lint, test, check, clean); it does not record task state. To \
+                        report progress, call update_plan with \
+                        {\"plan\":[{\"step\",\"status\"}]}. If you are blocked on the \
+                        operator, call request_user_input (or request_permissions for \
+                        a grant). When the work is done, reply without a tool call — \
+                        that final answer ends the turn."
+                    .to_string();
+            }
             let Some(phase) = crate::tooling::Phase::from_key(phase_key) else {
                 let valid = crate::tooling::Phase::ALL
                     .iter()
