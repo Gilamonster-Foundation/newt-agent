@@ -38,6 +38,21 @@
 //!
 //! See `docs/decisions/windows_cockpit_conpty.md` for what this does and does
 //! NOT decide about the cockpit's architecture.
+//!
+//! ## Why every probe is `#[ignore]`d
+//!
+//! These are real-resource EVIDENCE probes, not unit tests: Probe A swaps this
+//! process's own global `STD_OUTPUT_HANDLE`, and Probes B/C spawn a ConPTY host
+//! subprocess and touch the filesystem. In the parallel per-PR `cargo test
+//! --workspace` run, Probe A's in-process handle swap corrupts libtest's own
+//! stdout while the ~1300 sibling tests are mid-flight — the harness's result
+//! channel dies with a `SendError` / `BrokenPipe` and the whole binary fails
+//! (`#[serial]` only orders same-key tests, so it does not help here). Per the
+//! testing-tiers doctrine (CLAUDE.md) such tests run single-threaded, isolated,
+//! never in the per-PR parallel suite. They are therefore `#[ignore]`d — like
+//! the `conpty_host`/`conpty_child` roles below — and exercised only by the
+//! dedicated single-threaded CI step (`.github/workflows/ci.yml`, "ConPTY
+//! feasibility probe evidence"), which passes `--include-ignored`.
 
 #[cfg(test)]
 mod probes {
@@ -148,6 +163,7 @@ mod probes {
     /// and a pipe is not a console — so `is_terminal()` would flip, exactly as a
     /// pipe would on unix. The unix in-process fd-swap has no Windows analogue.
     #[serial_test::serial(tty_arbiter)]
+    #[ignore = "real-resource evidence probe: swaps this process's global STD_OUTPUT_HANDLE, so it must run single-threaded in the dedicated CI step, not the parallel workspace suite"]
     #[test]
     fn probe_a_pipe_stdout_is_not_a_console() {
         let (read, write) = create_pipe();
@@ -182,6 +198,7 @@ mod probes {
     /// process is untouched; it captures the pty bytes to a file we read here.
     /// Then those exact bytes go through the existing #1744 scanner.
     #[serial_test::serial(tty_arbiter)]
+    #[ignore = "real-resource evidence probe: spawns a ConPTY host subprocess, so it must run single-threaded in the dedicated CI step, not the parallel workspace suite"]
     #[test]
     fn probe_b_child_stdout_and_stderr_traverse_the_conpty() {
         let result = result_path();
@@ -294,6 +311,7 @@ mod probes {
     /// * `leaked` — the markers appeared on the host's inherited pipes, i.e.
     ///   the child took the parent's redirected handles instead of the pty.
     /// * `absent` — neither; the child produced nothing either way.
+    #[ignore = "real-resource evidence probe: spawns a ConPTY host subprocess, so it must run single-threaded in the dedicated CI step, not the parallel workspace suite"]
     #[test]
     fn probe_c_is_a_process_global_console_required() {
         let result = result_path().with_extension("nocon");
