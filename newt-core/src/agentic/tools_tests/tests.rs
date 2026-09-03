@@ -2409,6 +2409,55 @@ async fn lifecycle_unknown_phase_lists_valid_phases() {
     assert!(out.contains("check"), "should name valid phases: {out}");
 }
 
+/// Regression: a model that learned `lifecycle` as a task-state reporter in
+/// another harness calls it with `{event|status|state, message}` and no
+/// `phase`. Before the fix it got `error: unknown lifecycle phase ''` plus a
+/// list of build phases — a dead end that says nothing about where task
+/// state actually lives. It must instead be coached to update_plan /
+/// request_user_input / the final answer. Returns before any fs touch, so
+/// this is a fully-mocked unit test.
+#[tokio::test]
+async fn lifecycle_task_state_args_are_coached_to_update_plan() {
+    let caveats = crate::caveats::Caveats::top();
+    for args in [
+        serde_json::json!({ "event": "complete", "message": "done" }),
+        serde_json::json!({ "status": "blocked" }),
+        serde_json::json!({ "state": "in_progress" }),
+    ] {
+        let out = execute_tool(
+            "lifecycle",
+            &args,
+            ".",
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(out.starts_with("error:"), "{args}: {out}");
+        assert!(
+            !out.contains("unknown lifecycle phase"),
+            "{args}: still the phase dead-end: {out}"
+        );
+        for tool in ["update_plan", "request_user_input"] {
+            assert!(out.contains(tool), "{args}: should coach to {tool}: {out}");
+        }
+    }
+}
+
 /// #1972 red-first, reproduced against this repo's own real tree (no
 /// tempfile): `crates/` carries no lifecycle markers of its own, but its
 /// child `crates/newt-tuner/` has a real `Cargo.toml` — the same shape as
