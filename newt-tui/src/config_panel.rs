@@ -59,7 +59,7 @@ use crate::panel::Key;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use newt_core::cognition::{cli_cognition, CognitionOverride};
 use newt_core::role_profile::Cognition;
@@ -862,24 +862,17 @@ pub(crate) fn render_panel(
     label_w: usize,
     val_w: usize,
 ) {
-    let area = f.area();
-    let theme = crate::theme::active();
-    // The frame wears the colour that means "the keyboard is here", because
-    // that is exactly what a modal has taken. Before this the border carried no
-    // style at all, so it drew in whatever the terminal last set — a dialog
-    // that owns your input rendered as ordinary output. The title is the same
-    // argument one level in.
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(crate::theme::color(crate::theme::Role::ModalBorder)))
-        .title(Span::styled(
-            title.to_string(),
-            Style::default()
-                .fg(crate::theme::color(crate::theme::Role::ModalTitle))
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    // The edge comes from `modal::frame`, which every dialog now shares. The
+    // panel used to own the only border in the crate; making it the SHARED one
+    // is how the pagers and the permission prompt got an edge at all.
+    let inner = crate::modal::frame(
+        f,
+        f.area(),
+        &crate::modal::Chrome {
+            title: title.trim(),
+            ..crate::modal::Chrome::default()
+        },
+    );
 
     let mut lines: Vec<Line> = Vec::new();
     for row in rows {
@@ -955,7 +948,6 @@ pub(crate) fn hint_line(hint: &'static str) -> Line<'static> {
 /// they were named after stayed put. Same bytes, now themeable.
 pub(crate) fn row_styles(selected: bool, editable: bool) -> (Style, Style) {
     if selected {
-        let theme = crate::theme::active();
         (
             Style::default()
                 .fg(crate::theme::color(crate::theme::Role::SelectedLabel))
@@ -1128,7 +1120,12 @@ mod tests {
         // The frame. Top-left corner is border, and it is NOT the terminal
         // default — which is the whole bug.
         let corner = buf.cell((0, 0)).unwrap();
-        assert_eq!(corner.symbol(), "┌", "the box still draws");
+        assert_eq!(
+            corner.symbol(),
+            "╭",
+            "the box draws, now through the SHARED chrome — rounded, like every \
+             other modal, which is the point of the shared edge"
+        );
         assert_eq!(
             corner.fg,
             crate::theme::color(Role::ModalBorder),

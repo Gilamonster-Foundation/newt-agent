@@ -197,6 +197,9 @@ mod cockpit;
 mod mouse;
 #[cfg(all(unix, any(feature = "rich-tui", feature = "live-spill")))]
 pub use mouse::install_panic_release_hook;
+/// The chrome every modal wears — one themed border for every dialog.
+#[cfg(feature = "rich-tui")]
+mod modal;
 // The lean input surface (issue #527): a dead-simple word-wrapped text box, the
 // flight/wyvern morphology. Always built — it is the footer-off / lean tier.
 mod lean_input;

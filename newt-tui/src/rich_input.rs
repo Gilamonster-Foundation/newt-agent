@@ -588,7 +588,6 @@ fn status_options() -> Option<String> {
 /// hazard at every terminal width and buys nothing adjacency does not already
 /// give: the rows are next to each other, which is what makes them regions.
 fn header_line(session: &str, headline: &str) -> Line<'static> {
-    let theme = crate::theme::active();
     let mut spans: Vec<Span> = Vec::new();
     // #1671: the session name is ALWAYS visible — a mid-luminance grey so it
     // reads without shouting (accessibility default: no saturated darks).
@@ -659,7 +658,6 @@ fn footer_line(
     gauge: Option<(u32, u32)>,
     active: bool,
 ) -> Line<'static> {
-    let theme = crate::theme::active();
     // ONE accent, shared with the chevron: two constants for one signal is how
     // they drift apart.
     let accent = crate::theme::color(crate::theme::Role::Accent);
@@ -732,7 +730,6 @@ impl CommandKind {
 
     fn marker_style_with_focus(self, focused: bool) -> Style {
         let color = if focused {
-            let theme = crate::theme::active();
             match self {
                 Self::Bang => crate::theme::color(crate::theme::Role::CommandBang),
                 Self::Ex => crate::theme::color(crate::theme::Role::CommandEx),
@@ -935,7 +932,6 @@ fn background_line(jobs: &[BackgroundJob], frame: usize) -> Option<Line<'static>
     };
     let labels = active.join(", ");
     let spinner = newt_core::tty::SPINNER_FRAMES[frame % newt_core::tty::SPINNER_FRAMES.len()];
-    let theme = crate::theme::active();
     Some(Line::from(vec![
         Span::styled(
             format!("{spinner} background{count}"),

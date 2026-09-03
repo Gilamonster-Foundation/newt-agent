@@ -433,7 +433,6 @@ pub(crate) fn palette_lines(state: &PaletteState) -> Vec<Line<'static>> {
     // literal value of `ACTIVE_INPUT_CT`, written out a second time. The same
     // duplication was fixed in `header_line` (#2019) and reappeared here,
     // because nothing NAMED the colour.
-    let theme = crate::theme::active();
     let accent = crate::theme::color(crate::theme::Role::Accent);
     let end = (state.scroll + state.viewport).min(state.matched.len());
     state.matched[state.scroll..end]

@@ -29,10 +29,10 @@ use ratatui::style::Color as RtColor;
 
 pub(crate) use newt_core::tty::theme::{active, complaints, Role};
 
+// The table's OWN tests moved with it to newt-core; what stays here tests the
+// adapter, which needs only these two.
 #[cfg(test)]
-pub(crate) use newt_core::tty::theme::{
-    from_env, parse_color, role_from_name, role_name, Theme, ALL_ROLES,
-};
+use newt_core::tty::theme::{role_name, ALL_ROLES};
 
 /// The colour for a role, as ratatui wants it.
 ///
