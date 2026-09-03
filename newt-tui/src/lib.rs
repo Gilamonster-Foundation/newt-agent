@@ -9102,6 +9102,14 @@ enum SpillEligibility {
     StdoutNotTty,
     /// `TERM=dumb` — the terminal disclaims cursor addressing.
     TermDumb,
+    /// The cockpit owns the terminal, so the viewport is deliberately not
+    /// built: it paints with cursor motion the presenter drops by design.
+    ///
+    /// Last in the ladder because it is the one refusal that says nothing is
+    /// WRONG — the platform, the build and the terminal are all fine, and the
+    /// operator is simply on the surface that does its own drawing. Reporting
+    /// it after the others keeps the fixable causes first.
+    TerminalOwnedByCockpit,
 }
 
 impl SpillEligibility {
@@ -9125,6 +9133,10 @@ impl SpillEligibility {
                 "live interaction unavailable: stdout is not a terminal (piped or redirected)"
             }
             Self::TermDumb => "live interaction unavailable: TERM=dumb disclaims cursor control",
+            Self::TerminalOwnedByCockpit => {
+                "live interaction unavailable: the cockpit owns the terminal \
+                 (committed results stay full; /spill open <id> reopens one)"
+            }
         }
     }
 }
@@ -9177,26 +9189,36 @@ fn spill_status(
 }
 
 /// Whether the committed-collapse default can honestly engage this session:
-/// the rich surface with the completed-spill viewport buildable (feature
-/// compiled + terminal capable). Shared by `/spill status` so the status line
-/// and the turn-head seeding (`summary_recoverable` in `run_chat`, which
-/// additionally requires the renderer to have actually constructed) cannot
-/// drift apart. Review fix on #1663.
-fn summary_recovery_available(surface_is_rich: bool) -> bool {
+/// the rich surface with the completed-spill viewport buildable.
+///
+/// The old comment claimed sharing this with `/spill status` kept the status
+/// line and the turn-head seeding from drifting, and treated "the renderer
+/// additionally has to construct" as a harmless remainder. It was not
+/// harmless. Under the cockpit — the DEFAULT rich surface — `run_chat`
+/// declines to build the renderer at all, so the turn seeded collapse OFF and
+/// committed excerpts, while this said the collapse was engaged. `/spill`
+/// answered "results collapse to a summary line" and the very next tool result
+/// printed a five-row excerpt.
+///
+/// `terminal_owns_turn` is now part of the eligibility ladder, so both answers
+/// come from one walk of it and the remainder is only the genuine
+/// constructor-failed case.
+fn summary_recovery_available(surface_is_rich: bool, terminal_owns_turn: bool) -> bool {
     // `live_spill_capable` itself only exists under live-spill, so the whole
     // conjunction is cfg-split rather than short-circuited with `cfg!`.
     #[cfg(all(feature = "rich-tui", feature = "live-spill"))]
     {
-        surface_is_rich && live_spill_capable()
+        surface_is_rich && live_spill_capable(terminal_owns_turn)
     }
     #[cfg(not(all(feature = "rich-tui", feature = "live-spill")))]
     {
         let _ = surface_is_rich;
+        let _ = terminal_owns_turn;
         false
     }
 }
 
-fn live_spill_eligibility() -> SpillEligibility {
+fn live_spill_eligibility(terminal_owns_turn: bool) -> SpillEligibility {
     let term = std::env::var("TERM").ok();
     spill_eligibility_for(
         cfg!(unix),
@@ -9204,6 +9226,7 @@ fn live_spill_eligibility() -> SpillEligibility {
         std::io::stdin().is_terminal(),
         std::io::stdout().is_terminal(),
         term.as_deref(),
+        terminal_owns_turn,
     )
 }
 
@@ -9216,8 +9239,8 @@ fn live_spill_eligibility() -> SpillEligibility {
 /// Not `test`-gated: it probes the real stdin/stdout, so the unit tier drives
 /// the injected-bool [`live_spill_capable_for`] instead.
 #[cfg(feature = "live-spill")]
-fn live_spill_capable() -> bool {
-    live_spill_eligibility() == SpillEligibility::Available
+fn live_spill_capable(terminal_owns_turn: bool) -> bool {
+    live_spill_eligibility(terminal_owns_turn) == SpillEligibility::Available
 }
 
 /// Same five gates the old boolean ANDed, but reporting *which* one refused.
@@ -9234,6 +9257,7 @@ fn spill_eligibility_for(
     stdin_terminal: bool,
     stdout_terminal: bool,
     term: Option<&str>,
+    terminal_owns_turn: bool,
 ) -> SpillEligibility {
     if !platform_supported {
         SpillEligibility::UnsupportedPlatform
@@ -9245,6 +9269,8 @@ fn spill_eligibility_for(
         SpillEligibility::StdoutNotTty
     } else if term == Some("dumb") {
         SpillEligibility::TermDumb
+    } else if terminal_owns_turn {
+        SpillEligibility::TerminalOwnedByCockpit
     } else {
         SpillEligibility::Available
     }
@@ -9261,6 +9287,7 @@ fn live_spill_capable_for(
     stdin_terminal: bool,
     stdout_terminal: bool,
     term: Option<&str>,
+    terminal_owns_turn: bool,
 ) -> bool {
     spill_eligibility_for(
         platform_supported,
@@ -9268,6 +9295,7 @@ fn live_spill_capable_for(
         stdin_terminal,
         stdout_terminal,
         term,
+        terminal_owns_turn,
     ) == SpillEligibility::Available
 }
 
@@ -9322,6 +9350,13 @@ fn mouse_capable_for(
             stdin_terminal,
             stdout_terminal,
             term,
+            // NOT the cockpit gate. That refusal says "this surface draws its
+            // own frames", which is a fact about the VIEWPORT; the mouse tier
+            // is asking whether the TERMINAL can report clicks, and the
+            // cockpit does not take that away. Feeding it in here would
+            // silently disable the mouse tier on the default rich surface,
+            // which is a behaviour change and not this predicate's business.
+            false,
         )
 }
 
