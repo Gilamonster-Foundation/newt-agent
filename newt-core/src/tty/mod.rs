@@ -71,7 +71,10 @@ pub use modal::{
     PromptLine, MODAL_CONTROL_HINT, MODAL_INPUT_GLYPH,
 };
 pub use progress_sink::TerminalProgressSink;
-pub use spinner::{interrupt_pending, set_interrupt_pending, with_spinner, Spinner};
+pub use spinner::{
+    interrupt_pending, interrupt_presses, note_interrupt_press, set_interrupt_pending,
+    with_spinner, Spinner,
+};
 pub use widgets::{Action, Level, Notice, Question};
 pub use width::{ch_width, str_width, wrap_line};
 
