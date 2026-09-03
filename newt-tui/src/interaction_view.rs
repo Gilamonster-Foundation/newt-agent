@@ -147,10 +147,25 @@ mod terminal {
             .take(MAX_ROWS)
             .map(|row| line_of(row, view.selected()))
             .collect();
-        frame.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }),
+        // The shared edge, for the reason it exists: a prompt that has TAKEN
+        // THE KEYBOARD should not be shaped like ordinary output.
+        //
+        // This does not break the monochrome contract documented on
+        // `style_of`. That contract is "the surface reads correctly on a
+        // NO_COLOR terminal without a second code path", and a border
+        // satisfies it STRUCTURALLY — the box is drawn with glyphs, so it
+        // survives a terminal that discards every colour. The hue is additive,
+        // and the ROWS are untouched: every span still maps to a modifier,
+        // never to a colour.
+        let body = crate::modal::frame(
+            frame,
             frame.area(),
+            &crate::modal::Chrome {
+                title: "permission required",
+                ..crate::modal::Chrome::default()
+            },
         );
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
     }
 
     /// Present one interaction on the terminal and report what the operator
@@ -167,7 +182,10 @@ mod terminal {
     ) -> io::Result<(HumanQuestionOutcome, String)> {
         let mut view = InteractionView::new(interaction);
         let canonical = view.fallback().to_string();
-        let height = view.rows().len().clamp(1, MAX_ROWS) as u16;
+        // +2 for the shared chrome's top and bottom edge. Without it the box
+        // eats two content rows and the last option falls off the bottom —
+        // which on a permission prompt is a choice the operator cannot see.
+        let height = view.rows().len().clamp(1, MAX_ROWS) as u16 + 2;
         let _guard = InlineGuard::enter()?;
         // #1950: through the ONE inline constructor. A permission frame that
         // will not open is a decision the operator never gets to make.

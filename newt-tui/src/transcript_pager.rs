@@ -323,7 +323,6 @@ mod terminal {
     use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
     use newt_core::tty::raw_mode::RawModeGuard;
     use ratatui::backend::CrosstermBackend;
-    use ratatui::layout::{Constraint, Layout};
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
@@ -424,29 +423,23 @@ mod terminal {
         loop {
             let mut page_rows = 1usize;
             terminal.draw(|f| {
-            let [header, body, footer] = Layout::vertical([
-                Constraint::Length(1),
-                Constraint::Fill(1),
-                Constraint::Length(1),
-            ])
-            .areas(f.area());
-            page_rows = body.height.max(1) as usize;
-
             let title = if state.title.is_empty() {
-                "transcript".to_string()
+                "transcript"
             } else {
-                state.title.clone()
+                state.title.as_str()
             };
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(
-                        format!(" {title} "),
-                        Style::default().add_modifier(Modifier::BOLD),
+            let body = crate::modal::frame(
+                f,
+                f.area(),
+                &crate::modal::Chrome {
+                    title,
+                    subtitle: Some(format!("· {}", state.position())),
+                    hint: Some(
+                        "q quit · ↑↓ scroll · PgUp/PgDn page · n/p message · Enter fold · g/G top/bottom",
                     ),
-                    Span::styled(format!("· {}", state.position()), Style::default().fg(Color::Gray)),
-                ])),
-                header,
+                },
             );
+            page_rows = body.height.max(1) as usize;
 
             // #1677: re-clamp to the SAME end rail the keyboard uses. The
             // renderer's own clamp used to be `len - 1`, one rail past the
@@ -461,14 +454,6 @@ mod terminal {
                 .map(|row| Line::from(Span::styled(row.text.clone(), row_style(row.kind))))
                 .collect::<Vec<_>>();
             f.render_widget(Paragraph::new(visible), body);
-
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    " q quit · ↑↓ scroll · PgUp/PgDn page · n/p message · Enter fold · g/G top/bottom",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                footer,
-            );
         })?;
 
             let Event::Key(key) = event::read()? else {
@@ -510,16 +495,6 @@ mod terminal {
         loop {
             let mut page_rows = 1usize;
             terminal.draw(|f| {
-                let [header, body, footer] = Layout::vertical([
-                    Constraint::Length(1),
-                    Constraint::Fill(1),
-                    Constraint::Length(1),
-                ])
-                .areas(f.area());
-                page_rows = body.height.max(1) as usize;
-                let max_scroll = spill.lines().len().saturating_sub(page_rows);
-                scroll = scroll.min(max_scroll);
-
                 let retention = if spill.dropped_lines() == 0 {
                     format!("{} lines", spill.total_lines())
                 } else {
@@ -529,16 +504,18 @@ mod terminal {
                         spill.total_lines()
                     )
                 };
-                f.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(
-                            format!(" spill {} ", spill.id()),
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(format!("· {retention}"), Style::default().fg(Color::Gray)),
-                    ])),
-                    header,
+                let body = crate::modal::frame(
+                    f,
+                    f.area(),
+                    &crate::modal::Chrome {
+                        title: &format!("spill {}", spill.id()),
+                        subtitle: Some(format!("· {retention}")),
+                        hint: Some("q quit · ↑↓ scroll · PgUp/PgDn page · g/G top/bottom"),
+                    },
                 );
+                page_rows = body.height.max(1) as usize;
+                let max_scroll = spill.lines().len().saturating_sub(page_rows);
+                scroll = scroll.min(max_scroll);
 
                 let visible = spill
                     .lines()
@@ -548,18 +525,11 @@ mod terminal {
                     .map(|line| {
                         Line::from(Span::styled(
                             line.clone(),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(crate::theme::color(crate::theme::Role::Dim)),
                         ))
                     })
                     .collect::<Vec<_>>();
                 f.render_widget(Paragraph::new(visible), body);
-                f.render_widget(
-                    Paragraph::new(Span::styled(
-                        " q quit · ↑↓ scroll · PgUp/PgDn page · g/G top/bottom",
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                    footer,
-                );
             })?;
 
             let Event::Key(key) = event::read()? else {
