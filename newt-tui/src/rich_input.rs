@@ -4761,7 +4761,9 @@ mod tests {
     fn ctrl_d_during_a_turn_is_acknowledged_not_dropped() {
         let mut mounted = MountedEditor::new(Edit::Nano, Some(1), Vec::new(), "");
         let mut sink = RecordingSink::default();
-        mounted.set_turn_running(true);
+        // The field, not `set_turn_running`: that setter is unix-only (its
+        // one caller is the cockpit), and this rule holds on every platform.
+        mounted.turn_running = true;
         let outcome = mounted.on_event(Event::Key(ctrl('d')), &mut sink).unwrap();
         assert_eq!(outcome, None, "mid-turn Ctrl-D is not an EOF");
         let notes: Vec<String> = sink.batches.iter().flatten().map(line_text).collect();
@@ -4770,7 +4772,7 @@ mod tests {
             "the press is answered with where exit and interrupt live: {notes:?}"
         );
 
-        mounted.set_turn_running(false);
+        mounted.turn_running = false;
         let outcome = mounted.on_event(Event::Key(ctrl('d')), &mut sink).unwrap();
         assert_eq!(
             outcome,
