@@ -57,7 +57,7 @@ use std::io;
 
 use crate::panel::Key;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -863,9 +863,21 @@ pub(crate) fn render_panel(
     val_w: usize,
 ) {
     let area = f.area();
+    let theme = crate::theme::active();
+    // The frame wears the colour that means "the keyboard is here", because
+    // that is exactly what a modal has taken. Before this the border carried no
+    // style at all, so it drew in whatever the terminal last set — a dialog
+    // that owns your input rendered as ordinary output. The title is the same
+    // argument one level in.
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(title.to_string());
+        .border_style(Style::default().fg(theme.color(crate::theme::Role::ModalBorder)))
+        .title(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(theme.color(crate::theme::Role::ModalTitle))
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -905,22 +917,22 @@ pub(crate) fn render_panel(
     );
 }
 
-/// The green `:…▏` ex-command bottom line — shared panel chrome (#1667).
+/// The `:…▏` ex-command bottom line — shared panel chrome (#1667).
 pub(crate) fn command_line(buf: &str) -> Line<'static> {
     Line::from(Span::styled(
         format!(":{buf}▏"),
         Style::default()
-            .fg(Color::Green)
+            .fg(crate::theme::active().color(crate::theme::Role::Ok))
             .add_modifier(Modifier::BOLD),
     ))
 }
 
-/// The magenta status bottom line — shared panel chrome (#1667).
+/// The status bottom line — shared panel chrome (#1667).
 pub(crate) fn status_line(status: &str) -> Line<'static> {
     Line::from(Span::styled(
         status.to_string(),
         Style::default()
-            .fg(Color::Magenta)
+            .fg(crate::theme::active().color(crate::theme::Role::Identity))
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -933,16 +945,23 @@ pub(crate) fn hint_line(hint: &'static str) -> Line<'static> {
     ))
 }
 
-/// Row styling shared across panels (#1667): selected = bold cyan/yellow,
+/// Row styling shared across panels (#1667): selected = bold label/value,
 /// read-only = dim.
+///
+/// The four colours this file hardcoded — Cyan, Yellow, Green, Magenta — are
+/// where `SelectedLabel`, `SelectedValue`, `Ok` and `Identity` came from: the
+/// colour census that minted those roles read this panel and then never wired
+/// them back, so they sat in `theme.rs` with zero consumers while the literals
+/// they were named after stayed put. Same bytes, now themeable.
 pub(crate) fn row_styles(selected: bool, editable: bool) -> (Style, Style) {
     if selected {
+        let theme = crate::theme::active();
         (
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.color(crate::theme::Role::SelectedLabel))
                 .add_modifier(Modifier::BOLD),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.color(crate::theme::Role::SelectedValue))
                 .add_modifier(Modifier::BOLD),
         )
     } else if editable {
@@ -1066,6 +1085,95 @@ mod tests {
     use newt_core::cognition::set_cli_cognition;
     use newt_core::tenacity::{clear_cli_tenacity, set_cli_tenacity};
     use newt_core::test_guard::GlobalSettingsGuard;
+
+    /// The panel is newt's only bordered box, and it shipped with no
+    /// `border_style` — so the frame around a dialog that had TAKEN THE
+    /// KEYBOARD drew in whatever the terminal last set, i.e. exactly like
+    /// ordinary output. This pins that the frame, the title, and the selected
+    /// row all read their colour from the theme rather than a literal.
+    ///
+    /// It also guards the failure that motivated the change: `SelectedLabel`,
+    /// `SelectedValue`, `Ok` and `Identity` were minted from this file's
+    /// hardcoded Cyan/Yellow/Green/Magenta and then never wired back, so they
+    /// sat in `theme.rs` with zero consumers. A role with no consumer is a
+    /// theme that silently does nothing.
+    #[test]
+    fn panel_chrome_reads_its_colours_from_the_theme() {
+        use crate::theme::{active, Role};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let theme = active();
+        let rows = vec![
+            RowView {
+                label: "persona",
+                value: "sol".to_string(),
+                provenance: String::new(),
+                selected: true,
+                editable: true,
+            },
+            RowView {
+                label: "backend",
+                value: "dgx".to_string(),
+                provenance: String::new(),
+                selected: false,
+                editable: false,
+            },
+        ];
+
+        let mut term = Terminal::new(TestBackend::new(48, 6)).unwrap();
+        term.draw(|f| render_panel(f, " settings ", &rows, hint_line("q quit"), 10, 12))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+
+        // The frame. Top-left corner is border, and it is NOT the terminal
+        // default — which is the whole bug.
+        let corner = buf.cell((0, 0)).unwrap();
+        assert_eq!(corner.symbol(), "┌", "the box still draws");
+        assert_eq!(
+            corner.fg,
+            theme.color(Role::ModalBorder),
+            "the border is themed, not left at the terminal default"
+        );
+        assert_ne!(
+            corner.fg,
+            ratatui::style::Color::Reset,
+            "an unstyled border is the defect this test exists for"
+        );
+
+        // The title, somewhere along the top edge.
+        let titled = (1..47)
+            .map(|x| buf.cell((x, 0)).unwrap())
+            .find(|c| c.symbol() == "s")
+            .expect("the title renders on the top edge");
+        assert_eq!(titled.fg, theme.color(Role::ModalTitle));
+
+        // The selected row's label and value take the two roles this file's
+        // literals originally named.
+        let row: Vec<_> = (0..48).map(|x| buf.cell((x, 1)).unwrap()).collect();
+        let label = row
+            .iter()
+            .find(|c| c.symbol() == "p")
+            .expect("the selected label renders");
+        assert_eq!(label.fg, theme.color(Role::SelectedLabel));
+        let value = row
+            .iter()
+            .find(|c| c.symbol() == "‹")
+            .expect("the selected row carries dial chrome");
+        assert_eq!(value.fg, theme.color(Role::SelectedValue));
+    }
+
+    /// The two shared bottom lines take the other two once-orphaned roles.
+    #[test]
+    fn bottom_lines_read_their_colours_from_the_theme() {
+        use crate::theme::{active, Role};
+
+        let theme = active();
+        let ex = command_line("w");
+        assert_eq!(ex.spans[0].style.fg, Some(theme.color(Role::Ok)));
+        let status = status_line("saved");
+        assert_eq!(status.spans[0].style.fg, Some(theme.color(Role::Identity)));
+    }
 
     fn choice(
         name: &str,

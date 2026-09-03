@@ -88,6 +88,17 @@ pub(crate) enum Role {
     Ok,
     /// A persona, a name, an identity.
     Identity,
+
+    /// The frame around a dialog that owns the keyboard.
+    ///
+    /// Its own role, and accent-coloured by default, because a modal IS the
+    /// keyboard being somewhere: the same claim [`Self::Accent`] makes for the
+    /// input line. The panel border shipped with no `border_style` at all, so
+    /// it drew in whatever the terminal last set — which is how a dialog that
+    /// has taken the keyboard ends up looking like ordinary output.
+    ModalBorder,
+    /// The dialog's name, in its frame.
+    ModalTitle,
 }
 
 /// A complete assignment of colours to roles.
@@ -117,6 +128,8 @@ pub(crate) struct Theme {
     selected_value: Color,
     ok: Color,
     identity: Color,
+    modal_border: Color,
+    modal_title: Color,
 }
 
 impl Theme {
@@ -152,6 +165,9 @@ impl Theme {
             selected_value: Color::Yellow,
             ok: Color::Green,
             identity: Color::Magenta,
+            // A modal owns the keyboard, so it wears the colour that means so.
+            modal_border: Color::Rgb(255, 165, 90),
+            modal_title: Color::LightYellow,
         }
     }
 
@@ -176,13 +192,15 @@ impl Theme {
             Role::SelectedValue => self.selected_value,
             Role::Ok => self.ok,
             Role::Identity => self.identity,
+            Role::ModalBorder => self.modal_border,
+            Role::ModalTitle => self.modal_title,
         }
     }
 
     /// Overlay a partial assignment read from a theme file.
     ///
     /// Partial ON PURPOSE, and it is the whole ergonomic argument: an operator
-    /// who wants a brighter accent writes one line, not a file of nineteen
+    /// who wants a brighter accent writes one line, not a file of all nineteen
     /// colours they must keep in step with ours. Everything unstated keeps the
     /// built-in value, so a theme file cannot go stale by omission when a role
     /// is added — the same droppable-override shape the language packs use.
@@ -207,6 +225,8 @@ impl Theme {
                 Role::SelectedValue => self.selected_value = *color,
                 Role::Ok => self.ok = *color,
                 Role::Identity => self.identity = *color,
+                Role::ModalBorder => self.modal_border = *color,
+                Role::ModalTitle => self.modal_title = *color,
             }
         }
         self
@@ -236,6 +256,8 @@ pub(crate) fn role_from_name(name: &str) -> Option<Role> {
         "selected-value" => Role::SelectedValue,
         "ok" => Role::Ok,
         "identity" => Role::Identity,
+        "modal-border" => Role::ModalBorder,
+        "modal-title" => Role::ModalTitle,
         _ => return None,
     })
 }
@@ -259,6 +281,8 @@ pub(crate) const ALL_ROLES: &[Role] = &[
     Role::SelectedValue,
     Role::Ok,
     Role::Identity,
+    Role::ModalBorder,
+    Role::ModalTitle,
 ];
 
 /// The name a role answers to in a theme file.
@@ -281,6 +305,8 @@ pub(crate) fn role_name(role: Role) -> &'static str {
         Role::SelectedValue => "selected-value",
         Role::Ok => "ok",
         Role::Identity => "identity",
+        Role::ModalBorder => "modal-border",
+        Role::ModalTitle => "modal-title",
     }
 }
 
@@ -466,11 +492,11 @@ mod tests {
             );
             assert_eq!(name, name.to_ascii_lowercase(), "names are kebab-case");
         }
-        assert_eq!(ALL_ROLES.len(), 17, "add the new role to ALL_ROLES too");
+        assert_eq!(ALL_ROLES.len(), 19, "add the new role to ALL_ROLES too");
         assert_eq!(role_from_name("nonsense"), None);
     }
 
-    /// An override is PARTIAL: state one role, keep eighteen.
+    /// An override is PARTIAL: state one role, keep the rest.
     #[test]
     fn an_override_touches_only_what_it_names() {
         let base = Theme::builtin();
