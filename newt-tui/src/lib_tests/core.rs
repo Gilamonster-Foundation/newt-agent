@@ -980,35 +980,63 @@ fn spill_status_names_the_gate_that_refused() {
 fn spill_eligibility_reports_the_most_fundamental_refusal_first() {
     // Every gate failing at once: platform outranks all.
     assert_eq!(
-        spill_eligibility_for(false, false, false, false, Some("dumb")),
+        spill_eligibility_for(false, false, false, false, Some("dumb"), false),
         SpillEligibility::UnsupportedPlatform
     );
     // Supported platform, everything else failing: the cargo feature is next.
     assert_eq!(
-        spill_eligibility_for(true, false, false, false, Some("dumb")),
+        spill_eligibility_for(true, false, false, false, Some("dumb"), false),
         SpillEligibility::FeatureDisabled
     );
     // Then the invocation-shaped gates, stdin before stdout.
     assert_eq!(
-        spill_eligibility_for(true, true, false, false, Some("dumb")),
+        spill_eligibility_for(true, true, false, false, Some("dumb"), false),
         SpillEligibility::StdinNotTty
     );
     assert_eq!(
-        spill_eligibility_for(true, true, true, false, Some("dumb")),
+        spill_eligibility_for(true, true, true, false, Some("dumb"), false),
         SpillEligibility::StdoutNotTty
     );
     // Only the terminal's own declaration remains.
     assert_eq!(
-        spill_eligibility_for(true, true, true, true, Some("dumb")),
+        spill_eligibility_for(true, true, true, true, Some("dumb"), false),
         SpillEligibility::TermDumb
     );
     assert_eq!(
-        spill_eligibility_for(true, true, true, true, Some("xterm-256color")),
+        spill_eligibility_for(true, true, true, true, Some("xterm-256color"), false),
         SpillEligibility::Available
+    );
+    // The cockpit is LAST on purpose. It is the one refusal where nothing is
+    // wrong — platform, build and terminal are all fine, and the operator is
+    // simply on the surface that paints its own frames — so every fixable
+    // cause outranks it and nobody is sent to fix `TERM` for it.
+    assert_eq!(
+        spill_eligibility_for(true, true, true, true, Some("xterm-256color"), true),
+        SpillEligibility::TerminalOwnedByCockpit
+    );
+    assert_eq!(
+        spill_eligibility_for(true, true, true, true, Some("dumb"), true),
+        SpillEligibility::TermDumb,
+        "a dumb terminal is the more fundamental refusal and still outranks it"
+    );
+    assert_eq!(
+        spill_eligibility_for(false, true, true, true, Some("xterm-256color"), true),
+        SpillEligibility::UnsupportedPlatform,
+        "and so does a platform the viewport could never run on"
+    );
+
+    // The refusal must name the surface AND the way out. This is the line that
+    // read "live interaction available" while the cockpit drew every frame.
+    let cockpit = SpillEligibility::TerminalOwnedByCockpit.explain();
+    assert!(cockpit.contains("cockpit"), "{cockpit}");
+    assert!(
+        cockpit.contains("/spill open"),
+        "an unavailability the operator cannot act on is barely better than a \
+         bare `unavailable`: {cockpit}"
     );
     // A terminal that declares nothing is not "dumb".
     assert_eq!(
-        spill_eligibility_for(true, true, true, true, None),
+        spill_eligibility_for(true, true, true, true, None, false),
         SpillEligibility::Available
     );
 }
@@ -1022,13 +1050,24 @@ fn capable_bool_agrees_with_typed_eligibility() {
             for stdin in [true, false] {
                 for stdout in [true, false] {
                     for term in [Some("xterm"), Some("dumb"), None] {
-                        assert_eq!(
-                            live_spill_capable_for(platform, feature, stdin, stdout, term),
-                            spill_eligibility_for(platform, feature, stdin, stdout, term)
-                                == SpillEligibility::Available,
-                            "disagreement at platform={platform} feature={feature} \
-                             stdin={stdin} stdout={stdout} term={term:?}"
-                        );
+                        // The cockpit gate is a new AXIS of this table, not a
+                        // fixed `false` bolted onto it: the property is that
+                        // the boolean facade and the ladder never disagree,
+                        // and a gate exempted from the sweep is a gate that
+                        // can drift.
+                        for cockpit in [true, false] {
+                            assert_eq!(
+                                live_spill_capable_for(
+                                    platform, feature, stdin, stdout, term, cockpit
+                                ),
+                                spill_eligibility_for(
+                                    platform, feature, stdin, stdout, term, cockpit
+                                ) == SpillEligibility::Available,
+                                "disagreement at platform={platform} feature={feature} \
+                                 stdin={stdin} stdout={stdout} term={term:?} \
+                                 cockpit={cockpit}"
+                            );
+                        }
                     }
                 }
             }
@@ -1043,42 +1082,48 @@ fn live_spill_requires_a_supported_interactive_terminal() {
         true,
         true,
         true,
-        Some("xterm-256color")
+        Some("xterm-256color"),
+        false
     ));
     assert!(!live_spill_capable_for(
         false,
         true,
         true,
         true,
-        Some("xterm")
+        Some("xterm"),
+        false
     ));
     assert!(!live_spill_capable_for(
         true,
         false,
         true,
         true,
-        Some("xterm")
+        Some("xterm"),
+        false
     ));
     assert!(!live_spill_capable_for(
         true,
         true,
         false,
         true,
-        Some("xterm")
+        Some("xterm"),
+        false
     ));
     assert!(!live_spill_capable_for(
         true,
         true,
         true,
         false,
-        Some("xterm")
+        Some("xterm"),
+        false
     ));
     assert!(!live_spill_capable_for(
         true,
         true,
         true,
         true,
-        Some("dumb")
+        Some("dumb"),
+        false
     ));
 }
 

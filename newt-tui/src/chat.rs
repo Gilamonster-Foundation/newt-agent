@@ -3814,11 +3814,14 @@ fn session_body(
                                 configured,
                                 spill_lines_override,
                                 crate::effective_spill_summary(
-                                    crate::summary_recovery_available(surface_is_rich),
+                                    crate::summary_recovery_available(
+                                        surface_is_rich,
+                                        terminal_owns_turn,
+                                    ),
                                     spill_summary_override,
                                 ),
                                 surface_is_rich,
-                                live_spill_eligibility(),
+                                live_spill_eligibility(terminal_owns_turn),
                             ),
                             color,
                             verbose,
@@ -3897,11 +3900,14 @@ fn session_body(
                                 configured,
                                 spill_lines_override,
                                 crate::effective_spill_summary(
-                                    crate::summary_recovery_available(surface_is_rich),
+                                    crate::summary_recovery_available(
+                                        surface_is_rich,
+                                        terminal_owns_turn,
+                                    ),
                                     spill_summary_override,
                                 ),
                                 surface_is_rich,
-                                live_spill_eligibility(),
+                                live_spill_eligibility(terminal_owns_turn),
                             ),
                             color,
                             verbose,
@@ -7305,20 +7311,20 @@ fn session_body(
                     // it paints with cursor motion the presenter drops by design
                     // (v1). The tool spinner (#1727) covers liveness meanwhile.
                     #[cfg(feature = "live-spill")]
-                    let live_spill =
-                        (configured_spill_lines > 0 && live_spill_capable() && !terminal_owns_turn)
-                            .then_some(())
-                            .and_then(|()| {
-                                // #1410: `stdout` now returns the `Arc` itself —
-                                // registration with the line arbiter needs
-                                // `Arc<dyn Ephemeral>`, so the constructor owns the
-                                // wrapping rather than leaving it to each caller.
-                                crate::live_spill::LiveSpillRenderer::stdout(
-                                    configured_spill_lines,
-                                    color,
-                                    completed_spills.clone(),
-                                )
-                            });
+                    let live_spill = (configured_spill_lines > 0
+                        && live_spill_capable(terminal_owns_turn))
+                    .then_some(())
+                    .and_then(|()| {
+                        // #1410: `stdout` now returns the `Arc` itself —
+                        // registration with the line arbiter needs
+                        // `Arc<dyn Ephemeral>`, so the constructor owns the
+                        // wrapping rather than leaving it to each caller.
+                        crate::live_spill::LiveSpillRenderer::stdout(
+                            configured_spill_lines,
+                            color,
+                            completed_spills.clone(),
+                        )
+                    });
                     // #1640 Layer 1 + review fix (#1663): publish the
                     // committed-result mode AFTER the live renderer exists,
                     // because the collapse's whole justification is "the
