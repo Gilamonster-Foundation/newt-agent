@@ -186,18 +186,33 @@ pub(crate) fn dispatch(
         },
 
         // #1981: ABSORBED into `/settings thinking`.
-        "thinking" => match arg1 {
-            "on" | "off" => print_newt(
-                &apply_setting(Field::Thinking, arg1, "/thinking"),
-                color,
-                verbose,
+        //
+        // The legal values are NOT listed here. They were — a literal
+        // `"on" | "off"` arm — and that was a second copy of a vocabulary
+        // `Field::Thinking` already owns. When the field grew `fold` and
+        // `stream`, this arm did not, so `/thinking fold` answered
+        // "usage: ... <on|off>" for a value the form accepts. The panel and
+        // the slash command disagreed about what the setting IS.
+        //
+        // `apply_and_record` already validates through `Field::accepts` and
+        // already renders the refusal from `accepts_hint()`, so delegating
+        // makes the two impossible to desync: there is one list, and adding to
+        // it reaches every door at once. Only the no-argument case is handled
+        // here, because "you gave me nothing" is a different answer from "that
+        // is not one of the values".
+        "thinking" if arg1.is_empty() => print_newt(
+            &format!(
+                "usage: /settings thinking <{}>  (or /thinking <…>)",
+                Field::Thinking.accepts_hint()
             ),
-            _ => print_newt(
-                "usage: /settings thinking <on|off>  (or /thinking <on|off>)",
-                color,
-                verbose,
-            ),
-        },
+            color,
+            verbose,
+        ),
+        "thinking" => print_newt(
+            &apply_setting(Field::Thinking, arg1, "/thinking"),
+            color,
+            verbose,
+        ),
 
         // #1665: retired top-levels. Redirect WITHOUT mutating — a habitual
         // `/tenacity relentless` must not half-work through a deprecation shim,
@@ -498,6 +513,55 @@ fn psyche_command(rest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{cognition_command, tenacity_command};
+    use crate::settings_form::{Field, ValueSpace};
+
+    /// **Every value the field declares must be reachable through the slash
+    /// command.** Not "fold and stream are accepted" — that would be a third
+    /// copy of the list, and a fourth value would desync it again.
+    ///
+    /// This is the defect the test exists for, observed live: the dispatcher
+    /// matched a literal `"on" | "off"` while `Field::Thinking` had grown to
+    /// `fold | stream | off`. `/thinking fold` answered
+    /// `usage: /settings thinking <on|off>` for a value the settings panel
+    /// accepted, so the two doors onto one setting disagreed about what the
+    /// setting was. The arm now delegates to `Field::accepts`, and this walks
+    /// the declared vocabulary so a future value cannot ship half-wired.
+    #[test]
+    fn every_declared_thinking_value_is_reachable_through_the_slash_command() {
+        let ValueSpace::Choice(values) = Field::Thinking.value_space() else {
+            panic!("thinking is a fixed vocabulary, not a number");
+        };
+        assert!(
+            values.len() >= 3,
+            "the three-way vocabulary is the point: {values:?}"
+        );
+        for (value, _) in &values {
+            assert_eq!(
+                Field::Thinking.accepts(value).as_deref(),
+                Some(*value),
+                "`/thinking {value}` must reach the field it is declared on"
+            );
+        }
+        // The alias predates the three-way vocabulary and still means "show me
+        // the reasoning", which is now the default rather than a third thing.
+        assert_eq!(Field::Thinking.accepts("on").as_deref(), Some("fold"));
+        // …and nonsense is still refused, so delegating did not open the door.
+        assert_eq!(Field::Thinking.accepts("maybe"), None);
+    }
+
+    /// The no-argument usage line names the REAL vocabulary rather than a
+    /// frozen literal, so it cannot go stale the way the match arm did.
+    #[test]
+    fn thinking_usage_is_derived_from_the_declared_values() {
+        let hint = Field::Thinking.accepts_hint();
+        for want in ["fold", "stream", "off"] {
+            assert!(hint.contains(want), "usage omits `{want}`: {hint}");
+        }
+        assert!(
+            !hint.contains("on|off"),
+            "the stale two-value literal is back: {hint}"
+        );
+    }
 
     #[test]
     fn cognition_status_list_set_off_auto_and_error_are_informative() {
