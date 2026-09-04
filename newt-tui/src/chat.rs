@@ -3048,6 +3048,33 @@ fn session_body(
                         println!();
                         continue;
                     }
+                    // #2009 PR3: `/status <topic>` is the canonical name for
+                    // eight reads that used to be eight top-level verbs.
+                    // Rewriting the line HERE — before any arm sees it, and
+                    // after the `--help` intercept above so `/status models
+                    // --help` still reaches the help for `/models` — means the
+                    // topic and the retired verb run the same code, because
+                    // they ARE the same line by the time anything matches on
+                    // it. A second renderer per topic is the sprawl this cut
+                    // exists to remove.
+                    let task = match crate::status_topics::route(&task) {
+                        crate::status_topics::Route::Topic(rewritten) => {
+                            std::borrow::Cow::Owned(rewritten)
+                        }
+                        crate::status_topics::Route::Unknown(topic) => {
+                            print_newt(
+                                &crate::status_topics::unknown_topic_message(&topic),
+                                color,
+                                verbose,
+                            );
+                            println!();
+                            continue;
+                        }
+                        crate::status_topics::Route::Passthrough => {
+                            std::borrow::Cow::Borrowed(task.as_str())
+                        }
+                    };
+                    let task = task.as_ref();
                     // `/cd [dir]` — move the session working dir (shown in the
                     // prompt), confined below the start dir; bare `/cd` returns to
                     // the root. Handled here, not in `dispatch_slash`, because it
@@ -3055,7 +3082,7 @@ fn session_body(
                     // #1096 retired the bare `cd`/`pwd`/`ls`/`rm`/… verbs, so bare
                     // text is now a message to the model (like Claude Code) and
                     // `!` runs the shell explicitly (`!pwd`, `!ls`, `!rm x`).
-                    if let Some(arg) = cd_command(&task) {
+                    if let Some(arg) = cd_command(task) {
                         run_cd(arg, &mut session_cwd, workspace, color, verbose);
                         println!();
                         continue;
@@ -3629,7 +3656,7 @@ fn session_body(
                         // pipeline the loop's triggers call, run because the
                         // user asked — through the session compress_state and
                         // the same summarizer wiring the loop uses.
-                        let focus = parse_compress_command(&task).unwrap_or(None);
+                        let focus = parse_compress_command(task).unwrap_or(None);
                         let wire = session_wire_view(&memory, &system);
                         // Same capability-derived cap the Summarizing provider
                         // injects — the summary request must not be silently
@@ -3832,7 +3859,7 @@ fn session_body(
                     }
                     if slash_md == "spill" || slash_md.starts_with("spill ") {
                         let configured = spill_lines(&cfg);
-                        match parse_spill_command(&task) {
+                        match parse_spill_command(task) {
                             Ok(command @ (SpillCommand::Last | SpillCommand::Open(_))) => {
                                 #[cfg(all(feature = "rich-tui", feature = "live-spill"))]
                                 let opened = if !surface_is_rich {
@@ -3960,7 +3987,7 @@ fn session_body(
                     }
 
                     // #1387 Phases 2–4: structural nav + retrieval debug + impact.
-                    if let Some(parsed) = crate::navigator_cmds::parse_nav_command(&task) {
+                    if let Some(parsed) = crate::navigator_cmds::parse_nav_command(task) {
                         match parsed {
                             Ok(cmd) => {
                                 finish_nav_warmup(
@@ -4008,7 +4035,7 @@ fn session_body(
                     // #1387 Phase 1: Code Navigator `/search` cockpit — same
                     // structured retrieve path as auto-inject + code_search.
                     if slash_md == "search" || slash_md.starts_with("search ") {
-                        match parse_search_command(&task) {
+                        match parse_search_command(task) {
                             Ok(SearchCommand::Help) => {
                                 for line in search_help_text().lines() {
                                     print_newt(line, color, verbose);
@@ -4284,7 +4311,7 @@ fn session_body(
                         println!();
                         continue;
                     }
-                    if let Some((verb, _)) = tool_round_limit_command(&task) {
+                    if let Some((verb, _)) = tool_round_limit_command(task) {
                         let configured = cfg
                             .find_model_tuning(&inf_model)
                             .and_then(|t| t.max_tool_rounds)
@@ -4295,7 +4322,7 @@ fn session_body(
                         // say "over a configured 40" rather than just "320".
                         newt_core::tenacity::set_configured_tool_rounds(Some(configured));
                         let explicit_tenacity = newt_core::tenacity::cli_tenacity();
-                        match parse_tool_round_limit_command(&task) {
+                        match parse_tool_round_limit_command(task) {
                             Ok(command) => {
                                 let next = apply_tool_round_limit_command(
                                     configured,
@@ -4802,7 +4829,7 @@ fn session_body(
                         // conversation, so it goes through the SAME adoption seam
                         // `/resume` uses. Without this it could point a second tab
                         // at a conversation another tab already holds.
-                        let restore_target = conversation_command_target(&task);
+                        let restore_target = conversation_command_target(task);
                         let adopted_elsewhere = match (&restore_target, conversation_store.as_ref())
                         {
                             (Some(target), Some(store)) => {
@@ -4879,7 +4906,7 @@ fn session_body(
                                     active_prompt_context: &mut active_prompt_context,
                                     mode_states: &conversation_mode_states,
                                 };
-                                match handle_conversation_command(&task, &mut conversation_ctx) {
+                                match handle_conversation_command(task, &mut conversation_ctx) {
                                     Ok(msg) => print_newt(&msg, color, verbose),
                                     Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                                 }
@@ -4949,7 +4976,7 @@ fn session_body(
                     }
                     if slash_body == "recall" || slash_body.starts_with("recall ") {
                         match conversation_store.as_ref() {
-                            Some(store) => match handle_recall_command(&task, store) {
+                            Some(store) => match handle_recall_command(task, store) {
                                 Ok(msg) => print_newt(&msg, color, verbose),
                                 Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                             },
@@ -4967,7 +4994,7 @@ fn session_body(
                     if slash_body == "resume" || slash_body.starts_with("resume ") {
                         match conversation_store.as_ref() {
                             Some(store) => {
-                                let target: Option<String> = match parse_resume_command(&task) {
+                                let target: Option<String> = match parse_resume_command(task) {
                                     ResumeCommand::Browse => {
                                         match resume_browse_message(store, &active_conversation_id)
                                         {
@@ -5276,7 +5303,7 @@ fn session_body(
                         } else if let Some(rest) = slash_body.strip_prefix("plan ") {
                             format!("/roadmap {rest}")
                         } else {
-                            task.clone()
+                            task.to_string()
                         };
                         match conversation_store.as_ref() {
                             Some(store) => {
@@ -5487,7 +5514,7 @@ fn session_body(
                             mode_states: &conversation_mode_states,
                         };
                         match handle_persona_command(
-                            &task,
+                            task,
                             workspace,
                             &persona_store,
                             &mut active_persona,
@@ -6240,7 +6267,7 @@ fn session_body(
                     // thread's terminal instead is what left two live prompts
                     // painted over each other.
                     let cont = dispatch_slash_with_ask(
-                        &task,
+                        task,
                         workspace,
                         color,
                         verbose,

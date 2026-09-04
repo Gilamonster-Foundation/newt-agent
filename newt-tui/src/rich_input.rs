@@ -3649,13 +3649,18 @@ mod tests {
         };
         // Directly under the header: the highlighted first prefix match, with
         // its corpus description beside it.
+        //
+        // #2009 PR3 retired `/models` into `/status models`, so the corpus —
+        // and therefore the palette, which is derived from it and never
+        // hand-edited — no longer offers it. `/model` now matches itself,
+        // which is the palette correctly teaching the surface that exists.
         assert!(
-            row(1).starts_with("❯ /models"),
+            row(1).starts_with("❯ /model "),
             "highlight on the first match: {:?}",
             row(1)
         );
         assert!(
-            row(1).contains("list models"),
+            row(1).contains("switch model"),
             "description rides beside the command: {:?}",
             row(1)
         );

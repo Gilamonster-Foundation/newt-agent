@@ -74,6 +74,7 @@ mod settings_form_pty_test;
 mod slash_registry;
 #[cfg(feature = "live-spill")]
 mod spill_view;
+mod status_topics;
 /// #1669 PR-A — the staged tab switch and the one tab-action handler, against
 /// live session state. Separate from the pure model so the staging discipline
 /// (Stage-0 read, deactivate, hydrate, reset⊕overlay, owner handoff) reads in
@@ -12721,17 +12722,13 @@ fn help_request(task: &str) -> Option<String> {
 
 pub(crate) fn help_lines() -> &'static [&'static str] {
     &[
-        "  /models                  - list models on the active endpoint",
-        "  /models capabilities     - tool-conformance matrix (cached)",
         "  /model <name>            - switch model on the active backend (sticks across runs)",
         "  /backends [name]         - backend panel on a rich TTY (choose · edit · add · remove); text: list, or switch by name",
         "  /backend                 - alias of /backends",
-        "  /thinking                - folded into /settings thinking",
         "  /settings [field value]  - the settings form: edit-mode + effort dials + rounds; every applied change writes a receipt (#1981)",
         "  /probe [model|all]       - classify tool use, context window, thinking, calibration (all = re-probe every model; Esc cancels)",
         "  /probe window [model]    - empirical input-boundary search (records max input at High confidence)",
         "  /probe reset             - wipe all learned probe values (conformance, windows, calibration)",
-        "  /memory                  - show context window / notes usage",
         "  /compress [focus]        - compress context now, optionally focused on a topic (alias: /compact)",
         "  /summarizer              - show or change the summarizer backend and knobs",
         "  /rounds [n|double|reset|config|unlimited] - set this session's tool-call round limit",
@@ -12779,23 +12776,17 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /mode [name]             - show/set operating style: chat, dev, admin, plan, diagnose, auto, full-auto",
         "  /posture [name]          - show/set configured posture; permission floor is optional",
         "  /permissions             - prompted decisions + active permission posture",
-        "  /loadout                 - show the active loadout: declared axes vs what resolved",
-        "  /status                  - show session and environment summary",
-        "  /info                    - show detailed session info (backend, permissions, version)",
-        "  /workspace               - show current workspace path",
-        "  /byline                  - the Co-authored-by block the next commit would carry",
-        "  /docs                    - quick pointers to newt docs and issue tracker",
+        "  /status                  - session and environment summary (the default view)",
+        "  /status <topic>          - config · version · workspace · loadout · byline · memory · models · info",
         "  /dock [status|disable|enable] - remote-HTMX docking kill-switch (req 7): disable forcibly undocks THIS box from every hub; status lists approved peers",
         "  /allow                   - alias for /permissions",
         "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
         "  /psyche                  - effort dial panel: cognition, tenacity, persona (Esc exits; /psyche obsessive = max)",
         "  /mcp [on|off|enable|disable|auth] [name] - MCP servers: session mute (on/off) or durable config (enable/disable)",
         "  /spill [status|N|reset|summary|excerpt|last|open ID] - tool output",
-        "  /config show             - dump the resolved config (secrets redacted) for audit (bare /config: settings UI, not yet implemented)",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
         "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",
         "  /vi  /emacs  /nano       - switch line-editor key bindings for this session",
-        "  /version                 - print newt version",
         "  ! <command>              - run a host command interactively (e.g. ! pa login) — you, not the agent",
         "  /cd [dir]                - change the session working dir (shown in prompt), confined below the start dir; bare /cd returns to the root — use ! for pwd/ls/rm/…",
         "  Esc                      - while the agent is working: interrupt the turn, back to your prompt",

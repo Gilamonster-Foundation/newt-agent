@@ -74,13 +74,25 @@ pub(crate) enum Surface {
     /// It PERFORMS rather than setting, so it has no from→to, but it is still
     /// a mutator and still owes a receipt destination.
     SectionAction,
-    /// A permanent pointer to where the thing went.
+    /// A permanent pointer to where the thing went — **carrying the
+    /// destination**, so the pointer is data rather than prose someone has to
+    /// keep in sync (§6 F6).
     ///
     /// **Never deleted.** §5: "No high-frequency verb ever answers 'unknown
     /// command' — retired rows are permanent pointers." A row here still
     /// occupies the register and still resolves; it just no longer occupies
     /// the surface.
-    Retired,
+    ///
+    /// # A retired MUTATOR must not mutate; a retired READ may still read
+    ///
+    /// `/thinking` redirects and changes nothing, because a half-working
+    /// mutator shim never gets to die. The nine reads folded into `/status`
+    /// go on printing through the deprecation window, because printing twice
+    /// harms nobody and §3.3 is explicit that reads must keep working on a
+    /// pipe — `newt solve`, the eval harness and wyvern read `/version` and
+    /// `/workspace` off one today. What retires now is the claim on the
+    /// top-level surface and the help line, not the output.
+    Retired(&'static str),
 }
 
 /// Where this command's state change is durably recorded.
@@ -173,12 +185,13 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Absorb,
         Receipt::Journal,
     ),
-    cmd(
+    cmd_on(
         "memory",
         &[],
         Family::Memory,
         Disposition::Keep,
-        Receipt::Missing,
+        Receipt::None_,
+        Surface::Retired("/status memory"),
     ),
     cmd(
         "recall",
@@ -201,12 +214,13 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Keep,
         Receipt::None_,
     ),
-    cmd(
+    cmd_on(
         "byline",
         &[],
         Family::Meta,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/status byline"),
     ),
     // #1981: the typed settings form the knob verbs are absorbed into. A
     // Keep: it PERFORMS (it asks and it writes), it does not merely hold a
@@ -219,14 +233,22 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Keep,
         Receipt::Journal,
     ),
-    cmd(
+    cmd_on(
         "config",
         &[],
         Family::Meta,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/status config"),
     ),
-    cmd("docs", &[], Family::Meta, Disposition::Keep, Receipt::None_),
+    cmd_on(
+        "docs",
+        &[],
+        Family::Meta,
+        Disposition::Keep,
+        Receipt::None_,
+        Surface::Retired("/help docs"),
+    ),
     cmd(
         "exit",
         &["quit"],
@@ -235,7 +257,14 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::None_,
     ),
     cmd("help", &[], Family::Meta, Disposition::Keep, Receipt::None_),
-    cmd("info", &[], Family::Meta, Disposition::Keep, Receipt::None_),
+    cmd_on(
+        "info",
+        &[],
+        Family::Meta,
+        Disposition::Keep,
+        Receipt::None_,
+        Surface::Retired("/status"),
+    ),
     cmd(
         "setup",
         &[],
@@ -250,19 +279,21 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Keep,
         Receipt::None_,
     ),
-    cmd(
+    cmd_on(
         "version",
         &[],
         Family::Meta,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/status version"),
     ),
-    cmd(
+    cmd_on(
         "workspace",
         &[],
         Family::Meta,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/status workspace"),
     ),
     cmd(
         "backends",
@@ -279,12 +310,13 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Absorb,
         Receipt::Missing,
     ),
-    cmd(
+    cmd_on(
         "models",
         &[],
         Family::Model,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/status models"),
     ),
     cmd(
         "probe",
@@ -594,7 +626,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Family::Tuning,
         Disposition::Absorb,
         Receipt::Journal,
-        Surface::Retired,
+        Surface::Retired("/settings cognition"),
     ),
     cmd(
         "psyche",
@@ -610,12 +642,13 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Absorb,
         Receipt::Missing,
     ),
-    cmd(
+    cmd_on(
         "loadout",
         &[],
         Family::Tuning,
-        Disposition::Absorb,
-        Receipt::Missing,
+        Disposition::Keep,
+        Receipt::None_,
+        Surface::Retired("/status loadout"),
     ),
     cmd(
         "markdown",
@@ -686,7 +719,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Family::Tuning,
         Disposition::Absorb,
         Receipt::Journal,
-        Surface::Retired,
+        Surface::Retired("/settings tenacity"),
     ),
     cmd_on(
         "thinking",
@@ -694,7 +727,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Family::Tuning,
         Disposition::Absorb,
         Receipt::Journal,
-        Surface::Retired,
+        Surface::Retired("/settings thinking"),
     ),
 ];
 
@@ -759,6 +792,13 @@ pub(crate) fn receipt_for(token: &str) -> Receipt {
 /// "unknown" (#1981), because operators have muscle memory.
 pub(crate) fn fallthrough_message(token: &str) -> String {
     match lookup(token) {
+        // **A retired row is authoritative about where it went**, whatever its
+        // disposition — the destination is data on the row, so this cannot
+        // drift from the table the way a per-arm string would.
+        Some(SlashCommand {
+            surface: Surface::Retired(dest),
+            ..
+        }) => format!("/{token} is retired — use {dest}"),
         // An absorbed setting names its new home, not its old handler.
         Some(command) if command.disposition == Disposition::Absorb => format!(
             "/{token} sets a value that now lives in /settings {}",
@@ -891,6 +931,19 @@ mod tests {
     /// Walked from the dispatch, not from `help_lines()`: the help had
     /// already drifted by eleven undocumented commands when this was armed.
     ///
+    /// # 68/83 → 59/74: the `/status` fold (#2009 PR3)
+    ///
+    /// Nine reads stop being top-level verbs and become topics of one:
+    /// `/info` `/config` `/version` `/workspace` `/byline` `/memory`
+    /// `/loadout` `/models` retire into `/status <topic>`, and `/docs` into
+    /// `/help docs`. **The first real reduction of the cut**, and it pays back
+    /// PR2's raise with one to spare.
+    ///
+    /// The verbs still work — see `Surface::Retired`: a retired READ may
+    /// still read, because §3.3 requires reads to keep working on a pipe.
+    /// What retires is the claim on the surface, which is what these two
+    /// numbers measure.
+    ///
     /// # 63/76 → 68/83: registering the ghosts (#2009 PR2)
     ///
     /// Five commands an operator could type today, advertised in
@@ -925,14 +978,14 @@ mod tests {
     #[test]
     fn the_registered_surface_only_shrinks() {
         assert!(
-            slash_commands().count() <= 68,
+            slash_commands().count() <= 59,
             "the slash surface GREW to {} commands. #1981 is a reduction: a \
              new command needs an argument for why it is not a field of \
              /settings or a subcommand of an existing verb",
             slash_commands().count()
         );
         assert!(
-            slash_tokens().len() <= 83,
+            slash_tokens().len() <= 74,
             "the slash surface GREW to {} tokens",
             slash_tokens().len()
         );
@@ -964,6 +1017,14 @@ mod tests {
     /// site count is the proxy that is exact: every top-level command reaches
     /// its handler through one of these, so a new one means either a new
     /// command or a refactor, and both deserve a look at this file.
+    /// # PR3 did NOT free a site, and says so
+    ///
+    /// The train predicted the `/status` fold would kill the `/info` site. It
+    /// did not: a retired READ keeps reading, so the `/status || /info` arm is
+    /// still there and still needed. §5's site-count honesty rule is explicit
+    /// that a shared binding survives until its LAST command dies, and that a
+    /// slice may only lower this number when a real recount says so — so it
+    /// stays 22, and the site dies with the shims in PR14b.
     #[test]
     fn the_number_of_slash_interception_sites_is_pinned() {
         let counted: usize = dispatch_sources()
@@ -1078,6 +1139,24 @@ mod tests {
     /// would let the entire debt disappear as the cut proceeds, which is the
     /// most tempting wrong answer available here.
     ///
+    /// # 33 → 31: two truthing reclassifications, verified (#2009 PR3)
+    ///
+    /// `/memory` and `/loadout` were both registered `Missing` on a
+    /// **read-only description** — the doc flagged both as "verify; if it
+    /// writes nothing, reclassify `None_` with the argument recorded". Read,
+    /// and recorded here:
+    ///
+    /// - `/memory` (`chat.rs:3279`) calls `memory.usage()` and prints the
+    ///   compression counters. No store, no filesystem, no config write.
+    /// - `/loadout` (`chat.rs:5613`) renders a resolution view for
+    ///   `""`/`show` and prints a refusal otherwise. No write on either path.
+    ///
+    /// **This lowers the debt without paying anything, which is the one
+    /// direction a ratchet must be argued for rather than just taken.** The
+    /// argument is that the debt was never theirs: `Missing` means "mutates
+    /// and records nothing", and neither mutates. A row that cannot write
+    /// cannot owe a receipt.
+    ///
     /// # 28 → 33: five ghosts walk into the count (#2009 PR2)
     ///
     /// `/new` (`/clear`), `/end`, `/restart`, `/start` and `/cd` are shipped,
@@ -1110,7 +1189,7 @@ mod tests {
             .filter(|c| matches!(c.receipt, Receipt::Missing))
             .count();
         assert!(
-            missing <= 33,
+            missing <= 31,
             "{missing} state-mutating commands record nothing durable — that \
              is more than when #1981 armed this. A new state mutator needs a \
              receipt destination, not another silent write"
@@ -1214,7 +1293,9 @@ mod tests {
             .collect();
         let dangling: Vec<&str> = COMMANDS
             .iter()
-            .filter(|c| c.disposition == Disposition::Absorb && c.surface == Surface::Retired)
+            .filter(|c| {
+                c.disposition == Disposition::Absorb && matches!(c.surface, Surface::Retired(_))
+            })
             .map(|c| c.name)
             .filter(|name| !fields.contains(name))
             .collect();
@@ -1236,7 +1317,24 @@ mod tests {
     /// the same defect wearing the opposite face.
     #[test]
     fn a_retired_row_still_resolves_to_its_replacement() {
-        for command in COMMANDS.iter().filter(|c| c.surface == Surface::Retired) {
+        for command in COMMANDS {
+            let Surface::Retired(dest) = command.surface else {
+                continue;
+            };
+            // The no-dangling guard (§6 F6): a pointer to nowhere is worse
+            // than no pointer, because it is confident.
+            assert!(
+                dest.starts_with('/'),
+                "`/{}` retires to {dest:?}, which is not a command",
+                command.name
+            );
+            let target = dest.trim_start_matches('/');
+            let target = target.split_whitespace().next().unwrap_or(target);
+            assert!(
+                lookup(target).is_some(),
+                "`/{}` retires to `/{target}`, which is not registered",
+                command.name
+            );
             for token in command.tokens() {
                 let hint = fallthrough_message(token);
                 assert!(
@@ -1245,9 +1343,9 @@ mod tests {
                      path cannot find the row that explains it"
                 );
                 assert!(
-                    hint.contains("/settings"),
-                    "`/{token}` is retired and its hint names no destination: \
-                     {hint:?}"
+                    hint.contains(dest),
+                    "`/{token}` is retired and its hint does not name its \
+                     declared destination {dest:?}: {hint:?}"
                 );
             }
         }
@@ -1257,7 +1355,9 @@ mod tests {
     #[test]
     fn something_is_actually_retired() {
         assert!(
-            COMMANDS.iter().any(|c| c.surface == Surface::Retired),
+            COMMANDS
+                .iter()
+                .any(|c| matches!(c.surface, Surface::Retired(_))),
             "no row is retired, so the retired-pointer guard proves nothing"
         );
     }
@@ -1301,11 +1401,11 @@ mod target_set_doc {
     /// How a row is REACHED, so the doc cannot be read as "everything here is
     /// typed with a slash". That was true when the register and the surface
     /// were the same set; #2009 exists to make them differ.
-    fn surface_cell(command: &SlashCommand) -> &'static str {
+    fn surface_cell(command: &SlashCommand) -> String {
         match command.surface {
-            Surface::Slash => "`/` command",
-            Surface::SectionAction => "action inside a section",
-            Surface::Retired => "retired — redirects only",
+            Surface::Slash => "`/` command".to_string(),
+            Surface::SectionAction => "action inside a section".to_string(),
+            Surface::Retired(dest) => format!("retired → `{dest}`"),
         }
     }
 
@@ -1426,7 +1526,10 @@ mod fallthrough_tests {
     /// sends them to `/help` to find something already listed there.
     #[test]
     fn a_registered_token_is_not_called_unknown() {
-        for token in ["memory", "tab", "def"] {
+        // Live `Surface::Slash` rows only — a RETIRED token correctly gets
+        // its pointer instead of this message, which is what
+        // `a_retired_row_still_resolves_to_its_replacement` pins.
+        for token in ["remember", "tab", "def"] {
             let msg = fallthrough_message(token);
             assert!(
                 !msg.contains("unknown command"),
@@ -1532,7 +1635,7 @@ mod fallthrough_tests {
         let cognition = lookup("cognition").expect("/cognition is registered");
         assert_eq!(
             cognition.surface,
-            Surface::Retired,
+            Surface::Retired("/settings cognition"),
             "`commands::settings` answers /cognition with a redirect that \
              mutates nothing — the registry has to say so"
         );
@@ -1592,8 +1695,18 @@ mod fallthrough_tests {
              matched a help row"
         );
 
-        let missing: Vec<&str> = COMMANDS
-            .iter()
+        // **A retired row must NOT be advertised — that is what retiring
+        // it means.** The help teaches the surface, and a help line for a
+        // command the cut just folded would teach the fold away. The verb
+        // goes on working (a retired read still reads); it stops being
+        // taught, and `fallthrough_message` carries the pointer for muscle
+        // memory. `no_retired_row_is_still_advertised` is the other half.
+        let missing: Vec<&str> = slash_commands()
+            .chain(
+                COMMANDS
+                    .iter()
+                    .filter(|c| c.surface == Surface::SectionAction),
+            )
             .map(|c| c.name)
             .filter(|n| !is_advertised(n) && !KNOWN_UNADVERTISED.contains(n))
             .collect();
@@ -1602,6 +1715,20 @@ mod fallthrough_tests {
             "registry commands with no help_lines() row (add the row, or argue \
              a KNOWN_UNADVERTISED entry in review): {missing:?}"
         );
+        // ...and the paired direction, so "not advertised" cannot quietly
+        // become the way to dodge the check above.
+        let taught: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|c| matches!(c.surface, Surface::Retired(_)))
+            .map(|c| c.name)
+            .filter(|n| is_advertised(n))
+            .collect();
+        assert!(
+            taught.is_empty(),
+            "these rows are retired but the help still teaches them as \
+             top-level commands, which teaches the fold away: {taught:?}"
+        );
+
         // The ratchet only shrinks: a row that gained a help line must leave.
         let stale: Vec<&str> = KNOWN_UNADVERTISED
             .iter()

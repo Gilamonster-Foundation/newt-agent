@@ -1304,11 +1304,35 @@ fn command_help_covers_every_listed_command_and_folds_aliases() {
     assert_eq!(command_help_page("quit"), command_help_page("exit"));
     assert_eq!(command_help_page("plan"), command_help_page("roadmap"));
     assert_eq!(command_help_page("allow"), command_help_page("permissions"));
-    assert!(help_lines().iter().any(|l| l.contains("/loadout")));
     assert!(help_lines().iter().any(|l| l.contains("/status")));
-    assert!(help_lines().iter().any(|l| l.contains("/info")));
-    assert!(help_lines().iter().any(|l| l.contains("/docs")));
     assert!(help_lines().iter().any(|l| l.contains("/allow")));
+    // #2009 PR3: `/loadout`, `/info` and `/docs` retired into `/status
+    // <topic>` and `/help docs`. Their help LINES are gone from the corpus —
+    // the same shape as the #1665 note below — so what the corpus must teach
+    // now is the topic list that replaced them.
+    let topics = help_lines()
+        .iter()
+        .find(|l| l.contains("/status <topic>"))
+        .expect("the /status topic line is advertised");
+    for topic in [
+        "config",
+        "version",
+        "workspace",
+        "loadout",
+        "byline",
+        "memory",
+        "models",
+    ] {
+        assert!(topics.contains(topic), "{topics:?} omits the {topic} topic");
+    }
+    // ...and their help PAGES survive, so `/help loadout` still answers the
+    // operator who reaches for the old name.
+    for retired in ["loadout", "info", "docs", "version", "workspace", "models"] {
+        assert!(
+            command_help_page(retired).is_some(),
+            "/help {retired} lost its page; a retired verb keeps its pointer"
+        );
+    }
     assert!(help_lines().iter().any(|l| l.contains("/plan")));
     // #1665: /psyche is the one advertised dial surface; the retired top-level
     // /tenacity + /cognition lines are gone from the corpus (their help PAGES
@@ -1405,7 +1429,7 @@ fn rich_help_uses_the_default_markdown_policy_and_honors_off() {
     assert!(!rendered.contains("## Available commands"));
     assert!(rendered.contains("commands"));
     assert!(rendered.contains("• "));
-    assert!(rendered.contains("/models"));
+    assert!(rendered.contains("/status"));
 
     let cfg_off = newt_core::Config {
         tui: Some(newt_core::TuiConfig {
@@ -1468,8 +1492,13 @@ this is not json\n\
 }
 
 #[test]
-fn help_lists_loadout_command() {
-    assert!(help_lines().iter().any(|l| l.contains("/loadout")));
+fn loadout_is_reachable_as_a_status_topic_and_keeps_its_help_page() {
+    // #2009 PR3: retired into `/status loadout`. The corpus teaches the
+    // topic; the verb still runs and `/help loadout` still answers.
+    assert!(help_lines()
+        .iter()
+        .any(|l| l.contains("/status <topic>") && l.contains("loadout")));
+    assert!(command_help_page("loadout").is_some());
 }
 
 #[test]
@@ -1540,9 +1569,17 @@ fn slash_config_returns_true() {
     assert!(dispatch_slash("/config", "/ws", false, false, false).unwrap());
 }
 
+/// `/config` retired into `/status config` (#2009 PR3). It still runs — a
+/// retired READ keeps reading — but the corpus teaches the topic, not the
+/// verb, and `/help config` still answers.
 #[test]
-fn help_lists_config_command() {
-    assert!(help_lines().iter().any(|l| l.contains("/config")));
+fn config_is_reachable_as_a_status_topic_and_keeps_its_help_page() {
+    assert!(help_lines()
+        .iter()
+        .any(|l| l.contains("/status <topic>") && l.contains("config")));
+    assert!(command_help_page("config").is_some());
+    // The verb itself is unchanged for the deprecation window.
+    assert!(dispatch_slash("/config", "/ws", false, false, false).unwrap());
 }
 
 #[test]
