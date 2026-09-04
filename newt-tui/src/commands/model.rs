@@ -439,6 +439,14 @@ pub(crate) fn served_choices(
 /// - Optional `model` (ollama only) → session-only override on the same axis
 ///   the loadout `model` feeds (NEWT_DGX_MODEL), consumed by the Ollama
 ///   resolution. Avoids mutating saved config on a live A/B switch.
+///
+/// **Rich-only since #2048 removed `/backend <openai|ollama>`.** The sole
+/// remaining caller is the panel's kind-fallback row, and the panel does not
+/// exist in the lean build. Left ungated it is dead code there, which
+/// `-D warnings` fails on — and that failure is a true signal rather than
+/// noise: the lean tier can no longer reach a wire-kind toggle at all,
+/// because the only door to one is now a panel it does not build.
+#[cfg(feature = "rich-tui")]
 pub(crate) fn apply_backend_kind(kind: &str, model: &str, color: bool, verbose: bool) {
     {
         // One hold for the whole switch, released before the re-resolve and

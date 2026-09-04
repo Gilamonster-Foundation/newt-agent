@@ -562,8 +562,6 @@ impl PanelState {
         self.mode = Mode::Form(Box::new(FormState::add()));
     }
 
-    /// `d`: prefill the typed confirm — the ex-command line `:d <name>` the
-    /// operator must still Enter.
     /// Ask before removing the selected backend.
     ///
     /// **Every refusal is evaluated BEFORE the question is asked.** Confirming
