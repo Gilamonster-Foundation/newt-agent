@@ -70,6 +70,18 @@ impl<W: Write> MarkdownStreamWriter<W> {
         Ok(())
     }
 
+    /// Give the sink back after [`finish`] (`BufWriter::into_inner`'s shape,
+    /// minus the error case — nothing is buffered here once `finish` has run).
+    ///
+    /// #123: the streamed-answer path hands its output sink to this writer and
+    /// needs it back to print the cut-stream notice *below* the answer, on the
+    /// same sink. Taking the sink back is what keeps ownership single —
+    /// the alternative is a second handle to the same stream, which is how
+    /// two writers end up interleaving on one terminal line.
+    pub fn into_inner(self) -> W {
+        self.out
+    }
+
     /// Flush the trailing partial line and any still-open block at end of stream.
     pub fn finish(&mut self) -> io::Result<()> {
         if self.color && !self.line_buf.is_empty() {

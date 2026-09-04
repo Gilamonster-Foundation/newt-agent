@@ -100,6 +100,20 @@ fn ctx<'a>(
     }
 }
 
+/// #123: the streaming re-issue of an ALREADY-ACCEPTED OpenAI round. It is
+/// not a new round — it re-serves the same answer over SSE — so a responder
+/// answers it WITHOUT advancing its round counter, and a `requests` assertion
+/// keeps counting model rounds rather than HTTP requests.
+fn is_stream(req: &Request) -> bool {
+    body_json(req)["stream"].as_bool().unwrap_or(false)
+}
+
+fn sse_replay(text: &str) -> ResponseTemplate {
+    let frame = serde_json::json!({"choices": [{"delta": {"content": text}}]});
+    let body = format!("data: {frame}\n\ndata: [DONE]\n\n");
+    ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream")
+}
+
 fn body_json(req: &Request) -> serde_json::Value {
     serde_json::from_slice(&req.body).expect("provider request body is JSON")
 }
@@ -239,6 +253,9 @@ struct OpenAiPlanResponder {
 
 impl Respond for OpenAiPlanResponder {
     fn respond(&self, req: &Request) -> ResponseTemplate {
+        if is_stream(req) {
+            return sse_replay("retry plan provenance captured");
+        }
         let body = body_json(req);
         self.artifact_read_seen
             .fetch_and(chat_tools_include(&body, "artifact_read"), Ordering::SeqCst);
@@ -420,7 +437,10 @@ struct OpenAiScriptResponder {
 }
 
 impl Respond for OpenAiScriptResponder {
-    fn respond(&self, _req: &Request) -> ResponseTemplate {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        if is_stream(req) {
+            return sse_replay(self.final_text);
+        }
         let round = self.requests.fetch_add(1, Ordering::SeqCst);
         let message = if round == 0 {
             self.first_message.clone()
