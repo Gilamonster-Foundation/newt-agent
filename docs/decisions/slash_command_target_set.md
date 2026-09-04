@@ -147,74 +147,76 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 ```
 
 <!-- BEGIN GENERATED: slash_registry::COMMANDS -->
-| command | also typed as | family | disposition | receipt |
-|---|---|---|---|---|
-| `/edit-mode` | `/vi` `/emacs` `/nano` | Editor | absorb → `/settings edit-mode` | `~/.newt/receipts.jsonl` |
-| `/memory` | — | Memory | keep — it performs | **none — #1965** |
-| `/recall` | — | Memory | keep — it performs | — read-only |
-| `/remember` | — | Memory | keep — it performs | **none — #1965** |
-| `/search` | — | Memory | keep — it performs | — read-only |
-| `/byline` | — | Meta | keep — it performs | — read-only |
-| `/config` | — | Meta | keep — it performs | — read-only |
-| `/docs` | — | Meta | keep — it performs | — read-only |
-| `/exit` | `/quit` | Meta | keep — it performs | — read-only |
-| `/help` | — | Meta | keep — it performs | — read-only |
-| `/info` | — | Meta | keep — it performs | — read-only |
-| `/settings` | — | Meta | keep — it performs | `~/.newt/receipts.jsonl` |
-| `/setup` | — | Meta | keep — it performs | **none — #1965** |
-| `/status` | — | Meta | keep — it performs | — read-only |
-| `/version` | — | Meta | keep — it performs | — read-only |
-| `/workspace` | — | Meta | keep — it performs | — read-only |
-| `/backends` | `/backend` | Model | panel — a chooser, needs a region (#1979) | **none — #1965** |
-| `/dgx` | — | Model | keep — it performs | — read-only |
-| `/model` | — | Model | absorb → `/settings model` | **none — #1965** |
-| `/models` | — | Model | keep — it performs | — read-only |
-| `/probe` | — | Model | keep — it performs | — read-only |
-| `/summarizer` | — | Model | absorb → `/settings summarizer` | **none — #1965** |
-| `/callees` | — | Navigator | keep — it performs | — read-only |
-| `/callers` | — | Navigator | keep — it performs | — read-only |
-| `/compare` | — | Navigator | keep — it performs | — read-only |
-| `/def` | `/goto` | Navigator | keep — it performs | — read-only |
-| `/export` | — | Navigator | keep — it performs | — read-only |
-| `/hierarchy` | — | Navigator | keep — it performs | — read-only |
-| `/impact` | — | Navigator | keep — it performs | — read-only |
-| `/implementations` | `/impls` | Navigator | keep — it performs | — read-only |
-| `/map` | — | Navigator | keep — it performs | — read-only |
-| `/tests` | — | Navigator | keep — it performs | — read-only |
-| `/text` | `/grep` | Navigator | keep — it performs | — read-only |
-| `/type` | — | Navigator | keep — it performs | — read-only |
-| `/uses` | `/refs` | Navigator | keep — it performs | — read-only |
-| `/allow` | — | Session | keep — it performs | **none — #1965** |
-| `/compress` | `/compact` | Session | keep — it performs | **none — #1965** |
-| `/context` | — | Session | keep — it performs | **none — #1965** |
-| `/conversation` | — | Session | keep — it performs | **none — #1965** |
-| `/crew` | — | Session | keep — it performs | **none — #1965** |
-| `/dock` | — | Session | keep — it performs | **none — #1965** |
-| `/mcp` | — | Session | panel — a chooser, needs a region (#1979) | **none — #1965** |
-| `/permissions` | — | Session | panel — a chooser, needs a region (#1979) | **none — #1965** |
-| `/rename` | `/name` | Session | keep — it performs | **none — #1965** |
-| `/resume` | — | Session | keep — it performs | **none — #1965** |
-| `/roadmap` | — | Session | keep — it performs | — read-only |
-| `/spill` | — | Session | keep — it performs | — read-only |
-| `/tab` | — | Session | keep — it performs | **none — #1965** |
-| `/transcript` | — | Session | keep — it performs | — read-only |
-| `/tree` | — | Session | keep — it performs | — read-only |
-| `/undo-lock` | — | Session | keep — it performs | **none — #1965** |
-| `/cognition` | `/psyche` | Tuning | absorb → `/settings cognition` | `~/.newt/receipts.jsonl` |
-| `/detail` | — | Tuning | absorb → `/settings detail` | **none — #1965** |
-| `/loadout` | — | Tuning | absorb → `/settings loadout` | **none — #1965** |
-| `/markdown` | — | Tuning | absorb → `/settings markdown` | **none — #1965** |
-| `/mode` | — | Tuning | absorb → `/settings mode` | **none — #1965** |
-| `/nudge` | — | Tuning | absorb → `/settings nudge` | `~/.newt/receipts.jsonl` |
-| `/persona` | — | Tuning | absorb → `/settings persona` | **none — #1965** |
-| `/plan` | — | Tuning | absorb → `/settings plan` | **none — #1965** |
-| `/posture` | — | Tuning | absorb → `/settings posture` | **none — #1965** |
-| `/prompt` | — | Tuning | absorb → `/settings prompt` | **none — #1965** |
-| `/retrieval` | — | Tuning | absorb → `/settings retrieval` | **none — #1965** |
-| `/rounds` | `/tool-rounds` `/max-rounds` | Tuning | absorb → `/settings rounds` | `~/.newt/receipts.jsonl` |
-| `/tenacity` | — | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
-| `/thinking` | — | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
+| command | also typed as | reached by | family | disposition | receipt |
+|---|---|---|---|---|---|
+| `/edit-mode` | `/vi` `/emacs` `/nano` | `/` command | Editor | absorb → `/settings edit-mode` | `~/.newt/receipts.jsonl` |
+| `/memory` | — | `/` command | Memory | keep — it performs | **none — #1965** |
+| `/recall` | — | `/` command | Memory | keep — it performs | — read-only |
+| `/remember` | — | `/` command | Memory | keep — it performs | **none — #1965** |
+| `/search` | — | `/` command | Memory | keep — it performs | — read-only |
+| `/byline` | — | `/` command | Meta | keep — it performs | — read-only |
+| `/config` | — | `/` command | Meta | keep — it performs | — read-only |
+| `/docs` | — | `/` command | Meta | keep — it performs | — read-only |
+| `/exit` | `/quit` | `/` command | Meta | keep — it performs | — read-only |
+| `/help` | — | `/` command | Meta | keep — it performs | — read-only |
+| `/info` | — | `/` command | Meta | keep — it performs | — read-only |
+| `/settings` | — | `/` command | Meta | keep — it performs | `~/.newt/receipts.jsonl` |
+| `/setup` | — | `/` command | Meta | keep — it performs | **none — #1965** |
+| `/status` | — | `/` command | Meta | keep — it performs | — read-only |
+| `/version` | — | `/` command | Meta | keep — it performs | — read-only |
+| `/workspace` | — | `/` command | Meta | keep — it performs | — read-only |
+| `/backends` | `/backend` | `/` command | Model | panel — a chooser, needs a region (#1979) | **none — #1965** |
+| `/dgx` | — | `/` command | Model | keep — it performs | — read-only |
+| `/model` | — | `/` command | Model | absorb → `/settings model` | **none — #1965** |
+| `/models` | — | `/` command | Model | keep — it performs | — read-only |
+| `/probe` | — | `/` command | Model | keep — it performs | — read-only |
+| `/probe reset` | — | action inside a section | Model | keep — it performs | **none — #1965** |
+| `/summarizer` | — | `/` command | Model | absorb → `/settings summarizer` | **none — #1965** |
+| `/callees` | — | `/` command | Navigator | keep — it performs | — read-only |
+| `/callers` | — | `/` command | Navigator | keep — it performs | — read-only |
+| `/compare` | — | `/` command | Navigator | keep — it performs | — read-only |
+| `/def` | `/goto` | `/` command | Navigator | keep — it performs | — read-only |
+| `/export` | — | `/` command | Navigator | keep — it performs | — read-only |
+| `/hierarchy` | — | `/` command | Navigator | keep — it performs | — read-only |
+| `/impact` | — | `/` command | Navigator | keep — it performs | — read-only |
+| `/implementations` | `/impls` | `/` command | Navigator | keep — it performs | — read-only |
+| `/map` | — | `/` command | Navigator | keep — it performs | — read-only |
+| `/tests` | — | `/` command | Navigator | keep — it performs | — read-only |
+| `/text` | `/grep` | `/` command | Navigator | keep — it performs | — read-only |
+| `/type` | — | `/` command | Navigator | keep — it performs | — read-only |
+| `/uses` | `/refs` | `/` command | Navigator | keep — it performs | — read-only |
+| `/allow` | — | `/` command | Session | keep — it performs | **none — #1965** |
+| `/compress` | `/compact` | `/` command | Session | keep — it performs | **none — #1965** |
+| `/context` | — | `/` command | Session | keep — it performs | **none — #1965** |
+| `/conversation` | — | `/` command | Session | keep — it performs | **none — #1965** |
+| `/crew` | — | `/` command | Session | keep — it performs | **none — #1965** |
+| `/dock` | — | `/` command | Session | keep — it performs | **none — #1965** |
+| `/mcp` | — | `/` command | Session | panel — a chooser, needs a region (#1979) | **none — #1965** |
+| `/permissions` | — | `/` command | Session | panel — a chooser, needs a region (#1979) | **none — #1965** |
+| `/rename` | `/name` | `/` command | Session | keep — it performs | **none — #1965** |
+| `/resume` | — | `/` command | Session | keep — it performs | **none — #1965** |
+| `/roadmap` | — | `/` command | Session | keep — it performs | — read-only |
+| `/spill` | — | `/` command | Session | keep — it performs | — read-only |
+| `/tab` | — | `/` command | Session | keep — it performs | **none — #1965** |
+| `/transcript` | — | `/` command | Session | keep — it performs | — read-only |
+| `/tree` | — | `/` command | Session | keep — it performs | — read-only |
+| `/undo-lock` | — | `/` command | Session | keep — it performs | **none — #1965** |
+| `/cognition` | — | retired — redirects only | Tuning | absorb → `/settings cognition` | `~/.newt/receipts.jsonl` |
+| `/detail` | — | `/` command | Tuning | absorb → `/settings detail` | **none — #1965** |
+| `/loadout` | — | `/` command | Tuning | absorb → `/settings loadout` | **none — #1965** |
+| `/markdown` | — | `/` command | Tuning | absorb → `/settings markdown` | **none — #1965** |
+| `/mode` | — | `/` command | Tuning | absorb → `/settings mode` | **none — #1965** |
+| `/nudge` | — | `/` command | Tuning | absorb → `/settings nudge` | `~/.newt/receipts.jsonl` |
+| `/persona` | — | `/` command | Tuning | absorb → `/settings persona` | **none — #1965** |
+| `/plan` | — | `/` command | Tuning | absorb → `/settings plan` | **none — #1965** |
+| `/posture` | — | `/` command | Tuning | absorb → `/settings posture` | **none — #1965** |
+| `/prompt` | — | `/` command | Tuning | absorb → `/settings prompt` | **none — #1965** |
+| `/psyche` | — | `/` command | Tuning | keep — it performs | `~/.newt/receipts.jsonl` |
+| `/retrieval` | — | `/` command | Tuning | absorb → `/settings retrieval` | **none — #1965** |
+| `/rounds` | `/tool-rounds` `/max-rounds` | `/` command | Tuning | absorb → `/settings rounds` | `~/.newt/receipts.jsonl` |
+| `/tenacity` | — | retired — redirects only | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
+| `/thinking` | — | retired — redirects only | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
 
-**65 commands, 79 tokens.** Absorb 17 · keep 45 · panel 3. Receipts: journalled 7 · read-only 31 · **missing 27**.
+**67 registered, 63 of them typed as `/` commands (76 tokens).** Absorb 17 · keep 47 · panel 3. Receipts: journalled 8 · read-only 31 · **missing 28**.
 
 <!-- END GENERATED -->

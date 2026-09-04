@@ -55,6 +55,34 @@ pub(crate) enum Disposition {
     Panel,
 }
 
+/// **Where a registered thing LIVES** — the axis the ratchets count on.
+///
+/// The registry used to hold one kind of row: a top-level `/verb`. The radical
+/// cut (#2009) turns most of those into fields and actions inside `/settings`,
+/// and a register that can only describe verbs would have to DELETE a row to
+/// record that — losing the pointer an operator's muscle memory still needs,
+/// and losing the receipt destination the field still has.
+///
+/// So the register grows while the surface shrinks. That is the point, and it
+/// is why the two ratchets below count `Slash` rows rather than all rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Surface {
+    /// A top-level `/verb` an operator types. **The only surface the shrink
+    /// ratchets count.**
+    Slash,
+    /// An action inside a `/settings` section — `/settings backends probe`.
+    /// It PERFORMS rather than setting, so it has no from→to, but it is still
+    /// a mutator and still owes a receipt destination.
+    SectionAction,
+    /// A permanent pointer to where the thing went.
+    ///
+    /// **Never deleted.** §5: "No high-frequency verb ever answers 'unknown
+    /// command' — retired rows are permanent pointers." A row here still
+    /// occupies the register and still resolves; it just no longer occupies
+    /// the surface.
+    Retired,
+}
+
 /// Where this command's state change is durably recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Receipt {
@@ -87,6 +115,9 @@ pub(crate) struct SlashCommand {
     /// drives behaviour, and `Receipt::Missing` is the remaining #1965 debt
     /// rather than the whole state of the world.
     pub(crate) receipt: Receipt,
+    /// Which surface this row occupies — see [`Surface`]. Defaults to `Slash`
+    /// via [`cmd`]; a row that has moved says so with [`cmd_on`].
+    pub(crate) surface: Surface,
 }
 
 impl SlashCommand {
@@ -102,6 +133,7 @@ impl SlashCommand {
     }
 }
 
+/// A row on the slash surface — the default, and still most of them.
 const fn cmd(
     name: &'static str,
     aliases: &'static [&'static str],
@@ -109,12 +141,26 @@ const fn cmd(
     disposition: Disposition,
     receipt: Receipt,
 ) -> SlashCommand {
+    cmd_on(name, aliases, family, disposition, receipt, Surface::Slash)
+}
+
+/// A row on a named surface — a settings field, a section action, or a
+/// retirement pointer.
+const fn cmd_on(
+    name: &'static str,
+    aliases: &'static [&'static str],
+    family: Family,
+    disposition: Disposition,
+    receipt: Receipt,
+    surface: Surface,
+) -> SlashCommand {
     SlashCommand {
         name,
         aliases,
         family,
         disposition,
         receipt,
+        surface,
     }
 }
 
@@ -246,6 +292,31 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Family::Model,
         Disposition::Keep,
         Receipt::None_,
+    ),
+    // ── THE DECLARED TRUTHING RAISE (#2009 §7 Q8) ────────────────────────
+    //
+    // `/probe reset` wipes every learned capability: tool conformance,
+    // context windows, calibration. It has always been a mutator and has
+    // never been registered as one, so the receiptless-mutator count has been
+    // understating itself by exactly this row.
+    //
+    // Registering it RAISES that count, which is why the doc made it an
+    // operator question rather than a silent edit. Q8's recommendation, taken
+    // here: "Approve. The alternative is a mutator that stays invisible
+    // because registering it would embarrass a number."
+    //
+    // It is a `SectionAction` rather than a `Slash` row because `/probe`
+    // itself already occupies the surface; this is the destructive verb
+    // INSIDE it, and PR9 re-homes both to `/settings backends probe`. Being
+    // off the slash surface is also why the raise costs the shrink ratchet
+    // nothing — the register grows, the surface does not.
+    cmd_on(
+        "probe reset",
+        &[],
+        Family::Model,
+        Disposition::Keep,
+        Receipt::Missing,
+        Surface::SectionAction,
     ),
     cmd(
         "summarizer",
@@ -457,11 +528,23 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Keep,
         Receipt::Missing,
     ),
-    cmd(
+    // **`/cognition` redirects; `/psyche` performs.** They were one row with
+    // an alias, which pointed the surviving verb at the retired one. The dial
+    // panel is reached by `/psyche`, and `commands::settings` answers
+    // `/cognition` with a redirect that mutates nothing.
+    cmd_on(
         "cognition",
-        &["psyche"],
+        &[],
         Family::Tuning,
         Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Retired,
+    ),
+    cmd(
+        "psyche",
+        &[],
+        Family::Tuning,
+        Disposition::Keep,
         Receipt::Journal,
     ),
     cmd(
@@ -541,21 +624,43 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Absorb,
         Receipt::Journal,
     ),
-    cmd(
+    cmd_on(
         "tenacity",
         &[],
         Family::Tuning,
         Disposition::Absorb,
         Receipt::Journal,
+        Surface::Retired,
     ),
-    cmd(
+    cmd_on(
         "thinking",
         &[],
         Family::Tuning,
         Disposition::Absorb,
         Receipt::Journal,
+        Surface::Retired,
     ),
 ];
+
+/// The rows an operator can type at the top level — what the shrink
+/// ratchets count.
+///
+/// `#[cfg(test)]` for the same reason as `all_tokens` below: the register is
+/// a conformance instrument today, and only `lookup` is on a runtime path.
+/// This loses the gate when the completion source stops offering retired rows.
+#[cfg(test)]
+pub(crate) fn slash_commands() -> impl Iterator<Item = &'static SlashCommand> {
+    COMMANDS.iter().filter(|c| c.surface == Surface::Slash)
+}
+
+/// Every token that reaches a `Surface::Slash` row.
+#[cfg(test)]
+pub(crate) fn slash_tokens() -> Vec<&'static str> {
+    let mut tokens: Vec<&'static str> = slash_commands().flat_map(SlashCommand::tokens).collect();
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens
+}
 
 /// Every token that reaches any registered command.
 ///
@@ -603,6 +708,13 @@ pub(crate) fn fallthrough_message(token: &str) -> String {
             "/{token} sets a value that now lives in /settings {}",
             command.name
         ),
+        // An action that lives inside a section says which door it is
+        // behind. It is not a routing bug: nothing ever routed it at the top
+        // level, and calling it one sends the operator to file an issue
+        // instead of to the place the action actually is.
+        Some(command) if command.surface == Surface::SectionAction => {
+            format!("/{token} is an action inside /settings, not a top-level command")
+        }
         Some(command) => format!(
             "/{token} is a known command ({:?} family) but nothing handled it \
              here — this is a routing bug, not a typo. Please report it.",
@@ -717,19 +829,46 @@ mod tests {
     /// come off then, and this bound comes down with them. Raising a ratchet
     /// is allowed exactly when the growth is the plan; it is not allowed to
     /// make a surprise go away.
+    /// **Counted on `Surface::Slash`, not on the register (#2009 PR1).**
+    ///
+    /// The register GROWS as the cut proceeds — fields, section actions and
+    /// permanent retirement pointers all keep their rows, because a deleted
+    /// row loses both the pointer an operator's muscle memory needs and the
+    /// receipt destination the setting still has. Counting every row would
+    /// therefore turn the plan into a ratchet violation.
+    ///
+    /// What may only shrink is what an operator can TYPE at the top level.
     #[test]
     fn the_registered_surface_only_shrinks() {
         assert!(
-            COMMANDS.len() <= 65,
+            slash_commands().count() <= 63,
             "the slash surface GREW to {} commands. #1981 is a reduction: a \
              new command needs an argument for why it is not a field of \
              /settings or a subcommand of an existing verb",
-            COMMANDS.len()
+            slash_commands().count()
         );
         assert!(
-            all_tokens().len() <= 79,
+            slash_tokens().len() <= 76,
             "the slash surface GREW to {} tokens",
-            all_tokens().len()
+            slash_tokens().len()
+        );
+    }
+
+    /// **The register may grow; only the surface may not.**
+    ///
+    /// Anti-vacuous guard on the ratchet above: if `slash_commands()` ever
+    /// returned everything, the two numbers would coincide and the ratchet
+    /// would silently become the old one again — which is exactly the shape
+    /// the cut needs it not to be.
+    #[test]
+    fn the_register_is_allowed_to_be_larger_than_the_surface() {
+        assert!(
+            COMMANDS.len() >= slash_commands().count(),
+            "the surface cannot exceed the register"
+        );
+        assert!(
+            all_tokens().len() >= slash_tokens().len(),
+            "typed tokens cannot exceed registered ones"
         );
     }
 
@@ -794,7 +933,12 @@ mod tests {
     #[test]
     fn every_registered_token_still_appears_in_the_dispatch() {
         let sources = dispatch_sources();
-        for command in COMMANDS {
+        // `Surface::Slash` only. A `SectionAction` is reached through its
+        // parent verb's ARGUMENT (`/probe reset`), so it has no dispatch token
+        // of its own and never will — asking for one would force every future
+        // section action to be registered as a fake top-level command, which
+        // is the fiction #2009 PR1 exists to end.
+        for command in slash_commands() {
             for token in command.tokens() {
                 let needle = format!("\"{token}\"");
                 assert!(
@@ -843,6 +987,25 @@ mod tests {
     /// Slash commands never reach the receipt path — that is how a round-cap
     /// escalation to unlimited left no durable record. This is the size of
     /// that hole, and like the sprawl ratchet it may only go DOWN.
+    ///
+    /// **Counted across EVERY surface, unlike the shrink ratchets.** A mutator
+    /// does not stop owing a receipt by becoming a settings field or a section
+    /// action; it only stops being typed. Scoping this to `Surface::Slash`
+    /// would let the entire debt disappear as the cut proceeds, which is the
+    /// most tempting wrong answer available here.
+    ///
+    /// # 27 → 28: the one declared raise (#2009 §7 Q8)
+    ///
+    /// `/probe reset` wipes every learned capability — tool conformance,
+    /// context windows, calibration — and has never been registered. The
+    /// count was not 27 because the debt was 27; it was 27 because this row
+    /// was invisible.
+    ///
+    /// Q8's recommendation, taken: *"Approve. The alternative is a mutator
+    /// that stays invisible because registering it would embarrass a number."*
+    /// Raising a ratchet is allowed exactly when the growth is the plan and
+    /// the item is named. It is never allowed to make a surprise go away, and
+    /// the itemization above is what separates the two.
     #[test]
     fn the_receiptless_state_mutators_are_counted_and_only_shrink() {
         let missing = COMMANDS
@@ -850,7 +1013,7 @@ mod tests {
             .filter(|c| matches!(c.receipt, Receipt::Missing))
             .count();
         assert!(
-            missing <= 27,
+            missing <= 28,
             "{missing} state-mutating commands record nothing durable — that \
              is more than when #1981 armed this. A new state mutator needs a \
              receipt destination, not another silent write"
@@ -926,6 +1089,81 @@ mod tests {
             );
         }
     }
+
+    /// **And the other direction: every absorbed row names a field that
+    /// exists.**
+    ///
+    /// The join above catches a knob added to the form and forgotten by the
+    /// registry — a MISCOUNT. This one catches the failure that reaches the
+    /// operator: `unknown_command_hint` answers a retired verb with
+    /// "/{token} sets a value that now lives in /settings {name}", built from
+    /// the registry alone. If no such field exists, the redirect sends someone
+    /// to a door that is not there, and the message is confident about it.
+    ///
+    /// **Scoped to RETIRED rows, and that scope is the point.** A
+    /// `Disposition::Absorb` on a live verb is a PLAN — eleven of them are
+    /// still waiting on their slice of #2009, and asserting against a plan
+    /// would only pressure someone to mark the plan differently. Once the verb
+    /// retires, the pointer is no longer a plan: it is the entire remaining
+    /// behaviour, and it is spoken to an operator.
+    ///
+    /// One join is two lists agreeing about their overlap. Two joins is the
+    /// same set.
+    #[test]
+    fn every_absorbed_row_points_at_a_field_that_exists() {
+        let fields: std::collections::BTreeSet<&str> = crate::settings_form::Field::ALL
+            .iter()
+            .map(|f| f.name())
+            .collect();
+        let dangling: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|c| c.disposition == Disposition::Absorb && c.surface == Surface::Retired)
+            .map(|c| c.name)
+            .filter(|name| !fields.contains(name))
+            .collect();
+        assert!(
+            dangling.is_empty(),
+            "these rows are marked absorbed, so their shim tells the operator \
+             the setting lives at `/settings <name>` — but /settings carries \
+             no such field: {dangling:?}"
+        );
+    }
+
+    /// **A retired row still resolves, and still says where to go.**
+    ///
+    /// Retiring a verb is the one moment a row stops being reachable by the
+    /// thing that names it, so it is the moment a pointer can rot unobserved:
+    /// the arm is gone, no dispatch test covers it, and the only surviving
+    /// behaviour is the hint. `/thinking` retired in #2045 precisely because a
+    /// half-working shim never gets to die — a shim that redirects nowhere is
+    /// the same defect wearing the opposite face.
+    #[test]
+    fn a_retired_row_still_resolves_to_its_replacement() {
+        for command in COMMANDS.iter().filter(|c| c.surface == Surface::Retired) {
+            for token in command.tokens() {
+                let hint = fallthrough_message(token);
+                assert!(
+                    lookup(token).is_some(),
+                    "`/{token}` is retired but no longer resolves — the hint \
+                     path cannot find the row that explains it"
+                );
+                assert!(
+                    hint.contains("/settings"),
+                    "`/{token}` is retired and its hint names no destination: \
+                     {hint:?}"
+                );
+            }
+        }
+    }
+
+    /// Anti-vacuous: the guard above is worthless if nothing is retired yet.
+    #[test]
+    fn something_is_actually_retired() {
+        assert!(
+            COMMANDS.iter().any(|c| c.surface == Surface::Retired),
+            "no row is retired, so the retired-pointer guard proves nothing"
+        );
+    }
 }
 
 /// **The decision doc's table, rendered from this registry** (#1981
@@ -963,12 +1201,24 @@ mod target_set_doc {
         }
     }
 
+    /// How a row is REACHED, so the doc cannot be read as "everything here is
+    /// typed with a slash". That was true when the register and the surface
+    /// were the same set; #2009 exists to make them differ.
+    fn surface_cell(command: &SlashCommand) -> &'static str {
+        match command.surface {
+            Surface::Slash => "`/` command",
+            Surface::SectionAction => "action inside a section",
+            Surface::Retired => "retired — redirects only",
+        }
+    }
+
     fn table() -> String {
         let mut rows: Vec<&SlashCommand> = COMMANDS.iter().collect();
         rows.sort_by_key(|c| (format!("{:?}", c.family), c.name));
-        let mut out =
-            String::from("| command | also typed as | family | disposition | receipt |\n");
-        out.push_str("|---|---|---|---|---|\n");
+        let mut out = String::from(
+            "| command | also typed as | reached by | family | disposition | receipt |\n",
+        );
+        out.push_str("|---|---|---|---|---|---|\n");
         for command in &rows {
             let aliases = if command.aliases.is_empty() {
                 "—".to_string()
@@ -981,8 +1231,9 @@ mod target_set_doc {
                     .join(" ")
             };
             out.push_str(&format!(
-                "| `/{}` | {aliases} | {:?} | {} | {} |\n",
+                "| `/{}` | {aliases} | {} | {:?} | {} | {} |\n",
                 command.name,
+                surface_cell(command),
                 command.family,
                 disposition_cell(command),
                 receipt_cell(command),
@@ -991,10 +1242,12 @@ mod target_set_doc {
         let count = |d: Disposition| COMMANDS.iter().filter(|c| c.disposition == d).count();
         let receipts = |r: Receipt| COMMANDS.iter().filter(|c| c.receipt == r).count();
         out.push_str(&format!(
-            "\n**{} commands, {} tokens.** Absorb {} · keep {} · panel {}. \
+            "\n**{} registered, {} of them typed as `/` commands ({} tokens).** \
+             Absorb {} · keep {} · panel {}. \
              Receipts: journalled {} · read-only {} · **missing {}**.\n",
             COMMANDS.len(),
-            all_tokens().len(),
+            slash_commands().count(),
+            slash_tokens().len(),
             count(Disposition::Absorb),
             count(Disposition::Keep),
             count(Disposition::Panel),
@@ -1086,14 +1339,54 @@ mod fallthrough_tests {
         }
     }
 
+    /// **A section action is told where it lives, not accused of being a
+    /// bug.**
+    ///
+    /// `/probe reset` never routed at the top level and never will — it is an
+    /// action inside a section. The generic arm calls any registered token
+    /// that falls through a routing bug and asks for a report, which for this
+    /// row is both false and a dead end: it names no destination.
+    #[test]
+    fn a_section_action_names_the_door_it_is_behind() {
+        let msg = fallthrough_message("probe reset");
+        assert!(msg.contains("/settings"), "names where it lives: {msg}");
+        assert!(!msg.contains("routing bug"), "it is not a bug: {msg}");
+        assert!(!msg.contains("unknown command"), "{msg}");
+    }
+
     /// Aliases resolve to their command, so a shim can name the replacement
     /// for the token the operator actually typed.
     #[test]
     fn lookup_resolves_aliases_and_is_case_insensitive() {
         assert_eq!(lookup("quit").map(|c| c.name), Some("exit"));
         assert_eq!(lookup("vi").map(|c| c.name), Some("edit-mode"));
-        assert_eq!(lookup("PSYCHE").map(|c| c.name), Some("cognition"));
+        assert_eq!(lookup("NUDGE").map(|c| c.name), Some("nudge"));
         assert!(lookup("zzznotacommand").is_none());
+    }
+
+    /// **`/psyche` is not an alias of `/cognition`; it is what `/cognition`
+    /// redirects TO.**
+    ///
+    /// The registry had the arrow backwards — one row named `cognition` with
+    /// `psyche` in its alias list — which made the surviving verb resolve to
+    /// the retired one. Two rows now, and each says what it does.
+    #[test]
+    fn psyche_performs_and_cognition_points_at_it() {
+        let psyche = lookup("psyche").expect("/psyche is registered");
+        assert_eq!(
+            psyche.name, "psyche",
+            "resolves to itself, not to cognition"
+        );
+        assert_eq!(psyche.surface, Surface::Slash, "it is still typed");
+        assert_eq!(psyche.disposition, Disposition::Keep, "and it performs");
+
+        let cognition = lookup("cognition").expect("/cognition is registered");
+        assert_eq!(
+            cognition.surface,
+            Surface::Retired,
+            "`commands::settings` answers /cognition with a redirect that \
+             mutates nothing — the registry has to say so"
+        );
     }
 
     /// #2001: `/settings` shipped in #1994 reachable but ADVERTISED NOWHERE —
@@ -1124,22 +1417,36 @@ mod fallthrough_tests {
             "undo-lock",
         ];
 
-        let advertised: std::collections::BTreeSet<&str> = crate::help_lines()
-            .iter()
-            .filter_map(|l| l.split_whitespace().next())
-            .filter_map(|tok| tok.strip_prefix('/'))
-            .collect();
+        // **Matched by NAME, not by word count.** This took the first
+        // whitespace-delimited token of each help line, which cannot see a
+        // `SectionAction` — `/probe reset` advertised itself as `probe`, so a
+        // registered two-word row could never be found however plainly it was
+        // documented. A registry that grows subcommand rows (#2009 PR1) needs
+        // the check to read the name it is looking for.
+        let is_advertised = |name: &str| -> bool {
+            let needle = format!("/{name}");
+            crate::help_lines().iter().any(|line| {
+                line.trim_start().strip_prefix(&needle).is_some_and(|rest| {
+                    // A real boundary, so `/model` is not advertised by
+                    // `/models` and `/probe` is not advertised by
+                    // `/probe reset`.
+                    rest.is_empty() || rest.starts_with(char::is_whitespace)
+                })
+            })
+        };
+
         // Positive read assertion: an empty parse must fail, not pass.
+        let advertised_count = COMMANDS.iter().filter(|c| is_advertised(c.name)).count();
         assert!(
-            advertised.len() >= 20,
-            "help_lines() parse collapsed: only {} slash tokens",
-            advertised.len()
+            advertised_count >= 20,
+            "help_lines() parse collapsed: only {advertised_count} commands \
+             matched a help row"
         );
 
         let missing: Vec<&str> = COMMANDS
             .iter()
             .map(|c| c.name)
-            .filter(|n| !advertised.contains(n) && !KNOWN_UNADVERTISED.contains(n))
+            .filter(|n| !is_advertised(n) && !KNOWN_UNADVERTISED.contains(n))
             .collect();
         assert!(
             missing.is_empty(),
@@ -1150,7 +1457,7 @@ mod fallthrough_tests {
         let stale: Vec<&str> = KNOWN_UNADVERTISED
             .iter()
             .copied()
-            .filter(|n| advertised.contains(n))
+            .filter(|n| is_advertised(n))
             .collect();
         assert!(
             stale.is_empty(),
