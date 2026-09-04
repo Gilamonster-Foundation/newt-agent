@@ -81,6 +81,7 @@ const ENV_KEYS: &[&str] = &[
     "NEWT_NUDGE",
     "NEWT_MARKDOWN",
     "NEWT_COMPACTION_TRIGGER",
+    "NEWT_SPILL_LINES",
     crate::settings_receipt::RECEIPT_PATH_ENV,
 ];
 

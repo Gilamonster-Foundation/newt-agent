@@ -674,11 +674,16 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::Journal,
     ),
     cmd(
+        // Absorbed as `/settings detail` (#2009 PR7b) and still a
+        // typed verb: `/detail` toggles, the field sets a count.
+        // Journal, because the write goes through `apply_and_record`
+        // like every other field — which is what the relocation of
+        // the override out of `run_chat` bought.
         "detail",
         &[],
         Family::Tuning,
         Disposition::Absorb,
-        Receipt::Missing,
+        Receipt::Journal,
     ),
     cmd_on(
         "loadout",
@@ -1215,6 +1220,16 @@ mod tests {
     /// would let the entire debt disappear as the cut proceeds, which is the
     /// most tempting wrong answer available here.
     ///
+    /// # 28 → 27: `/detail` pays (#2009 PR7b)
+    ///
+    /// **Back below where the cut started.** The count was 27 when PR1 armed
+    /// it, rose to 33 as PR2 registered five ghosts that had never been
+    /// counted, and has been paid down since — by relocation, not by
+    /// reclassification, every time except PR3's two verified read-only rows.
+    ///
+    /// `/detail`'s override was a `run_chat` local shared with `/spill`. It
+    /// lives in core now, so `apply_and_record` can read a real from→to.
+    ///
     /// # 29 → 28: `/prompt` pays (#2009 PR5)
     ///
     /// Its state already lived in `NEWT_PROMPT`, so no relocation was needed —
@@ -1289,7 +1304,7 @@ mod tests {
             .filter(|c| matches!(c.receipt, Receipt::Missing))
             .count();
         assert!(
-            missing <= 28,
+            missing <= 27,
             "{missing} state-mutating commands record nothing durable — that \
              is more than when #1981 armed this. A new state mutator needs a \
              receipt destination, not another silent write"

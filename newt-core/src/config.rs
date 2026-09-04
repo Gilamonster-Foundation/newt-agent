@@ -1038,6 +1038,38 @@ impl CompactionTriggerPolicy {
     }
 }
 
+/// The operator's session spill-detail override, if one is installed.
+///
+/// `None` follows `[tui] spill_lines`; `Some(0)` is this knob's **unbounded**;
+/// `Some(n)` keeps `n` rows.
+///
+/// # Why this exists (#2009 PR7b)
+///
+/// It was `spill_lines_override`, a `run_chat` local shared by `/spill` and
+/// `/detail` — deliberately one variable, "so the launch flag and the runtime
+/// control cannot disagree". That property is preserved and widened: the
+/// `/settings detail` field is a THIRD door onto the same knob, and it had to
+/// be able to see the value, which §5's precondition says a pure function
+/// cannot do while the value is a local.
+///
+/// The launch flag (`--trace`) installs its value here at startup, so "one
+/// variable" still holds across all three doors.
+#[must_use]
+pub fn session_spill_lines() -> Option<usize> {
+    std::env::var("NEWT_SPILL_LINES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+}
+
+/// Install (or release, with `None`) the session spill-detail override. The
+/// one writer: `/spill`, `/detail` and `/settings detail` all land here.
+pub fn set_session_spill_lines(rows: Option<usize>) {
+    match rows {
+        Some(n) => crate::process_env::set_var("NEWT_SPILL_LINES", &n.to_string()),
+        None => crate::process_env::remove_var("NEWT_SPILL_LINES"),
+    }
+}
+
 /// The compaction trigger policy this session resolves to: the operator's
 /// session override, else `[context] compaction_trigger_policy`, else the
 /// default.

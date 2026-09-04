@@ -104,6 +104,7 @@ pub(crate) enum Field {
     Mode,
     Prompt,
     Compaction,
+    Detail,
     Rounds,
 }
 
@@ -119,6 +120,7 @@ impl Field {
         Self::Mode,
         Self::Prompt,
         Self::Compaction,
+        Self::Detail,
         Self::Rounds,
     ];
 
@@ -136,6 +138,7 @@ impl Field {
             Self::Mode => "mode",
             Self::Prompt => "prompt",
             Self::Compaction => "compaction",
+            Self::Detail => "detail",
             Self::Rounds => "rounds",
         }
     }
@@ -151,6 +154,7 @@ impl Field {
             Self::Mode => "operating mode",
             Self::Prompt => "input prompt template",
             Self::Compaction => "automatic-compaction trigger",
+            Self::Detail => "tool-output detail rows",
             Self::Rounds => "tool-call round limit",
         }
     }
@@ -245,6 +249,21 @@ impl Field {
                 release: "reset",
                 placeholder: "\"[$TIME] ❯ \"",
             },
+            // A count, like the round cap — and for the same reason: the
+            // absorbed verb takes `/spill <rows>` with any number, so a
+            // vocabulary could not represent the state the operator can
+            // already reach.
+            //
+            // `0` is this knob's UNBOUNDED, which is what `/detail` toggles to
+            // and what `--trace` installs. `auto` releases back to
+            // `[tui] spill_lines`. The maximum is a formality — a `Number`
+            // field must declare one, and no terminal has a hundred thousand
+            // rows of useful scrollback.
+            Self::Detail => ValueSpace::Number {
+                release: "auto",
+                min: 0,
+                max: 100_000,
+            },
             // The one field that is not a vocabulary. `/rounds double` and
             // `/rounds unlimited` stay affordances of the VERB — they are
             // relative operations, not values — and the verb resolves them to a
@@ -299,6 +318,10 @@ impl Field {
             Self::Compaction => newt_core::config::session_compaction_trigger_policy()
                 .keyword()
                 .to_string(),
+            // The OVERRIDE, like the dials: `auto` is a real choosable value
+            // that resolution then fills in from `[tui] spill_lines`.
+            Self::Detail => newt_core::config::session_spill_lines()
+                .map_or_else(|| "auto".to_string(), |n| n.to_string()),
             Self::Rounds => newt_core::tenacity::session_tool_rounds()
                 .map_or_else(|| "auto".to_string(), |n| n.to_string()),
         }
@@ -369,6 +392,11 @@ impl Field {
             // `/rounds reset|default` release the override, the same word the
             // dials use for the same act.
             (Self::Rounds, "reset" | "default") => "auto",
+            // `/spill reset|default|config` release this one — every word the
+            // absorbed verb already accepted for the same act.
+            (Self::Detail, "reset" | "default" | "config") => "auto",
+            // `/detail`'s unbounded, said in words rather than as a bare `0`.
+            (Self::Detail, "full" | "unbounded" | "all") => "0",
             // `/markdown always|never` — the keywords `MarkdownMode` has
             // always aliased. Absorbing a verb must not drop an affordance
             // operators already type.
@@ -563,6 +591,11 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         // `reset` removes the variable rather than storing the word, so the
         // session falls back to `[tui] prompt` and no leftover survives for
         // the next `/prompt` to explain — the same shape `/nudge on` uses.
+        // Through the same writer `/spill` and `/detail` use, so the three
+        // doors onto this one knob cannot disagree.
+        Field::Detail => {
+            newt_core::config::set_session_spill_lines(value.parse::<usize>().ok());
+        }
         // Through the same writer `/context compaction` uses.
         Field::Compaction => {
             if let Some(policy) = newt_core::CompactionTriggerPolicy::from_keyword(value) {
@@ -1087,6 +1120,71 @@ mod tests {
     /// **Every alias the absorbed verbs took still resolves.** Each of these
     /// was reachable before the family moved; absorbing a command must not
     /// quietly delete an affordance operators already type.
+    /// **Three doors onto one knob** (#2009 PR7b).
+    ///
+    /// `/spill <rows>`, `/detail` and `/settings detail` all set the session
+    /// spill override. The code already claimed "one variable, so the launch
+    /// flag and the runtime control cannot disagree"; absorbing it added a
+    /// third door, and this is what keeps that claim true across all of them.
+    #[test]
+    fn the_detail_field_shares_one_knob_with_spill_and_the_toggle() {
+        let _guard = settings_guard();
+        newt_core::config::set_session_spill_lines(None);
+        assert_eq!(Field::Detail.current(), "auto", "unpinned follows config");
+
+        // The field sets it...
+        assert_eq!(
+            apply(Field::Detail, "12"),
+            Ok("tool-output detail rows: 12".to_string())
+        );
+        assert_eq!(newt_core::config::session_spill_lines(), Some(12));
+
+        // ...`/detail`'s toggle reads the SAME value and flips it to unbounded.
+        let toggled = crate::toggle_spill_detail(newt_core::config::session_spill_lines(), 3);
+        newt_core::config::set_session_spill_lines(toggled);
+        assert_eq!(Field::Detail.current(), "0", "0 is this knob's unbounded");
+
+        // ...and the field reports what the toggle did, with no second state.
+        assert_eq!(newt_core::config::session_spill_lines(), Some(0));
+    }
+
+    /// `auto` releases; the launch flag's unbounded is a real value, not a
+    /// release. Those are different states and the field keeps them apart.
+    #[test]
+    fn releasing_detail_is_not_the_same_as_setting_it_unbounded() {
+        let _guard = settings_guard();
+
+        apply(Field::Detail, "0").expect("0 is in range");
+        assert_eq!(newt_core::config::session_spill_lines(), Some(0));
+        assert_eq!(Field::Detail.current(), "0");
+
+        apply(Field::Detail, "auto").expect("auto releases");
+        assert_eq!(
+            newt_core::config::session_spill_lines(),
+            None,
+            "release must REMOVE the override, not store a word"
+        );
+        assert_eq!(Field::Detail.current(), "auto");
+    }
+
+    /// Every word the absorbed verbs accepted for these two acts still works.
+    #[test]
+    fn the_detail_verbs_vocabulary_survives_absorption() {
+        for word in ["reset", "default", "config"] {
+            assert_eq!(
+                Field::Detail.accepts(word),
+                Some("auto".to_string()),
+                "`/spill {word}` released the override"
+            );
+        }
+        for word in ["full", "unbounded", "all"] {
+            assert_eq!(Field::Detail.accepts(word), Some("0".to_string()), "{word}");
+        }
+        assert_eq!(Field::Detail.accepts("40"), Some("40".to_string()));
+        assert_eq!(Field::Detail.accepts("-1"), None);
+        assert_eq!(Field::Detail.accepts("banana"), None);
+    }
+
     /// **The verb and the field write one policy** (#2009 PR7).
     ///
     /// `/context compaction` set a `run_chat` local that
