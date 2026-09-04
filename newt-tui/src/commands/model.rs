@@ -320,53 +320,23 @@ pub(crate) fn dispatch(
             }
         }
 
-        "backend" => {
-            let cfg = crate::resolve_runtime_or_default();
-            let has_openai = cfg
-                .backends
-                .iter()
-                .any(|b| b.kind == Some(newt_core::BackendKind::Openai));
-            let kind_name = |c: &BackendChoice| c.kind.label();
-            if arg1.is_empty() {
-                let Some(choice) = choice_or_print(&cfg, color, verbose) else {
-                    return Ok(true);
-                };
-                print_newt(
-                    &format!(
-                        "active backend: {} · {} @ {}",
-                        kind_name(&choice),
-                        choice.display_model(),
-                        choice.url
-                    ),
-                    color,
-                    verbose,
-                );
-                print_newt(
-                    &format!(
-                        "usage: /backend <{}> [model]   (e.g. /backend ollama deepseek-r1)",
-                        if has_openai {
-                            "openai|ollama"
-                        } else {
-                            "ollama"
-                        }
-                    ),
-                    color,
-                    verbose,
-                );
-            } else if matches!(arg1, "openai" | "ollama") {
-                apply_backend_kind(arg1, arg2, color, verbose);
-            } else {
-                print_newt("usage: /backend <openai|ollama> [model]", color, verbose);
-            }
-        }
-
-        "backends" => {
+        "backend" | "backends" => {
             let cfg = crate::resolve_runtime_or_default();
             if arg1.is_empty() {
-                // List every configured [[backends]] entry by name, flagging the
-                // one the session currently resolves to. `/backend` toggles the
-                // coarse openai-vs-ollama *kind*; `/backends` picks a *named*
-                // endpoint (dgx1, gpu-runner, openai, …) regardless of wire protocol.
+                // List every configured [[backends]] entry by name, flagging
+                // the one the session currently resolves to.
+                //
+                // `/backend` is an ALIAS of this, as the slash registry has
+                // always claimed (`cmd("backends", &["backend"], …)`). Until
+                // now that alias was a fiction: `/backend` toggled the coarse
+                // wire KIND while `/backends` picked a NAMED endpoint, so one
+                // registry row described two different commands.
+                //
+                // The kind toggle is not lost — it is where it belongs. A kind
+                // is a property OF a named backend, and the panel's edit form
+                // has carried a `kind` field since #1979. Setting it globally,
+                // detached from the endpoint it applies to, is how a session
+                // ends up pointed at an OpenAI-wire URL in Ollama mode.
                 let active = active_backend_name(&cfg);
                 print_newt("configured backends:", color, verbose);
                 if cfg.backends.is_empty() {
