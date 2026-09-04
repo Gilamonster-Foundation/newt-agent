@@ -18,6 +18,42 @@
 //! These tests touch no process-global state (no env, no filesystem), so
 //! unlike `anthropic_loop.rs` they need neither a serial lane nor an env
 //! guard: the streaming re-issue has no valve to set.
+//!
+//! # They are not load-flaky, and this is why — do not "fix" them with a lane
+//!
+//! Reported as failing under machine load and hunted for deliberately: 6 500+
+//! runs of this file at 32× process oversubscription with every core pinned,
+//! plus 84 whole-`newt-core` runs at up to 256 test threads. **Zero failures
+//! here** — while the SAME runs reproduced load failures in `retry::tests`
+//! (env-global), `tool_spinner_pty_test` (real PTY) and
+//! `execute_tool_branch_tests`, so the harness demonstrably catches this class
+//! on this box. Each suspect is closed by construction, not by luck:
+//!
+//! * **The `Buf` sink.** `flush` is a no-op and every write lands in the shared
+//!   `Vec` synchronously, so there is nothing to lose to a missed flush; and
+//!   `stream_onto` awaits the helper to COMPLETION before reading it, so the
+//!   markdown writer's `finish()` has already run.
+//! * **wiremock.** One server per test, one mock, one request, no `expect()`
+//!   counts — there is no port or expectation shared with anything.
+//! * **The tty/spinner global.** These call with `color = false`, so
+//!   `legacy_caps` yields `LineCaps::None`, `Terminal::lease_with_caps` refuses
+//!   on `!caps.can_own()` BEFORE touching the arbiter mutex, and the spinner is
+//!   `None`. Zero bytes on stdout, zero contention on the lease.
+//! * **The interrupt flag.** `cancelled()` reads the flag on its FIRST poll and
+//!   `select!` is `biased`, so an already-set flag wins without a timer and a
+//!   flag set from the sink is observed on the very next loop iteration. No
+//!   window either way.
+//! * **Chunk boundaries** (what load actually moves): `SseAccumulator` holds a
+//!   rolling line buffer and `MarkdownStreamWriter` holds a line buffer, so
+//!   arrival splits are normalised before anything is asserted.
+//!
+//! The hunt did turn up one REAL load-sensitivity here, and it was not any of
+//! the above: the loop decoded each chunk with its own `from_utf8_lossy`, so a
+//! multi-byte character split across two `chunk()` boundaries became U+FFFD —
+//! silently, in the text that is printed, returned, persisted and re-sent.
+//! Where the boundary falls is exactly what machine load moves. Every body in
+//! this file was ASCII, which is why nothing here could ever see it. Fixed by
+//! `decode_chunk` and covered below; the Ollama wire still has the twin.
 
 use super::*;
 use crate::caveats::Caveats;
@@ -368,9 +404,239 @@ async fn an_interrupt_before_the_send_never_fires_the_second_call() {
     );
     assert_eq!(buf.text(), "", "nothing streamed, so nothing is painted");
     assert!(
-        matches!(out, StreamOutcome::Cancelled),
-        "an interrupt ends the turn; it is not a wire failure to fall back from"
+        matches!(out, StreamOutcome::Cancelled(None)),
+        "an interrupt ends the turn; it is not a wire failure to fall back from — \
+         and with no call fired there is no usage to report, which is `None` and \
+         never a zero: {out:?}"
     );
+}
+
+/// Serve one SSE response over a socket the test owns, and interrupt only once
+/// the client is demonstrably reading it.
+///
+/// `wiremock` cannot express this case. The third outcome arm needs the
+/// interrupt to land AFTER the send resolved and BEFORE any text is painted,
+/// and nothing wiremock exposes says when the client began reading — a flag
+/// tripped from a `Respond` races the send's own completion, which would make
+/// the test either flaky or (worse) silently cover the pre-send arm instead.
+///
+/// TCP backpressure is the signal that removes the race. The padding is far
+/// larger than the socket buffers, so `write_all` returns only after the client
+/// has drained megabytes: by then the send has long resolved and the chunk loop
+/// is running, so the pre-send check cannot be what fires. The padding is SSE
+/// COMMENT lines (`:…`), which `apply_line` drops before `serde_json` is ever
+/// reached, so this costs bytes and not parsing.
+async fn interrupt_once_the_client_is_reading(frames: &str) -> (StreamOutcome, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = cancel.clone();
+    let head = frames.to_string();
+
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut scratch = [0u8; 8192];
+        // The head's CONTENT does not matter; that it arrived does — the
+        // response must not start before the client has actually asked.
+        let asked = sock.read(&mut scratch).await.unwrap();
+        assert!(asked > 0, "the client sent its request");
+        // Neither `Content-Length` nor chunked framing, deliberately: an
+        // HTTP/1.1 response body then runs to connection close, and this
+        // connection never closes. The client therefore BLOCKS in `chunk()`
+        // rather than seeing an EOF — an EOF here would be a cut stream, which
+        // is a different arm entirely.
+        sock.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Connection: close\r\n\r\n{head}"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let pad = format!(":{}\n", "x".repeat(64 * 1024 - 2));
+        for _ in 0..256 {
+            sock.write_all(pad.as_bytes()).await.unwrap();
+        }
+        // 16 MiB have gone out and been drained, so the answer stream is well
+        // under way. NOW the operator presses Esc.
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        std::future::pending::<()>().await;
+    });
+
+    let buf = Buf::default();
+    let req = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({"stream": true}));
+    let out =
+        openai_stream_final_answer(req, buf.clone(), false, false, false, Some(cancel.as_ref()))
+            .await;
+    server.abort();
+    (out, buf.text())
+}
+
+/// Serve an SSE body whose bytes are cut at a chosen offset, with a real gap
+/// between the two writes — the split `reqwest` would otherwise only produce
+/// when the machine is busy, made to happen on demand.
+async fn stream_split_at(body: &str, cut: usize) -> (StreamOutcome, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let bytes = body.as_bytes().to_vec();
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        sock.set_nodelay(true).unwrap();
+        let mut scratch = [0u8; 8192];
+        // The head's CONTENT does not matter; that it arrived does — the
+        // response must not start before the client has actually asked.
+        let asked = sock.read(&mut scratch).await.unwrap();
+        assert!(asked > 0, "the client sent its request");
+        sock.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+              Connection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        sock.write_all(&bytes[..cut]).await.unwrap();
+        sock.flush().await.unwrap();
+        // Let the reader drain the first half before the rest is written, so
+        // the two halves land in two different `chunk()` calls.
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        sock.write_all(&bytes[cut..]).await.unwrap();
+        sock.shutdown().await.unwrap();
+    });
+
+    let buf = Buf::default();
+    let req = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({"stream": true}));
+    let out = openai_stream_final_answer(req, buf.clone(), false, false, false, None).await;
+    server.abort();
+    (out, buf.text())
+}
+
+/// A character split across two chunks is still that character.
+///
+/// `reqwest` splits where the socket did, not where the protocol did — the
+/// same fact `SseAccumulator`'s line buffer exists for — and a chunk boundary
+/// lands wherever machine load puts it. Decoding each chunk on its own turns
+/// the half that arrived into U+FFFD, and that corruption is silent and
+/// permanent: the mangled text is what gets printed, returned, persisted, and
+/// re-sent to the model. It is also invisible to every other test in this
+/// file, because every other body here is ASCII.
+#[tokio::test]
+async fn a_character_split_across_two_chunks_is_not_corrupted() {
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"café\"}}]}\n\ndata: [DONE]\n\n";
+    // Between the two bytes of `é` (0xC3 0xA9) — the boundary a busy box picks
+    // by accident.
+    let cut = body.find('é').unwrap() + 1;
+
+    let (out, painted) = stream_split_at(body, cut).await;
+
+    assert_eq!(
+        printed(out),
+        "café",
+        "the returned answer is what gets re-sent"
+    );
+    assert_eq!(
+        painted, "▸  café\n",
+        "and the operator sees the same: {painted:?}"
+    );
+}
+
+/// The adversarial form of the test above, and the one that cannot go vacuous.
+///
+/// The socket test can only split where the kernel agrees to split, so on some
+/// run it may deliver both halves together and pass without proving anything.
+/// This splits at EVERY byte offset — including inside all of a 2-, 3- and
+/// 4-byte character — and is pure, so it is the guard that actually holds.
+#[test]
+fn decode_chunk_reassembles_a_split_at_every_byte_offset() {
+    let s = "aé→𝄞z";
+    let bytes = s.as_bytes();
+    for cut in 0..=bytes.len() {
+        let mut carry = Vec::new();
+        let mut got = decode_chunk(&mut carry, &bytes[..cut]);
+        got.push_str(&decode_chunk(&mut carry, &bytes[cut..]));
+        assert_eq!(got, s, "split at byte {cut} corrupted the answer");
+        assert!(carry.is_empty(), "nothing is left held at byte {cut}");
+    }
+}
+
+/// Byte-at-a-time is the same property taken to its limit — the shape
+/// `openai_sse`'s own `one_byte_at_a_time_produces_the_same_answer` already
+/// uses one layer up.
+#[test]
+fn decode_chunk_survives_one_byte_at_a_time() {
+    let s = "aé→𝄞z";
+    let mut carry = Vec::new();
+    let got: String = s
+        .as_bytes()
+        .iter()
+        .map(|b| decode_chunk(&mut carry, &[*b]))
+        .collect();
+    assert_eq!(got, s);
+    assert!(carry.is_empty());
+}
+
+/// Bytes that are not a cut character but genuinely invalid must be SPENT, not
+/// held: holding them would grow the carry without bound and stall the stream
+/// forever, waiting for a continuation that is never coming.
+#[test]
+fn decode_chunk_spends_invalid_bytes_instead_of_stalling_on_them() {
+    let mut carry = Vec::new();
+    let got = decode_chunk(&mut carry, b"ok\xffthen");
+    assert_eq!(got, "ok\u{FFFD}then");
+    assert!(
+        carry.is_empty(),
+        "an invalid byte is consumed, never carried"
+    );
+}
+
+/// The third outcome arm, which no test reached: the operator interrupts after
+/// the stream is under way but before one character of the answer has been
+/// painted. That is neither a cut wire nor a fallback — the turn ends empty,
+/// because printing the complete probe answer over an interrupt is the exact
+/// opposite of what Esc asked for.
+///
+/// The usage rides along for the same reason `UseProbe`'s does, and the reason
+/// was never "the answer arrived": the second call reported tokens and they
+/// were spent. Dropping them here while merging them one arm up would make the
+/// turn's billed cost depend on WHICH way the second call failed.
+#[tokio::test]
+async fn an_interrupt_before_any_text_ends_the_turn_and_still_bills_the_call() {
+    // Usage FIRST, so it is parsed well before the interrupt can land; then a
+    // role-only delta, which paints nothing. No text delta anywhere, and no
+    // `[DONE]` — this stream is stopped, not finished.
+    let (out, painted) = interrupt_once_the_client_is_reading(
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":5}}\n\n\
+         data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+    )
+    .await;
+
+    assert_eq!(
+        painted, "",
+        "nothing reached the terminal — that is what makes this arm this arm"
+    );
+    match out {
+        StreamOutcome::Cancelled(usage) => {
+            // `expect` and not a silent skip: reaching the PRE-SEND `Cancelled`
+            // instead would look identical without it, and a test that cannot
+            // tell which arm it covered is not covering either.
+            let u = usage.expect("the second call reported usage before the interrupt");
+            assert_eq!(
+                (u.input_tokens, u.output_tokens),
+                (42, 5),
+                "an interrupted call is still a call the operator paid for: {u:?}"
+            );
+        }
+        other => panic!("an interrupt with nothing on screen ends the turn, got {other:?}"),
+    }
 }
 
 /// A sink that trips the interrupt flag the moment the answer starts
@@ -488,6 +754,11 @@ async fn the_final_round_is_re_issued_as_a_stream() {
 /// End to end: an interrupt that lands after the probe answered ends the turn
 /// with an empty reply — the loop's own round-boundary contract — and the
 /// second inference call never leaves the harness.
+///
+/// An empty REPLY is not an empty BILL. The probe round was paid for before
+/// the operator pressed anything, so its usage has to survive the cancelled
+/// arm; a turn that reports no tokens because it ended early would understate
+/// what the session actually cost.
 #[tokio::test]
 async fn an_interrupt_after_the_probe_ends_the_turn_with_no_second_call() {
     let server = MockServer::start().await;
@@ -505,7 +776,7 @@ async fn an_interrupt_after_the_probe_ends_the_turn_with_no_second_call() {
     let uri = server.uri();
     let mut ctx = ctx(&uri, &messages, &caveats);
     ctx.cancel = Some(cancel.as_ref());
-    let (reply, streamed, _usage, _hallu) = chat_complete(ctx, &mut NoMcp)
+    let (reply, streamed, usage, _hallu) = chat_complete(ctx, &mut NoMcp)
         .await
         .expect("an interrupt is not an error");
 
@@ -515,6 +786,12 @@ async fn an_interrupt_after_the_probe_ends_the_turn_with_no_second_call() {
         server.received_requests().await.unwrap().len(),
         1,
         "only the probe — the operator cancelled before the re-issue"
+    );
+    let u = usage.expect("the probe round was billed before the interrupt landed");
+    assert_eq!(
+        (u.input_tokens, u.output_tokens),
+        (100, 7),
+        "the cancelled arm returns the turn's accumulated usage, not a fresh zero: {u:?}"
     );
 }
 

@@ -7291,9 +7291,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 // Esc, with nothing streamed. Same contract as the interrupt
                 // checkpoint at the top of this loop: the turn ends with an
                 // empty reply rather than printing an answer the operator
-                // just asked to stop.
-                StreamOutcome::Cancelled => {
-                    return Ok((String::new(), false, accumulated_usage, hallucination_count))
+                // just asked to stop. The usage merges like both arms above —
+                // an interrupted call is still a call the operator paid for,
+                // and billing that depended on WHICH way the second call ended
+                // would be a lie about the turn's cost.
+                StreamOutcome::Cancelled(stream_usage) => {
+                    accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
+                    return Ok((String::new(), false, accumulated_usage, hallucination_count));
                 }
             };
             // #1964: this normal (non-cap) finish gets the same claim check
@@ -11143,6 +11147,53 @@ impl<W: std::io::Write> AnswerSink<W> {
     }
 }
 
+/// Decode one wire chunk, holding an INCOMPLETE trailing character back for
+/// the next one.
+///
+/// It replaces a per-chunk `String::from_utf8_lossy`, which was wrong for
+/// exactly the reason a per-chunk `lines()` split is wrong: `reqwest` splits
+/// where the socket did, not where the protocol did. A multi-byte character
+/// therefore straddles a chunk boundary whenever the boundary happens to fall
+/// inside it — and lossy decoding replaces the half that arrived with U+FFFD.
+/// That corruption is silent and permanent: the mangled text is what gets
+/// printed, returned, persisted, and re-sent to the model. Where the boundary
+/// falls is a function of machine load, so the same reply is clean on an idle
+/// box and mangled on a busy one; `café` arrives as `caf\u{FFFD}\u{FFFD}`.
+///
+/// Only a TRUNCATED tail is carried (`Utf8Error::error_len() == None`).
+/// Genuinely invalid bytes are consumed lossily and the loop continues, so a
+/// server emitting garbage cannot grow `carry` without bound or stall the
+/// stream waiting for a continuation that will never come.
+fn decode_chunk(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
+    carry.extend_from_slice(chunk);
+    let mut out = String::new();
+    loop {
+        let err = match std::str::from_utf8(carry) {
+            Ok(s) => {
+                out.push_str(s);
+                carry.clear();
+                return out;
+            }
+            Err(e) => e,
+        };
+        let good = err.valid_up_to();
+        // Valid by construction, so this is a decode and never a replacement.
+        out.push_str(&String::from_utf8_lossy(&carry[..good]));
+        match err.error_len() {
+            // Cut at the boundary: the rest is in the next chunk.
+            None => {
+                carry.drain(..good);
+                return out;
+            }
+            // Not a cut — actually invalid. Spend it and keep going.
+            Some(n) => {
+                carry.drain(..good + n);
+                out.push(char::REPLACEMENT_CHARACTER);
+            }
+        }
+    }
+}
+
 /// What the streaming re-issue produced, and so what the caller owes the
 /// operator. Three arms because the caller has three different jobs — an
 /// `Option` collapsed the last two, and the collapse is what let an operator's
@@ -11163,7 +11214,15 @@ enum StreamOutcome {
     /// The operator interrupted with nothing on screen. End the turn with an
     /// empty reply, the same contract as the loop's round-boundary interrupt
     /// checkpoint — an interrupt is not a wire failure to recover from.
-    Cancelled,
+    ///
+    /// Carries usage for the SAME reason `UseProbe` does, and the reason is not
+    /// "the answer arrived" — it is that the tokens were spent. A cancelled
+    /// stream that had already reported usage was billed for a prefill the
+    /// operator paid for and stopped; dropping it here while merging it one arm
+    /// up would make the turn's cost depend on WHICH way the second call
+    /// failed. `None` when the send was never fired, because then nothing was
+    /// spent — an honest absence, not a zero.
+    Cancelled(Option<crate::TokenUsage>),
 }
 
 /// Re-issue an accepted OpenAI-compatible round as a stream and print it live.
@@ -11206,7 +11265,8 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     // answers.
     let sent = match cancellable(cancel, req.send()).await {
         Some(sent) => sent,
-        None => return StreamOutcome::Cancelled,
+        // Nothing was sent, so nothing was spent — `None` is the honest figure.
+        None => return StreamOutcome::Cancelled(None),
     };
     let resp = match sent {
         Ok(r) if r.status().is_success() => r,
@@ -11242,6 +11302,8 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     let mut started = false;
     let mut transport_break: Option<String> = None;
     let mut interrupted = false;
+    // The bytes of a character that has only half arrived. See `decode_chunk`.
+    let mut carry: Vec<u8> = Vec::new();
     let mut resp = resp;
     while !acc.is_done() {
         match cancellable(cancel, resp.chunk()).await {
@@ -11253,10 +11315,11 @@ async fn openai_stream_final_answer<W: std::io::Write>(
                 break;
             }
             Some(Ok(Some(chunk))) => {
-                // Lossy UTF-8 into the accumulator's ROLLING line buffer — a
-                // `data:` line routinely splits across chunks, so a per-chunk
-                // `lines()` split would drop events.
-                for action in acc.feed(&String::from_utf8_lossy(&chunk)) {
+                // Two rolling buffers, one per layer, because `reqwest` splits
+                // where the socket did and the protocol cares about neither
+                // boundary: `decode_chunk` carries half a CHARACTER to the next
+                // chunk, and the accumulator carries half a LINE.
+                for action in acc.feed(&decode_chunk(&mut carry, &chunk)) {
                     let openai_sse::StreamAction::TextDelta(raw) = action else {
                         // See the doc comment: the fold above already showed it.
                         continue;
@@ -11298,8 +11361,10 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     if text.is_empty() {
         // Nothing reached the terminal, so an interrupt here ends the turn
         // rather than printing the probe answer the operator just stopped.
+        // The usage still travels: the call FIRED, so whatever it reported was
+        // billed, exactly as on the `UseProbe` arms below.
         if interrupted {
-            return StreamOutcome::Cancelled;
+            return StreamOutcome::Cancelled(round.usage);
         }
         if debug {
             print_debug("stream produced no text — using probe content", color);
@@ -11315,13 +11380,30 @@ async fn openai_stream_final_answer<W: std::io::Write>(
         return StreamOutcome::Printed(text, round.usage);
     }
     // A stream that never reached `[DONE]` was CUT: the fragment on screen
-    // stops at whatever byte the socket died on. The other two wires keep
-    // their partial because the partial is all they have — this one is not in
-    // that position. The probe answer is complete, was already accepted by
-    // every gate, and is what gets persisted and re-sent, so returning the
-    // fragment would silently truncate the turn's record to whatever arrived.
-    // Say the stream was cut, then hand the complete answer back for the
-    // caller to print under it.
+    // stops at whatever byte the socket died on. The probe answer is complete,
+    // was already accepted by every gate, and is what gets persisted and
+    // re-sent, so returning the fragment would silently truncate the turn's
+    // record to whatever arrived. Say the stream was cut, then hand the
+    // complete answer back for the caller to print under it.
+    //
+    // SCOPE — deliberate, and NOT "the siblings were checked and are fine".
+    // Anthropic streams its round directly, so its partial really is all it
+    // has. **Ollama is not in that position and has this exact defect.** It
+    // runs the same probe-then-reissue, is holding the complete answer in
+    // `probe_content`, and recovers only when `resp.chunk()` returns an `Err`
+    // (#640's "stream broke mid-response" arm at that call site). A clean EOF
+    // with no `done:true` chunk is `Ok(None)`, not an error: `stream_response`
+    // hands the fragment back as `Ok`, and the call site returns it as the
+    // turn's answer with `was_streamed = true` while `probe_content` is
+    // dropped. Measured, not inferred — an `/api/chat` mock that streams one
+    // token and closes returns the fragment today.
+    //
+    // Widening the fix there is a separate change, not three lines: `done` has
+    // to come out of `stream_response`, an `interrupted` flag has to come with
+    // it (or Esc gets reported as a broken wire — the defect this wire fixed
+    // one commit ago), and the cut-fragment-with-an-empty-probe corner has to
+    // be decided. It is the same probe-then-reissue question this branch has
+    // already left open, and it is the operator's call.
     if !round.done {
         let why = transport_break.unwrap_or_else(|| "stream ended before [DONE]".to_string());
         display::write_harness_notice(
