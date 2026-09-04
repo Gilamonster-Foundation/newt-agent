@@ -12047,34 +12047,34 @@ Tab through what's installed with /models.
         }
         "backend" => {
             "\
-/backend — the backend panel (chooser · editor), plus the wire-kind toggle
+/backend — an alias of /backends (#2048)
 
-Bare /backend on a rich interactive terminal opens the backend panel: ←/→
-spins through the configured backends (plus the bare openai/ollama kind
-toggles), ◀ marks the active one; Enter applies the pick with exactly the
-/backends <name> semantics; Esc leaves silently. `e` edits the selected
-entry, `a` adds one (name, kind, url, model, api-key env/file — written
-crash-safe to ~/.newt/backends/<name>.toml), and `:d <name>` removes one
-(the active backend only together with a new selection, one transaction).
-
-The text forms keep working everywhere (piped, lean build, headless):
-  /backend ollama deepseek-r1   session-only wire-kind toggle (not persisted)
-  /backend openai gpt-4.1
-Use /backends <name> or /model <name> to make a choice persist."
+They were never two commands the operator should have had to tell apart, and
+the slash registry always described them as one. See /help backends."
         }
         "backends" => {
             "\
-/backends [name] — alias of /backend: panel, text list, or switch by name
+/backends [name] — the backend panel, the text list, or a switch by name
 
-Bare /backends on a rich interactive terminal opens the same backend panel
-as /backend (chooser · edit · add · remove). The text forms remain:
+Bare /backends on a rich interactive terminal opens the panel: ←/→ spins
+through the configured backends, ◀ marks the active one; Enter applies the
+pick; Esc leaves silently. `e` edits the selected entry, `a` adds one (name,
+kind, url, model, api-key env/file — written crash-safe to
+~/.newt/backends/<name>.toml), and `d` removes one after confirming, naming
+what is lost and where from.
+
+The text forms work everywhere (piped, lean build, headless):
   /backends            list every configured backend, ◀ the active one
   /backends dgx1       repoint this session at the 'dgx1' backend
 
-Where /backend's kind toggle picks the coarse openai-vs-ollama wire protocol,
-/backends <name> picks a NAMED backend (dgx1, gpu-runner, openai, …) regardless of
-its protocol. Your choice sticks across runs (~/.newt/settings.toml); an
-explicit NEWT_PROVIDER or a --loadout still overrides it."
+A backend's WIRE KIND (openai / ollama) is a field on the backend itself,
+edited with `e` in the panel. `/backend <kind>` used to set it globally,
+detached from the endpoint it applied to — which is how a session ends up
+pointed at an OpenAI-wire URL in Ollama mode. Pick a named backend that
+already has the kind you want instead.
+
+Your choice sticks across runs (~/.newt/settings.toml); an explicit
+NEWT_PROVIDER or a --loadout still overrides it."
         }
         "crew" => {
             "\
@@ -12724,9 +12724,8 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /models                  - list models on the active endpoint",
         "  /models capabilities     - tool-conformance matrix (cached)",
         "  /model <name>            - switch model on the active backend (sticks across runs)",
-        "  /backend                 - backend panel on a rich TTY: choose · edit · add · remove",
-        "  /backend <openai|ollama> [model] - text form: switch the wire kind (e.g. /backend ollama deepseek-r1)",
-        "  /backends [name]         - alias of /backend; text list stays: bare lists (piped/lean), /backends <name> switches",
+        "  /backends [name]         - backend panel on a rich TTY (choose · edit · add · remove); text: list, or switch by name",
+        "  /backend                 - alias of /backends",
         "  /thinking                - folded into /settings thinking",
         "  /settings [field value]  - the settings form: edit-mode + effort dials + rounds; every applied change writes a receipt (#1981)",
         "  /probe [model|all]       - classify tool use, context window, thinking, calibration (all = re-probe every model; Esc cancels)",
