@@ -1248,6 +1248,41 @@ fn help_request_treats_start_and_rename_titles_as_titles_not_help() {
     // A SOLE help token still asks for help, folded to the documenting page.
     assert_eq!(help_request("/start --help").as_deref(), Some("new"));
     assert_eq!(help_request("/rename -h").as_deref(), Some("conversation"));
+
+    // **`/name` is `/rename`'s alias and was NOT carved out** — the list named
+    // two verbs and the alias was not one of them, so `/name help me debug`
+    // opened a help page instead of retitling the conversation. Found while
+    // porting the carve-out to `Text` fields (#2009 PR5).
+    assert_eq!(help_request("/name help me debug"), None);
+    assert_eq!(help_request("/name fix the -h flag"), None);
+    assert_eq!(help_request("/name -h").as_deref(), Some("conversation"));
+}
+
+/// **A free-text SETTING is carved out the same way a free-text verb is.**
+///
+/// `/settings prompt "help me"` is a template, not a help request. The rule
+/// was hardcoded to two verb names; a `Text` field is the same situation
+/// arriving through a different door, so the predicate asks the FIELD whether
+/// it takes free text rather than growing a third name in a list.
+#[test]
+fn help_request_treats_a_text_settings_value_as_a_value_not_help() {
+    assert_eq!(help_request("/settings prompt \"help me\""), None);
+    assert_eq!(help_request("/settings prompt [$TIME] -h > "), None);
+    // The field itself still has a page, reached the way every other one is.
+    assert_eq!(
+        help_request("/settings prompt --help").as_deref(),
+        Some("settings")
+    );
+    assert_eq!(
+        help_request("/settings --help").as_deref(),
+        Some("settings")
+    );
+    // A CHOICE field is not free text: its values are a closed vocabulary, so
+    // a help token among them is a help request as it always was.
+    assert_eq!(
+        help_request("/settings mode --help").as_deref(),
+        Some("settings")
+    );
 }
 
 #[test]

@@ -76,6 +76,21 @@ pub(crate) enum ValueSpace {
         min: usize,
         max: usize,
     },
+    /// **Free text, taken verbatim.**
+    ///
+    /// Not a vocabulary and not a number: a prompt template is whatever the
+    /// operator typed, trailing space and all. `release` releases the setting
+    /// back to config the way `auto` does for a number, so "go back to my
+    /// `[tui] prompt`" stays a value rather than becoming a second verb.
+    ///
+    /// The important half is in `run`: a `Text` field reads the RAW remainder
+    /// of the line, because trimming it would silently eat the trailing space
+    /// in `/settings prompt "❯ "` — which is the single most likely template
+    /// anyone writes.
+    Text {
+        release: &'static str,
+        placeholder: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +102,7 @@ pub(crate) enum Field {
     Nudge,
     Markdown,
     Mode,
+    Prompt,
     Rounds,
 }
 
@@ -100,6 +116,7 @@ impl Field {
         Self::Nudge,
         Self::Markdown,
         Self::Mode,
+        Self::Prompt,
         Self::Rounds,
     ];
 
@@ -115,6 +132,7 @@ impl Field {
             Self::Nudge => "nudge",
             Self::Markdown => "markdown",
             Self::Mode => "mode",
+            Self::Prompt => "prompt",
             Self::Rounds => "rounds",
         }
     }
@@ -128,6 +146,7 @@ impl Field {
             Self::Nudge => "action-pressure nudges",
             Self::Markdown => "markdown rendering",
             Self::Mode => "operating mode",
+            Self::Prompt => "input prompt template",
             Self::Rounds => "tool-call round limit",
         }
     }
@@ -205,6 +224,10 @@ impl Field {
                     .map(|m| (m.as_str(), m.description().to_string()))
                     .collect(),
             ),
+            Self::Prompt => ValueSpace::Text {
+                release: "reset",
+                placeholder: "\"[$TIME] ❯ \"",
+            },
             // The one field that is not a vocabulary. `/rounds double` and
             // `/rounds unlimited` stay affordances of the VERB — they are
             // relative operations, not values — and the verb resolves them to a
@@ -253,6 +276,9 @@ impl Field {
             Self::Mode => newt_core::operating_mode::session_operating_mode()
                 .as_str()
                 .to_string(),
+            // The TEMPLATE, not the rendered preview: the setting is what this
+            // form can change, and the preview is what resolution makes of it.
+            Self::Prompt => crate::prompt::active_prompt_template(),
             Self::Rounds => newt_core::tenacity::session_tool_rounds()
                 .map_or_else(|| "auto".to_string(), |n| n.to_string()),
         }
@@ -273,6 +299,17 @@ impl Field {
                 .map_or_else(|| SettingValue::Token(self.current()), SettingValue::from),
             _ => SettingValue::Token(self.current()),
         }
+    }
+
+    /// Whether this field's value is FREE TEXT rather than a vocabulary.
+    ///
+    /// Asked by `help_request`: a template may legitimately contain `help` or
+    /// `-h`, so `/settings prompt "help me"` must not be swallowed by the help
+    /// interceptor. The carve-out asks the field instead of carrying a third
+    /// hardcoded name beside `start` and `rename` — a list that had already
+    /// gone stale by missing `/name` (#2009 PR5).
+    pub(crate) fn takes_free_text(self) -> bool {
+        matches!(self.value_space(), ValueSpace::Text { .. })
     }
 
     /// Resolve a deep-link token to a field.
@@ -324,6 +361,18 @@ impl Field {
                 .into_iter()
                 .find(|(v, _)| *v == want)
                 .map(|(v, _)| v.to_string()),
+            // Verbatim, from the ORIGINAL — `want` is lowercased, and a
+            // template is not case-insensitive. One layer of surrounding
+            // quotes comes off, which is what lets a trailing space be typed
+            // at all.
+            ValueSpace::Text { release, .. } => {
+                let raw = crate::prompt::strip_one_quote_pair(value);
+                if raw.trim().eq_ignore_ascii_case(release) || raw.trim().is_empty() {
+                    Some(release.to_string())
+                } else {
+                    Some(raw.to_string())
+                }
+            }
             ValueSpace::Number { release, min, max } => {
                 if want == release {
                     return Some(release.to_string());
@@ -344,7 +393,9 @@ impl Field {
     fn offered(self) -> Vec<&'static str> {
         match self.value_space() {
             ValueSpace::Choice(values) => values.into_iter().map(|(v, _)| v).collect(),
-            ValueSpace::Number { release, .. } => vec![release],
+            ValueSpace::Number { release, .. } | ValueSpace::Text { release, .. } => {
+                vec![release]
+            }
         }
     }
 
@@ -360,6 +411,10 @@ impl Field {
             ValueSpace::Number { release, min, max } => {
                 format!("{release}, or a number from {min} to {max}")
             }
+            ValueSpace::Text {
+                release,
+                placeholder,
+            } => format!("{release}, or a template like {placeholder}"),
         }
     }
 }
@@ -485,6 +540,16 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         // config again; anything else is a number `accepts` has already
         // bounded, so the parse cannot fail.
         Field::Rounds => newt_core::tenacity::set_session_tool_rounds(value.parse::<usize>().ok()),
+        // `reset` removes the variable rather than storing the word, so the
+        // session falls back to `[tui] prompt` and no leftover survives for
+        // the next `/prompt` to explain — the same shape `/nudge on` uses.
+        Field::Prompt => {
+            if value == "reset" {
+                newt_core::process_env::remove_var("NEWT_PROMPT");
+            } else {
+                newt_core::process_env::set_var("NEWT_PROMPT", value);
+            }
+        }
     }
     Ok(format!("{}: {value}", field.label()))
 }
@@ -691,9 +756,13 @@ pub(crate) fn moved_notice(verb: &str, field: Field) -> String {
 /// token deep-links to a field's value menu; two apply directly. Returns the
 /// lines to print — the caller owns the terminal, this owns no I/O.
 pub(crate) fn run(ask: Ask<'_>, rest: &str) -> Vec<String> {
-    let mut parts = rest.trim().splitn(2, char::is_whitespace);
+    // `trim_end` only for the split: a trailing space belongs to a `Text`
+    // value, so trimming the whole line here would eat it before anything
+    // could decide whether it mattered.
+    let mut parts = rest.trim_start().splitn(2, char::is_whitespace);
     let first = parts.next().unwrap_or("").trim();
-    let second = parts.next().unwrap_or("").trim();
+    let raw_second = parts.next().unwrap_or("");
+    let second = raw_second.trim();
 
     // `/settings <field> <value>` — no question needed.
     if !first.is_empty() {
@@ -704,8 +773,20 @@ pub(crate) fn run(ask: Ask<'_>, rest: &str) -> Vec<String> {
                 known.join(", ")
             )];
         };
-        if !second.is_empty() {
-            return vec![match apply_and_record(field, second, "/settings") {
+        // **The deep link carries the quoted template verbatim** (#2009 PR5).
+        //
+        // This is the parsing the `/prompt set` verb owned, ported rather than
+        // reinvented: everything after the field name is the literal value,
+        // taken from the RAW remainder so internal and trailing spaces
+        // survive, with one layer of surrounding quotes stripped by `accepts`.
+        //
+        // `/settings prompt "❯ "` is the case that decides it. Trimming turns
+        // it into `❯`, which renders flush against whatever the operator
+        // types, and nothing in the pipeline would report the difference.
+        let is_text = matches!(field.value_space(), ValueSpace::Text { .. });
+        let value = if is_text { raw_second } else { second };
+        if !value.trim().is_empty() {
+            return vec![match apply_and_record(field, value, "/settings") {
                 Ok(msg) | Err(msg) => msg,
             }];
         }
@@ -740,6 +821,21 @@ fn ask_value(ask: Ask<'_>, field: Field) -> Vec<String> {
             let answer = answer.trim().to_string();
             // An empty line is backing out, not an invalid number.
             if answer.is_empty() {
+                return cancelled();
+            }
+            answer
+        }
+        // Free text, taken as typed — `accepts` is the one validator, and for
+        // a template it accepts anything, so the form grows no second opinion
+        // about what a prompt may contain.
+        ValueSpace::Text { .. } => {
+            let interaction = SurfaceInteraction::blocking(definition.clone());
+            let HumanQuestionOutcome::Answer(answer) = ask(&interaction) else {
+                return cancelled();
+            };
+            // NOT trimmed: `"❯ "` is the likeliest template anyone types and
+            // its trailing space is the point. An empty line is backing out.
+            if answer.trim().is_empty() {
                 return cancelled();
             }
             answer
@@ -965,6 +1061,57 @@ mod tests {
     /// **Every alias the absorbed verbs took still resolves.** Each of these
     /// was reachable before the family moved; absorbing a command must not
     /// quietly delete an affordance operators already type.
+    /// **The trailing space survives the deep link.**
+    ///
+    /// `/settings prompt "❯ "` is the case that decides whether the port was
+    /// real. `run` split on whitespace and trimmed, which would turn that
+    /// template into `❯` — rendering flush against whatever the operator
+    /// types — and nothing downstream would report the difference. The quoted
+    /// parsing the `/prompt set` verb owned is carried, not reinvented.
+    #[test]
+    fn a_quoted_template_reaches_the_field_verbatim() {
+        let _guard = settings_guard();
+        newt_core::process_env::remove_var("NEWT_PROMPT");
+
+        let out = run(&declining(), "prompt \"[$TIME] ❯ \"");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            Field::Prompt.current(),
+            "[$TIME] ❯ ",
+            "the trailing space is the whole point of quoting it"
+        );
+
+        // Internal spaces too, and one layer of quotes only.
+        run(&declining(), "prompt \"a  b\"");
+        assert_eq!(Field::Prompt.current(), "a  b");
+    }
+
+    /// `reset` is a VALUE of the field, not a second verb — and it removes the
+    /// variable rather than storing the word, so nothing is left for the next
+    /// `/prompt` to explain.
+    #[test]
+    fn resetting_the_prompt_releases_it_to_config() {
+        let _guard = settings_guard();
+        newt_core::process_env::set_var("NEWT_PROMPT", "custom ");
+        assert_eq!(Field::Prompt.current(), "custom ");
+
+        run(&declining(), "prompt reset");
+        assert!(
+            std::env::var("NEWT_PROMPT").is_err(),
+            "reset must remove the override, not store the word"
+        );
+        assert_ne!(Field::Prompt.current(), "reset");
+    }
+
+    /// A `Text` field is not a menu and not a number, and the hint says so.
+    #[test]
+    fn the_text_field_offers_a_release_and_a_shape_not_a_vocabulary() {
+        assert_eq!(Field::Prompt.offered(), vec!["reset"]);
+        let hint = Field::Prompt.accepts_hint();
+        assert!(hint.contains("reset"), "{hint}");
+        assert!(hint.contains("template"), "{hint}");
+    }
+
     /// **The mode field's vocabulary IS the enum's** (#2009 PR4b).
     ///
     /// The styles, their order and their descriptions are read off

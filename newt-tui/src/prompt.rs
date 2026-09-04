@@ -167,12 +167,15 @@ pub(crate) fn prompt_token_help() -> Vec<String> {
         .collect()
 }
 
-/// The active prompt template (`NEWT_PROMPT` > `[tui] prompt` > the built-in
-/// default) and its live expansion, for `/prompt`'s preview line. Resolving the
-/// model + edit mode here lets the preview show the *expanded* result so a
-/// backslash/TOML escaping mistake is visible at a glance.
-pub(crate) fn current_prompt_and_preview(workspace: &str) -> (String, String) {
-    let template = std::env::var("NEWT_PROMPT")
+/// The active prompt TEMPLATE: `NEWT_PROMPT` > `[tui] prompt` > the built-in
+/// default.
+///
+/// Split out of `current_prompt_and_preview` for `/settings prompt` (#2009
+/// PR5), which needs the template a field reports and not the expansion a
+/// preview line shows. One resolver, two callers — the preview still asks this
+/// rather than re-deriving the precedence beside it.
+pub(crate) fn active_prompt_template() -> String {
+    std::env::var("NEWT_PROMPT")
         .ok()
         .or_else(|| {
             newt_core::Config::resolve()
@@ -180,7 +183,15 @@ pub(crate) fn current_prompt_and_preview(workspace: &str) -> (String, String) {
                 .and_then(|c| c.tui)
                 .and_then(|t| t.prompt)
         })
-        .unwrap_or_else(|| DEFAULT_RICH_PROMPT.to_string());
+        .unwrap_or_else(|| DEFAULT_RICH_PROMPT.to_string())
+}
+
+/// The active prompt template and its live expansion, for `/prompt`'s preview
+/// line. Resolving the
+/// model + edit mode here lets the preview show the *expanded* result so a
+/// backslash/TOML escaping mistake is visible at a glance.
+pub(crate) fn current_prompt_and_preview(workspace: &str) -> (String, String) {
+    let template = active_prompt_template();
     let model = newt_core::Config::resolve_runtime()
         .ok()
         .and_then(|c| super::resolve_backend_choice(&c).ok())
