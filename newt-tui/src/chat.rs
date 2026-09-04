@@ -1738,7 +1738,6 @@ fn session_body(
     let mut active_posture: Option<ActivePosture> = None;
     // Step 25.4 (#568): per-session Markdown override set by `/markdown on|off`.
     // `None` defers to `[tui].markdown`; `Some(b)` forces it for the session.
-    let mut markdown_override: Option<bool> = None;
     // #1235: per-session live spill height. `None` follows `[tui].spill_lines`;
     // `Some(0)` keeps completed output unbounded and disables the live frame.
     //
@@ -3039,12 +3038,7 @@ fn session_body(
                     // <cmd>`) uniformly — even the ones handled inline below.
                     // A bare `/help` falls through to the full command list.
                     if let Some(topic) = help_request(&task) {
-                        print_command_help(
-                            &topic,
-                            color,
-                            verbose,
-                            markdown_enabled(&cfg, color, markdown_override),
-                        );
+                        print_command_help(&topic, color, verbose, markdown_enabled(&cfg, color));
                         println!();
                         continue;
                     }
@@ -3784,8 +3778,8 @@ fn session_body(
                     if slash_md == "markdown" || slash_md.starts_with("markdown ") {
                         let arg = slash_md.strip_prefix("markdown").unwrap_or("").trim();
                         if arg.is_empty() {
-                            let on = markdown_enabled(&cfg, color, markdown_override);
-                            let src = if markdown_override.is_some() {
+                            let on = markdown_enabled(&cfg, color);
+                            let src = if newt_core::config::markdown_is_session_pinned() {
                                 "session"
                             } else {
                                 "config"
@@ -3799,8 +3793,11 @@ fn session_body(
                                 verbose,
                             );
                         } else if let Some(mode) = newt_core::MarkdownMode::from_keyword(arg) {
-                            markdown_override = mode.forced();
-                            let on = markdown_enabled(&cfg, color, markdown_override);
+                            // Through the SAME writer `/settings markdown`
+                            // uses, so the verb and the field cannot set
+                            // different things.
+                            newt_core::process_env::set_var("NEWT_MARKDOWN", mode.keyword());
+                            let on = markdown_enabled(&cfg, color);
                             print_newt(
                                 &format!(
                                     "markdown → {} (now {})",
@@ -6271,7 +6268,7 @@ fn session_body(
                         workspace,
                         color,
                         verbose,
-                        markdown_enabled(&cfg, color, markdown_override),
+                        markdown_enabled(&cfg, color),
                         Some(&ask_surface),
                     )?;
                     surface.save_history();
@@ -7522,7 +7519,7 @@ fn session_body(
                                         color,
                                         // Step 25.4 (#568): `[tui].markdown` ∧
                                         // `/markdown` override ∧ color.
-                                        markdown: markdown_enabled(&cfg, color, markdown_override),
+                                        markdown: markdown_enabled(&cfg, color),
                                         // Step 26.3 (#584): offload oversized tool
                                         // results to the session spill store.
                                         tool_offload: tool_offload_on,
@@ -7895,7 +7892,7 @@ fn session_body(
                                 } else if !was_streamed {
                                     // Step 25.4 (#568): the non-stream fallback also
                                     // renders Markdown when it is active.
-                                    if markdown_enabled(&cfg, color, markdown_override) {
+                                    if markdown_enabled(&cfg, color) {
                                         let cols = crossterm::terminal::size()
                                             .map(|(c, _)| c as usize)
                                             .unwrap_or(80)

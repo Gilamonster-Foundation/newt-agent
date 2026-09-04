@@ -85,6 +85,7 @@ pub(crate) enum Field {
     Cognition,
     Thinking,
     Nudge,
+    Markdown,
     Rounds,
 }
 
@@ -96,6 +97,7 @@ impl Field {
         Self::Cognition,
         Self::Thinking,
         Self::Nudge,
+        Self::Markdown,
         Self::Rounds,
     ];
 
@@ -109,6 +111,7 @@ impl Field {
             Self::Cognition => "cognition",
             Self::Thinking => "thinking",
             Self::Nudge => "nudge",
+            Self::Markdown => "markdown",
             Self::Rounds => "rounds",
         }
     }
@@ -120,6 +123,7 @@ impl Field {
             Self::Cognition => "cognition",
             Self::Thinking => "reasoning display",
             Self::Nudge => "action-pressure nudges",
+            Self::Markdown => "markdown rendering",
             Self::Rounds => "tool-call round limit",
         }
     }
@@ -179,6 +183,14 @@ impl Field {
                 ("on", "action-pressure steering enabled (default)"),
                 ("off", "no narration rescue / workflow repair / plan pushes"),
             ]),
+            // `auto` is a real choosable value, not the absence of one: it
+            // means "follow colour", which is a different state from `on`
+            // on a pipe. The absorbed verb offered all three and so does this.
+            Self::Markdown => owned(&[
+                ("auto", "render when colour is active (default)"),
+                ("on", "always render (still needs colour)"),
+                ("off", "stream raw text"),
+            ]),
             // The one field that is not a vocabulary. `/rounds double` and
             // `/rounds unlimited` stay affordances of the VERB — they are
             // relative operations, not values — and the verb resolves them to a
@@ -219,6 +231,11 @@ impl Field {
             }
             .to_string(),
             Self::Nudge => if nudges_off() { "off" } else { "on" }.to_string(),
+            // The OVERRIDE, like the dials — `auto` is what this form can set
+            // and what resolution then fills in from colour.
+            Self::Markdown => newt_core::config::session_markdown_mode()
+                .keyword()
+                .to_string(),
             Self::Rounds => newt_core::tenacity::session_tool_rounds()
                 .map_or_else(|| "auto".to_string(), |n| n.to_string()),
         }
@@ -270,6 +287,11 @@ impl Field {
             // `/rounds reset|default` release the override, the same word the
             // dials use for the same act.
             (Self::Rounds, "reset" | "default") => "auto",
+            // `/markdown always|never` — the keywords `MarkdownMode` has
+            // always aliased. Absorbing a verb must not drop an affordance
+            // operators already type.
+            (Self::Markdown, "always") => "on",
+            (Self::Markdown, "never") => "off",
             _ => want.as_str(),
         };
         match self.value_space() {
@@ -410,6 +432,9 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
                 .map_or(CognitionOverride::Unset, CognitionOverride::Set),
         }),
         Field::Thinking => newt_core::process_env::set_var("NEWT_THINKING", value),
+        // Written the same way `/markdown` writes it, under the #1850 lock,
+        // and read back through the one resolver that owns the precedence.
+        Field::Markdown => newt_core::process_env::set_var("NEWT_MARKDOWN", value),
         // `on` REMOVES the variable rather than setting it, which is what the
         // absorbed `/nudge on` did: the readers test for `=off`, so an unset
         // variable and `on` are the same state and only one of them is a
@@ -905,6 +930,52 @@ mod tests {
     /// **Every alias the absorbed verbs took still resolves.** Each of these
     /// was reachable before the family moved; absorbing a command must not
     /// quietly delete an affordance operators already type.
+    /// **The verb and the field write the same state** (#2009 PR4).
+    ///
+    /// `/markdown off` set a `run_chat` local; `/settings markdown off` could
+    /// not see it. Two writers for one setting is how they come to disagree,
+    /// and it is why the receipt could not record a from→to. Both doors now
+    /// go through `NEWT_MARKDOWN`, read back by the one resolver.
+    #[test]
+    fn the_markdown_field_and_its_verb_resolve_to_one_state() {
+        let _guard = settings_guard();
+        newt_core::process_env::remove_var("NEWT_MARKDOWN");
+        assert_eq!(
+            Field::Markdown.current(),
+            newt_core::config::session_markdown_mode().keyword(),
+            "unpinned, the field reports what the resolver resolves"
+        );
+
+        assert_eq!(
+            apply(Field::Markdown, "off"),
+            Ok("markdown rendering: off".to_string())
+        );
+        assert_eq!(Field::Markdown.current(), "off");
+        assert!(newt_core::config::markdown_is_session_pinned());
+
+        // `auto` is a value, not a release: it means "follow colour", which
+        // is a different state from `on` on a pipe.
+        assert_eq!(
+            apply(Field::Markdown, "auto"),
+            Ok("markdown rendering: auto".to_string())
+        );
+        assert_eq!(Field::Markdown.current(), "auto");
+        assert!(
+            newt_core::config::markdown_is_session_pinned(),
+            "`auto` is still an operator pin — it beats a config that says off"
+        );
+    }
+
+    /// The keywords the verb accepted, kept. Absorbing a command must not
+    /// silently drop an affordance operators already type.
+    #[test]
+    fn the_markdown_verbs_aliases_survive_absorption() {
+        assert_eq!(Field::Markdown.accepts("always"), Some("on".to_string()));
+        assert_eq!(Field::Markdown.accepts("never"), Some("off".to_string()));
+        assert_eq!(Field::Markdown.accepts("AUTO"), Some("auto".to_string()));
+        assert_eq!(Field::Markdown.accepts("sometimes"), None);
+    }
+
     #[test]
     fn the_aliases_the_absorbed_verbs_took_still_resolve() {
         for (field, typed, want) in [

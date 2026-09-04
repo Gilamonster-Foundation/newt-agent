@@ -71,6 +71,15 @@ const ENV_KEYS: &[&str] = &[
     "NEWT_PROVIDER",
     "NEWT_DGX_MODEL",
     "NEWT_OPENAI_API",
+    // **Every env-backed `/settings` field.** The guard's own doc says it
+    // snapshots "the relevant env", and these are the most relevant there is:
+    // a test that flips a form field left the variable set for whatever ran
+    // next on this thread. Three of them (#2009 PR4 found this while adding
+    // the fourth) had been absent since the fields landed.
+    "NEWT_EDIT_MODE",
+    "NEWT_THINKING",
+    "NEWT_NUDGE",
+    "NEWT_MARKDOWN",
     crate::settings_receipt::RECEIPT_PATH_ENV,
 ];
 
