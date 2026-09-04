@@ -242,6 +242,7 @@ async fn private_review_fetch_recovers_through_tool_search_and_mcp() {
             crew_runner: None,
             operating_mode_control: None,
             plan_mode_control: None,
+            disposition_request_control: None,
             steering: None,
         },
         &mut mcp,

@@ -108,6 +108,11 @@ const EXPOSURE_CLASSES: &[(&str, ExposureClass)] = &[
     ("enter_plan_mode", ExposureClass::ByIntent),
     ("exit_plan_mode", ExposureClass::ByIntent),
     ("select_operating_mode", ExposureClass::ByIntent),
+    // #2051: classed with its sibling `request_user_input` — both are the
+    // ask-the-human affordances, surfaced when there is a human to ask.
+    // REVIEWER: `Kernel` is arguable, since a turn that loses this under budget
+    // pressure is back to narrating its cage. Kept with the sibling for now.
+    ("request_disposition", ExposureClass::RecoveryOnly),
 ];
 
 /// The exposure class of a tool by name. Base tools are `Kernel`; a name found

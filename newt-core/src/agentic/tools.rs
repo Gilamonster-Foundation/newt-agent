@@ -2524,6 +2524,67 @@ fn execute_request_user_input(
     }
 }
 
+/// #2051: the model-facing `request_disposition` tool — ask the OPERATOR to
+/// widen a turn prompt intake classified too narrowly.
+///
+/// It reaches the human through the same gate `request_user_input` uses
+/// ([`PermissionGate::ask_question`]) rather than inventing a second asking
+/// mechanism, and it reuses that tool's honest outcome vocabulary: a cancel, an
+/// exit, EOF, or an input failure each keep their own message and are never
+/// reported as "headless".
+///
+/// The authority rule lives in the two lines that matter. Only a plainly
+/// affirmative human answer calls [`DispositionRequestControl::grant`]; every
+/// other outcome leaves the turn exactly where it was. This tool mints no
+/// caveat and widens nothing by itself — the dispatcher re-reads the stored
+/// grant on the model's next call, which is what makes the widening the
+/// operator's act.
+fn execute_request_disposition(
+    args: &serde_json::Value,
+    gate: Option<&mut dyn PermissionGate>,
+    control: Option<&dyn super::DispositionRequestControl>,
+) -> String {
+    let justification = args["justification"].as_str().unwrap_or("").trim();
+    if justification.is_empty() {
+        // Say what is missing AND how to fix it. A bare schema complaint is
+        // what the evidenced session apologised to the operator about in prose.
+        return "request_disposition: 'justification' is required — one sentence saying what \
+                you need to do and why this turn cannot do it. Call it again with that field."
+            .to_string();
+    }
+
+    // No control means this session has no place to record a grant, so there is
+    // nothing to ask about. Say so plainly instead of opening a prompt whose
+    // answer could not be honoured.
+    let Some(control) = control else {
+        return super::DispositionRequestVerdict::NoOperator.model_message();
+    };
+    let Some(gate) = gate else {
+        return super::DispositionRequestVerdict::NoOperator.model_message();
+    };
+
+    let answer = match gate.ask_question(&super::disposition_request::operator_question(
+        justification,
+    )) {
+        HumanQuestionOutcome::Answer(answer) => answer,
+        HumanQuestionOutcome::Unavailable => {
+            return super::DispositionRequestVerdict::NoOperator.model_message()
+        }
+        HumanQuestionOutcome::Cancelled => return OPERATOR_CANCELLED.to_string(),
+        HumanQuestionOutcome::ExitRequested => return OPERATOR_EXIT_REQUESTED.to_string(),
+        HumanQuestionOutcome::InputClosed => return OPERATOR_INPUT_CLOSED.to_string(),
+        HumanQuestionOutcome::InputFailed => return OPERATOR_INPUT_FAILED.to_string(),
+    };
+
+    if !super::disposition_request::answer_is_affirmative(&answer) {
+        return super::DispositionRequestVerdict::Denied.model_message();
+    }
+    match control.grant(PromptDisposition::Act) {
+        Ok(()) => super::DispositionRequestVerdict::Granted(PromptDisposition::Act).model_message(),
+        Err(error) => format!("error: request_disposition: {error}"),
+    }
+}
+
 /// Best-effort host extraction for the #263 net pre-check. This only gates
 /// whether to PROMPT — reachability enforcement stays with the bridle's
 /// leash (host allowlist + SSRF screen). `None` (unparseable / non-http URL)
@@ -3650,6 +3711,9 @@ pub(crate) struct ToolCollaborators<'a> {
     pub(crate) step_ledger: Option<&'a dyn super::scheduled::StepLedger>,
     pub(crate) operating_mode_control: Option<&'a dyn super::OperatingModeControl>,
     pub(crate) plan_mode_control: Option<&'a dyn super::PlanModeControl>,
+    /// #2051: the operator-answered widening seam. `None` ⇒ `request_disposition`
+    /// degrades honestly (no operator this session) and nothing widens.
+    pub(crate) disposition_request_control: Option<&'a dyn super::DispositionRequestControl>,
     pub(crate) spill_store: Option<&'a dyn SpillStore>,
     pub(crate) persona_tools: Option<&'a [String]>,
     pub(crate) live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
@@ -4091,16 +4155,31 @@ async fn execute_tool_inner(
         step_ledger,
         operating_mode_control,
         plan_mode_control,
+        disposition_request_control,
         spill_store,
         persona_tools,
         live_tool_output,
         completed_spill_renderer: _,
     } = collab;
 
+    // #2051: an operator who widened this turn takes effect immediately for
+    // every later tool call in the same inference round, the same way the Plan
+    // clamp below does. `effective_disposition` enforces the direction — a
+    // grant may only widen, and `Ask` never widens at all — and the grant
+    // itself can only have come from a human answer, never from the model.
+    let disposition = super::effective_disposition(
+        disposition,
+        disposition_request_control.and_then(super::DispositionRequestControl::granted),
+    );
+
     // A model-entered Plan phase takes effect immediately for every later
     // tool call in the same inference round. The outer TUI also resolves it
     // into Plan caveats on the next turn; this local clamp closes the
     // enter-then-write gap before that boundary is rebuilt.
+    //
+    // Deliberately AFTER the grant: the model's own self-clamp still
+    // attenuates, so asking the operator to widen cannot undo a plan phase the
+    // model entered itself.
     let disposition = if plan_mode_control.is_some_and(super::PlanModeControl::is_plan_mode)
         && disposition == PromptDisposition::Act
     {
@@ -4125,7 +4204,15 @@ async fn execute_tool_inner(
     // exception: its question path mints no caveat and cannot widen this turn,
     // but it must still be able to hand control back to an interactive operator.
     // The existing caveats continue to decide whether each read is legal.
-    if disposition != PromptDisposition::Act && name != "request_user_input" {
+    // #2051 adds `request_disposition` to that exception, for exactly the same
+    // reason: it reaches the operator through `ask_question`, which mints no
+    // caveat and cannot widen anything by itself. Removing the gate here would
+    // leave the escalation with no human to ask — the double-bind again, one
+    // layer down.
+    if disposition != PromptDisposition::Act
+        && name != "request_user_input"
+        && name != "request_disposition"
+    {
         permission_gate = None;
     }
 
@@ -4453,6 +4540,14 @@ async fn execute_tool_inner(
                     .to_string()
             }
         },
+        // #2051: ask the operator to widen this turn. The call itself grants
+        // NOTHING — it puts the request to a human and reports their verdict.
+        // A grant lands on the injected control and is re-read by the
+        // disposition boundary above on the model's NEXT tool call, so the
+        // widening is always the operator's act, never this handler's.
+        "request_disposition" => {
+            execute_request_disposition(args, permission_gate, disposition_request_control)
+        }
         // `/mode auto`: schedule a bounded working-style transition for a
         // future turn. The injected collaborator owns session-local state;
         // this call cannot alter the current disposition or caveats.
@@ -5559,6 +5654,14 @@ mod execute_tool_branch_tests;
 #[cfg(test)]
 #[path = "tools_tests/exit_code_ok_tests.rs"]
 mod exit_code_ok_tests;
+
+// ---------------------------------------------------------------------------
+// #2051 — request_disposition: the model asks, only the operator grants.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "tools_tests/disposition_request_tests.rs"]
+mod disposition_request_tests;
 
 // ---------------------------------------------------------------------------
 // INTERIM (#297) --disable-ocap / --yolo tests — the exec escape hatch.

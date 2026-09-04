@@ -1588,6 +1588,52 @@ impl newt_core::agentic::PlanModeControl for PlanModeState {
     }
 }
 
+/// Per-TUI-session record of an operator-granted turn widening (#2051).
+///
+/// Session-local for the same reason `PlanModeState` is: two embedded or test
+/// sessions must never widen one another's tool calls. The state is cleared at
+/// every conversation boundary alongside the other model-selected modes, so a
+/// grant is bounded to the turn the operator gave it for and cannot survive
+/// into a later one they never saw.
+#[derive(Debug, Default)]
+struct DispositionGrantState {
+    /// `true` once the operator answered yes to a `request_disposition` ask.
+    /// Only ever set through `grant`, which core calls only after a human
+    /// answer — never by the model.
+    granted_act: std::sync::atomic::AtomicBool,
+}
+
+impl DispositionGrantState {
+    fn clear(&self) {
+        self.granted_act
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl newt_core::agentic::DispositionRequestControl for DispositionGrantState {
+    fn granted(&self) -> Option<newt_core::agentic::PromptDisposition> {
+        self.granted_act
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then_some(newt_core::agentic::PromptDisposition::Act)
+    }
+
+    fn grant(&self, disposition: newt_core::agentic::PromptDisposition) -> Result<(), String> {
+        // This surface records exactly one widening — to Act. A request for
+        // anything else is refused rather than silently rounded to Act: an
+        // operator answered a question about full execution authority, and the
+        // grant recorded must be the one they were shown.
+        if disposition != newt_core::agentic::PromptDisposition::Act {
+            return Err(format!(
+                "this session records only an Act widening, not {}",
+                disposition.as_str()
+            ));
+        }
+        self.granted_act
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+}
+
 /// Conversation-scoped operating state with one boundary-clear operation.
 ///
 /// Keeping these together makes it impossible for `/new`, persona rotation,
@@ -1597,12 +1643,16 @@ impl newt_core::agentic::PlanModeControl for PlanModeState {
 struct ConversationModeStates {
     auto: AutoModeState,
     plan: PlanModeState,
+    /// #2051: cleared with the rest, so an operator's widening never leaks
+    /// into a conversation they did not grant it for.
+    disposition_grant: DispositionGrantState,
 }
 
 impl ConversationModeStates {
     fn clear(&self) {
         self.auto.clear();
         self.plan.clear();
+        self.disposition_grant.clear();
     }
 }
 

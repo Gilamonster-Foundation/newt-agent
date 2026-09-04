@@ -95,6 +95,7 @@ fn ctx<'a>(
         crew_runner: None,
         operating_mode_control: None,
         plan_mode_control: None,
+        disposition_request_control: None,
         steering: None,
         completed_spill_renderer: None,
     }

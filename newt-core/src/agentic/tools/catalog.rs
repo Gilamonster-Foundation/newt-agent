@@ -511,6 +511,12 @@ fn common_read_only_tool_allowed(name: &str) -> bool {
                 // widen the accepted turn; an absent interactive gate still
                 // returns a recoverable no-human message without hanging.
                 | "request_user_input"
+                // #2051: the escalation that ASKS for a wider turn. Callable
+                // under every non-Act disposition — a turn that cannot ask is
+                // the double-bind this fixes. It mints no caveat and widens
+                // nothing by itself; only an operator answer can, and the
+                // dispatcher re-reads that answer on the next call.
+                | "request_disposition"
     )
 }
 
@@ -1027,6 +1033,15 @@ pub(super) const EXTENDED_TOOL_REGISTRY: &[ToolSpec] = &[
         name: "exit_plan_mode",
         definition: super::super::scheduled::exit_plan_mode_tool_definition,
         gate: Gate::PlanMode,
+    },
+    // #2051: the model's move when intake classified the turn wrong. Always
+    // advertised, like `request_user_input`: a model must always be able to
+    // ask, and it degrades honestly when no operator is present. It grants
+    // nothing by itself — see `disposition_request`.
+    ToolSpec {
+        name: "request_disposition",
+        definition: super::super::disposition_request::request_disposition_tool_definition,
+        gate: Gate::Always,
     },
     ToolSpec {
         name: "select_operating_mode",

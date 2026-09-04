@@ -7633,6 +7633,14 @@ fn session_body(
                                             &conversation_mode_states.plan
                                                 as &dyn newt_core::agentic::PlanModeControl,
                                         ),
+                                        // #2051: where an operator's answer to
+                                        // `request_disposition` is recorded. The
+                                        // model never writes here — core calls
+                                        // `grant` only after a human said yes.
+                                        disposition_request_control: Some(
+                                            &conversation_mode_states.disposition_grant
+                                                as &dyn newt_core::agentic::DispositionRequestControl,
+                                        ),
                                         // #952/#1669: the loop-side seam is in
                                         // place, but this surface cannot yet
                                         // SUBMIT mid-turn — `read_line` does not

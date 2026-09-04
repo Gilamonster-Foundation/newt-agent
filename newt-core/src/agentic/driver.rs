@@ -669,6 +669,7 @@ async fn run_one_turn(
         crew_runner: runtime.crew_runner.as_deref(),
         operating_mode_control: None,
         plan_mode_control: None,
+        disposition_request_control: None,
         steering: None,
     };
     // NoMcp: the cowork driver advertises only the built-in tools. A consumer

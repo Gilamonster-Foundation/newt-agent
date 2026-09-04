@@ -1887,6 +1887,10 @@ fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
             "find_hierarchy",
             "inspect_type",
             "impact",
+            // #2051: advertised ALWAYS, like `request_user_input` — a model
+            // must always be able to ask, and it degrades honestly with no
+            // operator present.
+            "request_disposition",
         ]
     );
 }

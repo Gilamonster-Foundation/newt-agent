@@ -118,6 +118,7 @@ mod markdown {
 mod adjudicate;
 mod artifact_hooks;
 mod artifact_read;
+mod disposition_request;
 mod mcp;
 mod memory_fetch;
 mod note_sink;
@@ -261,6 +262,10 @@ pub fn tidy_markdown_tables(src: &str) -> String {
 #[path = "mod_tests/tidy_tables_tests.rs"]
 mod tidy_tables_tests;
 pub use budget::get_context_remaining_tool_definition;
+pub use disposition_request::{
+    effective_disposition, request_disposition_tool_definition, DispositionRequestControl,
+    DispositionRequestVerdict,
+};
 pub use memory_fetch::{
     memory_fetch_tool_definition, MemAddr, MemPayload, MemorySource, StoreMemorySource,
 };
@@ -1441,6 +1446,9 @@ pub struct ChatCtx<'a> {
     /// entering Plan immediately clamps subsequent calls in the same model
     /// round. `None` means the model-entered Plan phase is unavailable.
     pub plan_mode_control: Option<&'a dyn PlanModeControl>,
+    /// #2051: the operator-answered seam behind `request_disposition`. `None`
+    /// ⇒ the tool degrades honestly and no turn is ever widened.
+    pub disposition_request_control: Option<&'a dyn DispositionRequestControl>,
     /// #952/#1669: operator steering submitted while this turn is running.
     ///
     /// Drained at the TOP of each tool round — before the next model call, and
@@ -2010,6 +2018,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
+        disposition_request_control,
         steering,
         emits_leading_reasoning,
     } = ctx;
@@ -3841,6 +3850,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         step_ledger,
                         operating_mode_control,
                         plan_mode_control,
+                        disposition_request_control,
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
@@ -5995,6 +6005,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
+        disposition_request_control,
         steering,
         completed_spill_renderer,
         // This loop does not call `stream_response`, the only consumer of the
@@ -7438,6 +7449,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         step_ledger,
                         operating_mode_control,
                         plan_mode_control,
+                        disposition_request_control,
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
@@ -8098,6 +8110,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
+        disposition_request_control,
         steering,
         completed_spill_renderer,
         // Anthropic streams reasoning in its own wire fields, not as a lone
@@ -9439,6 +9452,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         step_ledger,
                         operating_mode_control,
                         plan_mode_control,
+                        disposition_request_control,
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
@@ -9843,6 +9857,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         crew_runner,
         operating_mode_control,
         plan_mode_control,
+        disposition_request_control,
         steering,
         completed_spill_renderer,
         // This loop does not call `stream_response`, the only consumer of the
@@ -10535,6 +10550,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         step_ledger,
                         operating_mode_control,
                         plan_mode_control,
+                        disposition_request_control,
                         spill_store,
                         persona_tools,
                         live_tool_output: live_tool_output.clone(),
