@@ -6,7 +6,7 @@
   /backend                 - backend panel on a rich TTY: choose · edit · add · remove
   /backend <openai|ollama> [model] - text form: switch the wire kind (e.g. /backend ollama deepseek-r1)
   /backends [name]         - alias of /backend; text list stays: bare lists (piped/lean), /backends <name> switches
-  /thinking <fold|stream|off> - how much of the model's reasoning you see
+  /thinking                - folded into /settings thinking
   /settings [field value]  - the settings form: edit-mode + effort dials + rounds; every applied change writes a receipt (#1981)
   /probe [model|all]       - classify tool use, context window, thinking, calibration (all = re-probe every model; Esc cancels)
   /probe window [model]    - empirical input-boundary search (records max input at High confidence)

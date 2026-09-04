@@ -185,39 +185,30 @@ pub(crate) fn dispatch(
             ),
         },
 
-        // #1981: ABSORBED into `/settings thinking`.
+        // #1665: retired top-levels. Redirect WITHOUT mutating — a habitual
+        // `/tenacity relentless` must not half-work through a deprecation shim,
+        // or the shim never gets to die.
+        "tenacity" | "cognition" => print_newt(&retired_dial_redirect(cmd), color, verbose),
+
+        // #2044: retired the same way, and for the same reason — one door per
+        // setting. The reasoning display is a `/settings` field like any
+        // other, and a second verb that only ever forwarded to it was a second
+        // place for the vocabulary to drift. It already had: this arm matched
+        // a literal `"on" | "off"` while the field had grown `fold | stream |
+        // off`, so `/thinking fold` was refused for a value the panel took.
         //
-        // The legal values are NOT listed here. They were — a literal
-        // `"on" | "off"` arm — and that was a second copy of a vocabulary
-        // `Field::Thinking` already owns. When the field grew `fold` and
-        // `stream`, this arm did not, so `/thinking fold` answered
-        // "usage: ... <on|off>" for a value the form accepts. The panel and
-        // the slash command disagreed about what the setting IS.
-        //
-        // `apply_and_record` already validates through `Field::accepts` and
-        // already renders the refusal from `accepts_hint()`, so delegating
-        // makes the two impossible to desync: there is one list, and adding to
-        // it reaches every door at once. Only the no-argument case is handled
-        // here, because "you gave me nothing" is a different answer from "that
-        // is not one of the values".
-        "thinking" if arg1.is_empty() => print_newt(
+        // Redirects WITHOUT mutating, per the retirement discipline above: a
+        // habitual `/thinking fold` must not half-work through a shim, or the
+        // shim never gets to die.
+        "thinking" => print_newt(
             &format!(
-                "usage: /settings thinking <{}>  (or /thinking <…>)",
+                "/thinking folded into /settings — /settings opens the form; \
+                 text: /settings thinking <{}>  (nothing changed)",
                 Field::Thinking.accepts_hint()
             ),
             color,
             verbose,
         ),
-        "thinking" => print_newt(
-            &apply_setting(Field::Thinking, arg1, "/thinking"),
-            color,
-            verbose,
-        ),
-
-        // #1665: retired top-levels. Redirect WITHOUT mutating — a habitual
-        // `/tenacity relentless` must not half-work through a deprecation shim,
-        // or the shim never gets to die.
-        "tenacity" | "cognition" => print_newt(&retired_dial_redirect(cmd), color, verbose),
 
         // /psyche owns the dials (#1665): bare = panel (intercepted in chat.rs
         // on a rich TTY; HERE bare renders the text status for piped/lean),
