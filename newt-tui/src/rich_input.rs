@@ -3367,6 +3367,65 @@ mod tests {
         Editor::new(Edit::Emacs)
     }
 
+    /// Replace a footer `[YYYY-MM-DD HH:MM:SS]` stamp with fixed digits.
+    ///
+    /// For frame comparisons that must not depend on the wall clock. Narrow on
+    /// purpose: it rewrites a run only when it has the timestamp's exact
+    /// shape, so a tab number, a row count or a model name keeps its own
+    /// digits and stays byte-compared.
+    fn normalize_clock(rows: &[String]) -> Vec<String> {
+        // `[dddd-dd-dd dd:dd:dd]` — the shape `footer_line` renders.
+        const SHAPE: &str = "[dddd-dd-dd dd:dd:dd]";
+        let looks_like_stamp = |window: &str| {
+            window
+                .chars()
+                .zip(SHAPE.chars())
+                .all(|(c, want)| match want {
+                    'd' => c.is_ascii_digit(),
+                    other => c == other,
+                })
+        };
+        rows.iter()
+            .map(|row| {
+                let chars: Vec<char> = row.chars().collect();
+                let mut out = chars.clone();
+                for start in 0..chars.len().saturating_sub(SHAPE.len() - 1) {
+                    let window: String = chars[start..start + SHAPE.len()].iter().collect();
+                    if looks_like_stamp(&window) {
+                        for (offset, want) in SHAPE.chars().enumerate() {
+                            if want == 'd' {
+                                out[start + offset] = '0';
+                            }
+                        }
+                    }
+                }
+                out.into_iter().collect()
+            })
+            .collect()
+    }
+
+    /// The normalizer is narrow: it rewrites a timestamp and nothing else.
+    ///
+    /// Without this, "mask the clock" could quietly become "mask every digit",
+    /// and the frame comparison would stop being able to see a tab number.
+    #[test]
+    fn the_clock_normalizer_touches_only_a_timestamp() {
+        let rows = vec![
+            "[2026-09-04 20:31:07] vi  1 tab  40%".to_string(),
+            "no stamp here: 12345".to_string(),
+        ];
+        let out = normalize_clock(&rows);
+        assert_eq!(out[0], "[0000-00-00 00:00:00] vi  1 tab  40%");
+        assert_eq!(out[1], rows[1], "a row without a stamp is untouched");
+        // Two different clock readings normalize to the same row...
+        let a = normalize_clock(&["[2026-09-04 20:31:07] x".to_string()]);
+        let b = normalize_clock(&["[2026-09-04 20:31:08] x".to_string()]);
+        assert_eq!(a, b);
+        // ...while a real difference beside it still shows.
+        let c = normalize_clock(&["[2026-09-04 20:31:08] y".to_string()]);
+        assert_ne!(b, c);
+    }
+
     /// Drive a sequence of chars (in NORMAL-friendly contexts) and return lines.
     fn type_chars(ed: &mut Editor, ta: &mut TextArea, s: &str) {
         for c in s.chars() {
@@ -3452,6 +3511,22 @@ mod tests {
             degraded: false,
             pending: false,
         }]);
+        // **The footer carries a live wall clock**, and these are two separate
+        // renders. `footer_line` stamps `chrono::Local::now()` at SECOND
+        // resolution, so two frames taken either side of a tick differ in the
+        // clock and nowhere else — a failure that reads "the tab bar leaked a
+        // row" while meaning "a second passed". It fired on the coverage job,
+        // where instrumentation makes each render slow enough to straddle a
+        // boundary often.
+        //
+        // Only the stamp is normalized, and only where it parses as one, so
+        // every other cell stays byte-compared — including the tab number,
+        // which is also a digit and must NOT be masked. The invariant under
+        // test is that fewer than two tabs render no row; it was never about
+        // the clock's digits, and a unit test must not read the wall clock at
+        // all (`CLAUDE.md`, testing tiers).
+        let none = normalize_clock(&none);
+        let one = normalize_clock(&one);
         assert_eq!(none, one, "one tab must render exactly like no tabs");
         assert!(
             !one.iter().any(|r| r.contains("solo")),
