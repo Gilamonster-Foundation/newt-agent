@@ -109,6 +109,20 @@ impl BackendSource {
         }
     }
 
+    /// Where this row's configuration lives, for a delete to name.
+    ///
+    /// A drop-in file and a `config.toml` entry are removed from different
+    /// places, and an operator about to lose one should be told which.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::UserDropIn => "~/.newt/backends/",
+            Self::UserDropInOverInline => "~/.newt/backends/ (shadowing an inline entry)",
+            Self::Inline => "config.toml",
+            Self::ShadowedByProject => "a project .newt/backends drop-in",
+            Self::KindToggle => "this session",
+        }
+    }
+
     /// Why this row cannot be edited/removed from here.
     fn refusal(self, name: &str) -> String {
         match self {
@@ -414,6 +428,35 @@ enum Mode {
     Choose,
     Command(String),
     Form(Box<FormState>),
+    /// A destructive action, waiting to be confirmed.
+    ///
+    /// **Every delete asks first.** Before this, `d` prefilled the ex-command
+    /// `d <name>` and Enter ran it — which is a confirmation only in the sense
+    /// that a keystroke separates you from the deletion. It named no
+    /// consequence, and the row it would remove was the one already under the
+    /// cursor, so the prefill read as a label rather than as a question.
+    Confirm(Confirm),
+}
+
+/// A pending destructive action and the question that guards it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Confirm {
+    /// The question, naming the target and what goes with it. Built at the
+    /// moment of asking, so it can say what THIS deletion costs rather than
+    /// what deletions cost in general.
+    prompt: String,
+    action: Pending,
+}
+
+/// What a confirmed answer performs.
+///
+/// One variant today. It is an enum rather than a bare name because the panels
+/// after this one — conversations, personas — delete different things, and the
+/// confirm should be the shape they can adopt rather than a fourth thing each
+/// invents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Pending {
+    RemoveBackend(String),
 }
 
 /// The panel's working state. Pure: no terminal, no I/O; fully unit-testable.
@@ -521,14 +564,66 @@ impl PanelState {
 
     /// `d`: prefill the typed confirm — the ex-command line `:d <name>` the
     /// operator must still Enter.
+    /// Ask before removing the selected backend.
+    ///
+    /// **Every refusal is evaluated BEFORE the question is asked.** Confirming
+    /// a delete and then being told it was never allowed teaches the operator
+    /// that the question is decoration, and the next one gets answered without
+    /// reading it.
     pub(crate) fn begin_remove(&mut self) {
         self.status = None;
-        match &self.selected().selection {
-            BackendSelection::Named(n) => self.mode = Mode::Command(format!("d {n}")),
-            BackendSelection::Kind(_) => {
-                self.status = Some("select a named backend to remove".into());
-            }
+        let BackendSelection::Named(name) = &self.selected().selection else {
+            self.status = Some("select a named backend to remove".into());
+            return;
+        };
+        let name = name.clone();
+        if let Some(refusal) = self.remove_refusal(&name) {
+            self.status = Some(refusal);
+            return;
         }
+        self.mode = Mode::Confirm(Confirm {
+            prompt: self.remove_prompt(&name),
+            action: Pending::RemoveBackend(name),
+        });
+    }
+
+    /// The question, naming what this particular deletion costs.
+    ///
+    /// A drop-in file and a `config.toml` entry are removed from different
+    /// places, and an operator who is about to lose one should be told which.
+    fn remove_prompt(&self, name: &str) -> String {
+        let where_from = self
+            .named_index(name)
+            .map_or("configuration", |i| self.options[i].source.describe());
+        format!("delete backend '{name}' from {where_from}? this cannot be undone  [y/N]")
+    }
+
+    /// Answer a pending confirmation. `y` performs it; anything else does not.
+    ///
+    /// **The default is no.** `[y/N]` is the same shape the vi `:wq` guard and
+    /// the permission modal's `[d]eny (default)` already use, so a reflexive
+    /// Enter or Esc is always the safe answer.
+    fn answer_confirm(
+        &mut self,
+        yes: bool,
+        remove: &mut dyn FnMut(&str) -> Result<String, String>,
+    ) -> Option<bool> {
+        let Mode::Confirm(confirm) = &self.mode else {
+            return None;
+        };
+        let action = confirm.action.clone();
+        self.mode = Mode::Choose;
+        if !yes {
+            self.status = Some("cancelled — nothing was deleted".to_string());
+            return None;
+        }
+        match action {
+            Pending::RemoveBackend(name) => self.remove_command(Some(&name), remove),
+        }
+    }
+
+    pub(crate) fn in_confirm(&self) -> bool {
+        matches!(self.mode, Mode::Confirm(_))
     }
 
     pub(crate) fn begin_command(&mut self, prefill: &str) {
@@ -732,22 +827,19 @@ impl PanelState {
         }
     }
 
-    fn remove_command(
-        &mut self,
-        name: Option<&str>,
-        remove: &mut dyn FnMut(&str) -> Result<String, String>,
-    ) -> Option<bool> {
-        let Some(name) = name.map(str::trim).filter(|s| !s.is_empty()) else {
-            self.status = Some("remove needs a name: :d <name>".to_string());
-            return None;
-        };
+    /// Why this name cannot be removed right now, or `None` if it can.
+    ///
+    /// **One statement of the rules, asked twice.** `begin_remove` asks it to
+    /// decide whether the question is worth posing; `remove_command` asks it
+    /// again to enforce. A confirm that could still be refused would teach the
+    /// operator that the question is decoration — and a confirm that BYPASSED
+    /// the enforcement would be worse, so neither reads the other's answer.
+    fn remove_refusal(&self, name: &str) -> Option<String> {
         let Some(idx) = self.named_index(name) else {
-            self.status = Some(format!("no configured backend named '{name}'"));
-            return None;
+            return Some(format!("no configured backend named '{name}'"));
         };
         if !self.options[idx].editable() {
-            self.status = Some(self.options[idx].source.refusal(name));
-            return None;
+            return Some(self.options[idx].source.refusal(name));
         }
         // Two pointers may not be orphaned by a delete: the SESSION's active
         // backend, and config.toml's DURABLE `default_backend` — which diverges
@@ -760,25 +852,49 @@ impl PanelState {
         // deletes this file. Anything else is refused.
         let is_active = self.active == Some(idx);
         let is_default = self.default_backend.as_deref() == Some(name);
-        if is_active || is_default {
-            let picked_other_named = self.pick.is_dirty()
-                && self.pick.value() != idx
-                && matches!(
-                    self.options[self.pick.value()].selection,
-                    BackendSelection::Named(_)
-                );
-            if !picked_other_named {
-                let role = match (is_active, is_default) {
-                    (true, true) => "the active backend and config.toml's default_backend",
-                    (true, false) => "the active backend",
-                    _ => "config.toml's default_backend",
-                };
-                self.status = Some(format!(
-                    "'{name}' is {role} — dial another named backend first; then :d {name} \
-                     switches and removes it in one transaction"
-                ));
-                return None;
-            }
+        if (is_active || is_default) && !self.picked_other_named(idx) {
+            let role = match (is_active, is_default) {
+                (true, true) => "the active backend and config.toml's default_backend",
+                (true, false) => "the active backend",
+                _ => "config.toml's default_backend",
+            };
+            return Some(format!(
+                "'{name}' is {role} — dial another named backend first; then :d {name} \
+                 switches and removes it in one transaction"
+            ));
+        }
+        None
+    }
+
+    /// The spinner is deliberately parked on a DIFFERENT named backend — the
+    /// precondition for removing the active one in a single transaction.
+    fn picked_other_named(&self, idx: usize) -> bool {
+        self.pick.is_dirty()
+            && self.pick.value() != idx
+            && matches!(
+                self.options[self.pick.value()].selection,
+                BackendSelection::Named(_)
+            )
+    }
+
+    fn remove_command(
+        &mut self,
+        name: Option<&str>,
+        remove: &mut dyn FnMut(&str) -> Result<String, String>,
+    ) -> Option<bool> {
+        let Some(name) = name.map(str::trim).filter(|s| !s.is_empty()) else {
+            self.status = Some("remove needs a name: :d <name>".to_string());
+            return None;
+        };
+        if let Some(refusal) = self.remove_refusal(name) {
+            self.status = Some(refusal);
+            return None;
+        }
+        let Some(idx) = self.named_index(name) else {
+            self.status = Some(format!("no configured backend named '{name}'"));
+            return None;
+        };
+        if self.active == Some(idx) || self.default_backend.as_deref() == Some(name) {
             self.pending_remove = Some(name.to_string());
             return Some(true);
         }
@@ -1001,9 +1117,14 @@ fn draw(f: &mut ratatui::Frame, state: &PanelState) {
     let title = match &state.mode {
         Mode::Form(form) if form.editing.is_some() => " backend — edit ",
         Mode::Form(_) => " backend — add ",
+        Mode::Confirm(_) => " backend — confirm delete ",
         _ => " backend — chooser ",
     };
-    let bottom = if let Mode::Command(buf) = &state.mode {
+    let bottom = if let Mode::Confirm(confirm) = &state.mode {
+        // Deliberately the STATUS line, not the hint line: a question is not a
+        // list of things you may do, and it should not be dressed as one.
+        status_line(&confirm.prompt)
+    } else if let Mode::Command(buf) = &state.mode {
         command_line(buf)
     } else if let Some(status) = &state.status {
         status_line(status)
@@ -1135,6 +1256,24 @@ where
 
     fn key(&mut self, key: Key) -> crate::panel::Flow {
         use crate::panel::Flow;
+        // Checked before every other mode: while a delete is pending, the
+        // panel answers nothing else. A guard you can dismiss with `←` is not
+        // a guard.
+        if self.state.in_confirm() {
+            match key {
+                Key::Char('y') | Key::Char('Y') => {
+                    if let Some(apply) = self.state.answer_confirm(true, &mut self.remove) {
+                        return Flow::Close(apply);
+                    }
+                }
+                // Everything else declines, including Enter. `[y/N]` means the
+                // reflexive keystroke is the safe one.
+                _ => {
+                    self.state.answer_confirm(false, &mut self.remove);
+                }
+            }
+            return Flow::Stay;
+        }
         if self.state.in_command() {
             match key {
                 Key::Char(c) => self.state.command_char(c),
@@ -1544,13 +1683,39 @@ mod tests {
         assert!(s.status.as_deref().unwrap().contains("aren't editable"));
     }
 
+    /// **`d` asks before it deletes.**
+    ///
+    /// It used to prefill the ex-command `d <name>` and let Enter run it —
+    /// a confirmation only in the sense that a keystroke stood between you and
+    /// the deletion. It named no consequence, and the row it would remove was
+    /// already under the cursor, so the prefill read as a label rather than a
+    /// question.
     #[test]
-    fn d_key_prefills_the_typed_confirm() {
+    fn d_asks_before_deleting_and_names_what_is_lost() {
         let mut s = panel();
         s.cycle(1); // gpu-runner
         s.begin_remove();
-        assert_eq!(s.mode, Mode::Command("d gpu-runner".to_string()));
-        // On a kind fallback there is nothing to remove.
+
+        let Mode::Confirm(confirm) = &s.mode else {
+            panic!("d must open a confirmation, got {:?}", s.mode);
+        };
+        assert_eq!(
+            confirm.action,
+            Pending::RemoveBackend("gpu-runner".to_string())
+        );
+        assert!(confirm.prompt.contains("gpu-runner"), "{}", confirm.prompt);
+        assert!(
+            confirm.prompt.contains("cannot be undone"),
+            "the question states the consequence: {}",
+            confirm.prompt
+        );
+        assert!(
+            confirm.prompt.contains("[y/N]"),
+            "and states that the default is no: {}",
+            confirm.prompt
+        );
+
+        // On a kind fallback there is nothing to remove, and nothing is asked.
         let mut k = panel();
         k.cycle(1);
         k.cycle(1);
@@ -1558,6 +1723,87 @@ mod tests {
         k.begin_remove();
         assert!(matches!(k.mode, Mode::Choose));
         assert!(k.status.as_deref().unwrap().contains("named backend"));
+    }
+
+    /// **The default is no**, and every key that is not `y` takes it —
+    /// including Enter, which is the one most likely to be pressed by reflex.
+    #[test]
+    fn anything_but_y_declines_and_deletes_nothing() {
+        for answer in [false, true] {
+            let mut s = panel();
+            s.cycle(1);
+            s.begin_remove();
+            let mut removed: Vec<String> = Vec::new();
+            let mut remove = |name: &str| -> Result<String, String> {
+                removed.push(name.to_string());
+                Ok(format!("removed {name}"))
+            };
+            s.answer_confirm(answer, &mut remove);
+            let removed = removed;
+
+            assert!(
+                matches!(s.mode, Mode::Choose),
+                "the question closes either way"
+            );
+            if answer {
+                assert_eq!(removed, ["gpu-runner"], "y performs the delete");
+            } else {
+                assert!(removed.is_empty(), "no answer but y may delete");
+                assert!(
+                    s.status.as_deref().unwrap().contains("nothing was deleted"),
+                    "and declining says so: {:?}",
+                    s.status
+                );
+            }
+        }
+    }
+
+    /// **A confirm is never posed for a delete that would then be refused.**
+    ///
+    /// Being asked "are you sure?" and then told it was never allowed teaches
+    /// the operator that the question is decoration, and the next one gets
+    /// answered without reading it.
+    #[test]
+    fn a_delete_that_would_be_refused_is_never_asked_about() {
+        // The active backend cannot go without a replacement dialled first.
+        let mut s = panel();
+        s.begin_remove();
+        assert!(
+            matches!(s.mode, Mode::Choose),
+            "no question for a refused delete, got {:?}",
+            s.mode
+        );
+        let status = s.status.as_deref().unwrap_or_default();
+        assert!(
+            status.contains("active backend") || status.contains("default_backend"),
+            "the refusal is shown instead: {status}"
+        );
+    }
+
+    /// The refusal rules have ONE statement, asked twice: once to decide
+    /// whether to pose the question, once to enforce. A `:d <name>` typed
+    /// directly must still hit every rule the `d` key does.
+    #[test]
+    fn the_typed_command_enforces_the_same_refusals_the_confirm_checks() {
+        let mut s = panel();
+        let active = s.selected().selection.clone();
+        let BackendSelection::Named(name) = active else {
+            panic!("the fixture's first row is a named backend");
+        };
+        assert!(
+            s.remove_refusal(&name).is_some(),
+            "the active backend is refused"
+        );
+
+        let mut removed: Vec<String> = Vec::new();
+        let mut remove = |n: &str| -> Result<String, String> {
+            removed.push(n.to_string());
+            Ok(String::new())
+        };
+        s.begin_command(&format!("d {name}"));
+        s.run_command(&mut remove);
+        let removed = removed;
+        assert!(removed.is_empty(), "the typed path refuses it too");
     }
 
     /// **`selected()` indexes without a bounds check, and this is why that is
