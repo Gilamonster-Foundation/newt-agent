@@ -139,6 +139,24 @@ test:
     # enabled here so the published schemas cannot go stale unnoticed.
     cargo test --workspace --features newt-data/kernel,newt-interaction/schema
 
+# The cross-crate tripwire: the e2e goldens in newt-eval that capture
+# newt-tui's and newt-core's OBSERVABLE surface — the help text, the MCP
+# handshake, an ACP reply.
+#
+# These exist because a per-crate run cannot catch them. `cargo test -p
+# newt-tui` is what you reach for while working in newt-tui, and it is
+# structurally blind to a golden that lives in newt-eval and captures the
+# built binary. That gap has now cost two CI round-trips on the same test
+# (#2040, #2047), both from a one-line help edit.
+#
+# Seconds, not the several minutes `just check` takes, so there is no excuse
+# to skip it before a push that touched a user-visible surface.
+#
+#   just goldens              # verify
+#   NEWT_GOLDEN_UPDATE=1 just goldens   # re-record, then READ THE DIFF
+goldens:
+    cargo test -p newt-eval --test mock_e2e golden
+
 # --- Lint & format ---
 
 # Apply rustfmt to the whole workspace.
