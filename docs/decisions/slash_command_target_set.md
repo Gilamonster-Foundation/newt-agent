@@ -187,6 +187,7 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/uses` | `/refs` | `/` command | Navigator | keep — it performs | — read-only |
 | `/allow` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/cd` | — | `/` command | Session | keep — it performs | **none — #1965** |
+| `/settings compaction` | — | field of `/settings` | Session | absorb → `/settings compaction` | `~/.newt/receipts.jsonl` |
 | `/compress` | `/compact` | `/` command | Session | keep — it performs | **none — #1965** |
 | `/context` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/conversation` | — | retired → `/resume` | Session | keep — it performs | **none — #1965** |
@@ -222,6 +223,6 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/tenacity` | — | retired → `/settings tenacity` | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
 | `/thinking` | — | retired → `/settings thinking` | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
 
-**72 registered, 57 of them typed as `/` commands (72 tokens).** Absorb 16 · keep 53 · panel 3. Receipts: journalled 11 · read-only 33 · **missing 28**.
+**73 registered, 57 of them typed as `/` commands (72 tokens).** Absorb 17 · keep 53 · panel 3. Receipts: journalled 12 · read-only 33 · **missing 28**.
 
 <!-- END GENERATED -->

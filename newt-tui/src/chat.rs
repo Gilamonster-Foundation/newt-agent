@@ -1769,7 +1769,6 @@ fn session_body(
     let mut context_manager_override: Option<newt_core::ContextManager> = None;
     // Per-session automatic-compaction trigger override from `/context
     // compaction <policy>`. `None` defers to `[context].compaction_trigger_policy`.
-    let mut compaction_trigger_policy_override: Option<newt_core::CompactionTriggerPolicy> = None;
     // Step 26.1 (#588): per-session context-FEATURE overrides from
     // `/context feature <name> on|off`. Each `None` defers to `[context.features]`
     // then the `manager` preset default.
@@ -4388,12 +4387,8 @@ fn session_body(
                             // counters), so it's handled here, not in the pure
                             // dispatch helper.
                             let manager = context_manager(&cfg, context_manager_override);
-                            let compaction_policy =
-                                compaction_trigger_policy(&cfg, compaction_trigger_policy_override);
-                            let compaction_policy_source = compaction_trigger_policy_source(
-                                &cfg,
-                                compaction_trigger_policy_override,
-                            );
+                            let compaction_policy = compaction_trigger_policy(&cfg);
+                            let compaction_policy_source = compaction_trigger_policy_source(&cfg);
                             let features = context_features(
                                 &cfg,
                                 manager,
@@ -4480,7 +4475,6 @@ fn session_body(
                                 rest,
                                 &cfg,
                                 context_manager_override,
-                                compaction_trigger_policy_override,
                                 &context_features_override,
                                 inf_kind,
                             );
@@ -4497,12 +4491,20 @@ fn session_body(
                                 context_size_override = if sz == 0 { None } else { Some(sz) };
                             }
                             if let Some(policy) = result.set_compaction_trigger_policy {
+                                // Through the SAME writer `/settings
+                                // compaction` uses (#2009 PR7), so the verb and
+                                // the field cannot set different policies.
                                 match policy {
                                     CompactionTriggerPolicyOverride::Set(policy) => {
-                                        compaction_trigger_policy_override = Some(policy);
+                                        newt_core::process_env::set_var(
+                                            "NEWT_COMPACTION_TRIGGER",
+                                            policy.keyword(),
+                                        );
                                     }
                                     CompactionTriggerPolicyOverride::Reset => {
-                                        compaction_trigger_policy_override = None;
+                                        newt_core::process_env::remove_var(
+                                            "NEWT_COMPACTION_TRIGGER",
+                                        );
                                     }
                                 }
                             }
@@ -6782,8 +6784,7 @@ fn session_body(
                         model_tune.and_then(|t| t.mid_loop_trim_tokens),
                         cfg.tui.as_ref().and_then(|t| t.mid_loop_trim_tokens),
                     );
-                    let eff_compaction_trigger_policy =
-                        compaction_trigger_policy(&cfg, compaction_trigger_policy_override);
+                    let eff_compaction_trigger_policy = compaction_trigger_policy(&cfg);
                     let eff_input_ceiling_pct = newt_core::config::normalize_input_ceiling_pct(
                         cfg.context
                             .as_ref()

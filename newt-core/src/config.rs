@@ -1038,6 +1038,49 @@ impl CompactionTriggerPolicy {
     }
 }
 
+/// The compaction trigger policy this session resolves to: the operator's
+/// session override, else `[context] compaction_trigger_policy`, else the
+/// default.
+///
+/// # Why this exists (#2009 PR7)
+///
+/// The override was `compaction_trigger_policy_override`, a `run_chat` LOCAL —
+/// §5's precondition, the same one `/markdown` and `/mode` hit: **a receipt
+/// writer cannot read a local.** `settings_form::apply` is a pure function and
+/// has no view into the session loop.
+///
+/// Deliberately the same shape as `session_markdown_mode` and
+/// `session_operating_mode`, under the same #1850 lock. A third spelling of
+/// "session override, else config, else default" is how the three come to
+/// disagree.
+#[must_use]
+pub fn session_compaction_trigger_policy() -> CompactionTriggerPolicy {
+    if let Some(policy) = std::env::var("NEWT_COMPACTION_TRIGGER")
+        .ok()
+        .as_deref()
+        .and_then(CompactionTriggerPolicy::from_keyword)
+    {
+        return policy;
+    }
+    Config::resolve()
+        .ok()
+        .and_then(|c| c.context)
+        .map(|c| c.compaction_trigger_policy)
+        .unwrap_or_default()
+}
+
+/// Whether the operator pinned the policy this session, as opposed to
+/// inheriting it. `/context` reports which, and a receipt's from→to is
+/// meaningless without it.
+#[must_use]
+pub fn compaction_trigger_is_session_pinned() -> bool {
+    std::env::var("NEWT_COMPACTION_TRIGGER")
+        .ok()
+        .as_deref()
+        .and_then(CompactionTriggerPolicy::from_keyword)
+        .is_some()
+}
+
 /// A composable context-management feature (Phase 26, #588) — an independent
 /// on/off technique under `[context.features]` and the `/context feature <name>
 /// on|off` command. None are implemented yet (`available()` is false for all);
