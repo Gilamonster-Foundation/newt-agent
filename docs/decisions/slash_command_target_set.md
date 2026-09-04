@@ -150,25 +150,25 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | command | also typed as | reached by | family | disposition | receipt |
 |---|---|---|---|---|---|
 | `/edit-mode` | `/vi` `/emacs` `/nano` | `/` command | Editor | absorb → `/settings edit-mode` | `~/.newt/receipts.jsonl` |
-| `/memory` | — | `/` command | Memory | keep — it performs | **none — #1965** |
+| `/memory` | — | retired → `/status memory` | Memory | keep — it performs | — read-only |
 | `/recall` | — | `/` command | Memory | keep — it performs | — read-only |
 | `/remember` | — | `/` command | Memory | keep — it performs | **none — #1965** |
 | `/search` | — | `/` command | Memory | keep — it performs | — read-only |
-| `/byline` | — | `/` command | Meta | keep — it performs | — read-only |
-| `/config` | — | `/` command | Meta | keep — it performs | — read-only |
-| `/docs` | — | `/` command | Meta | keep — it performs | — read-only |
+| `/byline` | — | retired → `/status byline` | Meta | keep — it performs | — read-only |
+| `/config` | — | retired → `/status config` | Meta | keep — it performs | — read-only |
+| `/docs` | — | retired → `/help docs` | Meta | keep — it performs | — read-only |
 | `/exit` | `/quit` | `/` command | Meta | keep — it performs | — read-only |
 | `/help` | — | `/` command | Meta | keep — it performs | — read-only |
-| `/info` | — | `/` command | Meta | keep — it performs | — read-only |
+| `/info` | — | retired → `/status` | Meta | keep — it performs | — read-only |
 | `/settings` | — | `/` command | Meta | keep — it performs | `~/.newt/receipts.jsonl` |
 | `/setup` | — | `/` command | Meta | keep — it performs | **none — #1965** |
 | `/status` | — | `/` command | Meta | keep — it performs | — read-only |
-| `/version` | — | `/` command | Meta | keep — it performs | — read-only |
-| `/workspace` | — | `/` command | Meta | keep — it performs | — read-only |
+| `/version` | — | retired → `/status version` | Meta | keep — it performs | — read-only |
+| `/workspace` | — | retired → `/status workspace` | Meta | keep — it performs | — read-only |
 | `/backends` | `/backend` | `/` command | Model | panel — a chooser, needs a region (#1979) | **none — #1965** |
 | `/dgx` | — | `/` command | Model | keep — it performs | — read-only |
 | `/model` | — | `/` command | Model | absorb → `/settings model` | **none — #1965** |
-| `/models` | — | `/` command | Model | keep — it performs | — read-only |
+| `/models` | — | retired → `/status models` | Model | keep — it performs | — read-only |
 | `/probe` | — | `/` command | Model | keep — it performs | — read-only |
 | `/probe reset` | — | action inside a section | Model | keep — it performs | **none — #1965** |
 | `/summarizer` | — | `/` command | Model | absorb → `/settings summarizer` | **none — #1965** |
@@ -206,9 +206,9 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/transcript` | — | `/` command | Session | keep — it performs | — read-only |
 | `/tree` | — | `/` command | Session | keep — it performs | — read-only |
 | `/undo-lock` | — | `/` command | Session | keep — it performs | **none — #1965** |
-| `/cognition` | — | retired — redirects only | Tuning | absorb → `/settings cognition` | `~/.newt/receipts.jsonl` |
+| `/cognition` | — | retired → `/settings cognition` | Tuning | absorb → `/settings cognition` | `~/.newt/receipts.jsonl` |
 | `/detail` | — | `/` command | Tuning | absorb → `/settings detail` | **none — #1965** |
-| `/loadout` | — | `/` command | Tuning | absorb → `/settings loadout` | **none — #1965** |
+| `/loadout` | — | retired → `/status loadout` | Tuning | keep — it performs | — read-only |
 | `/markdown` | — | `/` command | Tuning | absorb → `/settings markdown` | **none — #1965** |
 | `/mode` | — | `/` command | Tuning | absorb → `/settings mode` | **none — #1965** |
 | `/nudge` | — | `/` command | Tuning | absorb → `/settings nudge` | `~/.newt/receipts.jsonl` |
@@ -219,9 +219,9 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/psyche` | — | `/` command | Tuning | keep — it performs | `~/.newt/receipts.jsonl` |
 | `/retrieval` | — | `/` command | Tuning | absorb → `/settings retrieval` | **none — #1965** |
 | `/rounds` | `/tool-rounds` `/max-rounds` | `/` command | Tuning | absorb → `/settings rounds` | `~/.newt/receipts.jsonl` |
-| `/tenacity` | — | retired — redirects only | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
-| `/thinking` | — | retired — redirects only | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
+| `/tenacity` | — | retired → `/settings tenacity` | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
+| `/thinking` | — | retired → `/settings thinking` | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
 
-**72 registered, 68 of them typed as `/` commands (83 tokens).** Absorb 17 · keep 52 · panel 3. Receipts: journalled 8 · read-only 31 · **missing 33**.
+**72 registered, 59 of them typed as `/` commands (74 tokens).** Absorb 16 · keep 53 · panel 3. Receipts: journalled 8 · read-only 33 · **missing 31**.
 
 <!-- END GENERATED -->
