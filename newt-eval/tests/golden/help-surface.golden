@@ -3,9 +3,8 @@
   /models                  - list models on the active endpoint
   /models capabilities     - tool-conformance matrix (cached)
   /model <name>            - switch model on the active backend (sticks across runs)
-  /backend                 - backend panel on a rich TTY: choose · edit · add · remove
-  /backend <openai|ollama> [model] - text form: switch the wire kind (e.g. /backend ollama deepseek-r1)
-  /backends [name]         - alias of /backend; text list stays: bare lists (piped/lean), /backends <name> switches
+  /backends [name]         - backend panel on a rich TTY (choose · edit · add · remove); text: list, or switch by name
+  /backend                 - alias of /backends
   /thinking                - folded into /settings thinking
   /settings [field value]  - the settings form: edit-mode + effort dials + rounds; every applied change writes a receipt (#1981)
   /probe [model|all]       - classify tool use, context window, thinking, calibration (all = re-probe every model; Esc cancels)
