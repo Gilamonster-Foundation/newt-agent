@@ -123,6 +123,7 @@ mod markdown {
 mod adjudicate;
 mod artifact_hooks;
 mod artifact_read;
+mod disposition_voice;
 mod mcp;
 mod memory_fetch;
 mod note_sink;
@@ -223,7 +224,8 @@ pub use plan_exec::{run_plan, run_plan_with_reground, NoReground, PlanRun, Regro
 pub use prompt_intake::{
     AdjudicationCandidate, AdjudicationRefusal, AdjudicationVerdict, AtomicAsk,
     ClarificationRejection, DecisionLock, DecisionSource, DecisionStatus, DispositionLexicon,
-    PromptComprehensionManifest, PromptDisposition, PromptIntake, MAX_ADJUDICATION_BATCH,
+    DispositionSource, PromptComprehensionManifest, PromptDisposition, PromptIntake,
+    MAX_ADJUDICATION_BATCH,
 };
 #[cfg(test)]
 pub(crate) use prompt_read::response_repository_policy_tokens;
@@ -266,6 +268,7 @@ pub fn tidy_markdown_tables(src: &str) -> String {
 #[path = "mod_tests/tidy_tables_tests.rs"]
 mod tidy_tables_tests;
 pub use budget::get_context_remaining_tool_definition;
+pub(crate) use disposition_voice::DispositionVoices;
 pub use memory_fetch::{
     memory_fetch_tool_definition, MemAddr, MemPayload, MemorySource, StoreMemorySource,
 };
@@ -11667,6 +11670,11 @@ mod openai_stream_loop_tests;
 #[cfg(test)]
 #[path = "mod_tests/bat_largest_files.rs"]
 mod bat_largest_files_tests;
+// #2051: the `hello?` turn that narrated its own disposition, replayed through
+// the same simulated environment.
+#[cfg(test)]
+#[path = "mod_tests/bat_disposition_voice.rs"]
+mod bat_disposition_voice_tests;
 
 // ---------------------------------------------------------------------------
 // save_note tool + memory nudge — loop integration (Step 19.3, #248)

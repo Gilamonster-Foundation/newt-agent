@@ -2723,12 +2723,12 @@ async fn explain_turn_request_user_input_dispatches_and_completes() {
         "request_user_input must dispatch (headless => the recoverable no-human message): {all}"
     );
     assert!(
-        !all.contains("Tool `request_user_input` is unavailable"),
+        !all.contains("Tool `request_user_input` is not available for this request"),
         "request_user_input must NOT be disposition-refused in an Explain turn"
     );
     // The boundary still holds for Act-only tools in the SAME turn.
     assert!(
-        all.contains("Tool `run_command` is unavailable"),
+        all.contains("Tool `run_command` is not available for this request"),
         "run_command must stay disposition-refused in an Explain turn: {all}"
     );
 }

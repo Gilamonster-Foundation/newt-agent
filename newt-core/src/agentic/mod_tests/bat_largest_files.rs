@@ -126,14 +126,15 @@ async fn run_scenario(
     workspace: &std::path::Path,
     script: Vec<serde_json::Value>,
 ) -> (String, u32, Option<crate::TurnEndReason>, String) {
-    run_scenario_for(PROMPT, workspace, script).await
+    run_scenario_for(PROMPT, PromptDisposition::Research, workspace, script).await
 }
 
 /// As [`run_scenario`], for an arbitrary evidence `prompt`. Both the byte-size
 /// (#1257) and line-count (#1387) prompts are Research by content, so the
 /// classification invariant is asserted here for whichever prompt is replayed.
-async fn run_scenario_for(
+pub(super) async fn run_scenario_for(
     prompt: &str,
+    expected: PromptDisposition,
     workspace: &std::path::Path,
     script: Vec<serde_json::Value>,
 ) -> (String, u32, Option<crate::TurnEndReason>, String) {
@@ -141,10 +142,14 @@ async fn run_scenario_for(
     // #1260/#1387: content classifies (the "largest"/"line count" evidence
     // needles) — the `?` cliff no longer decides. Research keeps the bounded
     // evidence loop.
+    //
+    // #2051: the expected disposition is a parameter so a sibling BAT can
+    // replay a non-evidence turn through the same simulated environment
+    // instead of standing up a second copy of this harness.
     assert_eq!(
         intake.disposition(),
-        PromptDisposition::Research,
-        "the evidence prompt must classify Research by content"
+        expected,
+        "{prompt:?} must classify {expected:?}"
     );
 
     let server = MockServer::start().await;
@@ -330,6 +335,7 @@ async fn line_count_question_answers_with_lined_find_and_clean_footer() {
     let ws = simulated_line_workspace();
     let (reply, hallucinations, end_reason, wire) = run_scenario_for(
         LINE_COUNT_PROMPT,
+        PromptDisposition::Research,
         ws.path(),
         vec![
             serde_json::json!({
@@ -419,6 +425,7 @@ async fn general_repository_explanation_is_markdown_and_source_first() {
     let ws = simulated_workspace();
     let (reply, hallucinations, end_reason, wire) = run_scenario_for(
         GENERAL_REPOSITORY_PROMPT,
+        PromptDisposition::Research,
         ws.path(),
         vec![
             serde_json::json!({
@@ -464,6 +471,7 @@ async fn rust_followup_answers_with_source_filtered_markdown_table() {
     let ws = simulated_line_workspace();
     let (reply, hallucinations, end_reason, wire) = run_scenario_for(
         RUST_TABLE_PROMPT,
+        PromptDisposition::Research,
         ws.path(),
         vec![
             serde_json::json!({
@@ -508,6 +516,7 @@ async fn line_count_question_wc_denied_then_escalates_cleanly() {
     let ws = simulated_line_workspace();
     let (reply, hallucinations, end_reason, wire) = run_scenario_for(
         LINE_COUNT_PROMPT,
+        PromptDisposition::Research,
         ws.path(),
         vec![
             serde_json::json!({
@@ -536,7 +545,7 @@ async fn line_count_question_wc_denied_then_escalates_cleanly() {
         "final answer returned: {reply}"
     );
     assert!(
-        wire.contains("Tool `run_command` is unavailable"),
+        wire.contains("Tool `run_command` is not available for this request"),
         "Research refuses the wc -l shell honestly: {wire}"
     );
     assert!(
@@ -544,7 +553,7 @@ async fn line_count_question_wc_denied_then_escalates_cleanly() {
         "request_user_input must dispatch in the evidence turn: {wire}"
     );
     assert!(
-        !wire.contains("Tool `request_user_input` is unavailable"),
+        !wire.contains("Tool `request_user_input` is not available for this request"),
         "the escalation must not be disposition-refused"
     );
     assert_clean_footer(hallucinations, end_reason);
@@ -588,7 +597,7 @@ async fn largest_files_question_pipeline_denied_then_escalates_cleanly() {
     // The pipeline was DISPOSITION-refused (an honest gate), never hijacked as
     // a misdirected embedded-find (#1262 kept hallucinations at zero below).
     assert!(
-        wire.contains("Tool `run_command` is unavailable"),
+        wire.contains("Tool `run_command` is not available for this request"),
         "the evidence turn refuses the shell honestly: {wire}"
     );
     // The formal escalation dispatched (#1259): headless => the recoverable
@@ -598,7 +607,7 @@ async fn largest_files_question_pipeline_denied_then_escalates_cleanly() {
         "request_user_input must dispatch in the evidence turn: {wire}"
     );
     assert!(
-        !wire.contains("Tool `request_user_input` is unavailable"),
+        !wire.contains("Tool `request_user_input` is not available for this request"),
         "the escalation must not be disposition-refused"
     );
     assert_clean_footer(hallucinations, end_reason);

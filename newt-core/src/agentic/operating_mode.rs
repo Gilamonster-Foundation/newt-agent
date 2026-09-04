@@ -25,15 +25,19 @@ pub trait OperatingModeControl: Send + Sync {
 /// Tool definition advertised only when an [`OperatingModeControl`] is
 /// injected (the interactive session is configured with `/mode auto`).
 pub fn select_operating_mode_tool_definition() -> serde_json::Value {
+    // #2051: the sentence about what a selection does to the turn in flight
+    // is disposition vocabulary, owned by `disposition_voice`. It used to say
+    // "never changes the authority or disposition of the current turn" — the
+    // mechanism by name, plus a reminder that the model has no move.
+    let scope = super::DispositionVoices::default().next_turn_scope;
     serde_json::json!({
         "type": "function",
         "function": {
             "name": "select_operating_mode",
-            "description": "In /mode auto, select the working style for the next \
-                            action-shaped turn. This changes no permissions and \
-                            never changes the authority or disposition of the \
-                            current turn. Choose chat, dev, admin, plan, or \
-                            diagnose; full-auto is human-only.",
+            "description": format!(
+                "In /mode auto, select the working style for the next action-shaped turn. \
+                 {scope} Choose chat, dev, admin, plan, or diagnose; full-auto is human-only."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
