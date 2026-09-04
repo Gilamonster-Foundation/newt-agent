@@ -183,20 +183,25 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/map` | — | `/` command | Navigator | keep — it performs | — read-only |
 | `/tests` | — | `/` command | Navigator | keep — it performs | — read-only |
 | `/text` | `/grep` | `/` command | Navigator | keep — it performs | — read-only |
-| `/type` | — | `/` command | Navigator | keep — it performs | — read-only |
+| `/type` | `/inspect` | `/` command | Navigator | keep — it performs | — read-only |
 | `/uses` | `/refs` | `/` command | Navigator | keep — it performs | — read-only |
 | `/allow` | — | `/` command | Session | keep — it performs | **none — #1965** |
+| `/cd` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/compress` | `/compact` | `/` command | Session | keep — it performs | **none — #1965** |
 | `/context` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/conversation` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/crew` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/dock` | — | `/` command | Session | keep — it performs | **none — #1965** |
+| `/end` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/mcp` | — | `/` command | Session | panel — a chooser, needs a region (#1979) | **none — #1965** |
+| `/new` | `/clear` | `/` command | Session | keep — it performs | **none — #1965** |
 | `/permissions` | — | `/` command | Session | panel — a chooser, needs a region (#1979) | **none — #1965** |
 | `/rename` | `/name` | `/` command | Session | keep — it performs | **none — #1965** |
+| `/restart` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/resume` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/roadmap` | — | `/` command | Session | keep — it performs | — read-only |
 | `/spill` | — | `/` command | Session | keep — it performs | — read-only |
+| `/start` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/tab` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/transcript` | — | `/` command | Session | keep — it performs | — read-only |
 | `/tree` | — | `/` command | Session | keep — it performs | — read-only |
@@ -217,6 +222,6 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/tenacity` | — | retired — redirects only | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
 | `/thinking` | — | retired — redirects only | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
 
-**67 registered, 63 of them typed as `/` commands (76 tokens).** Absorb 17 · keep 47 · panel 3. Receipts: journalled 8 · read-only 31 · **missing 28**.
+**72 registered, 68 of them typed as `/` commands (83 tokens).** Absorb 17 · keep 52 · panel 3. Receipts: journalled 8 · read-only 31 · **missing 33**.
 
 <!-- END GENERATED -->
