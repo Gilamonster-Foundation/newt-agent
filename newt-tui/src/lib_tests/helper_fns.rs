@@ -59,34 +59,35 @@ fn markdown_enabled_resolves_config_session_and_color() {
         }),
         ..Default::default()
     };
+    // The session override is a process-global since #2009 PR4, so this
+    // holds it exclusively and restores it on drop — including on panic.
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    newt_core::process_env::remove_var("NEWT_MARKDOWN");
+
     // Default (auto): follows color.
-    assert!(markdown_enabled(&newt_core::Config::default(), true, None));
-    assert!(!markdown_enabled(
-        &newt_core::Config::default(),
-        false,
-        None
-    ));
+    assert!(markdown_enabled(&newt_core::Config::default(), true));
+    assert!(!markdown_enabled(&newt_core::Config::default(), false));
     // Config off: never renders, even with color.
-    assert!(!markdown_enabled(&cfg_with(MarkdownMode::Off), true, None));
+    assert!(!markdown_enabled(&cfg_with(MarkdownMode::Off), true));
     // Config on: still gated by color (ANSI needs color).
-    assert!(markdown_enabled(&cfg_with(MarkdownMode::On), true, None));
-    assert!(!markdown_enabled(&cfg_with(MarkdownMode::On), false, None));
-    // Session override wins over config, still color-gated.
-    assert!(!markdown_enabled(
-        &cfg_with(MarkdownMode::On),
-        true,
-        Some(false)
-    ));
-    assert!(markdown_enabled(
-        &cfg_with(MarkdownMode::Off),
-        true,
-        Some(true)
-    ));
-    assert!(!markdown_enabled(
-        &cfg_with(MarkdownMode::Off),
-        false,
-        Some(true)
-    ));
+    assert!(markdown_enabled(&cfg_with(MarkdownMode::On), true));
+    assert!(!markdown_enabled(&cfg_with(MarkdownMode::On), false));
+
+    // Session override wins over config, still color-gated. Set the way both
+    // `/markdown` and `/settings markdown` set it, so this exercises the real
+    // precedence rather than a parameter that no longer exists.
+    newt_core::process_env::set_var("NEWT_MARKDOWN", "off");
+    assert!(!markdown_enabled(&cfg_with(MarkdownMode::On), true));
+    newt_core::process_env::set_var("NEWT_MARKDOWN", "on");
+    assert!(markdown_enabled(&cfg_with(MarkdownMode::Off), true));
+    assert!(
+        !markdown_enabled(&cfg_with(MarkdownMode::Off), false),
+        "color still gates it: ANSI needs color"
+    );
+
+    // ...and releasing the pin returns the session to config.
+    newt_core::process_env::remove_var("NEWT_MARKDOWN");
+    assert!(!markdown_enabled(&cfg_with(MarkdownMode::Off), true));
 }
 
 #[test]

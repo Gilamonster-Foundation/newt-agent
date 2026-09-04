@@ -822,6 +822,50 @@ pub enum MarkdownMode {
     Off,
 }
 
+/// The Markdown display mode this session resolves to: the operator's session
+/// override, else `[tui] markdown`, else the default.
+///
+/// # Why this exists (#2009 PR4)
+///
+/// The override was a `run_chat` LOCAL (`markdown_override: Option<bool>`),
+/// which is the precondition §5 names: **a receipt writer cannot read a
+/// local.** `settings_form::apply` is a pure function reached from a form, a
+/// deep link and a shim; none of them can see into the session loop. So the
+/// override moves to where every other absorbed display setting already keeps
+/// it — a process-global under the #1850 lock, read through ONE resolver that
+/// owns the precedence.
+///
+/// Deliberately the same shape as `agentic::thinking_mode`, not a new one. Two
+/// resolvers for "session override, else config, else default" is how they
+/// come to disagree.
+#[must_use]
+pub fn session_markdown_mode() -> MarkdownMode {
+    if let Some(mode) = std::env::var("NEWT_MARKDOWN")
+        .ok()
+        .as_deref()
+        .and_then(MarkdownMode::from_keyword)
+    {
+        return mode;
+    }
+    Config::resolve()
+        .ok()
+        .and_then(|c| c.tui)
+        .map(|t| t.markdown)
+        .unwrap_or_default()
+}
+
+/// Whether the operator has pinned the mode this session, as opposed to
+/// inheriting it from config. `/markdown` reports which, and a receipt's
+/// from→to is meaningless without it.
+#[must_use]
+pub fn markdown_is_session_pinned() -> bool {
+    std::env::var("NEWT_MARKDOWN")
+        .ok()
+        .as_deref()
+        .and_then(MarkdownMode::from_keyword)
+        .is_some()
+}
+
 impl MarkdownMode {
     /// Parse a CLI/config/command keyword (case-insensitive). `always`/`never`
     /// alias `on`/`off`.

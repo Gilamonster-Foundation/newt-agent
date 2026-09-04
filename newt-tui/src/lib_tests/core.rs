@@ -1418,7 +1418,7 @@ fn render_help_is_byte_identical_to_the_plain_help_corpus() {
 #[test]
 fn rich_help_uses_the_default_markdown_policy_and_honors_off() {
     let default_cfg = newt_core::Config::default();
-    let markdown = markdown_enabled(&default_cfg, true, None);
+    let markdown = markdown_enabled(&default_cfg, true);
     assert!(markdown, "RichTUI defaults to rendered Markdown");
 
     let rendered = render_help_for_tui(None, true, false, markdown, 100);
@@ -1438,7 +1438,7 @@ fn rich_help_uses_the_default_markdown_policy_and_honors_off() {
         }),
         ..Default::default()
     };
-    let markdown = markdown_enabled(&cfg_off, true, None);
+    let markdown = markdown_enabled(&cfg_off, true);
     assert!(!markdown);
     assert_eq!(
         render_help_for_tui(None, true, false, markdown, 100),

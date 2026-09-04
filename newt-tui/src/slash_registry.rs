@@ -651,11 +651,15 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Surface::Retired("/status loadout"),
     ),
     cmd(
+        // Absorbed as a `/settings` field in #2009 PR4 — and still a typed
+        // verb, exactly like `/edit-mode`: absorbing moves the STATE, the
+        // window close (PR14a) moves the row. Journal, because the field
+        // writes a receipt through `apply_and_record` like every other.
         "markdown",
         &[],
         Family::Tuning,
         Disposition::Absorb,
-        Receipt::Missing,
+        Receipt::Journal,
     ),
     cmd(
         "mode",
@@ -1139,6 +1143,15 @@ mod tests {
     /// would let the entire debt disappear as the cut proceeds, which is the
     /// most tempting wrong answer available here.
     ///
+    /// # 31 → 30: `/markdown` pays, rather than being reclassified (#2009 PR4)
+    ///
+    /// The two before it came off by argument — they never owed. This one is
+    /// paid: `/markdown` mutates, still mutates, and now writes a receipt,
+    /// because absorbing it moved its state out of a `run_chat` local into
+    /// `session_markdown_mode` where `settings_form::apply_and_record` can
+    /// read a from→to. **That relocation IS the payment.** A field whose
+    /// previous value lives in a local can only be recorded as a guess.
+    ///
     /// # 33 → 31: two truthing reclassifications, verified (#2009 PR3)
     ///
     /// `/memory` and `/loadout` were both registered `Missing` on a
@@ -1189,7 +1202,7 @@ mod tests {
             .filter(|c| matches!(c.receipt, Receipt::Missing))
             .count();
         assert!(
-            missing <= 31,
+            missing <= 30,
             "{missing} state-mutating commands record nothing durable — that \
              is more than when #1981 armed this. A new state mutator needs a \
              receipt destination, not another silent write"

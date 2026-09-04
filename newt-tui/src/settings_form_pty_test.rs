@@ -41,16 +41,24 @@ fn settings_form_child() {
     }
 }
 
-/// Every field label the bare-form menu must show. Asserted on the grid one
-/// by one so a failure names the missing row instead of "menu absent".
-const FIELD_LABELS: &[&str] = &[
-    "line-editor key bindings",
-    "tenacity",
-    "cognition",
-    "reasoning display",
-    "action-pressure nudges",
-    "tool-call round limit",
-];
+/// Every field label the bare-form menu must show, **taken from `Field::ALL`
+/// rather than copied beside it** (#2009 PR4).
+///
+/// §5 requires each slice that adds a field to extend this grid. A
+/// hand-maintained list is a way to forget: the grid would go on passing over
+/// the six fields it knew about while a seventh rendered or did not. Reading
+/// the form's own field list means adding a field extends the acceptance test
+/// by construction, and a field that stops rendering fails here whether or not
+/// anyone remembered this file.
+///
+/// Still asserted one by one below, so a failure names the missing row instead
+/// of "menu absent".
+fn field_labels() -> Vec<&'static str> {
+    crate::settings_form::Field::ALL
+        .iter()
+        .map(|f| f.label())
+        .collect()
+}
 
 #[test]
 fn the_settings_form_renders_picks_applies_and_receipts() {
@@ -126,8 +134,14 @@ fn the_settings_form_renders_picks_applies_and_receipts() {
 
     // 1. The bare form: every field label visible on the grid.
     let mut wait_on_grid = |m: &str| wait_on_grid_inner(m, false);
-    let menu = wait_on_grid(FIELD_LABELS[FIELD_LABELS.len() - 1]);
-    for label in FIELD_LABELS {
+    let labels = field_labels();
+    assert!(
+        labels.len() >= 7,
+        "the form lost fields; this grid covers {} of them",
+        labels.len()
+    );
+    let menu = wait_on_grid(labels[labels.len() - 1]);
+    for label in &labels {
         assert!(
             menu.contains(label),
             "field `{label}` not rendered:\n{menu}"

@@ -9916,18 +9916,25 @@ pub(crate) fn build_adjudicator(
 /// Whether to render assistant Markdown this turn (Step 25.4, #568). The
 /// session `/markdown` override wins over `[tui].markdown`; either way the
 /// result is gated by `color` (Markdown emits ANSI, so it is off without color).
-fn markdown_enabled(cfg: &newt_core::Config, color: bool, session: Option<bool>) -> bool {
-    let base = match session {
-        Some(forced) => forced,
-        None => cfg
-            .tui
-            .as_ref()
-            .map(|t| t.markdown)
-            .unwrap_or_default()
-            .forced()
-            .unwrap_or(color),
+/// Whether Markdown renders right now.
+///
+/// # The `session` parameter is gone (#2009 PR4)
+///
+/// It was a `run_chat` local threaded through nine call sites, which meant the
+/// session's override was invisible to anything outside that loop — including
+/// `settings_form::apply`, which is exactly what had to see it for `/markdown`
+/// to become a field. `session_markdown_mode` owns the precedence now, so this
+/// asks it rather than being told.
+///
+/// `cfg` stays a parameter: callers already hold the resolved config, and the
+/// resolver falls back to `Config::resolve()` only when nobody has.
+fn markdown_enabled(cfg: &newt_core::Config, color: bool) -> bool {
+    let mode = if newt_core::config::markdown_is_session_pinned() {
+        newt_core::config::session_markdown_mode()
+    } else {
+        cfg.tui.as_ref().map(|t| t.markdown).unwrap_or_default()
     };
-    base && color
+    mode.forced().unwrap_or(color) && color
 }
 
 /// Resolve the active context manager (Step 24.8, #559): session override
