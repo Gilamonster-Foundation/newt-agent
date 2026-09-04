@@ -104,18 +104,29 @@ pub fn print_list_item(label: &str, active: bool, color: bool) {
 /// (the failure mode the operator flagged). Multi-line text stays amber; the
 /// marker leads the first line.
 pub fn print_harness_notice(msg: &str, color: bool) {
+    write_harness_notice(io::stdout(), msg, color);
+}
+
+/// [`print_harness_notice`] onto a caller-supplied sink.
+///
+/// Same bytes, one implementation. The streamed-answer path (#123) takes its
+/// output sink as a parameter so a test can assert what actually reached the
+/// terminal, and its cut-stream notice belongs on that same sink — a notice
+/// nothing can observe is a print site that can be deleted with the suite
+/// staying green.
+pub fn write_harness_notice(mut out: impl Write, msg: &str, color: bool) {
     if color {
         execute!(
-            io::stdout(),
+            out,
             SetForegroundColor(CtColor::DarkYellow),
             Print(format!("⚠  newt: {msg}\n")),
             ResetColor,
         )
         .ok();
     } else {
-        println!("⚠  newt: {msg}");
+        writeln!(out, "⚠  newt: {msg}").ok();
     }
-    io::stdout().flush().ok();
+    out.flush().ok();
 }
 
 /// Print a single-line debug diagnostic (dimmed, prefix `[debug]`).

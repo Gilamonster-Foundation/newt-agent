@@ -114,6 +114,10 @@ mod markdown {
             }
             self.out.flush()
         }
+        /// Give the sink back — see the full renderer's `into_inner`.
+        pub fn into_inner(self) -> W {
+            self.out
+        }
     }
 }
 mod adjudicate;
@@ -7260,21 +7264,37 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 stream_req = stream_req.bearer_auth(key);
             }
             let (out, was_streamed) = match openai_stream_final_answer(
-                stream_req, color, markdown, debug, cancel,
+                stream_req,
+                io::stdout(),
+                color,
+                markdown,
+                debug,
+                cancel,
             )
             .await
             {
                 // A second call, so a second usage record. Merged, not
                 // replaced — and when the server sent none, `merge_round_usage`
                 // keeps what the probe already reported rather than zeroing it.
-                Some((text, stream_usage)) => {
+                StreamOutcome::Printed(text, stream_usage) => {
                     accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
                     (text, true)
                 }
-                // The re-issue produced nothing usable and printed nothing.
-                // The probe answer is right here — never return silence
-                // because the second call failed.
-                None => (content, false),
+                // The re-issue produced no usable answer (or a cut fragment,
+                // announced as such). The probe answer is right here — never
+                // return silence, or a truncation, because the second call
+                // failed. Its tokens were still spent, so they still merge.
+                StreamOutcome::UseProbe(stream_usage) => {
+                    accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
+                    (content, false)
+                }
+                // Esc, with nothing streamed. Same contract as the interrupt
+                // checkpoint at the top of this loop: the turn ends with an
+                // empty reply rather than printing an answer the operator
+                // just asked to stop.
+                StreamOutcome::Cancelled => {
+                    return Ok((String::new(), false, accumulated_usage, hallucination_count))
+                }
             };
             // #1964: this normal (non-cap) finish gets the same claim check
             // + disclosure gate as a cap-exit summary. Note the wart shared
@@ -11045,17 +11065,111 @@ impl ReasoningTrickle {
     }
 }
 
+/// Who owns the answer sink while a streamed answer paints.
+///
+/// An enum and not two `Option`s because there is exactly ONE owner at a time:
+/// when markdown is on the block writer TAKES the sink, and the `▸  ` prefix
+/// has to be written raw before it does — pushed through the markdown writer
+/// it would be *content*, and a `#` heading right after it would stop being a
+/// heading. Writing the prefix to a second handle on the same stream instead
+/// is what the sprawl note in AGENTS.md is about; here the sink is passed in,
+/// so there is no second handle to reach for.
+enum AnswerSink<W: std::io::Write> {
+    Raw(W),
+    Markdown(MarkdownStreamWriter<W>),
+}
+
+impl<W: std::io::Write> AnswerSink<W> {
+    /// The first visible character of the answer: the `▸  ` prefix, after
+    /// which markdown (when on) takes the sink for the rest of the stream.
+    fn begin(self, color: bool, markdown: bool, cols: usize) -> Self {
+        let mut w = match self {
+            Self::Raw(w) => w,
+            // Called once, guarded by `started`.
+            already => return already,
+        };
+        if color {
+            execute!(
+                w,
+                SetForegroundColor(NEWT_ORANGE_CT),
+                Print("▸  "),
+                ResetColor,
+            )
+            .ok();
+        } else {
+            write!(w, "▸  ").ok();
+        }
+        w.flush().ok();
+        if markdown {
+            Self::Markdown(MarkdownStreamWriter::new(
+                w,
+                RenderOpts { color: true, cols },
+            ))
+        } else {
+            Self::Raw(w)
+        }
+    }
+
+    /// One think-filtered delta, flushed so the operator sees it arrive.
+    fn push(&mut self, t: &str) {
+        match self {
+            Self::Raw(w) => {
+                write!(w, "{t}").ok();
+                w.flush().ok();
+            }
+            Self::Markdown(w) => {
+                w.push(t).ok();
+            }
+        }
+    }
+
+    /// Close the answer and give the sink back, so a notice can be printed
+    /// BELOW it on the same terminal instead of racing it on another handle.
+    fn end(self, started: bool) -> W {
+        match self {
+            Self::Raw(mut w) => {
+                // The raw path closes its own line; `MarkdownStreamWriter`
+                // ends on a newline of its own.
+                if started {
+                    writeln!(w).ok();
+                }
+                w
+            }
+            Self::Markdown(mut w) => {
+                w.finish().ok();
+                w.into_inner()
+            }
+        }
+    }
+}
+
+/// What the streaming re-issue produced, and so what the caller owes the
+/// operator. Three arms because the caller has three different jobs — an
+/// `Option` collapsed the last two, and the collapse is what let an operator's
+/// own interrupt be reported as a broken wire.
+#[derive(Debug)]
+enum StreamOutcome {
+    /// Text reached the terminal: return it with `was_streamed = true` so the
+    /// caller does NOT print it a second time.
+    Printed(String, Option<crate::TokenUsage>),
+    /// The streamed answer is not usable — the request never landed, it
+    /// answered non-2xx, the body carried no text, or the stream was CUT
+    /// before `[DONE]` (the fragment stays on screen under a notice, but it is
+    /// not the answer). The probe answer the caller holds is complete: return
+    /// it with `was_streamed = false` so the caller prints it. Carries any
+    /// usage the second call did report — those tokens were spent whether or
+    /// not the answer arrived.
+    UseProbe(Option<crate::TokenUsage>),
+    /// The operator interrupted with nothing on screen. End the turn with an
+    /// empty reply, the same contract as the loop's round-boundary interrupt
+    /// checkpoint — an interrupt is not a wire failure to recover from.
+    Cancelled,
+}
+
 /// Re-issue an accepted OpenAI-compatible round as a stream and print it live.
 ///
 /// `req` is the fully built `stream: true` request (body + auth); building it
-/// at the call site is what keeps this signature reviewable. Returns the
-/// streamed answer and the round's usage, or `None` when the re-issue produced
-/// nothing usable — **the caller must then fall back to the probe answer it
-/// already holds and report `was_streamed = false`,** because nothing reached
-/// the terminal and a blank turn is never the right outcome. Three distinct
-/// failures collapse into that one `None`: the request never landed, it
-/// answered non-2xx, or the body carried no text (a stream cut before `[DONE]`
-/// with nothing printed, or a model that simply said nothing the second time).
+/// at the call site is what keeps this signature reviewable.
 ///
 /// No retry envelope, deliberately: the probe answer IS the fallback, and it is
 /// strictly better than re-running a full prefill for a round whose answer is
@@ -11070,14 +11184,31 @@ impl ReasoningTrickle {
 /// has already shown this turn's reasoning — it runs on the *probe* response,
 /// before `has_tools` is even computed — so trickling the re-issue's reasoning
 /// would show the operator the same thinking block twice.
-async fn openai_stream_final_answer(
+///
+/// `out` is the sink every visible byte goes to — `io::stdout()` in the loop,
+/// a buffer under test. It is a parameter and not `io::stdout()` inline
+/// because the flag this returns is what tells the CALLER not to print: a
+/// suite that can only assert the flag cannot tell "streamed" from "printed
+/// nothing", and a deleted print site ships as a blank turn with the tests
+/// still green.
+async fn openai_stream_final_answer<W: std::io::Write>(
     req: reqwest::RequestBuilder,
+    out: W,
     color: bool,
     markdown: bool,
     debug: bool,
     cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> Option<(String, Option<crate::TokenUsage>)> {
-    let resp = match req.send().await {
+) -> StreamOutcome {
+    // The re-issue is a WHOLE SECOND inference call, so the send is raced
+    // against the interrupt flag exactly like both sibling wires race theirs:
+    // an already-cancelled turn never fires it (and never pays for it), and Esc
+    // during a slow prefill is felt at once instead of after the server
+    // answers.
+    let sent = match cancellable(cancel, req.send()).await {
+        Some(sent) => sent,
+        None => return StreamOutcome::Cancelled,
+    };
+    let resp = match sent {
         Ok(r) if r.status().is_success() => r,
         outcome => {
             if debug {
@@ -11087,7 +11218,7 @@ async fn openai_stream_final_answer(
                 };
                 print_debug(&format!("{why} — using probe content"), color);
             }
-            return None;
+            return StreamOutcome::UseProbe(None);
         }
     };
 
@@ -11098,8 +11229,7 @@ async fn openai_stream_final_answer(
         color,
     );
     let cols = display::term_cols();
-    let mut md =
-        markdown.then(|| MarkdownStreamWriter::new(io::stdout(), RenderOpts { color: true, cols }));
+    let mut sink = AnswerSink::Raw(out);
     let mut acc = openai_sse::SseAccumulator::new();
     // #385, on this wire: the non-streaming arm of this same loop runs every
     // reply through `split_reasoning`, so an inline `<think>` block never
@@ -11111,11 +11241,17 @@ async fn openai_stream_final_answer(
     let mut text = String::new();
     let mut started = false;
     let mut transport_break: Option<String> = None;
+    let mut interrupted = false;
     let mut resp = resp;
     while !acc.is_done() {
         match cancellable(cancel, resp.chunk()).await {
-            // Interrupted: stop reading and keep what already streamed.
-            None => break,
+            // Interrupted: stop reading and keep what already streamed. Record
+            // WHOSE stop this was — a cut socket and a keypress both end the
+            // loop without `[DONE]`, and only one of them is the wire's fault.
+            None => {
+                interrupted = true;
+                break;
+            }
             Some(Ok(Some(chunk))) => {
                 // Lossy UTF-8 into the accumulator's ROLLING line buffer — a
                 // `data:` line routinely splits across chunks, so a per-chunk
@@ -11132,25 +11268,10 @@ async fn openai_stream_final_answer(
                     }
                     if !started {
                         drop(spinner.take());
-                        if color {
-                            execute!(
-                                io::stdout(),
-                                SetForegroundColor(NEWT_ORANGE_CT),
-                                Print("▸  "),
-                                ResetColor,
-                            )
-                            .ok();
-                        } else {
-                            print!("▸  ");
-                        }
+                        sink = sink.begin(color, markdown, cols);
                         started = true;
                     }
-                    if let Some(w) = md.as_mut() {
-                        w.push(&t).ok();
-                    } else {
-                        print!("{t}");
-                        io::stdout().flush().ok();
-                    }
+                    sink.push(&t);
                     text.push_str(&t);
                 }
             }
@@ -11168,39 +11289,49 @@ async fn openai_stream_final_answer(
     // reached the terminal.
     let tail = think.finish();
     if !tail.is_empty() && started {
-        if let Some(w) = md.as_mut() {
-            w.push(&tail).ok();
-        } else {
-            print!("{tail}");
-            io::stdout().flush().ok();
-        }
+        sink.push(&tail);
         text.push_str(&tail);
     }
     drop(spinner.take());
-    if let Some(w) = md.as_mut() {
-        w.finish().ok();
-    }
-    if started && md.is_none() {
-        println!();
-    }
+    let mut out = sink.end(started);
     let round = acc.finish();
     if text.is_empty() {
+        // Nothing reached the terminal, so an interrupt here ends the turn
+        // rather than printing the probe answer the operator just stopped.
+        if interrupted {
+            return StreamOutcome::Cancelled;
+        }
         if debug {
             print_debug("stream produced no text — using probe content", color);
         }
-        return None;
+        return StreamOutcome::UseProbe(round.usage);
     }
-    // Text reached the terminal, so the probe answer can no longer replace it —
-    // it would print a second, differently-worded reply under the partial one.
-    // Same policy as the other two wires: keep the partial, say it is partial.
+    // The operator stopped it. Keep the partial — it is on screen, and
+    // reprinting the complete answer under it is the opposite of what Esc
+    // asked for — but say who stopped it. Reporting a keypress as "the stream
+    // ended before [DONE]" blames the wire for the operator's own decision.
+    if interrupted {
+        display::write_harness_notice(&mut out, "interrupted — keeping the partial answer", color);
+        return StreamOutcome::Printed(text, round.usage);
+    }
+    // A stream that never reached `[DONE]` was CUT: the fragment on screen
+    // stops at whatever byte the socket died on. The other two wires keep
+    // their partial because the partial is all they have — this one is not in
+    // that position. The probe answer is complete, was already accepted by
+    // every gate, and is what gets persisted and re-sent, so returning the
+    // fragment would silently truncate the turn's record to whatever arrived.
+    // Say the stream was cut, then hand the complete answer back for the
+    // caller to print under it.
     if !round.done {
         let why = transport_break.unwrap_or_else(|| "stream ended before [DONE]".to_string());
-        print_harness_notice(
-            &format!("stream broke mid-response ({why}) — keeping the partial answer"),
+        display::write_harness_notice(
+            &mut out,
+            &format!("stream cut mid-answer ({why}) — the complete answer follows"),
             color,
         );
+        return StreamOutcome::UseProbe(round.usage);
     }
-    Some((text, round.usage))
+    StreamOutcome::Printed(text, round.usage)
 }
 
 /// Stream an Ollama NDJSON response, printing tokens as they arrive.
