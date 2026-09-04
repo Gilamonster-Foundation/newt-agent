@@ -33,6 +33,7 @@ pub(crate) mod cw_overflow;
 mod display;
 mod generation_policy;
 mod git_tool;
+mod openai_sse;
 pub(crate) mod self_verify;
 // Step 26.4 (#583): scratchpad structured-state — the `scratchpad` context feature.
 pub(crate) mod scratchpad;
