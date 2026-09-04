@@ -203,6 +203,12 @@ mod modal;
 // The lean input surface (issue #527): a dead-simple word-wrapped text box, the
 // flight/wyvern morphology. Always built — it is the footer-off / lean tier.
 mod lean_input;
+/// Cursor + window arithmetic for a list longer than its panel.
+#[cfg(feature = "rich-tui")]
+mod list_cursor;
+/// The model picker: a windowed, arrow-navigated list.
+#[cfg(feature = "rich-tui")]
+mod models_panel;
 // #1669: the channel seam that lets a session's turn stop owning the keyboard.
 mod session_worker;
 // #1669 PR-B: the tab projection that crosses the surface protocol.
