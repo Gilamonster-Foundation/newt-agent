@@ -86,6 +86,7 @@ pub(crate) enum Field {
     Thinking,
     Nudge,
     Markdown,
+    Mode,
     Rounds,
 }
 
@@ -98,6 +99,7 @@ impl Field {
         Self::Thinking,
         Self::Nudge,
         Self::Markdown,
+        Self::Mode,
         Self::Rounds,
     ];
 
@@ -112,6 +114,7 @@ impl Field {
             Self::Thinking => "thinking",
             Self::Nudge => "nudge",
             Self::Markdown => "markdown",
+            Self::Mode => "mode",
             Self::Rounds => "rounds",
         }
     }
@@ -124,6 +127,7 @@ impl Field {
             Self::Thinking => "reasoning display",
             Self::Nudge => "action-pressure nudges",
             Self::Markdown => "markdown rendering",
+            Self::Mode => "operating mode",
             Self::Rounds => "tool-call round limit",
         }
     }
@@ -191,6 +195,16 @@ impl Field {
                 ("on", "always render (still needs colour)"),
                 ("off", "stream raw text"),
             ]),
+            // **Built from the enum, not typed out beside it.** The styles,
+            // their order and their one-line descriptions all live on
+            // `OperatingMode`; a style added there appears here without an
+            // edit, which is the whole reason the type moved to core.
+            Self::Mode => ValueSpace::Choice(
+                newt_core::operating_mode::OperatingMode::all()
+                    .iter()
+                    .map(|m| (m.as_str(), m.description().to_string()))
+                    .collect(),
+            ),
             // The one field that is not a vocabulary. `/rounds double` and
             // `/rounds unlimited` stay affordances of the VERB — they are
             // relative operations, not values — and the verb resolves them to a
@@ -236,6 +250,9 @@ impl Field {
             Self::Markdown => newt_core::config::session_markdown_mode()
                 .keyword()
                 .to_string(),
+            Self::Mode => newt_core::operating_mode::session_operating_mode()
+                .as_str()
+                .to_string(),
             Self::Rounds => newt_core::tenacity::session_tool_rounds()
                 .map_or_else(|| "auto".to_string(), |n| n.to_string()),
         }
@@ -273,6 +290,14 @@ impl Field {
     /// affordance operators already type.
     pub(crate) fn accepts(self, value: &str) -> Option<String> {
         let want = value.trim().to_lowercase();
+        // **The mode aliases live on the enum**, which already owns
+        // `developer`/`sysadmin`/`diagnostic`/`full_auto`. Listing them again
+        // in the arms below would be a second copy of a vocabulary this slice
+        // moved to core precisely so there could be one.
+        if matches!(self, Self::Mode) {
+            return newt_core::operating_mode::OperatingMode::from_keyword(&want)
+                .map(|m| m.as_str().to_string());
+        }
         let want = match (self, want.as_str()) {
             // `/edit-mode vim`
             (Self::EditMode, "vim") => "vi",
@@ -435,6 +460,16 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         // Written the same way `/markdown` writes it, under the #1850 lock,
         // and read back through the one resolver that owns the precedence.
         Field::Markdown => newt_core::process_env::set_var("NEWT_MARKDOWN", value),
+        // `accepts` has already resolved the token through `from_keyword`, so
+        // this cannot fail — and it goes through the SAME setter `/mode` uses.
+        // The session loop clears the stale model-selected style when it sees
+        // this value change; see `chat.rs`'s reconcile beside
+        // `dispatch_slash_with_ask`.
+        Field::Mode => {
+            if let Some(mode) = newt_core::operating_mode::OperatingMode::from_keyword(value) {
+                newt_core::operating_mode::set_session_operating_mode(mode);
+            }
+        }
         // `on` REMOVES the variable rather than setting it, which is what the
         // absorbed `/nudge on` did: the readers test for `=off`, so an unset
         // variable and `on` are the same state and only one of them is a
@@ -930,6 +965,53 @@ mod tests {
     /// **Every alias the absorbed verbs took still resolves.** Each of these
     /// was reachable before the family moved; absorbing a command must not
     /// quietly delete an affordance operators already type.
+    /// **The mode field's vocabulary IS the enum's** (#2009 PR4b).
+    ///
+    /// The styles, their order and their descriptions are read off
+    /// `OperatingMode` rather than typed out beside it. A style added to the
+    /// enum appears in the form without an edit here — which is the reuse the
+    /// type's move down to core buys, beyond making the field possible at all.
+    #[test]
+    fn the_mode_fields_choices_are_the_enums_own() {
+        use newt_core::operating_mode::OperatingMode;
+        let offered = Field::Mode.offered();
+        let want: Vec<&str> = OperatingMode::all().iter().map(|m| m.as_str()).collect();
+        assert_eq!(offered, want, "the form drifted from the mode vocabulary");
+        assert!(!want.is_empty(), "an empty list would make this vacuous");
+        // Every style is choosable, `full-auto` included: this is the human's
+        // door, and the human-only exclusion belongs to the MODEL's schema.
+        assert!(offered.contains(&"full-auto"));
+    }
+
+    /// The verb and the field select one style, through one setter.
+    #[test]
+    fn the_mode_field_and_its_verb_resolve_to_one_state() {
+        use newt_core::operating_mode::{session_operating_mode, OperatingMode};
+        let _guard = settings_guard();
+        newt_core::process_env::remove_var("NEWT_MODE");
+        assert_eq!(session_operating_mode(), OperatingMode::Chat);
+        assert_eq!(Field::Mode.current(), "chat");
+
+        assert_eq!(
+            apply(Field::Mode, "plan"),
+            Ok("operating mode: plan".to_string())
+        );
+        assert_eq!(session_operating_mode(), OperatingMode::Plan);
+        assert_eq!(Field::Mode.current(), "plan");
+    }
+
+    /// The keywords the verb accepted, kept by the absorption.
+    #[test]
+    fn the_mode_verbs_aliases_survive_absorption() {
+        assert_eq!(Field::Mode.accepts("developer"), Some("dev".to_string()));
+        assert_eq!(Field::Mode.accepts("sysadmin"), Some("admin".to_string()));
+        assert_eq!(
+            Field::Mode.accepts("FULL-AUTO"),
+            Some("full-auto".to_string())
+        );
+        assert_eq!(Field::Mode.accepts("nonsense"), None);
+    }
+
     /// **The verb and the field write the same state** (#2009 PR4).
     ///
     /// `/markdown off` set a `run_chat` local; `/settings markdown off` could

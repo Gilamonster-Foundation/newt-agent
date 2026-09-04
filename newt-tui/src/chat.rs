@@ -6263,6 +6263,20 @@ fn session_body(
                     // its clock while the operator answers. Asking on this
                     // thread's terminal instead is what left two live prompts
                     // painted over each other.
+                    // #2009 PR4b: `/settings mode <style>` writes the session
+                    // mode through core, where this loop cannot see the write
+                    // happen. Choosing a style explicitly must also supersede
+                    // any stale model-selected one — the consequence the
+                    // `/mode` arm performs inline — and those states are
+                    // conversation-scoped and owned HERE.
+                    //
+                    // So the value has one writer and its consequence has one
+                    // named boundary, joined by observing the value rather than
+                    // by a second setter reaching into this loop's state. This
+                    // is the same explicit-boundary discipline `/new`, persona
+                    // rotation and restore already use; it adds a boundary, it
+                    // does not replace them with an observer.
+                    let mode_before = newt_core::operating_mode::session_operating_mode();
                     let cont = dispatch_slash_with_ask(
                         task,
                         workspace,
@@ -6271,6 +6285,11 @@ fn session_body(
                         markdown_enabled(&cfg, color),
                         Some(&ask_surface),
                     )?;
+                    let mode_after = newt_core::operating_mode::session_operating_mode();
+                    if mode_after != mode_before {
+                        active_operating_mode = mode_after;
+                        conversation_mode_states.clear();
+                    }
                     surface.save_history();
                     // Skip config reload and terminal reinit when exiting — unnecessary
                     // work that can hang if the terminal is in a degraded state.
