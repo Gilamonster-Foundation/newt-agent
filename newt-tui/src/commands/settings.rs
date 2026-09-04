@@ -57,9 +57,13 @@ pub(crate) fn dispatch(
                     verbose,
                 );
             } else {
-                // Under the process-env lock (#1850); the next prompt is
-                // built right after this returns.
-                newt_core::process_env::set_var("NEWT_PROMPT", template);
+                // #2009 PR5: ABSORBED into `/settings prompt`. The verb keeps
+                // its prose — a rendered preview says more than a template
+                // echoed back — but no longer owns a write. This arm used to
+                // call `set_var` itself, which is exactly the "one mutation
+                // path is aspirational rather than true" the `/vi` arm below
+                // warns about, and it is why the setting had no receipt.
+                apply_setting(Field::Prompt, template, "/prompt set");
                 let (_t, preview) = current_prompt_and_preview(workspace);
                 print_newt(
                     &format!("prompt set for this session — preview: {preview}"),
@@ -75,7 +79,9 @@ pub(crate) fn dispatch(
         }
 
         "prompt" if matches!(arg1, "reset" | "default" | "clear") => {
-            newt_core::process_env::remove_var("NEWT_PROMPT");
+            // Through the same writer, so the release is recorded too. `reset`
+            // is a VALUE of the field, not a second act.
+            apply_setting(Field::Prompt, "reset", "/prompt reset");
             print_newt(
                 "prompt reset to your [tui] prompt / the built-in default.",
                 color,

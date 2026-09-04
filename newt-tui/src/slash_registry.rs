@@ -700,11 +700,13 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::Missing,
     ),
     cmd(
+        // Absorbed as the form's first `Text` field in #2009 PR5, and
+        // still a typed verb until the window closes.
         "prompt",
         &[],
         Family::Tuning,
         Disposition::Absorb,
-        Receipt::Missing,
+        Receipt::Journal,
     ),
     cmd(
         "retrieval",
@@ -1146,6 +1148,14 @@ mod tests {
     /// would let the entire debt disappear as the cut proceeds, which is the
     /// most tempting wrong answer available here.
     ///
+    /// # 29 → 28: `/prompt` pays (#2009 PR5)
+    ///
+    /// Its state already lived in `NEWT_PROMPT`, so no relocation was needed —
+    /// what it lacked was a single writer. `/prompt set` open-coded its own
+    /// `set_var`, which is precisely the "one mutation path is aspirational
+    /// rather than true" the `/vi` arm's comment warns about. It routes
+    /// through `apply_and_record` now.
+    ///
     /// # 30 → 29: `/mode` pays the same way (#2009 PR4b)
     ///
     /// Same shape as `/markdown` and for the same reason: absorbing it moved
@@ -1212,7 +1222,7 @@ mod tests {
             .filter(|c| matches!(c.receipt, Receipt::Missing))
             .count();
         assert!(
-            missing <= 29,
+            missing <= 28,
             "{missing} state-mutating commands record nothing durable — that \
              is more than when #1981 armed this. A new state mutator needs a \
              receipt destination, not another silent write"

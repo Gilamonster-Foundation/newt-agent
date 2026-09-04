@@ -215,13 +215,13 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/persona` | — | `/` command | Tuning | absorb → `/settings persona` | **none — #1965** |
 | `/plan` | — | `/` command | Tuning | absorb → `/settings plan` | **none — #1965** |
 | `/posture` | — | `/` command | Tuning | absorb → `/settings posture` | **none — #1965** |
-| `/prompt` | — | `/` command | Tuning | absorb → `/settings prompt` | **none — #1965** |
+| `/prompt` | — | `/` command | Tuning | absorb → `/settings prompt` | `~/.newt/receipts.jsonl` |
 | `/psyche` | — | `/` command | Tuning | keep — it performs | `~/.newt/receipts.jsonl` |
 | `/retrieval` | — | `/` command | Tuning | absorb → `/settings retrieval` | **none — #1965** |
 | `/rounds` | `/tool-rounds` `/max-rounds` | `/` command | Tuning | absorb → `/settings rounds` | `~/.newt/receipts.jsonl` |
 | `/tenacity` | — | retired → `/settings tenacity` | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
 | `/thinking` | — | retired → `/settings thinking` | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
 
-**72 registered, 59 of them typed as `/` commands (74 tokens).** Absorb 16 · keep 53 · panel 3. Receipts: journalled 10 · read-only 33 · **missing 29**.
+**72 registered, 59 of them typed as `/` commands (74 tokens).** Absorb 16 · keep 53 · panel 3. Receipts: journalled 11 · read-only 33 · **missing 28**.
 
 <!-- END GENERATED -->

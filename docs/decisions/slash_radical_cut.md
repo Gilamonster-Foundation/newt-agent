@@ -108,7 +108,7 @@ Endgame surfaces: **VERB** (exception) · **Native** (a settings field, no slash
 | `/dock` | **VERB** (kill-switch); peers also read-only in Permissions | `disable` parked Missing → event journal, sequenced **before** window close | survives |
 | `/mcp` | Section `/settings mcp`; LINK-mode fallback if the `mcp`-to-core precondition slips | durable config writes Journal; Missing −1; session mute is session-scoped state → parked, no scope field is added to `SettingChange` | PR10 |
 | `/permissions` | Section `/settings permissions` (posture field + audit + grants + decision reopen) | posture Journal (Missing −1); audit None_; grants/reopen parked SectionAction rows | PR10 |
-| `/rename` (`/name`) | Native field `title` — **OPERATOR-CALL Q5**; the `help_request` free-text-title carve-out (lib.rs:12529) is **ported to the deep link** | Journal (Token); Missing −1 | PR5 |
+| `/rename` (`/name`) | **VERB** — Q5 answered *conversation metadata* (see §7 Q5); the free-text carve-out was ported anyway and generalized to `Text` fields | parked Missing → event journal, with the conversation ops | PR5 (answered) |
 | `/resume` | **VERB** — absorbs `/recall` + `/conversation` | run-state; parked | PR6 grows it |
 | `/roadmap` | **VERB** — absorbs `/tree`, `/plan` | parked Missing → event journal | PR12 |
 | `/spill` | **VERB** (OPERATOR-CALL Q4); its `detail` knob leaves for Context | views None_; `reset` parked Missing | PR7 splits knob |
@@ -126,7 +126,7 @@ Endgame surfaces: **VERB** (exception) · **Native** (a settings field, no slash
 | `/markdown` | Native | Journal; Missing −1 | PR4 |
 | `/mode` | Native | Journal; Missing −1 | PR4 |
 | `/nudge` | Native (landed) | Journal (landed) | done |
-| `/persona` | Native (store-seeded Choice at ask time) | Journal; Missing −1 | PR5 |
+| `/persona` | **VERB** — it PERFORMS (criterion 1): `chat.rs:5500` rotates the conversation id, then resets memory, the system prompt, the artifact store, the preference pin and the backend route. A CRUD panel is its own later slice | parked Missing → event journal | corrected in PR5 |
 | `/plan` | Retired → `/roadmap` (old Absorb row quoted in place) | never writes; redirect says "(nothing changed)" | PR12 |
 | `/posture` | Native (Permissions) | Journal; Missing −1 | PR10 |
 | `/prompt` | Native (Text); **quoted-template parsing preserved in the deep link**; rich edit via the panel field editor, never `InteractionView` | Journal; Missing −1 | PR5 |
@@ -330,7 +330,7 @@ Every slice: `UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generat
 | **Q2** | `/dgx` — keep the verb, or fold fleet ops into the Backends section? | **Keep.** It removes an entire unbuilt work item (modal progress rendering) and it is incident-speed on your daily-driver box. |
 | **Q3** | `/tab` — keep the verb, or retire it to chords + palette? | **Keep** until a macOS-safe chord exists. `/detail` exists precisely because Option is a compose key; retiring `/tab` to a chord repeats the mistake that verb was created to fix. |
 | **Q4** | `/spill` — keep the verb, or fold its views into `/transcript`? | **Keep.** Folding is new pager machinery for the same view, and it retrains a reflex used exactly while watching a run go wrong. |
-| **Q5** | `/rename` → `/settings title`: is a conversation title a setting? | **Yes**, with the free-text carve-out ported — it has a real from→to and a typed `via`. If you read it as conversation metadata, `/rename` survives as verb #17. |
+| **Q5** | `/rename` → `/settings title`: is a conversation title a setting? | **ANSWERED (PR5): conversation metadata — `/rename` survives as a verb**, the alternative this row already named. Three reasons, in order of weight. (1) *Its state is a per-conversation DB row*, reached through `conversation_store` + `active_conversation_id` — two of the `run_chat` locals #1999 names, so absorbing it needs the full store relocation, not a slice-sized one. (2) *A title is not a session preference*: `~/.newt/receipts.jsonl` records what the operator set for the session, and every retitle of every conversation landing there conflates document metadata with settings. (3) §4.4 already routes conversation operations to the **event journal**, and a rename is one of them — absorbing it would put one conversation op in the settings journal while `list`/`restore`/`delete` wait for the other. The free-text carve-out was ported regardless, because `Text` fields need it. |
 | **Q6** | Deprecation window length. | **One full release cycle** after PR11, all retirements closing together in PR14a–d — muscle memory breaks once, not thirteen times. |
 | **Q7** | The event journal (PR-E): land it in-train, or accept ~10 parked `Missing` rows at the endgame? | **Land it before window close.** Without it the security kill-switch and #1749 decision reversals stay unwitnessed. Accepting the parked set is honest but leaves the highest-value provenance events recordless. |
 | **Q8** | The PR1 truthing raise: approve a one-time, itemized increase to the receiptless-mutator count? | **Approve.** The alternative is a mutator that stays invisible because registering it would embarrass a number. |

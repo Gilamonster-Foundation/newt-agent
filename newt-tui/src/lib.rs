@@ -12585,11 +12585,17 @@ fn help_request(task: &str) -> Option<String> {
         return rest.first().map(|c| c.to_string());
     }
     let is_help_token = |a: &&str| matches!(*a, "--help" | "-h" | "help");
-    // #1030: `/start` and `/rename` take a free-text TITLE, so a `help`/`-h`/
-    // `--help` token INSIDE a title must NOT be read as a help request — only an
-    // invocation whose SOLE argument is the help token asks for help (folded to
-    // the page documenting each: /start under /new, /rename under /conversation).
-    if matches!(cmd, "start" | "rename") {
+    // #1030: `/start`, `/rename` and its `/name` alias take a free-text TITLE,
+    // so a `help`/`-h`/`--help` token INSIDE a title must NOT be read as a help
+    // request — only an invocation whose SOLE argument is the help token asks
+    // for help (folded to the page documenting each: /start under /new,
+    // /rename under /conversation).
+    //
+    // **`/name` was missing from this list** until #2009 PR5, so `/name help me
+    // debug` opened a help page instead of retitling the conversation. A list
+    // of verb names is exactly the shape that goes stale when an alias is
+    // added, which is why the settings arm below asks the FIELD instead.
+    if matches!(cmd, "start" | "rename" | "name") {
         if rest.len() == 1 && is_help_token(&rest[0]) {
             return Some(
                 if cmd == "start" {
@@ -12601,6 +12607,22 @@ fn help_request(task: &str) -> Option<String> {
             );
         }
         return None;
+    }
+    // The same rule for a free-text SETTING, arriving through a different
+    // door: `/settings prompt "help me"` is a template. Asked of the field, so
+    // a future `Text` field is covered without editing this.
+    if cmd == "settings" {
+        if let Some(field) = rest
+            .first()
+            .and_then(|f| settings_form::Field::from_token(f))
+        {
+            if field.takes_free_text() {
+                if rest.len() == 2 && is_help_token(&rest[1]) {
+                    return Some(cmd.to_string());
+                }
+                return None;
+            }
+        }
     }
     if rest.iter().any(is_help_token) {
         return Some(cmd.to_string());

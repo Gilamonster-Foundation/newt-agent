@@ -162,6 +162,11 @@ struct SettingRow {
     /// browse-and-leave visit writes nothing and journals nothing.
     opened_as: String,
     bounds: Option<(usize, usize, &'static str)>,
+    /// Set for a row that cannot be dialled. The panel is a dial surface and
+    /// a template is not a vocabulary, so this row shows its value and names
+    /// the door that edits it. Silently ignoring ←/→ would read as a broken
+    /// row; the field editor that would make it dialable is PR8's.
+    not_dialable: Option<String>,
 }
 
 impl SettingRow {
@@ -176,7 +181,10 @@ impl SettingRow {
             ValueSpace::Number { release, min, max } => {
                 (Vec::new(), Vec::new(), Some((min, max, release)))
             }
+            ValueSpace::Text { .. } => (Vec::new(), Vec::new(), None),
         };
+        let not_dialable = matches!(field.value_space(), ValueSpace::Text { .. })
+            .then(|| format!("edit with /settings {} \"<template>\"", field.name()));
         Self {
             field,
             options,
@@ -184,6 +192,7 @@ impl SettingRow {
             value: current.clone(),
             opened_as: current,
             bounds,
+            not_dialable,
         }
     }
 
@@ -227,6 +236,9 @@ impl SettingRow {
 
     /// What this row's current value means, for the provenance column.
     fn meaning(&self) -> String {
+        if let Some(hint) = &self.not_dialable {
+            return hint.clone();
+        }
         self.options
             .iter()
             .position(|o| *o == self.value)
@@ -609,7 +621,9 @@ mod tests {
         let mut panel = panel();
         let offered: Vec<&str> = match Field::EditMode.value_space() {
             ValueSpace::Choice(offers) => offers.iter().map(|(t, _)| *t).collect(),
-            ValueSpace::Number { .. } => panic!("edit-mode is a choice"),
+            ValueSpace::Number { .. } | ValueSpace::Text { .. } => {
+                panic!("edit-mode is a choice")
+            }
         };
         // Walk right past the end; every value seen must be an offered one.
         for _ in 0..offered.len() + 2 {
@@ -631,7 +645,9 @@ mod tests {
         let _g = GlobalSettingsGuard::acquire();
         let (min, max, release) = match Field::Rounds.value_space() {
             ValueSpace::Number { min, max, release } => (min, max, release),
-            ValueSpace::Choice(_) => panic!("the round cap is a number"),
+            ValueSpace::Choice(_) | ValueSpace::Text { .. } => {
+                panic!("the round cap is a number")
+            }
         };
         let mut row = SettingRow::new(Field::Rounds);
 
