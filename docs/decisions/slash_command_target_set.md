@@ -151,7 +151,7 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 |---|---|---|---|---|---|
 | `/edit-mode` | `/vi` `/emacs` `/nano` | `/` command | Editor | absorb → `/settings edit-mode` | `~/.newt/receipts.jsonl` |
 | `/memory` | — | retired → `/status memory` | Memory | keep — it performs | — read-only |
-| `/recall` | — | `/` command | Memory | keep — it performs | — read-only |
+| `/recall` | — | retired → `/resume find` | Memory | keep — it performs | — read-only |
 | `/remember` | — | `/` command | Memory | keep — it performs | **none — #1965** |
 | `/search` | — | `/` command | Memory | keep — it performs | — read-only |
 | `/byline` | — | retired → `/status byline` | Meta | keep — it performs | — read-only |
@@ -222,6 +222,6 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/tenacity` | — | retired → `/settings tenacity` | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
 | `/thinking` | — | retired → `/settings thinking` | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
 
-**72 registered, 59 of them typed as `/` commands (74 tokens).** Absorb 16 · keep 53 · panel 3. Receipts: journalled 11 · read-only 33 · **missing 28**.
+**72 registered, 58 of them typed as `/` commands (73 tokens).** Absorb 16 · keep 53 · panel 3. Receipts: journalled 11 · read-only 33 · **missing 28**.
 
 <!-- END GENERATED -->

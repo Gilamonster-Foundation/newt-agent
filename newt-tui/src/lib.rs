@@ -7176,40 +7176,12 @@ fn auto_resume_banner(
 /// most recent and says so; search passes it as the FTS5 `LIMIT`.
 const RECALL_LIMIT: usize = 10;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RecallCommand {
-    /// Bare `/recall` — zero-cost browse of recent conversations.
-    Browse,
-    /// `/recall <query>` — FTS5 keyword search over this workspace's turns.
-    Search(String),
-}
-
-fn parse_recall_command(input: &str) -> anyhow::Result<RecallCommand> {
-    let body = input.trim().trim_start_matches('/').trim();
-    let Some(rest) = body.strip_prefix("recall") else {
-        anyhow::bail!("not a recall command");
-    };
-    // `/recallx` is not `/recall x`.
-    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
-        anyhow::bail!("not a recall command");
-    }
-    let query = rest.trim();
-    if query.is_empty() {
-        Ok(RecallCommand::Browse)
-    } else {
-        Ok(RecallCommand::Search(query.to_string()))
-    }
-}
-
-fn handle_recall_command(
-    input: &str,
-    store: &newt_core::ConversationStore,
-) -> anyhow::Result<String> {
-    match parse_recall_command(input)? {
-        RecallCommand::Browse => recall_browse_message(store),
-        RecallCommand::Search(query) => recall_search_message(store, &query),
-    }
-}
+// `RecallCommand` / `parse_recall_command` / `handle_recall_command` were
+// deleted in #2009 PR6. `/recall` retired into `/resume find`, and
+// `parse_resume_command` reads both — a second parser kept "for the old verb"
+// is how the two doors come to disagree about what `/recall foo bar` means.
+// The RENDERERS below are untouched and still do the work; only the parse and
+// the dispatch hop are gone.
 
 /// Browse mode: the workspace's conversations, most recently active first.
 ///
@@ -7293,13 +7265,41 @@ enum ResumeCommand {
     Select(usize),
     /// `/resume <token>` — an id/prefix to reopen, else an FTS5 search query.
     Query(String),
+    /// `/resume find [query]` — search (or browse) and SHOW, never reopen.
+    ///
+    /// This is what `/recall` was, folded in (#2009 PR6). It is not the same
+    /// as `Query`: a bare token that happens to resolve as an id reopens that
+    /// conversation, which is the right default for "take me back to work"
+    /// and the wrong one for "what do I have about auth?". Keeping the
+    /// read-only half addressable is why the fold is a subcommand rather than
+    /// an alias.
+    Find(String),
 }
 
 fn parse_resume_command(input: &str) -> ResumeCommand {
     let body = input.trim().trim_start_matches('/').trim();
+    // **The retired verb parses as its replacement.** `/recall` and
+    // `/recall <query>` ARE `/resume find`, so they are read here rather than
+    // kept as a second arm that could drift from it (#2009 PR6). A retired
+    // READ keeps reading — the rule PR3 wrote down — and this is where it
+    // keeps reading from.
+    // Whole-word, carried over from the parser this replaces: `/recallx` is
+    // not `/recall x`. Enforced HERE rather than only at the dispatch guard,
+    // so the parser cannot be called into a wrong answer from somewhere else.
+    if let Some(rest) = body.strip_prefix("recall") {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            return ResumeCommand::Find(rest.trim().to_string());
+        }
+    }
     let rest = body.strip_prefix("resume").map(str::trim).unwrap_or("");
     if rest.is_empty() {
         return ResumeCommand::Browse;
+    }
+    if let Some(query) = rest.strip_prefix("find") {
+        // `/resume findings` is a SEARCH for "findings", not an empty find.
+        if query.is_empty() || query.starts_with(char::is_whitespace) {
+            return ResumeCommand::Find(query.trim().to_string());
+        }
     }
     if let Ok(n) = rest.parse::<usize>() {
         // Only a plausible ROW number (1..=RECALL_LIMIT, the most rows a listing
@@ -12654,6 +12654,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /restart                 - the same, recorded as a restart",
         "  /start [title]           - begin a new conversation, leaving the current one open to /resume",
         "  /resume [name|search|n|id] - find & reopen a past conversation: bare lists recent, then match by name/title, id, or full-text search",
+        "  /resume find [query]     - search conversations WITHOUT reopening one (bare: browse)",
         "  /name <title>            - retitle the current conversation so it is easy to find in /resume (alias: /rename)",
         "  /transcript              - review this conversation: full-screen pager (rich) / printed spine (lean)",
         "  /conversation list       - list saved conversations",
@@ -12662,8 +12663,6 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /conversation rename <id> <title> - rename a saved conversation",
         "  /conversation delete <id> - delete a saved conversation",
         "  /conversation rm <id>    - alias for /conversation delete",
-        "  /recall [query]          - recent conversations, or full-text search",
-        "  /resume [query|n|id]     - find & reopen a past conversation (listed by liveness, searchable)",
         "  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval·drive · task <n> commit [sha] · issue <n> <#> · export·import [path]",
         "  /plan                    - alias for /roadmap",
         "  /tree                    - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)",

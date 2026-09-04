@@ -193,12 +193,13 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::None_,
         Surface::Retired("/status memory"),
     ),
-    cmd(
+    cmd_on(
         "recall",
         &[],
         Family::Memory,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/resume find"),
     ),
     cmd(
         "remember",
@@ -940,6 +941,14 @@ mod tests {
     /// Walked from the dispatch, not from `help_lines()`: the help had
     /// already drifted by eleven undocumented commands when this was armed.
     ///
+    /// # 59/74 → 58/73: `/recall` folds into `/resume find` (#2009 PR6)
+    ///
+    /// `/resume <token>` already ran the same FTS5 search; what `/recall` had
+    /// that it lacked was *searching without reopening*, since a token that
+    /// resolves as an id reopens that conversation. That is now `find`, a
+    /// subcommand of the verb the operator already reaches for — so the
+    /// capability survives while the top-level name does not.
+    ///
     /// # 68/83 → 59/74: the `/status` fold (#2009 PR3)
     ///
     /// Nine reads stop being top-level verbs and become topics of one:
@@ -987,14 +996,14 @@ mod tests {
     #[test]
     fn the_registered_surface_only_shrinks() {
         assert!(
-            slash_commands().count() <= 59,
+            slash_commands().count() <= 58,
             "the slash surface GREW to {} commands. #1981 is a reduction: a \
              new command needs an argument for why it is not a field of \
              /settings or a subcommand of an existing verb",
             slash_commands().count()
         );
         assert!(
-            slash_tokens().len() <= 74,
+            slash_tokens().len() <= 73,
             "the slash surface GREW to {} tokens",
             slash_tokens().len()
         );
@@ -1026,6 +1035,15 @@ mod tests {
     /// site count is the proxy that is exact: every top-level command reaches
     /// its handler through one of these, so a new one means either a new
     /// command or a refactor, and both deserve a look at this file.
+    /// # PR6 DID free one: 22 → 21
+    ///
+    /// The `/recall` arm is gone, not redirected. `parse_resume_command` reads
+    /// `/recall` as the `/resume find` it retired into, so the retired verb
+    /// runs the replacement's code instead of a second copy — which is what
+    /// makes the site removable rather than merely renamed. This is the first
+    /// real consolidation of the cut, and §5's rule is satisfied: a recount
+    /// says so, rather than a forecast.
+    ///
     /// # PR3 did NOT free a site, and says so
     ///
     /// The train predicted the `/status` fold would kill the `/info` site. It
@@ -1041,7 +1059,7 @@ mod tests {
             .map(|(_, src)| count_sites(src))
             .sum();
         assert_eq!(
-            counted, 22,
+            counted, 21,
             "the number of slash interception sites moved to {counted}. If a \
              command was added, register it here. If sites were consolidated \
              — which is #1981's goal — lower this number and the ratchet above."

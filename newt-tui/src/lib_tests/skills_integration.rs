@@ -555,23 +555,80 @@ fn recall_test_store() -> (
     (state, workspace, store)
 }
 
+/// Route a `/recall` (or `/resume find`) line the way `chat.rs` routes it.
+///
+/// `handle_recall_command` was deleted with its parser in #2009 PR6; this
+/// mirrors the arm that replaced it, so the tests below keep exercising the
+/// parse and not just the renderer. The `panic!` arm is the point: if the
+/// line stops parsing as a find, these fail loudly instead of quietly
+/// testing something else.
+fn recall_via_resume(input: &str, store: &newt_core::ConversationStore) -> anyhow::Result<String> {
+    match parse_resume_command(input) {
+        ResumeCommand::Find(query) if query.is_empty() => recall_browse_message(store),
+        ResumeCommand::Find(query) => recall_search_message(store, &query),
+        other => panic!("`{input}` no longer parses as a find: {other:?}"),
+    }
+}
+
+/// **The retired `/recall` parses as `/resume find`** (#2009 PR6).
+///
+/// Every case the old `parse_recall_command` pinned, now asserted against the
+/// parser that replaced it — the point of the fold is that these are the SAME
+/// behaviour, so the evidence has to be the same cases.
 #[test]
-fn recall_commands_parse_expected_actions() {
+fn recall_commands_parse_as_the_find_they_retired_into() {
     assert_eq!(
-        parse_recall_command("/recall").unwrap(),
-        RecallCommand::Browse
+        parse_resume_command("/recall"),
+        ResumeCommand::Find(String::new())
     );
     assert_eq!(
-        parse_recall_command("/recall   ").unwrap(),
-        RecallCommand::Browse
+        parse_resume_command("/recall   "),
+        ResumeCommand::Find(String::new())
     );
     assert_eq!(
-        parse_recall_command("/recall tokio panic").unwrap(),
-        RecallCommand::Search("tokio panic".into())
+        parse_resume_command("/recall tokio panic"),
+        ResumeCommand::Find("tokio panic".into())
     );
-    // `/recallx` is some other (unknown) command, not `/recall x`.
-    assert!(parse_recall_command("/recallx").is_err());
-    assert!(parse_recall_command("/conversation list").is_err());
+    // `/recallx` is some other (unknown) command, not `/recall x`. The old
+    // parser returned an error; this one declines to claim the line, which is
+    // the same refusal in the shape the resume parser speaks.
+    assert_ne!(
+        parse_resume_command("/recallx"),
+        ResumeCommand::Find("x".into())
+    );
+    assert_ne!(
+        parse_resume_command("/conversation list"),
+        ResumeCommand::Find("list".into())
+    );
+}
+
+/// `find` is search that never reopens — the half of `/recall` that `/resume
+/// <token>` could not express, because a token resolving as an id reopens it.
+#[test]
+fn resume_find_searches_without_reopening() {
+    assert_eq!(
+        parse_resume_command("/resume find"),
+        ResumeCommand::Find(String::new())
+    );
+    assert_eq!(
+        parse_resume_command("/resume find tokio panic"),
+        ResumeCommand::Find("tokio panic".into())
+    );
+    // An id-shaped token under `find` STAYS a search: that is the distinction
+    // the subcommand exists to make.
+    assert_eq!(
+        parse_resume_command("/resume find 175200000000"),
+        ResumeCommand::Find("175200000000".into())
+    );
+    assert_eq!(
+        parse_resume_command("/resume 175200000000"),
+        ResumeCommand::Query("175200000000".into())
+    );
+    // `/resume findings` searches for "findings", not an empty find.
+    assert_eq!(
+        parse_resume_command("/resume findings"),
+        ResumeCommand::Query("findings".into())
+    );
 }
 
 #[test]
@@ -1185,7 +1242,7 @@ fn recall_garbage_only_query_renders_friendly_hint() {
     let (_state, _ws, store) = recall_test_store();
     // "AND" sanitizes to nothing (bare operator) — must come back as a
     // friendly Ok message, never through the `error:` path.
-    let msg = handle_recall_command("/recall AND", &store).unwrap();
+    let msg = recall_via_resume("/recall AND", &store).unwrap();
     assert!(msg.contains("Nothing searchable"), "got: {msg}");
     assert!(msg.contains("Try plain keywords"), "got: {msg}");
 }
@@ -1206,7 +1263,7 @@ fn recall_browse_orders_by_activity_tick_with_short_ids() {
         .append_turn(&alpha, "alpha follow-up", "alpha again")
         .unwrap();
 
-    let msg = handle_recall_command("/recall", &store).unwrap();
+    let msg = recall_via_resume("/recall", &store).unwrap();
     assert!(msg.starts_with("Recent conversations (most recent first):"));
     let alpha_pos = msg.find("Alpha task").unwrap();
     let beta_pos = msg.find("Beta task").unwrap();
@@ -1261,7 +1318,7 @@ fn recall_search_renders_snippets_and_footer() {
         .append_turn(&other, "write the readme", "done")
         .unwrap();
 
-    let msg = handle_recall_command("/recall login", &store).unwrap();
+    let msg = recall_via_resume("/recall login", &store).unwrap();
     assert!(msg.starts_with("Recall matches for `login`:"), "got: {msg}");
     assert!(msg.contains(short_conversation_id(&id)));
     assert!(!msg.contains(&id), "full ids must not render:\n{msg}");
@@ -1288,10 +1345,17 @@ fn recall_search_no_matches_message() {
 }
 
 #[test]
-fn help_documents_recall_command() {
+fn help_documents_the_search_that_does_not_reopen() {
+    // #2009 PR6: `/recall` retired into `/resume find`. What the corpus must
+    // still teach is the CAPABILITY — searching conversations without
+    // reopening one — not the name it used to have.
     assert!(help_lines()
         .iter()
-        .any(|line| line.contains("/recall [query]")));
+        .any(|line| line.contains("/resume find")));
+    assert!(
+        !help_lines().iter().any(|line| line.contains("/recall")),
+        "a retired verb must not still be advertised as a top-level command"
+    );
 }
 
 #[test]
