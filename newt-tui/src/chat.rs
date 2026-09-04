@@ -1745,8 +1745,14 @@ fn session_body(
     // separately at the point of use. One variable, so the launch flag and the
     // runtime control cannot disagree — see `initial_spill_override`, and pi's
     // `options.verbose || toolOutputExpanded` phase bug that motivated it.
-    let mut spill_lines_override: Option<usize> =
-        crate::initial_spill_override(crate::prompt::trace_mode(&cfg));
+    // #2009 PR7b: the override lives in core now, so `/settings detail` can
+    // read it. The launch flag installs its value HERE, at the same moment it
+    // used to seed the local — "one variable, so the launch flag and the
+    // runtime control cannot disagree" is preserved, and now spans three doors
+    // instead of two.
+    newt_core::config::set_session_spill_lines(crate::initial_spill_override(
+        crate::prompt::trace_mode(&cfg),
+    ));
     // #1640 Layer 1: per-session committed-result mode. `None` follows the
     // surface default (rich collapses spilled results to a one-line summary,
     // lean shows full output); `/spill summary` / `/spill excerpt` override.
@@ -3819,7 +3825,7 @@ fn session_body(
                     }
                     // #1434: `/detail` flips the session detail level between the
                     // configured height and unbounded. It shares
-                    // `spill_lines_override` with `/spill`, so the two controls
+                    // the session spill override with `/spill`, so the two controls
                     // cannot disagree — there is no second detail state.
                     //
                     // A slash command, not only a chord, because the chord path
@@ -3830,12 +3836,16 @@ fn session_body(
                     // issue exists to prevent.)
                     if slash_md == "detail" {
                         let configured = spill_lines(&cfg);
-                        spill_lines_override =
-                            crate::toggle_spill_detail(spill_lines_override, configured);
+                        // Still ONE pure transition; the caller reads and
+                        // writes the shared value instead of owning it.
+                        newt_core::config::set_session_spill_lines(crate::toggle_spill_detail(
+                            newt_core::config::session_spill_lines(),
+                            configured,
+                        ));
                         print_newt(
                             &spill_status(
                                 configured,
-                                spill_lines_override,
+                                newt_core::config::session_spill_lines(),
                                 crate::effective_spill_summary(
                                     crate::summary_recovery_available(
                                         surface_is_rich,
@@ -3897,11 +3907,17 @@ fn session_body(
                             // test) — Reset returns BOTH knobs to the surface
                             // defaults.
                             Ok(cmd) => {
+                                // The pure transition is unchanged; it
+                                // operates on a copy that is written straight
+                                // back, so `/spill` and `/settings detail`
+                                // cannot hold different values.
+                                let mut lines = newt_core::config::session_spill_lines();
                                 crate::apply_spill_command(
                                     cmd,
-                                    &mut spill_lines_override,
+                                    &mut lines,
                                     &mut spill_summary_override,
                                 );
+                                newt_core::config::set_session_spill_lines(lines);
                             }
                             Err(e) => {
                                 print_newt(
@@ -3921,7 +3937,7 @@ fn session_body(
                         print_newt(
                             &spill_status(
                                 configured,
-                                spill_lines_override,
+                                newt_core::config::session_spill_lines(),
                                 crate::effective_spill_summary(
                                     crate::summary_recovery_available(
                                         surface_is_rich,
@@ -7468,8 +7484,10 @@ fn session_body(
                     // whole record (no viewport to recover hidden lines), so
                     // `committed_spill_lines` forces it unbounded there; only the
                     // RICH surface collapses + offers the interactive viewport.
-                    let configured_spill_lines =
-                        effective_spill_lines(spill_lines(&cfg), spill_lines_override);
+                    let configured_spill_lines = effective_spill_lines(
+                        spill_lines(&cfg),
+                        newt_core::config::session_spill_lines(),
+                    );
                     // Review fix (#1663): the forced value applies to the
                     // COMMITTED record only. The LIVE in-progress viewport keeps
                     // the configured height on every surface — reusing the
