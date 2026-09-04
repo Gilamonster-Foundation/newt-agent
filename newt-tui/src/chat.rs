@@ -4820,7 +4820,16 @@ fn session_body(
                         continue;
                     }
                     let slash_body = task.trim_start_matches('/');
-                    if slash_body == "conversation" || slash_body.starts_with("conversation ") {
+                    // #2009 PR6b: ONE conversation-ops arm, two doors.
+                    // `/conversation <sub>` is retired into `/resume <sub>`;
+                    // both parse with the same parser and run the same handler,
+                    // so the fold cannot drift. `/resume` alone is BROWSE and is
+                    // handled further down — only the named subcommands come
+                    // here.
+                    if slash_body == "conversation"
+                        || slash_body.starts_with("conversation ")
+                        || crate::resume_conversation_subcommand(slash_body)
+                    {
                         let conversation_id_before = active_conversation_id.clone();
                         // #1669 PR-A blocker 2: `/conversation restore` selects a
                         // conversation, so it goes through the SAME adoption seam
@@ -4903,8 +4912,56 @@ fn session_body(
                                     active_prompt_context: &mut active_prompt_context,
                                     mode_states: &conversation_mode_states,
                                 };
-                                match handle_conversation_command(task, &mut conversation_ctx) {
-                                    Ok(msg) => print_newt(&msg, color, verbose),
+                                match crate::conversation_op_plan(task) {
+                                    // A retired MUTATOR redirects and changes
+                                    // nothing — the rule `/thinking` set. A
+                                    // retired READ still reads (§3.3), which is
+                                    // why this is decided per subcommand and
+                                    // not per verb.
+                                    Ok(crate::ConversationOpPlan::Redirect(msg)) => {
+                                        print_newt(&msg, color, verbose);
+                                    }
+                                    // Every destructive op asks first, and names
+                                    // what is lost. Anything but `yes` deletes
+                                    // nothing; a surface that cannot ask (a
+                                    // pipe, EOF, Esc) declines rather than
+                                    // assuming consent.
+                                    Ok(crate::ConversationOpPlan::Confirm { prompt, id }) => {
+                                        let answered = crate::confirm_conversation_delete(
+                                            &ask_surface,
+                                            &prompt,
+                                        );
+                                        if answered {
+                                            match handle_conversation_command(
+                                                &format!("/conversation delete {id}"),
+                                                &mut conversation_ctx,
+                                            ) {
+                                                Ok(msg) => print_newt(&msg, color, verbose),
+                                                Err(e) => print_newt(
+                                                    &format!("error: {e}"),
+                                                    color,
+                                                    verbose,
+                                                ),
+                                            }
+                                        } else {
+                                            print_newt(
+                                                "delete cancelled — nothing was removed",
+                                                color,
+                                                verbose,
+                                            );
+                                        }
+                                    }
+                                    Ok(crate::ConversationOpPlan::Run) => {
+                                        match handle_conversation_command(
+                                            task,
+                                            &mut conversation_ctx,
+                                        ) {
+                                            Ok(msg) => print_newt(&msg, color, verbose),
+                                            Err(e) => {
+                                                print_newt(&format!("error: {e}"), color, verbose);
+                                            }
+                                        }
+                                    }
                                     Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                                 }
                             }

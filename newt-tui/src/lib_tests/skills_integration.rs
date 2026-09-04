@@ -534,10 +534,22 @@ fn conversation_commands_parse_expected_actions() {
 
 #[serial_test::serial(real_fs)]
 #[test]
-fn help_documents_conversation_rm_alias() {
-    assert!(help_lines()
+fn help_documents_the_delete_alias_and_that_it_asks() {
+    // #2009 PR6b: the ops moved to `/resume`. `rm` survives as an alias — it
+    // is muscle memory — and the corpus now also promises the confirmation,
+    // which is the part an operator most needs to know before typing it.
+    let delete_row = help_lines()
         .iter()
-        .any(|line| line.contains("/conversation rm <id>")));
+        .find(|line| line.contains("/resume delete <id>"))
+        .expect("the delete row is advertised");
+    assert!(
+        delete_row.contains("rm"),
+        "the alias survives: {delete_row}"
+    );
+    assert!(
+        delete_row.contains("asks first"),
+        "the corpus promises the confirmation: {delete_row}"
+    );
 }
 
 // -- /recall (Step 17.4, #246) ------------------------------------------
@@ -553,6 +565,117 @@ fn recall_test_store() -> (
     let workspace = tempfile::TempDir::new().unwrap();
     let store = newt_core::ConversationStore::new(state.path(), workspace.path(), 100).unwrap();
     (state, workspace, store)
+}
+
+/// **A retired READ still reads; a retired MUTATOR redirects** (#2009 PR6b).
+///
+/// `/conversation` is both, so the rule is applied per SUBCOMMAND. Retiring
+/// the whole verb would break `/conversation list` on a pipe (§3.3); letting
+/// the whole verb keep working would mean the shim never dies.
+#[test]
+fn the_retired_conversation_verb_reads_but_does_not_mutate() {
+    use super::{conversation_op_plan, ConversationOpPlan};
+
+    // Reads: performed, exactly as before.
+    assert_eq!(
+        conversation_op_plan("/conversation list").unwrap(),
+        ConversationOpPlan::Run
+    );
+    assert_eq!(
+        conversation_op_plan("/conversation show abc").unwrap(),
+        ConversationOpPlan::Run
+    );
+
+    // Mutators: redirected, and the message names the replacement AND says
+    // nothing happened — the two things a habitual typist needs to know.
+    for (line, expect) in [
+        ("/conversation restore abc", "/resume restore abc"),
+        (
+            "/conversation rename abc New Title",
+            "/resume rename abc New Title",
+        ),
+        ("/conversation delete abc", "/resume delete abc"),
+    ] {
+        match conversation_op_plan(line).unwrap() {
+            ConversationOpPlan::Redirect(msg) => {
+                assert!(msg.contains(expect), "{line}: {msg}");
+                assert!(msg.contains("nothing changed"), "{line}: {msg}");
+            }
+            other => panic!("`{line}` must not mutate through the retired verb: {other:?}"),
+        }
+    }
+}
+
+/// **Every delete asks first, at either door.** The operator's standing rule
+/// for this sweep; `/resume delete` is not exempt for being the new spelling.
+#[test]
+fn deleting_a_conversation_asks_first_and_names_what_is_lost() {
+    use super::{conversation_op_plan, ConversationOpPlan};
+
+    match conversation_op_plan("/resume delete abc").unwrap() {
+        ConversationOpPlan::Confirm { prompt, id } => {
+            assert_eq!(id, "abc");
+            assert!(prompt.contains("abc"), "{prompt}");
+            assert!(
+                prompt.contains("every turn"),
+                "names what is lost: {prompt}"
+            );
+            assert!(prompt.contains("cannot be undone"), "{prompt}");
+        }
+        other => panic!("a delete must ask: {other:?}"),
+    }
+    // `rm` is the same act under another name and gets the same question.
+    assert!(matches!(
+        conversation_op_plan("/resume rm abc").unwrap(),
+        ConversationOpPlan::Confirm { .. }
+    ));
+    // ...and the non-destructive ops are NOT gated behind a question.
+    assert_eq!(
+        conversation_op_plan("/resume rename abc Title").unwrap(),
+        ConversationOpPlan::Run
+    );
+}
+
+/// Anything but an explicit yes deletes nothing — including a surface that
+/// cannot ask at all.
+#[test]
+fn a_declined_or_unaskable_delete_removes_nothing() {
+    use newt_core::interaction_surface::SurfaceInteraction;
+    use newt_core::HumanQuestionOutcome;
+
+    let answering =
+        |a: &'static str| move |_: &SurfaceInteraction| HumanQuestionOutcome::Answer(a.to_string());
+    assert!(super::confirm_conversation_delete(&answering("y"), "q"));
+    assert!(super::confirm_conversation_delete(&answering("yes"), "q"));
+
+    assert!(!super::confirm_conversation_delete(&answering("n"), "q"));
+    assert!(!super::confirm_conversation_delete(&answering(""), "q"));
+    assert!(
+        !super::confirm_conversation_delete(&answering("delete it please"), "q"),
+        "an unresolvable answer is a no, not a yes"
+    );
+
+    // A surface with no way to ask — a pipe, EOF, Esc — declines. §3.3: those
+    // are outcomes, never an implied answer.
+    let cancelled = |_: &SurfaceInteraction| HumanQuestionOutcome::Cancelled;
+    assert!(!super::confirm_conversation_delete(&cancelled, "q"));
+}
+
+/// Only the five named subcommands reach the conversation ops; everything else
+/// after `/resume` is still a search.
+#[test]
+fn resume_routes_only_its_subcommands_to_the_conversation_ops() {
+    use super::resume_conversation_subcommand as sub;
+    for word in ["list", "show", "restore", "rename", "delete", "rm"] {
+        assert!(sub(&format!("resume {word} x")), "{word}");
+    }
+    assert!(sub("resume list"));
+    // A query that merely STARTS like one is a search, not an op.
+    assert!(!sub("resume restored"), "restored is a search term");
+    assert!(!sub("resume listing"), "listing is a search term");
+    assert!(!sub("resume"), "bare /resume is browse");
+    assert!(!sub("resume tokio panic"));
+    assert!(!sub("resumex list"));
 }
 
 /// Route a `/recall` (or `/resume find`) line the way `chat.rs` routes it.

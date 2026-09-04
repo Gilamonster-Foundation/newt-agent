@@ -5725,43 +5725,193 @@ pub(crate) fn conversation_command_target(input: &str) -> Option<String> {
     }
 }
 
-fn parse_conversation_command(input: &str) -> anyhow::Result<ConversationCommand> {
+/// Which verb an operator typed to reach the conversation ops.
+///
+/// #2009 PR6b folded them into `/resume`. The ops are identical either way —
+/// the same parser, the same handler — but the VERB decides what a retired
+/// mutator is allowed to do: a retired READ still reads, and a retired MUTATOR
+/// redirects without mutating (the rule PR3 wrote down, applied per
+/// subcommand because `/conversation` is both).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConversationDoor {
+    /// `/resume <sub>` — the replacement, which performs.
+    Resume,
+    /// `/conversation <sub>` — retired; reads still read.
+    Retired,
+}
+
+impl ConversationCommand {
+    /// Whether this op CHANGES something. A retired verb may still serve the
+    /// reads and must not serve these.
+    pub(crate) fn mutates(&self) -> bool {
+        !matches!(self, Self::List | Self::Show(_))
+    }
+}
+
+/// Parse a conversation op typed at EITHER door, reporting which one.
+fn parse_conversation_command_at(
+    input: &str,
+) -> anyhow::Result<(ConversationDoor, ConversationCommand)> {
     let body = input.trim().trim_start_matches('/').trim();
     let mut parts = body.split_whitespace();
-    match parts.next() {
-        Some("conversation") => {}
+    let door = match parts.next() {
+        Some("conversation") => ConversationDoor::Retired,
+        Some("resume") => ConversationDoor::Resume,
         _ => anyhow::bail!("not a conversation command"),
-    }
+    };
+    parse_conversation_rest(door, parts)
+}
 
-    match parts.next() {
-        None | Some("list") => Ok(ConversationCommand::List),
+fn parse_conversation_command(input: &str) -> anyhow::Result<ConversationCommand> {
+    Ok(parse_conversation_command_at(input)?.1)
+}
+
+/// The named conversation subcommands, reached through `/resume`.
+///
+/// Bare `/resume` and `/resume <query>` are BROWSE and SEARCH and belong to
+/// the resume arm; only these five words route to the conversation ops. The
+/// list is data so the predicate, the parser and the help cannot disagree
+/// about what `/resume` accepts.
+const CONVERSATION_SUBCOMMANDS: &[&str] = &["list", "show", "restore", "rename", "delete", "rm"];
+
+/// Whether `body` is `/resume <one of the conversation subcommands>`.
+pub(crate) fn resume_conversation_subcommand(body: &str) -> bool {
+    let Some(rest) = body.strip_prefix("resume") else {
+        return false;
+    };
+    // `/resumex list` is not `/resume list`; bare `/resume` is browse. Same
+    // whole-word shape as every other parser in this fold, deliberately.
+    let rest = match rest.chars().next() {
+        None => return false,
+        Some(c) if c.is_whitespace() => rest.trim_start(),
+        Some(_) => return false,
+    };
+    // `/resume restored` is a SEARCH, not `restore` with a suffix — the word
+    // has to match whole, which `split_whitespace` gives for free.
+    rest.split_whitespace()
+        .next()
+        .is_some_and(|word| CONVERSATION_SUBCOMMANDS.contains(&word))
+}
+
+/// What the session loop should DO with a conversation op.
+///
+/// Split out of the arm so the retirement rule is one decision in one place
+/// with its own tests, rather than a shape of nested `if`s inside a 200-line
+/// match in `run_chat`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConversationOpPlan {
+    /// Perform it.
+    Run,
+    /// Ask first, then perform. Carries the question and the id it names.
+    Confirm { prompt: String, id: String },
+    /// A retired MUTATOR: print this and change nothing.
+    Redirect(String),
+}
+
+/// Decide how a conversation-op line should be handled (#2009 PR6b).
+///
+/// Two rules meet here:
+///
+/// - **A retired mutator must not mutate.** `/conversation restore|rename|
+///   delete` redirect and do nothing, the way `/thinking` does, so the shim
+///   gets to die instead of half-working forever.
+/// - **A retired read may still read.** `/conversation list|show` keep
+///   printing, because §3.3 requires reads to work on a pipe and scripts read
+///   them today.
+/// - **Every destructive op asks first**, at EITHER door — the operator's
+///   standing rule for this sweep. `/resume delete` is not exempt for being
+///   the new spelling.
+pub(crate) fn conversation_op_plan(input: &str) -> anyhow::Result<ConversationOpPlan> {
+    let (door, command) = parse_conversation_command_at(input)?;
+    if door == ConversationDoor::Retired && command.mutates() {
+        let replacement = match &command {
+            ConversationCommand::Restore(id) => format!("/resume restore {id}"),
+            ConversationCommand::Rename { id, title } => format!("/resume rename {id} {title}"),
+            ConversationCommand::Delete(id) => format!("/resume delete {id}"),
+            ConversationCommand::List | ConversationCommand::Show(_) => unreachable!(
+                "List and Show do not mutate; `mutates()` is the one predicate that says so"
+            ),
+        };
+        return Ok(ConversationOpPlan::Redirect(format!(
+            "/conversation is retired — use `{replacement}` (nothing changed)"
+        )));
+    }
+    if let ConversationCommand::Delete(id) = &command {
+        return Ok(ConversationOpPlan::Confirm {
+            prompt: format!(
+                "delete conversation `{id}` and every turn in it? this cannot be undone"
+            ),
+            id: id.clone(),
+        });
+    }
+    Ok(ConversationOpPlan::Run)
+}
+
+/// Ask the delete question through the surface's own seam.
+///
+/// `true` ONLY for an explicit yes. A cancelled ask — a pipe, EOF, Esc — is a
+/// no: §3.3 is explicit that those are outcomes and never an implied answer,
+/// and for a destructive op that is the only safe reading.
+pub(crate) fn confirm_conversation_delete(ask: SlashAsk<'_>, prompt: &str) -> bool {
+    let definition = newt_core::interaction_form::confirm(
+        prompt.to_string(),
+        "this removes the conversation and its turns",
+        "delete it",
+        "keep it",
+    );
+    let interaction =
+        newt_core::interaction_surface::SurfaceInteraction::blocking(definition.clone());
+    match ask(&interaction) {
+        newt_core::HumanQuestionOutcome::Answer(answer) => {
+            newt_core::interaction_form::resolve(&definition, answer.trim())
+                .is_some_and(|id| id.as_str() == newt_core::interaction_form::YES)
+        }
+        _ => false,
+    }
+}
+
+/// The subcommand half, shared by both doors so they cannot diverge on what
+/// `rename <id> <title>` means.
+fn parse_conversation_rest<'a>(
+    door: ConversationDoor,
+    mut parts: impl Iterator<Item = &'a str>,
+) -> anyhow::Result<(ConversationDoor, ConversationCommand)> {
+    let verb = match door {
+        ConversationDoor::Resume => "resume",
+        ConversationDoor::Retired => "conversation",
+    };
+    let command = match parts.next() {
+        // Bare `/resume` is BROWSE, not a list — the caller handles it before
+        // reaching here. Bare `/conversation` is its list, as it always was.
+        None | Some("list") => ConversationCommand::List,
         Some("show") => match parts.next() {
-            Some(id) => Ok(ConversationCommand::Show(id.to_string())),
-            None => anyhow::bail!("usage: /conversation show <id>"),
+            Some(id) => ConversationCommand::Show(id.to_string()),
+            None => anyhow::bail!("usage: /{verb} show <id>"),
         },
         Some("restore") => match parts.next() {
-            Some(id) => Ok(ConversationCommand::Restore(id.to_string())),
-            None => anyhow::bail!("usage: /conversation restore <id>"),
+            Some(id) => ConversationCommand::Restore(id.to_string()),
+            None => anyhow::bail!("usage: /{verb} restore <id>"),
         },
         Some("rename") => {
             let Some(id) = parts.next() else {
-                anyhow::bail!("usage: /conversation rename <id> <title>");
+                anyhow::bail!("usage: /{verb} rename <id> <title>");
             };
             let title = parts.collect::<Vec<_>>().join(" ");
             if title.trim().is_empty() {
-                anyhow::bail!("usage: /conversation rename <id> <title>");
+                anyhow::bail!("usage: /{verb} rename <id> <title>");
             }
-            Ok(ConversationCommand::Rename {
+            ConversationCommand::Rename {
                 id: id.to_string(),
                 title,
-            })
+            }
         }
         Some("delete" | "rm") => match parts.next() {
-            Some(id) => Ok(ConversationCommand::Delete(id.to_string())),
-            None => anyhow::bail!("usage: /conversation delete <id>"),
+            Some(id) => ConversationCommand::Delete(id.to_string()),
+            None => anyhow::bail!("usage: /{verb} delete <id>"),
         },
         Some(other) => anyhow::bail!("unknown conversation command `{other}`"),
-    }
+    };
+    Ok((door, command))
 }
 
 /// Build the progressive-disclosure skills index block for the system prompt
@@ -12655,14 +12805,13 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /start [title]           - begin a new conversation, leaving the current one open to /resume",
         "  /resume [name|search|n|id] - find & reopen a past conversation: bare lists recent, then match by name/title, id, or full-text search",
         "  /resume find [query]     - search conversations WITHOUT reopening one (bare: browse)",
+        "  /resume list             - list saved conversations",
+        "  /resume show <id>        - show a saved conversation",
+        "  /resume restore <id>     - restore a saved conversation",
+        "  /resume rename <id> <title> - rename a saved conversation",
+        "  /resume delete <id>      - delete a saved conversation (asks first; alias: rm)",
         "  /name <title>            - retitle the current conversation so it is easy to find in /resume (alias: /rename)",
         "  /transcript              - review this conversation: full-screen pager (rich) / printed spine (lean)",
-        "  /conversation list       - list saved conversations",
-        "  /conversation show <id>  - show a saved conversation",
-        "  /conversation restore <id> - restore a saved conversation",
-        "  /conversation rename <id> <title> - rename a saved conversation",
-        "  /conversation delete <id> - delete a saved conversation",
-        "  /conversation rm <id>    - alias for /conversation delete",
         "  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval·drive · task <n> commit [sha] · issue <n> <#> · export·import [path]",
         "  /plan                    - alias for /roadmap",
         "  /tree                    - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)",

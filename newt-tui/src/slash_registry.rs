@@ -470,12 +470,17 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Keep,
         Receipt::Missing,
     ),
-    cmd(
+    cmd_on(
+        // Retired into `/resume` (#2009 PR6b). Its READS still read and
+        // its MUTATORS redirect, so the row stays a permanent pointer
+        // while the receipt debt it owes stays counted: the ops are
+        // parked for the event journal (§4.4), not reclassified.
         "conversation",
         &[],
         Family::Session,
         Disposition::Keep,
         Receipt::Missing,
+        Surface::Retired("/resume"),
     ),
     cmd(
         "crew",
@@ -941,6 +946,18 @@ mod tests {
     /// Walked from the dispatch, not from `help_lines()`: the help had
     /// already drifted by eleven undocumented commands when this was armed.
     ///
+    /// # 58/73 → 57/72: `/conversation` folds into `/resume` (#2009 PR6b)
+    ///
+    /// One conversation surface: list, show, restore, rename and delete are
+    /// `/resume` subcommands now, sharing the retired verb's parser and
+    /// handler so the two doors cannot drift.
+    ///
+    /// **The row keeps `Receipt::Missing`.** Retiring the verb does not pay
+    /// its debt — a delete still records nothing durable, and §4.4 parks the
+    /// conversation operations for the event journal rather than minting
+    /// `SettingValue` variants for them. A retirement that quietly cleared the
+    /// count would be the most tempting wrong answer available here.
+    ///
     /// # 59/74 → 58/73: `/recall` folds into `/resume find` (#2009 PR6)
     ///
     /// `/resume <token>` already ran the same FTS5 search; what `/recall` had
@@ -996,14 +1013,14 @@ mod tests {
     #[test]
     fn the_registered_surface_only_shrinks() {
         assert!(
-            slash_commands().count() <= 58,
+            slash_commands().count() <= 57,
             "the slash surface GREW to {} commands. #1981 is a reduction: a \
              new command needs an argument for why it is not a field of \
              /settings or a subcommand of an existing verb",
             slash_commands().count()
         );
         assert!(
-            slash_tokens().len() <= 73,
+            slash_tokens().len() <= 72,
             "the slash surface GREW to {} tokens",
             slash_tokens().len()
         );
