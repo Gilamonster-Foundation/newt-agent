@@ -696,23 +696,11 @@ impl PromptIntake {
     pub fn model_card(&self) -> String {
         let pending = self.manifest.pending_decision_count();
         let locked = self.manifest.locked_decision_count();
-        let instruction = match self.disposition {
-            PromptDisposition::Ask => {
-                "harness_action: await the bounded operator clarification; do not call tools"
-            }
-            PromptDisposition::Act => {
-                "harness_action: decisions are locked; ordinary execution authority is available"
-            }
-            PromptDisposition::Explain => {
-                "harness_action: answer without mutation; bounded read/recovery tools only"
-            }
-            PromptDisposition::Research => {
-                "harness_action: gather bounded read-only evidence; do not mutate or request capability grants"
-            }
-            PromptDisposition::Plan => {
-                "harness_action: read evidence and maintain the harness plan ledger only; do not mutate the workspace, execute commands, or request capability grants"
-            }
-        };
+        // #2051: one owner for every sentence the harness says about the
+        // disposition. The block carries the action line plus the provenance
+        // and privacy clauses — without them a small model reads the action
+        // line as an operator-imposed rule and reports its compliance.
+        let instruction = super::DispositionVoices::default().card_block(self.disposition);
         let prompt = self
             .manifest
             .atomic_asks
@@ -1747,6 +1735,53 @@ mod tests {
             "the model is told it may not mutate: {}",
             intake.model_card()
         );
+    }
+
+    /// #2051: the card names WHOSE decision the disposition is, and marks
+    /// itself as plumbing.
+    ///
+    /// The evidenced 9b session answered `hello?` and then told the operator
+    /// *"this is an 'explain' turn, so I won't be making any changes"*. The
+    /// action line alone reads as a rule imposed from outside and worth
+    /// announcing; these two clauses are what say otherwise.
+    #[test]
+    fn the_card_states_the_disposition_is_the_harness_own_inference() {
+        let card = PromptIntake::analyze("hello?").model_card();
+        assert!(card.contains("disposition: explain"), "{card}");
+        assert!(
+            card.contains("disposition_source:"),
+            "the card must say the harness inferred this: {card}"
+        );
+        assert!(
+            card.contains("disposition_privacy:"),
+            "the card must say it is not for the operator: {card}"
+        );
+        // The suppression is of the mechanism, not of honesty about limits.
+        assert!(card.contains("say plainly what you cannot do"), "{card}");
+    }
+
+    /// Every disposition gets both clauses — a new variant cannot ship a card
+    /// that reads as an unattributed cage.
+    #[test]
+    fn every_disposition_card_carries_the_shared_clauses() {
+        let mut intake = PromptIntake::analyze("fix the parser");
+        assert_eq!(intake.disposition(), PromptDisposition::Act);
+        for disposition in [
+            PromptDisposition::Explain,
+            PromptDisposition::Research,
+            PromptDisposition::Plan,
+        ] {
+            intake.enforce_read_only(disposition);
+            let card = intake.model_card();
+            assert!(
+                card.contains("disposition_source:"),
+                "{disposition:?}: {card}"
+            );
+            assert!(
+                card.contains("disposition_privacy:"),
+                "{disposition:?}: {card}"
+            );
+        }
     }
 
     /// **The twin that bounds the blast radius, measured not asserted.**

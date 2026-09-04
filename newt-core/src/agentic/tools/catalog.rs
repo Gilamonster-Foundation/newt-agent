@@ -547,21 +547,16 @@ pub(super) fn disposition_tool_denied_message(
     disposition: PromptDisposition,
     name: &str,
 ) -> String {
-    let guidance = match disposition {
-        PromptDisposition::Ask => {
-            "The harness is awaiting the operator's clarification; this turn cannot run tools."
-        }
-        PromptDisposition::Explain => {
-            "This is an Explain turn: only the bounded read-only evidence and recovery tools are available."
-        }
-        PromptDisposition::Research => {
-            "This is a Research turn: only the bounded read-only evidence and recovery tools are available; capability grants, execution, mutations, and generic MCP calls require an Act disposition."
-        }
-        PromptDisposition::Plan => {
-            "This is a Plan turn: reads, the harness-owned update_plan ledger, and exit from a model-entered plan phase are available; workspace mutations, execution, capability grants, and generic MCP calls require an Act disposition."
-        }
-        PromptDisposition::Act => unreachable!("Act permits every tool"),
-    };
+    // #2051: the guidance text lives in `disposition_voice`, the single owner
+    // of the disposition vocabulary. This string used to open "This is an
+    // Explain turn", which is the sentence a 9b model read back to the
+    // operator; the voice table both drops that framing and appends the
+    // non-narration clause.
+    debug_assert!(
+        disposition != PromptDisposition::Act,
+        "Act permits every tool and must never reach a disposition refusal"
+    );
+    let guidance = super::super::DispositionVoices::default().denied_block(disposition);
     format!("Tool `{name}` is unavailable under the current prompt disposition. {guidance}")
 }
 

@@ -229,13 +229,13 @@ pub(crate) fn execute_tool_search_for_disposition(
     if disposition == super::PromptDisposition::Act || !query_seeks_execution_tool(query) {
         return result;
     }
+    // #2051: the scope note is part of the disposition vocabulary, so it is
+    // owned by `disposition_voice` alongside the card and refusal lines. It no
+    // longer names the disposition — naming it is what invited the model to
+    // report the filtering to the operator.
     format!(
-        "{result}\n\nCatalog scope: this is only the current {} turn. A missing execution \
-         tool may be available on a direct Act request. Ask the operator to send an explicit \
-         action request (use request_user_input when available); do not report a session-wide \
-         capability absence from this result. /mode changes working style but cannot widen an \
-         already accepted turn.",
-        disposition.as_str()
+        "{result}\n\n{}",
+        super::DispositionVoices::default().discovery_scope
     )
 }
 
@@ -356,10 +356,18 @@ mod tests {
             &serde_json::json!([]),
             super::super::PromptDisposition::Explain,
         );
-        assert!(out.contains("direct Act request"), "got: {out}");
+        // The handoff itself is unchanged: a filtered catalog must coach an
+        // explicit operator request rather than a session-wide "I cannot".
+        assert!(out.contains("direct action request"), "got: {out}");
         assert!(out.contains("request_user_input"), "got: {out}");
+        // #2051: the note no longer names the disposition, and no longer ends
+        // with "/mode … cannot widen an already accepted turn". Telling a 9b
+        // model it has no move is what left narrating the cage as its only
+        // remaining response.
+        assert!(!out.contains("Explain"), "got: {out}");
+        assert!(!out.contains("explain"), "got: {out}");
         assert!(
-            out.contains("cannot widen an already accepted turn"),
+            !out.contains("cannot widen an already accepted turn"),
             "got: {out}"
         );
     }
@@ -372,7 +380,7 @@ mod tests {
             super::super::PromptDisposition::Explain,
         );
         assert!(out.contains("read_file"), "got: {out}");
-        assert!(!out.contains("direct Act request"), "got: {out}");
+        assert!(!out.contains("direct action request"), "got: {out}");
         assert!(!out.contains("request_user_input"), "got: {out}");
     }
 
