@@ -39,6 +39,23 @@ pub(super) const PROMPT_COMPREHENSION_SCHEMA_V2: &str = "prompt_comprehension_ma
 pub(super) const PROMPT_COMPREHENSION_SCHEMA_V3: &str = "prompt_comprehension_manifest_v3";
 pub(super) const PROMPT_COMPREHENSION_SCHEMA_CURRENT: &str = PROMPT_COMPREHENSION_SCHEMA_V3;
 
+/// Where the live [`PromptDisposition`] came from, so the model card can say
+/// so truthfully (#2051 review).
+///
+/// The card's provenance clause once said, unconditionally, that the harness
+/// inferred the disposition from the operator's words and the operator did not
+/// choose it. That is false under an explicit `/mode plan` or `/mode diagnose`,
+/// which reach [`PromptIntake::enforce_read_only`] and narrow the turn on the
+/// operator's own standing instruction. The two arms name the two callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispositionSource {
+    /// Classified from the prompt text by the intake lexicon.
+    Inferred,
+    /// Narrowed after classification by a session setting the operator chose
+    /// earlier (an operating mode); the prompt's own words did not decide it.
+    SessionPolicy,
+}
+
 /// The harness-selected mode for one accepted prompt receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -292,6 +309,9 @@ pub struct PromptIntake {
     /// temporarily changes the live disposition to `Ask`; an explicit answer
     /// restores this value once every decision is locked.
     post_lock_disposition: PromptDisposition,
+    /// Whether the live disposition is the lexicon's reading of the prompt or
+    /// a session policy's narrowing of it. Read by the model card only.
+    source: DispositionSource,
     /// Why the LAST clarification reply failed to lock the batch, if it did.
     ///
     /// #1689 item 1. Set only by [`Self::resolve_with_operator_answer`]; a
@@ -342,6 +362,7 @@ impl PromptIntake {
                 },
                 disposition: PromptDisposition::Ask,
                 post_lock_disposition: PromptDisposition::Explain,
+                source: DispositionSource::Inferred,
                 last_rejection: None,
             };
             debug_assert!(intake.validate().is_ok());
@@ -368,6 +389,7 @@ impl PromptIntake {
             },
             disposition,
             post_lock_disposition,
+            source: DispositionSource::Inferred,
             last_rejection: None,
         };
         debug_assert!(intake.validate().is_ok());
@@ -396,8 +418,17 @@ impl PromptIntake {
         if self.disposition != PromptDisposition::Ask {
             self.disposition = disposition;
             self.post_lock_disposition = disposition;
+            // The narrowing came from a session setting, not the prompt; the
+            // card must not claim the operator had no hand in it.
+            self.source = DispositionSource::SessionPolicy;
         }
         debug_assert!(self.validate().is_ok());
+    }
+
+    /// Whether the live disposition was inferred from the prompt or narrowed
+    /// by a session policy the operator set.
+    pub fn disposition_source(&self) -> DispositionSource {
+        self.source
     }
 
     pub fn atomic_asks(&self) -> &[AtomicAsk] {
@@ -700,7 +731,8 @@ impl PromptIntake {
         // disposition. The block carries the action line plus the provenance
         // and privacy clauses — without them a small model reads the action
         // line as an operator-imposed rule and reports its compliance.
-        let instruction = super::DispositionVoices::default().card_block(self.disposition);
+        let instruction =
+            super::DispositionVoices::default().card_block(self.disposition, self.source);
         let prompt = self
             .manifest
             .atomic_asks
@@ -1603,8 +1635,8 @@ fn digest_metadata(text: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        AskKind, AtomicAsk, DispositionLexicon, PromptDisposition, PromptIntake, MAX_ATOMIC_ASKS,
-        MAX_CONCRETE_DECISIONS, PROMPT_COMPREHENSION_MODEL_CARD_PREFIX,
+        AskKind, AtomicAsk, DispositionLexicon, DispositionSource, PromptDisposition, PromptIntake,
+        MAX_ATOMIC_ASKS, MAX_CONCRETE_DECISIONS, PROMPT_COMPREHENSION_MODEL_CARD_PREFIX,
     };
 
     // -----------------------------------------------------------------
@@ -1746,10 +1778,12 @@ mod tests {
     /// announcing; these two clauses are what say otherwise.
     #[test]
     fn the_card_states_the_disposition_is_the_harness_own_inference() {
-        let card = PromptIntake::analyze("hello?").model_card();
+        let intake = PromptIntake::analyze("hello?");
+        assert_eq!(intake.disposition_source(), DispositionSource::Inferred);
+        let card = intake.model_card();
         assert!(card.contains("disposition: explain"), "{card}");
         assert!(
-            card.contains("disposition_source:"),
+            card.contains("disposition_source: the harness inferred this"),
             "the card must say the harness inferred this: {card}"
         );
         assert!(
@@ -1760,28 +1794,50 @@ mod tests {
         assert!(card.contains("say plainly what you cannot do"), "{card}");
     }
 
-    /// Every disposition gets both clauses — a new variant cannot ship a card
-    /// that reads as an unattributed cage.
+    /// Review of #2057: `/mode plan` and `/mode diagnose` reach
+    /// `enforce_read_only` on the operator's own standing instruction, so a
+    /// card that still says "the operator did not choose it" is false there.
+    /// Every narrowed disposition gets both clauses AND the policy provenance;
+    /// a new variant cannot ship a card that reads as an unattributed cage.
     #[test]
-    fn every_disposition_card_carries_the_shared_clauses() {
-        let mut intake = PromptIntake::analyze("fix the parser");
-        assert_eq!(intake.disposition(), PromptDisposition::Act);
+    fn a_policy_narrowed_card_credits_the_session_mode_not_the_prompt() {
         for disposition in [
             PromptDisposition::Explain,
             PromptDisposition::Research,
             PromptDisposition::Plan,
         ] {
+            let mut intake = PromptIntake::analyze("fix the parser");
+            assert_eq!(intake.disposition(), PromptDisposition::Act);
             intake.enforce_read_only(disposition);
+            assert_eq!(
+                intake.disposition_source(),
+                DispositionSource::SessionPolicy
+            );
             let card = intake.model_card();
             assert!(
-                card.contains("disposition_source:"),
+                card.contains("disposition_source: a session mode the operator set"),
                 "{disposition:?}: {card}"
+            );
+            assert!(
+                !card.contains("did not choose it"),
+                "{disposition:?}: the card must not deny the operator's own mode choice: {card}"
             );
             assert!(
                 card.contains("disposition_privacy:"),
                 "{disposition:?}: {card}"
             );
         }
+    }
+
+    /// An `Ask` intake is terminal: `enforce_read_only` changes nothing, so it
+    /// must not relabel the provenance either.
+    #[test]
+    fn narrowing_an_ask_intake_keeps_its_inferred_provenance() {
+        let mut intake = PromptIntake::analyze("pick either parser and fix it");
+        assert_eq!(intake.disposition(), PromptDisposition::Ask);
+        intake.enforce_read_only(PromptDisposition::Plan);
+        assert_eq!(intake.disposition(), PromptDisposition::Ask);
+        assert_eq!(intake.disposition_source(), DispositionSource::Inferred);
     }
 
     /// **The twin that bounds the blast radius, measured not asserted.**

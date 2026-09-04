@@ -547,17 +547,16 @@ pub(super) fn disposition_tool_denied_message(
     disposition: PromptDisposition,
     name: &str,
 ) -> String {
-    // #2051: the guidance text lives in `disposition_voice`, the single owner
-    // of the disposition vocabulary. This string used to open "This is an
-    // Explain turn", which is the sentence a 9b model read back to the
-    // operator; the voice table both drops that framing and appends the
-    // non-narration clause.
+    // #2051: the whole refusal lives in `disposition_voice`, the single owner
+    // of the disposition vocabulary. It used to open "This is an Explain
+    // turn", which is the sentence a 9b model read back to the operator, and
+    // the prefix here used to say "under the current prompt disposition",
+    // which named the mechanism the model was then told not to mention.
     debug_assert!(
         disposition != PromptDisposition::Act,
         "Act permits every tool and must never reach a disposition refusal"
     );
-    let guidance = super::super::DispositionVoices::default().denied_block(disposition);
-    format!("Tool `{name}` is unavailable under the current prompt disposition. {guidance}")
+    super::super::DispositionVoices::default().denied_block(disposition, name)
 }
 
 /// The refusal returned to the model when it calls a tool the active persona

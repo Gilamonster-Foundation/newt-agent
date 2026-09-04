@@ -79,10 +79,89 @@ async fn the_greeting_turn_never_ships_a_sentence_to_read_aloud() {
         !wire.contains("This is an Explain turn"),
         "the refusal phrasing the model read aloud is back on the wire"
     );
+    assert!(
+        !wire.contains("unavailable under the current prompt disposition"),
+        "the mechanism is named on the wire again"
+    );
     // The harness used to tell the model, twice, that it had no move. Under
     // that framing narrating the cage is close to the only response left.
     assert!(
         !wire.contains("cannot widen an already accepted turn"),
         "the you-have-no-move sentence is back on the wire"
+    );
+}
+
+/// The turn the greeting BAT above cannot exercise: a request the lexicon
+/// misfiles as Explain, on which the model reaches for a write, is refused,
+/// then goes looking for an execution tool. Both of those results land on the
+/// model wire as tool results, which is the only place the refusal and the
+/// discovery note exist — a script that answers in one round never puts either
+/// there, and the negative assertions above would pass vacuously.
+///
+/// Observed on `llama3.1:8b` under the first version of this branch: the
+/// refusal said "under the current prompt disposition" and "do not report this
+/// refusal", and the model, told to stay quiet about a write it could not do,
+/// reported the write as done. The wire must now carry a refusal that names no
+/// mechanism and that separates what may not be quoted from what must still
+/// be said.
+#[tokio::test]
+async fn a_refused_write_and_a_discovery_reach_the_wire_without_naming_the_mechanism() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    let (_reply, _hallucinations, _end_reason, wire) = run_scenario_for(
+        "could you add a line saying hello to README.md?",
+        PromptDisposition::Explain,
+        ws.path(),
+        vec![
+            serde_json::json!({
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": { "name": "write_file",
+                        "arguments": "{\"path\":\"README.md\",\"content\":\"hello\\n\"}" }
+                }]
+            }),
+            serde_json::json!({
+                "content": null,
+                "tool_calls": [{
+                    "id": "c2", "type": "function",
+                    "function": { "name": "tool_search",
+                        "arguments": "{\"query\":\"run command\"}" }
+                }]
+            }),
+            serde_json::json!({ "content":
+                "I can't change README.md from here, so the line was not added." }),
+        ],
+    )
+    .await;
+
+    // The refusal reached the model, names the tool, and says what to do
+    // with the gap: not quote the notice, and not pretend the write happened.
+    assert!(
+        wire.contains("Tool `write_file` is not available for this request."),
+        "the refusal must reach the model as a tool result: {wire}"
+    );
+    assert!(
+        wire.contains("say plainly what remains undone; never claim it was done"),
+        "the refusal must require the honest answer, not silence"
+    );
+    // The discovery note reached the model and still coaches the handoff.
+    assert!(
+        wire.contains("Catalog scope:") && wire.contains("direct action request"),
+        "the discovery scope note must reach the model as a tool result"
+    );
+    // None of the sentences that named the mechanism, or told the model it
+    // had no move, or gagged it, are on the wire in either result.
+    for gone in [
+        "unavailable under the current prompt disposition",
+        "This is an Explain turn",
+        "cannot widen an already accepted turn",
+        "Do not report this refusal",
+    ] {
+        assert!(!wire.contains(gone), "{gone:?} is back on the wire");
+    }
+    // The workspace was never touched: the refusal was a refusal.
+    assert!(
+        !ws.path().join("README.md").exists(),
+        "a refused write must not write"
     );
 }

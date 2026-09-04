@@ -545,7 +545,7 @@ async fn line_count_question_wc_denied_then_escalates_cleanly() {
         "final answer returned: {reply}"
     );
     assert!(
-        wire.contains("Tool `run_command` is unavailable"),
+        wire.contains("Tool `run_command` is not available for this request"),
         "Research refuses the wc -l shell honestly: {wire}"
     );
     assert!(
@@ -553,7 +553,7 @@ async fn line_count_question_wc_denied_then_escalates_cleanly() {
         "request_user_input must dispatch in the evidence turn: {wire}"
     );
     assert!(
-        !wire.contains("Tool `request_user_input` is unavailable"),
+        !wire.contains("Tool `request_user_input` is not available for this request"),
         "the escalation must not be disposition-refused"
     );
     assert_clean_footer(hallucinations, end_reason);
@@ -597,7 +597,7 @@ async fn largest_files_question_pipeline_denied_then_escalates_cleanly() {
     // The pipeline was DISPOSITION-refused (an honest gate), never hijacked as
     // a misdirected embedded-find (#1262 kept hallucinations at zero below).
     assert!(
-        wire.contains("Tool `run_command` is unavailable"),
+        wire.contains("Tool `run_command` is not available for this request"),
         "the evidence turn refuses the shell honestly: {wire}"
     );
     // The formal escalation dispatched (#1259): headless => the recoverable
@@ -607,7 +607,7 @@ async fn largest_files_question_pipeline_denied_then_escalates_cleanly() {
         "request_user_input must dispatch in the evidence turn: {wire}"
     );
     assert!(
-        !wire.contains("Tool `request_user_input` is unavailable"),
+        !wire.contains("Tool `request_user_input` is not available for this request"),
         "the escalation must not be disposition-refused"
     );
     assert_clean_footer(hallucinations, end_reason);

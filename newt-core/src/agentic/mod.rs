@@ -219,7 +219,8 @@ pub use plan_exec::{run_plan, run_plan_with_reground, NoReground, PlanRun, Regro
 pub use prompt_intake::{
     AdjudicationCandidate, AdjudicationRefusal, AdjudicationVerdict, AtomicAsk,
     ClarificationRejection, DecisionLock, DecisionSource, DecisionStatus, DispositionLexicon,
-    PromptComprehensionManifest, PromptDisposition, PromptIntake, MAX_ADJUDICATION_BATCH,
+    DispositionSource, PromptComprehensionManifest, PromptDisposition, PromptIntake,
+    MAX_ADJUDICATION_BATCH,
 };
 #[cfg(test)]
 pub(crate) use prompt_read::response_repository_policy_tokens;
@@ -262,7 +263,7 @@ pub fn tidy_markdown_tables(src: &str) -> String {
 #[path = "mod_tests/tidy_tables_tests.rs"]
 mod tidy_tables_tests;
 pub use budget::get_context_remaining_tool_definition;
-pub use disposition_voice::{DispositionVoice, DispositionVoices};
+pub(crate) use disposition_voice::DispositionVoices;
 pub use memory_fetch::{
     memory_fetch_tool_definition, MemAddr, MemPayload, MemorySource, StoreMemorySource,
 };

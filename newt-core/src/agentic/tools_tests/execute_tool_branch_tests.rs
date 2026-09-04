@@ -379,7 +379,7 @@ async fn enter_and_exit_plan_mode_are_session_local_and_immediate() {
     )
     .await;
     assert!(
-        denied_write.contains("current prompt disposition"),
+        denied_write.contains("is not available for this request"),
         "a write later in the same tool round must hit the immediate Plan clamp: {denied_write}"
     );
     assert!(
@@ -2746,7 +2746,10 @@ async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
         PromptDisposition::Research,
     )
     .await;
-    assert!(write.contains("current prompt disposition"), "got: {write}");
+    assert!(
+        write.contains("is not available for this request"),
+        "got: {write}"
+    );
     assert!(
         !ws.path().join("must-not-write.txt").exists(),
         "disposition rejection must precede the write handler"
@@ -2763,7 +2766,10 @@ async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
         PromptDisposition::Explain,
     )
     .await;
-    assert!(exec.contains("current prompt disposition"), "got: {exec}");
+    assert!(
+        exec.contains("is not available for this request"),
+        "got: {exec}"
+    );
     assert!(
         !ws.path().join("must-not-exec.txt").exists(),
         "disposition rejection must precede the shell handler"
@@ -2785,7 +2791,10 @@ async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
         PromptDisposition::Research,
     )
     .await;
-    assert!(grant.contains("current prompt disposition"), "got: {grant}");
+    assert!(
+        grant.contains("is not available for this request"),
+        "got: {grant}"
+    );
     assert!(
         gate.asks.is_empty(),
         "non-Act must not consult a grant gate"
@@ -2804,7 +2813,7 @@ async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
     )
     .await;
     assert!(
-        remote.contains("current prompt disposition"),
+        remote.contains("is not available for this request"),
         "got: {remote}"
     );
     assert!(
@@ -2868,7 +2877,10 @@ async fn plan_disposition_updates_ledger_but_still_denies_workspace_mutation() {
         PromptDisposition::Plan,
     )
     .await;
-    assert!(write.contains("current prompt disposition"), "{write}");
+    assert!(
+        write.contains("is not available for this request"),
+        "{write}"
+    );
     assert!(!ws.path().join("must-not-write.txt").exists());
 }
 
