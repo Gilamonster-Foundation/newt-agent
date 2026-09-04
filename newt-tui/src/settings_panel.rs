@@ -483,7 +483,23 @@ pub(crate) fn run(
     window: Option<crate::session_worker::PanelWindow>,
 ) -> std::io::Result<Outcome> {
     let mut panel = SettingsPanel::new(backend, models, current_model);
-    let applied = crate::panel::drive(&mut panel, panel_height(), window.as_ref())?;
+    // #2009 PR8: the panel is driven as a SECTION of the shell rather than on
+    // its own. With one section the shell is a pass-through — it opens into
+    // this panel and closes when it closes — so `/settings` is unchanged
+    // today, and the index lights up when PR9 adds the second section.
+    //
+    // The panel is still owned HERE, so `commit()` and `picked_model()` below
+    // read it exactly as before; the shell borrows it for the duration of the
+    // loop and gives it back.
+    let applied = {
+        let mut shell = crate::shell::Shell::new(vec![crate::shell::Section {
+            name: "Session",
+            accel: 's',
+            summary: "dials, editor, reasoning, prompt".to_string(),
+            screen: &mut panel,
+        }]);
+        crate::panel::drive(&mut shell, panel_height(), window.as_ref())?
+    };
     if !applied {
         return Ok(Outcome::Applied {
             lines: vec!["settings: cancelled".to_string()],

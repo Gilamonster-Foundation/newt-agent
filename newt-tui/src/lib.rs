@@ -71,6 +71,8 @@ mod settings_form;
 /// siblings above; it grounds the mocked `settings_form` unit tests.
 #[cfg(all(test, unix, feature = "rich-tui"))]
 mod settings_form_pty_test;
+#[cfg(feature = "rich-tui")]
+mod shell;
 mod slash_registry;
 #[cfg(feature = "live-spill")]
 mod spill_view;
