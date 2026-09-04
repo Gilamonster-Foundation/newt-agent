@@ -12743,7 +12743,8 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /search <query>          - semantic code search cockpit (#1387): preview · model · rejects · pin · exclude · status",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
         "  /new                     - finalize this conversation and start a fresh one (stays in the session; alias: /clear)",
-        "  /end  /restart           - finalize this conversation and start fresh (aliases of /new; /end no longer exits)",
+        "  /end                     - the same, recorded as ended by /end rather than /new (it no longer exits — use /exit)",
+        "  /restart                 - the same, recorded as a restart",
         "  /start [title]           - begin a new conversation, leaving the current one open to /resume",
         "  /resume [name|search|n|id] - find & reopen a past conversation: bare lists recent, then match by name/title, id, or full-text search",
         "  /name <title>            - retitle the current conversation so it is easy to find in /resume (alias: /rename)",
@@ -13137,12 +13138,34 @@ fn run_bang_escape_unix(
 
 /// Parse a `/cd` line. `Some("")` for a bare `/cd` (return to root), `Some(arg)`
 /// for `/cd <arg>`, and `None` for anything else (`/cdx`, the bare `cd` verb, …).
+///
+/// # Why `trim_start_matches('/')` and not `strip_prefix("/cd")`
+///
+/// **The old shape was invisible to the interception-site pin** (#2009 PR2).
+/// That guard counts `trim_start_matches('/')` occurrences, because every
+/// top-level command reaches its handler through one — so a new command shows
+/// up as a new site and forces a registry review. `/cd` reached its handler
+/// through a bespoke prefix strip instead, which is exactly how it stayed an
+/// unregistered ghost outside every ratchet while being a real, shipped,
+/// state-mutating command.
+///
+/// Splitting the verb from the argument also removes the `/cdate` class of
+/// near-miss by construction rather than by a second `strip_prefix(' ')`
+/// check: `/cdate` has the verb `cdate`, which is simply not `cd`.
 fn cd_command(input: &str) -> Option<&str> {
-    let rest = input.trim().strip_prefix("/cd")?;
-    if rest.is_empty() {
-        return Some("");
+    let trimmed = input.trim();
+    // The `/` is required — bare `cd` was retired (#1096) and is a message to
+    // the model. Everything after it is trimmed the way every other command's
+    // interception trims it, so `//cd` behaves like `//help` rather than
+    // being the one verb in the shell that refuses a doubled slash.
+    if !trimmed.starts_with('/') {
+        return None;
     }
-    Some(rest.strip_prefix(' ')?.trim())
+    let slash_verb = trimmed.trim_start_matches('/');
+    let (verb, arg) = slash_verb
+        .split_once(char::is_whitespace)
+        .map_or((slash_verb, ""), |(v, a)| (v, a.trim()));
+    (verb == "cd").then_some(arg)
 }
 
 /// Lexically resolve `.` / `..` WITHOUT touching the filesystem, so a symlinked

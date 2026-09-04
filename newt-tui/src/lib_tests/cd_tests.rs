@@ -18,6 +18,24 @@ fn cd_command_parses_only_slash_cd() {
     assert_eq!(cd_command("hello /cd"), None);
 }
 
+/// **The one behaviour the counted-interception rewrite changed** (#2009 PR2).
+///
+/// `strip_prefix("/cd")` accepted exactly one leading slash, so `/cd` was the
+/// single verb in the shell that refused a doubled slash — every other command
+/// reaches its handler through `trim_start_matches('/')` and has always
+/// accepted `//help`. This is `/cd` joining them, pinned here so the change is
+/// a recorded decision rather than something discovered later by an operator
+/// with a sticky key.
+#[test]
+fn a_doubled_slash_reaches_cd_the_way_it_reaches_every_other_verb() {
+    assert_eq!(cd_command("//cd"), Some(""));
+    assert_eq!(cd_command("//cd src"), Some("src"));
+    // The near-miss class is still refused, and now by construction: `/cdate`
+    // parses to the verb `cdate`, which is not `cd`.
+    assert_eq!(cd_command("//cdate"), None);
+    assert_eq!(cd_command("//cd/src"), None, "not a whitespace-split arg");
+}
+
 #[test]
 fn confine_keeps_cd_under_the_root() {
     let root = Path::new("/w");

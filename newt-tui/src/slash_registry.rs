@@ -404,7 +404,7 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     ),
     cmd(
         "type",
-        &[],
+        &["inspect"],
         Family::Navigator,
         Disposition::Keep,
         Receipt::None_,
@@ -523,6 +523,62 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
     ),
     cmd(
         "undo-lock",
+        &[],
+        Family::Session,
+        Disposition::Keep,
+        Receipt::Missing,
+    ),
+    // ------------------------------------------------------------------
+    // **The ghosts** (#2009 PR2). Five shipped, advertised, state-mutating
+    // commands that were in no register at all — outside the shrink ratchets,
+    // outside the receipt debt count, and invisible to every conformance test
+    // in this file. Registering them RAISES three ratchets, and that raise is
+    // the whole point: the numbers were low because they were not looking.
+    //
+    // Rows follow the code, not the help. `chat.rs:4506-4516` is one match on
+    // the verb, and it is the authority for what is an alias and what is not.
+    // ------------------------------------------------------------------
+    cmd(
+        // `/clear` and `/new` share ONE arm returning `Some("new")` — proven
+        // identical, so a genuine alias.
+        "new",
+        &["clear"],
+        Family::Session,
+        Disposition::Keep,
+        Receipt::Missing,
+    ),
+    cmd(
+        // **NOT an alias of `/new`, though the help said so for two years.**
+        // `end_reason` is a persisted column (`store.rs:2017`), and these
+        // write different values into it. Two rows, because the difference
+        // outlives the session that made it.
+        "end",
+        &[],
+        Family::Session,
+        Disposition::Keep,
+        Receipt::Missing,
+    ),
+    cmd(
+        "restart",
+        &[],
+        Family::Session,
+        Disposition::Keep,
+        Receipt::Missing,
+    ),
+    cmd(
+        // The one that is obviously distinct: `/start` SWITCHES without
+        // finalizing — it skips close-time note extraction, leaves the
+        // outgoing conversation OPEN and resumable, and takes a title.
+        "start",
+        &[],
+        Family::Session,
+        Disposition::Keep,
+        Receipt::Missing,
+    ),
+    cmd(
+        // The one human navigation command (#1096). Moves `session_cwd`,
+        // confined below the start dir.
+        "cd",
         &[],
         Family::Session,
         Disposition::Keep,
@@ -774,6 +830,20 @@ mod tests {
         out.join("\n")
     }
 
+    /// Interception sites in `src`, **not** mentions of one.
+    ///
+    /// The count skips comment lines. Writing the doc comment that explains
+    /// why `/cd` joined this shape moved the pin by two without adding a
+    /// single interception — a guard that a comment can trip teaches its
+    /// reader to edit the number instead of reading the code, which is the
+    /// one failure mode a ratchet cannot survive.
+    fn count_sites(src: &str) -> usize {
+        src.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(|line| line.matches("trim_start_matches('/')").count())
+            .sum()
+    }
+
     fn dispatch_sources() -> Vec<(&'static str, String)> {
         vec![
             ("lib.rs", production(include_str!("lib.rs"))),
@@ -798,8 +868,9 @@ mod tests {
                 src.len()
             );
             assert!(
-                src.contains("trim_start_matches('/')"),
-                "{name}: no slash interception survived the cut"
+                count_sites(src.as_str()) > 0,
+                "{name}: no slash interception survived the cut — counted over \
+                 CODE, so a surviving comment cannot stand in for one"
             );
         }
         // ...and it really does remove test code.
@@ -819,6 +890,19 @@ mod tests {
     ///
     /// Walked from the dispatch, not from `help_lines()`: the help had
     /// already drifted by eleven undocumented commands when this was armed.
+    ///
+    /// # 63/76 → 68/83: registering the ghosts (#2009 PR2)
+    ///
+    /// Five commands an operator could type today, advertised in
+    /// `help_lines()`, reaching real handlers, and counted by neither of these
+    /// numbers: `/new` (`/clear`), `/end`, `/restart`, `/start`, `/cd` — plus
+    /// `inspect`, a proven alias of `/type` (`navigator_cmds.rs:105` matches
+    /// both in one arm).
+    ///
+    /// **A shrink ratchet that does not know about a command cannot stop it
+    /// growing.** This raise buys the ratchet its teeth: the surface it now
+    /// guards is the surface that exists. Every later slice pays it back —
+    /// PR3 alone retires nine rows.
     ///
     /// **Slice 1 raised these by one, and that is honest rather than a
     /// weakening.** `/settings` is a net ADDITION: it absorbs the editor-mode
@@ -841,14 +925,14 @@ mod tests {
     #[test]
     fn the_registered_surface_only_shrinks() {
         assert!(
-            slash_commands().count() <= 63,
+            slash_commands().count() <= 68,
             "the slash surface GREW to {} commands. #1981 is a reduction: a \
              new command needs an argument for why it is not a field of \
              /settings or a subcommand of an existing verb",
             slash_commands().count()
         );
         assert!(
-            slash_tokens().len() <= 76,
+            slash_tokens().len() <= 83,
             "the slash surface GREW to {} tokens",
             slash_tokens().len()
         );
@@ -884,10 +968,10 @@ mod tests {
     fn the_number_of_slash_interception_sites_is_pinned() {
         let counted: usize = dispatch_sources()
             .iter()
-            .map(|(_, src)| src.matches("trim_start_matches('/')").count())
+            .map(|(_, src)| count_sites(src))
             .sum();
         assert_eq!(
-            counted, 21,
+            counted, 22,
             "the number of slash interception sites moved to {counted}. If a \
              command was added, register it here. If sites were consolidated \
              — which is #1981's goal — lower this number and the ratchet above."
@@ -994,6 +1078,19 @@ mod tests {
     /// would let the entire debt disappear as the cut proceeds, which is the
     /// most tempting wrong answer available here.
     ///
+    /// # 28 → 33: five ghosts walk into the count (#2009 PR2)
+    ///
+    /// `/new` (`/clear`), `/end`, `/restart`, `/start` and `/cd` are shipped,
+    /// advertised, state-mutating commands that were in NO register — so they
+    /// were outside this number while owing exactly what it measures. Four
+    /// finalize a conversation and write `end_reason`; `/cd` moves
+    /// `session_cwd`. None of them records a receipt.
+    ///
+    /// **The debt did not grow by five; the instrument stopped under-reading
+    /// by five.** Per §4.4 these are operations, not settings — they have no
+    /// prior value for a `from→to` — so they park here, counted, against the
+    /// event journal (PR-E) rather than being handed a fabricated baseline.
+    ///
     /// # 27 → 28: the one declared raise (#2009 §7 Q8)
     ///
     /// `/probe reset` wipes every learned capability — tool conformance,
@@ -1013,7 +1110,7 @@ mod tests {
             .filter(|c| matches!(c.receipt, Receipt::Missing))
             .count();
         assert!(
-            missing <= 28,
+            missing <= 33,
             "{missing} state-mutating commands record nothing durable — that \
              is more than when #1981 armed this. A new state mutator needs a \
              receipt destination, not another silent write"
@@ -1336,6 +1433,58 @@ mod fallthrough_tests {
                 "`/{token}` is registered; calling it unknown is the defect: {msg}"
             );
             assert!(msg.contains("routing bug"), "{msg}");
+        }
+    }
+
+    /// **The lifecycle family is four rows, not one row with three aliases.**
+    ///
+    /// The help called `/end` and `/restart` "aliases of /new" and the
+    /// registry knew nothing about any of them, so nothing contradicted it.
+    /// `chat.rs:4512-4515` does: `/new` and `/clear` share one arm returning
+    /// `Some("new")`, while `/end` and `/restart` return their own words, and
+    /// that word is written to the persisted `end_reason` column
+    /// (`store.rs:2017`). A difference that outlives the session that made it
+    /// is not an alias.
+    ///
+    /// `/start` is further out still — it skips close-time note extraction
+    /// entirely, leaves the outgoing conversation OPEN and resumable, and
+    /// takes a title.
+    ///
+    /// This test exists because the three tokens LOOK interchangeable, which
+    /// is exactly the argument that would collapse them in a later cleanup.
+    #[test]
+    fn the_lifecycle_verbs_that_differ_are_separate_rows() {
+        for token in ["new", "end", "restart", "start"] {
+            let row = lookup(token).unwrap_or_else(|| panic!("/{token} is registered"));
+            assert_eq!(
+                row.name, token,
+                "`/{token}` resolves to `/{}` — it was made an alias of a \
+                 command it does not behave like",
+                row.name
+            );
+        }
+        // ...and the one pair that IS proven identical stays one row.
+        assert_eq!(
+            lookup("clear").map(|c| c.name),
+            Some("new"),
+            "`/clear` and `/new` share a dispatch arm; two rows would claim a \
+             difference the code does not have"
+        );
+    }
+
+    /// Every ghost registered by PR2 is reachable, receipted honestly, and
+    /// advertised — the three things being unregistered let them skip.
+    #[test]
+    fn the_registered_ghosts_are_typed_mutators_that_owe_a_receipt() {
+        for token in ["new", "clear", "end", "restart", "start", "cd"] {
+            let row = lookup(token).unwrap_or_else(|| panic!("/{token} is registered"));
+            assert_eq!(row.surface, Surface::Slash, "/{token} is typed today");
+            assert_eq!(
+                row.receipt,
+                Receipt::Missing,
+                "/{token} mutates durable state and records no receipt; \
+                 saying otherwise hides it from the #1965 debt"
+            );
         }
     }
 

@@ -22,7 +22,8 @@
   /search <query>          - semantic code search cockpit (#1387): preview · model · rejects · pin · exclude · status
   /remember <fact>         - add a fact to persistent NOTES.md
   /new                     - finalize this conversation and start a fresh one (stays in the session; alias: /clear)
-  /end  /restart           - finalize this conversation and start fresh (aliases of /new; /end no longer exits)
+  /end                     - the same, recorded as ended by /end rather than /new (it no longer exits — use /exit)
+  /restart                 - the same, recorded as a restart
   /start [title]           - begin a new conversation, leaving the current one open to /resume
   /resume [name|search|n|id] - find & reopen a past conversation: bare lists recent, then match by name/title, id, or full-text search
   /name <title>            - retitle the current conversation so it is easy to find in /resume (alias: /rename)
