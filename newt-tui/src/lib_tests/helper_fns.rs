@@ -131,40 +131,52 @@ fn compaction_trigger_policy_resolves_session_config_default() {
         ..Default::default()
     };
 
+    // The session override is a process-global since #2009 PR7, so this holds
+    // it exclusively and restores it on drop — including on panic.
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    newt_core::process_env::remove_var("NEWT_COMPACTION_TRIGGER");
+
     // No [context] → the conservative headroom-aware default.
     assert_eq!(
-        compaction_trigger_policy(&newt_core::Config::default(), None),
+        compaction_trigger_policy(&newt_core::Config::default()),
         CompactionTriggerPolicy::HeadroomAware
     );
     assert_eq!(
-        compaction_trigger_policy_source(&newt_core::Config::default(), None),
+        compaction_trigger_policy_source(&newt_core::Config::default()),
         "default"
     );
 
     // Config wins when the session has not selected a temporary policy.
     assert_eq!(
-        compaction_trigger_policy(&cfg_with(CompactionTriggerPolicy::MessageCount), None),
+        compaction_trigger_policy(&cfg_with(CompactionTriggerPolicy::MessageCount)),
         CompactionTriggerPolicy::MessageCount
     );
     assert_eq!(
-        compaction_trigger_policy_source(&cfg_with(CompactionTriggerPolicy::MessageCount), None),
+        compaction_trigger_policy_source(&cfg_with(CompactionTriggerPolicy::MessageCount)),
         "config"
     );
 
-    // A session override remains highest precedence.
+    // A session override remains highest precedence — set the way both
+    // `/context compaction` and `/settings compaction` set it, so this
+    // exercises the real precedence rather than a parameter that is gone.
+    newt_core::process_env::set_var(
+        "NEWT_COMPACTION_TRIGGER",
+        CompactionTriggerPolicy::HeadroomAware.keyword(),
+    );
     assert_eq!(
-        compaction_trigger_policy(
-            &cfg_with(CompactionTriggerPolicy::MessageCount),
-            Some(CompactionTriggerPolicy::HeadroomAware)
-        ),
+        compaction_trigger_policy(&cfg_with(CompactionTriggerPolicy::MessageCount)),
         CompactionTriggerPolicy::HeadroomAware
     );
     assert_eq!(
-        compaction_trigger_policy_source(
-            &cfg_with(CompactionTriggerPolicy::MessageCount),
-            Some(CompactionTriggerPolicy::HeadroomAware)
-        ),
+        compaction_trigger_policy_source(&cfg_with(CompactionTriggerPolicy::MessageCount)),
         "session"
+    );
+
+    // ...and releasing the pin returns the session to config.
+    newt_core::process_env::remove_var("NEWT_COMPACTION_TRIGGER");
+    assert_eq!(
+        compaction_trigger_policy(&cfg_with(CompactionTriggerPolicy::MessageCount)),
+        CompactionTriggerPolicy::MessageCount
     );
 }
 
@@ -265,8 +277,7 @@ fn handle_context_command_dispatch() {
     let none = ContextFeatures::default();
     // Cloud kind keeps the all-off base so these assertions isolate the
     // dispatch logic from the Step 27.4 local default.
-    let run =
-        |rest: &str| handle_context_command(rest, &cfg, None, None, &none, BackendKind::Openai);
+    let run = |rest: &str| handle_context_command(rest, &cfg, None, &none, BackendKind::Openai);
 
     // bare status: manager + features summary, no mutation. `tool_offload`
     // now defaults on for EVERY backend kind (`base_for` sets it
@@ -296,23 +307,16 @@ fn handle_context_command_dispatch() {
         )),
         "the command accepts the canonical policy parser's case-insensitive form"
     );
-    let session_status = handle_context_command(
-        "",
-        &cfg,
-        None,
-        Some(CompactionTriggerPolicy::MessageCount),
-        &none,
-        BackendKind::Openai,
+    // The session pin is a process-global since #2009 PR7, so it is installed
+    // rather than passed. Same precedence, same assertions.
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    newt_core::process_env::set_var(
+        "NEWT_COMPACTION_TRIGGER",
+        CompactionTriggerPolicy::MessageCount.keyword(),
     );
+    let session_status = handle_context_command("", &cfg, None, &none, BackendKind::Openai);
     assert!(session_status.lines[1].contains("message_count (session)"));
-    let r = handle_context_command(
-        "compaction reset",
-        &cfg,
-        None,
-        Some(CompactionTriggerPolicy::MessageCount),
-        &none,
-        BackendKind::Openai,
-    );
+    let r = handle_context_command("compaction reset", &cfg, None, &none, BackendKind::Openai);
     assert_eq!(
         r.set_compaction_trigger_policy,
         Some(CompactionTriggerPolicyOverride::Reset)
@@ -385,7 +389,6 @@ fn handle_context_command_dispatch() {
         "feature provenance off",
         &cfg_on,
         None,
-        None,
         &none,
         BackendKind::Openai,
     );
@@ -399,7 +402,7 @@ fn handle_context_command_dispatch() {
         r.lines[0]
     );
     assert!(
-        handle_context_command("", &cfg_on, None, None, &none, BackendKind::Openai).lines[0]
+        handle_context_command("", &cfg_on, None, &none, BackendKind::Openai).lines[0]
             .contains("provenance (pending #584)"),
         "bare status annotates a config-on-but-unavailable feature as pending"
     );

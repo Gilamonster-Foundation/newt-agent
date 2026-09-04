@@ -9982,12 +9982,34 @@ fn context_manager(
 /// Resolve the automatic-compaction trigger policy: the interactive-session
 /// override (`/context compaction`) wins over `[context]`, which in turn falls
 /// back to the safe headroom-aware default.
-fn compaction_trigger_policy(
+/// The effective compaction trigger policy.
+///
+/// # The `session` parameter is gone (#2009 PR7)
+///
+/// It was a `run_chat` local threaded through seven call sites, so the
+/// session's override was invisible to anything outside that loop — including
+/// `settings_form::apply`, which is exactly what had to see it for
+/// `/context compaction` to become a field. `session_compaction_trigger_policy`
+/// owns the precedence now, so this asks rather than being told.
+fn compaction_trigger_policy(cfg: &newt_core::Config) -> newt_core::CompactionTriggerPolicy {
+    if newt_core::config::compaction_trigger_is_session_pinned() {
+        return newt_core::config::session_compaction_trigger_policy();
+    }
+    configured_compaction_trigger_policy(cfg)
+}
+
+/// The policy IGNORING any session pin — what `reset` would fall back to.
+///
+/// Named rather than expressed as `compaction_trigger_policy(cfg, None)`,
+/// which is how it read while the override was a parameter. With the override
+/// global there is no `None` to pass, and "resolve as if unpinned" is a real
+/// question with one answer instead of an argument someone has to get right.
+fn configured_compaction_trigger_policy(
     cfg: &newt_core::Config,
-    session: Option<newt_core::CompactionTriggerPolicy>,
 ) -> newt_core::CompactionTriggerPolicy {
-    session
-        .or_else(|| cfg.context.as_ref().map(|c| c.compaction_trigger_policy))
+    cfg.context
+        .as_ref()
+        .map(|c| c.compaction_trigger_policy)
         .unwrap_or_default()
 }
 
@@ -9995,11 +10017,8 @@ fn compaction_trigger_policy(
 /// `[context]` section is the closest provenance the deserialized config can
 /// preserve; TOML does not retain whether an individual defaulted field was
 /// explicitly written.
-fn compaction_trigger_policy_source(
-    cfg: &newt_core::Config,
-    session: Option<newt_core::CompactionTriggerPolicy>,
-) -> &'static str {
-    if session.is_some() {
+fn compaction_trigger_policy_source(cfg: &newt_core::Config) -> &'static str {
+    if newt_core::config::compaction_trigger_is_session_pinned() {
         "session"
     } else if cfg.context.is_some() {
         "config"
@@ -10116,7 +10135,6 @@ fn handle_context_command(
     rest: &str,
     cfg: &newt_core::Config,
     manager_override: Option<newt_core::ContextManager>,
-    compaction_policy_override: Option<newt_core::CompactionTriggerPolicy>,
     feature_override: &newt_core::ContextFeatures,
     kind: newt_core::BackendKind,
 ) -> ContextCommandResult {
@@ -10124,9 +10142,8 @@ fn handle_context_command(
     let rest = rest.trim();
     let manager = context_manager(cfg, manager_override);
     let features = context_features(cfg, manager, feature_override, kind);
-    let compaction_policy = compaction_trigger_policy(cfg, compaction_policy_override);
-    let compaction_policy_source =
-        compaction_trigger_policy_source(cfg, compaction_policy_override);
+    let compaction_policy = compaction_trigger_policy(cfg);
+    let compaction_policy_source = compaction_trigger_policy_source(cfg);
     let mgr_src = if manager_override.is_some() {
         "session"
     } else {
@@ -10224,8 +10241,15 @@ fn handle_context_command(
         let policy = policy.trim();
         if policy.eq_ignore_ascii_case("reset") {
             out.set_compaction_trigger_policy = Some(CompactionTriggerPolicyOverride::Reset);
-            let reset_policy = compaction_trigger_policy(cfg, None);
-            let reset_source = compaction_trigger_policy_source(cfg, None);
+            // The PREVIEW is deliberately unpinned: this line says what the
+            // policy becomes after the reset the caller is about to apply, and
+            // the pin is still installed while this runs.
+            let reset_policy = configured_compaction_trigger_policy(cfg);
+            let reset_source = if cfg.context.is_some() {
+                "config"
+            } else {
+                "default"
+            };
             out.lines.push(format!(
                 "compaction trigger policy → {} ({reset_source})",
                 reset_policy.keyword()

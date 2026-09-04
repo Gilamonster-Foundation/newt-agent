@@ -70,6 +70,27 @@ pub(crate) enum Surface {
     /// A top-level `/verb` an operator types. **The only surface the shrink
     /// ratchets count.**
     Slash,
+    /// **A field of `/settings` that was never a top-level verb.**
+    ///
+    /// Reached as `/settings <field>` and as a row in the form — and, for
+    /// `compaction`, still as `/context compaction`, the subcommand it was
+    /// absorbed from. It has a value, a from→to and a receipt, but it is not a
+    /// `/` command and must not be counted as one.
+    ///
+    /// # Why this variant existed, died, and came back
+    ///
+    /// PR1 removed it for having **no member**: `Disposition::Absorb` already
+    /// recorded the plan, and an empty vocabulary beside it was the
+    /// speculative API this repo keeps deleting. PR4 then declined to use it
+    /// for `/markdown`, because `/markdown` is still a typed verb and marking
+    /// it Native would drop a command an operator can type out of the surface
+    /// count — the dishonesty PR1 existed to end.
+    ///
+    /// `compaction` is the member both were waiting for: a field whose only
+    /// doors are `/settings compaction` and a subcommand. Register it `Slash`
+    /// and the surface grows by a command nobody can type; leave it
+    /// unregistered and the field↔row join has nothing to join to.
+    Native,
     /// An action inside a `/settings` section — `/settings backends probe`.
     /// It PERFORMS rather than setting, so it has no from→to, but it is still
     /// a mutator and still owes a receipt destination.
@@ -469,6 +490,17 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Family::Session,
         Disposition::Keep,
         Receipt::Missing,
+    ),
+    cmd_on(
+        // Absorbed from `/context compaction` (#2009 PR7). Never a top-level
+        // verb, so it is a field row rather than a slash row — see
+        // `Surface::Native`.
+        "compaction",
+        &[],
+        Family::Session,
+        Disposition::Absorb,
+        Receipt::Journal,
+        Surface::Native,
     ),
     cmd_on(
         // Retired into `/resume` (#2009 PR6b). Its READS still read and
@@ -1472,6 +1504,7 @@ mod target_set_doc {
     fn surface_cell(command: &SlashCommand) -> String {
         match command.surface {
             Surface::Slash => "`/` command".to_string(),
+            Surface::Native => "field of `/settings`".to_string(),
             Surface::SectionAction => "action inside a section".to_string(),
             Surface::Retired(dest) => format!("retired → `{dest}`"),
         }
@@ -1495,9 +1528,15 @@ mod target_set_doc {
                     .collect::<Vec<_>>()
                     .join(" ")
             };
+            // A `Native` row is NOT typeable as `/name`, so it is not
+            // rendered as though it were — the table is read by people, and a
+            // leading slash is a promise that the token works.
+            let shown = match command.surface {
+                Surface::Native => format!("`/settings {}`", command.name),
+                _ => format!("`/{}`", command.name),
+            };
             out.push_str(&format!(
-                "| `/{}` | {aliases} | {} | {:?} | {} | {} |\n",
-                command.name,
+                "| {shown} | {aliases} | {} | {:?} | {} | {} |\n",
                 surface_cell(command),
                 command.family,
                 disposition_cell(command),

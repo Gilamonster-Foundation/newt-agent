@@ -103,6 +103,7 @@ pub(crate) enum Field {
     Markdown,
     Mode,
     Prompt,
+    Compaction,
     Rounds,
 }
 
@@ -117,6 +118,7 @@ impl Field {
         Self::Markdown,
         Self::Mode,
         Self::Prompt,
+        Self::Compaction,
         Self::Rounds,
     ];
 
@@ -133,6 +135,7 @@ impl Field {
             Self::Markdown => "markdown",
             Self::Mode => "mode",
             Self::Prompt => "prompt",
+            Self::Compaction => "compaction",
             Self::Rounds => "rounds",
         }
     }
@@ -147,6 +150,7 @@ impl Field {
             Self::Markdown => "markdown rendering",
             Self::Mode => "operating mode",
             Self::Prompt => "input prompt template",
+            Self::Compaction => "automatic-compaction trigger",
             Self::Rounds => "tool-call round limit",
         }
     }
@@ -224,6 +228,19 @@ impl Field {
                     .map(|m| (m.as_str(), m.description().to_string()))
                     .collect(),
             ),
+            // Built from the enum's own keywords, so a policy added to
+            // `CompactionTriggerPolicy` shows up here without an edit.
+            Self::Compaction => ValueSpace::Choice(vec![
+                (
+                    newt_core::CompactionTriggerPolicy::HeadroomAware.keyword(),
+                    "defer a count-only compaction while input headroom is known (default)"
+                        .to_string(),
+                ),
+                (
+                    newt_core::CompactionTriggerPolicy::MessageCount.keyword(),
+                    "compact whenever the message count exceeds its threshold".to_string(),
+                ),
+            ]),
             Self::Prompt => ValueSpace::Text {
                 release: "reset",
                 placeholder: "\"[$TIME] ❯ \"",
@@ -279,6 +296,9 @@ impl Field {
             // The TEMPLATE, not the rendered preview: the setting is what this
             // form can change, and the preview is what resolution makes of it.
             Self::Prompt => crate::prompt::active_prompt_template(),
+            Self::Compaction => newt_core::config::session_compaction_trigger_policy()
+                .keyword()
+                .to_string(),
             Self::Rounds => newt_core::tenacity::session_tool_rounds()
                 .map_or_else(|| "auto".to_string(), |n| n.to_string()),
         }
@@ -543,6 +563,12 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         // `reset` removes the variable rather than storing the word, so the
         // session falls back to `[tui] prompt` and no leftover survives for
         // the next `/prompt` to explain — the same shape `/nudge on` uses.
+        // Through the same writer `/context compaction` uses.
+        Field::Compaction => {
+            if let Some(policy) = newt_core::CompactionTriggerPolicy::from_keyword(value) {
+                newt_core::process_env::set_var("NEWT_COMPACTION_TRIGGER", policy.keyword());
+            }
+        }
         Field::Prompt => {
             if value == "reset" {
                 newt_core::process_env::remove_var("NEWT_PROMPT");
@@ -1061,6 +1087,48 @@ mod tests {
     /// **Every alias the absorbed verbs took still resolves.** Each of these
     /// was reachable before the family moved; absorbing a command must not
     /// quietly delete an affordance operators already type.
+    /// **The verb and the field write one policy** (#2009 PR7).
+    ///
+    /// `/context compaction` set a `run_chat` local that
+    /// `settings_form::apply` could not see. Both doors go through
+    /// `NEWT_COMPACTION_TRIGGER` now, read back by the one resolver that owns
+    /// the precedence.
+    #[test]
+    fn the_compaction_field_and_its_verb_resolve_to_one_state() {
+        let _guard = settings_guard();
+        newt_core::process_env::remove_var("NEWT_COMPACTION_TRIGGER");
+        assert_eq!(
+            Field::Compaction.current(),
+            newt_core::CompactionTriggerPolicy::default().keyword(),
+            "unpinned, the field reports what the resolver resolves"
+        );
+
+        assert_eq!(
+            apply(Field::Compaction, "message_count"),
+            Ok("automatic-compaction trigger: message_count".to_string())
+        );
+        assert_eq!(Field::Compaction.current(), "message_count");
+        assert!(newt_core::config::compaction_trigger_is_session_pinned());
+    }
+
+    /// The field's vocabulary is the enum's, and only the enum's.
+    #[test]
+    fn the_compaction_fields_choices_are_the_policies_that_exist() {
+        use newt_core::CompactionTriggerPolicy as P;
+        let offered = Field::Compaction.offered();
+        assert_eq!(
+            offered,
+            vec![P::HeadroomAware.keyword(), P::MessageCount.keyword()]
+        );
+        // A policy the enum does not have is refused, not stored.
+        assert_eq!(Field::Compaction.accepts("aggressive"), None);
+        // ...and the canonical parser's case-insensitivity is inherited.
+        assert_eq!(
+            Field::Compaction.accepts("HEADROOM_AWARE"),
+            Some("headroom_aware".to_string())
+        );
+    }
+
     /// **The trailing space survives the deep link.**
     ///
     /// `/settings prompt "❯ "` is the case that decides whether the port was
