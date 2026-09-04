@@ -1,10 +1,16 @@
 //! Session-local operating-mode selection for `/mode auto`.
 //!
-//! The core loop knows nothing about the TUI's concrete mode enum. It receives
-//! this narrow collaborator only when the human has selected `auto`, and the
-//! model may use it to request one of the bounded working styles for a future
-//! turn. The collaborator cannot change the current turn's disposition or
-//! caveats, and the schema deliberately excludes `full-auto`.
+//! The core loop receives this narrow collaborator only when the human has
+//! selected `auto`, and the model may use it to request one of the bounded
+//! working styles for a future turn. The collaborator cannot change the
+//! current turn's disposition or caveats, and the schema deliberately excludes
+//! `full-auto`.
+//!
+//! The line above used to read "the core loop knows nothing about the TUI's
+//! concrete mode enum", and the schema below carried its own hand-written copy
+//! of the mode list as a result. The enum moved down in #2009 PR4b, so the
+//! schema is now generated from `OperatingMode::model_selectable()` — one
+//! vocabulary, and a mode added to the enum cannot be silently missing here.
 
 /// Model-facing seam behind `select_operating_mode`.
 ///
@@ -33,7 +39,7 @@ pub fn select_operating_mode_tool_definition() -> serde_json::Value {
                 "properties": {
                     "mode": {
                         "type": "string",
-                        "enum": ["chat", "dev", "admin", "plan", "diagnose"],
+                        "enum": crate::operating_mode::OperatingMode::model_selectable(),
                         "description": "The bounded working style to use next."
                     }
                 },
@@ -57,5 +63,15 @@ mod tests {
         assert!(modes.iter().any(|mode| mode == "dev"));
         assert!(!modes.iter().any(|mode| mode == "auto"));
         assert!(!modes.iter().any(|mode| mode == "full-auto"));
+
+        // ...and it is the enum's own list, not a copy that happens to agree
+        // today. A style added to `OperatingMode` now appears here or fails.
+        let want = crate::operating_mode::OperatingMode::model_selectable();
+        let got: Vec<&str> = modes.iter().filter_map(|m| m.as_str()).collect();
+        assert_eq!(got, want, "the schema drifted from the mode vocabulary");
+        assert!(
+            !want.is_empty(),
+            "an empty list would make every assertion above vacuous"
+        );
     }
 }

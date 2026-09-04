@@ -1385,137 +1385,14 @@ impl SessionCapability {
 
 // ---------------------------------------------------------------------------
 // Operating modes (`/mode`) — working style, never authority.
+//
+// The TYPE lives in `newt_core::operating_mode` since #2009 PR4b (shared
+// vocabulary belongs in the minimal layer, and `settings_form::apply` has
+// to reach it). This alias keeps every `OperatingMode` reference in this
+// crate reading the same as it did.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum OperatingMode {
-    #[default]
-    Chat,
-    Dev,
-    Admin,
-    Plan,
-    Diagnose,
-    Auto,
-    FullAuto,
-}
-
-#[allow(dead_code)]
-impl OperatingMode {
-    fn from_keyword(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "chat" => Some(Self::Chat),
-            "dev" | "developer" => Some(Self::Dev),
-            "admin" | "sysadmin" => Some(Self::Admin),
-            "plan" => Some(Self::Plan),
-            "diagnose" | "diagnostic" => Some(Self::Diagnose),
-            "auto" => Some(Self::Auto),
-            "full-auto" | "full_auto" | "fullauto" => Some(Self::FullAuto),
-            _ => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Chat => "chat",
-            Self::Dev => "dev",
-            Self::Admin => "admin",
-            Self::Plan => "plan",
-            Self::Diagnose => "diagnose",
-            Self::Auto => "auto",
-            Self::FullAuto => "full-auto",
-        }
-    }
-
-    fn description(self) -> &'static str {
-        match self {
-            Self::Chat => {
-                "Collaborate conversationally; answer directly and confirm consequential choices."
-            }
-            Self::Dev => {
-                "Develop with TDD, worktree-safe Git habits, targeted tests, and full preflight before a PR."
-            }
-            Self::Admin => {
-                "Do no harm, make minimal changes, respect privacy, and use elevated power responsibly."
-            }
-            Self::Plan => {
-                "Write an actionable plan without changing files, running mutations, or altering external state."
-            }
-            Self::Diagnose => {
-                "Gather evidence and identify root cause only; stop before planning or implementing a repair."
-            }
-            Self::Auto => {
-                "Let the model choose a bounded working style per task and ask when a consequential decision is unresolved."
-            }
-            Self::FullAuto => {
-                "Work safely to completion with minimal interruption, including tests and preflight."
-            }
-        }
-    }
-
-    fn instructions(self) -> &'static str {
-        match self {
-            Self::Chat => {
-                "Collaborate with the human at a conversational pace. Answer questions directly. \
-                 When action is requested, stay within the request and ask before making an \
-                 unresolved consequential choice."
-            }
-            Self::Dev => {
-                "Act as a disciplined developer. Inspect branch, worktree, and existing changes \
-                 before editing; preserve unrelated work. Use TDD when feasible: establish the \
-                 failing behavior, make the smallest coherent change, run targeted tests, then \
-                 run the workspace's full preflight before proposing or pushing a PR. Ask the \
-                 human when a product or architecture decision remains unresolved."
-            }
-            Self::Admin => {
-                "Do no harm. Make minimal changes. Respect privacy. With great power comes great \
-                 responsibility. Inspect first, protect secrets and user data, prefer reversible \
-                 operations, and require a clear human decision before destructive or \
-                 irreversible work."
-            }
-            Self::Plan => {
-                "Analyze the request and write a concrete, sequenced plan. Do not modify files, \
-                 run mutating commands, or alter external state. Surface unresolved decisions \
-                 for the human. When the plan is ready, recommend /mode dev to implement it, or \
-                 /mode admin for system administration."
-            }
-            Self::Diagnose => {
-                "Seek only to understand. Inspect available read-only evidence and identify the \
-                 root cause; do not plan, mutate the workspace, or implement the repair. Once the \
-                 root cause is known, say: \"I have found the root cause. Would you like to \
-                 switch to /mode plan to plan a fix?\""
-            }
-            Self::Auto => {
-                "Use the effective style for this turn and adapt within its boundaries. For later \
-                 action-shaped turns, select_operating_mode may choose chat, dev, admin, plan, or \
-                 diagnose; it never selects full-auto. Protected ask, research, explanation, and \
-                 plan intake still win. Ask the human whenever a consequential decision, \
-                 tradeoff, or missing requirement is unresolved."
-            }
-            Self::FullAuto => {
-                "Carry safe in-scope work through implementation, verification, and full \
-                 preflight with minimal interruption. Inspect branch, worktree, and existing \
-                 changes before editing; preserve unrelated work. Use TDD when feasible: \
-                 establish the failing behavior, make the smallest coherent change, run targeted \
-                 tests, then run the workspace's full preflight before proposing or pushing a \
-                 PR. Make conservative reversible assumptions and iterate to completion. Ask \
-                 only when blocked by required authority, a secret, destructive or irreversible \
-                 action, or a consequential human choice."
-            }
-        }
-    }
-
-    fn all() -> &'static [Self] {
-        &[
-            Self::Chat,
-            Self::Dev,
-            Self::Admin,
-            Self::Plan,
-            Self::Diagnose,
-            Self::Auto,
-            Self::FullAuto,
-        ]
-    }
-}
+pub(crate) use newt_core::operating_mode::OperatingMode;
 
 /// Session-local model selection behind `/mode auto`.
 ///
@@ -6069,6 +5946,10 @@ fn handle_operating_mode_command(
                 // commands leave both pieces of state untouched.
                 mode_states.auto.clear();
             }
+            // #2009 PR4b: one writer for the value. `/mode` and
+            // `/settings mode` both land in `set_session_operating_mode`, so
+            // the verb and the field cannot select different styles.
+            newt_core::operating_mode::set_session_operating_mode(*active_mode);
             if let Some(first) = lines.first() {
                 print_newt(first, color, verbose);
             }

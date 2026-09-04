@@ -662,11 +662,14 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::Journal,
     ),
     cmd(
+        // Absorbed as a `/settings` field in #2009 PR4b, and still a
+        // typed verb until the window closes — same state as
+        // `/edit-mode` and `/markdown`.
         "mode",
         &[],
         Family::Tuning,
         Disposition::Absorb,
-        Receipt::Missing,
+        Receipt::Journal,
     ),
     cmd(
         "nudge",
@@ -1143,6 +1146,13 @@ mod tests {
     /// would let the entire debt disappear as the cut proceeds, which is the
     /// most tempting wrong answer available here.
     ///
+    /// # 30 → 29: `/mode` pays the same way (#2009 PR4b)
+    ///
+    /// Same shape as `/markdown` and for the same reason: absorbing it moved
+    /// `OperatingMode` down to core and the session value out of a `run_chat`
+    /// local, so `apply_and_record` can finally read a real from→to. The
+    /// relocation is the payment.
+    ///
     /// # 31 → 30: `/markdown` pays, rather than being reclassified (#2009 PR4)
     ///
     /// The two before it came off by argument — they never owed. This one is
@@ -1202,7 +1212,7 @@ mod tests {
             .filter(|c| matches!(c.receipt, Receipt::Missing))
             .count();
         assert!(
-            missing <= 30,
+            missing <= 29,
             "{missing} state-mutating commands record nothing durable — that \
              is more than when #1981 armed this. A new state mutator needs a \
              receipt destination, not another silent write"
