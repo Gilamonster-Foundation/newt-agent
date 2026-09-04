@@ -33,10 +33,20 @@ impl Respond for CaptureThenFinish {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body: serde_json::Value =
             serde_json::from_slice(&request.body).expect("chat request is JSON");
+        let streaming = body["stream"].as_bool().unwrap_or(false);
         self.requests
             .lock()
             .expect("request capture lock")
             .push(body);
+        // #123: the accepted round is re-issued with `stream: true` and served
+        // as SSE. Captured like any other request — it goes to the same
+        // endpoint and carries the same wire controls, so the assertions about
+        // both apply to it too.
+        if streaming {
+            let frame = serde_json::json!({"choices": [{"delta": {"content": "done"}}]});
+            let sse = format!("data: {frame}\n\ndata: [DONE]\n\n");
+            return ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream");
+        }
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "model": NEMOTRON_MODEL,
             "choices": [{
@@ -477,8 +487,12 @@ kind = "openai"
         .success();
 
     let requests = requests.lock().expect("request capture lock");
-    assert_eq!(requests.len(), 1, "the CLI endpoint served the turn");
-    assert_eq!(requests[0]["model"], "operator-model");
+    // The probe round plus its #123 streaming re-issue — both to the CLI
+    // endpoint, both naming the CLI-overridden model.
+    assert_eq!(requests.len(), 2, "the CLI endpoint served the turn");
+    for request in requests.iter() {
+        assert_eq!(request["model"], "operator-model");
+    }
     drop(requests);
     assert!(
         stale_requests
@@ -548,9 +562,14 @@ api = "chat_completions"
         .success();
 
     let requests = requests.lock().expect("request capture lock");
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].get("max_tokens").is_none());
-    assert!(requests[0].get("chat_template_kwargs").is_none());
+    // The probe round plus its #123 streaming re-issue. Neither may carry
+    // cognition controls: a dial is an intent, not evidence the endpoint
+    // supports the wire fields, and the streamed round is the same wire.
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert!(request.get("max_tokens").is_none());
+        assert!(request.get("chat_template_kwargs").is_none());
+    }
     drop(requests);
 
     let contract = contract_from(&events_path);

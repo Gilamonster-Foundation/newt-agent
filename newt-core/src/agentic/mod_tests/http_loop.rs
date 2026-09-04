@@ -117,6 +117,17 @@ fn is_stream(req: &Request) -> bool {
     body_json(req)["stream"].as_bool().unwrap_or(false)
 }
 
+/// #123: an OpenAI-compatible SSE body replaying one already-accepted answer,
+/// for the streaming re-issue of the round that ends the turn. A responder
+/// serves this WITHOUT advancing its round counter — the re-issue re-asks a
+/// question the loop already had answered, so counting it would turn a
+/// `rounds` assertion into a request count.
+fn sse_replay(text: &str) -> ResponseTemplate {
+    let frame = serde_json::json!({"choices": [{"delta": {"content": text}}]});
+    let body = format!("data: {frame}\n\ndata: [DONE]\n\n");
+    ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream")
+}
+
 fn ndjson(lines: &[serde_json::Value]) -> ResponseTemplate {
     let body: String = lines
         .iter()
@@ -1522,6 +1533,7 @@ async fn openai_unverified_run_command_blocker_gets_ground_truth_retry() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ScriptedOpenAi {
+            last_content: Default::default(),
             round: round.clone(),
             script: vec![
                 serde_json::json!({
@@ -1985,6 +1997,9 @@ struct OpenAiReasoningOverflowResponder {
 
 impl Respond for OpenAiReasoningOverflowResponder {
     fn respond(&self, req: &Request) -> ResponseTemplate {
+        if is_stream(req) {
+            return sse_replay("completed after bounded continuation");
+        }
         let round = self.round.fetch_add(1, Ordering::SeqCst);
         if round > 0 {
             *self.second_request.lock().expect("capture lock") = Some(body_json(req));
@@ -2036,7 +2051,8 @@ async fn openai_reasoning_overflow_continues_once_with_the_current_plan() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(responder)
-        .expect(2)
+        // Two model rounds + the #123 streaming re-issue of the second one.
+        .expect(3)
         .mount(&server)
         .await;
 
@@ -2149,7 +2165,8 @@ async fn openai_inline_reasoning_overflow_uses_the_same_bounded_continuation() {
             overflow_twice: false,
             inline_reasoning: true,
         })
-        .expect(2)
+        // Two model rounds + the #123 streaming re-issue of the second one.
+        .expect(3)
         .mount(&server)
         .await;
 
@@ -2346,7 +2363,10 @@ async fn openai_anthropic_native_tool_calls_route_correctly() {
     let cc = call_count.clone();
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(move |_req: &Request| {
+        .respond_with(move |req: &Request| {
+            if is_stream(req) {
+                return sse_replay("done after anthropic-native tool");
+            }
             let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n == 0 {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2402,7 +2422,10 @@ async fn openai_hyphenated_server_name_routes_through_mcp() {
     let cc = call_count.clone();
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(move |_req: &Request| {
+        .respond_with(move |req: &Request| {
+            if is_stream(req) {
+                return sse_replay("outlook routed correctly");
+            }
             let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n == 0 {
                 // Proxy returns the underscore-normalised form of the
@@ -2503,9 +2526,26 @@ async fn openai_cap_exit_fallback_when_final_summary_errors() {
 struct ScriptedOpenAi {
     round: Arc<AtomicUsize>,
     script: Vec<serde_json::Value>,
+    /// What the last scripted round answered with, replayed over SSE for the
+    /// #123 streaming re-issue.
+    last_content: Arc<Mutex<String>>,
 }
 impl Respond for ScriptedOpenAi {
-    fn respond(&self, _req: &Request) -> ResponseTemplate {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        // #123: the streaming re-issue of an ALREADY-ACCEPTED round is not a
+        // new round — it re-serves the same answer over SSE. Advancing the
+        // script here would silently turn every `rounds` assertion in this
+        // file into a request count, which is not what any of them mean; and
+        // serving the next scripted message would answer a question the loop
+        // never asked. Replaying the accepted content is what a real backend
+        // approximately does, and it puts the whole OpenAI corpus through the
+        // streaming path for free.
+        if body_json(req)["stream"].as_bool().unwrap_or(false) {
+            let text = self.last_content.lock().unwrap().clone();
+            let frame = serde_json::json!({"choices": [{"delta": {"content": text}}]});
+            let body = format!("data: {frame}\n\ndata: [DONE]\n\n");
+            return ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream");
+        }
         let i = self.round.fetch_add(1, Ordering::SeqCst);
         let msg = self
             .script
@@ -2513,6 +2553,9 @@ impl Respond for ScriptedOpenAi {
             .or_else(|| self.script.last())
             .cloned()
             .unwrap_or_else(|| serde_json::json!({ "content": "final." }));
+        if let Some(content) = msg["content"].as_str() {
+            *self.last_content.lock().unwrap() = content.to_string();
+        }
         ResponseTemplate::new(200)
             .set_body_json(serde_json::json!({ "choices": [{ "message": msg }] }))
     }
@@ -2530,6 +2573,7 @@ async fn run_openai_script_with_ledger(
         .respond_with(ScriptedOpenAi {
             round: round.clone(),
             script,
+            last_content: Default::default(),
         })
         .mount(&server)
         .await;
@@ -2557,6 +2601,7 @@ async fn run_openai_script_in(script: Vec<serde_json::Value>, workspace: &str) -
         .respond_with(ScriptedOpenAi {
             round: round.clone(),
             script,
+            last_content: Default::default(),
         })
         .mount(&server)
         .await;
@@ -2625,6 +2670,7 @@ async fn explain_turn_request_user_input_dispatches_and_completes() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ScriptedOpenAi {
+            last_content: Default::default(),
             round: round.clone(),
             script: vec![
                 serde_json::json!({
@@ -2700,6 +2746,7 @@ async fn run_openai_script_with_cap(
         .respond_with(ScriptedOpenAi {
             round: round.clone(),
             script,
+            last_content: Default::default(),
         })
         .mount(&server)
         .await;
@@ -2763,6 +2810,7 @@ async fn question_turns_are_never_nudged() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ScriptedOpenAi {
+            last_content: Default::default(),
             round: round.clone(),
             // Phrasing the classifier reads as pending-action ("Let me…").
             script: vec![
@@ -2921,6 +2969,7 @@ async fn accepted_narration_reports_cap_exhausted_end_reason() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ScriptedOpenAi {
+            last_content: Default::default(),
             round: round.clone(),
             script: vec![
                 serde_json::json!({ "content": "Let me keep editing now." }),
@@ -2958,6 +3007,7 @@ async fn explain_turn_narration_reports_completed_not_cap_exhausted() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ScriptedOpenAi {
+            last_content: Default::default(),
             round: round.clone(),
             script: vec![
                 // The same pending-action phrasing the Act-turn test uses — the
@@ -3001,6 +3051,7 @@ async fn genuine_completion_reports_completed_end_reason() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ScriptedOpenAi {
+            last_content: Default::default(),
             round: round.clone(),
             script: vec![serde_json::json!({ "content": "The capital of France is Paris." })],
         })

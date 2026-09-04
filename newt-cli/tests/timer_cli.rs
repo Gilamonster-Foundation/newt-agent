@@ -33,6 +33,16 @@ impl Respond for CaptureThenFinish {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body: serde_json::Value =
             serde_json::from_slice(&request.body).expect("chat request is JSON");
+        // #123: the accepted round is re-issued with `stream: true` so the
+        // answer arrives live. It re-asks a question already answered, so it
+        // is served as SSE and NOT recorded — these tests count model ROUNDS
+        // (and read the prompt off each one), which a second copy of the same
+        // messages would double.
+        if body["stream"].as_bool().unwrap_or(false) {
+            let frame = serde_json::json!({"choices": [{"delta": {"content": "done"}}]});
+            let sse = format!("data: {frame}\n\ndata: [DONE]\n\n");
+            return ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream");
+        }
         self.requests
             .lock()
             .expect("request capture lock")

@@ -5929,7 +5929,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         task,
         workspace,
         color,
-        markdown: _,
+        // #123: bound, not discarded. The final round is re-issued as a
+        // stream and printed HERE, so the markdown block writer has to run on
+        // this path too — streaming plain text while the non-streaming arm
+        // renders markdown would be a rendering regression.
+        markdown,
         tool_offload,
         spill_store,
         disclosure,
@@ -5998,11 +6002,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         plan_mode_control,
         steering,
         completed_spill_renderer,
-        // This loop does not call `stream_response`, the only consumer of the
-        // flag (the leading-`</think>` filter is Ollama-wire only today).
-        // Bound and ignored rather than dropped from the pattern: a future
-        // field added to ChatCtx then fails HERE, forcing a decision about
-        // what it means for this wire instead of silently defaulting.
+        // #123 gave this loop a streamed round with a `ThinkFilter` in it, so
+        // the flag is now MEANINGFUL here and still deliberately unused: the
+        // lone-leading-`</think>` quirk (#528) has only ever been observed on
+        // the Ollama wire, and starting the filter INSIDE a reasoning block
+        // would swallow a normal answer from every endpoint that does not have
+        // it. Flip this when a `/v1/chat/completions` endpoint is actually
+        // seen doing it. Bound and ignored rather than dropped from the
+        // pattern: a future field added to ChatCtx then fails HERE, forcing a
+        // decision about what it means for this wire instead of silently
+        // defaulting.
         emits_leading_reasoning: _,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
@@ -6029,6 +6038,18 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
         .timeout(std::time::Duration::from_secs(inference_timeout_secs))
+        .build()?;
+    // #123 + #643: the streaming re-issue gets its OWN client, because a
+    // whole-request `.timeout()` bounds connect + headers + the ENTIRE body —
+    // it aborts a slow-but-progressing token stream the instant total time
+    // crosses the deadline (the DGX retry-storm wedge the Ollama path already
+    // learned). An IDLE `read_timeout` caps the gap BETWEEN chunks and resets
+    // on every token, so a stream runs as long as it keeps producing while a
+    // genuinely stalled connection still bails. The one-shot `stream:false`
+    // probe keeps `client` — a total bound is right for a single response.
+    let stream_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .read_timeout(std::time::Duration::from_secs(inference_timeout_secs))
         .build()?;
     let chat_url = format!("{}/v1/chat/completions", url.trim_end_matches('/'));
     let retry = tui_retry_policy(url);
@@ -7204,11 +7225,65 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 let out = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string();
                 return Ok((out, false, accumulated_usage, hallucination_count));
             }
+            // #123: the answer is ACCEPTED — re-issue it with `stream: true`
+            // so the operator watches it arrive instead of waiting on a
+            // finished paragraph.
+            //
+            // Placement is the whole trick. This sits AFTER the six nudge
+            // gates above, every one of which can `continue 'round_loop`: a
+            // re-issue placed before them would pay for a streamed answer the
+            // harness then throws away, double-billing every nudged round.
+            // The body is the probe's body with the stream flag flipped, so
+            // the second call sees the identical prompt (same tools, same
+            // policy) and is likely to reproduce the same answer from the
+            // same prefix.
+            let stream_wire_messages = openai_chat_wire_messages(&messages)?;
+            let mut stream_body = serde_json::json!({
+                "model": model,
+                "messages": stream_wire_messages,
+                "tools": tools.clone(),
+                "tool_choice": "auto",
+                "stream": true,
+                // Usage rides its own trailing chunk ONLY when asked for;
+                // without this the streamed round reports no tokens at all.
+                "stream_options": {"include_usage": true},
+            });
+            generation_policy.apply_to_chat_completions_body(&mut stream_body);
+            if !tools_supported {
+                if let Some(o) = stream_body.as_object_mut() {
+                    o.remove("tools");
+                    o.remove("tool_choice");
+                }
+            }
+            let mut stream_req = stream_client.post(&chat_url).json(&stream_body);
+            if let Some(key) = api_key {
+                stream_req = stream_req.bearer_auth(key);
+            }
+            let (out, was_streamed) = match openai_stream_final_answer(
+                stream_req, color, markdown, debug, cancel,
+            )
+            .await
+            {
+                // A second call, so a second usage record. Merged, not
+                // replaced — and when the server sent none, `merge_round_usage`
+                // keeps what the probe already reported rather than zeroing it.
+                Some((text, stream_usage)) => {
+                    accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
+                    (text, true)
+                }
+                // The re-issue produced nothing usable and printed nothing.
+                // The probe answer is right here — never return silence
+                // because the second call failed.
+                None => (content, false),
+            };
             // #1964: this normal (non-cap) finish gets the same claim check
-            // + disclosure gate as a cap-exit summary.
-            let out =
-                finalize_final_text(content, workspace, turn_start_head.as_deref(), disclosure);
-            return Ok((out, false, accumulated_usage, hallucination_count));
+            // + disclosure gate as a cap-exit summary. Note the wart shared
+            // with the Ollama path (mod.rs `finalize_final_text` after
+            // `stream_response`): on the streamed arm this runs AFTER the text
+            // was printed, so a claim-check or disclosure edit changes the
+            // returned string without changing what the operator saw.
+            let out = finalize_final_text(out, workspace, turn_start_head.as_deref(), disclosure);
+            return Ok((out, was_streamed, accumulated_usage, hallucination_count));
         }
 
         // Record the assistant turn (it carries the tool_calls), then VALIDATE the
@@ -10970,6 +11045,164 @@ impl ReasoningTrickle {
     }
 }
 
+/// Re-issue an accepted OpenAI-compatible round as a stream and print it live.
+///
+/// `req` is the fully built `stream: true` request (body + auth); building it
+/// at the call site is what keeps this signature reviewable. Returns the
+/// streamed answer and the round's usage, or `None` when the re-issue produced
+/// nothing usable — **the caller must then fall back to the probe answer it
+/// already holds and report `was_streamed = false`,** because nothing reached
+/// the terminal and a blank turn is never the right outcome. Three distinct
+/// failures collapse into that one `None`: the request never landed, it
+/// answered non-2xx, or the body carried no text (a stream cut before `[DONE]`
+/// with nothing printed, or a model that simply said nothing the second time).
+///
+/// No retry envelope, deliberately: the probe answer IS the fallback, and it is
+/// strictly better than re-running a full prefill for a round whose answer is
+/// already in hand.
+///
+/// Display follows [`stream_response`]'s contract exactly — spinner torn down
+/// before the first visible character, the `▸  ` prefix, the markdown block
+/// writer when markdown is on, and the accumulated text kept RAW (it is
+/// returned, persisted and re-sent, so no styling may enter it).
+///
+/// **Reasoning deltas are DISCARDED here, on purpose.** `commit_reasoning_fold`
+/// has already shown this turn's reasoning — it runs on the *probe* response,
+/// before `has_tools` is even computed — so trickling the re-issue's reasoning
+/// would show the operator the same thinking block twice.
+async fn openai_stream_final_answer(
+    req: reqwest::RequestBuilder,
+    color: bool,
+    markdown: bool,
+    debug: bool,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<(String, Option<crate::TokenUsage>)> {
+    let resp = match req.send().await {
+        Ok(r) if r.status().is_success() => r,
+        outcome => {
+            if debug {
+                let why = match outcome {
+                    Ok(r) => format!("stream request {}", r.status()),
+                    Err(e) => format!("stream request failed: {e}"),
+                };
+                print_debug(&format!("{why} — using probe content"), color);
+            }
+            return None;
+        }
+    };
+
+    let mut spinner = crate::tty::Spinner::start_with_caps(
+        legacy_caps(color && thinking_stream_enabled()),
+        "thinking…",
+        crate::tty::Sink::Stdout,
+        color,
+    );
+    let cols = display::term_cols();
+    let mut md =
+        markdown.then(|| MarkdownStreamWriter::new(io::stdout(), RenderOpts { color: true, cols }));
+    let mut acc = openai_sse::SseAccumulator::new();
+    // #385, on this wire: the non-streaming arm of this same loop runs every
+    // reply through `split_reasoning`, so an inline `<think>` block never
+    // reaches the answer. The streamed arm has to hold the identical line, or
+    // turning streaming on would start leaking reasoning into the reply text
+    // that gets printed, returned, persisted, and re-sent. The filter also
+    // spans token boundaries, which a per-delta check could not.
+    let mut think = crate::reasoning::ThinkFilter::new();
+    let mut text = String::new();
+    let mut started = false;
+    let mut transport_break: Option<String> = None;
+    let mut resp = resp;
+    while !acc.is_done() {
+        match cancellable(cancel, resp.chunk()).await {
+            // Interrupted: stop reading and keep what already streamed.
+            None => break,
+            Some(Ok(Some(chunk))) => {
+                // Lossy UTF-8 into the accumulator's ROLLING line buffer — a
+                // `data:` line routinely splits across chunks, so a per-chunk
+                // `lines()` split would drop events.
+                for action in acc.feed(&String::from_utf8_lossy(&chunk)) {
+                    let openai_sse::StreamAction::TextDelta(raw) = action else {
+                        // See the doc comment: the fold above already showed it.
+                        continue;
+                    };
+                    // The reasoning half is dropped for the same reason.
+                    let (t, _reasoning) = think.feed_split(&raw);
+                    if t.is_empty() {
+                        continue;
+                    }
+                    if !started {
+                        drop(spinner.take());
+                        if color {
+                            execute!(
+                                io::stdout(),
+                                SetForegroundColor(NEWT_ORANGE_CT),
+                                Print("▸  "),
+                                ResetColor,
+                            )
+                            .ok();
+                        } else {
+                            print!("▸  ");
+                        }
+                        started = true;
+                    }
+                    if let Some(w) = md.as_mut() {
+                        w.push(&t).ok();
+                    } else {
+                        print!("{t}");
+                        io::stdout().flush().ok();
+                    }
+                    text.push_str(&t);
+                }
+            }
+            Some(Ok(None)) => break,
+            Some(Err(e)) => {
+                transport_break = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    // Flush any clean tail the filter held back (a trailing run that turned
+    // out not to be the start of a `<think>` tag). When nothing was printed at
+    // all there is nothing to append to: `text` stays empty, and the caller
+    // falls back to the probe answer — which loses nothing, because nothing
+    // reached the terminal.
+    let tail = think.finish();
+    if !tail.is_empty() && started {
+        if let Some(w) = md.as_mut() {
+            w.push(&tail).ok();
+        } else {
+            print!("{tail}");
+            io::stdout().flush().ok();
+        }
+        text.push_str(&tail);
+    }
+    drop(spinner.take());
+    if let Some(w) = md.as_mut() {
+        w.finish().ok();
+    }
+    if started && md.is_none() {
+        println!();
+    }
+    let round = acc.finish();
+    if text.is_empty() {
+        if debug {
+            print_debug("stream produced no text — using probe content", color);
+        }
+        return None;
+    }
+    // Text reached the terminal, so the probe answer can no longer replace it —
+    // it would print a second, differently-worded reply under the partial one.
+    // Same policy as the other two wires: keep the partial, say it is partial.
+    if !round.done {
+        let why = transport_break.unwrap_or_else(|| "stream ended before [DONE]".to_string());
+        print_harness_notice(
+            &format!("stream broke mid-response ({why}) — keeping the partial answer"),
+            color,
+        );
+    }
+    Some((text, round.usage))
+}
+
 /// Stream an Ollama NDJSON response, printing tokens as they arrive.
 /// Returns `(accumulated_text, token_usage)`.
 /// Token usage is extracted from the final chunk (`done: true`).
@@ -11210,6 +11443,12 @@ mod http_loop_tests;
 #[cfg(test)]
 #[path = "mod_tests/anthropic_loop.rs"]
 mod anthropic_loop_tests;
+// #123: the OpenAI-compatible streaming re-issue — that the loop streams the
+// round it accepts (and only that round), and that every way the second call
+// can fail lands on the probe answer instead of on silence.
+#[cfg(test)]
+#[path = "mod_tests/openai_stream_loop.rs"]
+mod openai_stream_loop_tests;
 // #1265: EPIC #1257's acceptance gate — the "10 largest Rust files" session
 // replayed end-to-end (BAT tier: scripted backend, simulated workspace).
 #[cfg(test)]
