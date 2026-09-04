@@ -4971,24 +4971,20 @@ fn session_body(
                         println!();
                         continue;
                     }
-                    if slash_body == "recall" || slash_body.starts_with("recall ") {
-                        match conversation_store.as_ref() {
-                            Some(store) => match handle_recall_command(task, store) {
-                                Ok(msg) => print_newt(&msg, color, verbose),
-                                Err(e) => print_newt(&format!("error: {e}"), color, verbose),
-                            },
-                            None => print_newt(EPHEMERAL_SESSION_NOTICE, color, verbose),
-                        }
-                        surface.save_history();
-                        println!();
-                        continue;
-                    }
                     // #1030: `/resume` — find and reopen a past conversation,
                     // listed by liveness and searchable. Bare = browse; <query> =
                     // FTS5 search (or an id/prefix to open directly); <n> = pick
                     // the n-th row from the last listing. Reopening is claim-guarded
                     // so a conversation a live newt already holds is refused.
-                    if slash_body == "resume" || slash_body.starts_with("resume ") {
+                    // `/recall` is here too: it retired into `/resume find`
+                    // (#2009 PR6) and `parse_resume_command` reads it as that,
+                    // so the retired verb runs the replacement's code rather
+                    // than a second copy of it — one arm, two doors.
+                    if slash_body == "resume"
+                        || slash_body.starts_with("resume ")
+                        || slash_body == "recall"
+                        || slash_body.starts_with("recall ")
+                    {
                         match conversation_store.as_ref() {
                             Some(store) => {
                                 let target: Option<String> = match parse_resume_command(task) {
@@ -4999,6 +4995,25 @@ fn session_body(
                                                 last_resume_listing = ids;
                                                 print_newt(&msg, color, verbose);
                                             }
+                                            Err(e) => {
+                                                print_newt(&format!("error: {e}"), color, verbose);
+                                            }
+                                        }
+                                        None
+                                    }
+                                    // #2009 PR6: the read-only half —
+                                    // `/resume find` and the retired `/recall`
+                                    // it absorbed. It SHOWS and returns None,
+                                    // so nothing is reopened; the same
+                                    // renderers `/recall` used, unchanged.
+                                    ResumeCommand::Find(query) => {
+                                        let rendered = if query.is_empty() {
+                                            recall_browse_message(store)
+                                        } else {
+                                            recall_search_message(store, &query)
+                                        };
+                                        match rendered {
+                                            Ok(msg) => print_newt(&msg, color, verbose),
                                             Err(e) => {
                                                 print_newt(&format!("error: {e}"), color, verbose);
                                             }

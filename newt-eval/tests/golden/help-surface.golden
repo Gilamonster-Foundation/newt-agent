@@ -22,6 +22,7 @@
   /restart                 - the same, recorded as a restart
   /start [title]           - begin a new conversation, leaving the current one open to /resume
   /resume [name|search|n|id] - find & reopen a past conversation: bare lists recent, then match by name/title, id, or full-text search
+  /resume find [query]     - search conversations WITHOUT reopening one (bare: browse)
   /name <title>            - retitle the current conversation so it is easy to find in /resume (alias: /rename)
   /transcript              - review this conversation: full-screen pager (rich) / printed spine (lean)
   /conversation list       - list saved conversations
@@ -30,8 +31,6 @@
   /conversation rename <id> <title> - rename a saved conversation
   /conversation delete <id> - delete a saved conversation
   /conversation rm <id>    - alias for /conversation delete
-  /recall [query]          - recent conversations, or full-text search
-  /resume [query|n|id]     - find & reopen a past conversation (listed by liveness, searchable)
   /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval·drive · task <n> commit [sha] · issue <n> <#> · export·import [path]
   /plan                    - alias for /roadmap
   /tree                    - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)
