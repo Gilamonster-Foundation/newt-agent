@@ -191,6 +191,32 @@ fn render_crew(o: &newt_scheduler::CrewOutcome) -> String {
             o.refused.join(", ")
         ));
     }
+    for step in &o.steps {
+        let failed_over = if step.failed_over.is_empty() {
+            "(none)".to_string()
+        } else {
+            step.failed_over.join(",")
+        };
+        let usage = step
+            .usage
+            .map(|u| {
+                format!(
+                    "input_tokens:{} output_tokens:{}",
+                    u.input_tokens, u.output_tokens
+                )
+            })
+            .unwrap_or_else(|| "(unavailable)".to_string());
+        line.push_str(&format!(
+            "\n  step: role={} tier={:?} model={} backend={} failed_over={} model_id={} usage={}",
+            step.role,
+            step.tier,
+            step.model,
+            step.backend.as_deref().unwrap_or("(none)"),
+            failed_over,
+            step.model_id.as_deref().unwrap_or("(none)"),
+            usage,
+        ));
+    }
     line
 }
 
@@ -581,14 +607,34 @@ mod tests {
             attempts: 3,
             touched: Vec::new(),
             refused: vec!["README.md".to_string()],
+            steps: vec![newt_scheduler::RoleStep {
+                role: "planner".to_string(),
+                tier: newt_core::Tier::Complex,
+                model: "requested-model".to_string(),
+                backend: Some("backend-b".to_string()),
+                failed_over: vec!["backend-a".to_string()],
+                model_id: Some("served-model".to_string()),
+                usage: Some(newt_core::TokenUsage {
+                    input_tokens: 12,
+                    output_tokens: 34,
+                }),
+            }],
         };
         let line = render_crew(&refused);
         assert!(line.contains("refused (leash/scope): README.md"), "{line}");
+        assert!(
+            line.contains(
+                "step: role=planner tier=Complex model=requested-model backend=backend-b \
+                 failed_over=backend-a model_id=served-model usage=input_tokens:12 output_tokens:34"
+            ),
+            "{line}"
+        );
         let clean = newt_scheduler::CrewOutcome {
             status: CrewStatus::Passed,
             attempts: 1,
             touched: vec!["src/util.rs".to_string()],
             refused: Vec::new(),
+            steps: Vec::new(),
         };
         assert!(!render_crew(&clean).contains("refused"));
     }
