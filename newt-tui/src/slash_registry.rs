@@ -762,11 +762,14 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Surface::Retired("/roadmap"),
     ),
     cmd(
+        // #2009 PR10c: absorbed as `/settings posture` once the
+        // posture moved to core — the relocation is what lets
+        // `apply_and_record` read a real from→to.
         "posture",
         &[],
         Family::Tuning,
         Disposition::Absorb,
-        Receipt::Missing,
+        Receipt::Journal,
     ),
     cmd(
         // Absorbed as the form's first `Text` field in #2009 PR5, and
@@ -1281,6 +1284,19 @@ mod tests {
     /// would let the entire debt disappear as the cut proceeds, which is the
     /// most tempting wrong answer available here.
     ///
+    /// # 25 → 24: `/posture` pays, and the ledger's exit opens (#2009 PR10c)
+    ///
+    /// The last of the relocations §5.1 named. `ActivePosture` and
+    /// `build_posture` moved to `newt_core::posture`, so the value lives where
+    /// a pure `settings_form::apply` can install it and `apply_and_record` can
+    /// read a real from→to.
+    ///
+    /// It was smaller than the ledger implied: `ActivePosture` is plain data
+    /// over `Caveats`, and `build_posture` already took the skill loader as a
+    /// CLOSURE — which is what let it move without dragging the skills path
+    /// with it. Recorded because the ledger's estimate was the thing that made
+    /// this look like a project.
+    ///
     /// # 27 → 26: `/retrieval` was never a mutator (#2009 PR11)
     ///
     /// A truthing reclassification, and the decision doc predicted it: the row
@@ -1377,7 +1393,7 @@ mod tests {
             .filter(|c| matches!(c.receipt, Receipt::Missing))
             .count();
         assert!(
-            missing <= 25,
+            missing <= 24,
             "{missing} state-mutating commands record nothing durable — that \
              is more than when #1981 armed this. A new state mutator needs a \
              receipt destination, not another silent write"

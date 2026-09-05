@@ -273,7 +273,7 @@ deferral has one cause and one exit.
 | Session | PR8 | **hosted** | its panel already owned every value it writes |
 | Backends | PR9 | **LINK** | its commit path reads ~12 `run_chat` locals: cfg re-resolution, the wire target, the pinned choice, the degraded-pin state |
 | Permissions (read half) | PR10a/b | **HOSTED** | a read-only section has NO commit path, so the precondition does not apply |
-| Permissions (write half) | PR10c | deferred | the posture field, grants and decision-reopen need `active_posture` and the grant path in core |
+| Permissions (write half) | PR10c | **posture DONE**; grants/reopen parked | `ActivePosture` + `build_posture` moved to `newt_core::posture`, so the field installs through one writer. Grants and decision-reopen stay parked for the event journal (§4.4), which is a record type, not a relocation |
 | MCP | PR10a2 | **BLOCKED** | no chooser yet; `mcp` is a live connection handle, not a value that relocates |
 | Context | PR7 | n/a — fields, not a section | the two live knobs relocated cleanly (`compaction`, `detail`) |
 
@@ -379,7 +379,13 @@ between "`/settings` has an index of links" and "`/settings` is the cockpit".
 open-ended:
 
 1. The state each linked section's commit path reads lives in core, behind one
-   writer and one resolver.
+   writer and one resolver. **Posture: done (PR10c).** It was smaller than this
+   ledger implied — `ActivePosture` is plain data over `Caveats`, and
+   `build_posture` already took the skill loader as a CLOSURE, which is what
+   let it move without dragging the skills path with it. The estimate, not the
+   work, was what made it look like a project. What remains under (1) is the
+   BACKENDS commit path, which is a dozen values plus a re-resolution step and
+   is still the real one.
 2. `Body::Link` has no members left — a `Body` enum with one variant is the
    signal, and deleting the variant is the last commit of that work.
 3. ~~`shell::section_applied` stops being `#[cfg(test)]`, because two hosted

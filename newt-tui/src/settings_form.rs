@@ -105,6 +105,7 @@ pub(crate) enum Field {
     Prompt,
     Compaction,
     Detail,
+    Posture,
     Rounds,
 }
 
@@ -121,6 +122,7 @@ impl Field {
         Self::Prompt,
         Self::Compaction,
         Self::Detail,
+        Self::Posture,
         Self::Rounds,
     ];
 
@@ -139,6 +141,7 @@ impl Field {
             Self::Prompt => "prompt",
             Self::Compaction => "compaction",
             Self::Detail => "detail",
+            Self::Posture => "posture",
             Self::Rounds => "rounds",
         }
     }
@@ -155,6 +158,7 @@ impl Field {
             Self::Prompt => "input prompt template",
             Self::Compaction => "automatic-compaction trigger",
             Self::Detail => "tool-output detail rows",
+            Self::Posture => "permission posture",
             Self::Rounds => "tool-call round limit",
         }
     }
@@ -259,6 +263,29 @@ impl Field {
             // `[tui] spill_lines`. The maximum is a formality — a `Number`
             // field must declare one, and no terminal has a hundred thousand
             // rows of useful scrollback.
+            // **The vocabulary is the operator's config, read at ask time.**
+            // A posture is whatever `[modes.<name>]` they wrote, so a static
+            // list could only ever be wrong. `off` releases the clamp — the
+            // same word `/posture off` uses.
+            Self::Posture => {
+                let mut options = vec![("off", "no posture — release the clamp".to_string())];
+                if let Ok(cfg) = newt_core::Config::resolve() {
+                    for (name, m) in &cfg.modes {
+                        let what = m.preset.as_ref().map_or_else(
+                            || "guidance only (no permission clamp)".to_string(),
+                            |p| format!("clamped by preset '{p}'"),
+                        );
+                        // Leaked deliberately: `ValueSpace::Choice` holds
+                        // `&'static str`, and these names come from a config
+                        // read at ask time. One small leak per opened form is
+                        // the cost of a runtime-seeded vocabulary; the
+                        // alternative is a static list that cannot describe
+                        // the operator's own config.
+                        options.push((Box::leak(name.clone().into_boxed_str()) as &str, what));
+                    }
+                }
+                ValueSpace::Choice(options)
+            }
             Self::Detail => ValueSpace::Number {
                 release: "auto",
                 min: 0,
@@ -322,6 +349,9 @@ impl Field {
             // that resolution then fills in from `[tui] spill_lines`.
             Self::Detail => newt_core::config::session_spill_lines()
                 .map_or_else(|| "auto".to_string(), |n| n.to_string()),
+            Self::Posture => {
+                newt_core::posture::active_posture().map_or_else(|| "off".to_string(), |p| p.name)
+            }
             Self::Rounds => newt_core::tenacity::session_tool_rounds()
                 .map_or_else(|| "auto".to_string(), |n| n.to_string()),
         }
@@ -591,6 +621,24 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         // `reset` removes the variable rather than storing the word, so the
         // session falls back to `[tui] prompt` and no leftover survives for
         // the next `/prompt` to explain — the same shape `/nudge on` uses.
+        // Resolved by the SAME `build_posture` the verb calls, over the same
+        // config-rooted skill dirs, and installed through the one writer — so
+        // `/posture` and `/settings posture` cannot install different
+        // bindings. A posture that fails to resolve installs NOTHING: it is
+        // atomic-or-nothing, and `accepts` has already bounded the name to one
+        // the config declares.
+        Field::Posture => {
+            if value == "off" {
+                newt_core::posture::set_active_posture(None);
+            } else if let Ok(cfg) = newt_core::Config::resolve() {
+                let dirs = cfg.skill_search_dirs();
+                if let Ok(p) = newt_core::posture::build_posture(value, &cfg, |skill| {
+                    newt_skills::load_body_from(&dirs, skill)
+                }) {
+                    newt_core::posture::set_active_posture(Some(p));
+                }
+            }
+        }
         // Through the same writer `/spill` and `/detail` use, so the three
         // doors onto this one knob cannot disagree.
         Field::Detail => {
@@ -1183,6 +1231,49 @@ mod tests {
         assert_eq!(Field::Detail.accepts("40"), Some("40".to_string()));
         assert_eq!(Field::Detail.accepts("-1"), None);
         assert_eq!(Field::Detail.accepts("banana"), None);
+    }
+
+    /// **`off` releases the clamp, and the field reports what is installed.**
+    ///
+    /// The posture field is the last of §5.1's relocations: the value lives in
+    /// core, so a pure `apply` can install it. `off` is the same word
+    /// `/posture off` uses — a released clamp is a value, not a second verb.
+    #[test]
+    fn the_posture_field_reports_and_releases_what_is_installed() {
+        let _guard = settings_guard();
+        newt_core::posture::set_active_posture(None);
+        assert_eq!(Field::Posture.current(), "off");
+
+        newt_core::posture::set_active_posture(Some(newt_core::posture::ActivePosture {
+            name: "locked".to_string(),
+            preset_name: "strict".to_string(),
+            clamp: newt_core::Caveats::default(),
+            clamp_summary: "deny writes".to_string(),
+            skill_body: None,
+            framing: None,
+        }));
+        assert_eq!(Field::Posture.current(), "locked");
+
+        assert_eq!(
+            apply(Field::Posture, "off"),
+            Ok("permission posture: off".to_string())
+        );
+        assert!(
+            newt_core::posture::active_posture().is_none(),
+            "`off` releases the clamp rather than storing the word"
+        );
+    }
+
+    /// The vocabulary is the operator's own config, read at ask time — a
+    /// static list could only ever be wrong about `[modes.<name>]`.
+    #[test]
+    fn the_posture_vocabulary_always_offers_the_release() {
+        let offered = Field::Posture.offered();
+        assert!(
+            offered.contains(&"off"),
+            "releasing the clamp is always available: {offered:?}"
+        );
+        assert_eq!(offered.first().copied(), Some("off"), "and it leads");
     }
 
     /// **The verb and the field write one policy** (#2009 PR7).
