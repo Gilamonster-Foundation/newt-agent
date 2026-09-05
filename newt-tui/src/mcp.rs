@@ -316,6 +316,65 @@ impl Mcp {
 
     /// Whether `name` is currently session-muted (`/mcp off`).
     #[must_use]
+    /// The `/mcp` status view, one line per server.
+    ///
+    /// # Why this is a method rather than forty lines in `chat.rs`
+    ///
+    /// It was inline in the `/mcp` arm, which meant the only way to see what
+    /// it renders was to run a session with servers configured. The Session
+    /// cockpit needs the same lines for its MCP section (#2009 PR10a2), and a
+    /// second rendering of the same statuses is how a panel and its command
+    /// come to disagree about whether a server is muted.
+    ///
+    /// Pure over `self`, so the unit tier checks every status arm — including
+    /// the auth hint — with no connection and no config.
+    pub(crate) fn status_lines(&self) -> Vec<String> {
+        if self.statuses.is_empty() {
+            return vec![
+                "no MCP servers configured — add [[mcp_servers]] to ~/.newt/config.toml"
+                    .to_string(),
+            ];
+        }
+        let mut out = vec!["MCP servers:".to_string()];
+        for (n, st) in &self.statuses {
+            out.push(match st {
+                McpStatus::Connected {
+                    tools,
+                    confinement,
+                    net,
+                } => {
+                    if self.is_muted(n) {
+                        format!(
+                            "  {n}  ⏸ muted this session ({tools} tools still connected — /mcp on {n}){}{}",
+                            confinement.note(),
+                            net.note()
+                        )
+                    } else {
+                        format!(
+                            "  {n}  ✓ connected ({tools} tools){}{}",
+                            confinement.note(),
+                            net.note()
+                        )
+                    }
+                }
+                McpStatus::Skipped(r) => {
+                    // A 401 is the one skip an operator can act on, so it says
+                    // how — the rest report what happened and stop.
+                    let hint = if r.contains("401") || r.to_lowercase().contains("auth") {
+                        format!(" — `newt auth {n}` to re-authenticate")
+                    } else {
+                        String::new()
+                    };
+                    format!("  {n}  ✗ skipped: {r}{hint}")
+                }
+                McpStatus::Disabled => {
+                    format!("  {n}  ⏸ disabled in config (/mcp enable {n})")
+                }
+            });
+        }
+        out
+    }
+
     pub(crate) fn is_muted(&self, name: &str) -> bool {
         self.session_muted.contains(name)
     }
@@ -1378,5 +1437,94 @@ mod tests {
         // No text content → raw JSON fallback (still informative).
         let weird = json!({ "structured": 1 });
         assert!(format_result(&weird).contains("structured"));
+    }
+
+    /// **Every status arm renders, checked without a connection.**
+    ///
+    /// These forty lines lived inline in `chat.rs`'s `/mcp` arm until #2009
+    /// PR10a2, which meant the only way to see what they rendered was to run a
+    /// session with servers configured — so the auth hint, the muted wording
+    /// and the disabled row had never been asserted at all.
+    #[test]
+    fn status_lines_render_every_arm() {
+        let mut mcp = Mcp::empty();
+        mcp.statuses = vec![
+            (
+                "github".to_string(),
+                McpStatus::Connected {
+                    tools: 12,
+                    confinement: Confinement::from_sandbox(None),
+                    net: NetGate::from_posture(newt_mcp_client::NetPosture::Advisory),
+                },
+            ),
+            (
+                "stale".to_string(),
+                McpStatus::Skipped("HTTP 401".to_string()),
+            ),
+            (
+                "other".to_string(),
+                McpStatus::Skipped("connect timeout".to_string()),
+            ),
+            ("off".to_string(), McpStatus::Disabled),
+        ];
+
+        let lines = mcp.status_lines();
+        assert_eq!(lines[0], "MCP servers:");
+        assert!(lines[1].contains("github") && lines[1].contains("✓ connected (12 tools)"));
+
+        // A 401 is the one skip an operator can act on, so it says how.
+        assert!(
+            lines[2].contains("`newt auth stale`"),
+            "the auth hint is the actionable half: {:?}",
+            lines[2]
+        );
+        assert!(
+            !lines[3].contains("newt auth"),
+            "a timeout is not an auth problem: {:?}",
+            lines[3]
+        );
+        assert!(lines[4].contains("disabled in config"), "{:?}", lines[4]);
+    }
+
+    /// A muted server reads as muted AND as still connected — the distinction
+    /// `/mcp off` exists for, and the one a status line most easily loses.
+    #[test]
+    fn a_muted_server_still_says_it_is_connected() {
+        let mut mcp = Mcp::empty();
+        mcp.statuses = vec![(
+            "github".to_string(),
+            McpStatus::Connected {
+                tools: 3,
+                confinement: Confinement::from_sandbox(None),
+                net: NetGate::from_posture(newt_mcp_client::NetPosture::Advisory),
+            },
+        )];
+        assert!(mcp.status_lines()[1].contains("✓ connected"));
+
+        mcp.mute("github");
+        let muted = mcp.status_lines()[1].clone();
+        assert!(muted.contains("⏸ muted this session"), "{muted}");
+        assert!(
+            muted.contains("still connected"),
+            "muting removes tools, not the connection: {muted}"
+        );
+        assert!(
+            muted.contains("/mcp on github"),
+            "it names the way back: {muted}"
+        );
+    }
+
+    /// No servers says so, and says where they would be configured — "none
+    /// configured" and "the view is broken" must not look the same.
+    #[test]
+    fn no_servers_says_where_they_would_be_configured() {
+        let lines = Mcp::empty().status_lines();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("no MCP servers configured"),
+            "{:?}",
+            lines[0]
+        );
+        assert!(lines[0].contains("[[mcp_servers]]"), "{:?}", lines[0]);
     }
 }
