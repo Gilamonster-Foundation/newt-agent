@@ -259,6 +259,107 @@ Every slice: `UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generat
 
 **The precondition gate (applies to PR7, PR9, PR10).** No section lands until the state its receipts must read lives in core — `a receipt writer cannot read a local` (#1999's stated precondition; the locals are named in chat.rs:3036/3049/3233). Each of those slices **opens with its own relocation step**, or the section lands in **LINK mode** (§3.5 answer 3). This is why `/resume`, `/compress`, `/spill`, `/roadmap`, `/dock` stay verbs: they keep their chain blocks and their locals, and need no relocation at all.
 
+### 5.1 The LINK-mode ledger — what is deferred, and what unblocks it
+
+**Status: LINK mode is being SPENT, and this is the running account of it.**
+§3.5 answer 3 kept it as a live fallback; PR9 is the first slice to take it,
+and on present evidence PR10 will too. That is not a failure of those slices —
+they deliver the index row, the receipts and the vocabulary — but it means the
+cockpit's *single surface* is being **deferred, not delivered**, and the
+deferral has one cause and one exit.
+
+| section | slice | state | why |
+|---|---|---|---|
+| Session | PR8 | **hosted** | its panel already owned every value it writes |
+| Backends | PR9 | **LINK** | its commit path reads ~12 `run_chat` locals: cfg re-resolution, the wire target, the pinned choice, the degraded-pin state |
+| Permissions / MCP | PR10 | **BLOCKED — cannot link either** | see below: there is no panel to host *or* to link to |
+| Context | PR7 | n/a — fields, not a section | the two live knobs relocated cleanly (`compaction`, `detail`) |
+
+### Permissions and MCP: LINK mode does not apply
+
+**Recorded because the train assumed otherwise.** §5's precondition gate names
+PR10 as a slice that "opens with its own relocation step, or the section lands
+in LINK mode". Neither is available:
+
+- **There is no panel to link to.** Both rows are `Disposition::Panel` — the
+  register's own word for *"a chooser that needs a usable region first
+  (#1979)"*, i.e. the surface is future work. `/permissions` today is a text
+  command (`audit [N]`, grants, decision reopen); `/mcp` is a text command over
+  a live connection handle. Grep finds no `permissions_panel` and no
+  `mcp_panel`. LINK mode links to *today's panel*; for these two there is not
+  one.
+- **And the locals are still there**, so hosting is blocked as well:
+  `active_posture` (7 sites) and `mcp` — a live connection built with
+  `block_in_place` at `chat.rs:1940`, which is not a value that relocates.
+
+So PR10 is blocked on **#1979 (build the panels) and then #1999 (relocate the
+state)** — in that order, and neither is a slice of this train. `/posture` as a
+Native field is blocked by the same thing at a smaller scale:
+`handle_posture_command` preloads a named skill body and applies a permission
+clamp, so it is not a value assignment even though it looks like one in the
+table.
+
+**What this means for the endgame count.** The train's ≈16-command target
+assumes Permissions and MCP become sections. They cannot until #1979 lands, so
+either the target moves or #1979 joins this train's critical path.
+
+> **OPERATOR CALL, 2026-09-05: #1979 joins the train.** The target stands; the
+> panels get built inside this line of work rather than the count being
+> relaxed to fit what exists. Recorded here because it changes the critical
+> path, not just a slice.
+
+**Sequencing that decision.** PR10 is now three steps, and the order is forced
+by what each one needs from the last:
+
+| step | content | gate |
+|---|---|---|
+| **PR10a** | `#1979` — the Permissions chooser and the MCP chooser as `panel::Screen`s, driven by `panel::drive` like every other panel. No command changes, no registry movement. | the panels exist and are unit-testable with `Screen` doubles, the way `shell.rs` is |
+| **PR10b** | both become **LINK rows** in the shell index, per §5.1's rule | index shows four rows; ledger rows updated from BLOCKED to LINK |
+| **PR10c** | `#1999` for `active_posture` and the grant path → the sections become **hosted**, `/posture` becomes a field | ledger rows retire; `Body::Link` loses members |
+
+PR10a is the one that unblocks anything: until a panel exists there is neither
+a section to host nor a surface to link. It is also the one that can be built
+without touching `run_chat` at all, which is why it comes first.
+
+**A note on scope honesty.** #1979 was scoped as "a chooser needs a usable
+region" — the region work landed with `RegionLease` and the shell. What remains
+is the choosers themselves, which is UI construction against state that already
+resolves. That is a real slice, not a hidden project; the hidden project is
+#1999 behind it (PR10c), and §5.1's ledger is where that stays visible.
+
+**The one cause.** A hosted section must run its commit path from inside the
+shell's loop, and those paths read state that lives in `run_chat`. Hosting them
+without relocating that state means duplicating the commit block — which is how
+two paths come to disagree about what a switch did — so LINK mode is the
+correct retreat, not a lazy one.
+
+**The one exit: #1999's relocation.** Every deferred section unblocks on the
+same work — moving the session state its commit path reads out of `run_chat`
+and into core, the way `/markdown` (#2055), `/mode` (#2056), `compaction` and
+`detail` (#2064, #2065) each moved one value. Those four are the worked
+examples and the template: one owner, one writer, one resolver that owns the
+precedence, read back through a function a pure `apply` can call.
+
+**Scale, stated honestly.** Those four were single values. The Backends and
+Permissions commit paths are a dozen apiece and include a re-resolution step,
+so this is **a body of work larger than any slice in this train** — it is not a
+PR14 cleanup item and should not be discovered as one. It is the difference
+between "`/settings` has an index of links" and "`/settings` is the cockpit".
+
+**What "done" looks like**, so the deferral is falsifiable rather than
+open-ended:
+
+1. The state each linked section's commit path reads lives in core, behind one
+   writer and one resolver.
+2. `Body::Link` has no members left — a `Body` enum with one variant is the
+   signal, and deleting the variant is the last commit of that work.
+3. `shell::section_applied` stops being `#[cfg(test)]`, because two hosted
+   sections finally have outcomes to tell apart.
+
+Until (1), a slice that *could* host a section but has not relocated its state
+**must** take LINK mode and add a row above. Silently duplicating a commit path
+to claim a section is the one outcome this ledger exists to prevent.
+
 **Site-count honesty.** A shared `let slash_* =` binding survives until its *last* command dies, so a slice may only lower the pinned 21 when a real recount says so. Slices that actually free a site: PR3 (C2), PR6 (L2, L3), PR7 (C5/L6 partial), PR9 (C9 backend gate + model arms), PR10 (C1), PR11 (N1 becomes /nav's), PR14 (the rest). Other slices touch the `assert_eq!` only to reconfirm it.
 
 | PR | content | ratchet / UAT reflection |
@@ -273,7 +374,7 @@ Every slice: `UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generat
 | **PR7** | Context section + splits (`/compress` action stays a verb, knobs become fields; `/spill detail`→field). **Precondition step included** | Missing −2; LINK-mode fallback declared |
 | **PR8** | **the rich shell** — parent loop, one lease (`Shift` open, `Refuse`/`SuspendHolder` resize), index, filter; `/psyche` panel → Session section view with a zero-write retired redirect | no command changes; PTY acceptance for index + section entry; plain_scroller conditions enforced |
 | **PR9** | **Backends section** — folds `/backends` `/model` `/models` view `/probe` `/setup` `/summarizer`. Setup auto-open dual-gated. **Post-command reload regression test** (chat.rs:6189 divergence) | Missing −3; big site recount; PTY backends grid |
-| **PR10** | **Permissions + MCP sections**. **Precondition step included** (`mcp`, `active_posture` to core) or LINK mode | Missing −1 (posture); grants/reopen stay parked rows; C1 dies |
+| **PR10a/b/c** | **Permissions + MCP** — split by the 2026-09-05 operator call (§5.1): (a) build the choosers (#1979), (b) LINK rows in the index, (c) relocate (#1999) and host, `/posture` becomes a field | (a) no ratchet movement; (b) ledger rows LINK; (c) Missing −1 (posture), grants/reopen stay parked, C1 dies |
 | **PR11** | **/nav** — register; 13 + `/search` + `/retrieval` retire to subverbs, **one help line each** | N1 becomes /nav's parser (recount, not removal); KNOWN_UNADVERTISED loses 4 |
 | **PR12** | Crew section; `/roadmap` absorbs `/tree` and `/plan` (old rows quoted) | Missing −1 |
 | **PR13** | Audit section — receipts viewer (`read_jsonl` + `is_intact`), loadout resolution, config dump | read-only; no ratchet moves |

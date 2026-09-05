@@ -483,23 +483,47 @@ pub(crate) fn run(
     window: Option<crate::session_worker::PanelWindow>,
 ) -> std::io::Result<Outcome> {
     let mut panel = SettingsPanel::new(backend, models, current_model);
-    // #2009 PR8: the panel is driven as a SECTION of the shell rather than on
-    // its own. With one section the shell is a pass-through — it opens into
-    // this panel and closes when it closes — so `/settings` is unchanged
-    // today, and the index lights up when PR9 adds the second section.
+    // #2009 PR8/PR9: the panel is a SECTION of the shell rather than a panel
+    // on its own, and the index now has a second row.
+    //
+    // **Backends is a LINK row** (§3.5 answer 3), not a hosted section. Its
+    // commit path reads a dozen `run_chat` locals — cfg re-resolution, the
+    // wire target, the pinned choice — so hosting it inside the shell would
+    // mean relocating all of them (#1999) or duplicating that block. LINK mode
+    // is the doc's declared fallback for exactly that: the index entry and the
+    // receipts survive, only the single surface waits. Entering it closes the
+    // shell with the SAME `OpenBackends` outcome the panel's own door row has
+    // always produced, so the caller's path is unchanged.
     //
     // The panel is still owned HERE, so `commit()` and `picked_model()` below
-    // read it exactly as before; the shell borrows it for the duration of the
-    // loop and gives it back.
-    let applied = {
-        let mut shell = crate::shell::Shell::new(vec![crate::shell::Section {
-            name: "Session",
-            accel: 's',
-            summary: "dials, editor, reasoning, prompt".to_string(),
-            screen: &mut panel,
-        }]);
-        crate::panel::drive(&mut shell, panel_height(), window.as_ref())?
+    // read it exactly as before; the shell borrows it for the loop.
+    let (applied, linked) = {
+        let mut shell = crate::shell::Shell::new(vec![
+            crate::shell::Section {
+                name: "Session",
+                accel: 's',
+                summary: "dials, editor, reasoning, prompt".to_string(),
+                body: crate::shell::Body::Screen(&mut panel),
+            },
+            crate::shell::Section {
+                name: "Backends",
+                accel: 'b',
+                summary: "choose · edit · add · remove".to_string(),
+                body: crate::shell::Body::Link,
+            },
+        ]);
+        let applied = crate::panel::drive(&mut shell, panel_height(), window.as_ref())?;
+        (applied, shell.linked().is_some())
     };
+    if linked {
+        // The index's Backends row and the panel's own door row are one act:
+        // both leave through `OpenBackends`, so the caller opens the chooser
+        // once, by one path.
+        return Ok(Outcome::OpenBackends {
+            lines: panel.commit(),
+            model: panel.picked_model(),
+        });
+    }
     if !applied {
         return Ok(Outcome::Applied {
             lines: vec!["settings: cancelled".to_string()],
