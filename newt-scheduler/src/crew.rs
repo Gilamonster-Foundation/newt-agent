@@ -23,7 +23,7 @@
 use crate::{BackendPool, ChatRequest, Dispatcher};
 use newt_core::caveats::{Caveats, CaveatsExt, CountBoundExt};
 use newt_core::lazy_emission::lazy_emission_reason;
-use newt_core::Tier;
+use newt_core::{Tier, TokenUsage};
 use serde::Deserialize;
 
 /// A targeted edit: the full new content for one file (created if absent). The
@@ -50,6 +50,49 @@ pub enum CrewStatus {
     VacuousVerify,
 }
 
+/// One attempted crew-role dispatch and the backend result, if one succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleStep {
+    pub role: String,
+    pub tier: Tier,
+    pub model: String,
+    pub backend: Option<String>,
+    pub failed_over: Vec<String>,
+    pub model_id: Option<String>,
+    pub usage: Option<TokenUsage>,
+}
+
+impl RoleStep {
+    fn succeeded(
+        role: &str,
+        tier: Tier,
+        model: &str,
+        dispatch: &crate::Failover<crate::ChatReply>,
+    ) -> Self {
+        Self {
+            role: role.to_string(),
+            tier,
+            model: model.to_string(),
+            backend: Some(dispatch.chosen.clone()),
+            failed_over: dispatch.failed.clone(),
+            model_id: Some(dispatch.result.model_id.clone()),
+            usage: dispatch.result.usage,
+        }
+    }
+
+    fn failed(role: &str, tier: Tier, model: &str, failed_over: Vec<String>) -> Self {
+        Self {
+            role: role.to_string(),
+            tier,
+            model: model.to_string(),
+            backend: None,
+            failed_over,
+            model_id: None,
+            usage: None,
+        }
+    }
+}
+
 /// The result of running the crew on a task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrewOutcome {
@@ -62,6 +105,8 @@ pub struct CrewOutcome {
     /// leash or the #812 leaf-scope fence — surfaced so a refusal is
     /// diagnosable in the terminal report instead of a bare "touched: (none)".
     pub refused: Vec<String>,
+    /// Role dispatches in execution order, including unsuccessful dispatches.
+    pub steps: Vec<RoleStep>,
 }
 
 /// The effects side of the loop, injected so the orchestration stays pure.
@@ -381,6 +426,7 @@ pub async fn run_crew(
     // design (complete mediation per axis: this axis needs a sandbox, not a
     // crew-loop predicate).
     let mut calls_used: u64 = 0;
+    let mut steps = Vec::new();
 
     // 1. NAVIGATE — pick the relevant files (then the harness reads them).
     //    #812: a scoped leaf seeds the navigator with its declared files — a
@@ -417,9 +463,15 @@ pub async fn run_crew(
             attempts: 0,
             touched: Vec::new(),
             refused: Vec::new(),
+            steps,
         };
     }
     calls_used += 1;
+    let nav_candidates = pool
+        .ranked_candidates(Tier::Standard, Some(&cfg.navigator_model))
+        .into_iter()
+        .map(|backend| backend.name.clone())
+        .collect();
     let nav: NavOut = match pool
         .run_role_with_timeout(
             dispatcher,
@@ -430,14 +482,29 @@ pub async fn run_crew(
         )
         .await
     {
-        Some(f) => parse(&f.result.content),
+        Some(f) => {
+            steps.push(RoleStep::succeeded(
+                "navigator",
+                Tier::Standard,
+                &cfg.navigator_model,
+                &f,
+            ));
+            parse(&f.result.content)
+        }
         None => {
+            steps.push(RoleStep::failed(
+                "navigator",
+                Tier::Standard,
+                &cfg.navigator_model,
+                nav_candidates,
+            ));
             return CrewOutcome {
                 status: CrewStatus::NeedsHumanReview,
                 attempts: 0,
                 touched: Vec::new(),
                 refused: Vec::new(),
-            }
+                steps,
+            };
         }
     };
 
@@ -505,9 +572,15 @@ pub async fn run_crew(
                 attempts: attempt - 1,
                 touched,
                 refused: last_refused,
+                steps,
             };
         }
         calls_used += 1;
+        let planner_candidates = pool
+            .ranked_candidates(Tier::Complex, Some(&cfg.planner_model))
+            .into_iter()
+            .map(|backend| backend.name.clone())
+            .collect();
         let edits: Vec<Edit> = match pool
             .run_role_with_timeout(
                 dispatcher,
@@ -518,14 +591,29 @@ pub async fn run_crew(
             )
             .await
         {
-            Some(f) => parse_edits(&f.result.content),
+            Some(f) => {
+                steps.push(RoleStep::succeeded(
+                    "planner",
+                    Tier::Complex,
+                    &cfg.planner_model,
+                    &f,
+                ));
+                parse_edits(&f.result.content)
+            }
             None => {
+                steps.push(RoleStep::failed(
+                    "planner",
+                    Tier::Complex,
+                    &cfg.planner_model,
+                    planner_candidates,
+                ));
                 return CrewOutcome {
                     status: CrewStatus::NeedsHumanReview,
                     attempts: attempt,
                     touched,
                     refused: last_refused,
-                }
+                    steps,
+                };
             }
         };
 
@@ -629,6 +717,7 @@ pub async fn run_crew(
                     attempts: attempt,
                     touched,
                     refused: last_refused,
+                    steps,
                 };
             }
             // #812 adversarial-review finding: a green check on the UNCHANGED
@@ -648,6 +737,7 @@ pub async fn run_crew(
                 attempts: attempt,
                 touched,
                 refused: last_refused,
+                steps,
             };
         }
         let output = if refusal_notes.is_empty() {
@@ -672,9 +762,15 @@ pub async fn run_crew(
                 attempts: attempt,
                 touched,
                 refused: last_refused,
+                steps,
             };
         }
         calls_used += 1;
+        let triage_candidates = pool
+            .ranked_candidates(Tier::Fast, Some(&cfg.triage_model))
+            .into_iter()
+            .map(|backend| backend.name.clone())
+            .collect();
         let tri: TriageOut = match pool
             .run_role_with_timeout(
                 dispatcher,
@@ -685,8 +781,24 @@ pub async fn run_crew(
             )
             .await
         {
-            Some(f) => parse(&f.result.content),
-            None => TriageOut::default(),
+            Some(f) => {
+                steps.push(RoleStep::succeeded(
+                    "triage",
+                    Tier::Fast,
+                    &cfg.triage_model,
+                    &f,
+                ));
+                parse(&f.result.content)
+            }
+            None => {
+                steps.push(RoleStep::failed(
+                    "triage",
+                    Tier::Fast,
+                    &cfg.triage_model,
+                    triage_candidates,
+                ));
+                TriageOut::default()
+            }
         };
         failures.push(format!("{} -> {}", tri.summary, tri.next_action));
     }
@@ -697,6 +809,7 @@ pub async fn run_crew(
         attempts: cfg.max_attempts,
         touched,
         refused: last_refused,
+        steps,
     }
 }
 
@@ -912,6 +1025,10 @@ mod tests {
         )
         .await;
         assert_eq!(out.status, CrewStatus::NeedsHumanReview, "{out:?}");
+        assert_eq!(out.steps.len(), 1, "{out:?}");
+        assert_eq!(out.steps[0].role, "navigator");
+        assert_eq!(out.steps[0].failed_over, ["dgx"]);
+        assert!(out.steps[0].backend.is_none());
     }
 
     /// A dispatcher whose planner ALWAYS emits a (non-empty) edit writing
@@ -921,10 +1038,13 @@ mod tests {
     impl Dispatcher for AlwaysEditGoodMock {
         async fn dispatch(
             &self,
-            _backend: &PoolBackend,
+            backend: &PoolBackend,
             model: &str,
             _req: ChatRequest,
         ) -> anyhow::Result<ChatReply> {
+            if backend.name == "backend-a" {
+                anyhow::bail!("backend-a dispatch failed");
+            }
             let content = match model {
                 "nav" => r#"{"relevant_files":["target.rs"]}"#.to_string(),
                 "triage" => r#"{"summary":"ok","next_action":"none"}"#.to_string(),
@@ -937,6 +1057,45 @@ mod tests {
                 usage: None,
             })
         }
+    }
+
+    /// A crew run records which backend served every role, including the planner's
+    /// failed first dispatch. Before the ledger existed this routing fact was
+    /// discarded when `Failover` was reduced to `result.content`.
+    #[tokio::test]
+    async fn crew_outcome_records_role_steps_and_planner_failover() {
+        let p = BackendPool::from_source(&StaticSource {
+            backends: vec![
+                PoolBackend::new("backend-a", "http://backend-a:11434", BackendKind::Ollama)
+                    .with_tiers(vec![Tier::Complex])
+                    .with_models(["planner"])
+                    .with_health(Health::Up),
+                PoolBackend::new("backend-b", "http://backend-b:11434", BackendKind::Ollama)
+                    .with_models(["nav", "planner", "triage"])
+                    .with_health(Health::Up),
+            ],
+        });
+        let mut ws = MemWs::new();
+        let out = run_crew(
+            &p,
+            &AlwaysEditGoodMock,
+            &mut ws,
+            &cfg(1),
+            &newt_core::caveats::Caveats::top(),
+            "make target.rs GOOD",
+            &["other.rs".to_string()],
+        )
+        .await;
+
+        assert_eq!(
+            out.steps
+                .iter()
+                .map(|step| step.role.as_str())
+                .collect::<Vec<_>>(),
+            ["navigator", "planner", "triage"]
+        );
+        assert_eq!(out.steps[1].failed_over, ["backend-a"]);
+        assert_eq!(out.steps[1].backend.as_deref(), Some("backend-b"));
     }
 
     #[tokio::test]
@@ -1484,6 +1643,10 @@ mod tests {
         .await;
         assert_eq!(out.status, CrewStatus::NeedsHumanReview);
         assert_eq!(out.attempts, 0);
+        assert_eq!(out.steps.len(), 1, "{out:?}");
+        assert_eq!(out.steps[0].role, "navigator");
+        assert!(out.steps[0].failed_over.is_empty());
+        assert!(out.steps[0].backend.is_none());
     }
 
     /// Planner emits NO edits on its first call (the #701 / #548 failure mode —
