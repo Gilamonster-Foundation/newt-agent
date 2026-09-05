@@ -83,6 +83,12 @@ const ENV_KEYS: &[&str] = &[
     "NEWT_COMPACTION_TRIGGER",
     "NEWT_SPILL_LINES",
     crate::settings_receipt::RECEIPT_PATH_ENV,
+    // #2085 PR-E2: the same hazard, one journal later. Six mutators now append
+    // to the chained event journal, so a test that runs one would extend the
+    // developer's real `~/.newt/events.jsonl` — and, worse than the receipt
+    // case, would advance its head ref and chain a test's noise into a real
+    // audit trail.
+    crate::event_journal::JOURNAL_PATH_ENV,
 ];
 
 /// Exclusive access to the process-global operator settings for the duration of a
@@ -104,12 +110,15 @@ pub struct GlobalSettingsGuard {
 impl GlobalSettingsGuard {
     /// Acquire the guard, snapshotting the current settings.
     ///
-    /// It also turns the settings-receipt journal OFF for the duration. A
-    /// setting change is now a durable write (#1981), so a test that flips a
-    /// dial would append to the developer's real `~/.newt/receipts.jsonl` —
-    /// which it did, once, before this line existed. A test that wants to
-    /// inspect the journal points [`crate::settings_receipt::RECEIPT_PATH_ENV`]
-    /// at its own file; the default is silence.
+    /// It also turns BOTH durable journals OFF for the duration. A setting
+    /// change is a durable write (#1981) and six state mutators now append to
+    /// the chained event journal (#2085), so a test that flips a dial or runs a
+    /// mutator would append to the developer's real `~/.newt/receipts.jsonl` or
+    /// `~/.newt/events.jsonl` — which it did, once, before the first of these
+    /// lines existed. A test that wants to inspect either points
+    /// [`crate::settings_receipt::RECEIPT_PATH_ENV`] or
+    /// [`crate::event_journal::JOURNAL_PATH_ENV`] at its own file; the default
+    /// is silence.
     #[must_use]
     pub fn acquire() -> Self {
         let lock = crate::process_env::lock();
@@ -118,6 +127,7 @@ impl GlobalSettingsGuard {
             .map(|k| (*k, std::env::var(k).ok()))
             .collect();
         crate::process_env::set_var(crate::settings_receipt::RECEIPT_PATH_ENV, "");
+        crate::process_env::set_var(crate::event_journal::JOURNAL_PATH_ENV, "");
         Self {
             _lock: lock,
             cognition: Some(crate::cognition::snapshot_runtime_state()),

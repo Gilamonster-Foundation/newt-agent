@@ -274,6 +274,31 @@ Two consequences for this design:
   *chain-plus-one-ref*: the chain, plus a head reference stored **separately**.
   A head kept inside the journal would be truncated along with it.
 
+**What WIRING it found (2026-09-05, #2085 PR-E2).** The six rows the table
+above parks are not the six this section's list names, and reading the code is
+what separated them:
+
+- **The permission GRANT is not a slash command.** `/allow` and `/permissions`
+  share one arm in `chat.rs` that prints the session's decisions and the audit
+  tail and refuses every other argument — its comment says *"Read-only by
+  design"*, and the code agrees. Grants are minted in
+  `permissions::PromptPermissionGate::record`, which already writes
+  `permission-log.jsonl` — a **fourth** flat log, alongside the two above.
+  Moving it onto the chain is the migration this section names and does not
+  sequence, and `/allow` cannot carry a receipt until PR10 gives it the
+  `/settings permissions allow …` mutating path the table promises. So the two
+  rows stay `Missing`, honestly, and `EventKind::Grant` is first used by the
+  other ungating there is: `/dock enable`.
+- **`/rename` and `/resume rename` are two mutators, not two doors.** One
+  retitles the conversation you are IN (`store.rename` on
+  `active_conversation_id`, creating the row when there is none); the other
+  retitles one you NAME (`handle_conversation_command`). Two rows, two events,
+  distinct `via`.
+- **The receipt column now names two destinations.** `Receipt::Journal` is a
+  `settings_receipt` row; `Receipt::Event` is a chained event-journal line.
+  One variant covering both would make the generated target-set doc name the
+  wrong file for six rows, and would let each writer read the other's rows.
+
 This is a **correction to §4.5's "durable" list**: the `settings_receipt`
 *format* is durable, its *integrity guarantee* is not the one to carry forward.
 Migration posture per CLAUDE.md is one importer then one encoding, so
@@ -471,7 +496,7 @@ to claim a section is the one outcome this ledger exists to prevent.
 | **PR12** | Crew section; `/roadmap` absorbs `/tree` and `/plan` (old rows quoted) | Missing −1 |
 | **PR13** | Audit section — receipts viewer (`read_jsonl` + `is_intact`), loadout resolution, config dump | read-only; no ratchet moves |
 | **PR-E1** | **event journal — the mechanism** (#2085): `MerkleNode`-chained record for grants, kills, reopens, note appends, compressions, conversation ops, plus the head ref and the tamper suite | no ratchet movement — the contract lands before any call site |
-| **PR-E2** | **event journal — the wiring**: the six mutators call it; their rows go `Missing` → `Journal` | Missing −6, itemized |
+| **PR-E2** | **event journal — the wiring**: the six mutators call it; their rows go `Missing` → `Event` | Missing −6, itemized |
 | **PR14a–d** | **window close, one release, four slices**: (a) absorbed fields migrate to `Native` rows, dispatch arms deleted; (b) shims deleted, Retired rows kept as permanent pointers; (c) navigator + lifecycle closes; (d) endgame ratchet drop | ≈16 commands / ≈22 tokens; sites ≤ 9; `KNOWN_UNADVERTISED` → empty; goldens + generated doc regenerated. Four PRs, one release: muscle memory breaks once, review stays one-step-per-PR |
 
 **Deprecation window:** one full release cycle after PR11, all retirements closing together. High-frequency verbs (`/resume`, `/compress`, `/cd`, the navigator family) never answer "unknown" — their Retired rows are permanent.

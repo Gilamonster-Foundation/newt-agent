@@ -38,6 +38,14 @@ a content-addressed `newt_core::settings_receipt` line — one destination for
 five verbs, which is the whole argument for absorbing them into one mutation
 path instead of instrumenting each one.
 
+**Two destinations, and the column names which** (#2085 PR-E2). A *setting*
+records a from→to as a `settings_receipt` row. An *operation* — a note
+appended, a conversation deleted, the dock kill-switch thrown — has no previous
+value to record, so it lands on the chained `newt_core::event_journal` instead,
+where each event's id covers its payload AND its link to the one before it. The
+receipt column carries the file, because a destination that lives in prose
+rather than on the row is a destination that drifts.
+
 ## The three open questions, answered
 
 **1. Does `/settings` subsume `/psyche`?** No — and the question dissolves once
@@ -152,7 +160,7 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/edit-mode` | `/vi` `/emacs` `/nano` | `/` command | Editor | absorb → `/settings edit-mode` | `~/.newt/receipts.jsonl` |
 | `/memory` | — | retired → `/status memory` | Memory | keep — it performs | — read-only |
 | `/recall` | — | retired → `/resume find` | Memory | keep — it performs | — read-only |
-| `/remember` | — | `/` command | Memory | keep — it performs | **none — #1965** |
+| `/remember` | — | `/` command | Memory | keep — it performs | `~/.newt/events.jsonl` (chained) |
 | `/search` | — | `/` command | Memory | keep — it performs | — read-only |
 | `/byline` | — | retired → `/status byline` | Meta | keep — it performs | — read-only |
 | `/config` | — | retired → `/status config` | Meta | keep — it performs | — read-only |
@@ -189,25 +197,25 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/allow` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/cd` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/settings compaction` | — | field of `/settings` | Session | absorb → `/settings compaction` | `~/.newt/receipts.jsonl` |
-| `/compress` | `/compact` | `/` command | Session | keep — it performs | **none — #1965** |
+| `/compress` | `/compact` | `/` command | Session | keep — it performs | `~/.newt/events.jsonl` (chained) |
 | `/context` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/conversation` | — | retired → `/resume` | Session | keep — it performs | **none — #1965** |
 | `/crew` | — | `/` command | Session | keep — it performs | **none — #1965** |
-| `/dock` | — | `/` command | Session | keep — it performs | **none — #1965** |
+| `/dock` | — | `/` command | Session | keep — it performs | `~/.newt/events.jsonl` (chained) |
 | `/end` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/mcp` | — | `/` command | Session | panel — a chooser, needs a region (#1979) | **none — #1965** |
 | `/new` | `/clear` | `/` command | Session | keep — it performs | **none — #1965** |
 | `/permissions` | — | `/` command | Session | panel — a chooser, needs a region (#1979) | **none — #1965** |
-| `/rename` | `/name` | `/` command | Session | keep — it performs | **none — #1965** |
+| `/rename` | `/name` | `/` command | Session | keep — it performs | `~/.newt/events.jsonl` (chained) |
 | `/restart` | — | `/` command | Session | keep — it performs | **none — #1965** |
-| `/resume` | — | `/` command | Session | keep — it performs | **none — #1965** |
+| `/resume` | — | `/` command | Session | keep — it performs | `~/.newt/events.jsonl` (chained) |
 | `/roadmap` | — | `/` command | Session | keep — it performs | — read-only |
 | `/spill` | — | `/` command | Session | keep — it performs | — read-only |
 | `/start` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/tab` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/transcript` | — | `/` command | Session | keep — it performs | — read-only |
 | `/tree` | — | retired → `/roadmap tree` | Session | keep — it performs | — read-only |
-| `/undo-lock` | — | `/` command | Session | keep — it performs | **none — #1965** |
+| `/undo-lock` | — | `/` command | Session | keep — it performs | `~/.newt/events.jsonl` (chained) |
 | `/cognition` | — | retired → `/settings cognition` | Tuning | absorb → `/settings cognition` | `~/.newt/receipts.jsonl` |
 | `/detail` | — | `/` command | Tuning | absorb → `/settings detail` | `~/.newt/receipts.jsonl` |
 | `/loadout` | — | retired → `/status loadout` | Tuning | keep — it performs | — read-only |
@@ -224,6 +232,6 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/tenacity` | — | retired → `/settings tenacity` | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
 | `/thinking` | — | retired → `/settings thinking` | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
 
-**74 registered, 42 of them typed as `/` commands (52 tokens).** Absorb 15 · keep 56 · panel 3. Receipts: journalled 14 · read-only 36 · **missing 24**.
+**74 registered, 42 of them typed as `/` commands (52 tokens).** Absorb 15 · keep 56 · panel 3. Receipts: settings 14 · events 6 · read-only 36 · **missing 18**.
 
 <!-- END GENERATED -->

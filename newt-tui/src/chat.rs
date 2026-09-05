@@ -3347,11 +3347,19 @@ fn session_body(
                         match sub {
                             "disable" | "off" => match marker.as_ref() {
                                 Some(m) => match std::fs::write(m, b"") {
-                                    Ok(()) => print_newt(
-                                        "remote HTMX docking DISABLED — every hub is forcibly undocked (fail-closed until `/dock enable`)",
-                                        color,
-                                        verbose,
-                                    ),
+                                    Ok(()) => {
+                                        // #2085 PR-E2: the security
+                                        // kill-switch, journalled ONLY when it
+                                        // actually moved — a failed write that
+                                        // left docking open must not leave a
+                                        // record saying it was shut.
+                                        crate::event_receipt::dock_switched(sub);
+                                        print_newt(
+                                            "remote HTMX docking DISABLED — every hub is forcibly undocked (fail-closed until `/dock enable`)",
+                                            color,
+                                            verbose,
+                                        );
+                                    }
                                     Err(e) => print_newt(
                                         &format!("could not disable docking: {e}"),
                                         color,
@@ -3367,6 +3375,11 @@ fn session_body(
                             "enable" | "on" => {
                                 if let Some(m) = marker.as_ref() {
                                     let _ = std::fs::remove_file(m);
+                                    // The other direction is a `Grant`, and it
+                                    // is journalled for the same reason: a
+                                    // switch recorded only when it shuts reads
+                                    // as still shut forever.
+                                    crate::event_receipt::dock_switched(sub);
                                 }
                                 print_newt(
                                     "remote HTMX docking re-enabled — approved hubs may dock again",
@@ -3562,6 +3575,16 @@ fn session_body(
                             (Some(ordinal), Some(previous)) => {
                                 match previous.intake.undo_lock(ordinal) {
                                     Some(reopened) => {
+                                        // #2085 PR-E2: a decision the harness
+                                        // adjudicated for itself has been
+                                        // handed back to the operator. Recorded
+                                        // only on the arm that actually
+                                        // reopened one — a bad ordinal changes
+                                        // nothing and journals nothing.
+                                        crate::event_receipt::decision_reopened(
+                                            &active_conversation_id,
+                                            ordinal,
+                                        );
                                         let batch = reopened.clarification_batch();
                                         pending_clarification = Some(PendingClarification {
                                             parent: previous.parent,
@@ -3707,6 +3730,20 @@ fn session_body(
                             ))
                         });
                         if outcome.fired {
+                            // #2085 PR-E2. Inside `fired`, because a run that
+                            // changed nothing is not a compression — the same
+                            // rule the notice below obeys ("the caller must not
+                            // claim savings"). `how` is the pipeline's own
+                            // wording, so the journal and the notice cannot
+                            // drift; the route is the verb actually typed, so
+                            // `/compress` and `/compact` stay two events.
+                            crate::event_receipt::compressed(
+                                &active_conversation_id,
+                                slash_word.split_whitespace().next().unwrap_or("compress"),
+                                outcome.how,
+                                outcome.tokens_before,
+                                outcome.tokens_after,
+                            );
                             // Apply the compressed working set back through
                             // the existing in-memory replace seam so the next
                             // turn actually sends it — a notice claiming
@@ -4539,7 +4576,13 @@ fn session_body(
                         // Route the fact through MemoryManager::add_note —
                         // the first note-capable provider (NoteStore) wins.
                         match memory.add_note(fact) {
-                            Ok(()) => print_newt(&format!("Noted: {fact}"), color, verbose),
+                            Ok(()) => {
+                                // #2085 PR-E2: journal the append, not the
+                                // note. The size crosses; the operator's words
+                                // do not.
+                                crate::event_receipt::note_appended(fact.len());
+                                print_newt(&format!("Noted: {fact}"), color, verbose);
+                            }
                             Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                         }
                         println!();
@@ -4799,13 +4842,24 @@ fn session_body(
                                     match store.exists(&active_conversation_id) {
                                         Ok(true) => {
                                             match store.rename(&active_conversation_id, title) {
-                                                Ok(()) => print_newt(
-                                                    &format!(
-                                                        "Renamed this conversation to \"{title}\"."
-                                                    ),
-                                                    color,
-                                                    verbose,
-                                                ),
+                                                Ok(()) => {
+                                                    // #2085 PR-E2: the id
+                                                    // travels, the title does
+                                                    // not. `/rename` and
+                                                    // `/name` are two routes.
+                                                    crate::event_receipt::conversation_titled(
+                                                        verb,
+                                                        &active_conversation_id,
+                                                        false,
+                                                    );
+                                                    print_newt(
+                                                        &format!(
+                                                            "Renamed this conversation to \"{title}\"."
+                                                        ),
+                                                        color,
+                                                        verbose,
+                                                    );
+                                                }
                                                 Err(e) => print_newt(
                                                     &format!("could not rename: {e}"),
                                                     color,
@@ -4818,11 +4872,24 @@ fn session_body(
                                             title,
                                             active_persona.as_ref().map(|p| p.name.as_str()),
                                         ) {
-                                            Ok(()) => print_newt(
-                                                &format!("Titled this conversation \"{title}\"."),
-                                                color,
-                                                verbose,
-                                            ),
+                                            Ok(()) => {
+                                                // The create arm is a DIFFERENT
+                                                // fact — the row did not exist
+                                                // — so it journals as `title`,
+                                                // not `rename`.
+                                                crate::event_receipt::conversation_titled(
+                                                    verb,
+                                                    &active_conversation_id,
+                                                    true,
+                                                );
+                                                print_newt(
+                                                    &format!(
+                                                        "Titled this conversation \"{title}\"."
+                                                    ),
+                                                    color,
+                                                    verbose,
+                                                );
+                                            }
                                             Err(e) => print_newt(
                                                 &format!("could not title: {e}"),
                                                 color,

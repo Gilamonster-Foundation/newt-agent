@@ -30,6 +30,12 @@
 //! until its receipt destination exists. Absorbing the knob families into one
 //! `/settings` mutation path is what makes fixing them tractable — one path
 //! to instrument instead of twenty.
+//!
+//! There are **two** destinations, and the column names which (#2085 PR-E2).
+//! A SETTING has a from→to and lands as a `newt_core::settings_receipt` row
+//! ([`Receipt::Journal`]); an OPERATION has no prior value and lands on the
+//! chained `newt_core::event_journal` ([`Receipt::Event`]). Both writers read
+//! this column, and neither reads the other's variant.
 
 /// Which surface a command belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,11 +127,35 @@ pub(crate) enum Surface {
 pub(crate) enum Receipt {
     /// Read-only: nothing to record.
     None_,
-    /// Recorded as a content-addressed `newt_core::settings_receipt` line.
-    /// `settings_form::apply_and_record` is the writer, and it reads this
-    /// column to decide — a command is receipted because the registry says
-    /// where its receipt lands, not because a call site remembered to.
+    /// Recorded as a content-addressed `newt_core::settings_receipt` line —
+    /// a SETTING's from→to. `settings_form::change_for` reads this column to
+    /// decide and `settings_receipt::record` writes: a command is receipted
+    /// because the registry says where its receipt lands, not because a call
+    /// site remembered to.
     Journal,
+    /// Recorded on the chained `newt_core::event_journal` — an OPERATION
+    /// (#2085 PR-E2). `event_receipt::record` is the writer, and it reads this
+    /// column the same way `change_for` reads `Journal`.
+    ///
+    /// # Why this is a second variant and not the same one
+    ///
+    /// The two destinations are different files with different shapes, and
+    /// `Surface::Retired` already sets the precedent that **a destination is
+    /// data on the row, not prose someone keeps in sync** — the generated
+    /// `slash_command_target_set.md` renders this column into a "where the
+    /// receipt lands" cell, and one variant covering two files would make that
+    /// cell name the wrong file for six rows.
+    ///
+    /// It also keeps the two writers from reading each other's rows. With one
+    /// variant, `change_for` would mint a `SettingChange` for `/dock` and
+    /// `event_receipt::record` would journal `/rounds` — each writing to a
+    /// destination the row never declared, which is the failure
+    /// [`receipt_for`] exists to prevent.
+    ///
+    /// The distinction is a today fact, not a permanent one: #2085 records
+    /// that `settings_receipt` should join the chain, and when it does these
+    /// two collapse back into one.
+    Event,
     /// Mutates session state and records NOTHING today — #1965.
     Missing,
 }
@@ -223,11 +253,14 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Surface::Retired("/resume find"),
     ),
     cmd(
+        // #2085 PR-E2: a note append is one of the six event classes §4.4
+        // parked. It has no from→to — a note is added, not set — which is why
+        // it could never be a `/settings` field and needed the event journal.
         "remember",
         &[],
         Family::Memory,
         Disposition::Keep,
-        Receipt::Missing,
+        Receipt::Event,
     ),
     cmd(
         "search",
@@ -502,11 +535,14 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::Missing,
     ),
     cmd(
+        // #2085 PR-E2. Both spellings journal, and as two different events:
+        // `via` is the verb typed, so `/compress` and `/compact` are one
+        // effect reached two ways and the record says which.
         "compress",
         &["compact"],
         Family::Session,
         Disposition::Keep,
-        Receipt::Missing,
+        Receipt::Event,
     ),
     cmd(
         "context",
@@ -546,11 +582,15 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::Missing,
     ),
     cmd(
+        // #2085 PR-E2 — **the security kill-switch**, and §7 Q7's reason for
+        // landing the journal before the window closes. `disable` records a
+        // `Kill`, `enable` a `Grant`: a switch journalled in one direction
+        // reads as still shut forever.
         "dock",
         &[],
         Family::Session,
         Disposition::Keep,
-        Receipt::Missing,
+        Receipt::Event,
     ),
     cmd(
         "mcp",
@@ -567,18 +607,23 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::Missing,
     ),
     cmd(
+        // #2085 PR-E2: retitling the ACTIVE conversation — a different mutator
+        // from `/resume rename`, which retitles one the operator NAMES. Both
+        // are `ConversationOp`; the two rows are two mutators, not two doors.
         "rename",
         &["name"],
         Family::Session,
         Disposition::Keep,
-        Receipt::Missing,
+        Receipt::Event,
     ),
     cmd(
+        // #2085 PR-E2: the conversation ops — restore, rename, delete — all
+        // reach `handle_conversation_command`, which is where they journal.
         "resume",
         &[],
         Family::Session,
         Disposition::Keep,
-        Receipt::Missing,
+        Receipt::Event,
     ),
     cmd(
         "roadmap",
@@ -617,11 +662,14 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Surface::Retired("/roadmap tree"),
     ),
     cmd(
+        // #2085 PR-E2: reopening a decision the harness adjudicated on its own
+        // (#1749). §7 Q7's other named reason for the journal — a reversal
+        // nobody witnessed is the one an audit most needs to see.
         "undo-lock",
         &[],
         Family::Session,
         Disposition::Keep,
-        Receipt::Missing,
+        Receipt::Event,
     ),
     // ------------------------------------------------------------------
     // **The ghosts** (#2009 PR2). Five shipped, advertised, state-mutating
@@ -1284,6 +1332,65 @@ mod tests {
     /// would let the entire debt disappear as the cut proceeds, which is the
     /// most tempting wrong answer available here.
     ///
+    /// # 24 → 18: the event journal pays six at once (#2085 PR-E2)
+    ///
+    /// **The largest payment of the cut, and the first one that is not a
+    /// relocation.** Every reduction before this either moved a setting's
+    /// state somewhere `apply_and_record` could read a from→to, or found a row
+    /// that never owed. These six owed, and could not be paid at all, because
+    /// they are *operations*: a note is appended, a conversation is deleted, a
+    /// switch is thrown. There is no previous value to record, so no
+    /// `SettingValue` could ever have been minted for them — §4.4 parked them
+    /// against the event journal rather than handing them a fabricated
+    /// baseline, and #2087 landed the chain they were parked against.
+    ///
+    /// Row by row, with the kind each now records and the route it records it
+    /// through (`event_receipt`):
+    ///
+    /// - **`/remember`** → `NoteAppend`. `memory.add_note` appended and left
+    ///   nothing durable behind it. Records the note's SIZE, never its text.
+    /// - **`/compress` (`/compact`)** → `Compression`. Records only a run that
+    ///   FIRED, with the pipeline's own `how` and the token delta. The two
+    ///   spellings are two events, which is what `via` is for.
+    /// - **`/undo-lock`** → `Reopen`. #1749's reversal of a decision the
+    ///   harness adjudicated for itself. §7 Q7 named this and the kill-switch
+    ///   as the two events whose absence made the parked set unacceptable.
+    /// - **`/dock`** → `Kill` on `disable`/`off`, `Grant` on `enable`/`on`.
+    ///   Both directions, because a kill-switch journalled one way reads as
+    ///   still shut forever. `status` records nothing; it is a read.
+    /// - **`/resume`** → `ConversationOp` for restore, rename and delete,
+    ///   recorded inside `handle_conversation_command` — the one place both
+    ///   doors converge, so a future door cannot bypass it.
+    /// - **`/rename` (`/name`)** → `ConversationOp`. A DIFFERENT mutator from
+    ///   the one above, not a second door onto it: this retitles the
+    ///   conversation you are IN, and on a conversation with no durable row it
+    ///   creates the row titled — recorded as `title`, not `rename`, because
+    ///   those are not the same fact.
+    ///
+    /// **`/allow` did NOT flip, and the reason is the interesting one.**
+    /// #2085 leads with "permission grants", and the obvious row for it is
+    /// `/allow`. But `/allow` and `/permissions` share ONE arm in `chat.rs`
+    /// that prints the session's decisions and the audit tail and refuses
+    /// every other argument — its comment says *"Read-only by design"*, and
+    /// the code agrees. **The grant is not a slash command at all**: it is
+    /// minted in `permissions::PromptPermissionGate::record`, at the prompt,
+    /// which has no row in this register and already writes a FOURTH flat log
+    /// (`permission-log.jsonl`). Moving that onto the chain is the
+    /// `settings_receipt`/`denial_journal` migration #2085 records and does
+    /// not sequence, so it is not this slice's to make.
+    ///
+    /// The two rows stay `Missing` rather than being reclassified `None_`,
+    /// which is the one direction a ratchet must be argued for: the plan's own
+    /// table (§3) routes `/allow` to `/settings permissions allow …` in PR10,
+    /// where it becomes a real mutator. Clearing the debt now would have to be
+    /// undone then, and a ratchet that moves down and back up teaches its
+    /// reader to edit the number. `/conversation` stays for the sibling
+    /// reason: its mutators redirect today, but its row is the parked pointer
+    /// §4.4 kept deliberately.
+    ///
+    /// `EventKind::Grant` is therefore first used by the other ungating there
+    /// is — `/dock enable` — and not by a permission prompt.
+    ///
     /// # 25 → 24: `/posture` pays, and the ledger's exit opens (#2009 PR10c)
     ///
     /// The last of the relocations §5.1 named. `ActivePosture` and
@@ -1393,7 +1500,7 @@ mod tests {
             .filter(|c| matches!(c.receipt, Receipt::Missing))
             .count();
         assert!(
-            missing <= 24,
+            missing <= 18,
             "{missing} state-mutating commands record nothing durable — that \
              is more than when #1981 armed this. A new state mutator needs a \
              receipt destination, not another silent write"
@@ -1402,6 +1509,67 @@ mod tests {
         assert!(
             missing > 0,
             "if this is 0 the debt is paid — lower the bound"
+        );
+    }
+
+    /// **The other half of the ratchet above: a paid row must actually pay.**
+    ///
+    /// Lowering the debt count is a claim about the CODE, and a claim a doc
+    /// comment cannot check. This joins the register to the dispatch **both
+    /// ways**: every row #2085 PR-E2 flipped to `Event` names the
+    /// `event_receipt` constructor its arm must call, and every `Event` row in
+    /// the register is named here — so neither a deleted call nor a row
+    /// promoted without one can pass. Deleting a call turns this red with the
+    /// token in the message. Six mutators inside `run_chat` are not reachable
+    /// by a unit test; this is the guard that is, and its constructors carry
+    /// the kind/vocabulary/route assertions in `event_receipt`'s own tests.
+    ///
+    /// A ratchet nobody can fail is the whole failure mode #1965 exists to
+    /// prevent, so the number and this test move together or not at all.
+    #[test]
+    fn every_event_journalled_mutator_reaches_the_journal() {
+        // The registry row → the constructor that names its event.
+        const WIRED: &[(&str, &str)] = &[
+            ("remember", "event_receipt::note_appended("),
+            ("compress", "event_receipt::compressed("),
+            ("undo-lock", "event_receipt::decision_reopened("),
+            ("dock", "event_receipt::dock_switched("),
+            ("resume", "event_receipt::conversation_op("),
+            ("rename", "event_receipt::conversation_titled("),
+        ];
+        let sources = dispatch_sources();
+        for (token, call) in WIRED {
+            assert!(
+                matches!(receipt_for(token), Receipt::Event),
+                "`/{token}` is wired to the event journal but its row does not \
+                 say `Receipt::Event` — the column is what production reads"
+            );
+            assert!(
+                sources.iter().any(|(_, src)| src.contains(call)),
+                "`/{token}` claims `Receipt::Event` but no dispatch source \
+                 calls `{call}` — the row says the mutation is witnessed and \
+                 nothing witnesses it, which is the #1965 defect with a nicer \
+                 label. Either restore the call or raise the debt count back."
+            );
+        }
+        // **The reverse join.** Without it a seventh row could be promoted to
+        // `Event` — paying the ratchet — with nothing wiring it, which is the
+        // exact move the ratchet exists to catch.
+        for command in COMMANDS.iter().filter(|c| c.receipt == Receipt::Event) {
+            assert!(
+                WIRED.iter().any(|(token, _)| *token == command.name),
+                "`/{}` says `Receipt::Event` but is not in WIRED — a row cannot \
+                 pay the #1965 debt by declaring a destination it never reaches",
+                command.name
+            );
+        }
+        // Anti-vacuous: a containment check that finds everything finds
+        // nothing. It does not find a recorder that was never written.
+        assert!(
+            !sources
+                .iter()
+                .any(|(_, src)| src.contains("event_receipt::zzz_not_a_recorder(")),
+            "the containment check cannot fail and proves nothing"
         );
     }
 
@@ -1598,6 +1766,7 @@ mod target_set_doc {
         match command.receipt {
             Receipt::None_ => "— read-only",
             Receipt::Journal => "`~/.newt/receipts.jsonl`",
+            Receipt::Event => "`~/.newt/events.jsonl` (chained)",
             Receipt::Missing => "**none — #1965**",
         }
     }
@@ -1652,7 +1821,7 @@ mod target_set_doc {
         out.push_str(&format!(
             "\n**{} registered, {} of them typed as `/` commands ({} tokens).** \
              Absorb {} · keep {} · panel {}. \
-             Receipts: journalled {} · read-only {} · **missing {}**.\n",
+             Receipts: settings {} · events {} · read-only {} · **missing {}**.\n",
             COMMANDS.len(),
             slash_commands().count(),
             slash_tokens().len(),
@@ -1660,6 +1829,7 @@ mod target_set_doc {
             count(Disposition::Keep),
             count(Disposition::Panel),
             receipts(Receipt::Journal),
+            receipts(Receipt::Event),
             receipts(Receipt::None_),
             receipts(Receipt::Missing),
         ));
@@ -1713,6 +1883,9 @@ mod target_set_doc {
             "keep — it performs",
             "**none — #1965**",
             "`~/.newt/receipts.jsonl`",
+            // #2085 PR-E2: the second destination is real in the doc too, so
+            // this guard cannot pass over a table that lost it.
+            "`~/.newt/events.jsonl` (chained)",
         ] {
             assert!(block.contains(needle), "the doc never says {needle}");
         }

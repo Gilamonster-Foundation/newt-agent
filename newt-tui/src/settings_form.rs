@@ -1515,12 +1515,18 @@ mod tests {
             assert!(change_for(*field, "a".into(), "b".into(), "/settings").is_some());
         }
         // **Anti-vacuous.** If the column read `Journal` for everything,
-        // reading it would prove nothing. `/remember` writes durable notes and
-        // still records no decision; `/help` mutates nothing.
+        // reading it would prove nothing. `/setup` mutates and records no
+        // decision; `/help` mutates nothing.
         //
         // This used to name `/rounds`, which is the whole point of #1998: the
         // example had to be replaced because the debt it stood for was paid.
-        assert_eq!(receipt_for("remember"), Receipt::Missing);
+        // It then named `/remember`, and #2085 PR-E2 paid that one too — to the
+        // OTHER destination. That makes it the sharpest row here: the loop
+        // above demands `Journal` of every field, and `/remember` is `Event`,
+        // so the two writers provably read disjoint variants rather than one
+        // shared "somebody records this".
+        assert_eq!(receipt_for("remember"), Receipt::Event);
+        assert_eq!(receipt_for("setup"), Receipt::Missing);
         assert_eq!(receipt_for("help"), Receipt::None_);
         assert_eq!(receipt_for("zzznotacommand"), Receipt::Missing);
     }
