@@ -25,6 +25,41 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
   the first chained append and a fresh chain starts. The old bytes are kept and
   the command points at them; they are not parsed by a second decode arm.
 
+### Added — the content-addressable ratchet now counts journals that address NOTHING
+
+- **The gate could only see a bad identity, never a missing one.**
+  `content_addressable_ratchet.rs` counted hand-rolled digests and bare
+  canonical decodes — both failures of *minting the wrong id*. The opposite
+  and more common failure, minting none at all, was structurally invisible to
+  it: `newt-core/src/denial_journal.rs` persists `DenialRecord` as JSON lines
+  with zero occurrences of `ContentId`, `MerkleNode`, `content_addressable`,
+  `blake3`, or `hash`, and every gate in the file was green on it. A human
+  found it by reading the file. **That row has since been paid** — #2088
+  moved `denial_journal` onto `event_journal`'s chain while this change was in
+  flight — so the ratchet ships at 3 and its real-tree anchor is
+  `flight_recorder`, with a standing assertion that `denial_journal` does not
+  come back.
+- **Journals are now enumerated in two tiers, each with a count that may only
+  go DOWN.** A *journal* is a production source that appends a
+  `serde_json::to_string` record to a handle opened with `.append(true)` —
+  this repo's durable-evidence idiom. Tier 1 (**unaddressed**, 3):
+  `flight_recorder`, `agentic/permissions`, `metrics`. Tier 2
+  (**addressed but unchained**, 1): `settings_receipt`. `event_journal` is the
+  one conformant journal. The monotone bound that matters is on their sum, so
+  promoting a journal from tier 1 to tier 2 is allowed to raise tier 2 rather
+  than being forbidden by it.
+- **Built against the way an absence check fails, which is OPEN.** A scan for
+  "files lacking X" passes trivially when it scans nothing, and anything that
+  narrows the input makes a pass *more* likely. So the scan asserts it read
+  something before it may report clean, a seeded fixture proves the detector
+  detects (and discriminates in three other directions), a named test asserts
+  the real `denial_journal` row is seen, and pointing the scan at an empty
+  directory is a `#[should_panic]` test rather than a silent green.
+- Both rows now read one walker: `sites_matching` (presence of a bad
+  construct) and the journal scan (absence of a required one) share
+  `production_sources`, so a directory exclusion cannot apply to one and not
+  the other.
+
 ### Fixed — every interrupt press is acknowledged at press time (#2010)
 
 - **Repeated Ctrl-C / Esc is heard, not absorbed.** The 2nd and Nth press used
