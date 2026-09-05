@@ -212,8 +212,8 @@ impl WorktreeWorkspace {
         if let Some(parent) = worktree.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // --detach: a free-floating checkout of `base_ref` (the cumulative chain
-        // tip), not a new branch.
+        // --detach: a free-floating checkout of the executor-supplied
+        // `base_ref`, not a new branch.
         git(
             base,
             &[
@@ -320,6 +320,41 @@ impl WorktreeWorkspace {
         Ok((branch.to_string(), sha))
     }
 
+    /// Merge already-landed leaf branches into one review branch. The merge is
+    /// performed in another detached worktree, so the operator's checkout is
+    /// never switched or edited.
+    pub fn consolidate_branches(
+        base: &Path,
+        id: &str,
+        base_ref: &str,
+        branches: &[String],
+        author_name: &str,
+        author_email: &str,
+    ) -> anyhow::Result<(String, String)> {
+        if branches.is_empty() {
+            anyhow::bail!("no leaf branches to consolidate");
+        }
+        let ws = Self::create(base, id, base_ref, "true".to_string())?;
+        let branch = format!("crew/{id}");
+        git(&ws.worktree, &["checkout", "-q", "-b", &branch])?;
+        for leaf in branches {
+            git(
+                &ws.worktree,
+                &[
+                    "-c",
+                    &format!("user.name={author_name}"),
+                    "-c",
+                    &format!("user.email={author_email}"),
+                    "merge",
+                    "--no-edit",
+                    leaf,
+                ],
+            )?;
+        }
+        let sha = git(&ws.worktree, &["rev-parse", "--short", "HEAD"])?;
+        Ok((branch, sha))
+    }
+
     /// Remove the worktree (best-effort). Called by `Drop`; also callable early.
     pub fn cleanup(&self) {
         let _ = git(
@@ -398,6 +433,10 @@ impl Workspace for WorktreeWorkspace {
             Ok((ok, out)) => (ok, out),
             Err(e) => (false, format!("failed to run `{}`: {e}", self.test_cmd)),
         }
+    }
+
+    fn set_test_command(&mut self, cmd: &str) {
+        self.test_cmd = cmd.to_string();
     }
 }
 
@@ -766,6 +805,9 @@ pub async fn execute_plan(
     }
     if !run.remaining.is_empty() {
         println!("remaining (blocked/stalled): {}", run.remaining.join(", "));
+    }
+    if let Some(consolidated) = &run.consolidated {
+        println!("{consolidated}");
     }
     println!(
         "{}",
@@ -2410,6 +2452,49 @@ mod tests {
     }
 
     #[test]
+    fn same_head_siblings_consolidate_into_one_tip_containing_both() {
+        let repo = git_repo();
+        let mut a =
+            WorktreeWorkspace::create(repo.path(), "sibling-a", "HEAD", "true".into()).unwrap();
+        a.apply(&[Edit {
+            path: "a.txt".into(),
+            new_content: "A\n".into(),
+        }]);
+        let (branch_a, _) = a
+            .commit_to_branch("crew/sibling-a", "n", "n@b", "a")
+            .unwrap();
+        drop(a);
+
+        let mut b =
+            WorktreeWorkspace::create(repo.path(), "sibling-b", "HEAD", "true".into()).unwrap();
+        b.apply(&[Edit {
+            path: "b.txt".into(),
+            new_content: "B\n".into(),
+        }]);
+        let (branch_b, _) = b
+            .commit_to_branch("crew/sibling-b", "n", "n@b", "b")
+            .unwrap();
+        drop(b);
+
+        let (consolidated, _) = WorktreeWorkspace::consolidate_branches(
+            repo.path(),
+            "sibling-result",
+            "HEAD",
+            &[branch_a, branch_b],
+            "n",
+            "n@b",
+        )
+        .unwrap();
+        let files = git(
+            repo.path(),
+            &["ls-tree", "-r", "--name-only", &consolidated],
+        )
+        .unwrap();
+        assert!(files.lines().any(|line| line == "a.txt"), "{files}");
+        assert!(files.lines().any(|line| line == "b.txt"), "{files}");
+    }
+
+    #[test]
     fn commit_to_branch_errs_with_no_changes() {
         let repo = git_repo();
         let ws = WorktreeWorkspace::create(repo.path(), "land2", "HEAD", "true".into()).unwrap();
@@ -2477,6 +2562,31 @@ mod tests {
                 "a failing verify must never be reported as passing"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_test_command_changes_the_command_that_runs() {
+        // Production regression: Workspace's default setter used to discard
+        // the per-leaf verify command, so the runner silently repeated its
+        // inferred command instead. Observe the command's exit outcome rather
+        // than the setter call itself.
+        if !(newt_core::confined_exec::kernel_fs_fence_available()
+            && newt_core::confined_exec::net_guard_available())
+        {
+            return;
+        }
+        let repo = git_repo();
+        let mut ws =
+            WorktreeWorkspace::create(repo.path(), "verify-setter", "HEAD", "true".into()).unwrap();
+        assert!(ws.run_test().0, "the original command passes");
+
+        ws.set_test_command("false");
+
+        assert!(
+            !ws.run_test().0,
+            "the installed per-leaf command must run and fail"
+        );
     }
 
     #[test]

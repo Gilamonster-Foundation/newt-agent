@@ -19,7 +19,7 @@ use newt_core::caveats::{Caveats, CaveatsExt};
 use newt_core::{Config, Tier};
 use newt_scheduler::{
     compose_from_pool, run_crew, run_team, BackendPool, CrewConfig, CrewStatus, LocalDispatcher,
-    RosterMode, RosterSpec, StaticSource, SubtaskStatus, TeamConfig, TeamStatus,
+    RosterMode, RosterSpec, StaticSource, SubtaskStatus, TeamConfig, TeamStatus, WorkspaceFactory,
 };
 use serde_json::Value;
 use std::path::PathBuf;
@@ -39,14 +39,6 @@ pub struct LocalCrewRunner {
     /// the `/team` enable maps to `Presence::Prompt` (a soft affirmation); a
     /// `Passkey`-required action surfaces `NeedsAttest` until BOOT's verifier (#472).
     established: Presence,
-    /// The cumulative chaining cursor (#646): the git commit-ish of the last
-    /// successfully-landed leaf. Interior-mutable because `dispatch` takes
-    /// `&self`; each leaf forks its worktree off this, then advances it on a
-    /// successful land — so the LAST leaf's branch transitively contains every
-    /// prior leaf's work (one consolidated result). Seeded to `HEAD`. Correct
-    /// only because `run_plan` drives leaves SEQUENTIALLY (one at a time);
-    /// parallel fan-out would need a per-sibling base (a follow-up).
-    base_ref: std::sync::Mutex<String>,
     /// A caller-supplied, **operator-provenanced** verify command that overrides
     /// every leaf's gate (the "locked behavioral gate"). Unlike a model-authored
     /// `verify`, this comes from a human flag (`newt plan --locked-verify`), so it
@@ -64,7 +56,6 @@ impl LocalCrewRunner {
             cfg,
             dir,
             established,
-            base_ref: std::sync::Mutex::new("HEAD".to_string()),
             locked_verify: None,
         }
     }
@@ -324,6 +315,56 @@ fn crew_coauthor_trailer(model: &str, identity: &newt_core::AgentIdentity) -> St
     .trailer()
 }
 
+struct LocalWorkspaceFactory {
+    dir: PathBuf,
+    base_ref: String,
+    test_cmd: String,
+    editor_model: String,
+}
+
+impl WorkspaceFactory for LocalWorkspaceFactory {
+    type Leaf = WorktreeWorkspace;
+
+    fn create(&mut self, _subtask: &str) -> Result<Self::Leaf, String> {
+        WorktreeWorkspace::create(
+            &self.dir,
+            &worktree_id(),
+            &self.base_ref,
+            self.test_cmd.clone(),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn land(&mut self, workspace: Self::Leaf, subtask: &str) -> Result<String, String> {
+        let identity = newt_core::AgentIdentity::resolve().unwrap_or_default();
+        let (name, email) = identity.git_author();
+        let message = format!(
+            "{subtask}\n\n{}",
+            crew_coauthor_trailer(&self.editor_model, &identity)
+        );
+        workspace
+            .commit_to_branch(&format!("crew/{}", worktree_id()), &name, &email, &message)
+            .map(|(branch, _)| branch)
+            .map_err(|error| error.to_string())
+    }
+
+    fn consolidate(&mut self, branches: &[String]) -> Result<String, String> {
+        let identity = newt_core::AgentIdentity::resolve().unwrap_or_default();
+        let (name, email) = identity.git_author();
+        let id = format!("consolidated-{}", worktree_id());
+        WorktreeWorkspace::consolidate_branches(
+            &self.dir,
+            &id,
+            &self.base_ref,
+            branches,
+            &name,
+            &email,
+        )
+        .map(|(branch, sha)| format!("✓ LANDED on branch `{branch}` @ {sha}"))
+        .map_err(|error| error.to_string())
+    }
+}
+
 #[async_trait]
 impl CrewRunner for LocalCrewRunner {
     async fn dispatch(&self, op: &str, args: &Value, caveats: &Caveats) -> Result<String, String> {
@@ -334,6 +375,40 @@ impl CrewRunner for LocalCrewRunner {
                 let spec = compose_from_pool(&pool, &[], parse_mode(args))
                     .ok_or_else(|| "no live models reachable to compose a roster".to_string())?;
                 Ok(render_roster(&spec))
+            }
+            "consolidate" => {
+                if !caveats.permits_fs_write(&self.dir.to_string_lossy()) {
+                    return Err(
+                        "denied: branch consolidation needs workspace-write authority".to_string(),
+                    );
+                }
+                let base_ref = args
+                    .get("base_ref")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "consolidate requires 'base_ref'".to_string())?;
+                let branches: Vec<String> = args
+                    .get("branches")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "consolidate requires 'branches'".to_string())?
+                    .iter()
+                    .map(|branch| {
+                        branch
+                            .as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| "consolidate branches must be strings".to_string())
+                    })
+                    .collect::<Result<_, _>>()?;
+                let identity = newt_core::AgentIdentity::resolve().unwrap_or_default();
+                let (name, email) = identity.git_author();
+                let id = format!("consolidated-{}", worktree_id());
+                let (branch, sha) = WorktreeWorkspace::consolidate_branches(
+                    &self.dir, &id, base_ref, &branches, &name, &email,
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(format!(
+                    "✓ LANDED on branch `{branch}` @ {sha} — consolidated {} leaf branch(es)",
+                    branches.len()
+                ))
             }
             // Dispatch a crew/team — writes files, so FAIL CLOSED unless the
             // session permits workspace writes. The worktree isolates the effects;
@@ -425,20 +500,24 @@ impl CrewRunner for LocalCrewRunner {
                 // and handed to both `run_team` and `run_crew`.
                 let crew_clamp = self.crew_clamp();
                 let child_caveats = dispatch_caveats(caveats, &crew_clamp);
-                let id = worktree_id();
-                // Leaf composition (#646): fork the worktree off the cumulative
-                // chain tip (the last landed leaf), not bare HEAD, so each leaf
-                // builds on its predecessors. Clone the cursor out of the guard so
-                // the lock is NOT held across the blocking git call below.
-                let base = self.base_ref.lock().unwrap().clone();
-                let mut ws = WorktreeWorkspace::create(&self.dir, &id, &base, test_cmd)
-                    .map_err(|e| e.to_string())?;
-                let (body, passed) = if as_team {
+                // Placement is supplied by the plan executor. It knows the
+                // dependency graph; a process-local mutable cursor does not.
+                let base_ref = args
+                    .get("base_ref")
+                    .and_then(Value::as_str)
+                    .unwrap_or("HEAD");
+                if as_team {
                     let team_cfg = TeamConfig {
                         lead_model: lead.unwrap_or_else(|| crew_cfg.planner_model.clone()),
                         lead_tier: Tier::Complex,
                         crew: crew_cfg,
                         max_subtasks: MAX_SUBTASKS,
+                    };
+                    let mut workspaces = LocalWorkspaceFactory {
+                        dir: self.dir.clone(),
+                        base_ref: base_ref.to_string(),
+                        test_cmd,
+                        editor_model,
                     };
                     // #840: ground the fence in the harness's OWN grep, not just
                     // the lead's self-report — the same `def_sites_grep` crew
@@ -448,34 +527,44 @@ impl CrewRunner for LocalCrewRunner {
                     let out = run_team(
                         &pool,
                         &LocalDispatcher,
-                        &mut ws,
+                        &mut workspaces,
                         &team_cfg,
                         &child_caveats,
                         task,
                         &def_sites,
                     )
                     .await;
-                    let passed = out.status == TeamStatus::AllPassed;
-                    (render_team(&out), passed)
-                } else {
-                    // #812: the leaf's file scope, forwarded by plan_exec from
-                    // Subtask.context. A missing/empty scope fences nothing —
-                    // byte-identical to the pre-#812 dispatch. Team mode stays
-                    // unfenced until SubtaskSpec grows a files field (#816).
-                    let scope = parse_scope_arg(args);
-                    let out = run_crew(
-                        &pool,
-                        &LocalDispatcher,
-                        &mut ws,
-                        &crew_cfg,
-                        &child_caveats,
-                        task,
-                        &scope,
-                    )
-                    .await;
-                    let passed = out.status == CrewStatus::Passed;
-                    (render_crew(&out), passed)
-                };
+                    let did_land =
+                        out.status == TeamStatus::AllPassed && out.consolidated.is_some();
+                    let landed = out.consolidated.clone().unwrap_or_else(|| {
+                        "✗ team leaves were not consolidated — work not landed".to_string()
+                    });
+                    let report = format!(
+                        "roster: {}\n{}\n{landed}\n--- diff (review) ---\n(each team leaf used an isolated worktree)",
+                        rationale.join("; "),
+                        render_team(&out)
+                    );
+                    return crew_dispatch_result(report, did_land);
+                }
+
+                let id = worktree_id();
+                let mut ws = WorktreeWorkspace::create(&self.dir, &id, base_ref, test_cmd)
+                    .map_err(|e| e.to_string())?;
+                // #812: the leaf's file scope, forwarded by plan_exec from
+                // Subtask.context. A missing/empty scope fences nothing.
+                let scope = parse_scope_arg(args);
+                let out = run_crew(
+                    &pool,
+                    &LocalDispatcher,
+                    &mut ws,
+                    &crew_cfg,
+                    &child_caveats,
+                    task,
+                    &scope,
+                )
+                .await;
+                let passed = out.status == CrewStatus::Passed;
+                let body = render_crew(&out);
                 let diff = ws.diff();
                 // 23.3 — LAND verified work as a git branch: the worktree shares the
                 // base's object store, so the commit + branch ref survive cleanup and
@@ -495,20 +584,13 @@ impl CrewRunner for LocalCrewRunner {
                         crew_coauthor_trailer(&editor_model, &identity)
                     );
                     match ws.commit_to_branch(&format!("crew/{id}"), &name, &email, &message) {
-                        Ok((branch, sha)) => {
-                            // Advance the chain cursor to this landed tip so the
-                            // NEXT leaf forks off it. ONLY on a real land — a
-                            // failed / nothing-to-land leaf leaves the cursor at
-                            // the last GOOD tip.
-                            *self.base_ref.lock().unwrap() = sha.clone();
-                            (
-                                format!(
-                                    "\n✓ LANDED on branch `{branch}` @ {sha} — review with \
+                        Ok((branch, sha)) => (
+                            format!(
+                                "\n✓ LANDED on branch `{branch}` @ {sha} — review with \
                                      `git diff main..{branch}`, then merge with the `git` tool.\n"
-                                ),
-                                true,
-                            )
-                        }
+                            ),
+                            true,
+                        ),
                         Err(e) => (format!("\n⚠ verified but nothing to land: {e}\n"), false),
                     }
                 } else {

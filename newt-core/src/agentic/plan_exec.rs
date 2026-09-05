@@ -37,6 +37,27 @@ pub struct PlanRun {
     /// absent dep, so no progress was possible. Lets a caller tell a dep-stall
     /// from a clean finish.
     pub remaining: Vec<String>,
+    /// The runner's rendered report for the explicit merge of landed leaf
+    /// branches. `None` when no branch artifacts were returned.
+    pub consolidated: Option<String>,
+}
+
+/// Read the stable, human-visible landing marker emitted by crew runners.
+/// Keeping this parser beside the plan executor lets the existing rendered
+/// runner contract carry Git artifacts without introducing another wire type.
+fn landed_artifact(report: &str) -> Option<(String, String)> {
+    let marker = "LANDED on branch `";
+    let start = report.find(marker)? + marker.len();
+    let rest = &report[start..];
+    let branch_end = rest.find('`')?;
+    let branch = rest[..branch_end].to_string();
+    let after_branch = &rest[branch_end + 1..];
+    let sha_start = after_branch.find(" @ ")? + 3;
+    let sha = after_branch[sha_start..]
+        .split_whitespace()
+        .next()?
+        .to_string();
+    Some((branch, sha))
 }
 
 /// Re-grounds a failed leaf from its build error, returning a corrected
@@ -89,6 +110,7 @@ pub async fn run_plan_with_reground(
 ) -> PlanRun {
     let mut dispatched = Vec::new();
     let mut failed = None;
+    let mut consolidated = None;
     let mut reground_used = 0usize;
     // Defense-in-depth bound: a legitimate run dispatches at most one leaf per
     // subtask. A MALFORMED plan with duplicate ids desyncs the cursor —
@@ -109,6 +131,48 @@ pub async fn run_plan_with_reground(
         }
         plan.mark(&id, SubtaskStatus::Running, None);
         let mut args = json!({ "task": task.goal });
+        // The executor owns dependency order, so it supplies placement
+        // explicitly. A runner must never keep a mutable process-local cursor:
+        // two runners can start from the same HEAD and both legitimately land.
+        let deps = plan
+            .subtask(&id)
+            .map(|subtask| subtask.deps.clone())
+            .unwrap_or_default();
+        let dep_artifacts: Vec<(String, String)> = deps
+            .iter()
+            .filter_map(|dep| {
+                let artifact = plan.subtask(dep)?.artifact_ref.as_ref()?;
+                Some((artifact.branch.clone()?, artifact.commit.clone()?))
+            })
+            .collect();
+        let base_ref = match dep_artifacts.as_slice() {
+            [] => "HEAD".to_string(),
+            [(_, commit)] => commit.clone(),
+            many => {
+                let branches: Vec<&str> = many.iter().map(|(branch, _)| branch.as_str()).collect();
+                let merge_args = json!({ "base_ref": "HEAD", "branches": branches });
+                match runner.dispatch("consolidate", &merge_args, parent).await {
+                    Ok(report) => match landed_artifact(&report) {
+                        Some((_, commit)) => commit,
+                        None => {
+                            let error = "dependency consolidation returned no landed tip";
+                            plan.mark(&id, SubtaskStatus::Failed, Some(error.to_string()));
+                            dispatched.push(id);
+                            failed = Some(error.to_string());
+                            break;
+                        }
+                    },
+                    Err(error) => {
+                        let error = format!("dependency consolidation failed: {error}");
+                        plan.mark(&id, SubtaskStatus::Failed, Some(error.clone()));
+                        dispatched.push(id);
+                        failed = Some(error);
+                        break;
+                    }
+                }
+            }
+        };
+        args["base_ref"] = Value::String(base_ref);
         // Forward a plan-authored `verify` ONLY when the leaf's exec caveat
         // permits it. `verify` is a model-authored shell command the runner runs
         // via `sh -c`; forwarding it past a denied exec axis would let a
@@ -130,6 +194,9 @@ pub async fn run_plan_with_reground(
         }
         match runner.dispatch("crew", &args, &task.caveats).await {
             Ok(result) => {
+                if let Some((branch, commit)) = landed_artifact(&result) {
+                    plan.set_artifact_commit(&id, &commit, Some(&branch));
+                }
                 plan.mark(&id, SubtaskStatus::Done, Some(result));
                 dispatched.push(id);
             }
@@ -159,6 +226,25 @@ pub async fn run_plan_with_reground(
             }
         }
     }
+    if failed.is_none() && plan.is_complete() {
+        let branches: Vec<String> = plan
+            .leaves()
+            .iter()
+            .filter_map(|subtask| {
+                subtask
+                    .artifact_ref
+                    .as_ref()
+                    .and_then(|artifact| artifact.branch.clone())
+            })
+            .collect();
+        if !branches.is_empty() {
+            let args = json!({ "base_ref": "HEAD", "branches": branches });
+            match runner.dispatch("consolidate", &args, parent).await {
+                Ok(report) => consolidated = Some(report),
+                Err(error) => failed = Some(format!("consolidation failed: {error}")),
+            }
+        }
+    }
     let remaining: Vec<String> = plan
         .leaves()
         .iter()
@@ -169,10 +255,13 @@ pub async fn run_plan_with_reground(
         // `is_complete()` is vacuously true for a plan with no leaves (an
         // all-branch / parent-cycle plan), so require that work actually ran —
         // unless the plan was genuinely empty (no subtasks at all).
-        complete: plan.is_complete() && (!dispatched.is_empty() || plan.subtasks.is_empty()),
+        complete: failed.is_none()
+            && plan.is_complete()
+            && (!dispatched.is_empty() || plan.subtasks.is_empty()),
         dispatched,
         failed,
         remaining,
+        consolidated,
     }
 }
 
@@ -180,6 +269,7 @@ pub async fn run_plan_with_reground(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
 
     /// One recorded dispatch: `(op, task, verify, scope)`.
@@ -225,6 +315,77 @@ mod tests {
             } else {
                 Ok(format!("landed: {task}"))
             }
+        }
+    }
+
+    /// Models Git ancestry: each dispatched leaf inherits every commit in its
+    /// explicit base, then adds itself. Consolidation unions the named tips.
+    struct GraphRunner {
+        tips: Mutex<HashMap<String, HashSet<String>>>,
+        branches: Mutex<HashMap<String, String>>,
+        consolidated: Mutex<HashSet<String>>,
+    }
+
+    impl GraphRunner {
+        fn new() -> Self {
+            let mut tips = HashMap::new();
+            tips.insert("HEAD".to_string(), HashSet::new());
+            Self {
+                tips: Mutex::new(tips),
+                branches: Mutex::new(HashMap::new()),
+                consolidated: Mutex::new(HashSet::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CrewRunner for GraphRunner {
+        async fn dispatch(
+            &self,
+            op: &str,
+            args: &Value,
+            _caveats: &Caveats,
+        ) -> Result<String, String> {
+            if op == "consolidate" {
+                let branches = args["branches"]
+                    .as_array()
+                    .expect("consolidation receives branches");
+                let merged = {
+                    let branch_tips = self.branches.lock().unwrap();
+                    let tips = self.tips.lock().unwrap();
+                    let mut merged = HashSet::new();
+                    for branch in branches {
+                        let branch = branch.as_str().unwrap();
+                        let tip = branch_tips.get(branch).expect("known branch");
+                        merged.extend(tips.get(tip).expect("known tip").iter().cloned());
+                    }
+                    merged
+                };
+                *self.consolidated.lock().unwrap() = merged;
+                self.tips.lock().unwrap().insert(
+                    "tip-consolidated".to_string(),
+                    self.consolidated.lock().unwrap().clone(),
+                );
+                self.branches.lock().unwrap().insert(
+                    "crew/consolidated".to_string(),
+                    "tip-consolidated".to_string(),
+                );
+                return Ok("LANDED on branch `crew/consolidated` @ tip-consolidated".to_string());
+            }
+
+            let task = args["task"].as_str().unwrap().to_string();
+            let base = args["base_ref"].as_str().unwrap_or("HEAD");
+            let mut tips = self.tips.lock().unwrap();
+            let mut contents = tips.get(base).expect("known base ref").clone();
+            contents.insert(task.clone());
+            let tip = format!("tip-{}", task.replace(' ', "_"));
+            tips.insert(tip.clone(), contents);
+            let branch = format!("crew/{task}");
+            self.branches
+                .lock()
+                .unwrap()
+                .insert(branch.clone(), tip.clone());
+            Ok(format!("LANDED on branch `{branch}` @ {tip}"))
         }
     }
 
@@ -274,6 +435,49 @@ deps = ["b"]
             Some("landed: step c")
         );
         assert!(run.remaining.is_empty(), "clean finish → nothing remaining");
+    }
+
+    #[tokio::test]
+    async fn dependent_leaf_tip_contains_its_dependency() {
+        let mut plan = Plan::from_toml_str(ABC).unwrap();
+        let runner = GraphRunner::new();
+
+        let run = run_plan(&mut plan, &Caveats::top(), &runner).await;
+
+        assert!(run.complete);
+        assert_eq!(
+            runner.tips.lock().unwrap()["tip-step_c"],
+            HashSet::from([
+                "step a".to_string(),
+                "step b".to_string(),
+                "step c".to_string(),
+            ]),
+            "a dependent leaf must fork from its dependency's landed tip"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_head_siblings_have_one_tip_containing_both() {
+        let siblings = r#"
+[[subtask]]
+id = "a"
+instruction = "step a"
+
+[[subtask]]
+id = "b"
+instruction = "step b"
+"#;
+        let mut plan = Plan::from_toml_str(siblings).unwrap();
+        let runner = GraphRunner::new();
+
+        let run = run_plan(&mut plan, &Caveats::top(), &runner).await;
+
+        assert!(run.complete);
+        assert_eq!(
+            *runner.consolidated.lock().unwrap(),
+            HashSet::from(["step a".to_string(), "step b".to_string()]),
+            "the consolidated tip must contain both sibling commits"
+        );
     }
 
     #[tokio::test]

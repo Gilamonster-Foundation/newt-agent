@@ -8,7 +8,7 @@
 use newt_core::{BackendKind, Tier};
 use newt_scheduler::{
     run_team, BackendPool, CrewConfig, Edit, Health, LocalDispatcher, PoolBackend, StaticSource,
-    SubtaskStatus, TeamConfig, TeamStatus, Workspace,
+    SubtaskStatus, TeamConfig, TeamStatus, Workspace, WorkspaceFactory,
 };
 use std::path::PathBuf;
 use std::process::Command;
@@ -65,6 +65,34 @@ impl Workspace for FsWorkspace {
     }
 }
 
+struct FsFactory {
+    root: PathBuf,
+    test_cmd: String,
+    next: usize,
+}
+
+impl WorkspaceFactory for FsFactory {
+    type Leaf = FsWorkspace;
+
+    fn create(&mut self, _subtask: &str) -> Result<Self::Leaf, String> {
+        self.next += 1;
+        let root = self.root.join(format!("leaf-{}", self.next));
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        Ok(FsWorkspace {
+            root,
+            test_cmd: self.test_cmd.clone(),
+        })
+    }
+
+    fn land(&mut self, workspace: Self::Leaf, _subtask: &str) -> Result<String, String> {
+        Ok(workspace.root.display().to_string())
+    }
+
+    fn consolidate(&mut self, branches: &[String]) -> Result<String, String> {
+        Ok(format!("isolated leaves: {}", branches.join(", ")))
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let endpoint = std::env::var("OLLAMA").unwrap_or_else(|_| "http://localhost:11434".to_string());
@@ -94,7 +122,7 @@ async fn main() {
         },
         max_subtasks: 2,
     };
-    let mut ws = FsWorkspace {
+    let mut workspaces = FsFactory {
         root: root.clone(),
         // Default (whole-goal) check; the lead is expected to install a tighter
         // per-subtask `verify` for each step (otherwise this full check stands,
@@ -102,6 +130,7 @@ async fn main() {
         test_cmd: "python3 -c \"from calc import add, mul; assert add(2,3)==5 and \
                    mul(2,3)==6; print('OK')\""
             .to_string(),
+        next: 0,
     };
 
     let goal = "In `calc.py`, implement TWO functions: `add(a, b)` returning a+b, and \
@@ -120,7 +149,7 @@ async fn main() {
     let out = run_team(
         &pool,
         &LocalDispatcher,
-        &mut ws,
+        &mut workspaces,
         &cfg,
         &newt_core::caveats::Caveats::top(),
         goal,
@@ -142,9 +171,8 @@ async fn main() {
         println!("  [{mark}] ({}att) {}", r.attempts, r.subtask);
     }
     println!(
-        "\n== TEAM: {:?} ==  (final calc.py: {:?})",
-        out.status,
-        ws.read("calc.py").map(|c| c.lines().count())
+        "\n== TEAM: {:?} ==  (consolidated: {:?})",
+        out.status, out.consolidated
     );
     std::process::exit(match out.status {
         TeamStatus::AllPassed => 0,

@@ -33,7 +33,9 @@ pub use dispatch::{BackendRuntime, ChatReply, ChatRequest, Dispatcher, LocalDisp
 pub use panel::{run_panel, PanelConfig, PanelOutcome, PanelStatus, Verify, VoiceSpec, Vote};
 pub use probe::{Prober, TcpProber};
 pub use roster::{compose_from_pool, compose_roster, ModelPrior, RosterMode, RosterSpec};
-pub use team::{run_team, SubtaskResult, SubtaskStatus, TeamConfig, TeamOutcome, TeamStatus};
+pub use team::{
+    run_team, SubtaskResult, SubtaskStatus, TeamConfig, TeamOutcome, TeamStatus, WorkspaceFactory,
+};
 
 /// Liveness of a backend.
 ///
