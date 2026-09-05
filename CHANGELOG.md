@@ -9,6 +9,22 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Changed — the denial journal is a chain, and `newt ocap denials` verifies it (#2085)
+
+- **Denial records are content-addressed and linked.** `~/.newt/denial-journal.jsonl`
+  had no address of any kind: a record could be edited, deleted or reordered and
+  nothing could tell. Each record is now a `MerkleNode` whose parent is the
+  previous record's `ContentId` — reusing `event_journal`'s chain machinery
+  rather than copying its shape — with a head ref in `denial-journal.head`.
+- **`newt ocap denials` reports integrity before evidence.** It re-derives the
+  chain and prints either `chain: N record(s) verified, anchored to the stored
+  head` or a `CHAIN BROKEN` block naming the record each break was found at.
+  Removal from the *end* is only detectable against the head ref, and the
+  command says so when there is none.
+- **Migration:** a pre-chain journal is moved to `denial-journal.pre-chain` on
+  the first chained append and a fresh chain starts. The old bytes are kept and
+  the command points at them; they are not parsed by a second decode arm.
+
 ### Fixed — every interrupt press is acknowledged at press time (#2010)
 
 - **Repeated Ctrl-C / Esc is heard, not absorbed.** The 2nd and Nth press used

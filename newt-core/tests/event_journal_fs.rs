@@ -25,7 +25,8 @@
 //! path here is an explicit tempdir, so no process-global is involved.
 
 use newt_core::event_journal::{
-    self, append_to, read_jsonl, resume, verify_chain, ChainBreak, EventKind, Journal, JournalEvent,
+    self, append_to, read_jsonl, resume, verify_chain, ChainBreak, EventKind, Journal,
+    JournalEvent, JournalLine,
 };
 use serial_test::serial;
 use std::path::Path;
@@ -51,7 +52,7 @@ fn a_chain_written_to_a_real_file_verifies_when_read_back() {
         append_to(&mut journal, &path, event(&format!("tool-{i}"))).expect("append");
     }
 
-    let lines = read_jsonl(&body(&path));
+    let lines: Vec<JournalLine> = read_jsonl(&body(&path));
     assert_eq!(lines.len(), 3);
 
     let head = event_journal::read_head(&path).expect("head ref written");
@@ -101,7 +102,7 @@ fn a_second_session_extends_the_chain_it_found() {
     let mut second = resume(&path);
     append_to(&mut second, &path, event("after")).expect("append");
 
-    let lines = read_jsonl(&body(&path));
+    let lines: Vec<JournalLine> = read_jsonl(&body(&path));
     assert_eq!(lines.len(), 2, "one file, one chain");
     let head = event_journal::read_head(&path).expect("head");
     assert_eq!(verify_chain(&lines, Some(&head)), vec![]);
@@ -124,7 +125,7 @@ fn a_lost_head_ref_still_resumes_from_the_last_line() {
     let mut second = resume(&path);
     append_to(&mut second, &path, event("after")).expect("append");
 
-    let lines = read_jsonl(&body(&path));
+    let lines: Vec<JournalLine> = read_jsonl(&body(&path));
     assert_eq!(verify_chain(&lines, None), vec![], "still one chain");
 }
 
@@ -149,7 +150,7 @@ fn deleting_a_line_from_the_real_file_is_caught() {
         .collect();
     std::fs::write(&path, kept.join("\n")).expect("rewrite");
 
-    let lines = read_jsonl(&body(&path));
+    let lines: Vec<JournalLine> = read_jsonl(&body(&path));
     assert_eq!(lines.len(), 3);
     assert!(
         lines
@@ -180,7 +181,7 @@ fn truncating_the_real_file_is_caught_by_the_ref() {
     let kept: Vec<String> = body(&path).lines().take(2).map(str::to_string).collect();
     std::fs::write(&path, kept.join("\n")).expect("rewrite");
 
-    let lines = read_jsonl(&body(&path));
+    let lines: Vec<JournalLine> = read_jsonl(&body(&path));
     assert_eq!(verify_chain(&lines, None), vec![], "valid on its own terms");
     assert_eq!(
         verify_chain(&lines, Some(&head)),
@@ -201,5 +202,5 @@ fn the_parent_directory_is_created_on_demand() {
     let mut journal = Journal::new();
     append_to(&mut journal, &path, event("tool")).expect("append");
 
-    assert_eq!(read_jsonl(&body(&path)).len(), 1);
+    assert_eq!(read_jsonl::<JournalEvent>(&body(&path)).len(), 1);
 }

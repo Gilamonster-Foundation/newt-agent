@@ -14,6 +14,19 @@
 //! a new one beside them. Adding a third journal is the sprawl the reuse
 //! discipline exists to prevent.
 //!
+//! That sentence is now load-bearing rather than aspirational: the chain
+//! machinery here — [`Journal`], [`JournalLine`], [`verify_chain`],
+//! [`read_jsonl`], [`resume`], [`append_to`], [`read_head`] — is generic over
+//! the payload, and [`denial_journal`](crate::denial_journal) is its first
+//! adopter (`JournalLine<DenialRecord>`). A migrating journal reuses this
+//! code; it does not copy the shape. `JournalEvent` remains the default
+//! payload, and what stays event-specific is only the vocabulary
+//! ([`EventKind`]), the path ([`journal_path`]) and the arming
+//! ([`JOURNAL_PATH_ENV`]) — the things that differ per stream.
+//!
+//! When a third adopter arrives (`settings_receipt` is next), moving these
+//! types to their own module is a rename, not a redesign.
+//!
 //! # What a chain buys, stated exactly
 //!
 //! A per-row address detects an **edited** row: re-derive the id from the row's
@@ -41,6 +54,7 @@
 //! records what it can and proceeds.
 
 use content_addressable::{canonical, ContentAddressable, ContentError, ContentId};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -155,27 +169,19 @@ impl ContentAddressable for JournalEvent {
 ///
 /// The id covers the payload **and** the parent link, which is what makes the
 /// line's position in the chain part of what it claims.
+///
+/// Generic over the payload so a migrating journal reuses this line rather
+/// than declaring its own; `T` defaults to [`JournalEvent`], and
+/// `denial_journal` uses `JournalLine<DenialRecord>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JournalLine {
+#[serde(bound(serialize = "T: Serialize", deserialize = "T: DeserializeOwned"))]
+pub struct JournalLine<T = JournalEvent> {
     /// The [`MerkleNode`]'s `ContentId`, canonical string form.
     pub id: String,
-    pub node: MerkleNode<JournalEvent>,
+    pub node: MerkleNode<T>,
 }
 
-impl JournalLine {
-    /// Re-derive this line's address from the node and compare it to the claim.
-    ///
-    /// Per-line only — it says nothing about the line's neighbours. Use
-    /// [`verify_chain`] for that; a file of individually intact lines can still
-    /// be missing half its history.
-    #[must_use]
-    pub fn is_intact(&self) -> bool {
-        ContentId::from_str(&self.id)
-            .ok()
-            .and_then(|id| self.node.verify(&id).ok())
-            .unwrap_or(false)
-    }
-
+impl<T> JournalLine<T> {
     /// The single parent this line claims, if it claims exactly one.
     ///
     /// The journal is a chain, so a line has zero parents (genesis) or one. A
@@ -188,6 +194,21 @@ impl JournalLine {
             (Some(only), None) => Some(only),
             _ => None,
         }
+    }
+}
+
+impl<T: Serialize> JournalLine<T> {
+    /// Re-derive this line's address from the node and compare it to the claim.
+    ///
+    /// Per-line only — it says nothing about the line's neighbours. Use
+    /// [`verify_chain`] for that; a file of individually intact lines can still
+    /// be missing half its history.
+    #[must_use]
+    pub fn is_intact(&self) -> bool {
+        ContentId::from_str(&self.id)
+            .ok()
+            .and_then(|id| self.node.verify(&id).ok())
+            .unwrap_or(false)
     }
 
     /// The JSON line this is stored as. Pure — the fs write is separate so the
@@ -206,6 +227,11 @@ impl JournalLine {
 /// Deliberately holds **only** the head. A journal that accumulated its lines
 /// in memory would quietly become a second copy of the file and drift from it;
 /// the file is the record, and this is the one pointer needed to extend it.
+///
+/// Not generic: a head is a `ContentId` whatever the payload was, so
+/// [`append`](Self::append) takes the payload type instead. That is what lets
+/// [`resume`] read a head off any journal file without knowing what the stream
+/// records.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Journal {
     head: Option<ContentId>,
@@ -237,7 +263,7 @@ impl Journal {
     /// Propagates a canonical-encoding failure. The head is read but not
     /// written until the id is in hand, so a failed append leaves the journal
     /// exactly where it was rather than breaking the chain for the next one.
-    pub fn append(&mut self, event: JournalEvent) -> Result<JournalLine, ContentError> {
+    pub fn append<T: Serialize>(&mut self, event: T) -> Result<JournalLine<T>, ContentError> {
         let node = match self.head {
             Some(parent) => MerkleNode::new(event, [parent]),
             None => MerkleNode::genesis(event),
@@ -283,7 +309,10 @@ pub enum ChainBreak {
 /// the file can prove about itself; the truncation case is then not checked,
 /// and is honestly not reported as passing.
 #[must_use]
-pub fn verify_chain(lines: &[JournalLine], expected_head: Option<&str>) -> Vec<ChainBreak> {
+pub fn verify_chain<T: Serialize>(
+    lines: &[JournalLine<T>],
+    expected_head: Option<&str>,
+) -> Vec<ChainBreak> {
     let mut breaks = Vec::new();
 
     for (index, line) in lines.iter().enumerate() {
@@ -331,7 +360,7 @@ pub fn verify_chain(lines: &[JournalLine], expected_head: Option<&str>) -> Vec<C
 /// from the audit: it becomes a [`ChainBreak::BrokenLink`] at the line after
 /// it, because dropping it from the list does not drop it from the chain.
 #[must_use]
-pub fn read_jsonl(body: &str) -> Vec<JournalLine> {
+pub fn read_jsonl<T: DeserializeOwned>(body: &str) -> Vec<JournalLine<T>> {
     body.lines()
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| serde_json::from_str(line).ok())
@@ -391,11 +420,17 @@ pub fn read_head(path: &Path) -> Option<String> {
 /// the ref existed, or a lost ref — the last line of the journal is used
 /// instead, so a resumed session extends the existing chain rather than
 /// starting a second one beside it.
+///
+/// Payload-agnostic: the fallback reads the last line's `id` through
+/// `serde_json::Value`, so this works for any journal's file without being
+/// told what the stream records.
 #[must_use]
 pub fn resume(path: &Path) -> Journal {
     let head = read_head(path).or_else(|| {
         let body = std::fs::read_to_string(path).ok()?;
-        read_jsonl(&body).last().map(|line| line.id.clone())
+        read_jsonl::<serde_json::Value>(&body)
+            .last()
+            .map(|line| line.id.clone())
     });
     head.and_then(|id| ContentId::from_str(&id).ok())
         .map_or_else(Journal::new, Journal::resuming_from)
@@ -416,11 +451,11 @@ pub fn resume(path: &Path) -> Journal {
 /// ref pointing at a line that was never written, which is indistinguishable
 /// from deletion. **Given a choice of which way to be wrong, be wrong in the
 /// direction that over-reports.**
-pub fn append_to(
+pub fn append_to<T: Serialize>(
     journal: &mut Journal,
     path: &Path,
-    event: JournalEvent,
-) -> anyhow::Result<JournalLine> {
+    event: T,
+) -> anyhow::Result<JournalLine<T>> {
     let line = journal.append(event)?;
 
     if let Some(parent) = path.parent() {
@@ -521,7 +556,7 @@ mod tests {
 
     #[test]
     fn an_empty_chain_with_no_head_is_intact() {
-        assert_eq!(verify_chain(&[], None), vec![]);
+        assert_eq!(verify_chain::<JournalEvent>(&[], None), vec![]);
     }
 
     // --- the tamper suite: each case the per-row check cannot see ---
@@ -678,7 +713,7 @@ mod tests {
             lines[0].render_line().expect("render"),
             lines[2].render_line().expect("render"),
         );
-        let read = read_jsonl(&body);
+        let read: Vec<JournalLine> = read_jsonl(&body);
         assert_eq!(read.len(), 2);
         assert_eq!(
             verify_chain(&read, None),
