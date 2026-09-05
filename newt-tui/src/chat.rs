@@ -3101,51 +3101,18 @@ fn session_body(
                                 .map_or((rest, ""), |(a, b)| (a, b.trim()));
                             match (verb, name) {
                                 ("", _) => {
-                                    if mcp.statuses.is_empty() {
-                                        print_newt(
-                                            "no MCP servers configured — add [[mcp_servers]] to ~/.newt/config.toml",
-                                            color,
-                                            verbose,
-                                        );
-                                    } else {
-                                        print_newt("MCP servers:", color, verbose);
-                                        for (n, st) in &mcp.statuses {
-                                            let line = match st {
-                                                crate::mcp::McpStatus::Connected {
-                                                    tools,
-                                                    confinement,
-                                                    net,
-                                                } => {
-                                                    if mcp.is_muted(n) {
-                                                        format!(
-                                                            "  {n}  ⏸ muted this session ({tools} tools still connected — /mcp on {n}){}{}",
-                                                            confinement.note(),
-                                                            net.note()
-                                                        )
-                                                    } else {
-                                                        format!(
-                                                            "  {n}  ✓ connected ({tools} tools){}{}",
-                                                            confinement.note(),
-                                                            net.note()
-                                                        )
-                                                    }
-                                                }
-                                                crate::mcp::McpStatus::Skipped(r) => {
-                                                    let hint = if r.contains("401")
-                                                        || r.to_lowercase().contains("auth")
-                                                    {
-                                                        format!(" — `newt auth {n}` to re-authenticate")
-                                                    } else {
-                                                        String::new()
-                                                    };
-                                                    format!("  {n}  ✗ skipped: {r}{hint}")
-                                                }
-                                                crate::mcp::McpStatus::Disabled => {
-                                                    format!("  {n}  ⏸ disabled in config (/mcp enable {n})")
-                                                }
-                                            };
-                                            println!("{line}");
-                                        }
+                                    // #2009 PR10a2: one rendering, in
+                                    // `McpState::status_lines`, so the verb
+                                    // and the cockpit's MCP view cannot
+                                    // disagree about whether a server is muted.
+                                    let mut lines = mcp.status_lines().into_iter();
+                                    if let Some(first) = lines.next() {
+                                        print_newt(&first, color, verbose);
+                                    }
+                                    for line in lines {
+                                        println!("{line}");
+                                    }
+                                    if !mcp.statuses.is_empty() {
                                         print_newt(
                                             "usage: /mcp [on|off|enable|disable|auth] [name]",
                                             color,
