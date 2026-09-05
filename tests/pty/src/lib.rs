@@ -68,11 +68,30 @@ impl Pty {
         unsafe {
             let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
             assert!(master >= 0, "posix_openpt failed");
+            // CLOSE-ON-EXEC, and it is load-bearing (#2086). Tests in one
+            // binary run in PARALLEL, and `libc` does not set this for us, so
+            // without it every child ANY test spawns inherits every other live
+            // pty's descriptors. A child holding a copy of another test's slave
+            // means that test's own close is not the LAST close, its master
+            // never reaches EOF, and `screen_to_eof` waits for something that
+            // cannot happen — proved by
+            // `an_unrelated_childs_inherited_descriptors_do_not_block_eof`,
+            // where an unrelated `sleep` held EOF for its whole lifetime.
+            //
+            // `posix_openpt` takes no `O_CLOEXEC` portably, so it is set after.
+            // Harmless for the child that SHOULD have a descriptor: `dup2` into
+            // a stdio slot clears the flag, which is exactly how `slave_stdio`
+            // hands one over.
+            assert_eq!(
+                libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC),
+                0,
+                "FD_CLOEXEC on the pty master failed"
+            );
             assert_eq!(libc::grantpt(master), 0, "grantpt failed");
             assert_eq!(libc::unlockpt(master), 0, "unlockpt failed");
             let name = libc::ptsname(master);
             assert!(!name.is_null(), "ptsname failed");
-            let slave = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
+            let slave = libc::open(name, libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
             assert!(slave >= 0, "opening the pty slave failed");
 
             let ws = libc::winsize {
@@ -318,10 +337,18 @@ impl Pty {
     /// fd on drop, so a child wanting both stdin and stdout on the pty needs
     /// two calls. Duplicating also keeps our own `slave` alive for `Drop`.
     pub fn slave_stdio(&self) -> std::process::Stdio {
-        // SAFETY: `dup` returns a fresh owned descriptor for a slave fd this
-        // struct keeps open for its whole lifetime, so the `File` is the sole
-        // owner of the duplicate.
-        let file = unsafe { std::fs::File::from_raw_fd(libc::dup(self.slave)) };
+        // `F_DUPFD_CLOEXEC`, not `dup`: a plain duplicate is inheritable, so a
+        // duplicate still pending here would leak into a SIBLING test's child
+        // and hold this pty open (#2086 — see the note in `open`). The child
+        // this one is destined for still gets it, because `dup2` into a stdio
+        // slot clears the flag.
+        //
+        // SAFETY: the duplicate is a fresh owned descriptor for a slave fd this
+        // struct keeps open for its whole lifetime, so the `File` is its sole
+        // owner.
+        let duplicate = unsafe { libc::fcntl(self.slave, libc::F_DUPFD_CLOEXEC, 0) };
+        assert!(duplicate >= 0, "duplicating the pty slave failed");
+        let file = unsafe { std::fs::File::from_raw_fd(duplicate) };
         std::process::Stdio::from(file)
     }
 }
@@ -336,6 +363,20 @@ pub fn signal_winch(pid: u32) {
 }
 
 impl Drop for Pty {
+    /// Close the slave, let the drain stop, and only THEN release the master.
+    ///
+    /// **The order is the point** (#2086). Closing the master while the drain
+    /// thread is still blocked reading it frees that descriptor NUMBER while a
+    /// live thread is using it: the next `Pty::open` on another test thread is
+    /// handed the same number, and the orphaned reader goes on reading — now
+    /// from a stranger's terminal, stealing its bytes into a buffer nobody will
+    /// read. That is how one test's `SECOND` appeared in another test's screen
+    /// while its own first read came back empty, and it is a far nastier
+    /// failure than the timeout that triggered it, because it corrupts a test
+    /// that did nothing wrong.
+    ///
+    /// Closing the slave first gives the reader its EOF, so it is gone before
+    /// the master's number can be recycled.
     fn drop(&mut self) {
         unsafe {
             // `screen_to_eof` may already have closed the slave to reach EOF.
@@ -343,9 +384,32 @@ impl Drop for Pty {
             // whatever unrelated file inherited the number.
             if !self.slave_closed {
                 libc::close(self.slave);
+                self.slave_closed = true;
             }
-            libc::close(self.master);
         }
+        // Wait for the drain to notice. Bounded, because a child that outlived
+        // this harness still holds a slave and EOF may never come.
+        let stopped = matches!(
+            self.reader_done
+                .recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        );
+        if let Some(reader) = self.reader.take() {
+            if stopped {
+                let _ = reader.join();
+            }
+        }
+        if stopped {
+            // SAFETY: the reader has returned, so nothing is using this
+            // descriptor and its number is safe to recycle.
+            unsafe { libc::close(self.master) };
+        }
+        // Otherwise the master is deliberately LEAKED. A test process that
+        // leaks one descriptor is inert; a test process that recycles one out
+        // from under a live reader corrupts an unrelated test, which is the
+        // defect above. The leak is bounded by the process, and reaching here
+        // at all means a child outlived its harness — worth fixing in the test,
+        // not worth risking silent cross-talk to tidy up.
     }
 }
 
@@ -651,6 +715,67 @@ mod tests {
         assert!(screen.contains("EARLY"), "waiting ate the head: {screen:?}");
 
         assert!(wait(&mut child, Duration::from_secs(10)).is_some());
+    }
+
+    /// **An unrelated child must not hold this pty open** (#2086 CI).
+    ///
+    /// The harness's descriptors are opened by `libc`, which does NOT set
+    /// close-on-exec. Tests in one binary run in PARALLEL, so every child any
+    /// of them spawns inherits every OTHER live pty's master and slave — and a
+    /// child holding a copy of this slave means our close is not the last
+    /// close, so the master never reaches EOF and [`Pty::screen_to_eof`] waits
+    /// for something that cannot happen.
+    ///
+    /// That is what CI's coverage job hit: one `screen_to_eof` timed out
+    /// against a sibling test's `sleep`, and the panic then dropped a `Pty`
+    /// whose drain thread was still blocked on the master — freeing that
+    /// descriptor number for reuse while an orphaned reader kept reading it,
+    /// which is how one test's `SECOND` surfaced in another's screen.
+    ///
+    /// Deterministic on purpose: it spawns the interloper itself instead of
+    /// waiting for a parallel test to collide, so it fails on any machine
+    /// rather than only a loaded one.
+    #[test]
+    fn an_unrelated_childs_inherited_descriptors_do_not_block_eof() {
+        let pty = Pty::open();
+        let mut writer = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("printf DONE-WRITING")
+            .stdout(pty.slave_stdio())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the writer");
+
+        // An interloper with NOTHING to do with this pty, alive across the
+        // read below — the shape of any sibling test's child.
+        let mut interloper = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the interloper");
+
+        assert!(
+            wait(&mut writer, Duration::from_secs(10)).is_some_and(|s| s.success()),
+            "the writer never finished"
+        );
+
+        let started = std::time::Instant::now();
+        let screen = pty.screen_to_eof();
+        let _ = interloper.kill();
+        let _ = interloper.wait();
+
+        assert!(
+            screen.contains("DONE-WRITING"),
+            "the writer's bytes must survive: {screen:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "EOF was blocked by an unrelated child holding an inherited slave \
+             descriptor — took {:?}",
+            started.elapsed()
+        );
     }
 
     /// A needle that never comes is a bounded FALSE, not a hang.
