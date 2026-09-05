@@ -21,6 +21,10 @@ serde_json.workspace = true
 # #695: a per-role-dispatch wall-clock timeout (tokio::time) so a hung generation
 # can't hang the crew. Promoted from dev-deps to a regular dep for run_role.
 tokio = { workspace = true }
+reqwest.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
 
 [features]
 default = []
