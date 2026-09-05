@@ -3525,14 +3525,52 @@ fn session_body(
                             println!();
                             continue;
                         }
-                        let mut lines = permissions_command_lines(
+                        let status = permissions_command_lines(
                             &permission_state,
                             prompt_permissions_enabled,
                             permission_log_path.as_deref(),
                             // #307: surface the active posture's preset clamp.
                             active_posture.as_ref(),
-                        )
-                        .into_iter();
+                        );
+                        // #2009 PR10a / #1979: bare `/permissions` on a rich
+                        // TTY opens the chooser, the way `/backends` does. It
+                        // renders THESE lines — the verb's own words plus the
+                        // audit tail — so the panel and the command cannot
+                        // disagree about what the posture is.
+                        //
+                        // Gated on a real terminal: §3.3's rule is that reads
+                        // PRINT on a pipe and never open, so the text path
+                        // below still serves `newt solve`, the eval harness
+                        // and wyvern unchanged.
+                        #[cfg(feature = "rich-tui")]
+                        if perm_tail.is_empty()
+                            && std::io::IsTerminal::is_terminal(&std::io::stdout())
+                        {
+                            let mut rows = status.clone();
+                            if let Some(path) = permission_log_path.as_deref() {
+                                rows.push(String::new());
+                                rows.extend(crate::permission_audit_lines(path, 50));
+                            }
+                            let window = surface
+                                .open_panel(crate::permissions_panel::PermissionsPanel::height());
+                            let mut panel = crate::permissions_panel::PermissionsPanel::new(rows);
+                            match crate::panel::drive(
+                                &mut panel,
+                                crate::permissions_panel::PermissionsPanel::height(),
+                                window.as_ref(),
+                            ) {
+                                Ok(_) => {}
+                                Err(e) => print_newt(
+                                    &format!("permissions panel error: {e}"),
+                                    color,
+                                    verbose,
+                                ),
+                            }
+                            surface.save_history();
+                            println!();
+                            continue;
+                        }
+                        let mut lines = status.into_iter();
                         if let Some(first) = lines.next() {
                             print_newt(&first, color, verbose);
                         }
