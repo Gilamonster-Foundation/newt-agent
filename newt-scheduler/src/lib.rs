@@ -28,7 +28,7 @@ mod panel;
 mod probe;
 mod roster;
 mod team;
-pub use crew::{run_crew, CrewConfig, CrewOutcome, CrewStatus, Edit, Workspace};
+pub use crew::{run_crew, CrewConfig, CrewOutcome, CrewStatus, Edit, RoleStep, Workspace};
 pub use dispatch::{BackendRuntime, ChatReply, ChatRequest, Dispatcher, LocalDispatcher};
 pub use panel::{run_panel, PanelConfig, PanelOutcome, PanelStatus, Verify, VoiceSpec, Vote};
 pub use probe::{Prober, TcpProber};
