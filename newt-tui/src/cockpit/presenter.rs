@@ -1936,6 +1936,30 @@ mod terminal_acceptance {
                 })
                 .expect("the presenter lends the panel its rows");
             painter.join().expect("panel painter");
+            // #1959 (same shape as the cursor-restore and notice-commit waits
+            // above): `join` proves the painter's `write` returned, not that
+            // the responder thread — the pty master's sole reader — has drained
+            // those bytes into `painted`. This is what failed on #2069, a PR
+            // that touched a command parser and the slash registry and has no
+            // path to cockpit terminal ownership: the delta held the
+            // reservation scroll and the chat repaint that precedes the panel,
+            // and simply stopped before the panel body.
+            //
+            // `TERMINAL` is the LAST word the panel paints — ratatui emits
+            // cells in row-major order — so once it has landed, every earlier
+            // byte of this round is present by stream ordering: the other three
+            // words and the presenter's reservation `MoveTo` alike. Waiting on
+            // the last evidence changes WHEN the snapshot is safe to read, not
+            // WHAT any assertion below demands of it.
+            assert!(
+                tty.wait_for_painted_after(
+                    before_panel,
+                    "TERMINAL",
+                    std::time::Duration::from_secs(2)
+                ),
+                "the panel's bytes never reached the real terminal (waited 2s): {:?}",
+                &tty.painted()[before_panel..]
+            );
             let panel_delta = tty.painted()[before_panel..].to_string();
             // Ratatui emits a cursor move per painted run, so the body arrives
             // as words rather than one string. What matters is that they
