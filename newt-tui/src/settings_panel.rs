@@ -51,6 +51,10 @@ use crate::settings_form::{Field, ValueSpace};
 /// presenter gives what it can spare) — that is the point at which this grows
 /// tabs, and not before: today's six rows fit, and paging them behind a tab
 /// strip would be navigation cost for no gain.
+/// Index of the Session section in the shell — the one whose outcome
+/// `commit()` belongs to.
+const SESSION_SECTION: usize = 0;
+
 pub(crate) fn panel_height() -> u16 {
     // Every field, plus the model dial and the backend door.
     u16::try_from(Field::ALL.len() + 2)
@@ -480,6 +484,11 @@ pub(crate) fn run(
     backend: Option<String>,
     models: Option<Vec<ModelChoice>>,
     current_model: String,
+    // The Permissions section's rows — `permissions_command_lines` plus the
+    // audit tail, produced by the caller because they are the caller's state.
+    // Passed as LINES rather than as the state itself, so this function never
+    // learns what a posture is.
+    permissions: Vec<String>,
     window: Option<crate::session_worker::PanelWindow>,
 ) -> std::io::Result<Outcome> {
     let mut panel = SettingsPanel::new(backend, models, current_model);
@@ -497,6 +506,11 @@ pub(crate) fn run(
     //
     // The panel is still owned HERE, so `commit()` and `picked_model()` below
     // read it exactly as before; the shell borrows it for the loop.
+    // #2009 PR10b: Permissions is a HOSTED section, not a link. It is
+    // read-only — status and the audit — so it has no commit path, and §5.1's
+    // LINK rule is about a commit path that is out of reach. The half that
+    // writes (the posture field, grants, decision reopen) waits for #1999.
+    let mut permissions_panel = crate::permissions_panel::PermissionsPanel::new(permissions);
     let (applied, linked) = {
         let mut shell = crate::shell::Shell::new(vec![
             crate::shell::Section {
@@ -506,14 +520,28 @@ pub(crate) fn run(
                 body: crate::shell::Body::Screen(&mut panel),
             },
             crate::shell::Section {
+                name: "Permissions",
+                accel: 'p',
+                summary: "posture · prompted decisions · audit".to_string(),
+                body: crate::shell::Body::Screen(&mut permissions_panel),
+            },
+            crate::shell::Section {
                 name: "Backends",
                 accel: 'b',
                 summary: "choose · edit · add · remove".to_string(),
                 body: crate::shell::Body::Link,
             },
         ]);
-        let applied = crate::panel::drive(&mut shell, panel_height(), window.as_ref())?;
-        (applied, shell.linked().is_some())
+        crate::panel::drive(&mut shell, panel_height(), window.as_ref())?;
+        // **This section's flag, not the shell's.** With a second hosted
+        // section the two are no longer the same question: `commit()` below
+        // belongs to Session, and asking "did anything apply" would let a
+        // future writing section put Session's messages on screen. Correct by
+        // construction rather than by Permissions happening never to apply.
+        (
+            shell.section_applied(SESSION_SECTION),
+            shell.linked().is_some(),
+        )
     };
     if linked {
         // The index's Backends row and the panel's own door row are one act:
