@@ -51,10 +51,18 @@
 //! not by which is convenient.
 //!
 //! `RawContentId`, `MerkleNode<T>`, and `NodeStore` reach further than the
-//! frozen core this workspace pins (`Cargo.toml` takes the default features
-//! only, and merkle/store are `unstable-*`-gated), so a conversion to one of
-//! those is a dependency decision as well as a code change — raise it rather
-//! than assuming it is available.
+//! frozen core this workspace pins, so a conversion to one of those is a
+//! dependency decision as well as a code change — raise it rather than
+//! assuming it is available.
+//!
+//! **`unstable-merkle` is now ON** (#2085), and that was raised rather than
+//! assumed. The event journal needs a node addressed over its payload AND its
+//! parents, because that is the only thing that makes a deleted or reordered
+//! row detectable; nothing in the default feature set provides it, and the
+//! alternative was hand-rolling the chain — the exact defect this file counts.
+//! `unstable-store` remains OFF: `NodeStore` has no consumer yet, and turning
+//! on a feature for a type nobody calls is how an unstable surface becomes
+//! load-bearing by accident.
 
 use std::collections::BTreeMap;
 
