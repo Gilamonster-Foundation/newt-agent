@@ -152,15 +152,15 @@ impl<'a> Shell<'a> {
 
     /// Whether the section at `index` applied something.
     ///
-    /// `#[cfg(test)]` **for now**: with Backends in LINK mode there is only one
-    /// hosted section, so nothing in production has two outcomes to tell
-    /// apart yet. The per-section tracking is still the right model — a single
-    /// flag would tell a chooser that a dial change elsewhere was its own — and
-    /// this accessor lights up when a second panel is hosted rather than
-    /// linked. Shipping it `pub(crate)` before then would be the speculative
-    /// API this crate keeps deleting.
-    #[cfg(test)]
-    fn section_applied(&self, index: usize) -> bool {
+    /// **Live since #2009 PR10b**, which added the second hosted section.
+    /// `settings_panel::run` asks whether SESSION applied, because `commit()`
+    /// is Session's; "did anything apply" would let a future writing section
+    /// put Session's messages on screen.
+    ///
+    /// It was `#[cfg(test)]` until a caller genuinely had two outcomes to tell
+    /// apart — the ledger's third "done" marker, and it is the first of the
+    /// three to fall.
+    pub(crate) fn section_applied(&self, index: usize) -> bool {
         self.applied.get(index).copied().unwrap_or(false)
     }
 
@@ -450,6 +450,52 @@ mod tests {
         shell.key(Key::Enter);
         assert_eq!(shell.key(Key::Esc), Flow::Stay, "back to the index");
         assert_eq!(shell.key(Key::Esc), Flow::Close(false), "now it leaves");
+    }
+
+    /// **A read-only section's visit is not an edit** (#2009 PR10b).
+    ///
+    /// The case the per-section flag exists for, now that a second section is
+    /// hosted: an operator opens Session and changes nothing, then reads the
+    /// Permissions audit and leaves. Asking the shell "did anything apply"
+    /// still answers no here — but it answers no by luck, because the
+    /// read-only section never reports `true`. Asking SESSION answers no
+    /// because Session is the thing that did not change, which stays correct
+    /// when a writing section joins the index.
+    #[test]
+    fn a_read_only_sections_visit_is_not_attributed_to_the_editing_one() {
+        let mut session = FakeSection::new(Flow::Close(false));
+        let mut audit = FakeSection::new(Flow::Close(false));
+        let mut shell = Shell::new(vec![
+            section("Session", 's', &mut session),
+            section("Permissions", 'p', &mut audit),
+        ]);
+
+        shell.key(Key::Char('p'));
+        shell.key(Key::Enter); // read the audit, leave
+        assert!(!shell.section_applied(0), "Session was never opened");
+        assert!(!shell.section_applied(1), "and a read applies nothing");
+        assert_eq!(shell.key(Key::Esc), Flow::Close(false));
+    }
+
+    /// ...and the converse: an edit in Session survives a detour through a
+    /// read-only section, and is still attributed to Session.
+    #[test]
+    fn an_edit_survives_a_detour_through_a_read_only_section() {
+        let mut session = FakeSection::new(Flow::Close(true));
+        let mut audit = FakeSection::new(Flow::Close(false));
+        let mut shell = Shell::new(vec![
+            section("Session", 's', &mut session),
+            section("Permissions", 'p', &mut audit),
+        ]);
+
+        shell.key(Key::Char('s'));
+        shell.key(Key::Enter); // edit and close
+        shell.key(Key::Char('p'));
+        shell.key(Key::Enter); // detour through the audit
+
+        assert!(shell.section_applied(0), "the edit is still Session's");
+        assert!(!shell.section_applied(1), "the detour claimed nothing");
+        assert_eq!(shell.key(Key::Esc), Flow::Close(true));
     }
 
     /// **A LINK row closes the shell and names itself** (§3.5 answer 3).

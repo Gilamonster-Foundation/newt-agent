@@ -5855,10 +5855,25 @@ fn session_body(
                             .map(|c| c.display_model().to_string())
                             .unwrap_or_default();
                         let window = surface.open_panel(settings_panel::panel_height());
+                        // #2009 PR10b: the Permissions section's rows, built
+                        // HERE because this is where the state is — the same
+                        // lines `/permissions` prints, so the section and the
+                        // verb cannot disagree about the posture.
+                        let mut permission_rows = permissions_command_lines(
+                            &permission_state,
+                            prompt_permissions_enabled,
+                            permission_log_path.as_deref(),
+                            active_posture.as_ref(),
+                        );
+                        if let Some(path) = permission_log_path.as_deref() {
+                            permission_rows.push(String::new());
+                            permission_rows.extend(crate::permission_audit_lines(path, 50));
+                        }
                         match settings_panel::run(
                             active_backend_name(&cfg),
                             models,
                             current_model,
+                            permission_rows,
                             window,
                         ) {
                             Ok(outcome) => {

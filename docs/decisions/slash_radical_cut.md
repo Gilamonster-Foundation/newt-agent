@@ -272,7 +272,7 @@ deferral has one cause and one exit.
 |---|---|---|---|
 | Session | PR8 | **hosted** | its panel already owned every value it writes |
 | Backends | PR9 | **LINK** | its commit path reads ~12 `run_chat` locals: cfg re-resolution, the wire target, the pinned choice, the degraded-pin state |
-| Permissions (read half) | PR10a | **HOSTABLE — no LINK needed** | a read-only section has NO commit path, so the precondition does not apply |
+| Permissions (read half) | PR10a/b | **HOSTED** | a read-only section has NO commit path, so the precondition does not apply |
 | Permissions (write half) | PR10c | deferred | the posture field, grants and decision-reopen need `active_posture` and the grant path in core |
 | MCP | PR10a2 | **BLOCKED** | no chooser yet; `mcp` is a live connection handle, not a value that relocates |
 | Context | PR7 | n/a — fields, not a section | the two live knobs relocated cleanly (`compaction`, `detail`) |
@@ -382,8 +382,12 @@ open-ended:
    writer and one resolver.
 2. `Body::Link` has no members left — a `Body` enum with one variant is the
    signal, and deleting the variant is the last commit of that work.
-3. `shell::section_applied` stops being `#[cfg(test)]`, because two hosted
-   sections finally have outcomes to tell apart.
+3. ~~`shell::section_applied` stops being `#[cfg(test)]`, because two hosted
+   sections finally have outcomes to tell apart.~~ **Done in PR10b.** The
+   Permissions section is hosted, so `settings_panel::run` asks whether SESSION
+   applied rather than whether anything did. The first of the three markers to
+   fall — and it fell to a **read-only** section rather than to the relocation,
+   which is the correction above in miniature.
 
 Until (1), a slice that *could* host a section but has not relocated its state
 **must** take LINK mode and add a row above. Silently duplicating a commit path
