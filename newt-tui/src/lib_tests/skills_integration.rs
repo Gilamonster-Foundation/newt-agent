@@ -567,6 +567,54 @@ fn recall_test_store() -> (
     (state, workspace, store)
 }
 
+/// **`/tree` and `/plan` retire under the same per-subcommand rule** (#2009
+/// PR12).
+///
+/// `/roadmap` reads AND mutates, so retiring its two aliases wholesale would
+/// either break `/tree` on a pipe (§3.3 protects reads) or let `/plan done`
+/// mutate through a shim that is supposed to be dying. The door is decided per
+/// subcommand, exactly as `/conversation`'s was.
+#[test]
+fn the_roadmap_read_subcommands_are_the_ones_a_retired_door_may_serve() {
+    use super::roadmap_subcommand_reads as reads;
+
+    // Reads: `/tree` and a bare `/plan` land here, and they keep working.
+    assert!(reads(""), "bare /roadmap renders");
+    assert!(reads("show"));
+    assert!(reads("tree"), "the word /tree retired into");
+    assert!(reads("show 3"), "an argument does not make it a write");
+    assert!(reads("list"));
+
+    // Mutators: reachable through `/roadmap`, never through a retired door.
+    for sub in [
+        "new x",
+        "use 3",
+        "add task x",
+        "next",
+        "bind",
+        "done",
+        "drive",
+        "import p",
+    ] {
+        assert!(!reads(sub), "`{sub}` mutates");
+    }
+    // `export` writes a file, so it is not a read for this purpose either.
+    assert!(!reads("export json"));
+}
+
+/// `tree` is a REAL subcommand, not just a pointer.
+///
+/// The retirement message names `/roadmap tree`, and a pointer to something
+/// unparseable is worse than no pointer — it is confident. This is the half
+/// that would have been missed: the doc said `/roadmap tree` while the code
+/// mapped `/tree` to `/roadmap show`.
+#[test]
+fn roadmap_tree_parses_as_the_view_it_names() {
+    let show = super::parse_roadmap_command("/roadmap show").expect("show parses");
+    let tree = super::parse_roadmap_command("/roadmap tree").expect("tree parses");
+    assert_eq!(show, tree, "tree IS show — one view, two names");
+}
+
 /// **A retired READ still reads; a retired MUTATOR redirects** (#2009 PR6b).
 ///
 /// `/conversation` is both, so the rule is applied per SUBCOMMAND. Retiring
@@ -856,7 +904,9 @@ fn roadmap_commands_parse_expected_actions() {
 #[test]
 fn help_lists_the_roadmap_and_tree_commands() {
     assert!(help_lines().iter().any(|l| l.contains("/roadmap")));
-    assert!(help_lines().iter().any(|l| l.contains("/tree")));
+    // #2009 PR12: `/tree` retired into `/roadmap tree`, which is a real
+    // subcommand now — the fold kept the word rather than costing it.
+    assert!(help_lines().iter().any(|l| l.contains("/roadmap tree")));
 }
 
 #[test]

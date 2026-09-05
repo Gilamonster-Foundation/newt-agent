@@ -1368,7 +1368,9 @@ fn command_help_covers_every_listed_command_and_folds_aliases() {
             "/help {retired} lost its page; a retired verb keeps its pointer"
         );
     }
-    assert!(help_lines().iter().any(|l| l.contains("/plan")));
+    // #2009 PR12: `/plan` was an alias that forwarded to `/roadmap`; it
+    // retired, and the corpus teaches the verb it forwarded to.
+    assert!(help_lines().iter().any(|l| l.contains("/roadmap")));
     // #1665: /psyche is the one advertised dial surface; the retired top-level
     // /tenacity + /cognition lines are gone from the corpus (their help PAGES
     // survive as redirects for /help tenacity muscle memory).

@@ -608,12 +608,13 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Keep,
         Receipt::None_,
     ),
-    cmd(
+    cmd_on(
         "tree",
         &[],
         Family::Session,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/roadmap tree"),
     ),
     cmd(
         "undo-lock",
@@ -752,12 +753,13 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Absorb,
         Receipt::Missing,
     ),
-    cmd(
+    cmd_on(
         "plan",
         &[],
         Family::Tuning,
-        Disposition::Absorb,
-        Receipt::Missing,
+        Disposition::Keep,
+        Receipt::None_,
+        Surface::Retired("/roadmap"),
     ),
     cmd(
         "posture",
@@ -1008,6 +1010,26 @@ mod tests {
     /// Walked from the dispatch, not from `help_lines()`: the help had
     /// already drifted by eleven undocumented commands when this was armed.
     ///
+    /// # 44/54 → 42/52: `/roadmap` absorbs `/tree` and `/plan` (#2009 PR12)
+    ///
+    /// The dispatch had already folded them — `/tree` ran `/roadmap show` and
+    /// `/plan` ran `/roadmap` — so what this slice does is make the REGISTER
+    /// say what the code had been doing, and give the fold the retirement rule
+    /// the others got.
+    ///
+    /// # 26 → 25: `/plan` never wrote either
+    ///
+    /// Its row was `Absorb`/`Missing`, as though it set something. It was an
+    /// alias that FORWARDED to `/roadmap` — `chat.rs` rewrote the line and
+    /// handed it on. A row that cannot write never owed a receipt, so this is
+    /// the same truthing shape as `/memory` and `/loadout` (PR3) and
+    /// `/retrieval` (PR11): the debt was never its own.
+    ///
+    /// Four of the six reductions so far are this — a row that was counted
+    /// because nobody had read it, not because it stopped writing. That is
+    /// worth watching: the remaining 25 should be checked for the same before
+    /// anyone assumes they all need an event journal to clear.
+    ///
     /// # 57/72 → 44/54: the navigator folds into `/nav` (#2009 PR11)
     ///
     /// **Thirteen commands and five aliases, in one slice** — the largest
@@ -1089,14 +1111,14 @@ mod tests {
     #[test]
     fn the_registered_surface_only_shrinks() {
         assert!(
-            slash_commands().count() <= 44,
+            slash_commands().count() <= 42,
             "the slash surface GREW to {} commands. #1981 is a reduction: a \
              new command needs an argument for why it is not a field of \
              /settings or a subcommand of an existing verb",
             slash_commands().count()
         );
         assert!(
-            slash_tokens().len() <= 54,
+            slash_tokens().len() <= 52,
             "the slash surface GREW to {} tokens",
             slash_tokens().len()
         );
@@ -1355,7 +1377,7 @@ mod tests {
             .filter(|c| matches!(c.receipt, Receipt::Missing))
             .count();
         assert!(
-            missing <= 26,
+            missing <= 25,
             "{missing} state-mutating commands record nothing durable — that \
              is more than when #1981 armed this. A new state mutator needs a \
              receipt destination, not another silent write"

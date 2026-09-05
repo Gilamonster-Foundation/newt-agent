@@ -5383,8 +5383,16 @@ fn session_body(
                         || slash_body.starts_with("plan ")
                         || slash_body == "tree"
                     {
+                        // #2009 PR12: `/tree` and `/plan` are retired doors
+                        // onto `/roadmap`. A retired READ still reads; a
+                        // retired MUTATOR redirects and changes nothing, so a
+                        // habitual `/plan done` cannot half-work through a
+                        // shim that is supposed to be dying.
+                        let retired_door = slash_body == "tree"
+                            || slash_body == "plan"
+                            || slash_body.starts_with("plan ");
                         let cmd = if slash_body == "tree" {
-                            "/roadmap show".to_string()
+                            "/roadmap tree".to_string()
                         } else if slash_body == "plan" {
                             "/roadmap".to_string()
                         } else if let Some(rest) = slash_body.strip_prefix("plan ") {
@@ -5392,6 +5400,28 @@ fn session_body(
                         } else {
                             task.to_string()
                         };
+                        if retired_door {
+                            // `strip_prefix`, not `trim_start_matches('/')`:
+                            // this parses a line THIS code just built, it is
+                            // not a dispatch interception, and the site pin
+                            // counts the latter. Using the interception shape
+                            // here would inflate that count for a call that
+                            // intercepts nothing.
+                            let rest = cmd.strip_prefix('/').unwrap_or(&cmd);
+                            let rest = rest.strip_prefix("roadmap").unwrap_or(rest).trim();
+                            if !crate::roadmap_subcommand_reads(rest) {
+                                print_newt(
+                                    &format!(
+                                        "/{slash_body} is retired — use `{cmd}` (nothing changed)"
+                                    ),
+                                    color,
+                                    verbose,
+                                );
+                                surface.save_history();
+                                println!();
+                                continue;
+                            }
+                        }
                         match conversation_store.as_ref() {
                             Some(store) => {
                                 match handle_roadmap_command(
