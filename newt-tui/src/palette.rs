@@ -598,53 +598,97 @@ mod tests {
     }
 
     /// Review finding 1 (#1674): bare `|` alternation in NON-first tokens is
-    /// usage notation for argument forms, never command text. Replays the
-    /// real corpus rows that carry it and pins their EXACT (cmd, args), plus
-    /// the bracketed-pipe rows that must NOT trigger the rule.
+    /// usage notation for argument forms, never command text.
+    ///
+    /// # Driven by synthetic lines, not the live corpus (#2009 PR11)
+    ///
+    /// It used to replay real rows — `/export json|markdown` and the
+    /// `/compare` row. The navigator fold moved those under `/nav` and, in
+    /// doing so, showed the rule's edge: with a TWO-WORD command, truncating
+    /// to the first token throws away the half that says which command it is
+    /// (`/nav export` became `/nav`). Their alternation is now written inside
+    /// a placeholder — `<json|markdown>` — which is both what it always meant
+    /// and what keeps the command intact.
+    ///
+    /// That left the live corpus with no bare-pipe row at all, so replaying it
+    /// would assert nothing. The rule still matters — the next person to write
+    /// a help line can reintroduce the shape — so it is exercised directly.
+    /// `parse_help_corpus` is a pure function over lines, which is what makes
+    /// that possible without a fixture.
     #[test]
-    fn corpus_replay_bare_pipe_alternation_stays_out_of_commands() {
-        let pin = |cmd: &str| {
-            corpus_entries()
-                .iter()
-                .find(|e| e.cmd == cmd)
-                .unwrap_or_else(|| panic!("no corpus entry for {cmd}"))
-                .args
-                .clone()
+    fn bare_pipe_alternation_stays_out_of_commands() {
+        let parse = |line: &str| {
+            let entries = parse_help_corpus(&[line]);
+            assert_eq!(entries.len(), 1, "one row in, one entry out: {line}");
+            (entries[0].cmd.clone(), entries[0].args.clone())
         };
-        // "json|markdown" is two argument forms of plain /export — the old
-        // parse invented the non-dispatchable literal "/export json|markdown".
-        assert_eq!(pin("/export"), "json|markdown");
-        // The /compare row is three alternative argument forms of /compare.
-        assert_eq!(pin("/compare"), "semantic lexical | turn A B | index");
-        // Pipes INSIDE `[…]`/`<…>` are ordinary placeholders: subcommand cmds
-        // survive and the placeholder stays in args.
+
+        // Bare alternation after a ONE-WORD command: only the first token is
+        // the command. Parsing "/export json|markdown" as a single command
+        // invented a literal nothing could dispatch.
         assert_eq!(
-            pin("/context compaction"),
-            "[headroom_aware|message_count|reset]"
+            parse("  /export json|markdown - export the ledger"),
+            ("/export".to_string(), "json|markdown".to_string())
         );
-        // #1667 gave `/backend` a BARE panel row that now leads the corpus, and
-        // the palette dedupes by command with the first occurrence winning (see
-        // the test below) — so the palette's `/backend` is the argument-less
-        // panel form. The pipe rule itself still governs the text row, pinned
-        // directly here so #1674's finding stays covered by a real corpus line.
-        assert_eq!(pin("/backend"), "");
-        let text_form = parse_help_corpus(&[
-            "  /backend <openai|ollama> [model] - text form: switch the wire kind",
-        ]);
-        assert_eq!(text_form[0].cmd, "/backend");
-        assert_eq!(text_form[0].args, "<openai|ollama> [model]");
-        // The pipe-GROUP rule (first token) still expands alternatives.
-        assert_eq!(pin("/callers"), "<sym>");
-        assert_eq!(pin("/hierarchy"), "<sym>");
-        // Quoted placeholder ends the command.
-        assert_eq!(pin("/prompt set"), "\"<template>\"");
-        // Review finding 6: /help is a dispatchable, completable entry.
-        assert_eq!(pin("/help"), "[command]");
+        assert_eq!(
+            parse("  /compare semantic lexical | turn A B | index - compare"),
+            (
+                "/compare".to_string(),
+                "semantic lexical | turn A B | index".to_string()
+            )
+        );
+
+        // Pipes INSIDE `<…>` / `[…]` are ordinary placeholders: the leading
+        // literal words stay the command, which is how a two-word command
+        // survives its own argument alternation.
+        assert_eq!(
+            parse("  /nav export <json|markdown> - export the ledger"),
+            ("/nav export".to_string(), "<json|markdown>".to_string())
+        );
+        assert_eq!(
+            parse("  /context compaction [headroom_aware|message_count|reset] - policy"),
+            (
+                "/context compaction".to_string(),
+                "[headroom_aware|message_count|reset]".to_string()
+            )
+        );
     }
 
-    /// Review finding 8 (#1674): `help_lines()` carries `/search` twice (a
-    /// corpus wart kept verbatim for `/help`); the palette dedupes by command,
-    /// first occurrence winning.
+    /// The live corpus keeps its promise: every navigator verb is a TWO-WORD
+    /// `/nav <verb>` entry, not thirteen rows collapsed onto `/nav`.
+    ///
+    /// This is the half that would have gone unnoticed — the fold's whole
+    /// point is that the verbs stay discoverable, and a palette showing
+    /// `/nav` thirteen times would have looked fine in the diff.
+    #[test]
+    fn the_navigator_verbs_are_each_their_own_palette_entry() {
+        let entries = corpus_entries();
+        for verb in [
+            "def",
+            "text",
+            "uses",
+            "tests",
+            "map",
+            "callers",
+            "callees",
+            "implementations",
+            "hierarchy",
+            "type",
+            "impact",
+            "retrieval",
+            "compare",
+            "export",
+        ] {
+            let want = format!("/nav {verb}");
+            assert!(
+                entries.iter().any(|e| e.cmd == want),
+                "`{want}` is not its own palette entry"
+            );
+        }
+        // ...and the bare verb is offered too, for "what can this do?".
+        assert!(entries.iter().any(|e| e.cmd == "/nav"));
+    }
+
     #[test]
     fn duplicate_corpus_commands_collapse_to_the_first_occurrence() {
         let dupes = parse_help_corpus(&[

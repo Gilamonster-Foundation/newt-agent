@@ -40,11 +40,27 @@ pub(crate) enum RetrievalView {
 #[must_use]
 pub(crate) fn parse_nav_command(input: &str) -> Option<Result<NavCommand, String>> {
     let body = input.trim().trim_start_matches('/').trim();
+    // **`/nav <verb>` is the same parser** (#2009 PR11). Thirteen top-level
+    // verbs retire into one; stripping the `nav` here means the retired verb
+    // and its replacement are the SAME LINE by the time the match below sees
+    // it, so they cannot drift — the shape `/status` and `/resume` folds used.
+    //
+    // Whole-word: `/navigate foo` is not `/nav igate foo`.
+    let body = match body.strip_prefix("nav") {
+        Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => rest.trim(),
+        _ => body,
+    };
     let (verb, rest) = match body.split_once(char::is_whitespace) {
         Some((v, r)) => (v, r.trim()),
         None => (body, ""),
     };
     let help = |msg: &'static str| Some(Ok(NavCommand::Help(msg)));
+    // Bare `/nav` lists what it can do rather than falling through to
+    // "unknown command" — the verb is new, so it is the one an operator will
+    // type first with nothing after it.
+    if verb.is_empty() {
+        return help(NAV_USAGE);
+    }
     match verb {
         "def" | "goto" => {
             if rest.is_empty() || rest == "help" {
@@ -120,6 +136,12 @@ pub(crate) fn parse_nav_command(input: &str) -> Option<Result<NavCommand, String
         _ => None,
     }
 }
+
+/// What bare `/nav` prints. One string, so the usage line and the verb match
+/// below cannot disagree about what exists.
+const NAV_USAGE: &str = "usage: /nav <verb> — def · text · uses · tests · map · \
+callers · callees · implementations · hierarchy · type · impact · retrieval · \
+compare · export  (each takes /nav <verb> help)";
 
 fn parse_retrieval(rest: &str) -> Result<NavCommand, String> {
     if rest.is_empty() || rest == "help" {
