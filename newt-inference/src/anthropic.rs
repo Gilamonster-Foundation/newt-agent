@@ -43,6 +43,13 @@ impl AnthropicBackend {
         }
     }
 
+    /// Use a caller-owned HTTP client, preserving its connection pool across
+    /// backend values constructed for separate requests.
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
+    }
+
     /// Attach the API key, sent as `x-api-key` on every request. `None`/empty
     /// leaves the backend unauthenticated (the server will 401 — surfaced,
     /// never masked).

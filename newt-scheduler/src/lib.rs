@@ -29,7 +29,7 @@ mod probe;
 mod roster;
 mod team;
 pub use crew::{run_crew, CrewConfig, CrewOutcome, CrewStatus, Edit, Workspace};
-pub use dispatch::{ChatReply, ChatRequest, Dispatcher, LocalDispatcher};
+pub use dispatch::{BackendRuntime, ChatReply, ChatRequest, Dispatcher, LocalDispatcher};
 pub use panel::{run_panel, PanelConfig, PanelOutcome, PanelStatus, Verify, VoiceSpec, Vote};
 pub use probe::{Prober, TcpProber};
 pub use roster::{compose_from_pool, compose_roster, ModelPrior, RosterMode, RosterSpec};
@@ -58,6 +58,10 @@ pub struct PoolBackend {
     pub name: String,
     /// Endpoint URL.
     pub endpoint: String,
+    /// Maximum concurrent requests issued to this named endpoint.
+    pub slots: usize,
+    /// Shared connection pool and concurrency permits for this endpoint name.
+    runtime: BackendRuntime,
     /// Wire protocol.
     pub kind: BackendKind,
     /// Tiers this backend serves. Empty ⇒ serves any tier.
@@ -80,6 +84,8 @@ impl PoolBackend {
         Self {
             name: name.into(),
             endpoint: endpoint.into(),
+            slots: 1,
+            runtime: BackendRuntime::new(1),
             kind,
             tiers: Vec::new(),
             models: Vec::new(),
@@ -87,6 +93,14 @@ impl PoolBackend {
             api_key: None,
             model_path: None,
         }
+    }
+
+    /// Builder: maximum concurrent requests issued to this named endpoint.
+    #[must_use]
+    pub fn with_slots(mut self, slots: usize) -> Self {
+        self.slots = slots;
+        self.runtime = BackendRuntime::new(slots);
+        self
     }
 
     /// Builder: the local GGUF model file for an `embedded` backend.
@@ -153,6 +167,7 @@ impl From<&BackendConfig> for PoolBackend {
             c.endpoint.clone(),
             c.kind.unwrap_or(BackendKind::Ollama),
         )
+        .with_slots(c.slots.get())
         .with_tiers(c.tiers.clone())
         .with_models(c.effective_model().map(str::to_string))
         .with_api_key(c.resolve_api_key())

@@ -3116,6 +3116,14 @@ pub struct BackendConfig {
     /// backend — which runs in-process and has no URL — can omit it.
     #[serde(default)]
     pub endpoint: String,
+    /// Maximum concurrent inference requests issued to this named endpoint.
+    /// One is the safe default for single-slot local servers; operators may
+    /// opt into parallel dispatch when the backend is configured for it.
+    #[serde(
+        default = "default_backend_slots",
+        skip_serializing_if = "backend_slots_are_default"
+    )]
+    pub slots: BackendSlots,
     /// The model this backend serves. OPTIONAL (#1128, epic #1126): an unset
     /// model means "the server dictates" — Phase B's probe/adopt fills it in at
     /// session start. Configs that set it keep exactly today's behavior; read
@@ -3203,6 +3211,35 @@ pub struct BackendConfig {
     /// [`BackendProvenance`]. Written by `newt setup`; never read at runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<BackendProvenance>,
+}
+
+/// A positive backend concurrency limit. The wrapper keeps both Serde input
+/// and programmatic [`BackendConfig::default`] from producing a zero-slot
+/// endpoint that can never make progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BackendSlots(std::num::NonZeroUsize);
+
+impl BackendSlots {
+    /// The configured positive slot count.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+impl Default for BackendSlots {
+    fn default() -> Self {
+        Self(std::num::NonZeroUsize::MIN)
+    }
+}
+
+fn default_backend_slots() -> BackendSlots {
+    BackendSlots::default()
+}
+
+fn backend_slots_are_default(slots: &BackendSlots) -> bool {
+    *slots == default_backend_slots()
 }
 
 impl BackendConfig {

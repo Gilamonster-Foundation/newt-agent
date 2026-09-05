@@ -17,6 +17,33 @@ use newt_core::{BackendKind, Tier};
 use newt_inference::local::{LocalOllamaBackend, LocalVllmBackend};
 use newt_inference::InferenceBackend;
 
+/// Shared transport state for one configured backend name.
+///
+/// Pool entries clone this value when they are copied into a scheduler, keeping
+/// one connection pool and one concurrency ceiling for that endpoint.
+#[derive(Debug, Clone)]
+pub struct BackendRuntime {
+    client: reqwest::Client,
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl BackendRuntime {
+    pub(crate) fn new(slots: usize) -> Self {
+        assert!(slots > 0, "backend slots must be greater than zero");
+        Self {
+            client: reqwest::Client::new(),
+            permits: std::sync::Arc::new(tokio::sync::Semaphore::new(slots)),
+        }
+    }
+
+    async fn acquire(&self) -> anyhow::Result<tokio::sync::SemaphorePermit<'_>> {
+        self.permits
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("backend concurrency semaphore was closed"))
+    }
+}
+
 pub use newt_inference::{ChatReply, ChatRequest};
 
 /// The swappable dispatch strategy: run one role turn on a selected backend.
@@ -49,9 +76,14 @@ impl Dispatcher for LocalDispatcher {
         model: &str,
         req: ChatRequest,
     ) -> anyhow::Result<ChatReply> {
+        // RAII is load-bearing here: success, transport errors, and cancellation
+        // by the caller's timeout all drop the permit and unblock the endpoint.
+        let _permit = backend.runtime.acquire().await?;
+        let client = backend.runtime.client.clone();
         match backend.kind {
             BackendKind::Ollama => {
                 LocalOllamaBackend::new(backend.endpoint.clone(), model)
+                    .with_client(client)
                     // Ollama Cloud bearer; LAN backends carry no key.
                     .with_api_key(backend.api_key.clone())
                     .complete(req)
@@ -62,6 +94,7 @@ impl Dispatcher for LocalDispatcher {
             // can run on a HOSTED LLM, not just local Ollama.
             BackendKind::Openai => {
                 LocalVllmBackend::new(backend.endpoint.clone(), model)
+                    .with_client(client)
                     .with_api_key(backend.api_key.clone())
                     .complete(req)
                     .await
@@ -70,6 +103,7 @@ impl Dispatcher for LocalDispatcher {
             // `x-api-key` header, so a crew/team can run on hosted Claude.
             BackendKind::Anthropic => {
                 newt_inference::AnthropicBackend::new(backend.endpoint.clone(), model)
+                    .with_client(client)
                     .with_api_key(backend.api_key.clone())
                     .complete(req)
                     .await

@@ -1245,6 +1245,26 @@ fn backend_api_axis_defaults_and_parses() {
 }
 
 #[test]
+fn backend_slots_default_to_one_and_require_a_positive_value() {
+    let defaulted: BackendConfig =
+        toml::from_str("endpoint=\"http://h:1\"\nmodel=\"m\"\n").unwrap();
+    assert_eq!(defaulted.slots.get(), 1);
+    assert!(
+        !toml::to_string(&defaulted).unwrap().contains("slots"),
+        "the default should not bloat existing generated drop-ins"
+    );
+
+    let parallel: BackendConfig =
+        toml::from_str("endpoint=\"http://h:1\"\nmodel=\"m\"\nslots=3\n").unwrap();
+    assert_eq!(parallel.slots.get(), 3);
+    assert!(toml::to_string(&parallel).unwrap().contains("slots = 3"));
+
+    assert!(
+        toml::from_str::<BackendConfig>("endpoint=\"http://h:1\"\nmodel=\"m\"\nslots=0\n").is_err()
+    );
+}
+
+#[test]
 fn discovery_defaults_cover_localhost_unboxing() {
     // #1130: absent [discovery] seeds the localhost sweep — ollama's port
     // plus the vLLM range (several ports = several one-model instances).
