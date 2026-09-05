@@ -48,7 +48,34 @@ pub(crate) struct Section<'a> {
     pub(crate) name: &'static str,
     pub(crate) accel: char,
     pub(crate) summary: String,
-    pub(crate) screen: &'a mut dyn Screen,
+    pub(crate) body: Body<'a>,
+}
+
+/// What is behind a section row.
+pub(crate) enum Body<'a> {
+    /// A panel the shell drives in place.
+    Screen(&'a mut dyn Screen),
+    /// **LINK mode** (§3.5 answer 3): the row is in the index, but entering it
+    /// CLOSES the shell and asks the caller to open the existing surface.
+    ///
+    /// The doc keeps this as "a live declared fallback", and §5.1 of
+    /// `slash_radical_cut.md` is the running account of it being SPENT — which
+    /// sections are linked, why, and what unblocks each. A slice that could
+    /// host a section but has not relocated its state must take LINK mode and
+    /// add a row there; silently duplicating a commit path to claim a section
+    /// is the outcome that ledger exists to prevent.
+    ///
+    /// **The exit is one body of work, not a cleanup item.** Every linked
+    /// section unblocks on #1999's relocation: moving the state its commit path
+    /// reads out of `run_chat` and into core, the way `/markdown`, `/mode`,
+    /// `compaction` and `detail` each moved ONE value. These paths are a dozen
+    /// apiece. When it is done, this variant has no members left, and deleting
+    /// it is the last commit of that work. The Backends commit path reads a dozen `run_chat`
+    /// locals — cfg re-resolution, the wire target, the pinned choice — so
+    /// hosting the panel inside the shell would mean either relocating all of
+    /// them or duplicating the commit block. The index entry and the receipts
+    /// survive; only the single surface waits.
+    Link,
 }
 
 /// What the operator is looking at.
@@ -66,10 +93,18 @@ pub(crate) struct Shell<'a> {
     sections: Vec<Section<'a>>,
     view: View,
     cursor: ListCursor,
-    /// Sticky across sections: the shell reports "something was applied" if
-    /// ANY section applied, because the operator's edits are not undone by
-    /// their leaving through the index.
-    applied: bool,
+    /// **Per section, not one flag for the shell** (#2009 PR9).
+    ///
+    /// Each panel's outcome is read by its own caller —
+    /// `SettingsPanel::commit()`, `backend_panel::finish(.., applied, ..)` —
+    /// and each needs to know whether ITS section applied. A single bool
+    /// would tell the backend panel that a dial change in Session was its own,
+    /// which is how a chooser reports a switch nobody asked for.
+    ///
+    /// Sticky per section: leaving through the index does not undo an edit.
+    applied: Vec<bool>,
+    /// The LINK row the operator chose, if any. Read after `drive` returns.
+    linked: Option<usize>,
     /// **An index of one is not an index.**
     ///
     /// With a single section the shell opens straight into it and closes when
@@ -91,7 +126,11 @@ const VISIBLE: usize = 9;
 impl<'a> Shell<'a> {
     pub(crate) fn new(sections: Vec<Section<'a>>) -> Self {
         let len = sections.len();
-        let pass_through = len == 1;
+        // A lone LINK row is not a pass-through: there is nothing to open
+        // in place, and starting "inside" it would close the shell before the
+        // operator saw anything.
+        let pass_through =
+            len == 1 && matches!(sections.first().map(|s| &s.body), Some(Body::Screen(_)));
         Self {
             sections,
             view: if pass_through {
@@ -100,20 +139,29 @@ impl<'a> Shell<'a> {
                 View::Index
             },
             cursor: ListCursor::new(len, VISIBLE, 0),
-            applied: false,
+            applied: vec![false; len],
+            linked: None,
             pass_through,
         }
     }
 
-    /// Whether any section applied something.
+    /// Whether ANY section applied something — what `drive` returns.
+    fn any_applied(&self) -> bool {
+        self.applied.iter().any(|a| *a)
+    }
+
+    /// Whether the section at `index` applied something.
     ///
-    /// `#[cfg(test)]`: production reads this from `drive`'s own return value —
-    /// the shell reports it through `Flow::Close(applied)` like every other
-    /// panel, so a second accessor would be a second answer to one question.
-    /// The tests below want it without running a terminal.
+    /// `#[cfg(test)]` **for now**: with Backends in LINK mode there is only one
+    /// hosted section, so nothing in production has two outcomes to tell
+    /// apart yet. The per-section tracking is still the right model — a single
+    /// flag would tell a chooser that a dial change elsewhere was its own — and
+    /// this accessor lights up when a second panel is hosted rather than
+    /// linked. Shipping it `pub(crate)` before then would be the speculative
+    /// API this crate keeps deleting.
     #[cfg(test)]
-    fn applied(&self) -> bool {
-        self.applied
+    fn section_applied(&self, index: usize) -> bool {
+        self.applied.get(index).copied().unwrap_or(false)
     }
 
     /// The indices matching the active filter, in index order.
@@ -140,8 +188,19 @@ impl<'a> Shell<'a> {
     }
 
     fn enter(&mut self, index: usize) -> Flow {
+        // A LINK row does not open in place: it closes the shell and lets the
+        // caller open the surface it names.
+        if matches!(self.sections[index].body, Body::Link) {
+            self.linked = Some(index);
+            return Flow::Close(self.any_applied());
+        }
         self.view = View::Section(index);
         Flow::Stay
+    }
+
+    /// The LINK row the operator chose, if any.
+    pub(crate) fn linked(&self) -> Option<usize> {
+        self.linked
     }
 
     /// Key handling for the index and the filter line.
@@ -157,7 +216,7 @@ impl<'a> Shell<'a> {
                     self.cursor = ListCursor::new(self.sections.len(), VISIBLE, 0);
                     Flow::Stay
                 } else {
-                    Flow::Close(self.applied)
+                    Flow::Close(self.any_applied())
                 }
             }
             Key::Up => {
@@ -233,7 +292,9 @@ impl Screen for Shell<'_> {
             // The section draws the WHOLE region: it is a panel that has
             // always drawn its own chrome, and re-framing it here would put a
             // border inside a border.
-            self.sections[index].screen.draw(frame);
+            if let Body::Screen(screen) = &self.sections[index].body {
+                screen.draw(frame);
+            }
             return;
         }
 
@@ -277,16 +338,22 @@ impl Screen for Shell<'_> {
         let View::Section(index) = self.view else {
             return self.index_key(key);
         };
-        match self.sections[index].screen.key(key) {
+        let Body::Screen(screen) = &mut self.sections[index].body else {
+            // A LINK row is never the open view — `enter` closes instead.
+            return Flow::Close(self.any_applied());
+        };
+        match screen.key(key) {
             Flow::Stay => Flow::Stay,
             // **A section closing returns to the INDEX, not out of the shell.**
             // The panel's own Esc means "leave this panel"; one level up is
             // where that lands. Whether it applied is remembered — leaving
             // through the index does not undo an edit.
             Flow::Close(applied) => {
-                self.applied |= applied;
+                if let Some(slot) = self.applied.get_mut(index) {
+                    *slot |= applied;
+                }
                 if self.pass_through {
-                    return Flow::Close(self.applied);
+                    return Flow::Close(self.any_applied());
                 }
                 self.view = View::Index;
                 Flow::Stay
@@ -336,7 +403,16 @@ mod tests {
             name,
             accel,
             summary: String::new(),
-            screen,
+            body: Body::Screen(screen),
+        }
+    }
+
+    fn link<'a>(name: &'static str, accel: char) -> Section<'a> {
+        Section {
+            name,
+            accel,
+            summary: String::new(),
+            body: Body::Link,
         }
     }
 
@@ -374,6 +450,63 @@ mod tests {
         shell.key(Key::Enter);
         assert_eq!(shell.key(Key::Esc), Flow::Stay, "back to the index");
         assert_eq!(shell.key(Key::Esc), Flow::Close(false), "now it leaves");
+    }
+
+    /// **A LINK row closes the shell and names itself** (§3.5 answer 3).
+    ///
+    /// The row is in the index — that is the point of LINK mode — but entering
+    /// it hands back to the caller instead of opening in place, because the
+    /// surface it names still owns state the shell cannot reach.
+    #[test]
+    fn a_link_row_closes_the_shell_and_reports_which_row() {
+        let mut a = FakeSection::new(Flow::Stay);
+        let mut shell = Shell::new(vec![section("Session", 's', &mut a), link("Backends", 'b')]);
+
+        assert_eq!(shell.linked(), None);
+        assert_eq!(shell.key(Key::Char('b')), Flow::Close(false));
+        assert_eq!(shell.linked(), Some(1), "the caller learns WHICH link");
+    }
+
+    /// A link carries an earlier section's applied flag out with it — walking
+    /// on to another surface does not discard the edit already made.
+    #[test]
+    fn a_link_row_carries_out_what_an_earlier_section_applied() {
+        let mut a = FakeSection::new(Flow::Close(true));
+        let mut shell = Shell::new(vec![section("Session", 's', &mut a), link("Backends", 'b')]);
+
+        shell.key(Key::Enter); // open Session
+        shell.key(Key::Enter); // the section applies and closes
+        assert!(shell.section_applied(0));
+        assert_eq!(shell.key(Key::Char('b')), Flow::Close(true));
+    }
+
+    /// A shell whose only row is a LINK still shows the index: passing through
+    /// would close before the operator saw anything.
+    #[test]
+    fn a_lone_link_row_is_not_a_pass_through() {
+        let shell = Shell::new(vec![link("Backends", 'b')]);
+        assert_eq!(shell.view, View::Index);
+    }
+
+    /// **A section's applied flag is its own** — the property that lets each
+    /// caller read its own panel's outcome.
+    #[test]
+    fn applied_is_tracked_per_section() {
+        let mut a = FakeSection::new(Flow::Close(false));
+        let mut b = FakeSection::new(Flow::Close(true));
+        let mut shell = Shell::new(vec![
+            section("Session", 's', &mut a),
+            section("Backends", 'b', &mut b),
+        ]);
+
+        shell.key(Key::Char('b'));
+        shell.key(Key::Enter);
+        assert!(!shell.section_applied(0), "Session applied nothing");
+        assert!(shell.section_applied(1), "Backends did");
+        assert!(
+            !shell.section_applied(99),
+            "an absent section applied nothing"
+        );
     }
 
     /// **An index of one is not an index.** A single-section shell IS the
@@ -416,16 +549,22 @@ mod tests {
 
         shell.key(Key::Char('s'));
         shell.key(Key::Enter); // the section applies and closes
-        assert!(shell.applied());
+        assert!(shell.section_applied(0));
 
-        // A second section that applies nothing must not clear it.
+        // A second section that applies nothing must not clear it — and must
+        // not CLAIM it either: the flag belongs to the section that earned it.
         shell.key(Key::Char('b'));
         shell.key(Key::Enter);
+        assert!(shell.section_applied(0), "one section's edit is its own");
         assert!(
-            shell.applied(),
-            "one section's edit is not another's to undo"
+            !shell.section_applied(1),
+            "and is not attributed to the section that applied nothing"
         );
-        assert_eq!(shell.key(Key::Esc), Flow::Close(true));
+        assert_eq!(
+            shell.key(Key::Esc),
+            Flow::Close(true),
+            "the shell reports any"
+        );
     }
 
     /// Accelerators open a section from the index without moving the cursor.
@@ -568,7 +707,7 @@ mod tests {
                 name: "Session",
                 accel: 's',
                 summary: "dials, editor, reasoning".to_string(),
-                screen: &mut a,
+                body: Body::Screen(&mut a),
             },
             section("Backends", 'b', &mut b),
         ]);
