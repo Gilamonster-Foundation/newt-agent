@@ -51,6 +51,22 @@ use crate::settings_form::{Field, ValueSpace};
 /// presenter gives what it can spare) — that is the point at which this grows
 /// tabs, and not before: today's six rows fit, and paging them behind a tab
 /// strip would be navigation cost for no gain.
+/// The cockpit's sections: name, accelerator, and the one-line summary the
+/// index shows.
+///
+/// **Data, not four literals inline in `run`.** The names and accelerators are
+/// vocabulary — the thing an operator learns — so they live in one place that
+/// a test can walk. The bodies cannot join them (a `Body::Screen` borrows a
+/// panel for the loop), which is exactly why the half that CAN be data is.
+///
+/// Order is the index order, and `SESSION_SECTION` indexes into it.
+const SECTIONS: &[(&str, char, &str)] = &[
+    ("Session", 's', "dials, editor, reasoning, prompt"),
+    ("Permissions", 'p', "posture · prompted decisions · audit"),
+    ("Audit", 'a', "settings receipts · does each still verify"),
+    ("Backends", 'b', "choose · edit · add · remove"),
+];
+
 /// Index of the Session section in the shell — the one whose outcome
 /// `commit()` belongs to.
 const SESSION_SECTION: usize = 0;
@@ -480,6 +496,20 @@ impl Screen for SettingsPanel {
 /// # Errors
 ///
 /// The terminal could not be taken, built, polled, read or repainted.
+/// Build the `i`-th section from [`SECTIONS`] around a body.
+///
+/// The vocabulary comes from the table; only the body is supplied here, so a
+/// renamed section cannot rename in one place and not the other.
+fn section(i: usize, body: crate::shell::Body<'_>) -> crate::shell::Section<'_> {
+    let (name, accel, summary) = SECTIONS[i];
+    crate::shell::Section {
+        name,
+        accel,
+        summary: summary.to_string(),
+        body,
+    }
+}
+
 pub(crate) fn run(
     backend: Option<String>,
     models: Option<Vec<ModelChoice>>,
@@ -518,30 +548,10 @@ pub(crate) fn run(
     let mut audit_panel = crate::lines_panel::LinesPanel::new("audit", audit);
     let (applied, linked) = {
         let mut shell = crate::shell::Shell::new(vec![
-            crate::shell::Section {
-                name: "Session",
-                accel: 's',
-                summary: "dials, editor, reasoning, prompt".to_string(),
-                body: crate::shell::Body::Screen(&mut panel),
-            },
-            crate::shell::Section {
-                name: "Permissions",
-                accel: 'p',
-                summary: "posture · prompted decisions · audit".to_string(),
-                body: crate::shell::Body::Screen(&mut permissions_panel),
-            },
-            crate::shell::Section {
-                name: "Audit",
-                accel: 'a',
-                summary: "settings receipts · does each still verify".to_string(),
-                body: crate::shell::Body::Screen(&mut audit_panel),
-            },
-            crate::shell::Section {
-                name: "Backends",
-                accel: 'b',
-                summary: "choose · edit · add · remove".to_string(),
-                body: crate::shell::Body::Link,
-            },
+            section(0, crate::shell::Body::Screen(&mut panel)),
+            section(1, crate::shell::Body::Screen(&mut permissions_panel)),
+            section(2, crate::shell::Body::Screen(&mut audit_panel)),
+            section(3, crate::shell::Body::Link),
         ]);
         crate::panel::drive(&mut shell, panel_height(), window.as_ref())?;
         // **This section's flag, not the shell's.** With a second hosted
@@ -1009,5 +1019,48 @@ mod tests {
             "a changed row shows what it was: {:?}",
             moved_off.provenance
         );
+    }
+
+    /// **No two sections share an accelerator.**
+    ///
+    /// The shell opens a section on the first row whose accel matches, so a
+    /// duplicate would make one section unreachable by keyboard — and it would
+    /// look fine: the index still lists it, the arrow keys still reach it, and
+    /// only the shortcut silently opens the wrong row. Four sections is
+    /// exactly the size where this is easy to do and hard to notice.
+    #[test]
+    fn every_section_has_its_own_accelerator() {
+        let mut seen = std::collections::BTreeMap::new();
+        for (name, accel, _) in SECTIONS {
+            let lower = accel.to_ascii_lowercase();
+            if let Some(other) = seen.insert(lower, *name) {
+                panic!("`{accel}` opens both {other} and {name}");
+            }
+            assert!(
+                name.to_lowercase().starts_with(lower),
+                "{name}'s accelerator `{accel}` is not its own first letter — \
+                 an operator guesses the first letter before they read a hint"
+            );
+        }
+        assert_eq!(seen.len(), SECTIONS.len());
+    }
+
+    /// Every section says what it holds. A row with no summary is a row an
+    /// operator has to open to identify.
+    #[test]
+    fn every_section_carries_a_summary() {
+        for (name, _, summary) in SECTIONS {
+            assert!(!summary.is_empty(), "{name} has no summary");
+            assert!(!name.is_empty());
+        }
+    }
+
+    /// `SESSION_SECTION` indexes the row whose outcome `commit()` belongs to.
+    /// A reorder that moved Session without moving this constant would put
+    /// Session's applied flag on another section — and `commit()`'s messages
+    /// with it.
+    #[test]
+    fn the_session_constant_indexes_the_session_row() {
+        assert_eq!(SECTIONS[SESSION_SECTION].0, "Session");
     }
 }
