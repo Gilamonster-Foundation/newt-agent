@@ -138,6 +138,8 @@ mod config_panel;
 // piped / wyvern paths never compile it in.
 #[cfg(feature = "rich-tui")]
 mod palette;
+#[cfg(feature = "rich-tui")]
+mod permissions_panel;
 // One table of named roles, so a colour is chosen once and named everywhere —
 // the answer to a census of thirty-odd literals across nine files, including
 // `DarkGray` twenty times beside `DarkGrey` thirteen.

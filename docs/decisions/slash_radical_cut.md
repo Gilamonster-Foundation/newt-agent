@@ -272,25 +272,54 @@ deferral has one cause and one exit.
 |---|---|---|---|
 | Session | PR8 | **hosted** | its panel already owned every value it writes |
 | Backends | PR9 | **LINK** | its commit path reads ~12 `run_chat` locals: cfg re-resolution, the wire target, the pinned choice, the degraded-pin state |
-| Permissions / MCP | PR10 | **BLOCKED — cannot link either** | see below: there is no panel to host *or* to link to |
+| Permissions (read half) | PR10a | **HOSTABLE — no LINK needed** | a read-only section has NO commit path, so the precondition does not apply |
+| Permissions (write half) | PR10c | deferred | the posture field, grants and decision-reopen need `active_posture` and the grant path in core |
+| MCP | PR10a2 | **BLOCKED** | no chooser yet; `mcp` is a live connection handle, not a value that relocates |
 | Context | PR7 | n/a — fields, not a section | the two live knobs relocated cleanly (`compaction`, `detail`) |
 
-### Permissions and MCP: LINK mode does not apply
+### Correction (PR10a): a READ-ONLY section does not need LINK mode
+
+**Recorded because this ledger said otherwise a day earlier**, and the
+correction is worth more than the original entry.
+
+§5.1's rule reads "a section must LINK while its commit path reads `run_chat`
+locals". A **read-only** section has no commit path *at all* — it renders lines
+it was handed and reports that nothing was applied — so the precondition it was
+waiting on never applies to it. The Permissions chooser is hostable today.
+
+That splits the row in two, and the split is the useful part:
+
+- **The read half** — status and the permission audit — is pure. Both
+  `permissions_command_lines` and `permission_audit_lines` already produce the
+  exact text `/permissions` prints, so the panel renders *the verb's own
+  words*: there is no second rendering to drift.
+- **The write half** — the posture FIELD, grants, decision-reopen — is what
+  actually needs #1999. `handle_posture_command` preloads a named skill body
+  and applies a permission clamp; that is not a value assignment however much
+  the table makes it look like one.
+
+**The general lesson for the remaining sections:** ask whether the section
+*writes* before assuming it needs the relocation. LINK mode is for a section
+whose commit path is out of reach — not for every section whose neighbours'
+are. Audit-style views are hostable now.
+
+### MCP: LINK mode still does not apply
 
 **Recorded because the train assumed otherwise.** §5's precondition gate names
 PR10 as a slice that "opens with its own relocation step, or the section lands
 in LINK mode". Neither is available:
 
-- **There is no panel to link to.** Both rows are `Disposition::Panel` — the
+- **There is no panel to link to.** The row is `Disposition::Panel` — the
   register's own word for *"a chooser that needs a usable region first
-  (#1979)"*, i.e. the surface is future work. `/permissions` today is a text
-  command (`audit [N]`, grants, decision reopen); `/mcp` is a text command over
-  a live connection handle. Grep finds no `permissions_panel` and no
-  `mcp_panel`. LINK mode links to *today's panel*; for these two there is not
-  one.
-- **And the locals are still there**, so hosting is blocked as well:
-  `active_posture` (7 sites) and `mcp` — a live connection built with
-  `block_in_place` at `chat.rs:1940`, which is not a value that relocates.
+  (#1979)"*, i.e. the surface is future work. `/mcp` today is a text command
+  over a live connection handle, and there is no `mcp_panel`. LINK mode links
+  to *today's panel*; for `/mcp` there is not one. (`/permissions` was in the
+  same position until PR10a built its chooser — see the correction above.)
+- **And the state is not a value.** `mcp` is a live connection built with
+  `block_in_place` at `chat.rs:1940`. Unlike `active_posture`, relocating it is
+  not "move a value into core behind one writer" — the handle owns a
+  connection, so the MCP section needs a seed-and-act split like the backend
+  chooser's, not a relocation.
 
 So PR10 is blocked on **#1979 (build the panels) and then #1999 (relocate the
 state)** — in that order, and neither is a slice of this train. `/posture` as a
