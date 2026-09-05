@@ -3,8 +3,8 @@
 //! Where a [crew](crate::run_crew) solves ONE task and a [panel](crate::run_panel)
 //! runs N voices on one task, a **team** takes a whole GOAL: a **lead** model
 //! decomposes it into an ordered list of subtasks, and each subtask is then handed
-//! to a crew. Subtasks run **sequentially over a shared workspace** (subtask N
-//! builds on N-1), and the team **stops at the first blocked subtask** — a plan
+//! to a crew. Subtasks run sequentially in **isolated workspaces**, and the team
+//! **stops at the first blocked subtask** — a plan
 //! can't proceed past a step the crew couldn't land. The aggregate is honest:
 //! `AllPassed` only if every crew passed; otherwise `Blocked` with the remaining
 //! subtasks marked `Skipped`.
@@ -73,6 +73,19 @@ pub struct TeamOutcome {
     pub plan: Vec<String>,
     /// Per-subtask records (same order as `plan`).
     pub results: Vec<SubtaskResult>,
+    /// The factory's consolidated artifact after every leaf landed.
+    pub consolidated: Option<String>,
+}
+
+/// Creates, lands, and consolidates isolated leaf workspaces. A mutex around a
+/// single workspace would serialize execution while still making every crew
+/// edit the same files; this factory provides isolation instead of exclusion.
+pub trait WorkspaceFactory {
+    type Leaf: Workspace;
+
+    fn create(&mut self, subtask: &str) -> Result<Self::Leaf, String>;
+    fn land(&mut self, workspace: Self::Leaf, subtask: &str) -> Result<String, String>;
+    fn consolidate(&mut self, branches: &[String]) -> Result<String, String>;
 }
 
 /// A planned subtask: the work, plus an optional **per-subtask** verification
@@ -114,7 +127,7 @@ struct PlanOut {
 }
 
 /// Run the team on `goal`: lead decomposes → a crew runs each subtask over the
-/// shared `workspace`, stopping at the first block.
+/// an isolated workspace from `workspaces`, stopping at the first block.
 ///
 /// `def_sites` (#840) is the harness's own grounding — typically a `git grep`
 /// closure built by the caller exactly as crew mode's `author_plan_to_plan`
@@ -122,10 +135,10 @@ struct PlanOut {
 /// `files` declaration augments it. A closure returning `Vec::new()` for every
 /// term (e.g. in tests, or when the caller has no repo to grep) degrades to
 /// the lead's declaration alone, byte-identical to pre-#840 behavior.
-pub async fn run_team(
+pub async fn run_team<F: WorkspaceFactory>(
     pool: &BackendPool,
     dispatcher: &dyn Dispatcher,
-    workspace: &mut dyn Workspace,
+    workspaces: &mut F,
     cfg: &TeamConfig,
     caveats: &Caveats,
     goal: &str,
@@ -155,6 +168,7 @@ pub async fn run_team(
                 status: TeamStatus::NoPlan,
                 plan: Vec::new(),
                 results: Vec::new(),
+                consolidated: None,
             }
         }
     };
@@ -163,6 +177,7 @@ pub async fn run_team(
             status: TeamStatus::NoPlan,
             plan: Vec::new(),
             results: Vec::new(),
+            consolidated: None,
         };
     }
     let task_list: Vec<String> = plan.iter().map(|s| s.task.clone()).collect();
@@ -172,6 +187,7 @@ pub async fn run_team(
     //    Each subtask installs its OWN verification command when the lead supplied
     //    one (per-subtask verify); otherwise the workspace's default check stands.
     let mut results = Vec::with_capacity(plan.len());
+    let mut branches = Vec::with_capacity(plan.len());
     let mut blocked = false;
     for st in &plan {
         if blocked {
@@ -182,6 +198,18 @@ pub async fn run_team(
             });
             continue;
         }
+        let mut workspace = match workspaces.create(&st.task) {
+            Ok(workspace) => workspace,
+            Err(_) => {
+                blocked = true;
+                results.push(SubtaskResult {
+                    subtask: st.task.clone(),
+                    status: SubtaskStatus::NeedsHumanReview,
+                    attempts: 0,
+                });
+                continue;
+            }
+        };
         // #754 — gate the per-subtask `verify` through the exec axis (the T2
         // "verify-as-payload" vector). The `verify` is LEAD-authored, and the
         // lead is an LLM: untrusted plan input. Installed as the workspace test
@@ -213,11 +241,26 @@ pub async fn run_team(
         // unfenced — byte-identical to pre-#816 dispatch.
         let scope = newt_core::scope_grounding::ground_scope(&st.task, &st.files, def_sites);
         let outcome = run_crew(
-            pool, dispatcher, workspace, &cfg.crew, caveats, &st.task, &scope,
+            pool,
+            dispatcher,
+            &mut workspace,
+            &cfg.crew,
+            caveats,
+            &st.task,
+            &scope,
         )
         .await;
         let status = match outcome.status {
-            CrewStatus::Passed => SubtaskStatus::Passed,
+            CrewStatus::Passed => match workspaces.land(workspace, &st.task) {
+                Ok(branch) => {
+                    branches.push(branch);
+                    SubtaskStatus::Passed
+                }
+                Err(_) => {
+                    blocked = true;
+                    SubtaskStatus::NeedsHumanReview
+                }
+            },
             CrewStatus::NeedsHumanReview => {
                 blocked = true;
                 SubtaskStatus::NeedsHumanReview
@@ -236,6 +279,17 @@ pub async fn run_team(
         });
     }
 
+    let consolidated = if blocked {
+        None
+    } else {
+        match workspaces.consolidate(&branches) {
+            Ok(artifact) => Some(artifact),
+            Err(_) => {
+                blocked = true;
+                None
+            }
+        }
+    };
     let status = if blocked {
         TeamStatus::Blocked
     } else {
@@ -245,6 +299,7 @@ pub async fn run_team(
         status,
         plan: task_list,
         results,
+        consolidated,
     }
 }
 
@@ -346,6 +401,93 @@ mod tests {
         }
     }
 
+    struct MemFactory {
+        landed: Vec<MemWs>,
+    }
+
+    impl MemFactory {
+        fn new() -> Self {
+            Self { landed: Vec::new() }
+        }
+    }
+
+    impl WorkspaceFactory for MemFactory {
+        type Leaf = MemWs;
+
+        fn create(&mut self, _subtask: &str) -> Result<Self::Leaf, String> {
+            Ok(MemWs::new())
+        }
+
+        fn land(&mut self, workspace: Self::Leaf, subtask: &str) -> Result<String, String> {
+            self.landed.push(workspace);
+            Ok(format!("crew/{subtask}"))
+        }
+
+        fn consolidate(&mut self, branches: &[String]) -> Result<String, String> {
+            Ok(format!("consolidated: {}", branches.join(",")))
+        }
+    }
+
+    /// A leaf workspace is valid for exactly one crew. Reusing it makes the
+    /// second leaf's verification fail, while a fresh instance passes.
+    struct OneLeafWs {
+        files: BTreeMap<String, String>,
+        applications: usize,
+    }
+
+    impl OneLeafWs {
+        fn new() -> Self {
+            Self {
+                files: BTreeMap::from([("target.rs".to_string(), "BAD".to_string())]),
+                applications: 0,
+            }
+        }
+    }
+
+    impl Workspace for OneLeafWs {
+        fn files(&self) -> Vec<String> {
+            self.files.keys().cloned().collect()
+        }
+        fn read(&self, p: &str) -> Option<String> {
+            self.files.get(p).cloned()
+        }
+        fn apply(&mut self, edits: &[Edit]) -> Vec<String> {
+            self.applications += 1;
+            edits
+                .iter()
+                .map(|edit| {
+                    self.files
+                        .insert(edit.path.clone(), edit.new_content.clone());
+                    edit.path.clone()
+                })
+                .collect()
+        }
+        fn run_test(&self) -> (bool, String) {
+            (
+                self.applications == 1,
+                format!("applications={}", self.applications),
+            )
+        }
+    }
+
+    struct OneLeafFactory;
+
+    impl WorkspaceFactory for OneLeafFactory {
+        type Leaf = OneLeafWs;
+
+        fn create(&mut self, _subtask: &str) -> Result<Self::Leaf, String> {
+            Ok(OneLeafWs::new())
+        }
+
+        fn land(&mut self, _workspace: Self::Leaf, subtask: &str) -> Result<String, String> {
+            Ok(format!("crew/{subtask}"))
+        }
+
+        fn consolidate(&mut self, branches: &[String]) -> Result<String, String> {
+            Ok(format!("consolidated: {}", branches.join(",")))
+        }
+    }
+
     /// Mock dispatcher: the lead returns a 2-subtask plan; the crew roles converge
     /// (planner emits GOOD) UNLESS `block` is set (planner always emits BAD).
     struct TeamMock {
@@ -430,7 +572,7 @@ mod tests {
             block: false,
             planner_calls: AtomicUsize::new(0),
         };
-        let mut ws = MemWs::new();
+        let mut ws = MemFactory::new();
         let out = run_team(
             &p,
             &d,
@@ -450,6 +592,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_subtask_runs_in_a_fresh_workspace() {
+        let p = pool();
+        let d = TeamMock {
+            plan_json: r#"{"subtasks":["do A","do B"]}"#.into(),
+            block: false,
+            planner_calls: AtomicUsize::new(0),
+        };
+        let mut ws = OneLeafFactory;
+
+        let out = run_team(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(),
+            &newt_core::caveats::Caveats::top(),
+            "build the thing",
+            &no_grounding(),
+        )
+        .await;
+
+        assert_eq!(
+            out.status,
+            TeamStatus::AllPassed,
+            "a fresh workspace lets both independently-valid leaves pass"
+        );
+    }
+
+    #[tokio::test]
     async fn blocks_and_skips_the_rest() {
         let p = pool();
         let d = TeamMock {
@@ -457,7 +627,7 @@ mod tests {
             block: true, // the crew never converges -> first subtask blocks
             planner_calls: AtomicUsize::new(0),
         };
-        let mut ws = MemWs::new();
+        let mut ws = MemFactory::new();
         let out = run_team(
             &p,
             &d,
@@ -487,7 +657,7 @@ mod tests {
             block: false,
             planner_calls: AtomicUsize::new(0),
         };
-        let mut ws = MemWs::new();
+        let mut ws = MemFactory::new();
         let out = run_team(
             &p,
             &d,
@@ -516,7 +686,7 @@ mod tests {
             block: false,
             planner_calls: AtomicUsize::new(0),
         };
-        let mut ws = MemWs::new();
+        let mut ws = MemFactory::new();
         let out = run_team(
             &p,
             &d,
@@ -530,7 +700,10 @@ mod tests {
         assert_eq!(out.status, TeamStatus::AllPassed);
         assert_eq!(out.plan, vec!["do A".to_string(), "do B".to_string()]);
         assert_eq!(
-            ws.verifies,
+            ws.landed
+                .iter()
+                .flat_map(|workspace| workspace.verifies.iter().cloned())
+                .collect::<Vec<_>>(),
             vec!["check-a".to_string(), "check-b".to_string()]
         );
     }
@@ -556,7 +729,7 @@ mod tests {
             block: false,
             planner_calls: AtomicUsize::new(0),
         };
-        let mut ws = MemWs::new();
+        let mut ws = MemFactory::new();
         // Exec authority covers ONLY "check-a"; "check-b" is outside the caveat.
         let mut caveats = newt_core::caveats::Caveats::top();
         caveats.exec = newt_core::caveats::Scope::only(["check-a".to_string()]);
@@ -566,7 +739,13 @@ mod tests {
         assert_eq!(out.status, TeamStatus::AllPassed);
         assert_eq!(out.plan, vec!["do A".to_string(), "do B".to_string()]);
         // Only the permitted verify was installed; the denied one was refused.
-        assert_eq!(ws.verifies, vec!["check-a".to_string()]);
+        assert_eq!(
+            ws.landed
+                .iter()
+                .flat_map(|workspace| workspace.verifies.iter().cloned())
+                .collect::<Vec<_>>(),
+            vec!["check-a".to_string()]
+        );
     }
 
     /// Lead emits one subtask; the planner always emits edits to BOTH
@@ -615,7 +794,7 @@ mod tests {
         // (verify goes green); the out-of-scope edit is refused.
         let p = pool();
         let d = OverreachTeamMock { scoped: true };
-        let mut ws = MemWs::new();
+        let mut ws = MemFactory::new();
         let out = run_team(
             &p,
             &d,
@@ -627,9 +806,9 @@ mod tests {
         )
         .await;
         assert_eq!(out.status, TeamStatus::AllPassed);
-        assert_eq!(ws.read("target.rs").as_deref(), Some("GOOD"));
+        assert_eq!(ws.landed[0].read("target.rs").as_deref(), Some("GOOD"));
         assert_eq!(
-            ws.read("README.md").as_deref(),
+            ws.landed[0].read("README.md").as_deref(),
             Some("docs"),
             "out-of-scope edit must be refused, not landed"
         );
@@ -643,7 +822,7 @@ mod tests {
         // dispatch is byte-identical to pre-#816 team dispatch.
         let p = pool();
         let d = OverreachTeamMock { scoped: false };
-        let mut ws = MemWs::new();
+        let mut ws = MemFactory::new();
         let out = run_team(
             &p,
             &d,
@@ -655,9 +834,9 @@ mod tests {
         )
         .await;
         assert_eq!(out.status, TeamStatus::AllPassed);
-        assert_eq!(ws.read("target.rs").as_deref(), Some("GOOD"));
+        assert_eq!(ws.landed[0].read("target.rs").as_deref(), Some("GOOD"));
         assert_eq!(
-            ws.read("README.md").as_deref(),
+            ws.landed[0].read("README.md").as_deref(),
             Some("hacked"),
             "unscoped dispatch must remain unfenced"
         );
@@ -708,7 +887,7 @@ mod tests {
         // both edits would land, exactly like the sibling test above.
         let p = pool();
         let d = GroundedTeamMock;
-        let mut ws = MemWs::new();
+        let mut ws = MemFactory::new();
         let def_sites = |sym: &str| -> Vec<String> {
             if sym == "target_symbol" {
                 vec!["target.rs:1:fn target_symbol()".to_string()]
@@ -727,9 +906,9 @@ mod tests {
         )
         .await;
         assert_eq!(out.status, TeamStatus::AllPassed);
-        assert_eq!(ws.read("target.rs").as_deref(), Some("GOOD"));
+        assert_eq!(ws.landed[0].read("target.rs").as_deref(), Some("GOOD"));
         assert_eq!(
-            ws.read("README.md").as_deref(),
+            ws.landed[0].read("README.md").as_deref(),
             Some("docs"),
             "def-site-derived scope must fence the over-reach even with no declared files"
         );
@@ -743,7 +922,7 @@ mod tests {
             block: false,
             planner_calls: AtomicUsize::new(0),
         };
-        let mut ws = MemWs::new();
+        let mut ws = MemFactory::new();
         let out = run_team(
             &p,
             &d,
