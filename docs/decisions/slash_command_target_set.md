@@ -172,19 +172,20 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/probe` | — | `/` command | Model | keep — it performs | — read-only |
 | `/probe reset` | — | action inside a section | Model | keep — it performs | **none — #1965** |
 | `/summarizer` | — | `/` command | Model | absorb → `/settings summarizer` | **none — #1965** |
-| `/callees` | — | `/` command | Navigator | keep — it performs | — read-only |
-| `/callers` | — | `/` command | Navigator | keep — it performs | — read-only |
-| `/compare` | — | `/` command | Navigator | keep — it performs | — read-only |
-| `/def` | `/goto` | `/` command | Navigator | keep — it performs | — read-only |
-| `/export` | — | `/` command | Navigator | keep — it performs | — read-only |
-| `/hierarchy` | — | `/` command | Navigator | keep — it performs | — read-only |
-| `/impact` | — | `/` command | Navigator | keep — it performs | — read-only |
-| `/implementations` | `/impls` | `/` command | Navigator | keep — it performs | — read-only |
-| `/map` | — | `/` command | Navigator | keep — it performs | — read-only |
-| `/tests` | — | `/` command | Navigator | keep — it performs | — read-only |
-| `/text` | `/grep` | `/` command | Navigator | keep — it performs | — read-only |
-| `/type` | `/inspect` | `/` command | Navigator | keep — it performs | — read-only |
-| `/uses` | `/refs` | `/` command | Navigator | keep — it performs | — read-only |
+| `/callees` | — | retired → `/nav callees` | Navigator | keep — it performs | — read-only |
+| `/callers` | — | retired → `/nav callers` | Navigator | keep — it performs | — read-only |
+| `/compare` | — | retired → `/nav compare` | Navigator | keep — it performs | — read-only |
+| `/def` | `/goto` | retired → `/nav def` | Navigator | keep — it performs | — read-only |
+| `/export` | — | retired → `/nav export` | Navigator | keep — it performs | — read-only |
+| `/hierarchy` | — | retired → `/nav hierarchy` | Navigator | keep — it performs | — read-only |
+| `/impact` | — | retired → `/nav impact` | Navigator | keep — it performs | — read-only |
+| `/implementations` | `/impls` | retired → `/nav implementations` | Navigator | keep — it performs | — read-only |
+| `/map` | — | retired → `/nav map` | Navigator | keep — it performs | — read-only |
+| `/nav` | — | `/` command | Navigator | keep — it performs | — read-only |
+| `/tests` | — | retired → `/nav tests` | Navigator | keep — it performs | — read-only |
+| `/text` | `/grep` | retired → `/nav text` | Navigator | keep — it performs | — read-only |
+| `/type` | `/inspect` | retired → `/nav type` | Navigator | keep — it performs | — read-only |
+| `/uses` | `/refs` | retired → `/nav uses` | Navigator | keep — it performs | — read-only |
 | `/allow` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/cd` | — | `/` command | Session | keep — it performs | **none — #1965** |
 | `/settings compaction` | — | field of `/settings` | Session | absorb → `/settings compaction` | `~/.newt/receipts.jsonl` |
@@ -218,11 +219,11 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/posture` | — | `/` command | Tuning | absorb → `/settings posture` | **none — #1965** |
 | `/prompt` | — | `/` command | Tuning | absorb → `/settings prompt` | `~/.newt/receipts.jsonl` |
 | `/psyche` | — | `/` command | Tuning | keep — it performs | `~/.newt/receipts.jsonl` |
-| `/retrieval` | — | `/` command | Tuning | absorb → `/settings retrieval` | **none — #1965** |
+| `/retrieval` | — | retired → `/nav retrieval` | Tuning | keep — it performs | — read-only |
 | `/rounds` | `/tool-rounds` `/max-rounds` | `/` command | Tuning | absorb → `/settings rounds` | `~/.newt/receipts.jsonl` |
 | `/tenacity` | — | retired → `/settings tenacity` | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
 | `/thinking` | — | retired → `/settings thinking` | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
 
-**73 registered, 57 of them typed as `/` commands (72 tokens).** Absorb 17 · keep 53 · panel 3. Receipts: journalled 13 · read-only 33 · **missing 27**.
+**74 registered, 44 of them typed as `/` commands (54 tokens).** Absorb 16 · keep 55 · panel 3. Receipts: journalled 13 · read-only 35 · **missing 26**.
 
 <!-- END GENERATED -->

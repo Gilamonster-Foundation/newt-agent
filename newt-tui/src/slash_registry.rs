@@ -380,95 +380,119 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Receipt::Missing,
     ),
     cmd(
+        // #2009 PR11: thirteen navigator verbs plus `/retrieval` retire into
+        // this one. It is the same parser — `parse_nav_command` strips the
+        // `nav` and matches the verb it always matched — so the retired names
+        // and their replacements cannot drift.
+        "nav",
+        &[],
+        Family::Navigator,
+        Disposition::Keep,
+        Receipt::None_,
+    ),
+    cmd_on(
         "callees",
         &[],
         Family::Navigator,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/nav callees"),
     ),
-    cmd(
+    cmd_on(
         "callers",
         &[],
         Family::Navigator,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/nav callers"),
     ),
-    cmd(
+    cmd_on(
         "compare",
         &[],
         Family::Navigator,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/nav compare"),
     ),
-    cmd(
+    cmd_on(
         "def",
         &["goto"],
         Family::Navigator,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/nav def"),
     ),
-    cmd(
+    cmd_on(
         "export",
         &[],
         Family::Navigator,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/nav export"),
     ),
-    cmd(
+    cmd_on(
         "hierarchy",
         &[],
         Family::Navigator,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/nav hierarchy"),
     ),
-    cmd(
+    cmd_on(
         "impact",
         &[],
         Family::Navigator,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/nav impact"),
     ),
-    cmd(
+    cmd_on(
         "implementations",
         &["impls"],
         Family::Navigator,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/nav implementations"),
     ),
-    cmd(
+    cmd_on(
         "map",
         &[],
         Family::Navigator,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/nav map"),
     ),
-    cmd(
+    cmd_on(
         "tests",
         &[],
         Family::Navigator,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/nav tests"),
     ),
-    cmd(
+    cmd_on(
         "text",
         &["grep"],
         Family::Navigator,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/nav text"),
     ),
-    cmd(
+    cmd_on(
         "type",
         &["inspect"],
         Family::Navigator,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/nav type"),
     ),
-    cmd(
+    cmd_on(
         "uses",
         &["refs"],
         Family::Navigator,
         Disposition::Keep,
         Receipt::None_,
+        Surface::Retired("/nav uses"),
     ),
     cmd(
         "allow",
@@ -751,12 +775,13 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Absorb,
         Receipt::Journal,
     ),
-    cmd(
+    cmd_on(
         "retrieval",
         &[],
         Family::Tuning,
-        Disposition::Absorb,
-        Receipt::Missing,
+        Disposition::Keep,
+        Receipt::None_,
+        Surface::Retired("/nav retrieval"),
     ),
     cmd(
         "rounds",
@@ -983,6 +1008,20 @@ mod tests {
     /// Walked from the dispatch, not from `help_lines()`: the help had
     /// already drifted by eleven undocumented commands when this was armed.
     ///
+    /// # 57/72 → 44/54: the navigator folds into `/nav` (#2009 PR11)
+    ///
+    /// **Thirteen commands and five aliases, in one slice** — the largest
+    /// reduction of the cut, and the cheapest, because they were already one
+    /// parser with one verb match. `parse_nav_command` strips the `nav` and
+    /// matches the verb it always matched, so the retired names and their
+    /// replacements are the same line by the time anything decides what to do.
+    ///
+    /// Every verb keeps its OWN help line, spelled `/nav <verb>` — the doc is
+    /// explicit about that, and it is why the fold is a subcommand rather than
+    /// a single opaque entry point. Thirteen discoverable rows became thirteen
+    /// discoverable rows under one name; what left is thirteen top-level
+    /// claims on the operator's memory.
+    ///
     /// # 58/73 → 57/72: `/conversation` folds into `/resume` (#2009 PR6b)
     ///
     /// One conversation surface: list, show, restore, rename and delete are
@@ -1050,14 +1089,14 @@ mod tests {
     #[test]
     fn the_registered_surface_only_shrinks() {
         assert!(
-            slash_commands().count() <= 57,
+            slash_commands().count() <= 44,
             "the slash surface GREW to {} commands. #1981 is a reduction: a \
              new command needs an argument for why it is not a field of \
              /settings or a subcommand of an existing verb",
             slash_commands().count()
         );
         assert!(
-            slash_tokens().len() <= 72,
+            slash_tokens().len() <= 54,
             "the slash surface GREW to {} tokens",
             slash_tokens().len()
         );
@@ -1220,6 +1259,18 @@ mod tests {
     /// would let the entire debt disappear as the cut proceeds, which is the
     /// most tempting wrong answer available here.
     ///
+    /// # 27 → 26: `/retrieval` was never a mutator (#2009 PR11)
+    ///
+    /// A truthing reclassification, and the decision doc predicted it: the row
+    /// was registered `Absorb`/`Missing` as though `/retrieval` set something,
+    /// but **its only live handler is the nav ledger** — `parse_retrieval`
+    /// produces a `NavCommand` that renders a view. It writes nothing, so it
+    /// never owed a receipt, and it is not a `/settings` field either.
+    ///
+    /// Same shape as `/memory` and `/loadout` in PR3: the debt was never
+    /// theirs, and saying so needs the argument recorded, not just the number
+    /// lowered.
+    ///
     /// # 28 → 27: `/detail` pays (#2009 PR7b)
     ///
     /// **Back below where the cut started.** The count was 27 when PR1 armed
@@ -1304,7 +1355,7 @@ mod tests {
             .filter(|c| matches!(c.receipt, Receipt::Missing))
             .count();
         assert!(
-            missing <= 27,
+            missing <= 26,
             "{missing} state-mutating commands record nothing durable — that \
              is more than when #1981 armed this. A new state mutator needs a \
              receipt destination, not another silent write"
@@ -1651,7 +1702,7 @@ mod fallthrough_tests {
         // Live `Surface::Slash` rows only — a RETIRED token correctly gets
         // its pointer instead of this message, which is what
         // `a_retired_row_still_resolves_to_its_replacement` pins.
-        for token in ["remember", "tab", "def"] {
+        for token in ["remember", "tab", "crew"] {
             let msg = fallthrough_message(token);
             assert!(
                 !msg.contains("unknown command"),
