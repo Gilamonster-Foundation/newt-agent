@@ -271,7 +271,7 @@ deferral has one cause and one exit.
 | section | slice | state | why |
 |---|---|---|---|
 | Session | PR8 | **hosted** | its panel already owned every value it writes |
-| Backends | PR9 | **LINK** | its commit path reads ~12 `run_chat` locals: cfg re-resolution, the wire target, the pinned choice, the degraded-pin state |
+| Backends | PR9 | **LINK until #1139** | its commit path is the read-model/write-model split `runtime.rs` names as #1139's remaining step — not a value relocation |
 | Permissions (read half) | PR10a/b | **HOSTED** | a read-only section has NO commit path, so the precondition does not apply |
 | Permissions (write half) | PR10c | **posture DONE**; grants/reopen parked | `ActivePosture` + `build_posture` moved to `newt_core::posture`, so the field installs through one writer. Grants and decision-reopen stay parked for the event journal (§4.4), which is a record type, not a relocation |
 | MCP | PR10a2 | **BLOCKED** | no chooser yet; `mcp` is a live connection handle, not a value that relocates |
@@ -384,8 +384,28 @@ open-ended:
    `build_posture` already took the skill loader as a CLOSURE, which is what
    let it move without dragging the skills path with it. The estimate, not the
    work, was what made it look like a project. What remains under (1) is the
-   BACKENDS commit path, which is a dozen values plus a re-resolution step and
-   is still the real one.
+   BACKENDS commit path — **and it is not #1999 either.**
+
+   Named precisely, because "a dozen locals" is the symptom and the cause has
+   an issue number. `newt-core/src/runtime.rs` already says it: the runtime
+   snapshot *"does NOT yet own the mutation of those globals — the setters
+   still live at their call sites; the snapshot is the read model. Widening it
+   to own resolution end-to-end (moving `BackendChoice` into core, threading
+   one snapshot through dispatch) is the remaining **#1139** step, tracked
+   separately."*
+
+   That is exactly what the Backends section needs, so:
+
+   - the Backends row unblocks on **#1139**, not on #1999 — the posture (PR10c)
+     was the last of #1999's items this train needed;
+   - it is a **read-model-to-write-model** change across the resolution path,
+     not "move a value into core behind one writer" — the shape every other
+     relocation in this train had;
+   - so it is genuinely out of scope for a slice here, and pretending otherwise
+     is how a section lands by duplicating a commit path.
+
+   Until #1139, Backends stays LINK, and that is the ledger working rather
+   than failing.
 2. `Body::Link` has no members left — a `Body` enum with one variant is the
    signal, and deleting the variant is the last commit of that work.
 3. ~~`shell::section_applied` stops being `#[cfg(test)]`, because two hosted
