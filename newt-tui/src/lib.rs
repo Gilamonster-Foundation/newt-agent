@@ -137,9 +137,9 @@ mod config_panel;
 // the rich input surface. Gated with the other rich TTY surfaces so the lean /
 // piped / wyvern paths never compile it in.
 #[cfg(feature = "rich-tui")]
-mod palette;
+mod lines_panel;
 #[cfg(feature = "rich-tui")]
-mod permissions_panel;
+mod palette;
 // One table of named roles, so a colour is chosen once and named everywhere —
 // the answer to a census of thirty-odd literals across nine files, including
 // `DarkGray` twenty times beside `DarkGrey` thirteen.

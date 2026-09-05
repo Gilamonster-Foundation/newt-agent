@@ -1,11 +1,17 @@
-//! **The Permissions chooser** (#2009 PR10a, #1979).
+//! **A read-only section: lines, with a scroll** (#2009 PR10a/PR13, #1979).
 //!
-//! `/settings permissions` needs a surface before it can be a section, and the
-//! register has said so for a while: the row is `Disposition::Panel`, the
-//! word for *"a chooser that needs a usable region first (#1979)"*. The region
-//! landed with `RegionLease` and the shell; this is the chooser.
+//! Two sections want exactly this — Permissions (posture, prompted decisions,
+//! the audit) and Audit (the receipts journal, loadout resolution, the
+//! resolved config). They differ in their TITLE and their CONTENT and in
+//! nothing else, so they are one panel with two callers rather than two panels
+//! that will drift.
 //!
-//! # Read-only, and that is what makes it hostable today
+//! Generalized at the second caller, not the fourth. `CLAUDE.md`'s reuse
+//! discipline is written from a measured example — five spinner
+//! implementations, four erase strategies — and the cheapest moment to not
+//! repeat that is when the copy would be made.
+//!
+//! # Read-only, and that is what makes these hostable today
 //!
 //! §5.1's ledger says a section must LINK rather than host while its commit
 //! path reads `run_chat` locals. **A read-only section has no commit path at
@@ -34,22 +40,24 @@ use crate::panel::{Flow, Key, Screen};
 /// Rows visible at once. The panel leases this many plus chrome.
 const VISIBLE: usize = 12;
 
-pub(crate) struct PermissionsPanel {
+pub(crate) struct LinesPanel {
+    title: &'static str,
     lines: Vec<String>,
     cursor: ListCursor,
 }
 
-impl PermissionsPanel {
+impl LinesPanel {
     /// Build from lines the caller already produced.
     ///
-    /// The caller passes `permissions_command_lines` and, when a log exists,
-    /// `permission_audit_lines` — both pure, both already the text `/permissions`
-    /// prints. **The panel renders the same words as the verb**: a second
+    /// Every caller passes lines its own VERB already prints —
+    /// `permissions_command_lines`, the receipts journal, the loadout
+    /// resolution. **The panel renders the same words as the verb**: a second
     /// rendering of the same state is how a panel and its command come to
-    /// disagree about what the posture is.
-    pub(crate) fn new(lines: Vec<String>) -> Self {
+    /// disagree about what is true.
+    pub(crate) fn new(title: &'static str, lines: Vec<String>) -> Self {
         let len = lines.len();
         Self {
+            title,
             lines,
             cursor: ListCursor::new(len, VISIBLE, 0),
         }
@@ -71,7 +79,7 @@ impl PermissionsPanel {
     }
 }
 
-impl Screen for PermissionsPanel {
+impl Screen for LinesPanel {
     fn draw(&self, frame: &mut ratatui::Frame) {
         let top = self.cursor.top();
         let rows: Vec<crate::config_panel::RowView> = self
@@ -94,7 +102,7 @@ impl Screen for PermissionsPanel {
             .collect();
         crate::config_panel::render_panel(
             frame,
-            "permissions",
+            self.title,
             &rows,
             crate::config_panel::hint_line("↑↓ scroll · ^u/^d page · Esc leave"),
             0,
@@ -139,6 +147,63 @@ impl Screen for PermissionsPanel {
     }
 }
 
+/// The Audit section's rows: the settings-receipt journal, newest last.
+///
+/// # Every line says whether it still verifies
+///
+/// `SettingReceipt::is_intact` re-derives the address from the change and
+/// compares it to the claim — *"a receipt whose `to` was edited after the fact
+/// no longer computes to the id it carries"*. A viewer that printed the
+/// receipts without that check would be a viewer that a tampered line reads
+/// identically through, which is the one thing this record exists to prevent.
+///
+/// So the marker is per LINE, not a summary at the bottom: an intact journal
+/// with one broken row must not read as "the journal is fine".
+///
+/// Pure over the file body, so the unit tier checks the rendering with no
+/// filesystem — the fs read is the caller's.
+pub(crate) fn receipt_audit_lines(body: &str) -> Vec<String> {
+    let receipts = newt_core::settings_receipt::read_jsonl(body);
+    if receipts.is_empty() {
+        return vec!["no settings receipts yet".to_string()];
+    }
+    let mut out = Vec::with_capacity(receipts.len() + 1);
+    let broken = receipts.iter().filter(|r| !r.is_intact()).count();
+    out.push(match broken {
+        0 => format!("{} receipts · all verify", receipts.len()),
+        n => format!("{} receipts · {n} DO NOT VERIFY", receipts.len()),
+    });
+    for r in &receipts {
+        // `✓`/`✗` per row, and the route (`via`) because the same change
+        // through two verbs is two different events and which one was used is
+        // the part a reader cannot reconstruct.
+        let mark = if r.is_intact() { "✓" } else { "✗ TAMPERED" };
+        out.push(format!(
+            "{mark} {} · {} → {} · via {} · {}",
+            r.change.setting,
+            render_value(&r.change.from),
+            render_value(&r.change.to),
+            r.change.via,
+            r.change.ts_claim,
+        ));
+    }
+    out
+}
+
+/// A `SettingValue` as one short token for the audit row.
+fn render_value(v: &newt_core::settings_receipt::SettingValue) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .map(|j| match j {
+            // A token renders as itself; a structured value (the round cap's
+            // derivation) renders as its JSON rather than being flattened to
+            // a number that hides where it came from.
+            serde_json::Value::String(s) => s,
+            other => other.to_string(),
+        })
+        .unwrap_or_else(|| "?".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,10 +216,10 @@ mod tests {
     /// "settings applied" in front of an operator who only looked at the audit.
     #[test]
     fn every_exit_reports_that_nothing_was_applied() {
-        let mut panel = PermissionsPanel::new(lines(3));
+        let mut panel = LinesPanel::new("t", lines(3));
         assert_eq!(panel.key(Key::Esc), Flow::Close(false));
 
-        let mut panel = PermissionsPanel::new(lines(3));
+        let mut panel = LinesPanel::new("t", lines(3));
         assert_eq!(
             panel.key(Key::Enter),
             Flow::Close(false),
@@ -166,7 +231,7 @@ mod tests {
     /// held `↓` on an audit log must not silently return to the top.
     #[test]
     fn scrolling_walks_the_lines_and_clamps_at_both_ends() {
-        let mut panel = PermissionsPanel::new(lines(40));
+        let mut panel = LinesPanel::new("t", lines(40));
         assert_eq!(panel.visible_rows().first().copied(), Some("row 0"));
 
         for _ in 0..60 {
@@ -186,7 +251,7 @@ mod tests {
 
     #[test]
     fn paging_and_the_ends_are_reachable_in_one_gesture() {
-        let mut panel = PermissionsPanel::new(lines(40));
+        let mut panel = LinesPanel::new("t", lines(40));
         panel.key(Key::Char('G'));
         assert_eq!(panel.visible_rows().last().copied(), Some("row 39"));
         panel.key(Key::Char('g'));
@@ -217,7 +282,7 @@ mod tests {
     /// a normal state, not an exceptional one.
     #[test]
     fn an_empty_or_short_view_is_survivable() {
-        let mut panel = PermissionsPanel::new(Vec::new());
+        let mut panel = LinesPanel::new("t", Vec::new());
         for key in [Key::Down, Key::Up, Key::Ctrl('d'), Key::Char('G')] {
             assert_eq!(panel.key(key), Flow::Stay);
         }
@@ -232,10 +297,13 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let panel = PermissionsPanel::new(vec![
-            "active permission posture: strict — preset 'locked' floor: deny".to_string(),
-            "prompted permissions: ON".to_string(),
-        ]);
+        let panel = LinesPanel::new(
+            "permissions",
+            vec![
+                "active permission posture: strict — preset 'locked' floor: deny".to_string(),
+                "prompted permissions: ON".to_string(),
+            ],
+        );
         let mut term = Terminal::new(TestBackend::new(90, 8)).unwrap();
         term.draw(|f| panel.draw(f)).unwrap();
         let buf = term.backend().buffer();
@@ -251,5 +319,73 @@ mod tests {
         assert!(rendered.contains("permissions"), "{rendered}");
         assert!(rendered.contains("prompted permissions: ON"), "{rendered}");
         assert!(rendered.contains("Esc leave"), "{rendered}");
+    }
+
+    /// **A tampered receipt is marked on its own line.**
+    ///
+    /// The whole point of addressing the record: a receipt whose `to` was
+    /// edited no longer computes to the id it carries. A viewer that printed
+    /// the rows without checking would read identically over a forged one.
+    #[test]
+    fn the_audit_marks_each_receipt_with_whether_it_still_verifies() {
+        use newt_core::settings_receipt::{SettingChange, SettingReceipt, SettingValue};
+
+        let change = SettingChange {
+            schema: "newt.setting_change.v1".to_string(),
+            setting: "thinking".to_string(),
+            from: SettingValue::Token("off".to_string()),
+            to: SettingValue::Token("fold".to_string()),
+            via: "/settings".to_string(),
+            ts_claim: "2026-09-05T10:00:00Z".to_string(),
+        };
+        let good = SettingReceipt::mint(change).expect("mint");
+        let good_line = good.render_line().expect("render");
+
+        // Same receipt with the `to` rewritten after minting: the id no longer
+        // addresses the change it carries.
+        let forged = good_line.replace("\"fold\"", "\"stream\"");
+        assert_ne!(forged, good_line, "the fixture must actually differ");
+
+        let rows = receipt_audit_lines(&format!("{good_line}\n{forged}"));
+        assert!(rows[0].contains("2 receipts"), "{:?}", rows[0]);
+        assert!(rows[0].contains("1 DO NOT VERIFY"), "{:?}", rows[0]);
+        assert!(rows[1].starts_with('✓'), "{:?}", rows[1]);
+        assert!(rows[2].starts_with('✗'), "{:?}", rows[2]);
+        assert!(
+            rows[1].contains("via /settings"),
+            "the route is shown: {:?}",
+            rows[1]
+        );
+    }
+
+    /// An empty journal says so rather than rendering an empty panel — "no
+    /// receipts yet" and "the viewer is broken" must not look the same.
+    #[test]
+    fn an_empty_journal_says_so() {
+        assert_eq!(receipt_audit_lines(""), vec!["no settings receipts yet"]);
+        assert_eq!(
+            receipt_audit_lines("not json\n"),
+            vec!["no settings receipts yet"],
+            "unparseable lines are not receipts"
+        );
+    }
+
+    /// A clean journal reports it, so an operator can tell "verified" from
+    /// "not checked".
+    #[test]
+    fn a_clean_journal_reports_that_every_row_verifies() {
+        use newt_core::settings_receipt::{SettingChange, SettingReceipt, SettingValue};
+        let r = SettingReceipt::mint(SettingChange {
+            schema: "newt.setting_change.v1".to_string(),
+            setting: "markdown".to_string(),
+            from: SettingValue::Token("auto".to_string()),
+            to: SettingValue::Token("off".to_string()),
+            via: "/markdown".to_string(),
+            ts_claim: "2026-09-05T10:01:00Z".to_string(),
+        })
+        .expect("mint");
+        let rows = receipt_audit_lines(&r.render_line().expect("render"));
+        assert!(rows[0].contains("all verify"), "{:?}", rows[0]);
+        assert!(rows[1].starts_with('✓'));
     }
 }

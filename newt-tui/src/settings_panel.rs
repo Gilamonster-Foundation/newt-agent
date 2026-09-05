@@ -489,6 +489,10 @@ pub(crate) fn run(
     // Passed as LINES rather than as the state itself, so this function never
     // learns what a posture is.
     permissions: Vec<String>,
+    // The Audit section's rows — the receipts journal, read by the caller
+    // because the fs read is the caller's, rendered by `receipt_audit_lines`
+    // because the verification belongs with the rendering.
+    audit: Vec<String>,
     window: Option<crate::session_worker::PanelWindow>,
 ) -> std::io::Result<Outcome> {
     let mut panel = SettingsPanel::new(backend, models, current_model);
@@ -510,7 +514,8 @@ pub(crate) fn run(
     // read-only — status and the audit — so it has no commit path, and §5.1's
     // LINK rule is about a commit path that is out of reach. The half that
     // writes (the posture field, grants, decision reopen) waits for #1999.
-    let mut permissions_panel = crate::permissions_panel::PermissionsPanel::new(permissions);
+    let mut permissions_panel = crate::lines_panel::LinesPanel::new("permissions", permissions);
+    let mut audit_panel = crate::lines_panel::LinesPanel::new("audit", audit);
     let (applied, linked) = {
         let mut shell = crate::shell::Shell::new(vec![
             crate::shell::Section {
@@ -524,6 +529,12 @@ pub(crate) fn run(
                 accel: 'p',
                 summary: "posture · prompted decisions · audit".to_string(),
                 body: crate::shell::Body::Screen(&mut permissions_panel),
+            },
+            crate::shell::Section {
+                name: "Audit",
+                accel: 'a',
+                summary: "settings receipts · does each still verify".to_string(),
+                body: crate::shell::Body::Screen(&mut audit_panel),
             },
             crate::shell::Section {
                 name: "Backends",

@@ -3551,12 +3551,13 @@ fn session_body(
                                 rows.push(String::new());
                                 rows.extend(crate::permission_audit_lines(path, 50));
                             }
-                            let window = surface
-                                .open_panel(crate::permissions_panel::PermissionsPanel::height());
-                            let mut panel = crate::permissions_panel::PermissionsPanel::new(rows);
+                            let window =
+                                surface.open_panel(crate::lines_panel::LinesPanel::height());
+                            let mut panel =
+                                crate::lines_panel::LinesPanel::new("permissions", rows);
                             match crate::panel::drive(
                                 &mut panel,
-                                crate::permissions_panel::PermissionsPanel::height(),
+                                crate::lines_panel::LinesPanel::height(),
                                 window.as_ref(),
                             ) {
                                 Ok(_) => {}
@@ -5869,11 +5870,22 @@ fn session_body(
                             permission_rows.push(String::new());
                             permission_rows.extend(crate::permission_audit_lines(path, 50));
                         }
+                        // #2009 PR13: the Audit section's rows. The fs read
+                        // is here; the verification and the rendering are in
+                        // `receipt_audit_lines`, so a row cannot be printed
+                        // without saying whether it still verifies.
+                        let audit_rows = newt_core::settings_receipt::receipt_path()
+                            .and_then(|p| std::fs::read_to_string(p).ok())
+                            .map_or_else(
+                                || vec!["no settings receipts yet".to_string()],
+                                |body| crate::lines_panel::receipt_audit_lines(&body),
+                            );
                         match settings_panel::run(
                             active_backend_name(&cfg),
                             models,
                             current_model,
                             permission_rows,
+                            audit_rows,
                             window,
                         ) {
                             Ok(outcome) => {
