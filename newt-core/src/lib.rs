@@ -29,6 +29,7 @@ pub mod dock_registry;
 pub mod drift_cache;
 pub mod enrollment;
 pub mod error;
+pub mod event_journal;
 pub mod ffi_manifest;
 pub mod ffi_surface;
 pub mod flight_recorder;

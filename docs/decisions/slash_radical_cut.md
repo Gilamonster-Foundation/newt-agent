@@ -247,6 +247,39 @@ Any genuinely new *value* type (none is currently required) widens `SettingValue
 
 The solve-path separation stands: `--max-rounds` on a headless run is recorded by the invocation carrying it, not by the settings journal.
 
+**What building it found (2026-09-05, #2085).** The event journal was specified
+here as "a separate, content-addressed record type". Grounding it against the
+code turned up that `newt-core` already had **two** journals with **three**
+different integrity guarantees between them:
+
+| journal | addressing | catches an edited row | catches a deleted or reordered row |
+|---|---|---|---|
+| `settings_receipt` | `ContentId` per row | yes | **no** |
+| `denial_journal` | **none** | no | no |
+
+`SettingReceipt::is_intact` re-derives the address from the receipt's **own**
+bytes, so it catches an edit and cannot catch a removal — every row is
+independently valid, and so is any subset of them. Both files independently
+describe `ts_claim` as *"append order remains the ordering ground truth"*, and
+neither verifies append order.
+
+Two consequences for this design:
+
+- **PR-E is a chained journal, not a third flat one.** `MerkleNode<T>` addresses
+  a node over its payload AND its parent, which is what makes a deletion or a
+  reorder detectable. Building a third shape beside the two is the sprawl the
+  reuse discipline exists to prevent.
+- **A chain still cannot see its own truncation** — lopping off the last N lines
+  leaves a valid shorter chain. That is why the Authority Register's law is
+  *chain-plus-one-ref*: the chain, plus a head reference stored **separately**.
+  A head kept inside the journal would be truncated along with it.
+
+This is a **correction to §4.5's "durable" list**: the `settings_receipt`
+*format* is durable, its *integrity guarantee* is not the one to carry forward.
+Migration posture per CLAUDE.md is one importer then one encoding, so
+`settings_receipt` and `denial_journal` join the chain rather than keep their
+own weaker shapes.
+
 ### 4.5 The wyvern lens on where to spend
 
 Durable: the field/section schema (`InteractionDefinition`s), the `settings_receipt` format, the config-key and permission-name vocabulary, the registry and its conformance tests. Disposable: the ratatui shell. PR8's rendering work is written knowing the rewrite discards it, and no TUI code moves down into wyvern.
@@ -417,7 +450,8 @@ to claim a section is the one outcome this ledger exists to prevent.
 | **PR11** | **/nav** — register; 13 + `/search` + `/retrieval` retire to subverbs, **one help line each** | N1 becomes /nav's parser (recount, not removal); KNOWN_UNADVERTISED loses 4 |
 | **PR12** | Crew section; `/roadmap` absorbs `/tree` and `/plan` (old rows quoted) | Missing −1 |
 | **PR13** | Audit section — receipts viewer (`read_jsonl` + `is_intact`), loadout resolution, config dump | read-only; no ratchet moves |
-| **PR-E** | **event journal** (separate issue): content-addressed record for grants, kills, reopens, note appends, compressions, conversation ops. Sequenced before window close | pays the parked set; if it slips, the set stays parked and counted |
+| **PR-E1** | **event journal — the mechanism** (#2085): `MerkleNode`-chained record for grants, kills, reopens, note appends, compressions, conversation ops, plus the head ref and the tamper suite | no ratchet movement — the contract lands before any call site |
+| **PR-E2** | **event journal — the wiring**: the six mutators call it; their rows go `Missing` → `Journal` | Missing −6, itemized |
 | **PR14a–d** | **window close, one release, four slices**: (a) absorbed fields migrate to `Native` rows, dispatch arms deleted; (b) shims deleted, Retired rows kept as permanent pointers; (c) navigator + lifecycle closes; (d) endgame ratchet drop | ≈16 commands / ≈22 tokens; sites ≤ 9; `KNOWN_UNADVERTISED` → empty; goldens + generated doc regenerated. Four PRs, one release: muscle memory breaks once, review stays one-step-per-PR |
 
 **Deprecation window:** one full release cycle after PR11, all retirements closing together. High-frequency verbs (`/resume`, `/compress`, `/cd`, the navigator family) never answer "unknown" — their Retired rows are permanent.

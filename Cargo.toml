@@ -122,7 +122,12 @@ age = { version = "0.11", features = ["armor"] }
 # deprecates the bare decoder. That is a guarantee we had hand-rolled in
 # newt-interaction; the crate now owns it, so the bare door is a warning
 # (and, under -D warnings, a build failure) rather than a choice.
-content-addressable = "0.1.2"
+# `unstable-merkle` is what the chained event journal (#2085) is built on:
+# `MerkleNode<T>` addresses a node over its payload AND its parents, which is
+# what lets a deleted or reordered row be detected at all. CLAUDE.md names the
+# type for exactly this use, so this is uptake of the existing abstraction
+# rather than a hand-rolled chain beside it.
+content-addressable = { version = "0.1.2", features = ["unstable-merkle"] }
 # The key-precedence ladder (#2005, docs/decisions/key_ladder_crate.md §1): who
 # owns a trigger right now, as a pure predicate over a TOML table. Extracted to
 # its own repo rather than a newt module because a foreign TUI must be able to
