@@ -30,6 +30,13 @@ impl LocalOllamaBackend {
         }
     }
 
+    /// Use a caller-owned HTTP client, preserving its connection pool across
+    /// backend values constructed for separate requests.
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
+    }
+
     /// Override the retry/backoff policy (defaults to [`RetryPolicy::from_env`]).
     /// Used by tests to inject a zero-delay policy; production callers can tune
     /// it via the `NEWT_HTTP_*` env vars instead.
@@ -310,6 +317,13 @@ impl LocalVllmBackend {
             api_key: None,
             retry: RetryPolicy::from_env(),
         }
+    }
+
+    /// Use a caller-owned HTTP client, preserving its connection pool across
+    /// backend values constructed for separate requests.
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
     }
 
     /// Override the retry/backoff policy (defaults to [`RetryPolicy::from_env`]).
