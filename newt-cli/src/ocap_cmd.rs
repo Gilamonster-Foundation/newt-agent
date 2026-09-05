@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 
+use newt_core::denial_journal::ChainBreak;
 use newt_core::flight_recorder::{read_capture_jsonl, CAPTURE_PATH_ENV};
 use newt_core::ocap_propose::{in_policy_pairs, propose_from_capture, Proposal};
 use newt_core::ocap_store::{build_store, CapabilityClass, PolicyFile, Verdict, VERDICTS};
@@ -151,7 +152,18 @@ fn run_denials(journal: Option<PathBuf>, config: Option<&Path>) -> anyhow::Resul
         }
         Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
     };
-    print!("{}", render_denials(&body, &path));
+    let head = newt_core::denial_journal::read_head(&path);
+    print!("{}", render_denials(&body, &path, head.as_deref()));
+    // The pre-chain migration, stated where an operator looking for missing
+    // evidence will see it — the bytes were kept, not read.
+    let pre_chain = newt_core::denial_journal::pre_chain_path(&path);
+    if pre_chain.exists() {
+        println!(
+            "Records written before this journal adopted the chain were kept at\n  {}\n\
+             They carry no integrity guarantee and are not read here.",
+            pre_chain.display()
+        );
+    }
     Ok(0)
 }
 
@@ -352,20 +364,75 @@ fn note_of(note: &Option<String>) -> &str {
     note.as_deref().unwrap_or("observed")
 }
 
-/// Pure repair-oriented presentation of the denial journal.
-pub(crate) fn render_denials(body: &str, path: &Path) -> String {
-    let records = newt_core::denial_journal::read_jsonl(body);
-    let summaries = newt_core::denial_journal::summarize(&records);
-    if summaries.is_empty() {
-        return format!("No structured denials recorded in {}.\n", path.display());
+/// Report what the chain proves about the journal before anything it contains
+/// is presented as evidence.
+///
+/// This is the half that keeps the addressing honest: minting an id nothing
+/// re-derives is not tamper-evidence. A clean chain says so too, including
+/// which guarantee is missing when there is no head ref to anchor it.
+fn render_integrity(breaks: &[ChainBreak], records: usize, anchored: bool) -> String {
+    let anchor = if anchored {
+        "anchored to the stored head"
+    } else {
+        "no stored head ref, so removal from the END was NOT checked"
+    };
+    if breaks.is_empty() {
+        return format!("chain: {records} record(s) verified, {anchor}.\n\n");
     }
 
     let mut out = format!(
+        "!! CHAIN BROKEN — this journal does not verify ({} problem(s); {anchor}).\n\
+         !! The records below are still shown, and are NOT trustworthy evidence.\n",
+        breaks.len()
+    );
+    for br in breaks {
+        out.push_str(&match br {
+            ChainBreak::Edited { index } => {
+                format!("!!   record {index}: edited — its bytes no longer match its own address\n")
+            }
+            ChainBreak::Unreadable { index } => {
+                format!("!!   record {index}: its address does not parse\n")
+            }
+            ChainBreak::BrokenLink { index } => format!(
+                "!!   record {index}: broken link — a record before it was deleted or reordered\n"
+            ),
+            ChainBreak::NotAChain { index } => {
+                format!("!!   record {index}: not a single-parent chain link\n")
+            }
+            ChainBreak::Truncated { expected_head } => format!(
+                "!!   truncated — the chain no longer reaches the stored head {expected_head}\n"
+            ),
+        });
+    }
+    out.push('\n');
+    out
+}
+
+/// Pure repair-oriented presentation of the denial journal.
+///
+/// `head` is the separately-stored head ref (the "one ref" of
+/// *chain-plus-one-ref*); the fs read that produces it belongs to [`run_denials`],
+/// which keeps this render pure.
+pub(crate) fn render_denials(body: &str, path: &Path, head: Option<&str>) -> String {
+    let lines = newt_core::denial_journal::read_jsonl(body);
+    let breaks = newt_core::denial_journal::verify_chain(&lines, head);
+    let summaries = newt_core::denial_journal::summarize(&lines);
+
+    let mut out = render_integrity(&breaks, lines.len(), head.is_some());
+    if summaries.is_empty() {
+        out.push_str(&format!(
+            "No structured denials recorded in {}.\n",
+            path.display()
+        ));
+        return out;
+    }
+
+    out.push_str(&format!(
         "Denial repair journal: {} attempt(s), {} target(s)\nsource: {}\n\n",
-        records.len(),
+        lines.len(),
         summaries.len(),
         path.display()
-    );
+    ));
     for summary in summaries {
         out.push_str(&format!(
             "[{}] {}:{} ({}x)\n  reason: {}\n  replay: {}\n",
@@ -503,11 +570,10 @@ mod tests {
         assert!(def.ends_with("flight-recorder/unconfined.jsonl"), "{def:?}");
     }
 
-    #[test]
-    fn denial_report_presents_repair_class_and_replay_fixture() {
-        let record = newt_core::denial_journal::DenialRecord {
+    fn denial(command: &str) -> newt_core::denial_journal::DenialRecord {
+        newt_core::denial_journal::DenialRecord {
             ts_claim: "2026-07-23T22:00:00Z".into(),
-            command: "wc -l src/lib.rs".into(),
+            command: command.into(),
             cwd: "/workspace".into(),
             stage: newt_core::denial_journal::DenialStage::AfterGrant,
             denials: vec![newt_core::denial_journal::JournalDenial {
@@ -515,14 +581,95 @@ mod tests {
                 target: "confinement".into(),
                 reason: "exec of \"confinement\" is not within the granted authority".into(),
             }],
-        };
-        let body = serde_json::to_string(&record).unwrap();
-        let report = render_denials(&body, Path::new("/home/x/.newt/denial-journal.jsonl"));
+        }
+    }
+
+    /// A chained journal body plus the head ref that would sit beside it.
+    fn journal_body(commands: &[&str]) -> (String, String) {
+        let mut journal = newt_core::event_journal::Journal::new();
+        let body = commands
+            .iter()
+            .map(|c| {
+                journal
+                    .append(denial(c))
+                    .expect("append")
+                    .render_line()
+                    .expect("render")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (body, journal.head().expect("head").to_string())
+    }
+
+    const JOURNAL: &str = "/home/x/.newt/denial-journal.jsonl";
+
+    #[test]
+    fn denial_report_presents_repair_class_and_replay_fixture() {
+        let (body, head) = journal_body(&["wc -l src/lib.rs"]);
+        let report = render_denials(&body, Path::new(JOURNAL), Some(&head));
 
         assert!(report.contains("grant-retry"));
         assert!(report.contains("exec:confinement"));
         assert!(report.contains("2. Do not add it to policy"));
         assert!(report.contains("wc -l src/lib.rs"));
-        assert!(report.contains("/home/x/.newt/denial-journal.jsonl"));
+        assert!(report.contains(JOURNAL));
+        assert!(
+            report.contains("1 record(s) verified, anchored to the stored head"),
+            "an intact journal must SAY it verified: {report}"
+        );
+    }
+
+    /// The reader is the point. A journal with a record removed must be
+    /// reported as broken evidence, not folded into a tidy repair summary.
+    #[test]
+    fn a_journal_with_a_deleted_record_is_reported_as_broken() {
+        let (body, head) = journal_body(&["wc -l a.rs", "wc -l b.rs", "wc -l c.rs"]);
+        let kept: Vec<&str> = body
+            .lines()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, l)| l)
+            .collect();
+        let report = render_denials(&kept.join("\n"), Path::new(JOURNAL), Some(&head));
+
+        assert!(report.contains("CHAIN BROKEN"), "{report}");
+        assert!(
+            report.contains("record 1: broken link"),
+            "the break must name the record it was found at: {report}"
+        );
+        // The surviving evidence is still shown — unusable evidence is not the
+        // same as no evidence.
+        assert!(report.contains("wc -l a.rs"));
+    }
+
+    /// Truncation is only visible against the stored head, and the report says
+    /// which guarantee it had when there is none.
+    #[test]
+    fn a_truncated_journal_needs_the_head_ref_to_be_seen() {
+        let (body, head) = journal_body(&["wc -l a.rs", "wc -l b.rs"]);
+        let first = body.lines().next().unwrap();
+
+        let unanchored = render_denials(first, Path::new(JOURNAL), None);
+        assert!(!unanchored.contains("CHAIN BROKEN"));
+        assert!(
+            unanchored.contains("removal from the END was NOT checked"),
+            "the missing guarantee must be stated, not implied: {unanchored}"
+        );
+
+        let anchored = render_denials(first, Path::new(JOURNAL), Some(&head));
+        assert!(anchored.contains("truncated"), "{anchored}");
+    }
+
+    /// A journal emptied of every record is the tamper a per-record address
+    /// cannot see at all: there is nothing left to check the address of.
+    #[test]
+    fn an_emptied_journal_is_reported_against_the_head_ref() {
+        let (_, head) = journal_body(&["wc -l a.rs"]);
+        let report = render_denials("", Path::new(JOURNAL), Some(&head));
+        assert!(report.contains("CHAIN BROKEN"), "{report}");
+        assert!(
+            report.contains("No structured denials recorded"),
+            "{report}"
+        );
     }
 }
