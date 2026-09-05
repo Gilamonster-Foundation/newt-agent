@@ -28,6 +28,20 @@ use std::os::unix::io::{FromRawFd, RawFd};
 pub struct Pty {
     master: RawFd,
     slave: RawFd,
+    /// Set once [`Pty::screen_to_eof`] has closed the slave, so [`Drop`] does
+    /// not close the same descriptor twice — a second `close` of a number the
+    /// kernel has already handed back would shut down whatever unrelated file
+    /// took it.
+    slave_closed: bool,
+    /// The drain thread, and the signal it sends when it stops.
+    ///
+    /// Detaching it was right while nothing could ever observe its end: the
+    /// master stayed open for the harness's whole life, so there was no end to
+    /// observe. [`Pty::screen_to_eof`] creates one, and joining it there is the
+    /// exact "every byte has been handed over" proof that a sleep only guessed
+    /// at.
+    reader: Option<std::thread::JoinHandle<()>>,
+    reader_done: std::sync::mpsc::Receiver<()>,
     /// Bytes the child has written, collected by a background reader and
     /// handed to [`Pty::screen`] on demand.
     ///
@@ -83,11 +97,23 @@ impl Pty {
             // through every consumer to buy nothing.
             let drained = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let sink = drained.clone();
-            std::thread::spawn(move || {
+            // `done` fires when the reader stops, which happens only at EOF —
+            // see `screen_to_eof`. Sent by dropping the sender, so it fires on
+            // a panic in the reader too rather than hanging a waiter.
+            let (done_tx, reader_done) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let _done = done_tx;
                 let mut buf = [0u8; 8192];
                 loop {
+                    // This thread is the sole reader of `master`, which
+                    // outlives it — the harness closes the master only in
+                    // `Drop`, after `screen_to_eof` has joined this thread or
+                    // the process is tearing down.
                     let n = libc::read(master, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len());
                     if n <= 0 {
+                        // EOF (macOS) or EIO (Linux) once the last slave
+                        // descriptor closes, and only then: every byte written
+                        // before that close has already been delivered above.
                         return;
                     }
                     sink.lock()
@@ -99,7 +125,10 @@ impl Pty {
             Self {
                 master,
                 slave,
+                slave_closed: false,
                 drained,
+                reader: Some(reader),
+                reader_done,
             }
         }
     }
@@ -110,18 +139,28 @@ impl Pty {
         assert!(n > 0, "writing the operator's keystrokes to the pty failed");
     }
 
-    /// Everything the terminal has been shown so far.
+    /// Whatever has been drained SO FAR — a snapshot of a live stream, with no
+    /// claim that the child is finished writing.
     ///
-    /// Switches the master to non-blocking and drains it, so this returns what
-    /// is available rather than waiting for more. Call it after the child has
-    /// exited (or after a deliberate settling delay) or the screen may be
-    /// partial.
+    /// **This no longer sleeps, and it never promised what the sleep implied.**
+    /// It used to pause 20 ms "to give the drain a moment to catch up", which
+    /// is a guess about the scheduler wearing the shape of a guarantee: the
+    /// child's `write` returning, or the child exiting, says nothing about when
+    /// the drain thread appends those bytes here. Under load the guess is
+    /// wrong and the caller gets a partial screen — as this function's own
+    /// documentation used to concede.
+    ///
+    /// Two seams replace it, and which one a caller wants is not a matter of
+    /// taste:
+    ///
+    /// - the child has exited and you want everything → [`Pty::screen_to_eof`],
+    ///   which is exact;
+    /// - you are waiting for something to appear → [`Pty::wait_for_screen`],
+    ///   which waits for that evidence and nothing else.
+    ///
+    /// Reach for this one only to sample a stream you are accumulating, where a
+    /// short read costs a lap of the loop rather than a false failure.
     pub fn screen(&self) -> String {
-        // Give the drain a moment to catch up. A caller reading the instant a
-        // child exits would otherwise race bytes still in flight — the same
-        // race the old read-at-the-end had, now visible because the reading
-        // happens on another thread rather than hidden inside this call.
-        std::thread::sleep(std::time::Duration::from_millis(20));
         // TAKE, do not peek. The contract every consumer relies on is "the
         // bytes not yet returned": `settings_form_pty_test` reads in a loop and
         // accumulates its own transcript, so re-returning the whole history
@@ -133,6 +172,106 @@ impl Pty {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         String::from_utf8_lossy(&std::mem::take(&mut *drained)).into_owned()
+    }
+
+    /// Wait until `needle` has been drained, then report whether it arrived.
+    ///
+    /// The read-side twin of waiting on a child: it waits for the EVIDENCE the
+    /// caller is about to assert on, so a slow drain costs latency instead of a
+    /// false failure. The timeout bounds a FAILURE — on the passing path this
+    /// returns as soon as the bytes land — so a loaded runner makes it slower,
+    /// never wrong.
+    ///
+    /// **Peeks; it does not take.** A `screen()` loop that took and discarded
+    /// while hunting for a marker could split that marker across two takes and
+    /// never see it, which is a second flake wearing the first one's clothes.
+    /// Waiting leaves every byte in place for the `screen()` or
+    /// [`Pty::screen_to_eof`] that follows.
+    pub fn wait_for_screen(&self, needle: &str, timeout: std::time::Duration) -> bool {
+        wait_for_bytes(&self.drained, 0, needle, timeout)
+    }
+
+    /// Everything the child wrote, waiting for the pty to reach EOF first.
+    ///
+    /// **This is the exact replacement for the sleep, and it is not a longer
+    /// guess.** The harness keeps its OWN slave descriptor open for its whole
+    /// life, so the master never sees EOF and the drain thread never stops —
+    /// there was no completion signal to wait for, which is why a sleep stood
+    /// in for one. Once the child has exited its descriptors are closed, so
+    /// closing ours makes it the LAST close: the master then delivers every
+    /// buffered byte and reports EOF, the drain thread returns, and joining it
+    /// proves the buffer is complete. The kernel answers the question the
+    /// sleep was guessing at.
+    ///
+    /// # Preconditions
+    ///
+    /// **The child must have exited** (`child.wait()` returned). A child still
+    /// holding a slave descriptor keeps the pty open and there is no EOF to
+    /// reach; the wait below then fails the test rather than hanging it, but
+    /// the honest fix is to wait for the child first.
+    ///
+    /// The `Pty` is consumed: after EOF there is nothing further to read, and
+    /// [`Pty::is_raw`] needs the slave this closes, so sample that BEFORE
+    /// calling this.
+    ///
+    /// # Panics
+    ///
+    /// If the drain does not reach EOF within ten seconds — a bound on
+    /// failure, not on success. A test that hangs in CI reports nothing; this
+    /// says which harness invariant broke.
+    pub fn screen_to_eof(mut self) -> String {
+        // SAFETY: closing a descriptor this struct owns, exactly once — the
+        // flag below keeps `Drop` from closing it again.
+        unsafe { libc::close(self.slave) };
+        self.slave_closed = true;
+        // The reader never SENDS; it drops its sender as it returns, so
+        // `Disconnected` IS the "drain finished" signal and only `Timeout` is a
+        // failure. Treating a disconnect as an error would fail every healthy
+        // call — which is exactly what this crate's own tests said when it did.
+        match self
+            .reader_done
+            .recv_timeout(std::time::Duration::from_secs(10))
+        {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "the pty drain never reached EOF after the slave closed — a \
+                 child is still holding a slave descriptor, so wait for it \
+                 before calling this"
+            ),
+        }
+        if let Some(reader) = self.reader.take() {
+            // Already finished: the signal above fires as the thread returns,
+            // so this only reaps it.
+            let _ = reader.join();
+        }
+        let mut drained = self
+            .drained
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let screen = String::from_utf8_lossy(&std::mem::take(&mut *drained)).into_owned();
+        drop(drained);
+        screen
+    }
+
+    /// The final screen, exact when the child finished and honest when it did
+    /// not.
+    ///
+    /// A child that exited has released its slave descriptors, so
+    /// [`Pty::screen_to_eof`] can reach EOF and return every byte. A child that
+    /// hung or was killed still holds one, so there is no EOF to reach — and
+    /// what has been drained so far is exactly what a hang should report,
+    /// rather than a ten-second wait ending in a panic that buries the real
+    /// failure.
+    ///
+    /// Exists so its three callers do not each write that conditional slightly
+    /// differently; the choice is a property of the harness, not of any one
+    /// test.
+    pub fn screen_when_finished(self, child_exited: bool) -> String {
+        if child_exited {
+            self.screen_to_eof()
+        } else {
+            self.screen()
+        }
     }
 
     /// Change the pty's window size mid-test — the resize probe for
@@ -199,9 +338,54 @@ pub fn signal_winch(pid: u32) {
 impl Drop for Pty {
     fn drop(&mut self) {
         unsafe {
-            libc::close(self.slave);
+            // `screen_to_eof` may already have closed the slave to reach EOF.
+            // Closing a descriptor the kernel has handed back would shut down
+            // whatever unrelated file inherited the number.
+            if !self.slave_closed {
+                libc::close(self.slave);
+            }
             libc::close(self.master);
         }
+    }
+}
+
+/// Wait until `needle` appears in `buf` at or after byte offset `from`.
+///
+/// **The ONE bounded poll for "has the reader caught up?"**, shared rather than
+/// copied: `newt_tui::cockpit::test_tty` grew this same loop for its own
+/// capture thread (#2071), and a second copy is how the terminal code reached
+/// five spinners and four erase strategies one reasonable-looking copy at a
+/// time. The two harnesses drain different descriptors; the question they ask
+/// is identical.
+///
+/// `from` matters and is not optional: expected sequences legitimately recur —
+/// a cursor `Show`, a repainted row — so "appears anywhere" would return on an
+/// EARLIER occurrence without ever waiting for the one under test. A caller
+/// whose buffer is emptied as it is read (see [`Pty::screen`]) passes 0,
+/// because for it the buffer already holds only what has not been returned.
+///
+/// The timeout bounds a FAILURE. On the passing path this returns as soon as
+/// the bytes land, so a loaded runner makes it slower, never wrong.
+pub fn wait_for_bytes(
+    buf: &std::sync::Mutex<Vec<u8>>,
+    from: usize,
+    needle: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let seen = {
+            let buf = buf
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let text = String::from_utf8_lossy(&buf);
+            text.get(from.min(text.len())..)
+                .is_some_and(|tail| tail.contains(needle))
+        };
+        if seen || std::time::Instant::now() >= deadline {
+            return seen;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 
@@ -347,7 +531,11 @@ mod tests {
              so it blocked in `write` long before it could exit"
         );
 
-        let screen = pty.screen();
+        // #2075: `screen()` at this point read whatever the drain happened to
+        // have appended in the 20 ms it slept, which for 64 KiB is a race this
+        // test would lose under load and report as a lost tail. EOF is the
+        // kernel saying the same thing exactly.
+        let screen = pty.screen_to_eof();
         assert!(
             screen.contains("ALL-WRITTEN"),
             "the tail of a large write must survive; got {} bytes",
@@ -385,11 +573,130 @@ mod tests {
         assert!(!first.contains("SECOND"), "read the future: {first:?}");
 
         assert!(wait(&mut child, Duration::from_secs(10)).is_some());
-        let second = pty.screen();
+        let second = pty.screen_to_eof();
         assert!(second.contains("SECOND"), "second read: {second:?}");
         assert!(
             !second.contains("FIRST"),
             "a byte was returned twice: {second:?}"
+        );
+    }
+
+    /// **The sleep's replacement is exact, not longer.**
+    ///
+    /// The child writes far more than any pty buffer and exits; every byte
+    /// must be present the instant `screen_to_eof` returns, with no settling
+    /// pause anywhere. A `screen()` here would be reading a live stream and
+    /// could legitimately return a prefix — which is precisely what the 20 ms
+    /// sleep was papering over, and what CI lost under load.
+    #[test]
+    fn screen_to_eof_returns_every_byte_with_no_settling_time() {
+        let pty = Pty::open();
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("yes newt | head -c 200000; printf 'THE-VERY-LAST-BYTES'")
+            .stdout(pty.slave_stdio())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the writer");
+        assert!(
+            wait(&mut child, Duration::from_secs(20)).is_some_and(|s| s.success()),
+            "the child never finished writing"
+        );
+
+        let screen = pty.screen_to_eof();
+        assert!(
+            screen.ends_with("THE-VERY-LAST-BYTES"),
+            "the final bytes must be present, and last; tail was {:?}",
+            &screen[screen.len().saturating_sub(40)..]
+        );
+        assert!(
+            screen.len() >= 200_000 + "THE-VERY-LAST-BYTES".len(),
+            "every byte must survive; got {}",
+            screen.len()
+        );
+    }
+
+    /// `wait_for_screen` waits for EVIDENCE, and leaves it in place.
+    ///
+    /// Both halves matter. Returning early would put the guess back; taking
+    /// the bytes would break the caller that reads them next — and a marker
+    /// split across two destructive reads is the flake this seam exists to
+    /// prevent.
+    #[test]
+    fn wait_for_screen_waits_for_late_output_without_consuming_it() {
+        let pty = Pty::open();
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("printf EARLY; sleep 0.5; printf THE-MARKER")
+            .stdout(pty.slave_stdio())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the writer");
+
+        // Not there yet: proves the wait below is doing the waiting, rather
+        // than the marker having arrived before we looked.
+        assert!(
+            !pty.wait_for_screen("THE-MARKER", Duration::from_millis(50)),
+            "the marker cannot already be on screen"
+        );
+        assert!(
+            pty.wait_for_screen("THE-MARKER", Duration::from_secs(10)),
+            "the marker never arrived"
+        );
+
+        // Peeked, not taken — and EARLY, drained long before, is still here
+        // too, so waiting consumed nothing at either end of the buffer.
+        let screen = pty.screen();
+        assert!(screen.contains("THE-MARKER"), "waiting ate it: {screen:?}");
+        assert!(screen.contains("EARLY"), "waiting ate the head: {screen:?}");
+
+        assert!(wait(&mut child, Duration::from_secs(10)).is_some());
+    }
+
+    /// A needle that never comes is a bounded FALSE, not a hang.
+    #[test]
+    fn wait_for_screen_gives_up_and_says_so() {
+        let pty = Pty::open();
+        let started = std::time::Instant::now();
+        assert!(
+            !pty.wait_for_screen("NEVER-WRITTEN", Duration::from_millis(120)),
+            "nothing wrote this"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the timeout must bound the wait"
+        );
+    }
+
+    /// The shared poll honours `from`, so a LATER occurrence can be waited for.
+    ///
+    /// `newt_tui::cockpit::test_tty` depends on exactly this: a cursor `Show`
+    /// legitimately appears earlier in the session, and "appears anywhere"
+    /// would return on that one without ever waiting for the one under test.
+    #[test]
+    fn wait_for_bytes_can_wait_for_a_later_occurrence() {
+        let buf = std::sync::Mutex::new(b"MARK and then some".to_vec());
+        assert!(
+            wait_for_bytes(&buf, 0, "MARK", Duration::from_millis(50)),
+            "the first occurrence is visible from 0"
+        );
+        assert!(
+            !wait_for_bytes(&buf, 4, "MARK", Duration::from_millis(50)),
+            "an occurrence BEFORE `from` must not satisfy the wait"
+        );
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(b"MARK".to_vec()));
+        let writer = std::sync::Arc::clone(&buf);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(b" ... MARK again");
+        });
+        assert!(
+            wait_for_bytes(&buf, 4, "MARK", Duration::from_secs(10)),
+            "the later occurrence must satisfy it once written"
         );
     }
 }

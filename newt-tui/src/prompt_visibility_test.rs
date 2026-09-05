@@ -197,18 +197,17 @@ fn prompt_control_child(env: &str, expected: &str, key: &str, child: &str) {
     // landed in cooked mode, was echoed (`^C`) and swallowed by the line
     // discipline, and the web-decision timeout then resolved "Deny" instead of
     // the control under test.
-    let armed_by = std::time::Instant::now() + Duration::from_secs(8);
-    loop {
-        let screen = pty.screen();
-        if screen.contains("example.com") {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < armed_by,
-            "child never presented its prompt; screen={screen:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    //
+    // #2075: this loop used to TAKE with `screen()` and discard what it read,
+    // so a marker split across two reads could never match — a flake the 20 ms
+    // sleep inside `screen()` was hiding by making each read large. Waiting
+    // peeks instead, so the marker is matched whole however the bytes arrive,
+    // and stays on the buffer for the reads below.
+    assert!(
+        pty.wait_for_screen("example.com", Duration::from_secs(8)),
+        "child never presented its prompt; screen={:?}",
+        pty.screen()
+    );
     // The marker narrows the race but cannot close it alone: the TTY child's
     // modal reader enters raw mode BEFORE rendering the question (its window
     // only sets canonical mode), but the web child prints its banner just
@@ -220,7 +219,9 @@ fn prompt_control_child(env: &str, expected: &str, key: &str, child: &str) {
     // stays comfortably above the web-decision timeout so a genuinely
     // non-immediate control still loses to it and fails the screen assertion.
     let status = wait_for_child_nudging(&mut child, Duration::from_secs(10), || pty.type_in(key));
-    let screen = pty.screen();
+    // #2075: exact once the child has exited, instead of whatever a 20 ms
+    // sleep had collected.
+    let screen = pty.screen_when_finished(status.is_some());
     assert!(
         status.is_some_and(|s| s.success()) && screen.contains(expected),
         "{key:?} {screen:?}"
@@ -289,7 +290,7 @@ fn a_permission_prompt_is_visible_and_survives_a_live_spinner() {
 
     let status = wait_for_child(&mut child, Duration::from_secs(2));
 
-    let screen = pty.screen();
+    let screen = pty.screen_when_finished(status.is_some());
     assert!(
         status.is_some_and(|status| status.success()),
         "child failed; screen={screen:?}"

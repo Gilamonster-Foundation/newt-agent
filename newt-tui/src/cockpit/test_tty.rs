@@ -186,27 +186,21 @@ impl TestTty {
 /// shared buffer directly so the polling logic is testable against a plain
 /// `Mutex<Vec<u8>>` — no real pty, no responder thread, nothing for a
 /// `TestTty::drop` to restore.
+///
+/// **Delegates to `tests_pty::wait_for_bytes` rather than repeating it**
+/// (#2075). The pty harness grew the same bounded poll for the same reason —
+/// its drain thread is a reader a caller can outrun — and two copies of "has
+/// the reader caught up?" is how this crate's terminal code reached five
+/// spinners and four erase strategies. Kept as a named local function because
+/// the tests below pin the behaviour this module depends on, and because the
+/// call sites read better for saying `after`.
 fn wait_for_after(
     buf: &Mutex<Vec<u8>>,
     from: usize,
     needle: &str,
     timeout: std::time::Duration,
 ) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let seen = {
-            let buf = buf
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let text = String::from_utf8_lossy(&buf);
-            text.get(from.min(text.len())..)
-                .is_some_and(|tail| tail.contains(needle))
-        };
-        if seen || std::time::Instant::now() >= deadline {
-            return seen;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    tests_pty::wait_for_bytes(buf, from, needle, timeout)
 }
 
 /// The answering half of a terminal: accumulate what the application paints,

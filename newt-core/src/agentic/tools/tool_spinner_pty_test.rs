@@ -154,7 +154,10 @@ fn run_scenario(scenario: &str, child_test: &str) -> String {
     .spawn()
     .expect("spawn the pty child");
     let status = child.wait().expect("wait for the pty child");
-    let screen = pty.screen();
+    // #2075: the child has exited, so EOF is reachable and exact. `screen()`
+    // here returned whatever the drain had appended within a 20 ms sleep —
+    // child exit says nothing about when the drain thread runs.
+    let screen = pty.screen_to_eof();
     assert!(
         status.success(),
         "the {scenario} scenario child failed.\n\nscreen:\n{screen:?}"
