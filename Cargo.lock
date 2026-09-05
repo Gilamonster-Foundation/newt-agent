@@ -4624,9 +4624,11 @@ dependencies = [
  "async-trait",
  "newt-core",
  "newt-inference",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]
