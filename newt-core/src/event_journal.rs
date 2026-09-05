@@ -445,14 +445,23 @@ pub fn append_to(
 /// record must never undo what the operator asked for.
 #[must_use]
 pub fn record(kind: EventKind, subject: &str, detail: &str, via: &str) -> Option<JournalLine> {
+    record_event(JournalEvent::new(kind, subject, detail, via))
+}
+
+/// [`record`], for a caller that already holds the event.
+///
+/// **The seam a call site uses when it must also SHOW the event to a test.**
+/// `record` writes and hands back a [`JournalLine`] only when there was
+/// somewhere to write — which under a test guard is never, since the guard
+/// blanks [`JOURNAL_PATH_ENV`] precisely so a unit test cannot append to the
+/// developer's real journal. A caller that built the event first can therefore
+/// return the event it recorded, and its test asserts on **that object** rather
+/// than on a second one minted from the same arguments and hoped to match.
+#[must_use]
+pub fn record_event(event: JournalEvent) -> Option<JournalLine> {
     let path = journal_path()?;
     let mut journal = resume(&path);
-    append_to(
-        &mut journal,
-        &path,
-        JournalEvent::new(kind, subject, detail, via),
-    )
-    .ok()
+    append_to(&mut journal, &path, event).ok()
 }
 
 #[cfg(test)]

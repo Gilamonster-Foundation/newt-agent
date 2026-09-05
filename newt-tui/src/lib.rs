@@ -21,14 +21,17 @@ mod commands;
 mod completed_spill;
 mod danger;
 pub mod dgx_probe;
+/// #2085 PR-E2: where a non-setting state mutator's journal event is named,
+/// and the registry gate that decides whether it may be written at all.
+mod event_receipt;
 pub mod herdr;
-// C2 (#1876): the RichTUI renderer for one interaction. Rich-only — the pure
-// view model it draws lives in `newt_core::interaction_view`, where ratatui is
-// not a dependency, so "no renderer in the model" is a compile error.
 /// #1950: the ONE inline-viewport constructor, and the one answer to "where is
 /// the cursor?" when the terminal will not say.
 #[cfg(feature = "rich-tui")]
 mod inline_viewport;
+// C2 (#1876): the RichTUI renderer for one interaction. Rich-only — the pure
+// view model it draws lives in `newt_core::interaction_view`, where ratatui is
+// not a dependency, so "no renderer in the model" is a compile error.
 #[cfg(feature = "rich-tui")]
 mod interaction_view;
 /// C2 (#1876) — the PTY acceptance proof that the inline INTERACTION frame
@@ -6847,6 +6850,12 @@ fn handle_conversation_command(
         }
         ConversationCommand::Restore(id) => {
             let (record, warning) = restore_conversation_into_session(ctx, &id)?;
+            // #2085 PR-E2: the three mutating conversation ops journal HERE,
+            // after the store call succeeded, because this is the one place
+            // both doors converge — a future door cannot reach the mutation
+            // without passing the record. `record.id` is the resolved id, not
+            // the prefix an operator typed.
+            crate::event_receipt::conversation_op(input, "restore", &record.id);
             let mut message = format!(
                 "Restored conversation `{}` ({} turns).",
                 record.title,
@@ -6860,6 +6869,7 @@ fn handle_conversation_command(
         ConversationCommand::Rename { id, title } => {
             let resolved_id = ctx.store.resolve_id(&id)?;
             ctx.store.rename(&resolved_id, &title)?;
+            crate::event_receipt::conversation_op(input, "rename", &resolved_id);
             Ok(format!("Renamed conversation `{resolved_id}`."))
         }
         ConversationCommand::Delete(id) => {
@@ -6868,6 +6878,7 @@ fn handle_conversation_command(
                 anyhow::bail!("cannot delete the active conversation; use /new first");
             }
             ctx.store.delete(&resolved_id)?;
+            crate::event_receipt::conversation_op(input, "delete", &resolved_id);
             Ok(format!("Deleted conversation `{resolved_id}`."))
         }
     }
