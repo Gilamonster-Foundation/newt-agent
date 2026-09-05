@@ -216,7 +216,7 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/nudge` | — | `/` command | Tuning | absorb → `/settings nudge` | `~/.newt/receipts.jsonl` |
 | `/persona` | — | `/` command | Tuning | absorb → `/settings persona` | **none — #1965** |
 | `/plan` | — | retired → `/roadmap` | Tuning | keep — it performs | — read-only |
-| `/posture` | — | `/` command | Tuning | absorb → `/settings posture` | **none — #1965** |
+| `/posture` | — | `/` command | Tuning | absorb → `/settings posture` | `~/.newt/receipts.jsonl` |
 | `/prompt` | — | `/` command | Tuning | absorb → `/settings prompt` | `~/.newt/receipts.jsonl` |
 | `/psyche` | — | `/` command | Tuning | keep — it performs | `~/.newt/receipts.jsonl` |
 | `/retrieval` | — | retired → `/nav retrieval` | Tuning | keep — it performs | — read-only |
@@ -224,6 +224,6 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/tenacity` | — | retired → `/settings tenacity` | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
 | `/thinking` | — | retired → `/settings thinking` | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
 
-**74 registered, 42 of them typed as `/` commands (52 tokens).** Absorb 15 · keep 56 · panel 3. Receipts: journalled 13 · read-only 36 · **missing 25**.
+**74 registered, 42 of them typed as `/` commands (52 tokens).** Absorb 15 · keep 56 · panel 3. Receipts: journalled 14 · read-only 36 · **missing 24**.
 
 <!-- END GENERATED -->

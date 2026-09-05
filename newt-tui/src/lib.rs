@@ -1758,103 +1758,12 @@ fn operating_mode_prompt(configured: OperatingMode, effective: OperatingMode) ->
 // Named permission presets + the `/posture` command (issue #307).
 // ---------------------------------------------------------------------------
 
-/// The session's active `/posture` (issue #307): a configured skill/framing
-/// binding plus its optional named-permission-preset clamp. Held by the session
-/// next to `SessionCapability`; when configured, the clamp is `meet`-ed into
-/// the effective caveats for every turn (and into the #263 gate's re-mint), so
-/// it wins over both `--disable-ocap` and any interactive session-grant.
-///
-/// `None` (no posture active) means only that no posture-supplied clamp is
-/// present. Session, operating-mode, persona, or other effective floors may
-/// still narrow authority or force confined exec.
-#[derive(Debug, Clone)]
-pub(crate) struct ActivePosture {
-    /// The posture name (the `<name>` in `/posture <name>`), for `/permissions`.
-    name: String,
-    /// The preset name that supplied the clamp (for reporting), or empty when
-    /// this compatibility binding intentionally carries only skill/framing.
-    preset_name: String,
-    /// The authority ceiling (`NamedPermissionPreset::clamp`). The session's
-    /// effective authority is `base.meet(&clamp)`.
-    clamp: newt_core::Caveats,
-    /// One-line human summary of the clamp (for `/permissions`).
-    clamp_summary: String,
-    /// The validated skill guidance composed into each live turn.
-    skill_body: Option<String>,
-    /// Operator-defined framing composed into each live turn.
-    framing: Option<String>,
-}
-
-impl ActivePosture {
-    /// A compatibility binding without `preset` carries guidance only. Treat
-    /// that as genuinely absent at every enforcement seam rather than passing
-    /// an identity clamp that could still change the exec mechanism.
-    fn permission_clamp(&self) -> Option<&newt_core::Caveats> {
-        (!self.preset_name.is_empty()).then_some(&self.clamp)
-    }
-}
-
-/// Resolve and validate a `/posture <name>` invocation against config + skills,
-/// WITHOUT mutating anything — the atomic-or-nothing core of the command. A
-/// missing posture or any resource it explicitly names is an `Err`: a posture
-/// that silently skipped a configured clamp or guidance would be a false
-/// claim. A binding may intentionally omit its preset, skill, or framing. On
-/// success the caller applies every configured effect together.
-///
-/// `load_skill` is the skill-body loader seam (production wires the same
-/// `use_skill` / `newt_skills::load_body_from` path; tests inject a closure
-/// over a mock skills dir) — so skill loading is NOT reimplemented here.
-fn build_posture(
-    name: &str,
-    cfg: &newt_core::Config,
-    mut load_skill: impl FnMut(&str) -> newt_skills::Result<String>,
-) -> anyhow::Result<ActivePosture> {
-    let mode_cfg = cfg.modes.get(name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown posture: '{name}' (no [modes.{name}] compatibility entry in config)"
-        )
-    })?;
-
-    // Resolve the preset clamp (if the posture names one). A named-but-missing
-    // preset is a hard error — never a silent no-clamp.
-    let (preset_name, clamp, clamp_summary) = match &mode_cfg.preset {
-        Some(preset_name) => {
-            let preset = cfg.permission_presets.get(preset_name).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "posture '{name}' names preset '{preset_name}' but no \
-                     [permission_presets.{preset_name}] is defined"
-                )
-            })?;
-            (preset_name.clone(), preset.clamp(), preset.summary())
-        }
-        // A posture with no preset imposes no clamp (identity) — still valid
-        // for skill + framing composition.
-        None => (
-            String::new(),
-            newt_core::Caveats::top(),
-            "unconstrained".to_string(),
-        ),
-    };
-
-    // Preload the skill body (if named) through the injected loader. A
-    // named-but-unloadable skill is a hard error.
-    let skill_body = match &mode_cfg.skill {
-        Some(skill_name) => Some(
-            load_skill(skill_name)
-                .map_err(|e| anyhow::anyhow!("posture '{name}' skill '{skill_name}': {e}"))?,
-        ),
-        None => None,
-    };
-
-    Ok(ActivePosture {
-        name: name.to_string(),
-        preset_name,
-        clamp,
-        clamp_summary,
-        skill_body,
-        framing: mode_cfg.framing.clone(),
-    })
-}
+// `ActivePosture` and `build_posture` live in `newt_core::posture` since #2009
+// PR10c — §5.1's ledger named the posture as what blocked the Permissions
+// section's write half, and a pure `settings_form::apply` cannot read a
+// `run_chat` local. These aliases keep every reference in this crate reading
+// as it did.
+pub(crate) use newt_core::posture::{build_posture, ActivePosture};
 
 /// Compose posture guidance from current session state on every turn. It is
 /// deliberately not appended to the frozen base prompt: switching or clearing
