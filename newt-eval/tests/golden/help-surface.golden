@@ -31,8 +31,7 @@
   /name <title>            - retitle the current conversation so it is easy to find in /resume (alias: /rename)
   /transcript              - review this conversation: full-screen pager (rich) / printed spine (lean)
   /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval·drive · task <n> commit [sha] · issue <n> <#> · export·import [path]
-  /plan                    - alias for /roadmap
-  /tree                    - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)
+  /roadmap tree            - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)
   /persona list            - list configured personas
   /persona show            - show the active persona
   /persona <name>          - start fresh with a persona

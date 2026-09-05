@@ -7668,7 +7668,11 @@ fn parse_roadmap_command(input: &str) -> anyhow::Result<RoadmapCommand> {
     let rest = body.strip_prefix("roadmap").map(str::trim).unwrap_or("");
     let mut parts = rest.split_whitespace();
     match parts.next() {
-        None | Some("show") => Ok(RoadmapCommand::Show(parts.next().map(str::to_string))),
+        // `tree` is `show`'s name for what it renders, and the word the
+        // retired `/tree` verb used (#2009 PR12). Folding a verb should not
+        // cost the operator its vocabulary — the pointer says `/roadmap tree`
+        // because that is a thing you can type.
+        None | Some("show" | "tree") => Ok(RoadmapCommand::Show(parts.next().map(str::to_string))),
         Some("list") => Ok(RoadmapCommand::List),
         Some("new") => {
             let title = parts.collect::<Vec<_>>().join(" ");
@@ -8213,6 +8217,21 @@ fn import_roadmap_from(
             "created new"
         }
     )))
+}
+
+/// The roadmap subcommands that only READ.
+///
+/// Used by the retired `/tree` and `/plan` doors: **a retired READ may still
+/// read, a retired MUTATOR must redirect** — the rule `/thinking` set and
+/// `/conversation` applied per subcommand (#2009 PR6b). `/roadmap` is both, so
+/// the door has to be decided per subcommand rather than per verb, or retiring
+/// it either breaks `/tree` on a pipe or lets `/plan done` mutate through a
+/// shim that is supposed to be dying.
+fn roadmap_subcommand_reads(rest: &str) -> bool {
+    matches!(
+        rest.split_whitespace().next(),
+        None | Some("show" | "tree" | "list")
+    )
 }
 
 fn handle_roadmap_command(
@@ -12839,8 +12858,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /name <title>            - retitle the current conversation so it is easy to find in /resume (alias: /rename)",
         "  /transcript              - review this conversation: full-screen pager (rich) / printed spine (lean)",
         "  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval·drive · task <n> commit [sha] · issue <n> <#> · export·import [path]",
-        "  /plan                    - alias for /roadmap",
-        "  /tree                    - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)",
+        "  /roadmap tree            - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)",
         "  /persona list            - list configured personas",
         "  /persona show            - show the active persona",
         "  /persona <name>          - start fresh with a persona",
