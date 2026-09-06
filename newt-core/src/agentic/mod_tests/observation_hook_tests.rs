@@ -108,6 +108,7 @@ fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
     prompt_read::ensure_active_prompt_card(
         &mut wire_messages,
         prompt_read::PromptReadContext::new(Some(&receipt), task, None),
+        None,
     );
     estimate_request_tokens(
         &wire_messages,

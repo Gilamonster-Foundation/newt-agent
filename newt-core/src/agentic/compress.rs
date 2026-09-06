@@ -1440,6 +1440,7 @@ pub(crate) fn protect_active_prompt_for_compression(
     ensure_active_prompt_card(
         &mut protected,
         PromptReadContext::new(None, active_task, None),
+        None,
     );
     protected
 }

@@ -1313,6 +1313,7 @@ fn responses_keeps_exact_active_prompt_at_user_priority() {
     prompt_read::ensure_active_prompt_card(
         &mut messages,
         prompt_read::PromptReadContext::new(None, exact, None),
+        None,
     );
 
     let (instructions, input) = crate::responses_wire::build_responses_input(&messages);
@@ -1488,6 +1489,7 @@ fn mid_sized_pair_budget(task: &str, responses_wire: bool) -> usize {
     prompt_read::ensure_active_prompt_card(
         &mut messages,
         prompt_read::PromptReadContext::new(None, task, None),
+        None,
     );
     let head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
     let chat_tools = merged_tool_definitions(
