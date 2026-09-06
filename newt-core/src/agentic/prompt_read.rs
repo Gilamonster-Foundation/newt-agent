@@ -342,6 +342,21 @@ fn resolve_session_active_operator(
     )
 }
 
+/// Build a headless receipt only when the caller supplied no turn context.
+/// The caller keeps ownership so prompt and artifact readers can borrow it.
+pub(super) fn headless_prompt_fallback(
+    turn_prompt_context: Option<&TurnPromptContext>,
+    task: &str,
+) -> Option<TurnPromptContext> {
+    turn_prompt_context.is_none().then(|| {
+        TurnPromptContext::ephemeral_operator(
+            "ephemeral-headless",
+            task.as_bytes().to_vec(),
+            task.as_bytes().to_vec(),
+        )
+    })
+}
+
 /// Per-turn prompt recovery view. `fallback_model_text` keeps headless and
 /// ephemeral callers useful even when there is no durable receipt.
 #[derive(Clone, Copy)]
