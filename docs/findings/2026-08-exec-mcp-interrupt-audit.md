@@ -5,7 +5,8 @@
 >
 > **Partly landed:** Fix 1a is in — `host_exec_timeout()`, `kill_on_drop(true)`
 > + own process group, and the `timed_out` / exit-code-124 envelope now live in
-> `newt-core/src/agentic/tools.rs` (~966, ~1090-1103, ~1155). A first-class
+> `newt-core/src/agentic/tools/shell.rs` (`host_shell_command`,
+> `host_shell_output_with_timeout`, `host_shell_dispatch`). A first-class
 > `git` tool exists (`newt-git` crate; §5a). `run_command` accepts an optional
 > `cwd` (`resolve_exec_cwd`, #1159; §5b).
 >
