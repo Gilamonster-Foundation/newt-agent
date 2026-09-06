@@ -412,6 +412,7 @@ mod loop_watch_tests {
         let src = [
             include_str!("agentic/mod.rs"),
             include_str!("agentic/send_budget.rs"),
+            include_str!("agentic/display.rs"),
         ]
         .join("\n");
         // Positive read assertion FIRST: an absence-check that silently read

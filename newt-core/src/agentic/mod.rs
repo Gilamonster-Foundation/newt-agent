@@ -307,8 +307,11 @@ use crossterm::{
     execute,
     style::{Color as CtColor, Print, ResetColor, SetForegroundColor},
 };
+#[cfg(test)]
+use display::turn_heartbeat_line;
 use display::{
     emit_compression_notice, emit_overflow_notice, print_debug, print_retry_indicator, print_trace,
+    TurnHeartbeat,
 };
 #[cfg(test)]
 use send_budget::estimate_responses_request_tokens;
@@ -5075,75 +5078,6 @@ fn suspicious_empty_ollama_diagnostic(json: &serde_json::Value) -> String {
     format!(
         "(model generated output tokens but returned no assistant-visible content or tool calls; {field_note}; rerun with `newt --trace` to capture the response shape)"
     )
-}
-
-/// How much wall-clock passes between turn heartbeats (#1965).
-///
-/// Five minutes: long enough that an ordinary turn emits none at all, short
-/// enough that a turn on its way to 1954 seconds says something four times
-/// before it lands. The evidenced 32-minute turn emitted no intermediate
-/// signal of any kind — `mod.rs` has per-tool `Instant` timers and nothing
-/// that watches the turn as a whole.
-const TURN_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// Whether a turn heartbeat is due, and the bookkeeping to keep them bounded.
-///
-/// **Pure over a supplied `elapsed`** — it reads no clock. Production hands it
-/// `turn_start.elapsed()`; a test states the time. That is the difference
-/// between a test that asserts a schedule and one that sleeps, and this box
-/// saturates badly enough that a wall-clock assertion here would be a flake
-/// generator rather than a check.
-#[derive(Debug, Default)]
-struct TurnHeartbeat {
-    /// Interval boundaries already announced. Bounded by construction: it
-    /// counts, so a turn of any length holds one integer.
-    emitted: u64,
-}
-
-impl TurnHeartbeat {
-    /// Consume a due heartbeat and build its message without reading a clock.
-    fn notice(
-        &mut self,
-        elapsed: std::time::Duration,
-        round: usize,
-        limit: usize,
-    ) -> Option<String> {
-        self.due(elapsed, TURN_HEARTBEAT_INTERVAL)
-            .then(|| turn_heartbeat_line(elapsed, round, limit))
-    }
-
-    /// Consume the heartbeat due at `elapsed`, if one is.
-    ///
-    /// At most one line per interval however long the gap: a turn that blocks
-    /// for an hour inside a single tool call emits ONE line when it returns,
-    /// not twelve. Catching up would turn a quiet signal into a wall of text
-    /// at exactly the moment the operator is trying to read what happened.
-    fn due(&mut self, elapsed: std::time::Duration, interval: std::time::Duration) -> bool {
-        // The boundary rule is `display::cadence_boundary` — shared with the
-        // transcript's time markers so the two cannot drift into two different
-        // ideas of "often enough". What stays here is only this heartbeat's own
-        // record of what it has already said, which is per-turn where the
-        // marker's is per-process.
-        match display::cadence_boundary(elapsed, interval) {
-            Some(boundary) if boundary > self.emitted => {
-                self.emitted = boundary;
-                true
-            }
-            _ => false,
-        }
-    }
-}
-
-/// The heartbeat line. Pure, no ANSI, no I/O — the same split
-/// `Notice::line`/`Notice::emit` uses.
-///
-/// It reports the two facts missing from the evidenced 32-minute turn: how long
-/// it has been running, and how far into the ROUND budget it is — against the
-/// EFFECTIVE cap, so an escalated turn shows "round 210 of 10000" rather than
-/// looking like it has overrun a limit of 40.
-fn turn_heartbeat_line(elapsed: std::time::Duration, round: usize, limit: usize) -> String {
-    let mins = elapsed.as_secs() / 60;
-    format!("still working — {mins}m elapsed, round {round} of {limit}")
 }
 
 /// Build the nudge appended to the message list when the tool-round cap is hit.
