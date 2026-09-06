@@ -47,7 +47,7 @@ use common::{for_each_production_line, production_roots, workspace_root};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-const KNOWN_INERT_UNITS: usize = 38;
+const KNOWN_INERT_UNITS: usize = 39;
 const KNOWN_SANCTIONS: usize = 16;
 const KNOWN_SCRIPT_PARSE_FAILURES: usize = 1;
 const WORKFLOW_COMPILER: &str = r#"
@@ -256,6 +256,20 @@ const DEBT: &[Unit] = &[
                 "newt-core/src/project_model.rs",
                 "pub fn load_project_packs_from_dir"
             ),
+        ]
+    ),
+    unit!(
+        "X19",
+        Delete,
+        "grounding API is a closed tested island with no production entry point.",
+        [
+            site("newt-core/src/grounding.rs", "pub const DEFAULT_NGRAM"),
+            site("newt-core/src/grounding.rs", "pub const MIN_QUOTE_TOKENS"),
+            site("newt-core/src/grounding.rs", "pub struct GroundingConfig"),
+            site("newt-core/src/grounding.rs", "pub struct Span"),
+            site("newt-core/src/grounding.rs", "pub enum Ungrounded"),
+            site("newt-core/src/grounding.rs", "pub struct Grounding {"),
+            site("newt-core/src/grounding.rs", "pub fn check("),
         ]
     ),
     unit!(
@@ -1374,7 +1388,7 @@ fn the_named_inventory_only_decreases() {
                 .filter(|unit| unit.resolution == Resolution::Document)
                 .count(),
         ),
-        (25, 11, 2),
+        (25, 12, 2),
         "the accepted WIRE/DELETE/DOCUMENT classification changed"
     );
     assert!(
