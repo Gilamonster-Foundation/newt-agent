@@ -15,7 +15,7 @@ use std::io::Write;
 /// need no changes; the latter is for the handful of tests that assert on
 /// warning TEXT, which they now read as a returned value instead of
 /// scraping a global tracing subscriber (see the doc on
-/// `BackendAssembly::warnings` in `config.rs` for why that scrape was
+/// `BackendAssembly::warnings` in `config/backend.rs` for why that scrape was
 /// flaky).
 fn merge_for_test_inner(
     cfg: &mut Config,
@@ -3525,7 +3525,7 @@ fn exclusive_selection_of_another_backend_emits_no_orphan_probe_warning() {
     };
     // #1984: warnings are asserted as RETURNED VALUES now, not scraped off
     // a global tracing subscriber (see `BackendAssembly::warnings`'s doc in
-    // config.rs). `.join("\n")` keeps every `.contains()`/`!.contains()`
+    // config/backend.rs). `.join("\n")` keeps every `.contains()`/`!.contains()`
     // assertion below byte-for-byte unchanged from the pre-#1984 shape.
     let (_receipts, warnings) =
         resolve_for_test_with_warnings(&mut cfg, &[dir.path()], Some(over)).unwrap();
@@ -3870,7 +3870,7 @@ fn a_both_destination_declaration_is_rejected_everywhere() {
         ..Default::default()
     };
     // #1984: warnings as a returned value, not a scraped log — see
-    // `BackendAssembly::warnings`'s doc in config.rs.
+    // `BackendAssembly::warnings`'s doc in config/backend.rs.
     let (_receipts, warnings) = merge_for_test_with_warnings(&mut cfg, &[dir.path()]).unwrap();
     let warnings = warnings.join("\n");
     assert!(warnings.contains("ONE destination"), "{warnings}");
@@ -4057,7 +4057,7 @@ fn claiming_refuses_a_record_table() {
 /// process-wide callsite interest cache against sibling tests in this file
 /// doing the same thing concurrently; the returned-value shape has no
 /// global dispatcher in the loop to race. See `BackendAssembly::warnings`'s
-/// doc in config.rs for the full mechanism.
+/// doc in config/backend.rs for the full mechanism.
 #[test]
 fn an_empty_model_path_dropin_cannot_replace_a_declaration() {
     let dir = tempfile::tempdir().unwrap();
