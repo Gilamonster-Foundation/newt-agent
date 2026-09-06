@@ -135,7 +135,7 @@ with no model in the loop.
   ["agent-bridle/macos-seatbelt"]` — and gate the test
   `#[cfg(all(target_os = "macos", feature = "seatbelt"))]`.
 - **The test** (`newt-core/tests/seatbelt_e2e.rs`) mirrors newt's real call site
-  (`agentic/tools.rs`, the `agent_bridle::registry().dispatch("shell", …,
+  (`agentic/tools/shell.rs`, the `agent_bridle::registry().dispatch("shell", …,
   &caveats)` path — **not** the `--yolo` `host_shell_dispatch` raw-bash bypass,
   which is unconfined and unrelated to agent-bridle's `HostShellTool`): with
   `fs_write` fenced to a temp workspace, assert an in-fence write succeeds, an

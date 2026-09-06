@@ -743,7 +743,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `TMPDIR` in-fence, net deny-all, and fail-closed off the kernel fence. **step-4.5** migrated the roadmap
   `verify` command (`CommandVerifyRunner::run`, `newt-tui/lib.rs`) onto the executor and reclassified
   that file's remaining spawns (git/gh reads, self-re-exec, human bang-escape) as `trusted-infra`.
-  **step-4.6** finished the sweep: the last `agent-exec-todo-p4` sites — the `agentic/tools.rs`
+  **step-4.6** finished the sweep: the last `agent-exec-todo-p4` sites — the `agentic/tools/shell.rs`
   run_command HOST-SHELL lane — are reached ONLY via an explicit `--disable-ocap`/`--full-access`
   operator opt-out (the default confined posture uses the confined brush engine), so they are
   reclassified `operator-yolo-optout` (confining them would defeat the flag) and **hardened for #8**:

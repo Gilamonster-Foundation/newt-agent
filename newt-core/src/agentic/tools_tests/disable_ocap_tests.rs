@@ -543,7 +543,7 @@ async fn no_floor_keeps_disable_ocap_bit_for_bit() {
 #[tokio::test]
 async fn host_shell_envelope_matches_the_bridle_shape() {
     let ws = tempfile::TempDir::new().unwrap();
-    let envelope = host_shell_dispatch(
+    let envelope = super::shell::host_shell_dispatch(
         "echo out; echo err >&2; exit 3",
         &ws.path().to_string_lossy(),
         None,

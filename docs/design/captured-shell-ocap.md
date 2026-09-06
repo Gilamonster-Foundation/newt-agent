@@ -33,6 +33,12 @@ Two facts shape the answer:
   primitive. The credential should be a *named reference*, presented to authorized
   commands, never ambient.
 
+**Current implementation location:** shell setup and dispatch now live in
+`newt-core/src/agentic/tools/shell.rs`. `venv_env_map` carries the confined
+shell's structured environment; `venv_cmd_prefix` supplies the host-bypass
+prefix. The environment description above records this design's original
+implementation context.
+
 ## 2. The captured/interrogated shell
 
 A shift in confinement *model*: from per-command, env-clean, stateless confinement to a
