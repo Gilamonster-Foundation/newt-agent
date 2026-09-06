@@ -24,10 +24,10 @@ map floor (SC-L4) is the *rendering* of this model.
 ## 1. Terms
 
 - **Unit** — a project unit: a Cargo crate, a Python/Dart/TS package, a module.
-- **Project pack** — pure data (the `LanguagePack` shape, `api_surface.rs`) that
-  recognises a build system and says how to derive units, source roots, the
-  dependency graph, and which language pack extracts symbols. Droppable,
-  merge-by-name (SC-L1).
+- **Project pack** — pure data (the `LanguagePack` shape,
+  `newt-core/src/config/api_surface.rs`) that recognises a build system and says
+  how to derive units, source roots, the dependency graph, and which language
+  pack extracts symbols. Droppable, merge-by-name (SC-L1).
 - **Project model** — `{ units, source_roots, symbol_surface, dep_graph }`,
   derived per unit from the scanned tree.
 - **Scan / drift / cache** — the scan reads unit content; the cache persists the

@@ -31,7 +31,7 @@ upstream authority laws this spec cites rather than restates).
 | **Discovered budget (`w`)** | THE input to `resolve_budget`: the **resolved session send budget in tokens** as computed at provider construction — the mem_budget site (the double-80% path: a 262,144-token window resolves to `w = 167,772`). NOT the raw window; NOT safe_context. When discovery fails, `resolve_memory_budget` falls back to `DEFAULT_CONTEXT_TOKENS = 8,192` (memory.rs:520) — where the floor clamp dominates by construction (SC-L2) | mod.rs:327-341 + lib.rs:5019-5020; resolve_memory_budget (memory.rs:520) |
 | **Tier-1 / crate map** | one pointer-card line per crate (name, purpose, key paths) — pure DATA (§3.1), hand-written first (D2), never LLM-derived | `.newt/workspace-map.toml`; pointer-card format borrowed from the knowledge repo (format only — no data, no dependency) |
 | **Tier-2 / skeleton** | the symbol lines of the rendered surface — verbatim signatures, never summaries (RepoGraph ablation) | `render()` (api_surface.rs:301-341) |
-| **Budget (`b`)** | tier-2 character allowance: `b = clamp(floor_chars, ⌊pct/100 × w⌋ × chars_per_token, ceiling_chars)` — `w` in tokens, `b` in chars, conversion pinned to the **static** `[context.estimation] chars_per_token` value (§8), never the live calibrated ratio | replaces `max_block_chars = 3_000` (config.rs:1211-1213); chars_per_token (config.rs:1088-1092) |
+| **Budget (`b`)** | tier-2 character allowance: `b = clamp(floor_chars, ⌊pct/100 × w⌋ × chars_per_token, ceiling_chars)` — `w` in tokens, `b` in chars, conversion pinned to the **static** `[context.estimation] chars_per_token` value (§8), never the live calibrated ratio | replaces `max_block_chars = 3_000` (`newt-core/src/config/api_surface.rs`); chars_per_token (config.rs:1088-1092) |
 | **Pin** | a profile value (§8) carrying a stated property, never law — the ceiling is a pin whose v1 value is set empirically by the #548 map-size arms (D1) | §8; #852 model cards, #1218 family chain |
 | **Cut / CutSet** | a declared omission carrying a class from the profile registry (§8). The CutSet is the **retained list of `(path, class)` pairs** the manifest names but extraction skipped — known by path and class, never by the symbols inside | the three silent truncation stages (api_surface.rs:308, 325-329; semantic.rs:498-499) made loud |
 | **Verdict (lookup)** | `Found \| NotGathered \| NoSuchSymbol` — total, exclusive, exhaustive under the **conservative rule** (SC-L5): `NoSuchSymbol` is assertable only on a cut-free snapshot | `SymbolIndex::classify` semantics (newt-core/src/symbols.rs:153-254), reformulated conservative |
@@ -129,9 +129,10 @@ enums. No query language, no path expressions, no traversal operators.
 
 `kind`'s domain is **the set of kind tokens occurring in the session's
 resolved packs** — `SymbolRule.kind` is free-form pack data
-(config.rs:1153-1159), so no static enum exists; the tool schema is generated
-per session from the resolved set (newt already builds tool schemas at
-runtime). WF-1: an unknown kind in a request is a typed error, never a guess.
+(`newt-core/src/config/api_surface.rs`), so no static enum exists; the tool
+schema is generated per session from the resolved set (newt already builds
+tool schemas at runtime). WF-1: an unknown kind in a request is a typed error,
+never a guess.
 
 Response — a typed verdict, never free prose, never a guess:
 
@@ -205,8 +206,9 @@ chars_per_token` value (config.rs:1088-1092) — NEVER the live calibrated
 `estimate_ratio` (mod.rs:347-366), so `resolve_budget` stays a session-fixed
 pure function of `(w, chars_per_token, cfg)`. `floor ≤ ceiling` is WF-3,
 checked at config load; shipped defaults MUST NOT pin `floor = ceiling`
-(SC-L2). **Legacy:** a present `max_block_chars` (config.rs:1211-1213) is
-read as an operator-layer `floor_chars = ceiling_chars = max_block_chars` pin
+(SC-L2). **Legacy:** a present `max_block_chars`
+(`newt-core/src/config/api_surface.rs`) is read as an operator-layer
+`floor_chars = ceiling_chars = max_block_chars` pin
 with a deprecation warning — the constant becomes a pin routed *through* the
 formula, never a bypass, so SC-L2 holds without an exception window and the
 migration is a pure data rewrite. The raw knob is removed after one minor
@@ -573,9 +575,9 @@ counted, and marked.
 
 `ApiSurfaceConfig` grows `{floor_chars, pct_of_budget, ceiling_chars,
 max_symbols_per_file}` beside the deprecated `max_block_chars`
-(config.rs:1186-1217; legacy mapping per §3.4). Resolution happens at the one
-point the TUI already holds the discovered budget — the mem_budget site
-(newt-tui/src/lib.rs:3478-3494), immediately before provider registration
+(`newt-core/src/config/api_surface.rs`; legacy mapping per §3.4). Resolution
+happens at the one point the TUI already holds the discovered budget — the
+mem_budget site (newt-tui/src/lib.rs:3478-3494), immediately before provider registration
 (tui:3524-3529); the provider consumes it at `new()` (api_surface.rs:251-258)
 → render gate (api_surface.rs:326). Budget math this must respect
 (context-economics seam map): a 262k-window model resolves to `w = 167,772`
