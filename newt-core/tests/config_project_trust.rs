@@ -7,7 +7,7 @@
 //!
 //! This is the executable, real-path proof (real filesystem, real process-
 //! global env + cwd) that CLOSES the deviation; the platform-independent strip
-//! logic is also covered by a pure unit test in `config.rs`
+//! logic is also covered by a pure unit test in `newt-core/src/config_tests/layering.rs`
 //! (`untrusted_project_overlay_cannot_contribute_control_plane_keys`), which
 //! this grounds. Every test mutates process-global state (HOME /
 //! NEWT_CONFIG_DIR / NEWT_CONFIG / cwd) so it is `#[serial]` — they must never
