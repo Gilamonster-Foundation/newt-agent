@@ -713,7 +713,7 @@ async fn bridled_shell_forwards_live_bytes_without_changing_the_envelope() {
         ..crate::caveats::Caveats::top()
     };
 
-    let envelope = dispatch_bridled_shell(
+    let envelope = super::shell::dispatch_bridled_shell(
         serde_json::json!({"cmd": "echo observed", "cwd": "."}),
         &caveats,
         Some(sink.clone()),
@@ -750,7 +750,7 @@ async fn run_command_child_under_net_none_cannot_open_a_socket_b1() {
         net: crate::caveats::Scope::none(),
         ..crate::caveats::Caveats::top()
     };
-    let envelope = dispatch_bridled_shell(
+    let envelope = super::shell::dispatch_bridled_shell(
             serde_json::json!({
                 "cmd": r#"python3 -c "import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM)""#,
                 "cwd": "."
@@ -802,10 +802,13 @@ async fn run_command_child_can_reach_an_af_unix_abstract_deputy() {
     let cmd = format!(
         r#"python3 -c "import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('\0{name}'); print('DEPUTY-REACHED'); s.close()""#
     );
-    let envelope =
-        dispatch_bridled_shell(serde_json::json!({"cmd": cmd, "cwd": "."}), &caveats, None)
-            .await
-            .expect("dispatch");
+    let envelope = super::shell::dispatch_bridled_shell(
+        serde_json::json!({"cmd": cmd, "cwd": "."}),
+        &caveats,
+        None,
+    )
+    .await
+    .expect("dispatch");
     assert_eq!(
         envelope["sandbox_kind"], "landlock",
         "child must be kernel-confined: {envelope}"
@@ -854,10 +857,13 @@ async fn run_command_route_fd_hygiene_is_cloexec_based_not_explicit_close() {
     let cmd = format!(
         r#"python3 -c "import os; print('FD-INHERITED' if os.path.exists('/proc/self/fd/{fd}') else 'fd-closed')""#
     );
-    let envelope =
-        dispatch_bridled_shell(serde_json::json!({"cmd": cmd, "cwd": "."}), &caveats, None)
-            .await
-            .expect("dispatch");
+    let envelope = super::shell::dispatch_bridled_shell(
+        serde_json::json!({"cmd": cmd, "cwd": "."}),
+        &caveats,
+        None,
+    )
+    .await
+    .expect("dispatch");
     drop(marker);
     let stdout = envelope["stdout"].as_str().unwrap_or_default().to_string();
     // Ground truth: a non-CLOEXEC fd crosses into the run_command child (the
@@ -1114,7 +1120,7 @@ async fn run_command_windows_appcontainer_allows_granted_write_denies_sibling_wr
 
     let mut granted_args = cmd_set_content(&granted, "GRANTED");
     granted_args["cwd"] = serde_json::Value::String(windows_path(&workspace));
-    let ok = dispatch_bridled_shell(granted_args, &caveats, None)
+    let ok = super::shell::dispatch_bridled_shell(granted_args, &caveats, None)
         .await
         .expect("granted run_command dispatch");
     assert_eq!(
@@ -1131,7 +1137,7 @@ async fn run_command_windows_appcontainer_allows_granted_write_denies_sibling_wr
 
     let mut denied_args = cmd_set_content(&denied, "DENIED");
     denied_args["cwd"] = serde_json::Value::String(windows_path(&workspace));
-    let no = dispatch_bridled_shell(denied_args, &caveats, None)
+    let no = super::shell::dispatch_bridled_shell(denied_args, &caveats, None)
         .await
         .expect("denied run_command dispatch");
     assert_eq!(
@@ -1185,7 +1191,7 @@ async fn run_command_windows_appcontainer_denies_direct_tcp() {
         max_calls: crate::caveats::CountBound::Unlimited,
         valid_for_generation: crate::caveats::Scope::All,
     };
-    let envelope = dispatch_bridled_shell(
+    let envelope = super::shell::dispatch_bridled_shell(
         serde_json::json!({
             "program": windows_path(&probe),
             "args": ["127.0.0.1", port.to_string()],
@@ -1234,7 +1240,7 @@ async fn run_command_windows_provider_env_inheritance_is_active() {
         max_calls: crate::caveats::CountBound::Unlimited,
         valid_for_generation: crate::caveats::Scope::All,
     };
-    let envelope = dispatch_bridled_shell(
+    let envelope = super::shell::dispatch_bridled_shell(
         serde_json::json!({
             "program": "cmd.exe",
             "args": [
@@ -1298,7 +1304,7 @@ async fn run_command_windows_missing_launcher_refuses_not_host_fallback() {
         max_calls: crate::caveats::CountBound::Unlimited,
         valid_for_generation: crate::caveats::Scope::All,
     };
-    let result = dispatch_bridled_shell(
+    let result = super::shell::dispatch_bridled_shell(
             serde_json::json!({"cmd": "echo HOST-FALLBACK>fallback.txt", "cwd": windows_path(workspace.path())}),
             &caveats,
             None,

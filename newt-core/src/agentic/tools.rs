@@ -48,10 +48,9 @@ pub use shell::venv_cmd_prefix;
 #[cfg(test)]
 use shell::{
     confined_dispatch_args, decode_shell_stream, denial_axis_label, denied_run_command_result,
-    dispatch_bridled_shell, envelope_denial_reason, envelope_denied, exec_allowlist_name,
-    exec_denial_requests, exec_denial_target_label, exec_floor_permits, host_shell_dispatch,
-    net_denial_requests, pr_creation_url, shadow_records, shell_engine, shell_envelope_output,
-    venv_env_map,
+    envelope_denial_reason, envelope_denied, exec_allowlist_name, exec_denial_requests,
+    exec_denial_target_label, exec_floor_permits, net_denial_requests, pr_creation_url,
+    shadow_records, shell_engine, shell_envelope_output, venv_env_map,
 };
 use shell::{exec_confined_command, resolve_exec_cwd, split_leading_cd};
 #[cfg(all(test, not(windows)))]
