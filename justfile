@@ -332,9 +332,12 @@ audit:
 
 # --- MSRV (A2) ---
 
-# MSRV gate: the workspace must compile on the declared rust-version (1.88,
-# [workspace.package] in Cargo.toml). PIPELINE PARITY: mirrors the "MSRV
-# (Rust 1.88)" job in .github/workflows/ci.yml and the .githooks/pre-push hook.
+# MSRV gate: the workspace — lib, bin AND test targets — must compile on the
+# declared rust-version (1.88, [workspace.package] in Cargo.toml). PIPELINE
+# PARITY: mirrors the "MSRV (Rust 1.88)" job in .github/workflows/ci.yml and
+# the .githooks/pre-push hook. `--all-targets` is what makes dev-dependencies
+# count (#2161): without it they resolve but never build, so their
+# rust-version is never enforced and the floor can drift under the tests.
 # Local best-effort: needs rustup + the 1.88 toolchain; skips (with a note)
 # otherwise — CI is the hard gate.
 msrv:
@@ -345,7 +348,7 @@ msrv:
         echo "        install: rustup toolchain install 1.88"
         exit 0
     fi
-    cargo +1.88 check --workspace
+    cargo +1.88 check --workspace --all-targets
 
 # --- Coverage ---
 #

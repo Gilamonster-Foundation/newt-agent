@@ -324,8 +324,17 @@ jobs:
       # declared `rust-version` ([workspace.package] in Cargo.toml) actually
       # compiles — a dep bump can't silently raise the floor (it drifted once
       # under stable-only CI; see the Cargo.toml MSRV comment block).
-      - name: cargo check (MSRV 1.88)
-        run: cargo check --workspace
+      #
+      # `--all-targets` is load-bearing (#2161). Without it this builds lib and
+      # bin only: a dev-dependency is resolved but never becomes a build unit,
+      # so its rust-version is never enforced. The floor drifted a SECOND time
+      # that way — cargo-platform 0.3.3 (rust 1.91) reached only through a
+      # dev-dep — and stayed green here for months. The stable jobs that do
+      # pass --all-targets never run on 1.88; each gate saw one half and the
+      # intersection was unwatched. docs/ROADMAP.md names `cargo test
+      # --workspace` as acceptance, so tests are inside the promise.
+      - name: cargo check (MSRV 1.88, all targets)
+        run: cargo check --workspace --all-targets
 
   windows:
     name: Windows build + test
