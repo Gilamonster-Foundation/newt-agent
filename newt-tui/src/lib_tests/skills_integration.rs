@@ -32,27 +32,39 @@ fn resume_fixture() -> (
 
 // Shared fixtures live here because more than one family calls them;
 // every single-family helper moved with its family.
+#[cfg(test)]
 #[path = "skills_integration/auto_resume.rs"]
 mod auto_resume;
+#[cfg(test)]
 #[path = "skills_integration/compress.rs"]
 mod compress;
+#[cfg(test)]
 #[path = "skills_integration/conversation_ops.rs"]
 mod conversation_ops;
+#[cfg(test)]
 #[path = "skills_integration/ephemeral.rs"]
 mod ephemeral;
+#[cfg(test)]
 #[path = "skills_integration/help_corpus.rs"]
 mod help_corpus;
+#[cfg(test)]
 #[path = "skills_integration/persona.rs"]
 mod persona;
+#[cfg(test)]
 #[path = "skills_integration/recall_render.rs"]
 mod recall_render;
+#[cfg(test)]
 #[path = "skills_integration/restore.rs"]
 mod restore;
+#[cfg(test)]
 #[path = "skills_integration/resume_by_name.rs"]
 mod resume_by_name;
+#[cfg(test)]
 #[path = "skills_integration/roadmap.rs"]
 mod roadmap;
+#[cfg(test)]
 #[path = "skills_integration/save_paths.rs"]
 mod save_paths;
+#[cfg(test)]
 #[path = "skills_integration/system_prompt.rs"]
 mod system_prompt;
