@@ -94,6 +94,35 @@ broken call does not compile.
 If a second implementation really is warranted, say so in the PR and
 explain what the existing abstraction could not be widened to cover.
 
+### Write less code — the burden is on the addition
+
+The rules above say *search before you write*. This says something stronger:
+**the best change is the one that adds no lines at all.**
+
+Before adding a function, a module, a type, or a file, answer in the PR: what
+existing thing did you try to compose or widen, and what could it not be made
+to cover? "I needed one" is not the answer — it is what every one of the five
+spinners also believed.
+
+- A PR that **grows** the line count should say what that growth bought.
+- A PR that **shrinks** it while holding behaviour needs no such justification.
+
+This is not a prohibition on new code; features need code. It is a prohibition
+on *unexamined* new code, and a statement about which direction the repo is
+supposed to move when nobody is forcing it either way.
+
+### Size is a smell, not a rule
+
+No source file should exceed **5,000 lines**; most should sit near **2,000**.
+
+These are thresholds for asking *"what is this file actually doing?"* — not
+limits to be satisfied by splitting arbitrarily. **A file split along no seam
+is worse than a large cohesive one**, because it hides the coupling instead of
+removing it, and it costs a module header, an import block, and a re-export
+list per new file. Decomposition *adds* lines; only deduplication removes
+them. Split when a file has stopped having one reason to change, and expect
+the line count to go **up** at that step and down at the next one.
+
 ## Content-addressable data structures — the concrete instance of reuse discipline
 
 The rule above says "do not add a second implementation of something that
