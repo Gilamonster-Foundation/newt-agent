@@ -298,7 +298,7 @@ pub use trim::trim_for_summary;
 pub use untrusted::{wrap_internal_summary, wrap_untrusted};
 pub use warmup::warmup_if_cold;
 
-use crate::retry::{with_backoff_notify, with_backoff_notify_error, RetryPolicy};
+use crate::retry::{with_backoff_notify_error, RetryPolicy};
 use compress::{
     compress, compression_trigger, CompressAction, CompressRequest, CompressTrigger,
     CompressionTriggerLimits, RefusalReason,
@@ -5546,6 +5546,69 @@ struct CapExit {
     ollama_num_ctx: Option<u32>,
 }
 
+impl CapExit {
+    fn push_nudge(&self, messages: &mut Vec<serde_json::Value>) {
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": cap_exit_nudge(self.max_tool_rounds, self.progress.as_deref(), &self.observed),
+        }));
+    }
+
+    fn fits(&self, messages: &[serde_json::Value], model: &str) -> bool {
+        preflight_full_message_request(
+            messages,
+            None,
+            self.request_budget,
+            self.calibration,
+            self.estimation,
+            model,
+        )
+        .is_ok()
+    }
+
+    fn fallback(&self) -> (String, bool, Option<crate::TokenUsage>) {
+        (
+            cap_exit_fallback(
+                self.max_tool_rounds,
+                self.accumulated,
+                self.wasted_calls,
+                self.progress.as_deref(),
+            ),
+            false,
+            self.accumulated,
+        )
+    }
+
+    async fn finish(
+        &self,
+        endpoint: &str,
+        request: impl Fn() -> reqwest::RequestBuilder,
+        http_error_prefix: &str,
+        extract: impl FnOnce(serde_json::Value) -> (String, Option<crate::TokenUsage>),
+    ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
+        let retry = tui_retry_policy(endpoint);
+        let result = dispatch_json(&retry, request, http_error_prefix, |_, _, _| {}).await;
+        if let Ok(json) = result {
+            let (content, usage) = extract(json);
+            let total = merge_round_usage(self.accumulated, usage);
+            if !content.is_empty() {
+                return Ok((
+                    cap_exit_model_reply(
+                        self.max_tool_rounds,
+                        self.accumulated,
+                        &content,
+                        self.progress.as_deref(),
+                    ),
+                    false,
+                    total,
+                ));
+            }
+        }
+        // Failed or empty summaries retain only usage from preceding rounds.
+        Ok(self.fallback())
+    }
+}
+
 /// Final tools-disabled completion for the Ollama (`/api/chat`) path.
 ///
 /// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
@@ -5558,41 +5621,9 @@ async fn final_summary_ollama(
     mut messages: Vec<serde_json::Value>,
     cap: CapExit,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
-    let CapExit {
-        max_tool_rounds,
-        accumulated,
-        wasted_calls,
-        progress,
-        observed,
-        request_budget,
-        calibration,
-        estimation,
-        ollama_num_ctx,
-    } = cap;
-    messages.push(serde_json::json!({
-        "role": "user",
-        "content": cap_exit_nudge(max_tool_rounds, progress.as_deref(), &observed),
-    }));
-    if preflight_full_message_request(
-        &messages,
-        None,
-        request_budget,
-        calibration,
-        estimation,
-        model,
-    )
-    .is_err()
-    {
-        return Ok((
-            cap_exit_fallback(
-                max_tool_rounds,
-                accumulated,
-                wasted_calls,
-                progress.as_deref(),
-            ),
-            false,
-            accumulated,
-        ));
+    cap.push_nudge(&mut messages);
+    if !cap.fits(&messages, model) {
+        return Ok(cap.fallback());
     }
     // No `tools` key => the model cannot emit tool calls.
     let mut body = serde_json::json!({
@@ -5600,86 +5631,22 @@ async fn final_summary_ollama(
         "messages": &messages,
         "stream": false,
     });
-    if let Some(num_ctx) = ollama_num_ctx {
+    if let Some(num_ctx) = cap.ollama_num_ctx {
         body["options"] = serde_json::json!({ "num_ctx": num_ctx });
     }
-    let retry = tui_retry_policy(chat_url);
-    let result = with_backoff_notify(
-        &retry,
-        || async {
-            let resp = client
-                .post(chat_url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| {
-                    // Typed classification at the source (W0 #1511).
-                    anyhow::Error::new(observability::DispatchError::from_reqwest(
-                        "request failed",
-                        e,
-                    ))
-                })?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(observability::DispatchError::http_status(format!(
-                    "Ollama {status}: {text}"
-                ))
-                .into());
-            }
-            resp.json::<serde_json::Value>()
-                .await
-                .map_err(anyhow::Error::from)
-        },
-        |_, _| {}, // no color context here; tracing::warn covers it
-    )
-    .await;
-    match result {
-        Ok(json) => {
-            // #385: strip inline <think>…</think> reasoning Nemotron-style models emit
-            // in the content stream (the separate `thinking` field is handled elsewhere).
-            // All-reasoning content collapses to empty → the thinking-only recovery below.
+    cap.finish(
+        chat_url,
+        || client.post(chat_url).json(&body),
+        "Ollama",
+        |json| {
+            // #385: strip inline reasoning; all-reasoning content takes the fallback.
             let (content, _reasoning) = crate::reasoning::split_reasoning(
                 json["message"]["content"].as_str().unwrap_or(""),
             );
-            let total = merge_round_usage(accumulated, ollama_usage(&json));
-            if content.is_empty() {
-                Ok((
-                    cap_exit_fallback(
-                        max_tool_rounds,
-                        accumulated,
-                        wasted_calls,
-                        progress.as_deref(),
-                    ),
-                    false,
-                    accumulated,
-                ))
-            } else {
-                Ok((
-                    cap_exit_model_reply(
-                        max_tool_rounds,
-                        accumulated,
-                        &content,
-                        progress.as_deref(),
-                    ),
-                    false,
-                    total,
-                ))
-            }
-        }
-        // On any failure (including exhausted retries), still return the
-        // accumulated usage so the caller can log the tokens consumed.
-        Err(_) => Ok((
-            cap_exit_fallback(
-                max_tool_rounds,
-                accumulated,
-                wasted_calls,
-                progress.as_deref(),
-            ),
-            false,
-            accumulated,
-        )),
-    }
+            (content, ollama_usage(&json))
+        },
+    )
+    .await
 }
 
 /// Project the internal protected-head representation onto chat templates that
@@ -5765,42 +5732,10 @@ async fn final_summary_openai(
     generation_policy: generation_policy::GenerationPolicy,
     cap: CapExit,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
-    let CapExit {
-        max_tool_rounds,
-        accumulated,
-        wasted_calls,
-        progress,
-        observed,
-        request_budget,
-        calibration,
-        estimation,
-        ollama_num_ctx: _,
-    } = cap;
-    messages.push(serde_json::json!({
-        "role": "user",
-        "content": cap_exit_nudge(max_tool_rounds, progress.as_deref(), &observed),
-    }));
+    cap.push_nudge(&mut messages);
     let messages = openai_chat_wire_messages(&messages)?;
-    if preflight_full_message_request(
-        &messages,
-        None,
-        request_budget,
-        calibration,
-        estimation,
-        model,
-    )
-    .is_err()
-    {
-        return Ok((
-            cap_exit_fallback(
-                max_tool_rounds,
-                accumulated,
-                wasted_calls,
-                progress.as_deref(),
-            ),
-            false,
-            accumulated,
-        ));
+    if !cap.fits(&messages, model) {
+        return Ok(cap.fallback());
     }
     // Omit `tools` / `tool_choice` => the model cannot emit tool calls.
     let mut body = serde_json::json!({
@@ -5809,80 +5744,27 @@ async fn final_summary_openai(
         "stream": false,
     });
     generation_policy.apply_to_chat_completions_body(&mut body);
-    let retry = tui_retry_policy(chat_url);
-    let result = with_backoff_notify(
-        &retry,
-        || async {
+    cap.finish(
+        chat_url,
+        || {
             let mut req = client.post(chat_url).json(&body);
             if let Some(key) = api_key {
                 req = req.bearer_auth(key);
             }
-            let resp = req.send().await.map_err(|e| {
-                // Typed classification at the source (W0 #1511).
-                anyhow::Error::new(observability::DispatchError::from_reqwest(
-                    "request failed",
-                    e,
-                ))
-            })?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(observability::DispatchError::http_status(format!(
-                    "inference endpoint {status}: {text}"
-                ))
-                .into());
-            }
-            resp.json::<serde_json::Value>()
-                .await
-                .map_err(anyhow::Error::from)
+            req
         },
-        |_, _| {},
-    )
-    .await;
-    match result {
-        Ok(json) => {
+        "inference endpoint",
+        |json| {
             // #385: strip inline <think>…</think> reasoning from the content.
             let (content, _reasoning) = crate::reasoning::split_reasoning(
                 json["choices"][0]["message"]["content"]
                     .as_str()
                     .unwrap_or(""),
             );
-            let total = merge_round_usage(accumulated, openai_usage(&json["usage"]));
-            if content.is_empty() {
-                Ok((
-                    cap_exit_fallback(
-                        max_tool_rounds,
-                        accumulated,
-                        wasted_calls,
-                        progress.as_deref(),
-                    ),
-                    false,
-                    accumulated,
-                ))
-            } else {
-                Ok((
-                    cap_exit_model_reply(
-                        max_tool_rounds,
-                        accumulated,
-                        &content,
-                        progress.as_deref(),
-                    ),
-                    false,
-                    total,
-                ))
-            }
-        }
-        Err(_) => Ok((
-            cap_exit_fallback(
-                max_tool_rounds,
-                accumulated,
-                wasted_calls,
-                progress.as_deref(),
-            ),
-            false,
-            accumulated,
-        )),
-    }
+            (content, openai_usage(&json["usage"]))
+        },
+    )
+    .await
 }
 
 /// OpenAI-compatible variant of [`chat_complete`]: the same agentic tool-call
@@ -7963,42 +7845,10 @@ async fn final_summary_anthropic(
     generation_policy: generation_policy::GenerationPolicy,
     cap: CapExit,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
-    let CapExit {
-        max_tool_rounds,
-        accumulated,
-        wasted_calls,
-        progress,
-        observed,
-        request_budget,
-        calibration,
-        estimation,
-        ollama_num_ctx: _,
-    } = cap;
-    messages.push(serde_json::json!({
-        "role": "user",
-        "content": cap_exit_nudge(max_tool_rounds, progress.as_deref(), &observed),
-    }));
+    cap.push_nudge(&mut messages);
     let (system, wire_messages) = anthropic_wire::anthropic_wire_messages(&messages)?;
-    if preflight_full_message_request(
-        &wire_messages,
-        None,
-        request_budget,
-        calibration,
-        estimation,
-        model,
-    )
-    .is_err()
-    {
-        return Ok((
-            cap_exit_fallback(
-                max_tool_rounds,
-                accumulated,
-                wasted_calls,
-                progress.as_deref(),
-            ),
-            false,
-            accumulated,
-        ));
+    if !cap.fits(&wire_messages, model) {
+        return Ok(cap.fallback());
     }
     // Omit `tools` => the model cannot emit tool_use blocks (mirrors the
     // OpenAI path's tools-disabled summary).
@@ -8012,75 +7862,17 @@ async fn final_summary_anthropic(
         None,
         false,
     );
-    let retry = tui_retry_policy(messages_url);
-    let result = with_backoff_notify(
-        &retry,
-        || async {
-            let req = anthropic_headers(client.post(messages_url), api_key).json(&body);
-            let resp = req.send().await.map_err(|e| {
-                // Typed classification at the source (W0 #1511).
-                anyhow::Error::new(observability::DispatchError::from_reqwest(
-                    "request failed",
-                    e,
-                ))
-            })?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(observability::DispatchError::http_status(format!(
-                    "inference endpoint {status}: {text}"
-                ))
-                .into());
-            }
-            resp.json::<serde_json::Value>()
-                .await
-                .map_err(anyhow::Error::from)
-        },
-        |_, _| {},
-    )
-    .await;
-    match result {
-        Ok(json) => {
-            // This wire separates thinking natively, so the OpenAI path's
-            // `split_reasoning` has no work to do here — `text` is clean.
+    cap.finish(
+        messages_url,
+        || anthropic_headers(client.post(messages_url), api_key).json(&body),
+        "inference endpoint",
+        |json| {
+            // This wire separates thinking natively; text needs no split_reasoning.
             let reply = anthropic_wire::parse_messages_reply(&json);
-            let content = reply.text;
-            let total = merge_round_usage(accumulated, reply.usage);
-            if content.is_empty() {
-                Ok((
-                    cap_exit_fallback(
-                        max_tool_rounds,
-                        accumulated,
-                        wasted_calls,
-                        progress.as_deref(),
-                    ),
-                    false,
-                    accumulated,
-                ))
-            } else {
-                Ok((
-                    cap_exit_model_reply(
-                        max_tool_rounds,
-                        accumulated,
-                        &content,
-                        progress.as_deref(),
-                    ),
-                    false,
-                    total,
-                ))
-            }
-        }
-        Err(_) => Ok((
-            cap_exit_fallback(
-                max_tool_rounds,
-                accumulated,
-                wasted_calls,
-                progress.as_deref(),
-            ),
-            false,
-            accumulated,
-        )),
-    }
+            (reply.text, reply.usage)
+        },
+    )
+    .await
 }
 
 async fn anthropic_chat_complete_with_prompt_and_artifacts(
@@ -9792,15 +9584,36 @@ async fn dispatch_responses_json(
     color: bool,
 ) -> anyhow::Result<serde_json::Value> {
     let body = validated.body();
-    with_backoff_notify_error(
+    dispatch_json(
         retry,
-        || async {
+        || {
             let mut req = client.post(url).json(body);
             if let Some(key) = api_key {
                 req = req.bearer_auth(key);
             }
+            req
+        },
+        "inference endpoint",
+        |attempt, delay, error| {
+            print_retry_indicator(attempt, retry.max_retries, delay, error, color);
+        },
+    )
+    .await
+}
+
+/// Shared transport from the Responses dispatcher; build a fresh request per attempt.
+/// Keep the status prefix exact: retry classification reads the resulting message.
+async fn dispatch_json(
+    retry: &RetryPolicy,
+    request: impl Fn() -> reqwest::RequestBuilder,
+    http_error_prefix: &str,
+    on_retry: impl FnMut(u32, std::time::Duration, &anyhow::Error),
+) -> anyhow::Result<serde_json::Value> {
+    with_backoff_notify_error(
+        retry,
+        || async {
             // Typed classification at the source (W0 #1511).
-            let resp = req.send().await.map_err(|e| {
+            let resp = request().send().await.map_err(|e| {
                 anyhow::Error::new(observability::DispatchError::from_reqwest(
                     "request failed",
                     e,
@@ -9810,7 +9623,7 @@ async fn dispatch_responses_json(
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
                 return Err(observability::DispatchError::http_status(format!(
-                    "inference endpoint {status}: {text}"
+                    "{http_error_prefix} {status}: {text}"
                 ))
                 .into());
             }
@@ -9818,9 +9631,7 @@ async fn dispatch_responses_json(
                 .await
                 .map_err(anyhow::Error::from)
         },
-        |attempt, delay, error| {
-            print_retry_indicator(attempt, retry.max_retries, delay, error, color);
-        },
+        on_retry,
     )
     .await
 }

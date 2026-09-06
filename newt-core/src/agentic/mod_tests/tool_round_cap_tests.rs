@@ -1847,7 +1847,16 @@ async fn dispatch_responses_json_retries_transient_transport_failures() {
     let err = super::dispatch_responses_json(&client, &url, None, &validated, &retry, false)
         .await
         .expect_err("a persistent 503 exhausts retries");
-    assert!(err.to_string().contains("503"), "got: {err}");
+    assert_eq!(
+        err.to_string(),
+        "inference endpoint 503 Service Unavailable: "
+    );
+    assert_eq!(
+        err.downcast_ref::<observability::DispatchError>()
+            .unwrap()
+            .class,
+        observability::ErrorClass::Model
+    );
     // `.expect(3)` is verified on server drop — it retried, not sent once.
 }
 

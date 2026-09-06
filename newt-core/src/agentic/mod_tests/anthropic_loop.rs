@@ -720,7 +720,7 @@ async fn tool_round_cap_summary_request_has_no_tools_key() {
         result: "ok",
         seen: Arc::new(Mutex::new(Vec::new())),
     };
-    let (reply, streamed, _, _) = chat_complete(c, &mut mcp)
+    let (reply, streamed, usage, _) = chat_complete(c, &mut mcp)
         .await
         .expect("cap exit should produce the summary");
 
@@ -738,6 +738,123 @@ async fn tool_round_cap_summary_request_has_no_tools_key() {
     assert!(last.get("tools").is_none(), "no tools on the summary");
     assert!(last.get("tool_choice").is_none(), "no tool_choice either");
     assert_eq!(last["stream"], serde_json::json!(false));
+    assert_eq!(
+        usage,
+        Some(crate::TokenUsage {
+            input_tokens: 90,
+            output_tokens: 20,
+        })
+    );
+}
+
+/// Pin the summary-only dispatch contract before sharing its implementation:
+/// provider error classification, reasoning parsing, and fallback usage differ.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn final_summary_provider_contracts() {
+    let _env = test_env(false);
+    let _retry_limit = EnvGuard::set("NEWT_HTTP_MAX_RETRIES", "1");
+    for provider in ["ollama", "openai", "anthropic"] {
+        for case in ["retry", "fatal", "malformed", "empty", "success"] {
+            let server = MockServer::start().await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = calls.clone();
+            let content = if case == "empty" {
+                ""
+            } else {
+                "<think>inline reasoning</think>Finished."
+            };
+            // One fixture carries each provider's real content and usage shape.
+            let response = serde_json::json!({
+                "message": {"content": content},
+                "choices": [{"message": {"content": content}}],
+                "content": [
+                    {"type": "thinking", "thinking": "native reasoning"},
+                    {"type": "text", "text": content}
+                ],
+                "prompt_eval_count": 120, "eval_count": 7,
+                "usage": {
+                    "prompt_tokens": 120, "completion_tokens": 7,
+                    "input_tokens": 120, "output_tokens": 7
+                }
+            });
+            Mock::given(method("POST"))
+                .respond_with(move |_: &Request| {
+                    let attempt = counted.fetch_add(1, Ordering::SeqCst);
+                    match case {
+                        "retry" if attempt == 0 => {
+                            ResponseTemplate::new(503).set_body_string("busy")
+                        }
+                        "fatal" => ResponseTemplate::new(400).set_body_string("invalid"),
+                        "malformed" => ResponseTemplate::new(200).set_body_string("not JSON"),
+                        _ => ResponseTemplate::new(200).set_body_json(&response),
+                    }
+                })
+                .mount(&server)
+                .await;
+            let accumulated = Some(crate::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+            });
+            let cap = CapExit {
+                max_tool_rounds: 2,
+                accumulated,
+                wasted_calls: 0,
+                progress: None,
+                observed: Vec::new(),
+                request_budget: None,
+                calibration: 1.0,
+                estimation: crate::tokens::TokenEstimation::default(),
+                ollama_num_ctx: None,
+            };
+            let client = reqwest::Client::new();
+            let url = server.uri();
+            let policy = generation_policy::GenerationPolicy::default();
+            let result = match provider {
+                "ollama" => final_summary_ollama(&client, &url, "test", Vec::new(), cap).await,
+                "openai" => {
+                    final_summary_openai(&client, &url, "test", None, Vec::new(), policy, cap).await
+                }
+                _ => {
+                    final_summary_anthropic(&client, &url, "test", None, Vec::new(), policy, cap)
+                        .await
+                }
+            };
+            let (reply, streamed, usage) = result.expect("summary failures become fallbacks");
+            let retried = case == "retry" && provider != "ollama";
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1 + usize::from(retried),
+                "{provider}/{case}"
+            );
+            assert!(!streamed, "{provider}/{case}");
+            if case == "success" || retried {
+                assert_eq!(
+                    reply,
+                    if provider == "anthropic" {
+                        content
+                    } else {
+                        "Finished."
+                    },
+                    "{provider}/{case}"
+                );
+                assert_eq!(
+                    usage,
+                    Some(crate::TokenUsage {
+                        input_tokens: 120,
+                        output_tokens: 27,
+                    }),
+                    "{provider}/{case}"
+                );
+            } else {
+                assert!(
+                    reply.contains("tool-round limit (2"),
+                    "{provider}/{case}: {reply}"
+                );
+                assert_eq!(usage, accumulated, "{provider}/{case}");
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------
