@@ -1465,6 +1465,49 @@ pub struct ChatCtx<'a> {
     pub steering: Option<&'a dyn SteeringInbox>,
 }
 
+/// Record a completed call only when the event sink is present. Keep elapsed
+/// sampling here, after backend bookkeeping and before phantom classification.
+fn record_completed_tool_event(
+    tool_events: &mut Option<&mut Vec<crate::ToolEvent>>,
+    name: &str,
+    args: &serde_json::Value,
+    ok: bool,
+    tool_t0: std::time::Instant,
+) {
+    if let Some(rec) = tool_events.as_deref_mut() {
+        rec.push(crate::ToolEvent::from_call(
+            name,
+            args,
+            ok,
+            u64::try_from(tool_t0.elapsed().as_millis()).ok(),
+        ));
+    }
+}
+
+/// #717 / #479 (G4): record alias, hallucination, and real-tool empty-miss
+/// reaches, falling back to gated-off crew/team reaches. Classify only when
+/// the phantom sink is present; preserve the primary classifier's precedence.
+fn record_phantom_reach(
+    phantom_reaches: &mut Option<&mut Vec<crate::PhantomReach>>,
+    name: &str,
+    args: &serde_json::Value,
+    result: &str,
+    ok: bool,
+    advertise_team: bool,
+) {
+    if let Some(pr) = phantom_reaches.as_deref_mut() {
+        if let Some(resolution) = tools::classify_phantom_reach(name, args, result, ok)
+            .or_else(|| tools::classify_gated_off_reach(name, advertise_team))
+        {
+            pr.push(crate::PhantomReach {
+                name_as_called: name.to_string(),
+                resolution,
+                active_context_features: Vec::new(),
+            });
+        }
+    }
+}
+
 /// retry technique (R2 action arm): before a `write_file`/`edit_file` is dispatched,
 /// capture the target's pre-write bytes into the turn ledger. Recorded at the loop's
 /// dispatch site (not inside `execute_tool`) so the seam stays narrow and only the
@@ -3890,31 +3933,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if workflow_runtime.record_tool_result(&result) {
                 round_progress = true;
             }
-            if let Some(rec) = tool_events.as_deref_mut() {
-                rec.push(crate::ToolEvent::from_call(
-                    name,
-                    &args,
-                    ok,
-                    u64::try_from(tool_t0.elapsed().as_millis()).ok(),
-                ));
-            }
-            // #717: record any phantom/capability reach (alias / hallucination
-            // / real-tool empty miss) for the alias-seam telemetry. #479 (G4)
-            // composes the gated-off seam here, where `advertise_team` is known:
-            // a `crew`/`compose_roster` reach with the surface OFF is a real name
-            // (so `classify_phantom_reach` never flags it) but exactly the
-            // delegation signal we want to mine for the common OFF default.
-            if let Some(pr) = phantom_reaches.as_deref_mut() {
-                if let Some(resolution) = tools::classify_phantom_reach(name, &args, &result, ok)
-                    .or_else(|| tools::classify_gated_off_reach(name, advertise_team))
-                {
-                    pr.push(crate::PhantomReach {
-                        name_as_called: name.to_string(),
-                        resolution,
-                        active_context_features: Vec::new(),
-                    });
-                }
-            }
+            record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
+            record_phantom_reach(
+                &mut phantom_reaches,
+                name,
+                &args,
+                &result,
+                ok,
+                advertise_team,
+            );
             // #867 Part A: ledger the verified paths this result surfaced
             // BEFORE the offload may spill the text out of the transcript.
             observed_paths.record(&result, &mut observed_resolver);
@@ -7468,31 +7495,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if workflow_runtime.record_tool_result(&result) {
                 round_progress = true;
             }
-            if let Some(rec) = tool_events.as_deref_mut() {
-                rec.push(crate::ToolEvent::from_call(
-                    name,
-                    &args,
-                    ok,
-                    u64::try_from(tool_t0.elapsed().as_millis()).ok(),
-                ));
-            }
-            // #717: record any phantom/capability reach (alias / hallucination
-            // / real-tool empty miss) for the alias-seam telemetry. #479 (G4)
-            // composes the gated-off seam here, where `advertise_team` is known:
-            // a `crew`/`compose_roster` reach with the surface OFF is a real name
-            // (so `classify_phantom_reach` never flags it) but exactly the
-            // delegation signal we want to mine for the common OFF default.
-            if let Some(pr) = phantom_reaches.as_deref_mut() {
-                if let Some(resolution) = tools::classify_phantom_reach(name, &args, &result, ok)
-                    .or_else(|| tools::classify_gated_off_reach(name, advertise_team))
-                {
-                    pr.push(crate::PhantomReach {
-                        name_as_called: name.to_string(),
-                        resolution,
-                        active_context_features: Vec::new(),
-                    });
-                }
-            }
+            record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
+            record_phantom_reach(
+                &mut phantom_reaches,
+                name,
+                &args,
+                &result,
+                ok,
+                advertise_team,
+            );
             // #867 Part A: ledger verified paths (see the Ollama path).
             observed_paths.record(&result, &mut observed_resolver);
             messages.push(serde_json::json!({
@@ -9340,26 +9351,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             if workflow_runtime.record_tool_result(&result) {
                 round_progress = true;
             }
-            if let Some(rec) = tool_events.as_deref_mut() {
-                rec.push(crate::ToolEvent::from_call(
-                    name,
-                    &args,
-                    ok,
-                    u64::try_from(tool_t0.elapsed().as_millis()).ok(),
-                ));
-            }
-            // #717 / #479 (G4) — mirrors the OpenAI path.
-            if let Some(pr) = phantom_reaches.as_deref_mut() {
-                if let Some(resolution) = tools::classify_phantom_reach(name, &args, &result, ok)
-                    .or_else(|| tools::classify_gated_off_reach(name, advertise_team))
-                {
-                    pr.push(crate::PhantomReach {
-                        name_as_called: name.to_string(),
-                        resolution,
-                        active_context_features: Vec::new(),
-                    });
-                }
-            }
+            record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
+            record_phantom_reach(
+                &mut phantom_reaches,
+                name,
+                &args,
+                &result,
+                ok,
+                advertise_team,
+            );
             // #867 Part A: ledger verified paths (mirrors the OpenAI path).
             observed_paths.record(&result, &mut observed_resolver);
             // The tool result stays `role:"tool"` in the internal shape;
@@ -10443,31 +10443,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     "content": format!("{} {warning}", compress::LOOP_GUIDANCE_PREFIX),
                 }));
             }
-            if let Some(rec) = tool_events.as_deref_mut() {
-                rec.push(crate::ToolEvent::from_call(
-                    name,
-                    &args,
-                    ok,
-                    u64::try_from(tool_t0.elapsed().as_millis()).ok(),
-                ));
-            }
-            // #717: record any phantom/capability reach (alias / hallucination
-            // / real-tool empty miss) for the alias-seam telemetry. #479 (G4)
-            // composes the gated-off seam here, where `advertise_team` is known:
-            // a `crew`/`compose_roster` reach with the surface OFF is a real name
-            // (so `classify_phantom_reach` never flags it) but exactly the
-            // delegation signal we want to mine for the common OFF default.
-            if let Some(pr) = phantom_reaches.as_deref_mut() {
-                if let Some(resolution) = tools::classify_phantom_reach(name, &args, &result, ok)
-                    .or_else(|| tools::classify_gated_off_reach(name, advertise_team))
-                {
-                    pr.push(crate::PhantomReach {
-                        name_as_called: name.to_string(),
-                        resolution,
-                        active_context_features: Vec::new(),
-                    });
-                }
-            }
+            record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
+            record_phantom_reach(
+                &mut phantom_reaches,
+                name,
+                &args,
+                &result,
+                ok,
+                advertise_team,
+            );
             observed_paths.record(&result, &mut observed_resolver);
             input.push(serde_json::json!({
                 "type": "function_call_output",

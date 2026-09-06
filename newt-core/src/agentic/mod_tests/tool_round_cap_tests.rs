@@ -3650,6 +3650,7 @@ async fn ollama_loop_records_tool_events_with_digested_args() {
     let messages = msgs();
     let caveats = Caveats::top();
     let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let mut reaches = Vec::new();
     chat_complete(
         ChatCtx {
             url: &server.uri(),
@@ -3707,7 +3708,7 @@ async fn ollama_loop_records_tool_events_with_digested_args() {
             summarizer: None,
             compress_state: None,
             tool_events: Some(&mut events),
-            phantom_reaches: None,
+            phantom_reaches: Some(&mut reaches),
             end_reason: None,
             solve_obs: None,
             permission_gate: None,
@@ -3746,6 +3747,15 @@ async fn ollama_loop_records_tool_events_with_digested_args() {
         !events[1].args_digest.contains("tippy-top-secret"),
         "raw arg value leaked: {}",
         events[1].args_digest
+    );
+    assert_eq!(
+        reaches,
+        vec![crate::PhantomReach {
+            name_as_called: "definitely_not_a_real_tool".into(),
+            resolution: crate::PhantomResolution::Unknown,
+            active_context_features: Vec::new(),
+        }],
+        "record the unknown reach once, without treating the real listing as phantom"
     );
 }
 
