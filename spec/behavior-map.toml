@@ -522,8 +522,8 @@ invariant = "AuthorizationDisplayed"
 path = "newt-interaction/src/binding.rs"
 symbol = "resolve_typed_tests::an_alias_cannot_select_an_action_absent_from_the_question"
 [[BHV-PROMPT-001.refs.rust_tests]]
-path = "newt-core/src/store.rs"
-symbol = "tests::interaction_offer_publish_answer_take_race_and_fence"
+path = "newt-core/src/store_tests/inbox.rs"
+symbol = "interaction_offer_publish_answer_take_race_and_fence"
 [[BHV-PROMPT-001.refs.rust_tests]]
 path = "newt-web/src/main.rs"
 symbol = "tests::attach_tab_renders_and_answers_a_danger_gated_permission_decision"
@@ -598,8 +598,8 @@ symbol = "web_verdict_and_local_control_resolve_exactly_once"
 path = "newt-tui/src/permissions_tests/permission_prompt_tests.rs"
 symbol = "web_decision_timeout_resolves_and_denies_without_hanging"
 [[BHV-PROMPT-003.refs.rust_tests]]
-path = "newt-core/src/store.rs"
-symbol = "tests::interaction_offer_publish_answer_take_race_and_fence"
+path = "newt-core/src/store_tests/inbox.rs"
+symbol = "interaction_offer_publish_answer_take_race_and_fence"
 [[BHV-PROMPT-003.refs.production]]
 path = "newt-core/src/interaction_offer.rs"
 symbol = "take_interaction_decision"
