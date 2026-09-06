@@ -690,7 +690,7 @@ const DEBT: &[Unit] = &[
                 "self.tiers.is_empty() || self.tiers.contains(&tier)"
             ),
             site(
-                "newt-core/src/config.rs",
+                "newt-core/src/config/backend.rs",
                 "pub model_path: Option<String>,\n    #[serde(default)]\n    pub tiers: Vec<Tier>,"
             ),
         ]
@@ -1021,7 +1021,7 @@ const SANCTIONS: &[Unit] = &[
         Sanction,
         "backend provenance is serialized human audit evidence, not runtime policy.",
         [explained(
-            "newt-core/src/config.rs",
+            "newt-core/src/config/backend.rs",
             "pub provenance: Option<BackendProvenance>",
             "Written by `newt setup`; never read at runtime"
         ),]
