@@ -1317,7 +1317,7 @@ mod tests {
             let cancel = cancel.clone();
             let stop = stop.clone();
             std::thread::spawn(move || {
-                crate::watch_for_interrupt_fd(
+                crate::turn_input::watch_for_interrupt_fd(
                     pipe[0],
                     &cancel,
                     &stop,
