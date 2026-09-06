@@ -48,7 +48,7 @@ Everything that outranks interrupt is named as a negative conjunct in six lines,
 
 ## 2. What newt does today
 
-**The shipped path is the cockpit.** `newt-cli/Cargo.toml:66` default features + `config.rs:712` `FooterMode::Auto` + `prompt.rs:116` ⇒ on a unix TTY, rich surface → cockpit.
+**The shipped path is the cockpit.** `newt-cli/Cargo.toml:66` default features + `newt-core/src/config/presentation.rs` `FooterMode::Auto` + `prompt.rs:116` ⇒ on a unix TTY, rich surface → cockpit.
 
 | Axis | cockpit (shipped) | classic / lean |
 |---|---|---|
