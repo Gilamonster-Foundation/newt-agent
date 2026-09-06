@@ -1,4 +1,12 @@
 use super::*;
+// The roadmap family lives in `crate::roadmap_cmds`. These names are used
+// only by this test tree, so importing them here rather than re-exporting
+// from the crate root keeps them out of every non-test build. This file is
+// itself `#[cfg(test)]`, so the import is never dead.
+use crate::roadmap_cmds::{
+    autocapture_target, export_roadmap_to, import_roadmap_from, next_roadmap_node_id,
+    parse_roadmap_command, render_roadmap_tree, roadmap_file_path, RoadmapCommand,
+};
 use std::fs;
 
 /// A real store on tempdirs, mirroring the conversation-command tests.
