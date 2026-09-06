@@ -1,4 +1,11 @@
 use super::*;
+// Named directly rather than re-exported from the crate root: these are
+// used only by this test, and a `pub(crate) use` for them would be an
+// unused import in every non-test build.
+use crate::roadmap_cmds::{
+    autocapture_target, export_roadmap_to, import_roadmap_from, next_roadmap_node_id,
+    parse_roadmap_command, render_roadmap_tree, roadmap_file_path, RoadmapCommand,
+};
 use std::fs;
 
 fn write_skill(root: &std::path::Path, name: &str, desc: &str) {
@@ -620,8 +627,8 @@ fn the_roadmap_read_subcommands_are_the_ones_a_retired_door_may_serve() {
 /// mapped `/tree` to `/roadmap show`.
 #[test]
 fn roadmap_tree_parses_as_the_view_it_names() {
-    let show = super::parse_roadmap_command("/roadmap show").expect("show parses");
-    let tree = super::parse_roadmap_command("/roadmap tree").expect("tree parses");
+    let show = parse_roadmap_command("/roadmap show").expect("show parses");
+    let tree = parse_roadmap_command("/roadmap tree").expect("tree parses");
     assert_eq!(show, tree, "tree IS show — one view, two names");
 }
 

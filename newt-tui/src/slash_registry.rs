@@ -1022,6 +1022,14 @@ mod tests {
                 "navigator_cmds.rs",
                 production(include_str!("navigator_cmds.rs")),
             ),
+            // The `/roadmap` family moved out of `lib.rs`; its interception
+            // site moved with it, so the inventory follows the code. Adding
+            // the file keeps the pinned total whole — it is a REPOINT, not a
+            // lowering.
+            (
+                "roadmap_cmds.rs",
+                production(include_str!("roadmap_cmds.rs")),
+            ),
         ]
     }
 
