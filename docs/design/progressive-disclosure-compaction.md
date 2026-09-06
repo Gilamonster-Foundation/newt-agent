@@ -57,7 +57,7 @@ introduce a new store.
 | Resolver `turn:<conv>#<seq>` | `store.rs:581`, `store.rs:2045` (`load_turn` by `(conv, seq)`) | verbatim history is **already persisted and addressable** |
 | Resolver `note:<id>` | `memory.rs` index | the durable knowledge-bank tie-in |
 | Content addressing (blake3) | `store.rs:969` (`canonical_encoding_v1`) | tamper-evident, dedup'd spans |
-| Opt-in flag pattern, default inert | `MemoryDisclosure::Frozen`/`Index` (`config.rs:499`) | exact "behind a flag, bit-for-bit unchanged by default" shape |
+| Opt-in flag pattern, default inert | `MemoryDisclosure::Frozen`/`Index` (`newt-core/src/config/memory.rs`) | exact "behind a flag, bit-for-bit unchanged by default" shape |
 | CI-pinned index budget | `MEMORY_INDEX_BUDGET = 12` (`memory.rs:763`) | "cheap layer rides every request; bodies on demand" |
 
 The gap is narrow and specific: **the compaction marker does not carry the

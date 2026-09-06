@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{NewtError, Result};
 use crate::router::Tier;
+pub use api_surface::{ApiSurfaceConfig, LanguagePack, SymbolRule};
 pub(crate) use backend::resolve_api_key_common;
 pub use backend::{
     derive_serving, set_cli_backend_override, BackendConfig, BackendDestination, BackendKind,
@@ -37,6 +38,7 @@ pub(crate) use layering::{
 };
 pub use layering::{ArrayMergeStrategy, MergeConfig};
 pub use loadout::{Loadout, LoadoutSettings};
+pub use memory::{MemoryConfig, MemoryDisclosure, MemoryProviderKind};
 pub use newt_tuner::ModelTuning;
 pub use permissions::{ModeConfig, PermissionPreset, ToolPermissions};
 pub use presentation::{
@@ -47,20 +49,28 @@ pub use profile::{
     BundleConfig, PickVia, ProfileConfig, ProfilePick, RetryKnobs, VerifyGateKnobs,
     KNOWN_TECHNIQUES,
 };
+pub use semantic::{OnEmbedFailure, SemanticConfig};
+pub use skills::SkillsConfig;
+pub use summarizer::SummarizerConfig;
 pub use tool_exposure::{ExposureProfile, ToolExposureConfig};
 pub use tools::ToolsConfig;
 
+mod api_surface;
 mod backend;
 mod context;
 mod crew;
 mod dropin;
 mod layering;
 mod loadout;
+mod memory;
 mod permissions;
 mod presentation;
 mod profile;
 mod redact;
+mod semantic;
 mod shell;
+mod skills;
+mod summarizer;
 mod tool_exposure;
 mod tools;
 use backend::{cli_backend_override, validate_backend_names, BackendAssembly, RecordTag};
@@ -388,42 +398,6 @@ impl Default for ConversationsConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Skill search path
-// ---------------------------------------------------------------------------
-
-/// The skill discovery **search path**: an ordered list of directories newt
-/// scans for agentskills.io-format `SKILL.md` folders.
-///
-/// A skill is the same folder in every harness, so cross-harness use is just a
-/// matter of *pointing newt at the directories* — list `~/.claude/skills`,
-/// `~/.codex/skills`, a project-local `.skills/`, whatever — and their skills
-/// become visible with no copying. The list is open-ended on purpose: there is
-/// no hard-coded knowledge of any particular harness. Earlier entries win on a
-/// name collision.
-///
-/// Example `~/.newt/config.toml`:
-/// ```toml
-/// [skills]
-/// search = ["~/.newt/skills", "~/.claude/skills", "~/.codex/skills"]
-/// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SkillsConfig {
-    /// Ordered directories to scan for skills. Empty → `~/.newt/skills`.
-    /// `~/` is expanded to `$HOME`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub search: Vec<String>,
-
-    /// Directory of bundled skills shipped with newt-agent. Scanned *after* the
-    /// user's `search` paths — i.e. at the **lowest** priority — so a user skill
-    /// of the same name shadows the bundled one (earlier directories win a
-    /// collision; see [`newt_skills::discover_paths`]). Empty → no bundled
-    /// directory is scanned. `~/` is expanded to `$HOME`.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub bundled_dir: String,
-}
-
-// ---------------------------------------------------------------------------
 // Log rotation config
 // ---------------------------------------------------------------------------
 
@@ -482,291 +456,6 @@ impl Default for LogConfig {
             keep_rotated: default_log_keep_rotated(),
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Memory config
-// ---------------------------------------------------------------------------
-
-/// Memory management stored under `[memory]` in `newt.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MemoryConfig {
-    /// Which memory provider to activate.
-    #[serde(default)]
-    pub provider: MemoryProviderKind,
-    /// Turns retained by `RollingWindow`. Default: 20.
-    #[serde(default = "default_memory_window")]
-    pub window: usize,
-    /// Explicit context-token budget for `TokenBudget` / `Summarizing` — a
-    /// deliberate user override that wins over everything else (Step 18.2,
-    /// #247). When unset, the budget derives from the empirical capability
-    /// cache (`max_ok_input` else `safe_context` in
-    /// `model-capabilities.json`); the static default
-    /// (`DEFAULT_CONTEXT_TOKENS`, 8,192) applies only when neither exists.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_tokens: Option<u32>,
-
-    /// Explicit path to a soul file (overrides workspace + global resolution).
-    /// Default: auto-resolve from `.newt/soul.md` → `~/.newt/soul.md`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub soul_file: Option<String>,
-
-    /// User turns without an organic `save_note` call before the in-band
-    /// memory nudge is appended to the next user message (Step 19.3, #248).
-    /// `0` disables the nudge. Default: 10.
-    #[serde(default = "default_note_nudge_interval")]
-    pub note_nudge_interval: usize,
-
-    /// End-of-conversation note extraction (Step 19.4, #248): when `true`,
-    /// closing a conversation (`/new` or a clean exit) runs ONE synchronous
-    /// tools-disabled completion that distills at most 3 durable facts into
-    /// NOTES.md through the scanned `save_note` write path. Default: `false`
-    /// — the pass is optional and costs one completion per close.
-    #[serde(default)]
-    pub extract_notes_on_close: bool,
-
-    /// How memory is disclosed to the model (progressive-disclosure memory,
-    /// Workstream A MVP, #319). `Frozen` (the default) is today's behavior
-    /// exactly: NOTES are frozen verbatim into the system prompt and the
-    /// `memory_fetch` tool is not wired. `Index` opts in to the budgeted
-    /// memory INDEX (note titles/ids instead of full bodies) plus the
-    /// `memory_fetch` tool that pulls a body on demand. This is a context-cost
-    /// facet, never an authorization knob.
-    #[serde(default)]
-    pub disclosure: MemoryDisclosure,
-}
-
-/// Memory disclosure mode — the `[memory] disclosure` key (#319).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryDisclosure {
-    /// Today's behavior: NOTES frozen verbatim into the system prompt, no
-    /// `memory_fetch` tool. The MVP default — inert unless opted in.
-    #[default]
-    Frozen,
-    /// Progressive disclosure: a budgeted memory INDEX in the prompt plus the
-    /// `memory_fetch` tool to pull bodies on demand.
-    Index,
-}
-
-/// One symbol-extraction rule in a [`LanguagePack`]: a regex over a single source
-/// line whose **first capture group is the public symbol's name**, plus a
-/// free-form kind label. Free-form so a pack is not locked to one language's
-/// vocabulary (`fn`/`struct` for Rust, `class`/`def` for Python, `func` for Go…).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SymbolRule {
-    /// Regex; capture group 1 = the symbol name.
-    pub pattern: String,
-    /// Kind shown in the surface (e.g. `"fn"`, `"struct"`, `"class"`, `"func"`).
-    pub kind: String,
-}
-
-/// A **language pack** for the workspace API surface (#669): how to recognize a
-/// language's files, which files expose its public API, and how to extract its
-/// public symbols — entirely as DATA, so a new language is config, not code.
-///
-/// Built-in packs cover common source languages. A project ships more by
-/// dropping a `<name>.toml` into `~/.newt/language-packs/` (global) or
-/// `.newt/language-packs/` (project-local), or inline under
-/// `[[context.api_surface.language_packs]]`. Packs merge **by `name`** (a custom
-/// pack with a built-in's name replaces it), so anyone can add Java, Ruby, Swift,
-/// Objective-C, … without touching the binary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LanguagePack {
-    /// Stable id (a config pack with a built-in's name replaces that built-in).
-    pub name: String,
-    /// Human spellings accepted by harness source-file classification, e.g.
-    /// `["c++", "cpp"]` or `["c#", "dotnet"]`. The stable `name` is always an
-    /// implicit alias. Pure data keeps language understanding out of prompt-
-    /// specific conditionals.
-    #[serde(default)]
-    pub aliases: Vec<String>,
-    /// File extensions this pack claims, no dot — `["rs"]`, `["h", "hpp", "cpp"]`.
-    pub extensions: Vec<String>,
-    /// Entry-point filename globs (the public-API files, listed first in the
-    /// surface). Supported globs: exact (`lib.rs`), suffix (`*.h`), or all (`*`).
-    /// Empty ⇒ no file is prioritized for this pack.
-    #[serde(default)]
-    pub entry_points: Vec<String>,
-    /// Public-symbol extraction rules, applied per source line.
-    pub symbols: Vec<SymbolRule>,
-}
-
-/// `[context.api_surface]` — the workspace-API-surface knowledge_base technique.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApiSurfaceConfig {
-    /// Inline language packs, merged by `name` over the built-ins and the
-    /// drop-in directories (the highest-precedence layer).
-    #[serde(default)]
-    pub language_packs: Vec<LanguagePack>,
-    /// **Deprecated** operator pin. When present, the tier-2 budget is pinned to
-    /// this char count (`floor_chars == ceiling_chars == max_block_chars`) — the
-    /// legacy fixed cap. Prefer the proportional trio below (spec §3, SC-L2).
-    /// Absent by default so the surface scales with the discovered window.
-    #[serde(default)]
-    pub max_block_chars: Option<usize>,
-    /// SC-L2 floor: the minimum tier-2 char allowance, even on a tiny window —
-    /// the surface must never be starved to nothing (dominates near ~8k tokens).
-    #[serde(default = "default_api_surface_floor_chars")]
-    pub floor_chars: usize,
-    /// SC-L2 slope: percent of the resolved send budget `w` (tokens) the tier-2
-    /// surface may claim, before the chars/token conversion and clamp.
-    #[serde(default = "default_api_surface_pct_of_budget")]
-    pub pct_of_budget: usize,
-    /// SC-L2 ceiling — a §8 *pin*, not law: the max tier-2 char allowance on a
-    /// large window; the v1 value is set empirically by the #548 map-size arms.
-    #[serde(default = "default_api_surface_ceiling_chars")]
-    pub ceiling_chars: usize,
-    /// Per-file symbol cap, so one huge file can't crowd out the surface.
-    #[serde(default = "default_api_surface_max_symbols_per_file")]
-    pub max_symbols_per_file: usize,
-}
-
-impl Default for ApiSurfaceConfig {
-    fn default() -> Self {
-        Self {
-            language_packs: Vec::new(),
-            max_block_chars: None,
-            floor_chars: default_api_surface_floor_chars(),
-            pct_of_budget: default_api_surface_pct_of_budget(),
-            ceiling_chars: default_api_surface_ceiling_chars(),
-            max_symbols_per_file: default_api_surface_max_symbols_per_file(),
-        }
-    }
-}
-
-// SC-L2 pins (spec §8). Defaults chosen so the floor dominates at the
-// DEFAULT_CONTEXT_TOKENS=8,192 fallback (8192·5% ·4 = 1,638 < 2,000) and the
-// ceiling caps a 262k-window session (its ~168k send budget · 5% · 4 ≫ 24,000).
-fn default_api_surface_floor_chars() -> usize {
-    2_000
-}
-
-fn default_api_surface_pct_of_budget() -> usize {
-    5
-}
-
-fn default_api_surface_ceiling_chars() -> usize {
-    24_000
-}
-
-fn default_api_surface_max_symbols_per_file() -> usize {
-    12
-}
-
-/// `[context.semantic]` — the embedding RAG-for-code feature's settings (Step
-/// 26.5.4, #582).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SemanticConfig {
-    /// Embedding model used to index the repo + embed queries. Default
-    /// `nomic-embed-text` (the HTTP path). The model must exist on the embeddings
-    /// endpoint (see `embeddings_endpoint`); when it can't be reached the feature
-    /// follows `on_embed_failure`.
-    ///
-    /// For the **embedded backend** (`embeddings_api = "embedded"`, #720) this is
-    /// only a label — the model is loaded from `embedding_model_path` — and it
-    /// should name a **candle-clean standard-BERT** model (e.g.
-    /// `bge-small-en-v1.5`), NOT `nomic-embed-text`, which candle 0.8 cannot load.
-    #[serde(default = "default_embedding_model")]
-    pub embedding_model: String,
-    /// Local model **directory** for the embedded embedder (#720): a
-    /// candle-clean standard-BERT model dir holding
-    /// `config.json` + `tokenizer.json` + `model.safetensors` (e.g. a fetched
-    /// `BAAI/bge-small-en-v1.5`). `None` (default) ⇒ the embedded path can't
-    /// load and reports a clear error. When `embeddings_api` and
-    /// `embeddings_endpoint` are unset, a configured path selects embedded
-    /// embeddings automatically. Ignored by explicit HTTP embeddings targets.
-    /// Mirrors the summarizer's `model_path`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding_model_path: Option<String>,
-    /// How many code chunks to retrieve per turn. Default 5.
-    #[serde(default = "default_semantic_top_k")]
-    pub top_k: usize,
-    /// Dedicated endpoint that serves embeddings (e.g. an Ollama
-    /// `http://host:11434`). `None` (default) leaves semantic retrieval on the
-    /// embedded path unless `embeddings_api` explicitly selects an HTTP protocol.
-    /// Set this to a real embeddings host when remote/vector-server embeddings
-    /// are a deliberate performance choice.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embeddings_endpoint: Option<String>,
-    /// Wire protocol of `embeddings_endpoint` — `ollama` (`/api/embeddings`) or
-    /// `openai` (`/v1/embeddings`). `embedded` selects the in-process embedder.
-    /// `None` (default) selects embedded embeddings when `embeddings_endpoint`
-    /// is also unset; with an explicit endpoint, `None` assumes `ollama`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embeddings_api: Option<BackendKind>,
-    /// What to do when embedding fails structurally (wrong endpoint / model
-    /// absent): `disable` (default) stops indexing after the first failure with
-    /// one actionable message; `warn` logs per-chunk and keeps trying.
-    #[serde(default)]
-    pub on_embed_failure: OnEmbedFailure,
-}
-
-impl Default for SemanticConfig {
-    fn default() -> Self {
-        Self {
-            embedding_model: default_embedding_model(),
-            embedding_model_path: None,
-            top_k: default_semantic_top_k(),
-            embeddings_endpoint: None,
-            embeddings_api: None,
-            on_embed_failure: OnEmbedFailure::default(),
-        }
-    }
-}
-
-/// Policy when an embedding request fails structurally during indexing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum OnEmbedFailure {
-    /// Stop indexing on the first failure and log one actionable error — a
-    /// structural failure (wrong endpoint / missing model) is total, not
-    /// transient, so degrading per-chunk just produces an empty index quietly.
-    #[default]
-    Disable,
-    /// Log every failed chunk and keep going (the historical behaviour).
-    Warn,
-}
-
-fn default_embedding_model() -> String {
-    "nomic-embed-text".to_string()
-}
-
-fn default_semantic_top_k() -> usize {
-    5
-}
-
-fn default_memory_window() -> usize {
-    20
-}
-
-fn default_note_nudge_interval() -> usize {
-    10
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            provider: MemoryProviderKind::RollingWindow,
-            window: 20,
-            context_tokens: None,
-            soul_file: None,
-            note_nudge_interval: 10,
-            extract_notes_on_close: false,
-            disclosure: MemoryDisclosure::Frozen,
-        }
-    }
-}
-
-/// Which built-in memory strategy to use.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryProviderKind {
-    #[default]
-    RollingWindow,
-    TokenBudget,
-    Summarizing,
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,14 +791,6 @@ fn default_inference_timeout_secs() -> u64 {
 
 fn default_keep_alive() -> String {
     "5m".to_string()
-}
-
-fn default_summarizer_timeout_secs() -> u64 {
-    60
-}
-
-fn default_summarizer_retries() -> u32 {
-    1
 }
 
 fn default_mid_loop_trim_threshold() -> usize {
@@ -1545,124 +1226,6 @@ impl ResolvedConfig {
         self.config
             .selected_configured_slot()
             .and_then(|slot| self.backend(slot))
-    }
-}
-
-/// Dedicated configuration for the compression summarizer, loaded from
-/// `~/.newt/summarizer.toml` (Step 24.10, #559). An absent file means
-/// `SummarizerConfig::default()` — every field falls back to the session
-/// backend, so behavior is unchanged from "summarizer reuses the session
-/// model".
-///
-/// The point of the separate file is the **own-backend** fields
-/// (`endpoint`/`model`/`kind`/`api_key_file`): a summarizer can run on a
-/// different, fast box than the session model instead of contending with it
-/// (the #548 field incident — a slow primary summarizer stalled ~189s before
-/// the static marker). `timeout_secs` / `retries` / `fallback_model` are the
-/// knobs that used to live under `[tui]` (moved here in 24.10).
-///
-/// Example `~/.newt/summarizer.toml`:
-/// ```toml
-/// endpoint = "http://REDACTED-HOST:11434"  # default: session backend URL
-/// model    = "qwen2.5-coder:3b"            # default: session model
-/// kind     = "ollama"                      # "ollama" | "openai"
-/// timeout_secs   = 45
-/// retries        = 1
-/// fallback_model = "nemotron-mini:4b"      # else preference-list auto-pick (24.9)
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SummarizerConfig {
-    /// Summarizer endpoint URL. `None` ⇒ reuse the session backend's URL.
-    pub endpoint: Option<String>,
-    /// Summarizer model. `None` ⇒ reuse the session backend's model.
-    pub model: Option<String>,
-    /// Backend protocol. `None` ⇒ reuse the session backend's kind.
-    pub kind: Option<BackendKind>,
-    /// For `kind = "embedded"` (#661 group C): the local GGUF model file for the
-    /// in-process candle summarizer. Ignored for HTTP backends.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_path: Option<String>,
-    /// Bearer-token file (first non-empty line). `None` ⇒ reuse the session key.
-    pub api_key_file: Option<String>,
-    /// Bearer-token environment variable (checked before `api_key_file`).
-    pub api_key_env: Option<String>,
-    /// Per-request timeout (seconds). Default 60 — cold-loading a big model can
-    /// legitimately exceed it; raise on a slow box that falls back to the marker.
-    #[serde(default = "default_summarizer_timeout_secs")]
-    pub timeout_secs: u64,
-    /// Retry attempts before the static marker. Default 1 — each attempt can
-    /// cost the full `timeout_secs` (the #548 189s incident was 3 × 60s).
-    #[serde(default = "default_summarizer_retries")]
-    pub retries: u32,
-    /// Explicit fallback model. `None` ⇒ for an Ollama summarizer backend, the
-    /// first installed small-model-preference-list entry is auto-picked (24.9).
-    pub fallback_model: Option<String>,
-    /// `keep_alive` for the warm + summary requests. `None` ⇒ inherit
-    /// `[tui].keep_alive`.
-    pub keep_alive: Option<String>,
-}
-
-impl Default for SummarizerConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: None,
-            model: None,
-            kind: None,
-            model_path: None,
-            api_key_file: None,
-            api_key_env: None,
-            timeout_secs: default_summarizer_timeout_secs(),
-            retries: default_summarizer_retries(),
-            fallback_model: None,
-            keep_alive: None,
-        }
-    }
-}
-
-impl SummarizerConfig {
-    /// Parse a `summarizer.toml` body. Pure — fully unit-testable without disk.
-    pub fn from_toml_str(text: &str) -> Result<Self> {
-        toml::from_str(text).map_err(|e| NewtError::Config(e.to_string()))
-    }
-
-    /// Load `~/.newt/summarizer.toml` (or `$NEWT_SUMMARIZER_CONFIG`). A missing
-    /// file is not an error — it yields [`SummarizerConfig::default`] (reuse the
-    /// session backend). Only a present-but-malformed file errors.
-    pub fn resolve() -> Result<Self> {
-        for path in Self::candidate_paths() {
-            if path.is_file() {
-                let text = std::fs::read_to_string(&path)?;
-                return Self::from_toml_str(&text);
-            }
-        }
-        Ok(Self::default())
-    }
-
-    /// Ordered candidate paths for `summarizer.toml`.
-    fn candidate_paths() -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        if let Ok(p) = std::env::var("NEWT_SUMMARIZER_CONFIG") {
-            paths.push(PathBuf::from(p));
-        }
-        if let Some(dir) = Config::user_config_dir() {
-            paths.push(dir.join("summarizer.toml"));
-        }
-        paths
-    }
-
-    /// Resolve this summarizer's bearer token (env var first, then file —
-    /// plaintext or encrypted), or `None` — the same
-    /// [`resolve_api_key_common`] rule as [`BackendConfig::resolve_api_key`]
-    /// (the mirrored body it used to carry is gone).
-    pub fn resolve_api_key(&self) -> Option<String> {
-        match resolve_api_key_common(self.api_key_env.as_deref(), self.api_key_file.as_deref()) {
-            Ok(v) => return v,
-            Err(e) => {
-                crate::secrets::warn_once(self.api_key_file.as_deref().unwrap_or("summarizer"), &e);
-            }
-        }
-        None
     }
 }
 
@@ -2428,80 +1991,6 @@ impl Config {
 
     /// Placeholder substituted for redacted secret values in [`Self::to_redacted_toml`].
     pub const REDACTED: &'static str = "<redacted>";
-
-    /// The ordered skill-discovery search path, with `~/` expanded.
-    ///
-    /// Resolves `[skills].search` when configured; otherwise defaults to the
-    /// single host-scoped `~/.newt/skills`. Order is preserved — earlier
-    /// directories win on a name collision (see `newt_skills::discover_paths`).
-    /// The default falls back to a relative `.newt/skills` only when `$HOME`
-    /// can't be resolved, so the list is never empty.
-    ///
-    /// A configured `[skills].bundled_dir` is appended **last** (lowest
-    /// priority), so a user skill of the same name shadows the bundled one.
-    #[must_use]
-    pub fn skill_search_dirs(&self) -> Vec<PathBuf> {
-        let configured = self
-            .skills
-            .as_ref()
-            .map(|s| s.search.as_slice())
-            .unwrap_or(&[]);
-        let mut dirs: Vec<PathBuf> = if configured.is_empty() {
-            let default = Self::user_config_dir()
-                .map(|dir| dir.join("skills"))
-                .unwrap_or_else(|| PathBuf::from(".newt/skills"));
-            vec![default]
-        } else {
-            configured.iter().map(|s| expand_tilde(s)).collect()
-        };
-
-        // Bundled skills scanned last: user-configured dirs win a name
-        // collision (first-wins in `discover_paths`), so users can override
-        // any bundled skill by shipping their own of the same name.
-        if let Some(bundled) = self
-            .skills
-            .as_ref()
-            .map(|s| s.bundled_dir.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            dirs.push(expand_tilde(bundled));
-        }
-
-        dirs
-    }
-
-    /// Fill in a default `[skills].bundled_dir` when the user left it unset, so
-    /// an agent running **inside a newt checkout gets the repo's bundled skills
-    /// surfaced out-of-the-box** (progressive-disclosure index → `use_skill`)
-    /// without any config. Detection walks up from `cwd` for a
-    /// `.newt/bundled-skills` directory; if none is found (or the field is
-    /// already set), the config is returned unchanged. Kept off the pure
-    /// [`Self::skill_search_dirs`] path — the filesystem probe lives only here.
-    ///
-    /// This is the smallest first step (dev/agent-in-checkout); packaging a
-    /// default bundled dir for an *installed* newt is a follow-up (see the
-    /// bundled-skills epic).
-    #[must_use]
-    pub fn with_bundled_default(mut self) -> Self {
-        let already_set = self
-            .skills
-            .as_ref()
-            .is_some_and(|s| !s.bundled_dir.is_empty());
-        if already_set {
-            return self;
-        }
-        let Ok(cwd) = std::env::current_dir() else {
-            return self;
-        };
-        if let Some(dir) =
-            find_ancestor_dir(&cwd, Path::new(".newt/bundled-skills"), |p| p.is_dir())
-        {
-            self.skills
-                .get_or_insert_with(SkillsConfig::default)
-                .bundled_dir = dir.to_string_lossy().into_owned();
-        }
-        self
-    }
 
     /// The personas directory: sibling of `~/.newt/config.toml`, i.e.
     /// `~/.newt/personas`. Falls back to a relative `./personas` only when
