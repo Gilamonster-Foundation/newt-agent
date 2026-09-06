@@ -477,29 +477,29 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   real `..`, absolute, in-tree-relative-symlink-escape, and absolute-symlink-escape paths through
   `WorkspaceDir` and asserts denial, with an explicit contrast test proving the object resolver
   denies exactly what a lexical `starts_with` admits — neutering the resolve flags fails 5 of the
-  8 (verified red→green). `read_file_symlink_under_workspace_escaping_is_denied` (`tools.rs`,
+  8 (verified red→green). `read_file_symlink_under_workspace_escaping_is_denied` (`newt-core/src/agentic/tools_tests/execute_filesystem.rs`,
   step-52.2, real-fs tier) drives a confined `read_file` over a symlink-escape path and asserts the
   read is *denied* rather than exfiltrating the outside file (fails on the pre-rewire arm — verified
-  red→green). `list_dir_symlink_under_workspace_escaping_is_denied` (`tools.rs`, step-52.3, real-fs
+  red→green). `list_dir_symlink_under_workspace_escaping_is_denied` (`newt-core/src/agentic/tools_tests/execute_filesystem.rs`, step-52.3, real-fs
   tier) + `read_dir_lists_contained_entries` / `read_dir_denies_a_symlink_escape_directory`
   (`fs_cap_object_bound.rs`) drive a confined `list_dir` (and the underlying `WorkspaceDir::read_dir`)
   over a symlink-escape directory and assert it is *denied* rather than enumerated (verified
   red→green — neutering the resolve flags re-fails them). `write_file`'s escape residual is now
-  proven closed by `physical_symlink_escape_write_is_denied_object_bound` (`tools.rs`, step-52.4) —
+  proven closed by `physical_symlink_escape_write_is_denied_object_bound` (`newt-core/src/agentic/tools_tests/execute_file_artifacts.rs`, step-52.4) —
   the *flip* of the old `..._mutates_under_existing_policy...` test: a confined `write_file` through a
   symlink-escape path is denied and the outside file is left unchanged (verified red→green) — plus
   `create_dir_all_makes_nested_dirs_beneath` / `create_dir_all_denies_a_symlink_escape_component`
   (`fs_cap_object_bound.rs`) ground the object-bound `mkdir -p`. `edit_file_symlink_under_workspace_escaping_is_denied`
-  (`tools.rs`, step-52.5) proves BOTH the read of `existing` (which could leak an outside file's head
+  (`newt-core/src/agentic/tools_tests/execute_filesystem.rs`, step-52.5) proves BOTH the read of `existing` (which could leak an outside file's head
   on a no-match) and the write are object-bound beneath the `fs_write` root — the escape is denied and
   the outside file is left unchanged (verified red→green). `delete_file_symlink_under_workspace_escaping_is_denied`
-  (`tools.rs`, step-52.6) proves the removal is object-bound via `unlinkat` on the resolved parent — a
+  (`newt-core/src/agentic/tools_tests/execute_filesystem.rs`, step-52.6) proves the removal is object-bound via `unlinkat` on the resolved parent — a
   symlink-escape delete is denied and the outside file survives (before the rewire `remove_file`
   followed the intermediate symlink and deleted outside); `unlink_removes_a_contained_file` /
   `unlink_denies_a_symlink_escape_parent` (`fs_cap_object_bound.rs`) ground the primitive. `find`'s
   recursive-read root is now object-bound to the workspace (replacing its canonicalize-`starts_with`
   TOCTOU; `find_refuses_root_outside_workspace` + `find_does_not_follow_symlinks_out_of_workspace`
-  pin it). The `newt-tools` applier primitives (`apply_whole_files` / `fuzzy` / `diffy`) read AND
+  (`newt-core/src/agentic/tools_tests/execute_find.rs`) pin it). The `newt-tools` applier primitives (`apply_whole_files` / `fuzzy` / `diffy`) read AND
   write object-bound through one shared owner (`read_contained_opt` / `write_contained` +
   `WorkspaceDir::rename`), proven by `apply_whole_files_denies_symlink_escape_object_bound`
   (step-52.7). `tui_permits_path` is now documented as a lexical *pre-filter* (renamed
@@ -846,7 +846,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `no_persona_read_verb_tool_is_not_name_granted` (the name-classification adversarial test — a
   `get_…`-named tool is denied on the name alone, and dispatches ONLY on an explicit human grant),
   `no_persona_mutating_mcp_tool_dispatches_when_human_grants`,
-  `remote_tool_outside_allow_list_is_prompted_not_hard_vetoed` (`agentic/tools.rs`), and
+  `remote_tool_outside_allow_list_is_prompted_not_hard_vetoed` (`newt-core/src/agentic/tools_tests/execute_mcp_authority.rs`), and
   `classify_reads_by_verb_prefix_stripping_namespace` +
   `leash_mints_only_from_a_structural_grant_never_the_name` (`agentic/mcp.rs`). Removing the witness
   requirement makes the un-leashed dispatch compile again; re-adding a name-based auto-grant
