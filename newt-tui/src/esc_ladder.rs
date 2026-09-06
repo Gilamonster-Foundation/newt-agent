@@ -13,9 +13,9 @@
 //! What the ladder answers is one bit in the cockpit: escape, or pass to the
 //! editor. It does not dispatch — the editor still re-derives its own winner
 //! through `Editor::input`. The claimant *names* earn their place through the
-//! conformance test in `rich_input.rs` and, later, through `Ladder::describe`
-//! driving the mode hint; do not read `Verdict::Claimed`'s name as a routing
-//! decision.
+//! conformance test in `rich_input_tests/esc_ladder.rs` and, later, through
+//! `Ladder::describe` driving the mode hint; do not read `Verdict::Claimed`'s
+//! name as a routing decision.
 
 use std::sync::LazyLock;
 

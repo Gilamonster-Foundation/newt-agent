@@ -14,7 +14,7 @@
 //! `cargo test --workspace`.
 //!
 //! **What it grounds.** The mocked ladder tests (`esc_ladder.rs`) and the
-//! registration conformance test (`rich_input.rs`) both reason about a
+//! registration conformance test (`rich_input_tests/esc_ladder.rs`) both reason about a
 //! `ClaimSet` this crate constructs from state it also owns. Neither can tell
 //! you that a lone `0x1b` byte, arriving on a terminal in raw mode, becomes a
 //! `KeyCode::Esc` press event at all — crossterm's split-escape
