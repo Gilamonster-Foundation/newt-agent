@@ -2091,13 +2091,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         .iter()
         .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
         .collect();
-    let ephemeral_prompt = turn_prompt_context.is_none().then(|| {
-        crate::TurnPromptContext::ephemeral_operator(
-            "ephemeral-headless",
-            task.as_bytes().to_vec(),
-            task.as_bytes().to_vec(),
-        )
-    });
+    let ephemeral_prompt = prompt_read::headless_prompt_fallback(turn_prompt_context, task);
     let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
     let prompt_context =
         prompt_read::PromptReadContext::new(turn_prompt_context, task, prompt_source);
@@ -5971,13 +5965,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             serde_json::json!({"role": m.role.as_str(), "content": content})
         })
         .collect();
-    let ephemeral_prompt = turn_prompt_context.is_none().then(|| {
-        crate::TurnPromptContext::ephemeral_operator(
-            "ephemeral-headless",
-            task.as_bytes().to_vec(),
-            task.as_bytes().to_vec(),
-        )
-    });
+    let ephemeral_prompt = prompt_read::headless_prompt_fallback(turn_prompt_context, task);
     let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
     let prompt_context =
         prompt_read::PromptReadContext::new(turn_prompt_context, task, prompt_source);
@@ -8057,13 +8045,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             serde_json::json!({"role": m.role.as_str(), "content": content})
         })
         .collect();
-    let ephemeral_prompt = turn_prompt_context.is_none().then(|| {
-        crate::TurnPromptContext::ephemeral_operator(
-            "ephemeral-headless",
-            task.as_bytes().to_vec(),
-            task.as_bytes().to_vec(),
-        )
-    });
+    let ephemeral_prompt = prompt_read::headless_prompt_fallback(turn_prompt_context, task);
     let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
     let prompt_context =
         prompt_read::PromptReadContext::new(turn_prompt_context, task, prompt_source);
@@ -9764,13 +9746,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         .iter()
         .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
         .collect();
-    let ephemeral_prompt = turn_prompt_context.is_none().then(|| {
-        crate::TurnPromptContext::ephemeral_operator(
-            "ephemeral-headless",
-            task.as_bytes().to_vec(),
-            task.as_bytes().to_vec(),
-        )
-    });
+    let ephemeral_prompt = prompt_read::headless_prompt_fallback(turn_prompt_context, task);
     let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
     let prompt_context =
         prompt_read::PromptReadContext::new(turn_prompt_context, task, prompt_source);
