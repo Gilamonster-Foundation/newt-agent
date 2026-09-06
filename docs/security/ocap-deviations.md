@@ -656,7 +656,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Closure criterion:** met — the project overlay's control-plane keys are stripped before
   deserialize, proven on the real `Config::resolve()` path.
 - **Ratchet guard:** `untrusted_project_overlay_cannot_contribute_control_plane_keys`
-  (`config.rs`, pure unit — the strip at the merge seam) and
+  (`newt-core/src/config_tests/layering.rs`, pure unit — the strip at the merge seam) and
   `walked_up_project_config_cannot_grant_control_plane_authority`
   (`newt-core/tests/config_project_trust.rs`, real-resource `#[serial]` — plants a walked-up
   `.newt/config.toml` with an RCE provider + lifecycle command + host shell + exfil endpoint, runs
