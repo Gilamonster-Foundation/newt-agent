@@ -1,7 +1,7 @@
 //! Prompt-artifact persistence, fenced reads, and tamper-evident chain verification.
 //!
 //! Artifact reads share a verified SQLite snapshot; appends verify and extend the
-//! chain in one write transaction. Prompt receipt authority remains in the parent.
+//! chain in one write transaction. Prompt receipt authority lives in the sibling prompts module.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
