@@ -100,7 +100,7 @@ not invent new mechanism.
 | **decomposition on/off** | split a task so each subtask's working set fits | no agentic-loop knob; planning is external (`newt-core/src/plan.rs:42`, #334, Workstream C) | **gap — needs a seam** (the loop is decomposition-blind today) |
 | **disclosure / memory budget** | how many items the memory index surfaces | `MEMORY_INDEX_BUDGET` (`newt-core/src/memory.rs:763`, hardcoded `12`) | **hardcoded — needs a config knob** |
 | **re-ground-after-compression** | force recovery of the evicted surface after a compress | `reread_breadcrumb` (`newt-core/src/agentic/compress.rs:892`) — deterministic, no knob; R4 wants it to carry the *fact* | **gap — needs a seam** |
-| **prompt / soul shape** | per-family system-prompt framing | mode framing pattern (`ModeConfig.framing`, `newt-core/src/config.rs:138-151`) is the closest existing shape | **gap for the family axis — scoped, deferred** |
+| **prompt / soul shape** | per-family system-prompt framing | mode framing pattern (`ModeConfig.framing`, `newt-core/src/config/permissions.rs`) is the closest existing shape | **gap for the family axis — scoped, deferred** |
 
 **Where the schema stands today.** Three knobs are already (at least partly)
 config-driven — **window budget**, **tool-round cap**, and **compression

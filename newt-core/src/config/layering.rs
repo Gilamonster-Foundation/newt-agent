@@ -127,7 +127,7 @@ pub(crate) const CONTROL_PLANE_KEYS: &[&str] = &[
     "crews",
     "loadouts",
     // `[tui.permissions]` is the SESSION AUTHORITY preset — `to_caveats()` turns
-    // it into the caveats the turn runs under (config.rs mcp_probe_caveats /
+    // it into the caveats the turn runs under (config/permissions.rs mcp_probe_caveats /
     // caveats_for_session). A project overlay setting `preset = "full-access"` /
     // `extra_exec` / `net` would escalate an ordinary interactive turn to
     // `Caveats::top()`. A repo has no business setting the operator's permission
