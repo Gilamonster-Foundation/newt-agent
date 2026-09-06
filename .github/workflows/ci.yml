@@ -333,8 +333,12 @@ jobs:
       # pass --all-targets never run on 1.88; each gate saw one half and the
       # intersection was unwatched. docs/ROADMAP.md names `cargo test
       # --workspace` as acceptance, so tests are inside the promise.
+      #
+      # The feature flags match every other workspace gate in this file. A
+      # kernel- or schema-gated dependency is a third way for the floor to
+      # drift unseen: without them it is never resolved here at all.
       - name: cargo check (MSRV 1.88, all targets)
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --features newt-data/kernel,newt-interaction/schema
 
   windows:
     name: Windows build + test

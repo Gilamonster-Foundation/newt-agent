@@ -338,6 +338,8 @@ audit:
 # the .githooks/pre-push hook. `--all-targets` is what makes dev-dependencies
 # count (#2161): without it they resolve but never build, so their
 # rust-version is never enforced and the floor can drift under the tests.
+# The feature flags match `just test` and the CI test/lint jobs: a kernel- or
+# schema-gated dependency is otherwise never resolved here at all.
 # Local best-effort: needs rustup + the 1.88 toolchain; skips (with a note)
 # otherwise — CI is the hard gate.
 msrv:
@@ -348,7 +350,7 @@ msrv:
         echo "        install: rustup toolchain install 1.88"
         exit 0
     fi
-    cargo +1.88 check --workspace --all-targets
+    cargo +1.88 check --workspace --all-targets --features newt-data/kernel,newt-interaction/schema
 
 # --- Coverage ---
 #
