@@ -124,6 +124,79 @@ fn messages_contain(body: &serde_json::Value, needle: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[test]
+fn organic_note_use_resets_only_with_matching_call_and_sink() {
+    for (name, has_sink, resets) in [
+        ("save_note", true, true),
+        ("save_note", false, false),
+        ("read_file", true, false),
+    ] {
+        let mut sink = MockSink::default();
+        let sink = has_sink.then_some(&mut sink as &mut dyn NoteSink);
+        let mut nudge = NoteNudge::new(1);
+        assert!(nudge.begin_turn().is_none());
+        record_organic_note_use(name, &sink, &mut Some(&mut nudge));
+        assert_eq!(
+            nudge.begin_turn().is_none(),
+            resets,
+            "{name}, sink={has_sink}"
+        );
+    }
+    let mut sink = MockSink::default();
+    record_organic_note_use("save_note", &Some(&mut sink), &mut None);
+    assert!(sink.calls.is_empty(), "the gate does not dispatch a save");
+}
+
+/// Cancelling after batch acceptance reaches the tool's cancel-first dispatch
+/// boundary. The attempted organic save must have reset the nudge already,
+/// even though the sink body never runs and the loop returns immediately.
+#[tokio::test]
+async fn cancelled_save_attempt_resets_before_dispatch_without_calling_sink() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "prompt_eval_count": 1,
+            "eval_count": 1,
+            "message": { "content": "", "tool_calls": [{ "function": {
+                "name": "save_note",
+                "arguments": { "action": "add", "text": "cancelled note" }
+            }}] }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let cancel = AtomicBool::new(false);
+    let mut hook = |obs| {
+        if matches!(obs, RoundObservation::Accepted { .. }) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    };
+    let mut sink = MockSink::default();
+    let mut nudge = NoteNudge::new(1);
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.note_sink = Some(&mut sink);
+    c.note_nudge = Some(&mut nudge);
+    c.cancel = Some(&cancel);
+    c.on_round_usage = Some(&mut hook);
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.unwrap();
+
+    assert!(
+        cancel.load(Ordering::Relaxed),
+        "acceptance must trigger cancellation"
+    );
+    assert!(reply.is_empty(), "the interrupted turn returns immediately");
+    assert!(
+        sink.calls.is_empty(),
+        "cancellation must prevent the tool body"
+    );
+    assert!(nudge.begin_turn().is_none(), "reset must precede dispatch");
+}
+
 /// Ollama-shaped responder: issues one save_note tool call, then a final
 /// text answer once the "note saved:" tool result is visible in history.
 /// Also records whether save_note was advertised and whether the memory
@@ -476,8 +549,10 @@ async fn over_budget_error_round_trips_to_the_model() {
             ),
             ..Default::default()
         };
+    let mut nudge = NoteNudge::new(1);
     let mut c = ctx(&uri, &messages, &caveats);
     c.note_sink = Some(&mut sink);
+    c.note_nudge = Some(&mut nudge);
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
         .await
         .expect("chat_complete should succeed");
@@ -486,5 +561,10 @@ async fn over_budget_error_round_trips_to_the_model() {
     assert!(
         error_seen.load(Ordering::SeqCst),
         "the curator error (full entry list + instruction) must reach the model verbatim"
+    );
+    assert_eq!(sink.calls, vec!["add:too big"]);
+    assert!(
+        nudge.begin_turn().is_none(),
+        "a failed organic save attempt must still reset the nudge"
     );
 }

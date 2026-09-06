@@ -1465,6 +1465,21 @@ pub struct ChatCtx<'a> {
     pub steering: Option<&'a dyn SteeringInbox>,
 }
 
+/// Record organic save_note use after repeat rejection and before dispatch.
+/// Reset even if the subsequent attempt fails or is cancelled; retain the
+/// optional sink/nudge gates.
+fn record_organic_note_use(
+    name: &str,
+    note_sink: &Option<&mut dyn NoteSink>,
+    note_nudge: &mut Option<&mut NoteNudge>,
+) {
+    if name == "save_note" && note_sink.is_some() {
+        if let Some(n) = note_nudge.as_deref_mut() {
+            n.note_saved();
+        }
+    }
+}
+
 /// #1948: observe completed calls and append at most one clean-build warning
 /// per turn. Keep this after repeat recording and before event timing.
 fn append_clean_build_warning(
@@ -3806,13 +3821,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if !is_read_only_call(name, &args) {
                 round_wrote = true;
             }
-            // Organic save_note use resets the memory-nudge counter (the
-            // read-only-rounds reset pattern) — active curators never see it.
-            if name == "save_note" && note_sink.is_some() {
-                if let Some(n) = note_nudge.as_deref_mut() {
-                    n.note_saved();
-                }
-            }
+            record_organic_note_use(name, &note_sink, &mut note_nudge);
             // retry technique: snapshot the file's pre-write bytes before the
             // write tool runs, so the post-turn gate can revert exactly newt's writes.
             ledger_note_write(write_ledger, name, &args, workspace);
@@ -7361,13 +7370,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 }));
                 continue;
             }
-            // Organic save_note use resets the memory-nudge counter (mirrors
-            // the Ollama path).
-            if name == "save_note" && note_sink.is_some() {
-                if let Some(n) = note_nudge.as_deref_mut() {
-                    n.note_saved();
-                }
-            }
+            record_organic_note_use(name, &note_sink, &mut note_nudge);
             // retry technique: snapshot the file's pre-write bytes before the
             // write tool runs, so the post-turn gate can revert exactly newt's writes.
             ledger_note_write(write_ledger, name, &args, workspace);
@@ -9204,13 +9207,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 }));
                 continue;
             }
-            // Organic save_note use resets the memory-nudge counter (mirrors
-            // the OpenAI path).
-            if name == "save_note" && note_sink.is_some() {
-                if let Some(n) = note_nudge.as_deref_mut() {
-                    n.note_saved();
-                }
-            }
+            record_organic_note_use(name, &note_sink, &mut note_nudge);
             // retry technique: snapshot the file's pre-write bytes before the
             // write tool runs (mirrors the OpenAI path).
             ledger_note_write(write_ledger, name, &args, workspace);
@@ -10266,11 +10263,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 }));
                 continue;
             }
-            if name == "save_note" && note_sink.is_some() {
-                if let Some(n) = note_nudge.as_deref_mut() {
-                    n.note_saved();
-                }
-            }
+            record_organic_note_use(name, &note_sink, &mut note_nudge);
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
             // #727: intercept the read-only budget self-read (see the Ollama path).
