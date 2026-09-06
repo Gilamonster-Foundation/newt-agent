@@ -1792,3 +1792,66 @@ fn a_site_without_its_local_reason_is_not_counted() {
         .any(|failure| failure.contains("mandatory local reason"));
     assert!(missing_reason_was_reported);
 }
+
+/// The twin of the test above, and the one that keeps the *site* detector
+/// honest rather than only the *reason* detector.
+///
+/// Everything here is correct EXCEPT the registered needle: the file exists,
+/// is readable, and carries its mandatory local marker. The only thing wrong
+/// is that the code the row claims to indict is not there. A registry that
+/// counted this as a finding would be pinning the marker rather than the
+/// code, and would keep counting a unit whose declaration had been renamed or
+/// deleted out from under it.
+///
+/// **This test exists to be killed by a mutation.** Delete the occurrence
+/// check in `scan_under` and every other test in this file still passes; only
+/// this one goes red. That was a real hole, found by adversarial review of the
+/// PR that introduced this suite and proven by deleting the detector and
+/// watching 7/7 stay green.
+#[test]
+fn a_site_whose_needle_is_absent_is_not_counted() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"probe\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join("probe/src")).unwrap();
+    let reason = "the marker is present but the code it indicts is gone.";
+    let marker = format!("INERT-CODE-RATCHET: Z97 DELETE: {reason}");
+    // Marker present, file readable — and the needle deliberately absent.
+    std::fs::write(
+        root.path().join("probe/src/lib.rs"),
+        format!("// {marker}\npub fn something_else_entirely() {{}}\n"),
+    )
+    .unwrap();
+    const SEED: Unit = unit!(
+        "Z97",
+        Delete,
+        "the marker is present but the code it indicts is gone.",
+        [site("probe/src/lib.rs", "pub fn inert_seed() {}"),]
+    );
+    let report = scan_under(root.path(), &[&SEED]).expect("scan seed without its needle");
+    assert!(
+        report.findings.is_empty(),
+        "a unit whose registered needle is ABSENT was counted as a finding — \
+         the site detector is not running, so this ratchet would pin markers \
+         rather than code: {:#?}",
+        report.findings
+    );
+    assert_eq!(
+        report.incomplete.len(),
+        1,
+        "the absent needle was not reported"
+    );
+    let absent_needle_was_reported = report.incomplete[0]
+        .failures
+        .iter()
+        .any(|failure| failure.contains("occurrence"));
+    assert!(
+        absent_needle_was_reported,
+        "incomplete for the wrong reason — expected an occurrence-count \
+         failure, got: {:#?}",
+        report.incomplete[0].failures
+    );
+}
