@@ -257,7 +257,7 @@ async fn stream_off_dispatches_kind_anthropic_end_to_end() {
 
     let messages = msgs();
     let caveats = Caveats::top();
-    // Calling chat_complete (not anthropic_chat_complete) pins the dispatch.
+    // Calling chat_complete pins the shared dispatch.
     let (reply, streamed, usage, hallu) =
         chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
             .await

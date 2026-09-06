@@ -47,7 +47,7 @@ use common::{for_each_production_line, production_roots, workspace_root};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-const KNOWN_INERT_UNITS: usize = 46;
+const KNOWN_INERT_UNITS: usize = 38;
 const KNOWN_SANCTIONS: usize = 16;
 const KNOWN_SCRIPT_PARSE_FAILURES: usize = 1;
 const WORKFLOW_COMPILER: &str = r#"
@@ -244,32 +244,6 @@ const DEBT: &[Unit] = &[
         ]
     ),
     unit!(
-        "X06",
-        Delete,
-        "four exported staging helpers have zero consumers.",
-        [
-            site("newt-core/src/atomic_fs.rs", "pub fn stable_path"),
-            site("newt-core/src/atomic_fs.rs", "pub fn stage_file("),
-            site("newt-core/src/atomic_fs.rs", "pub fn stage_private_file"),
-            site(
-                "newt-core/src/atomic_fs.rs",
-                "pub fn stage_file_with_permissions"
-            ),
-        ]
-    ),
-    unit!(
-        "X07",
-        Delete,
-        "obsolete code-file projection helpers have zero consumers.",
-        [
-            site(
-                "newt-core/src/api_surface.rs",
-                "pub fn code_file_extensions"
-            ),
-            site("newt-core/src/api_surface.rs", "pub fn path_is_code_file"),
-        ]
-    ),
-    unit!(
         "X08",
         Wire,
         "project-pack loading and merge behavior is tested but never entered in production.",
@@ -282,71 +256,6 @@ const DEBT: &[Unit] = &[
                 "newt-core/src/project_model.rs",
                 "pub fn load_project_packs_from_dir"
             ),
-        ]
-    ),
-    unit!(
-        "X09",
-        Delete,
-        "legacy operator-email wrapper has no caller; matched-pair identity resolution is live.",
-        [site(
-            "newt-core/src/agent_identity.rs",
-            "pub fn default_operator_email"
-        ),]
-    ),
-    unit!(
-        "X10",
-        Delete,
-        "public Anthropic wrappers have no entry caller; the private implementation is live.",
-        [
-            site(
-                "newt-core/src/agentic/mod.rs",
-                "pub async fn anthropic_chat_complete("
-            ),
-            site(
-                "newt-core/src/agentic/mod.rs",
-                "pub async fn anthropic_chat_complete_with_prompt("
-            ),
-        ]
-    ),
-    unit!(
-        "X11",
-        Delete,
-        "code-evidence wrapper is only reexported; ranked retrieval is the live path.",
-        [site(
-            "newt-core/src/agentic/semantic.rs",
-            "pub fn code_evidence_block"
-        ),]
-    ),
-    unit!(
-        "X12",
-        Delete,
-        "offload-and-prompt wrapper is only reexported; collaborator dispatch is live.",
-        [site(
-            "newt-core/src/agentic/tools.rs",
-            "pub async fn execute_tool_with_offload_and_prompt("
-        ),]
-    ),
-    unit!(
-        "X13",
-        Delete,
-        "transcript role constant is reexported but no renderer reads it.",
-        [site(
-            "newt-core/src/agentic/driver.rs",
-            "pub const VISIBLE_TRANSCRIPT_ROLES"
-        ),]
-    ),
-    unit!(
-        "X19",
-        Delete,
-        "grounding API is a closed tested island with no production entry point.",
-        [
-            site("newt-core/src/grounding.rs", "pub const DEFAULT_NGRAM"),
-            site("newt-core/src/grounding.rs", "pub const MIN_QUOTE_TOKENS"),
-            site("newt-core/src/grounding.rs", "pub struct GroundingConfig"),
-            site("newt-core/src/grounding.rs", "pub struct Span"),
-            site("newt-core/src/grounding.rs", "pub enum Ungrounded"),
-            site("newt-core/src/grounding.rs", "pub struct Grounding {"),
-            site("newt-core/src/grounding.rs", "pub fn check("),
         ]
     ),
     unit!(
@@ -1465,7 +1374,7 @@ fn the_named_inventory_only_decreases() {
                 .filter(|unit| unit.resolution == Resolution::Document)
                 .count(),
         ),
-        (25, 19, 2),
+        (25, 11, 2),
         "the accepted WIRE/DELETE/DOCUMENT classification changed"
     );
     assert!(

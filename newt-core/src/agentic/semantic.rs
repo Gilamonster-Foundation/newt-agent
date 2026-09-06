@@ -328,54 +328,6 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Render a `<code_evidence>` block from already-ranked `hits` (Step 26.5.3).
-/// `None` when there are no hits — the OFF/empty bit-for-bit guarantee (mirror
-/// `scratchpad::build_state_block`). Hard-capped at `total_cap` chars so
-/// retrieval can't blow the send budget.
-fn render_hits(hits: &[(f32, CodeChunk)], total_cap: usize) -> Option<String> {
-    if hits.is_empty() {
-        return None;
-    }
-    let mut body = String::from("<code_evidence>\n");
-    for (score, chunk) in hits {
-        let piece = format!(
-            "// {}:{}-{} ({}, score {score:.2})\n{}\n\n",
-            chunk.file, chunk.start_line, chunk.end_line, chunk.kind, chunk.text
-        );
-        if body.chars().count() + piece.chars().count() + "</code_evidence>".len() > total_cap {
-            body.push_str("[… more evidence omitted to fit the budget …]\n");
-            break;
-        }
-        body.push_str(&piece);
-    }
-    body.push_str("</code_evidence>");
-    Some(body)
-}
-
-/// Render the `<code_evidence>` block for a query VECTOR (Step 26.5.3): search
-/// by cosine, render the top_k. The raw-cosine path (no rerank) behind the
-/// vector-only `code_evidence_block` entry — `retrieve_evidence` is the reranked
-/// path. `None` when the index has no hits.
-pub(crate) fn build_code_evidence_block(
-    index: &dyn SemanticIndex,
-    query: &[f32],
-    top_k: usize,
-    total_cap: usize,
-) -> Option<String> {
-    render_hits(&index.search(query, top_k), total_cap)
-}
-
-/// Render the `<code_evidence>` block with the default budget cap (Step 26.5) —
-/// the TUI-facing entry called per turn. `None` when retrieval finds nothing.
-// INERT-CODE-RATCHET: X11 DELETE: code-evidence wrapper is only reexported; ranked retrieval is the live path.
-pub fn code_evidence_block(
-    index: &dyn SemanticIndex,
-    query: &[f32],
-    top_k: usize,
-) -> Option<String> {
-    build_code_evidence_block(index, query, top_k, CODE_EVIDENCE_CAP)
-}
-
 // --- Step 26.5.4: indexing + retrieval (Embedder-driven, mockable) ----------
 
 /// Index a set of `(file, source)` pairs (Step 26.5.4): chunk each file and
@@ -1673,24 +1625,6 @@ class Dog:
         // clear empties it
         idx.clear();
         assert_eq!(idx.chunks_indexed(), 0);
-    }
-
-    #[test]
-    fn code_evidence_block_none_when_empty_renders_and_caps() {
-        let idx = SessionSemanticIndex::default();
-        // empty index → None (OFF/empty bit-for-bit)
-        assert_eq!(build_code_evidence_block(&idx, &[1.0, 0.0], 5, 6_000), None);
-        idx.index_chunk(chunk("src/lib.rs", "fn add() {}"), vec![1.0, 0.0]);
-        let block = build_code_evidence_block(&idx, &[1.0, 0.0], 5, 6_000).unwrap();
-        assert!(block.starts_with("<code_evidence>\n") && block.ends_with("</code_evidence>"));
-        assert!(
-            block.contains("src/lib.rs:1-1"),
-            "file:line header: {block}"
-        );
-        assert!(block.contains("fn add() {}"));
-        // total cap truncates: tiny cap → the omitted marker, bounded length
-        let capped = build_code_evidence_block(&idx, &[1.0, 0.0], 5, 30).unwrap();
-        assert!(capped.contains("omitted to fit"), "{capped}");
     }
 
     // --- 26.5.4 index_files + retrieve_evidence (mock Embedder, no fs/net) --

@@ -42,7 +42,6 @@ pub mod owned_hosts;
 pub mod fs_cap;
 pub mod git_caveats;
 pub mod git_hardening;
-pub mod grounding;
 pub mod interaction_adapter;
 pub mod interaction_form;
 pub mod interaction_gate;

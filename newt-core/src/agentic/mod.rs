@@ -205,7 +205,6 @@ pub use display::{
 };
 pub use driver::{
     HeadlessCodeSearch, TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
-    VISIBLE_TRANSCRIPT_ROLES,
 };
 pub use experiential::{
     experience_block, ExperienceStore, SessionExperienceStore, EXPERIENCE_TOP_K,
@@ -238,13 +237,13 @@ pub use scheduled::{
 };
 pub use scratchpad::{scratchpad_state_block, ScratchpadStore, SessionScratchpadStore};
 pub use semantic::{
-    chunk_source, code_evidence_block, code_search_tool_definition, cosine, format_index_status,
-    format_search_hits, format_search_model, format_search_preview, format_search_rejects,
-    gather_code_files, gather_with_manifest, index_files, plan_gather, render_code_evidence,
-    retrieve_evidence, retrieve_evidence_steered, retrieve_ranked, retrieve_ranked_with_cap,
-    CodeChunk, CodeSearch, Cut, CutClass, Embedder, EmbeddingsClient, EvidenceKind, GatherCaps,
-    GatherManifest, IndexStatus, RankedHit, RejectReason, RetrievalResult, RetrievalSteer,
-    SemanticIndex, SessionSemanticIndex,
+    chunk_source, code_search_tool_definition, cosine, format_index_status, format_search_hits,
+    format_search_model, format_search_preview, format_search_rejects, gather_code_files,
+    gather_with_manifest, index_files, plan_gather, render_code_evidence, retrieve_evidence,
+    retrieve_evidence_steered, retrieve_ranked, retrieve_ranked_with_cap, CodeChunk, CodeSearch,
+    Cut, CutClass, Embedder, EmbeddingsClient, EvidenceKind, GatherCaps, GatherManifest,
+    IndexStatus, RankedHit, RejectReason, RetrievalResult, RetrievalSteer, SemanticIndex,
+    SessionSemanticIndex,
 };
 
 /// Align GFM table pipes in Markdown **source** (Step 25.5, #568) — plain text,
@@ -286,12 +285,11 @@ pub use resume::resume_context_tool_definition;
 pub use send_budget::{initial_context_input_budget, is_truncation_suspect};
 pub use steering::{ReplaceRejected, Rev, SessionSteeringInbox, SteeringInbox};
 pub use tools::{
-    execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt,
-    execute_tool_with_offload_and_prompt_and_artifacts, filter_advertised_tools,
-    filter_tools_for_disposition, full_access_requested, ocap_disabled, persona_tool_allowed,
-    plan_phase_clamp, preserve_mcp_resource_url_affinity, set_max_output_tokens,
-    set_output_cap_chars_per_token, set_output_head_tokens, tool_allowed, tool_definitions,
-    venv_cmd_prefix, ExposureSettings, MCP_RESOURCE_URL_PREFIXES_META_KEY,
+    execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt_and_artifacts,
+    filter_advertised_tools, filter_tools_for_disposition, full_access_requested, ocap_disabled,
+    persona_tool_allowed, plan_phase_clamp, preserve_mcp_resource_url_affinity,
+    set_max_output_tokens, set_output_cap_chars_per_token, set_output_head_tokens, tool_allowed,
+    tool_definitions, venv_cmd_prefix, ExposureSettings, MCP_RESOURCE_URL_PREFIXES_META_KEY,
 };
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
@@ -8083,39 +8081,6 @@ async fn final_summary_anthropic(
             accumulated,
         )),
     }
-}
-
-/// Anthropic-native variant of [`chat_complete`]: the same agentic tool-call
-/// loop, but over `POST {endpoint}/v1/messages` with `x-api-key` auth and the
-/// Anthropic `tool_use` / `tool_result` / `usage` shapes.
-///
-/// Streaming is native and ON by default (SSE, printed token-by-token); the
-/// `NEWT_ANTHROPIC_STREAM=off` env valve selects the non-streaming mode.
-// INERT-CODE-RATCHET: X10 DELETE: public Anthropic wrappers have no entry caller; the private implementation is live.
-pub async fn anthropic_chat_complete(
-    ctx: ChatCtx<'_>,
-    mcp: &mut dyn McpTools,
-) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
-    anthropic_chat_complete_with_prompt(ctx, None, None, mcp).await
-}
-
-/// Provenance-aware Anthropic Messages loop. See
-/// [`chat_complete_with_prompt`] for the compatibility contract.
-pub async fn anthropic_chat_complete_with_prompt(
-    ctx: ChatCtx<'_>,
-    turn_prompt_context: Option<&crate::TurnPromptContext>,
-    prompt_source: Option<&dyn PromptSource>,
-    mcp: &mut dyn McpTools,
-) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
-    anthropic_chat_complete_with_prompt_and_artifacts(
-        ctx,
-        turn_prompt_context,
-        prompt_source,
-        None,
-        None,
-        mcp,
-    )
-    .await
 }
 
 async fn anthropic_chat_complete_with_prompt_and_artifacts(

@@ -493,15 +493,6 @@ impl ResolvedPath {
     }
 }
 
-/// Return a stable absolute identity for a destination.
-///
-/// Existing symlinks resolve to their target.  For a new file the existing
-/// parent is canonicalized and the final component is appended.
-// INERT-CODE-RATCHET: X06 DELETE: four exported staging helpers have zero consumers.
-pub fn stable_path(path: &Path) -> anyhow::Result<PathBuf> {
-    Ok(ResolvedPath::resolve(path)?.path)
-}
-
 fn resolve_stable_path(path: &Path) -> anyhow::Result<PathBuf> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => return Ok(std::fs::canonicalize(path)?),
@@ -525,28 +516,6 @@ fn resolve_stable_path(path: &Path) -> anyhow::Result<PathBuf> {
 /// The canonical sidecar lock identity for `path`.
 pub fn stable_lock_path_for(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(ResolvedPath::resolve(path)?.lock_path())
-}
-
-/// Write `bytes` to a unique sibling staging file and sync its contents.
-/// Existing destination permissions are copied to the stage.
-pub fn stage_file(path: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf> {
-    ResolvedPath::resolve(path)?.stage(bytes)
-}
-
-/// Write a secret to a unique sibling staging file with mode 0600 on Unix.
-pub fn stage_private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf> {
-    ResolvedPath::resolve(path)?.stage_private(bytes)
-}
-
-/// Stage a file while preserving explicit permissions.  `private_if_new`
-/// creates a previously absent destination as 0600 on Unix.
-pub fn stage_file_with_permissions(
-    path: &Path,
-    bytes: &[u8],
-    permissions: Option<&std::fs::Permissions>,
-    private_if_new: bool,
-) -> anyhow::Result<PathBuf> {
-    ResolvedPath::resolve(path)?.stage_with_permissions(bytes, permissions, private_if_new)
 }
 
 fn stage_file_at(

@@ -245,38 +245,6 @@ pub fn load_packs_from_dir(dir: &Path) -> Vec<LanguagePack> {
     out
 }
 
-/// Sorted unique file extensions from language packs (no leading dots).
-///
-/// Compatibility projection of the language-pack registry for callers that
-/// need the complete extension set. Repository evidence tools should prefer
-/// [`source_extensions_for`] so they can also honor language names and aliases.
-#[must_use]
-// INERT-CODE-RATCHET: X07 DELETE: obsolete code-file projection helpers have zero consumers.
-pub fn code_file_extensions(packs: &[LanguagePack]) -> Vec<String> {
-    let mut exts: Vec<String> = packs
-        .iter()
-        .flat_map(|p| p.extensions.iter().cloned())
-        .collect();
-    exts.sort();
-    exts.dedup();
-    exts
-}
-
-/// True when `path`'s extension is in the code allowlist (case-insensitive).
-/// Paths with no extension (e.g. `LICENSE`, `Cargo.lock`) are never code.
-#[must_use]
-pub fn path_is_code_file(path: &str, extensions: &[String]) -> bool {
-    let Some(ext) = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-    else {
-        return false;
-    };
-    extensions
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(ext))
-}
-
 /// Merge pack layers **by name** — later layers win (built-ins < global dir <
 /// project dir < inline config). A custom pack named `rust` replaces the built-in
 /// `rust`; a new name adds a language. Output order is stable (insertion order of
