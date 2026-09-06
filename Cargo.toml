@@ -222,10 +222,6 @@ csv = "1.3"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
-# Streaming
-futures-core = "0.3"
-tokio-stream = "0.1"
-
 # HTTP for local inference backends
 # `rustls-tls-native-roots` loads the OS trust store (like curl) in addition to
 # the bundled Mozilla roots, so newt can validate private/internal CAs (e.g. a

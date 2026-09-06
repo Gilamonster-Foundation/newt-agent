@@ -94,8 +94,9 @@ common "no skills installed" case and is treated as *empty*, never an error.
     folder can't hide the rest.
   - `index_block(&skills)` — the progressive-disclosure index (names +
     descriptions only).
-  - `load_body(dir, name)` — the `use_skill` payload: the body plus bundled
-    file paths.
+  - `load_body_from(&dirs, name)` — the `use_skill` payload: the body plus bundled
+    file paths, resolved across an ordered search path. The original unused
+    single-directory wrapper was retired in Stage D batch 1.
 - **`newt-tui`** wires three things:
   1. **Index injection** in `build_system_prompt_with_soul`: if any skills
      exist, an `Available skills (call use_skill to load one):` block of

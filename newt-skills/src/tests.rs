@@ -301,7 +301,7 @@ mod mocked {
     fn load_body_returns_body_for_known_skill() {
         let root = Path::new("/s");
         let fs = MemFs::new().skill(root, "alpha", skill_md("alpha", "A"));
-        assert!(load_body_in(&fs, root, "alpha")
+        assert!(load_body_from_in(&fs, &[root.to_path_buf()], "alpha")
             .unwrap()
             .contains("Body of alpha."));
     }
@@ -312,7 +312,7 @@ mod mocked {
         let fs = MemFs::new()
             .skill(root, "beta", skill_md("beta", "B"))
             .file(root.join("beta").join("deploy.sh"), "echo hi\n");
-        let body = load_body_in(&fs, root, "beta").unwrap();
+        let body = load_body_from_in(&fs, &[root.to_path_buf()], "beta").unwrap();
         assert!(body.contains("Bundled files"));
         assert!(body.contains("deploy.sh"));
     }
@@ -322,7 +322,7 @@ mod mocked {
         let root = Path::new("/s");
         let fs = MemFs::new().skill(root, "alpha", skill_md("alpha", "A"));
         assert!(matches!(
-            load_body_in(&fs, root, "nope").unwrap_err(),
+            load_body_from_in(&fs, &[root.to_path_buf()], "nope").unwrap_err(),
             SkillError::UnknownSkill(_)
         ));
     }
@@ -334,7 +334,7 @@ mod mocked {
         let root = Path::new("/s");
         let fs = MemFs::new().skill(root, "alpha", skill_md("alpha", "A"));
         assert!(matches!(
-            load_body_in(&fs, root, "../secret").unwrap_err(),
+            load_body_from_in(&fs, &[root.to_path_buf()], "../secret").unwrap_err(),
             SkillError::InvalidName { .. }
         ));
     }

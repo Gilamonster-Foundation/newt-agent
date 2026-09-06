@@ -562,28 +562,10 @@ pub struct RunOutcome {
 }
 
 /// The injected seam for running the graded program (#957). Mocked in unit
-/// tests; the real subprocess implementation lands in the epic's step 3, so the
+/// tests and implemented by [`SubprocessRunner`] for real execution, so the
 /// evaluator's compare logic is fully exercised without spawning a process.
 pub trait CommandRunner: Send + Sync {
     fn run(&self, spec: &RunSpec) -> RunOutcome;
-}
-
-/// Placeholder runner registered until the real subprocess runner (epic step 3)
-/// is wired. It runs nothing and says so honestly. `output_matches` is opt-in
-/// (never in [`default_evaluators`]), so no existing case is affected.
-// INERT-CODE-RATCHET: X32 DELETE: placeholder evaluator runner remains after the real subprocess runner shipped.
-pub struct PendingRunner;
-
-impl CommandRunner for PendingRunner {
-    fn run(&self, _spec: &RunSpec) -> RunOutcome {
-        RunOutcome {
-            stdout: String::new(),
-            stderr: "output_matches: subprocess runner not wired until the epic's step 3 (#957)"
-                .to_string(),
-            exit_code: None,
-            timed_out: false,
-        }
-    }
 }
 
 /// The real `CommandRunner` (#960): actually executes `spec.argv` in the graded

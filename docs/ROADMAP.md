@@ -190,7 +190,9 @@ returns `NoBackendForTier` when none, mixed tier support, names list correct.
 ## Step 2.3 — Add streaming reply types
 
 **Branch:** `step-02.3-stream-types`
-**Touches:** `newt-inference/src/stream.rs` (new), `newt-inference/src/lib.rs`.
+**Touches:** [archived newt-inference/src/stream.rs](https://github.com/Gilamonster-Foundation/newt-agent/blob/64b1da91456ecc9d096e225f33aaa2cdedf437f8/newt-inference/src/stream.rs) (new at this step), `newt-inference/src/lib.rs`.
+**Status:** The unused streaming island was retired in Stage D batch 1; it had
+no production consumer. The original step is preserved below for history.
 **Implements:**
 - `ChatChunk { delta: String, model_id: String, is_final: bool }`.
 - `ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>`.
@@ -1160,9 +1162,10 @@ become issues only **after** the spikes (C, H) answer.
 | 16.4+ | Android Compose UI · iOS SwiftUI UI · WireGuard WAN · revocation+biometric polish | — | roadmap-only until spikes resolve |
 
 **Sequencing notes:**
-- The streaming surface (16.1b / `OutputChunk`) is the **same need** as Step 2.3
-  (`ChatChunk`/`ChatStream`) and #167/#123 — land Step 2.3 as the shared
-  substrate first; do not build streaming twice.
+- The streaming surface (16.1b / `OutputChunk`) shares the need recorded in
+  Step 2.3 and #167/#123. The original plan called for Step 2.3 as a shared
+  substrate, but its unused `ChatChunk`/`ChatStream` island was retired in
+  Stage D batch 1. Streaming/cancel still needs one shared implementation.
 - 16.S1 (SAS transcript binding) is load-bearing security: if the handshake
   exposes no channel binding, the §4.5 numeric-comparison pairing needs
   redesign. Resolve before 16.2.

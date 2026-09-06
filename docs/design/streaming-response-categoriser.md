@@ -184,9 +184,10 @@ OpenAI-compatible Chat Completions path in the same driver reads `reasoning_cont
 exposes only `complete()` — its backends are **batch** producers (`newt-inference/src/`:
 `anthropic.rs`, `responses.rs`, `local.rs`, `provider_plugin.rs`); `local.rs` already runs
 `split_reasoning` over `message.content`, `anthropic.rs` ignores `thinking` blocks, and
-`responses.rs` maps content only. `newt_inference::stream::ChatChunk` / `collect_stream` have
-no producer or consumer outside `stream.rs`'s own tests and are not a migration source for
-A1. `newt-acp-worker` and `provider_plugin.rs` do not stream deltas at all today.
+`responses.rs` maps content only. The unused `newt_inference::stream` island (`ChatChunk` /
+`collect_stream`) was removed in Stage D batch 1; it had no producer or consumer outside its
+own tests and was not a migration source for A1. `newt-acp-worker` and `provider_plugin.rs`
+do not stream deltas at all today.
 
 | Producer | Native structure available | What A1 does | May emit |
 |----------|----------------------------|--------------|----------|
@@ -454,8 +455,6 @@ consumer may *receive* a stream at all is the session/attachment question
 - **Provider plugin / ACP protocol carrying `ResponseEvent` natively** — depends on the
   plugins-protocol crate; until then plugins are text-only producers through the adapter and
   are confined to the model-side variants.
-- **`newt_inference::stream::ChatChunk`** — unused outside its own tests; delete or retype
-  as the batch view once A1 lands (housekeeping, not a migration).
 
 ## Change log
 
