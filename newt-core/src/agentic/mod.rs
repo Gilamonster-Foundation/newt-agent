@@ -2317,12 +2317,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // Bounded to ONE line per interval, and the policy is pure over the
         // elapsed it is handed — this reads the clock, `due` does not.
         let turn_elapsed = turn_started.elapsed();
-        if turn_heartbeat.due(turn_elapsed, TURN_HEARTBEAT_INTERVAL) {
-            print_newt(
-                &turn_heartbeat_line(turn_elapsed, round, current_tool_round_limit),
-                color,
-                false,
-            );
+        if let Some(line) = turn_heartbeat.notice(turn_elapsed, round, current_tool_round_limit) {
+            print_newt(&line, color, false);
         }
         // FIRST statement of every round: the previous round's completed
         // viewport must come down before ANY canonical line this round can
@@ -5327,6 +5323,17 @@ struct TurnHeartbeat {
 }
 
 impl TurnHeartbeat {
+    /// Consume a due heartbeat and build its message without reading a clock.
+    fn notice(
+        &mut self,
+        elapsed: std::time::Duration,
+        round: usize,
+        limit: usize,
+    ) -> Option<String> {
+        self.due(elapsed, TURN_HEARTBEAT_INTERVAL)
+            .then(|| turn_heartbeat_line(elapsed, round, limit))
+    }
+
     /// Consume the heartbeat due at `elapsed`, if one is.
     ///
     /// At most one line per interval however long the gap: a turn that blocks
@@ -6141,12 +6148,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // Bounded to ONE line per interval, and the policy is pure over the
         // elapsed it is handed — this reads the clock, `due` does not.
         let turn_elapsed = turn_started.elapsed();
-        if turn_heartbeat.due(turn_elapsed, TURN_HEARTBEAT_INTERVAL) {
-            print_newt(
-                &turn_heartbeat_line(turn_elapsed, round, current_tool_round_limit),
-                color,
-                false,
-            );
+        if let Some(line) = turn_heartbeat.notice(turn_elapsed, round, current_tool_round_limit) {
+            print_newt(&line, color, false);
         }
         // FIRST statement of every round: the previous round's completed
         // viewport must come down before ANY canonical line this round can
@@ -8193,12 +8196,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // Bounded to ONE line per interval, and the policy is pure over the
         // elapsed it is handed — this reads the clock, `due` does not.
         let turn_elapsed = turn_started.elapsed();
-        if turn_heartbeat.due(turn_elapsed, TURN_HEARTBEAT_INTERVAL) {
-            print_newt(
-                &turn_heartbeat_line(turn_elapsed, round, current_tool_round_limit),
-                color,
-                false,
-            );
+        if let Some(line) = turn_heartbeat.notice(turn_elapsed, round, current_tool_round_limit) {
+            print_newt(&line, color, false);
         }
         // FIRST statement of every round: the previous round's completed
         // viewport must come down before ANY canonical line this round can
@@ -9900,12 +9899,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // Bounded to ONE line per interval, and the policy is pure over the
         // elapsed it is handed — this reads the clock, `due` does not.
         let turn_elapsed = turn_started.elapsed();
-        if turn_heartbeat.due(turn_elapsed, TURN_HEARTBEAT_INTERVAL) {
-            print_newt(
-                &turn_heartbeat_line(turn_elapsed, round, max_tool_rounds),
-                color,
-                false,
-            );
+        if let Some(line) = turn_heartbeat.notice(turn_elapsed, round, max_tool_rounds) {
+            print_newt(&line, color, false);
         }
         // FIRST statement of every round: the previous round's completed
         // viewport comes down while the cursor is still just below it — before

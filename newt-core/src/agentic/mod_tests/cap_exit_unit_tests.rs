@@ -517,6 +517,24 @@ fn workflow_classifier_text_keeps_recent_user_issue_context() {
 // #1965 — the turn heartbeat
 // ---------------------------------------------------------------------
 
+#[test]
+fn the_heartbeat_notice_pins_due_output_and_skips_missed_intervals() {
+    let mut heartbeat = TurnHeartbeat::default();
+    let at = std::time::Duration::from_secs;
+
+    assert!(heartbeat.notice(at(299), 10, 40).is_none());
+    assert_eq!(
+        heartbeat.notice(at(300), 10, 40).as_deref(),
+        Some("still working — 5m elapsed, round 10 of 40")
+    );
+    assert!(heartbeat.notice(at(301), 11, 40).is_none());
+    assert_eq!(
+        heartbeat.notice(at(4200), 210, 10_000).as_deref(),
+        Some("still working — 70m elapsed, round 210 of 10000")
+    );
+    assert!(heartbeat.notice(at(4200), 210, 10_000).is_none());
+}
+
 /// **Bounded, and pure over a stated elapsed.** No clock is read here and none
 /// is slept on: `due` takes the elapsed it should judge, so the whole schedule
 /// is table-testable. A wall-clock assertion would be a flake generator on a
