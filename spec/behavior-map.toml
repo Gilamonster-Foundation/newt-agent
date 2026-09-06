@@ -1278,8 +1278,8 @@ tier = "unit"
 # types the keys an operator types — so it cannot pass on a name that is merely
 # spelled somewhere.
 [[BHV-ESC-001.refs.rust_tests]]
-path = "newt-tui/src/rich_input.rs"
-symbol = "tests::every_ladder_claimant_is_reachable_from_the_editors_own_state"
+path = "newt-tui/src/rich_input_tests/esc_ladder.rs"
+symbol = "every_ladder_claimant_is_reachable_from_the_editors_own_state"
 tier = "unit"
 [[BHV-ESC-001.refs.production]]
 path = "newt-tui/src/cockpit/presenter.rs"

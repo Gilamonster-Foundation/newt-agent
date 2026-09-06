@@ -31,7 +31,7 @@
 //!
 //! That `read_turn` uses the guard — driving the event loop needs a real
 //! interactive turn. That half is
-//! `rich_input::tests::raw_and_paste_are_owned_by_one_guard`, with the teardown
+//! `rich_input::terminal_guard_tests::raw_and_paste_are_owned_by_one_guard`, with the teardown
 //! ORDER pinned by `the_guard_releases_paste_before_raw_mode`. Neither test is
 //! sufficient alone.
 
