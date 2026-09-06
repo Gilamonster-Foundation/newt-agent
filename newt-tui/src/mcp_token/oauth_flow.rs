@@ -7,12 +7,12 @@
 
 use super::*;
 
-pub(super) struct PkceChallenge {
-    pub(super) verifier: String,
-    pub(super) challenge: String,
+struct PkceChallenge {
+    verifier: String,
+    challenge: String,
 }
 
-pub(super) fn gen_pkce() -> anyhow::Result<PkceChallenge> {
+fn gen_pkce() -> anyhow::Result<PkceChallenge> {
     // 32 random bytes → 43-char base64url string (within the 43-128 range).
     let mut buf = [0u8; 32];
     fill_random(&mut buf)?;
@@ -75,7 +75,7 @@ pub(super) fn fenced_client_for_url_with_policy(
 }
 
 #[cfg(test)]
-pub(super) fn validate_discovery_hop(
+fn validate_discovery_hop(
     endpoint: &str,
     kind: &str,
     allow_test_loopback_http: bool,
@@ -145,7 +145,7 @@ fn validate_resource_url(
 /// `url::Url` synthesizes `/` for an origin-only URL, but RFC 9728 resource
 /// metadata uses simple string comparison and MCP recommends the bare origin as
 /// the canonical identifier when that is what the client was configured with.
-pub(super) fn canonical_resource_identifier(input: &str, parsed: &reqwest::Url) -> String {
+fn canonical_resource_identifier(input: &str, parsed: &reqwest::Url) -> String {
     let explicit_path = input
         .split_once("://")
         .map(|(_, authority_and_rest)| {
@@ -213,7 +213,7 @@ pub(super) fn resource_matches(bound: &str, selected: &str) -> bool {
 /// RFC 9728 well-known URL: insert the suffix between the authority and the
 /// path/query rather than appending it to the MCP endpoint.
 #[cfg(test)]
-pub(super) fn protected_resource_metadata_url(resource_url: &str) -> anyhow::Result<String> {
+fn protected_resource_metadata_url(resource_url: &str) -> anyhow::Result<String> {
     protected_resource_metadata_url_with_policy(resource_url, false)
 }
 
@@ -247,7 +247,7 @@ fn root_protected_resource_metadata_url_with_policy(
 
 /// RFC 8414 well-known URL: insert the suffix before any issuer path.
 #[cfg(test)]
-pub(super) fn authorization_server_metadata_url(issuer: &str) -> anyhow::Result<String> {
+fn authorization_server_metadata_url(issuer: &str) -> anyhow::Result<String> {
     authorization_server_metadata_url_with_policy(issuer, false)
 }
 
@@ -296,7 +296,7 @@ fn openid_configuration_urls_with_policy(
 }
 
 #[cfg(test)]
-pub(super) fn resource_origin(resource_url: &str) -> anyhow::Result<String> {
+fn resource_origin(resource_url: &str) -> anyhow::Result<String> {
     resource_origin_with_policy(resource_url, false)
 }
 
@@ -337,7 +337,7 @@ fn is_auth_token_char(byte: u8) -> bool {
 /// Parse the two MCP-relevant auth parameters without substring matching.
 /// Quoted strings honor backslash escaping; malformed target parameters are
 /// rejected, while unrelated schemes/parameters are ignored.
-pub(super) fn parse_bearer_challenge(header: &str) -> anyhow::Result<Option<BearerChallenge>> {
+fn parse_bearer_challenge(header: &str) -> anyhow::Result<Option<BearerChallenge>> {
     let bytes = header.as_bytes();
     let mut index = 0;
     let mut in_bearer = false;
@@ -436,10 +436,7 @@ fn valid_scope_value(scope: &str) -> bool {
         && scope.split(' ').all(|part| !part.is_empty())
 }
 
-pub(super) fn merge_scopes(
-    current: Option<&str>,
-    previously_granted: Option<&str>,
-) -> Option<String> {
+fn merge_scopes(current: Option<&str>, previously_granted: Option<&str>) -> Option<String> {
     let mut scopes = Vec::new();
     for scope in current.into_iter().chain(previously_granted) {
         for item in scope.split(' ') {
@@ -451,7 +448,7 @@ pub(super) fn merge_scopes(
     (!scopes.is_empty()).then(|| scopes.join(" "))
 }
 
-pub(super) fn prior_scope_for_binding(
+fn prior_scope_for_binding(
     token: Option<&TokenFile>,
     metadata: Option<&MetaFile>,
     resource: &str,
@@ -717,7 +714,7 @@ async fn fetch_authorization_server_meta(
 /// protected-resource metadata fails closed instead of treating the MCP
 /// resource origin as an authorization issuer.
 #[cfg(test)]
-pub(super) async fn discover_oauth_meta_with_policy(
+async fn discover_oauth_meta_with_policy(
     server_url: &str,
     allow_test_loopback_http: bool,
 ) -> anyhow::Result<DiscoveredOAuthMeta> {
@@ -734,7 +731,7 @@ pub(super) async fn discover_oauth_meta_with_policy(
 /// As [`discover_oauth_meta_with_policy`], with the aggregate discovery budget
 /// supplied by the caller so exhaustion can be exercised deterministically.
 #[cfg(test)]
-pub(super) async fn discover_oauth_meta_within_budget(
+async fn discover_oauth_meta_within_budget(
     server_url: &str,
     allow_test_loopback_http: bool,
     budget: &DiscoveryBudget,
@@ -750,7 +747,7 @@ pub(super) async fn discover_oauth_meta_within_budget(
     .await
 }
 
-pub(super) async fn discover_oauth_meta_for_client_with_policy(
+async fn discover_oauth_meta_for_client_with_policy(
     server_url: &str,
     allow_test_loopback_http: bool,
     client: Option<&ClientFile>,
@@ -874,7 +871,7 @@ async fn discover_oauth_meta_within_budget_for_client(
 }
 
 /// Parse the OAuth authorization response as application/x-www-form-urlencoded.
-pub(super) fn parse_callback(path: &str) -> CallbackParams {
+fn parse_callback(path: &str) -> CallbackParams {
     let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
     let mut out = CallbackParams::default();
     for pair in query.split('&') {
@@ -896,7 +893,7 @@ pub(super) fn parse_callback(path: &str) -> CallbackParams {
     out
 }
 
-pub(super) fn validate_authorization_response(
+fn validate_authorization_response(
     callback: &CallbackParams,
     expected_state: &str,
     expected_issuer: &str,
@@ -929,7 +926,7 @@ pub(super) fn validate_authorization_response(
         .ok_or_else(|| anyhow::anyhow!("No authorization code in callback"))
 }
 
-pub(super) fn callback_request_target(request: &str) -> anyhow::Result<&str> {
+fn callback_request_target(request: &str) -> anyhow::Result<&str> {
     let mut parts = request
         .lines()
         .next()
@@ -960,7 +957,7 @@ fn write_callback_response(stream: &mut std::net::TcpStream, status: &str, body:
     let _ = stream.write_all(body);
 }
 
-pub(super) fn urlencoding_decode(s: &str) -> String {
+fn urlencoding_decode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.bytes().peekable();
     while let Some(b) = chars.next() {
@@ -1001,13 +998,13 @@ fn open_browser(url: &str) -> std::io::Result<std::process::Child> {
         .spawn()
 }
 
-pub(super) struct CallbackTarget {
-    pub(super) redirect_uri: String,
-    pub(super) bind_addr: std::net::SocketAddr,
-    pub(super) path: String,
+struct CallbackTarget {
+    redirect_uri: String,
+    bind_addr: std::net::SocketAddr,
+    path: String,
 }
 
-pub(super) fn callback_target(client: &ClientFile) -> anyhow::Result<CallbackTarget> {
+fn callback_target(client: &ClientFile) -> anyhow::Result<CallbackTarget> {
     if client.redirect_uris.is_empty() {
         anyhow::bail!(
             "no usable local callback redirect URI; the saved client has no registered redirect_uris"
@@ -1073,7 +1070,7 @@ pub(super) fn callback_target(client: &ClientFile) -> anyhow::Result<CallbackTar
     )
 }
 
-pub(super) fn bind_client_registration(
+fn bind_client_registration(
     mut client: ClientFile,
     issuer: &str,
     client_metadata_documents_supported: bool,
@@ -1120,7 +1117,7 @@ fn valid_client_metadata_document_id(client_id: &str) -> bool {
     })
 }
 
-pub(super) fn client_is_portable_cimd(client: &ClientFile) -> bool {
+fn client_is_portable_cimd(client: &ClientFile) -> bool {
     let registered_as_cimd = client
         .extra
         .get("registration_method")
@@ -1153,7 +1150,7 @@ fn registration_string_list_contains(client: &ClientFile, field: &str, required:
 /// One eligibility predicate is used both for fresh DCR responses and saved
 /// DCR reuse, so a registration rejected at creation cannot become acceptable
 /// merely by surviving to a later process.
-pub(super) fn dcr_registration_is_eligible(
+fn dcr_registration_is_eligible(
     client: &ClientFile,
     requested_scope: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -1197,7 +1194,7 @@ pub(super) fn dcr_registration_is_eligible(
     Ok(())
 }
 
-pub(super) fn order_authorization_servers(
+fn order_authorization_servers(
     mut issuers: Vec<String>,
     client: Option<&ClientFile>,
     allow_re_registration: bool,
@@ -1239,7 +1236,7 @@ struct DynamicClientRegistrationRequest<'a> {
     scope: Option<&'a str>,
 }
 
-pub(super) async fn register_public_client(
+async fn register_public_client(
     registration_endpoint: &str,
     redirect_uris: Vec<String>,
     issuer: &str,
@@ -1339,14 +1336,14 @@ fn issuer_callback_path(issuer: &str) -> String {
     format!("/callback/newt-{hash}")
 }
 
-pub(super) fn issuer_redirect_uris(issuer: &str) -> Vec<String> {
+fn issuer_redirect_uris(issuer: &str) -> Vec<String> {
     vec![format!(
         "http://127.0.0.1:0{}",
         issuer_callback_path(issuer)
     )]
 }
 
-pub(super) fn client_has_issuer_distinct_redirect(client: &ClientFile, issuer: &str) -> bool {
+fn client_has_issuer_distinct_redirect(client: &ClientFile, issuer: &str) -> bool {
     let expected_path = issuer_callback_path(issuer);
     client.redirect_uris.iter().any(|redirect| {
         reqwest::Url::parse(redirect).is_ok_and(|url| {
@@ -1361,7 +1358,7 @@ pub(super) fn client_has_issuer_distinct_redirect(client: &ClientFile, issuer: &
     })
 }
 
-pub(super) async fn resolve_client_registration(
+async fn resolve_client_registration(
     stored: Option<ClientFile>,
     discovered: &DiscoveredOAuthMeta,
     requested_scope: Option<&str>,
@@ -1454,7 +1451,7 @@ pub(super) async fn resolve_client_registration(
     }
 }
 
-pub(super) fn build_authorization_url(
+fn build_authorization_url(
     endpoint: &str,
     client_id: &str,
     redirect_uri: &str,
@@ -1785,7 +1782,7 @@ pub async fn run_oauth_flow(
 }
 
 #[cfg(test)]
-pub(super) fn urlencoding_encode(s: &str) -> String {
+fn urlencoding_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         match b {
@@ -1800,3 +1797,7 @@ pub(super) fn urlencoding_encode(s: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+#[path = "oauth_flow_tests.rs"]
+mod tests;

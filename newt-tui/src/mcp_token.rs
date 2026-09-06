@@ -1811,6 +1811,14 @@ use oauth_flow::{
 // Tests
 // ---------------------------------------------------------------------------
 
+// Shared by BOTH test children — `mcp_token_tests` and
+// `oauth_flow::tests` — so it lives at their nearest common ancestor.
+// It builds an `OAuthHopPolicy`, which is defined here.
+#[cfg(test)]
+fn test_oauth_policy() -> OAuthHopPolicy {
+    OAuthHopPolicy::new(&newt_core::Scope::All)
+}
+
 #[cfg(test)]
 #[path = "mcp_token_tests/tests.rs"]
 mod tests;
