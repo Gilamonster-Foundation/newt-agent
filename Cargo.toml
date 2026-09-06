@@ -288,10 +288,6 @@ syntect = { version = "5", default-features = false, features = [
 
 # Test utilities (dev-only)
 tempfile = "3"
-# Resolves the cargo target directory the way cargo itself does (env var >
-# workspace/user config.toml > defaults), so tests locate built binaries even
-# when `[build] target-dir` is set in ~/.cargo/config.toml. See newt-agent#64.
-cargo_metadata = "0.23"
 wiremock = "0.6"
 mockall = "0.13"
 assert_cmd = "2"

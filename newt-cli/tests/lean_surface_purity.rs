@@ -113,7 +113,7 @@ const CASES: &[Case] = &[
 /// a unit test.
 #[tokio::test]
 async fn every_lean_configuration_emits_plain_scroller_bytes() {
-    let bin = locate_newt_bin();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_newt"));
     for case in CASES {
         let out = run_lean(&bin, case).await;
         for (capability, needles) in FORBIDDEN {
@@ -139,7 +139,7 @@ async fn every_lean_configuration_emits_plain_scroller_bytes() {
 /// and no unit test observes it because the path takes `io::stdin()` directly.
 #[tokio::test]
 async fn eof_on_a_pipe_terminates_instead_of_hanging() {
-    let bin = locate_newt_bin();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_newt"));
     for case in CASES {
         // `run_lean` closes stdin immediately and times out rather than
         // waiting forever; reaching here at all is the assertion.
@@ -160,7 +160,7 @@ async fn eof_on_a_pipe_terminates_instead_of_hanging() {
 /// to hold for a scripted session's transcript to be greppable.
 #[tokio::test]
 async fn a_custom_prompt_template_is_echoed_on_the_piped_path() {
-    let bin = locate_newt_bin();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_newt"));
     let case = CASES
         .iter()
         .find(|c| c.name == "custom prompt template")
@@ -250,49 +250,4 @@ async fn run_lean(bin: &Path, case: &Case) -> Vec<u8> {
         .unwrap_or_else(|_| panic!("[{}] did not terminate on EOF", case.name))
         .expect("collect newt output");
     output.stdout
-}
-
-fn cargo_target_dir() -> Option<PathBuf> {
-    cargo_metadata::MetadataCommand::new()
-        .exec()
-        .ok()
-        .map(|m| m.target_directory.into_std_path_buf())
-}
-
-/// Same locator strategy as `stdout_purity.rs` — see its doc comment for why
-/// each fallback exists (`cargo llvm-cov` runs in an isolated target dir).
-fn locate_newt_bin() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest.parent().expect("manifest dir has parent");
-
-    let mut target_dirs: Vec<PathBuf> = Vec::new();
-    if let Some(tdir) = std::env::var_os("CARGO_TARGET_DIR") {
-        target_dirs.push(PathBuf::from(tdir));
-    }
-    if let Some(tdir) = cargo_target_dir() {
-        target_dirs.push(tdir);
-    }
-    target_dirs.push(workspace_root.join("target"));
-    target_dirs.push(workspace_root.join("target").join("llvm-cov-target"));
-
-    for tdir in &target_dirs {
-        for profile in ["debug", "release"] {
-            let candidate = tdir.join(profile).join("newt");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-    }
-    let _ = std::process::Command::new(env!("CARGO"))
-        .args(["build", "--bin", "newt"])
-        .output();
-    for tdir in &target_dirs {
-        for profile in ["debug", "release"] {
-            let candidate = tdir.join(profile).join("newt");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-    }
-    panic!("could not locate the `newt` binary for the lean purity tests");
 }
