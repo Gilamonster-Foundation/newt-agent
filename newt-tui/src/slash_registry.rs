@@ -1263,6 +1263,34 @@ mod tests {
         );
     }
 
+    fn contains_dispatch_token(src: &str, token: &str) -> bool {
+        src.contains(&format!("\"{token}\""))
+            || src.contains(&format!(".strip_prefix(\"{token} \")"))
+    }
+
+    /// `/remember` dispatches through an argument prefix, without a bare
+    /// `"remember"` literal. Its help-page match arm used to mask that spelling
+    /// from the containment guard while the catalog lived in `lib.rs`.
+    #[test]
+    fn argument_prefix_dispatch_does_not_need_a_help_catalog_match() {
+        let dispatch = r#"task.trim_start_matches('/').strip_prefix("remember ")"#;
+        assert!(contains_dispatch_token(dispatch, "remember"));
+        assert!(!contains_dispatch_token(dispatch, "rem"));
+        assert!(!contains_dispatch_token(
+            r#"task.strip_prefix("remembered ")"#,
+            "remember"
+        ));
+        assert!(!contains_dispatch_token(
+            r#"task.strip_prefix("remember-more ")"#,
+            "remember"
+        ));
+        assert!(!contains_dispatch_token(r#""remember ""#, "remember"));
+        assert!(!contains_dispatch_token(
+            r#""  /remember <fact> - add a note""#,
+            "remember"
+        ));
+    }
+
     /// Every registered token is still present in the dispatch.
     ///
     /// Deliberately a weak check, and named as one: containment cannot tell a
@@ -1278,9 +1306,10 @@ mod tests {
         // is the fiction #2009 PR1 exists to end.
         for command in slash_commands() {
             for token in command.tokens() {
-                let needle = format!("\"{token}\"");
                 assert!(
-                    sources.iter().any(|(_, src)| src.contains(&needle)),
+                    sources
+                        .iter()
+                        .any(|(_, src)| contains_dispatch_token(src, token)),
                     "`/{token}` is registered but no longer appears in any \
                      dispatch source — if it was removed, remove it here and \
                      lower the ratchet"
@@ -1295,9 +1324,10 @@ mod tests {
     fn a_command_that_does_not_exist_is_not_found() {
         let sources = dispatch_sources();
         for absent in ["zzznotacommand", "quuxfrobnicate", "slash-registry-probe"] {
-            let needle = format!("\"{absent}\"");
             assert!(
-                !sources.iter().any(|(_, src)| src.contains(&needle)),
+                !sources
+                    .iter()
+                    .any(|(_, src)| contains_dispatch_token(src, absent)),
                 "`{absent}` was 'found' in the dispatch — the containment \
                  check cannot fail and proves nothing"
             );
