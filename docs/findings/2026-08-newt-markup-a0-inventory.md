@@ -402,7 +402,7 @@ Emitter emitter.rs (`Emitter` :29, `handle` :98, `finish` :139; colors from `age
 4. SSE re-enhancement: inline EventSource handler in `agent_panel` calls `window.newtEnhanceMarkdown(t)` shell.rs:186.
 5. Vendored engine: newt-web/assets/mermaid.min.js (Mermaid v11.15.0; license alongside), served self-contained with `include_str!` routes newt-web/src/main.rs:84-98.
 
-**No TUI/CLI/ACP/MCP mermaid path exists.** Repo-wide `mermaid` hits outside newt-web are only roadmap-title fixture strings (newt-core/tests/store/ordering_chain_concurrency.rs:534,539; newt-tui/src/lib_tests/skills_integration.rs:649-650).
+**No TUI/CLI/ACP/MCP mermaid path exists.** Repo-wide `mermaid` hits outside newt-web are only roadmap-title fixture strings (newt-core/tests/store/ordering_chain_concurrency.rs:534,539; newt-tui/src/lib_tests/skills_integration/roadmap.rs:19-20).
 
 ### 5.5 `+++` TOML front-matter splitter (the epic's A1 extraction source)
 
