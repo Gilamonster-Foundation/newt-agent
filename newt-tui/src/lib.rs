@@ -241,12 +241,15 @@ use chat::run_chat;
 pub(crate) use chat::{InputSurface, ReadOutcome};
 pub use color::color_supported;
 use color::{color_enabled_for, resolve_color_mode};
+#[cfg(any(feature = "rich-tui", test))]
 pub(crate) use help::help_lines;
 pub use help::render_help;
 #[cfg(test)]
 use help::{canonical_help_topic, command_help_page};
 use help::{print_command_help, render_help_for_tui};
-use newt_core::agentic::{newt_line, print_harness_notice, print_newt, ChatCtx, NEWT_ORANGE_CT};
+#[cfg(test)]
+use newt_core::agentic::newt_line;
+use newt_core::agentic::{print_harness_notice, print_newt, ChatCtx, NEWT_ORANGE_CT};
 use newt_core::recover_context_window_400;
 #[cfg(test)]
 use prompt::expand_prompt_tokens;
