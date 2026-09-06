@@ -431,29 +431,20 @@ pub fn prompt_read_tool_definition() -> serde_json::Value {
 /// messages: a metadata-only system card followed by the exact operator text
 /// at its original user priority. The adjacency lets compression protect the
 /// pair without promoting untrusted operator content into system instructions.
+///
+/// Optional harness-validated intake adds its content-free comprehension
+/// projection inside that same card. Raw operator, atomic-ask, decision, and
+/// clarification text remain outside the system card.
 pub(crate) fn ensure_active_prompt_card(
     messages: &mut Vec<serde_json::Value>,
     context: PromptReadContext<'_>,
+    intake: Option<&PromptIntake>,
 ) {
     let base_card = active_prompt_card(context);
-    insert_active_prompt_card(messages, context, &base_card, base_card.clone());
-}
-
-/// Insert the protected active-prompt pair with the harness-validated prompt
-/// comprehension projection inside the existing system card.
-///
-/// This deliberately does not create a second system message: compression and
-/// protected-head logic continue to see exactly one [`ACTIVE_PROMPT_PREFIX`]
-/// card adjacent to the exact operator text at user priority. `model_card` is a
-/// content-free projection owned by [`PromptIntake`]; raw operator, atomic-ask,
-/// decision, and clarification text remain outside the system card.
-pub(crate) fn ensure_active_prompt_card_with_intake(
-    messages: &mut Vec<serde_json::Value>,
-    context: PromptReadContext<'_>,
-    intake: &PromptIntake,
-) {
-    let base_card = active_prompt_card(context);
-    let card = active_prompt_card_with_intake(base_card.clone(), intake);
+    let card = match intake {
+        Some(intake) => active_prompt_card_with_intake(base_card.clone(), intake),
+        None => base_card.clone(),
+    };
     insert_active_prompt_card(messages, context, &base_card, card);
 }
 
@@ -1198,8 +1189,8 @@ mod tests {
             serde_json::json!({"role":"user", "content":"act now"}),
         ];
 
-        ensure_active_prompt_card(&mut messages, context);
-        ensure_active_prompt_card(&mut messages, context);
+        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, None);
 
         let cards: Vec<_> = messages
             .iter()
@@ -1264,7 +1255,7 @@ mod tests {
             serde_json::json!({"role":"user", "content":exact}),
         ];
 
-        ensure_active_prompt_card(&mut messages, context);
+        ensure_active_prompt_card(&mut messages, context, None);
         insert_active_prompt_card(&mut messages, context, &base_card, research_card);
         insert_active_prompt_card(&mut messages, context, &base_card, act_card);
 
@@ -1364,9 +1355,9 @@ mod tests {
 
         // Intake runs after receipt/card creation. Repeated insertion models a
         // retry or compression rebuild and must still replace, not accumulate.
-        ensure_active_prompt_card(&mut messages, context);
-        ensure_active_prompt_card_with_intake(&mut messages, context, &intake);
-        ensure_active_prompt_card_with_intake(&mut messages, context, &intake);
+        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, Some(&intake));
+        ensure_active_prompt_card(&mut messages, context, Some(&intake));
 
         let cards = messages
             .iter()
@@ -1430,8 +1421,8 @@ mod tests {
             serde_json::json!({"role":"user", "content":user_data}),
         ];
 
-        ensure_active_prompt_card(&mut messages, context);
-        ensure_active_prompt_card(&mut messages, context);
+        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, None);
 
         assert!(messages.iter().any(|message| {
             message["role"] == "user"
@@ -1468,8 +1459,8 @@ mod tests {
             serde_json::json!({"role":"user", "content":current}),
         ];
 
-        ensure_active_prompt_card(&mut messages, context);
-        ensure_active_prompt_card(&mut messages, context);
+        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, None);
 
         assert_eq!(
             messages.last(),
@@ -1498,8 +1489,8 @@ mod tests {
             serde_json::json!({"role":"user", "content":current}),
         ];
 
-        ensure_active_prompt_card(&mut messages, context);
-        ensure_active_prompt_card(&mut messages, context);
+        ensure_active_prompt_card(&mut messages, context, None);
+        ensure_active_prompt_card(&mut messages, context, None);
 
         assert!(messages.iter().any(|message| {
             message["role"] == "system" && message["content"].as_str() == Some(collision.as_str())
@@ -1605,7 +1596,7 @@ mod tests {
             serde_json::json!({"role":"system", "content":"base"}),
             serde_json::json!({"role":"user", "content":"continue"}),
         ];
-        ensure_active_prompt_card(&mut messages, context);
+        ensure_active_prompt_card(&mut messages, context, None);
         let card = messages[1]["content"].as_str().unwrap();
         assert!(
             card.contains(&format!("submitted_previous_address: {original_id}")),

@@ -2104,11 +2104,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
-    if let Some(intake) = prompt_intake {
-        prompt_read::ensure_active_prompt_card_with_intake(&mut messages, prompt_context, intake);
-    } else {
-        prompt_read::ensure_active_prompt_card(&mut messages, prompt_context);
-    }
+    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
 
     // In-band memory nudge (Step 19.3): after `[memory] note_nudge_interval`
     // user turns with zero organic save_note use, append a one-line reminder
@@ -6106,11 +6102,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
-    if let Some(intake) = prompt_intake {
-        prompt_read::ensure_active_prompt_card_with_intake(&mut messages, prompt_context, intake);
-    } else {
-        prompt_read::ensure_active_prompt_card(&mut messages, prompt_context);
-    }
+    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
 
     // In-band memory nudge (Step 19.3) — mirrors the Ollama path.
     if note_sink.is_some() {
@@ -8286,11 +8278,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
-    if let Some(intake) = prompt_intake {
-        prompt_read::ensure_active_prompt_card_with_intake(&mut messages, prompt_context, intake);
-    } else {
-        prompt_read::ensure_active_prompt_card(&mut messages, prompt_context);
-    }
+    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
 
     // In-band memory nudge (Step 19.3) — mirrors the OpenAI path.
     if note_sink.is_some() {
@@ -9977,11 +9965,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         prompt_read::PromptReadContext::new(turn_prompt_context, task, prompt_source);
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
-    if let Some(intake) = prompt_intake {
-        prompt_read::ensure_active_prompt_card_with_intake(&mut msgs_json, prompt_context, intake);
-    } else {
-        prompt_read::ensure_active_prompt_card(&mut msgs_json, prompt_context);
-    }
+    prompt_read::ensure_active_prompt_card(&mut msgs_json, prompt_context, prompt_intake);
     let exec_grounding_turn = action_nudges && prompt_disposition == PromptDisposition::Act;
     let (instructions, mut input) = crate::responses_wire::build_responses_input(&msgs_json);
     let tools_chat = merged_tool_definitions(
