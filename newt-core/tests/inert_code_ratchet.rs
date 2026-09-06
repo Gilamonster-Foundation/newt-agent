@@ -15,14 +15,28 @@
 //! and asks the paying change to lower the ratchet. Marker identity prevents
 //! an acknowledged unit from hiding behind an unchanged aggregate.
 //!
+//! **What that does NOT cover, stated so nobody has to discover it.** The
+//! check is textual. A site repaired *semantically* — a caller added to
+//! something registered as having none, a field that starts being read —
+//! leaves its declaration and marker in place, so every count, identity and
+//! test stays green while the row's present-tense justification has quietly
+//! become false. Deletion is caught; wiring is not. Treat this layer as
+//! "these registered witnesses still read as inert", never as a live liveness
+//! analysis.
+//!
 //! Workflow syntax is also detected independently: every JavaScript-family
-//! file under `scripts/` is parsed in its real dialect and the exact failure
-//! set is ratcheted. That detector can discover a new unregistered failure.
+//! file under the NON-HIDDEN paths of `scripts/` is parsed in its real
+//! dialect and the exact failure set is ratcheted. The qualifier is load
+//! bearing — hidden directories are skipped by the walker, so a file under
+//! something like `scripts/.fixtures/` is outside this detector's domain. That detector can discover a new unregistered failure.
 //! The remaining wrong-number, wildcard, and consumer-liveness findings stay
 //! registered witnesses because pretending to infer arbitrary intent with a
 //! textual heuristic would create the noisy detector this gate rejects.
 //!
-//! Deliberately inert implementations are a separate, exact sanctioned set.
+//! Deliberately inert implementations are a separate, exact set of REGISTERED
+//! sanctions. "Registered" is the honest word: the suite proves every listed
+//! sanction is resolved as one, not that the list is every deliberate no-op in
+//! the tree. A new unmarked no-op is not discovered by anything here.
 //! Serde/wire DTOs, PyO3 registrations, `thiserror` conversions, and Clap
 //! variants are not sanctions: generated or external construction is a real
 //! consumer, so those families are excluded structurally before inventorying.
