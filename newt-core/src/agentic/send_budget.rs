@@ -1,4 +1,256 @@
-use super::RoundObservation;
+//! Request accounting, admission, and input-budget state for agentic turns.
+
+use super::trim::{
+    estimate_request_tokens, estimate_tokens, estimate_value_tokens, protected_prompt_head_len,
+};
+use super::{budget, prompt_read, RoundObservation};
+
+/// Tightest whole-request ceiling that carries authoritative semantics for
+/// this turn. A proven-good high-water mark by itself is deliberately not a
+/// ceiling; configured token thresholds and believed/declared windows are.
+/// The LIVE usable input budget (in estimated tokens) the tool-exposure
+/// controller sizes the schema set against — the initial send budget when known
+/// (derived from probed `max_ok_input` / `safe_context` / `num_ctx`), else the
+/// declared `safe_context`. `None` means no live signal: the controller then
+/// does NOT clip (no starvation without a measurement). Deliberately not a
+/// function of the model name (#TEC): a bigger probed window widens exposure
+/// automatically.
+pub(super) fn exposure_budget_tokens(
+    send_budget: Option<usize>,
+    safe_context: Option<u32>,
+) -> Option<usize> {
+    send_budget.or_else(|| safe_context.map(|s| s as usize))
+}
+
+pub(super) fn authoritative_request_budget(
+    send_budget: Option<usize>,
+    send_budget_authoritative: bool,
+    token_threshold: Option<usize>,
+) -> Option<usize> {
+    let send = send_budget_authoritative.then_some(send_budget).flatten();
+    match (send, token_threshold.filter(|budget| *budget > 0)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Whether the message-count fallback may stand down. A real ceiling always
+/// delegates to the token/send guards. With no ceiling, a model-specific
+/// accepted-prompt high-water mark still proves that the current request fits
+/// when it is at or below that mark; treating that proof as no headroom causes
+/// needless count-only compaction on hosted large-context models.
+pub(super) fn count_guard_has_headroom(
+    current_tokens: usize,
+    authoritative_budget: Option<usize>,
+    max_ok_input: Option<u32>,
+) -> bool {
+    authoritative_budget.is_some()
+        || max_ok_input.is_some_and(|accepted| current_tokens <= accepted as usize)
+}
+
+pub(super) fn capped_accepted_prompt_tokens(
+    accepted_prompt_tokens: u32,
+    declared_ceiling: Option<usize>,
+) -> usize {
+    (accepted_prompt_tokens as usize).min(declared_ceiling.unwrap_or(usize::MAX))
+}
+
+/// Refuse before inference when the compression-immune system/card/exact-user
+/// head, newest live user presentation, and advertised schemas cannot fit an
+/// authoritative model budget. The live presentation intentionally remains at
+/// the transcript tail so normal multi-turn ordering is preserved; counting
+/// only the protected recovery copy would under-price every prompt by one full
+/// copy and permit an over-window dispatch. Exact prompt text is never
+/// truncated to manufacture a dispatchable request.
+pub(super) fn preflight_irreducible_request(
+    messages: &[serde_json::Value],
+    tools: Option<&serde_json::Value>,
+    authoritative_budget: Option<usize>,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+    model: &str,
+) -> anyhow::Result<()> {
+    let Some(budget) = authoritative_budget else {
+        return Ok(());
+    };
+    let head = protected_prompt_head_len(messages, prompt_read::ACTIVE_PROMPT_PREFIX);
+    let newest_live_user = messages[head..]
+        .iter()
+        .rev()
+        .find(|message| message["role"].as_str() == Some("user"));
+    let estimated = estimate_request_tokens(&messages[..head], tools, estimation)
+        + newest_live_user
+            .map(|message| estimate_value_tokens(message, estimation))
+            .unwrap_or(0);
+    let required = calibrate_up(estimated, calibration);
+    if required > budget {
+        anyhow::bail!(
+            "the exact active prompt, live user presentation, and required request scaffolding \
+             need ~{required} input \
+             tokens (including advertised tool schemas), which cannot fit model `{model}`'s \
+             authoritative {budget}-token input budget; refusing before inference dispatch — \
+             the operator prompt was not truncated"
+        );
+    }
+    Ok(())
+}
+
+/// Refuse any Chat-style dispatch when its complete dynamic message list plus
+/// the schemas currently advertised on that request no longer fit an
+/// authoritative budget. Count trimming alone is not a token bound: one fresh
+/// tool or prompt-read result can be larger than the entire window.
+fn full_message_request_real_tokens(
+    messages: &[serde_json::Value],
+    tools: Option<&serde_json::Value>,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+) -> usize {
+    calibrate_up(
+        estimate_request_tokens(messages, tools, estimation),
+        calibration,
+    )
+}
+
+/// Compression must fire whenever either the backend-anchored observation or
+/// the authoritative whole-request estimate crosses a budget. Otherwise the
+/// trigger can say "fits" immediately before preflight refuses the same wire.
+pub(super) fn full_message_request_pressure_tokens(
+    tracked_tokens: usize,
+    wire_messages: &[serde_json::Value],
+    tools: Option<&serde_json::Value>,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+) -> usize {
+    tracked_tokens.max(full_message_request_real_tokens(
+        wire_messages,
+        tools,
+        calibration,
+        estimation,
+    ))
+}
+
+pub(super) fn preflight_full_message_request(
+    messages: &[serde_json::Value],
+    tools: Option<&serde_json::Value>,
+    authoritative_budget: Option<usize>,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+    model: &str,
+) -> anyhow::Result<()> {
+    let Some(budget) = authoritative_budget else {
+        return Ok(());
+    };
+    let required = full_message_request_real_tokens(messages, tools, calibration, estimation);
+    if required > budget {
+        anyhow::bail!(
+            "the complete inference request needs ~{required} input tokens, which cannot fit \
+             model `{model}`'s authoritative {budget}-token input budget; refusing before \
+             inference dispatch — the exact operator prompt and tool results were not truncated"
+        );
+    }
+    Ok(())
+}
+
+/// #1528: the ONE token-shape estimate of a Responses request — the
+/// `instructions` (as a protected system head), the running `input`, and the
+/// flattened Responses-WIRE tool schemas — that BOTH [`preflight_responses_request`]
+/// (which refuses when it exceeds the budget) and the `get_context_remaining`
+/// self-read (which reports it as `used`) call, so the self-read counts exactly
+/// what dispatch counts. `tools` is `None` for a tools-disabled request; pass the
+/// Responses-wire `tools` array actually sent, never the Chat-shaped catalog.
+/// Uncalibrated (chars/4) — the caller applies [`calibrate_up`] when it needs
+/// real-token currency.
+pub(super) fn estimate_responses_request_tokens(
+    instructions: Option<&str>,
+    input: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    estimation: crate::tokens::TokenEstimation,
+) -> usize {
+    let instructions_tokens = instructions
+        .map(|text| {
+            estimate_value_tokens(
+                &serde_json::json!({"role": "system", "content": text}),
+                estimation,
+            )
+        })
+        .unwrap_or(0);
+    let input_tokens = estimate_tokens(input, estimation);
+    let tool_tokens = tools
+        .map(|tools| estimate_value_tokens(&serde_json::Value::Array(tools.to_vec()), estimation))
+        .unwrap_or(0);
+    instructions_tokens + input_tokens + tool_tokens
+}
+
+/// The CALIBRATED real-token estimate of a Responses request — the raw
+/// [`estimate_responses_request_tokens`] shape (chars/4) converted to the
+/// backend-token currency dispatch enforces in, via the model's `calibration`.
+/// Budget ceilings and remaining-token reports are real-token currency, so BOTH
+/// the dispatch preflight AND the `get_context_remaining` self-read subtract
+/// THIS, never the raw estimate (BHV-BUDGET-001/002/003: one currency, calibrated
+/// exactly once).
+pub(super) fn estimate_responses_request_real_tokens(
+    instructions: Option<&str>,
+    input: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    estimation: crate::tokens::TokenEstimation,
+    calibration: f32,
+) -> usize {
+    calibrate_up(
+        estimate_responses_request_tokens(instructions, input, tools, estimation),
+        calibration,
+    )
+}
+
+/// The Responses `get_context_remaining` self-read report, extracted so it is
+/// unit-testable and shares ONE calibrated estimate with dispatch: `used` is the
+/// CALIBRATED estimate of the exact next request (the instructions, the running
+/// `input`, and the enabled Responses-wire tool schemas), subtracted from the
+/// SAME `actionable_input_budget` the preflight refuses against, in the SAME
+/// real-token currency — so the self-read's remaining and low-budget
+/// classification match what dispatch would accept or reject (BHV-BUDGET-002).
+pub(super) fn responses_context_remaining_report(
+    instructions: Option<&str>,
+    input: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    budget_state: &ResponsesBudgetState,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+    low_budget_pct: usize,
+) -> String {
+    let used_real =
+        estimate_responses_request_real_tokens(instructions, input, tools, estimation, calibration);
+    budget::render_context_budget(
+        used_real,
+        budget_state.actionable_input_budget(),
+        budget_state.num_ctx(),
+        budget_state.input_ceiling_pct(),
+        low_budget_pct,
+    )
+}
+
+pub(super) fn preflight_responses_request(
+    instructions: Option<&str>,
+    input: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    authoritative_budget: Option<usize>,
+    calibration: f32,
+    estimation: crate::tokens::TokenEstimation,
+    model: &str,
+) -> anyhow::Result<()> {
+    let Some(budget) = authoritative_budget else {
+        return Ok(());
+    };
+    let required =
+        estimate_responses_request_real_tokens(instructions, input, tools, estimation, calibration);
+    if required > budget {
+        anyhow::bail!(
+            "the Responses request needs ~{required} input tokens, which cannot fit model \
+             `{model}`'s authoritative {budget}-token input budget; refusing before inference \
+             dispatch — the exact operator prompt and function outputs were not truncated"
+        );
+    }
+    Ok(())
+}
 
 /// Authoritative input-token ceiling implied by a declared context window.
 ///
@@ -260,7 +512,7 @@ pub(super) fn emit_context_window_400(
 /// #1528: the single source of truth for the **Responses** loop's context
 /// budget. It composes the existing pure helpers ([`num_ctx_input_ceiling`],
 /// [`initial_send_budget`], [`recovered_input_budget`],
-/// [`super::authoritative_request_budget`], [`super::exposure_budget_tokens`],
+/// [`authoritative_request_budget`], [`exposure_budget_tokens`],
 /// [`super::generation_policy::cognition_output_reserve`]) into ONE owner so the
 /// Responses dispatch preflight, tool exposure, compaction target, cw-400
 /// recovery, and `get_context_remaining` all read one derivation instead of the
@@ -342,11 +594,8 @@ impl ResponsesBudgetState {
         let soft_send_budget = initial_send_budget(max_ok_input, safe_context, seed_ceiling);
         // A declared window is authoritative just like a cached `safe_context`.
         let authoritative = safe_context.is_some() || seed_ceiling.is_some();
-        let preflight_budget = super::authoritative_request_budget(
-            soft_send_budget,
-            authoritative,
-            mid_loop_trim_tokens,
-        );
+        let preflight_budget =
+            authoritative_request_budget(soft_send_budget, authoritative, mid_loop_trim_tokens);
         Self {
             num_ctx,
             input_ceiling_pct,
@@ -381,7 +630,7 @@ impl ResponsesBudgetState {
     /// the declared `safe_context`. `None` means don't clip (no starvation
     /// without a measurement).
     pub(super) fn exposure_budget(&self) -> Option<usize> {
-        super::exposure_budget_tokens(self.soft_send_budget, self.safe_context)
+        exposure_budget_tokens(self.soft_send_budget, self.safe_context)
     }
 
     /// The constraint governing the next attempted dispatch: the hard ceiling and
@@ -444,11 +693,8 @@ impl ResponsesBudgetState {
             .map_or(recovered_budget, |ceiling| recovered_budget.min(ceiling));
         self.soft_send_budget = Some(new_budget);
         self.learned_hard_ceiling = Some(new_budget);
-        self.preflight_budget = super::authoritative_request_budget(
-            self.soft_send_budget,
-            true,
-            self.mid_loop_trim_tokens,
-        );
+        self.preflight_budget =
+            authoritative_request_budget(self.soft_send_budget, true, self.mid_loop_trim_tokens);
     }
 
     /// The compaction target for the cw-400 recovery's `compress` call: the

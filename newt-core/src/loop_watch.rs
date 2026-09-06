@@ -407,7 +407,13 @@ mod loop_watch_tests {
     /// that wires the guard and forgets the watch fails here.
     #[test]
     fn every_agent_loop_that_guards_repeats_also_watches_clean_builds() {
-        let src = include_str!("agentic/mod.rs");
+        // Keep extracted owners in the source inventory: moving a loop must
+        // never make it disappear from the wiring assertions below.
+        let src = [
+            include_str!("agentic/mod.rs"),
+            include_str!("agentic/send_budget.rs"),
+        ]
+        .join("\n");
         // Positive read assertion FIRST: an absence-check that silently read
         // nothing would otherwise pass forever.
         assert!(
