@@ -6,6 +6,14 @@
 
 ---
 
+> **Current source ownership:** `MountedEditor`, `EditorOutcome`, and the
+> controller's `claim_set` accessor now live in
+> [`rich_input/mounted.rs`](../../newt-tui/src/rich_input/mounted.rs).
+> The types remain reachable through `rich_input` reexports; `Editor` stays in
+> [`rich_input.rs`](../../newt-tui/src/rich_input.rs) and the vi keymap stays in
+> `vi.rs`. The investigation below retains its historical diagnoses and line
+> citations.
+
 ## 1. What codex does
 
 Codex partitions Esc on **one predicate**, not on staging.

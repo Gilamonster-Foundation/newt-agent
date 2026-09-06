@@ -477,6 +477,14 @@ zero test churn — and the bar's appearance on second-tab creation rides the
 existing height-change clear+rebuild (`rich_input.rs:1102-1111`) with no ghost
 rows in scrollback.
 
+> **Current controller owner:** `MountedEditor::wanted_rows`, event handling,
+> and draft/history state now live in
+> [`rich_input/mounted.rs`](../../newt-tui/src/rich_input/mounted.rs), with the
+> controller types reexported through `rich_input`. `RichSurface`, `Chrome`, and
+> rendering remain in [`rich_input.rs`](../../newt-tui/src/rich_input.rs).
+> The source citation and proposed height formula below are retained from this
+> ADR's original design.
+
 **Height budget** (`rich_input.rs:1094-1101`):
 `want = (rows + ex_extra).clamp(1, MAX_INPUT_ROWS) + 1 + background_extra + tab_extra`,
 plus a new **`want.min(term_rows)` total clamp** — a latent bug today (an
