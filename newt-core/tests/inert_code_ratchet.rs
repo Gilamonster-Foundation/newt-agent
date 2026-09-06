@@ -47,7 +47,7 @@ use common::{for_each_production_line, production_roots, workspace_root};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-const KNOWN_INERT_UNITS: usize = 39;
+const KNOWN_INERT_UNITS: usize = 38;
 const KNOWN_SANCTIONS: usize = 16;
 const KNOWN_SCRIPT_PARSE_FAILURES: usize = 1;
 const WORKFLOW_COMPILER: &str = r#"
@@ -513,12 +513,6 @@ const DEBT: &[Unit] = &[
         Wire,
         "max_age_days is parsed and defaulted but no retention decision reads it.",
         [site("newt-core/src/config.rs", "pub max_age_days: u64"),]
-    ),
-    unit!(
-        "F05",
-        Wire,
-        "chat_style is parsed and defaulted but never changes TUI rendering.",
-        [site("newt-core/src/config.rs", "pub chat_style: ChatStyle"),]
     ),
     unit!(
         "F06",
@@ -1388,7 +1382,7 @@ fn the_named_inventory_only_decreases() {
                 .filter(|unit| unit.resolution == Resolution::Document)
                 .count(),
         ),
-        (25, 12, 2),
+        (24, 12, 2),
         "the accepted WIRE/DELETE/DOCUMENT classification changed"
     );
     assert!(
