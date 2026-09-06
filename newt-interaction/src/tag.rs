@@ -122,35 +122,3 @@ macro_rules! string_scalar_schema {
         }
     };
 }
-
-/// Schema for an author-assigned name: non-empty, ASCII alphanumeric plus
-/// `-` and `_` — the rule [`crate::ids::ControlId::new`] enforces.
-///
-/// Published rather than merely enforced, because a schema that permits
-/// any string while the decoder refuses most of them is the same
-/// false-guarantee defect as a doc comment that claims a validation the
-/// wire does not perform.
-#[cfg(feature = "schema")]
-#[must_use]
-// INERT-CODE-RATCHET: X15 DELETE: feature-gated schema helpers have zero consumers and the scalar macro supersedes them.
-pub fn name_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-    let mut schema = schemars::schema::SchemaObject {
-        instance_type: Some(schemars::schema::InstanceType::String.into()),
-        ..Default::default()
-    };
-    schema.string().min_length = Some(1);
-    schema.string().pattern = Some("^[A-Za-z0-9_-]+$".to_string());
-    schema.into()
-}
-
-/// Schema for a scalar whose only rule is non-emptiness.
-#[cfg(feature = "schema")]
-#[must_use]
-pub fn non_empty_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-    let mut schema = schemars::schema::SchemaObject {
-        instance_type: Some(schemars::schema::InstanceType::String.into()),
-        ..Default::default()
-    };
-    schema.string().min_length = Some(1);
-    schema.into()
-}

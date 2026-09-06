@@ -36,7 +36,7 @@ use thiserror::Error;
 
 use crate::definition::InteractionDefinition;
 use crate::error::ProtocolError;
-use crate::ids::{InstanceId, Revision};
+use crate::ids::InstanceId;
 use crate::instance::{InteractionInstance, LifecycleState};
 
 /// The host's authority to publish an offer.
@@ -239,14 +239,4 @@ pub fn publish(
         instance: instance.instance_id()?,
         state: LifecycleState::Published,
     })
-}
-
-/// The revision an offer must bind to be publishable against `definition`.
-///
-/// Exposed so a host can mint a correct offer rather than discovering the
-/// mismatch at publication.
-#[must_use]
-// INERT-CODE-RATCHET: X16 DELETE: publishable-revision helper has zero consumers and only exposes an existing field.
-pub fn publishable_revision(definition: &InteractionDefinition) -> Revision {
-    definition.revision
 }
