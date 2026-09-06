@@ -1,5 +1,5 @@
 //! #1387 Code Navigator slash-command parse/format helpers (Phases 2–4).
-//! Execution (indexes, IO) stays in `chat.rs`; this module is pure.
+//! Execution (indexes, IO) lives in `chat/navigation_execution.rs`; this module is pure.
 
 /// Parsed navigator slash command.
 #[derive(Debug, Clone, PartialEq, Eq)]
