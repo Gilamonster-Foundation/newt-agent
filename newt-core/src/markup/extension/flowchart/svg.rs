@@ -26,8 +26,7 @@
 //! claim than "a diagram is present" — which is exactly the assertion that let
 //! the black-on-black regression through.
 
-// INERT-CODE-RATCHET: F19 DELETE: flowchart renderer imports NODE_H only to discard it.
-use super::layout::{Layout, NODE_H};
+use super::layout::Layout;
 use super::parse::{Direction, Graph};
 use std::fmt::Write as _;
 
@@ -163,5 +162,4 @@ fn arrowhead(out: &mut String, direction: Direction, x: f64, y: f64) {
         ),
     };
     let _ = write!(out, r#"<polygon points="{points}" fill="{INK}"/>"#);
-    let _ = NODE_H;
 }

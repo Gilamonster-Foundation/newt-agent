@@ -241,11 +241,6 @@ impl TurnDriverConfig {
 pub struct TurnOutcome {
     /// The model's reply text.
     pub reply: String,
-    /// Whether the reply was streamed token-by-token by the loop (it prints to
-    /// stdout when `color` is on; the driver always runs headless, so this is
-    /// informational).
-    // INERT-CODE-RATCHET: F02 DELETE: headless turn outcome stores a streaming flag no consumer reads.
-    pub was_streamed: bool,
     /// Token usage for the turn, when the backend reported it.
     pub usage: Option<TokenUsage>,
     /// Count of hallucinated (non-existent) tool calls the loop saw.
@@ -690,9 +685,8 @@ async fn run_one_turn(
     // infrastructure failure (e.g. a context-window 500) must not misreport the
     // agent as having done nothing.
     match dispatch {
-        Ok((reply, was_streamed, usage, hallucinations)) => Ok(TurnOutcome {
+        Ok((reply, _, usage, hallucinations)) => Ok(TurnOutcome {
             reply,
-            was_streamed,
             usage,
             hallucinations,
             tool_events,
@@ -705,7 +699,6 @@ async fn run_one_turn(
         }),
         Err(e) => Ok(TurnOutcome {
             reply: String::new(),
-            was_streamed: false,
             usage: None,
             hallucinations: 0,
             tool_events,

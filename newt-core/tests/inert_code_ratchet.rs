@@ -47,7 +47,7 @@ use common::{for_each_production_line, production_roots, workspace_root};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-const KNOWN_INERT_UNITS: usize = 38;
+const KNOWN_INERT_UNITS: usize = 34;
 const KNOWN_SANCTIONS: usize = 16;
 const KNOWN_SCRIPT_PARSE_FAILURES: usize = 1;
 const WORKFLOW_COMPILER: &str = r#"
@@ -482,33 +482,6 @@ const DEBT: &[Unit] = &[
         ]
     ),
     unit!(
-        "X31",
-        Delete,
-        "obsolete sync_all wrapper has only tests; active code uses the task-aware variant.",
-        [site(
-            "newt-core/src/memory.rs",
-            "pub async fn sync_all(&mut self"
-        ),]
-    ),
-    unit!(
-        "F02",
-        Delete,
-        "headless turn outcome stores a streaming flag no consumer reads.",
-        [site(
-            "newt-core/src/agentic/driver.rs",
-            "pub was_streamed: bool"
-        ),]
-    ),
-    unit!(
-        "F03",
-        Delete,
-        "stored pre-bridge estimate is unread after framing overhead is computed.",
-        [site(
-            "newt-core/src/agentic/responses_compaction.rs",
-            "pub(super) pre_bridge_estimate: usize"
-        ),]
-    ),
-    unit!(
         "F04",
         Wire,
         "max_age_days is parsed and defaulted but no retention decision reads it.",
@@ -644,21 +617,6 @@ const DEBT: &[Unit] = &[
                 "refusal: &newt_interaction::Refusal"
             ),
             site("newt-tui/src/permissions.rs", "let _ = refusal"),
-        ]
-    ),
-    unit!(
-        "F19",
-        Delete,
-        "flowchart renderer imports NODE_H only to discard it.",
-        [
-            site(
-                "newt-core/src/markup/extension/flowchart/svg.rs",
-                "use super::layout::{Layout, NODE_H};"
-            ),
-            site(
-                "newt-core/src/markup/extension/flowchart/svg.rs",
-                "let _ = NODE_H;"
-            ),
         ]
     ),
     unit!(
@@ -1382,7 +1340,7 @@ fn the_named_inventory_only_decreases() {
                 .filter(|unit| unit.resolution == Resolution::Document)
                 .count(),
         ),
-        (24, 12, 2),
+        (24, 8, 2),
         "the accepted WIRE/DELETE/DOCUMENT classification changed"
     );
     assert!(

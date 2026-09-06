@@ -538,11 +538,18 @@ async fn summarizing_provider_delegates_through_loop_summarizer() {
     let big = "x".repeat(200);
     for i in 0..5u32 {
         memory
-            .sync_all(&format!("task {i}"), &big, &metrics(10 + i))
+            .sync_all_with_active_task(
+                &format!("task {i}"),
+                &big,
+                &metrics(10 + i),
+                &format!("task {i}"),
+            )
             .await;
     }
     assert!(bodies.lock().unwrap().is_empty(), "under budget — no calls");
-    memory.sync_all("final task", &big, &metrics(600)).await;
+    memory
+        .sync_all_with_active_task("final task", &big, &metrics(600), "final task")
+        .await;
 
     let bodies = bodies.lock().unwrap();
     assert_eq!(bodies.len(), 1, "exactly one summarizer call");
