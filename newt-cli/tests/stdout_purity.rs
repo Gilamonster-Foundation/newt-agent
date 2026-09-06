@@ -34,13 +34,13 @@ fn init_request() -> serde_json::Value {
 
 #[tokio::test]
 async fn worker_stdout_is_pure_json_rpc() {
-    let bin = locate_newt_bin();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_newt"));
     spawn_and_assert_pure(&bin, &["worker"]).await;
 }
 
 #[tokio::test]
 async fn mcp_stdout_is_pure_json_rpc() {
-    let bin = locate_newt_bin();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_newt"));
     spawn_and_assert_pure(&bin, &["mcp"]).await;
 }
 
@@ -168,7 +168,7 @@ async fn spawn_and_assert_pure(bin: &PathBuf, args: &[&str]) {
 /// path runs), not just REPL init.
 #[tokio::test]
 async fn chat_emits_no_mouse_capture_sequences_when_piped() {
-    let bin = locate_newt_bin();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_newt"));
     // Piped stdout with a normal TERM, opt-in forced on → still no mouse.
     assert_no_mouse_capture(&bin, "xterm-256color").await;
     // Piped stdout AND TERM=dumb → still no mouse.
@@ -243,59 +243,4 @@ async fn assert_no_mouse_capture(bin: &PathBuf, term: &str) {
             String::from_utf8_lossy(&output.stderr),
         );
     }
-}
-
-/// The cargo target directory, resolved the way cargo itself resolves it: the
-/// `CARGO_TARGET_DIR` env var, then a workspace or user `config.toml`'s `[build]
-/// target-dir`, then the default. This makes the test robust to a target-dir set
-/// in `~/.cargo/config.toml` (newt-agent#64), which a plain
-/// `workspace_root/target` guess misses (failing with a confusing `NotFound`).
-fn cargo_target_dir() -> Option<PathBuf> {
-    cargo_metadata::MetadataCommand::new()
-        .exec()
-        .ok()
-        .map(|m| m.target_directory.into_std_path_buf())
-}
-
-/// Locator strategy (first hit wins):
-/// 1. `$CARGO_TARGET_DIR` (set by `cargo llvm-cov`)
-/// 2. the cargo-resolved target dir (honors `~/.cargo/config.toml`, newt-agent#64)
-/// 3. `<manifest>/../target/{debug,release}/newt`
-/// 4. `<manifest>/../target/llvm-cov-target/{debug,release}/newt`
-fn locate_newt_bin() -> PathBuf {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest.parent().expect("manifest dir has parent");
-
-    let mut target_dirs: Vec<PathBuf> = Vec::new();
-    if let Some(tdir) = std::env::var_os("CARGO_TARGET_DIR") {
-        target_dirs.push(PathBuf::from(tdir));
-    }
-    // Honor `[build] target-dir` from cargo config (newt-agent#64).
-    if let Some(tdir) = cargo_target_dir() {
-        target_dirs.push(tdir);
-    }
-    target_dirs.push(workspace_root.join("target"));
-    target_dirs.push(workspace_root.join("target").join("llvm-cov-target"));
-
-    for tdir in &target_dirs {
-        for profile in ["debug", "release"] {
-            let candidate = tdir.join(profile).join("newt");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-    }
-    // Best-effort build — `cargo test` for newt-cli usually builds
-    // the `newt` binary as a sibling artifact, but llvm-cov runs in
-    // an isolated target dir.
-    let _ = std::process::Command::new(env!("CARGO"))
-        .args(["build", "--bin", "newt"])
-        .output();
-
-    // Final fallback: the cargo-resolved target dir (newt-agent#64), else the
-    // conventional path.
-    cargo_target_dir()
-        .unwrap_or_else(|| workspace_root.join("target"))
-        .join("debug")
-        .join("newt")
 }

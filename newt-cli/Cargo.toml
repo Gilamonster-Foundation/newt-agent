@@ -86,7 +86,12 @@ libc.workspace = true
 [dev-dependencies]
 assert_cmd.workspace = true
 async-trait.workspace = true
-cargo_metadata.workspace = true
+# #2161: the purity suites locate the binary with `env!("CARGO_BIN_EXE_newt")`,
+# the path cargo just built, so `[build] target-dir` (newt-agent#64),
+# `CARGO_TARGET_DIR` and llvm-cov's isolated dir are handled by construction.
+# That replaced a target/-guessing ladder; `cargo_metadata` went with it, and
+# with it cargo-platform, whose `rust-version = "1.91"` had silently raised
+# this crate's test-tier floor above the declared 1.88. Do not re-add it.
 predicates.workspace = true
 # Validates the #687 definition-grep pattern matches defs, not mentions.
 regex.workspace = true
