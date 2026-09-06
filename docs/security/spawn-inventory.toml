@@ -44,7 +44,11 @@
 
 [files]
 # --- widened SCAN_ROOTS crates (step-7.2 convergence audit) ---
-"newt-git/src/lib.rs"                      = { count = 18, class = "test", note = "ALL raw `git` spawns are inside `#[cfg(test)] mod tests` (lib.rs:1237); production newt-git uses the git2/gix libraries, no subprocess. +1 (#1709): a new rebase-pick attribution regression test's git setup spawn, still `#[cfg(test)]`." }
+"newt-git/src/lib_tests/mod.rs"            = { count = 4, class = "test", note = "ALL raw `git` spawns stay inside the crate's `#[cfg(test)]` tree; production newt-git uses the git2/gix libraries and never spawns a subprocess. The shared test fixtures: the `git()` runner plus repo/commit setup helpers." }
+"newt-git/src/lib_tests/attribution.rs"    = { count = 2, class = "test", note = "ALL raw `git` spawns stay inside the crate's `#[cfg(test)]` tree; production newt-git uses the git2/gix libraries and never spawns a subprocess. Reads back commit trailers to assert attribution." }
+"newt-git/src/lib_tests/checkout_branch.rs"= { count = 3, class = "test", note = "ALL raw `git` spawns stay inside the crate's `#[cfg(test)]` tree; production newt-git uses the git2/gix libraries and never spawns a subprocess. Sets up and inspects branches for the checkout/branch-delete cases." }
+"newt-git/src/lib_tests/engine_write.rs"   = { count = 2, class = "test", note = "ALL raw `git` spawns stay inside the crate's `#[cfg(test)]` tree; production newt-git uses the git2/gix libraries and never spawns a subprocess. Verifies history after add/commit through the engine." }
+"newt-git/src/lib_tests/rebase.rs"         = { count = 7, class = "test", note = "ALL raw `git` spawns stay inside the crate's `#[cfg(test)]` tree; production newt-git uses the git2/gix libraries and never spawns a subprocess. Builds multi-commit fixtures and reads history back for the rebase plan cases; includes the +1 from #1709, the rebase-pick attribution regression's git setup spawn." }
 "newt-inference/src/provider_plugin.rs"    = { count = 2, class = "trusted-infra", note = "operator-configured provider plugin; env_clear() + explicit env_pass, the #93 chokepoint that refuses to mint NEWT_AGENT_KEY (strips on failure)" }
 "plugins-protocol/src/client.rs"           = { count = 2, class = "trusted-infra", note = "operator provider/skill plugin transport; env_clear() + explicit passthrough" }
 "newt-mesh/src/bin/newt-mesh-cli.rs"       = { count = 1, class = "trusted-infra", note = "operator mesh CLI reads `hostname`; fixed argv, no repo/model input" }
