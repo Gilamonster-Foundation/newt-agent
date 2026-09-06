@@ -529,8 +529,8 @@ Speech providers register **via the kit manifest / `Export` model of
 model-support catalogue (`MountKind`, `Axis { Reasoning, Structure,
 Grounding, GatingRepair }`) and has no mount for a `Session<…>` export; at
 most `Tier::TuiOnly` carries over as interface metadata. Selection stays
-`Loadout.kit` / `[bundles.*]` (`newt-core/src/config.rs`). A speech
-manifest declares:
+`Loadout.kit` (`newt-core/src/config.rs`) / `[bundles.*]`
+(`newt-core/src/config/profile.rs`). A speech manifest declares:
 
 | Manifest field | Speech example |
 |----------------|----------------|

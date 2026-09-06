@@ -245,8 +245,9 @@ and CI-testable before the load-bearing factor; do not fly too early):
   config schema, no persistence — unit-testable with `assert_cmd` + `predicates`,
   additive, and **behind a flag** (absent flag = today's behavior byte-for-byte).
 - **Walk** — config-file profiles: add `Config.profiles: BTreeMap<String,
-  ProfileConfig>` (`config.rs:26-122`) + a `ProfileConfig` struct, loaded through
-  the existing layering, mirroring `[modes.<name>]`. Add the family-prefix
+  ProfileConfig>` (`newt-core/src/config.rs`) + a `ProfileConfig` struct
+  (`newt-core/src/config/profile.rs`), loaded through the existing layering,
+  mirroring `[modes.<name>]`. Add the family-prefix
   fallback chain to `find_model_tuning`. Wire the persona `RoleProfile.model`
   seam. Values still hand-authored; the matrix validates them.
 - **Run** — auto-discovered / tuned profiles: the Phase 20 tuner writes *measured*

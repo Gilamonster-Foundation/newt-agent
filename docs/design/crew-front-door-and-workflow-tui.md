@@ -2,8 +2,9 @@
 
 **Status:** Design (2026-06-18). Builds on merged work: `run_crew` + `BackendPool`
 + `Dispatcher` (newt-scheduler), the multi-attach session model (newt-core
-`session.rs`, #429), loadouts/kits/profiles (newt-core `config.rs`), and the
-rich-tui input surface (#416). Companion to `crew-loadout.md` (the *ensemble &
+`session.rs`, #429), loadouts (newt-core `config.rs`), kits/profiles
+(newt-core `config/profile.rs`), and the rich-tui input surface (#416).
+Companion to `crew-loadout.md` (the *ensemble &
 config*), `workflow-swarm-harness.md` (count-adaptive dispatch, panel vs crew),
 and `mesh-remote-control-mobile-app.md` (multi-attach). **Amends**
 `docs/decisions/plain_scroller_tui.md` with one workflow carve-out.
