@@ -356,8 +356,9 @@ struct SessionClose { session_id: SessionId, reason: String }
 ```
 
 `SessionId` reuses the planned `newt-core` `SessionId(Uuid)` (ROADMAP Step 1.2);
-the streaming `OutputChunk` maps cleanly onto the planned `ChatChunk` /
-`ChatStream` types (ROADMAP Step 2.3).
+the original plan mapped streaming `OutputChunk` onto `ChatChunk` / `ChatStream`
+(ROADMAP Step 2.3). That unused type island was retired in Stage D batch 1;
+it was never a live dependency. Streaming/cancel remains new work (§6.4).
 
 ### 6.2 Transport mapping onto the bus
 
@@ -402,10 +403,10 @@ the workspace is bare). The turn runs **under the driving attachment's caveats**
 agent work" feel.
 
 > **[finding #3] Streaming/cancel is real new work, not reuse.** Today the ACP
-> path returns *one* `TaskReply` after `backend.complete(...)`; `ChatChunk` /
-> `ChatStream` exist in `newt-inference` but are **not** wired into the
-> `InferenceBackend` trait, the ACP session, the coder loop, or any cancellation
-> path. Delivering token-by-token `OutputChunk`s + `ControlC` therefore requires
+> path returns *one* `TaskReply` after `backend.complete(...)`. The former
+> `ChatChunk` / `ChatStream` island was **never** wired into `InferenceBackend`,
+> the ACP session, the coder loop, or any cancellation path, and was retired in
+> Stage D batch 1. Delivering token-by-token `OutputChunk`s + `ControlC` requires
 > *building* that streaming + cooperative-cancel surface (see §7, Phase 1b).
 
 ### 6.5 Terminal fidelity
@@ -609,8 +610,8 @@ buffered tail → terminal continues without data loss.
    upstream addition.
 2. **Streaming on the bus.** The session protocol leans on `publish_to` +
    per-session output topics. Validate throughput/backpressure on a real mobile
-   link; confirm the planned `ChatStream`/`ChatChunk` types (ROADMAP 2.3) are
-   the right substrate.
+   link. The historical `ChatStream`/`ChatChunk` candidate (ROADMAP 2.3) was
+   retired; implementing the shared streaming substrate remains Phase 1b work.
 3. **Revocation (§5.4).** Decide minimum-viable: short `expires_at` only, vs. a
    signed revocation topic / denied-fingerprint list at the responder.
 4. **UniFFI + tokio + iroh on mobile.** De-risk early: a "hello, signed echo"

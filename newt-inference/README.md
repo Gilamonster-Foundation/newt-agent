@@ -10,8 +10,8 @@ host.
   Newt-Provider JSON-RPC protocol — how OpenAI, Anthropic, etc. join via
   opt-in plugin installs.
 
-Also provides the `BackendRegistry`, streaming chat types, and retry/backoff
-helpers used by the rest of the workspace.
+Also provides the `BackendRegistry` and retry/backoff helpers used by the rest
+of the workspace.
 
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent), a
 free, friendly, local agentic coder.

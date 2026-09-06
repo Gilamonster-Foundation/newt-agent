@@ -17,13 +17,6 @@ struct FilePatch {
 #[derive(Debug)]
 struct Hunk {
     old_start: usize,
-    #[allow(dead_code)]
-    // INERT-CODE-RATCHET: F13 DELETE: diff hunk header counts are stored behind dead-code allows but never read.
-    old_count: usize,
-    #[allow(dead_code)]
-    new_start: usize,
-    #[allow(dead_code)]
-    new_count: usize,
     lines: Vec<DiffLine>,
 }
 
@@ -448,7 +441,7 @@ fn extract_path(line: &str) -> anyhow::Result<String> {
 /// Returns the parsed hunk and the number of lines consumed.
 fn parse_hunk(lines: &[&str]) -> anyhow::Result<(Hunk, usize)> {
     let header = lines[0];
-    let (old_start, old_count, new_start, new_count) = parse_hunk_header(header)?;
+    let (old_start, _, _, _) = parse_hunk_header(header)?;
 
     let mut diff_lines = Vec::new();
     let mut i = 1;
@@ -479,9 +472,6 @@ fn parse_hunk(lines: &[&str]) -> anyhow::Result<(Hunk, usize)> {
     Ok((
         Hunk {
             old_start,
-            old_count,
-            new_start,
-            new_count,
             lines: diff_lines,
         },
         i,

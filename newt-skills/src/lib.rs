@@ -63,8 +63,8 @@
 //! that is not a single safe path component — traversal (`..`), path
 //! separators, hidden `.`-names, control bytes — so a skill name can never
 //! escape a search root or an install destination. Discovery drops skills whose
-//! declared name fails that check, and [`load_body`] / [`load_body_from`]
-//! reject an unsafe request before touching the filesystem.
+//! declared name fails that check, and [`load_body_from`] rejects an unsafe
+//! request before touching the filesystem.
 //!
 //! ## Worked example
 //!
@@ -539,17 +539,6 @@ fn bundled_files_in(fs: &dyn SkillFs, dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Discover skills from the host-scoped default directory (`~/.newt/skills`).
-/// Returns an empty list when `$HOME` is unset or the directory is absent.
-#[must_use]
-// INERT-CODE-RATCHET: X14 DELETE: default skill wrappers have zero callers and search-path variants supersede them.
-pub fn discover_default() -> Vec<Skill> {
-    match default_skills_dir() {
-        Some(dir) => discover(dir),
-        None => Vec::new(),
-    }
-}
-
 /// Discover skills across an ordered **search path** of directories — the union
 /// of every `<dir>/*/SKILL.md`, deduplicated by name with **earlier
 /// directories winning** a collision (so a newt-owned or project-local skill
@@ -634,28 +623,6 @@ fn render_body(skill: Skill) -> String {
         }
     }
     out
-}
-
-/// Load a single skill by name from `skills_dir` and return its full body plus
-/// a list of its bundled file paths — the payload of the `use_skill` tool.
-///
-/// Resolves by the skill's declared frontmatter `name`, matching what
-/// [`discover`] / [`index_block`] show, rather than by folder name.
-///
-/// # Errors
-/// Returns [`SkillError::InvalidName`] when `name` is not a safe path component,
-/// or [`SkillError::UnknownSkill`] when no skill of that name exists.
-pub fn load_body(skills_dir: impl AsRef<Path>, name: &str) -> Result<String> {
-    load_body_in(&OsFs, skills_dir.as_ref(), name)
-}
-
-fn load_body_in(fs: &dyn SkillFs, skills_dir: &Path, name: &str) -> Result<String> {
-    validate_skill_name(name)?;
-    let skill = discover_in(fs, skills_dir)
-        .into_iter()
-        .find(|s| s.name == name)
-        .ok_or_else(|| SkillError::UnknownSkill(name.to_string()))?;
-    Ok(render_body(skill))
 }
 
 /// Load a skill body by name across an ordered search path, honouring the same

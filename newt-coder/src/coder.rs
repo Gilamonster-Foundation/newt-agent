@@ -66,12 +66,6 @@ pub struct CoderRun {
     /// — the diff path doesn't tell us which files it touched without
     /// re-parsing).
     pub files_written: Vec<String>,
-    /// The raw model reply. Useful for audit logs and post-mortem.
-    /// NOTE: when the whole-file re-prompt fallback fires this becomes a
-    /// composite first+retry transcript — use [`Self::first_emission`]
-    /// when you need just the model's initial output.
-    // INERT-CODE-RATCHET: F01 DELETE: raw_reply is written but never read; first_emission is the live audit value.
-    pub raw_reply: String,
     /// The model's *first* raw emission, before any re-prompt fallback.
     /// Always the initial reply (never a composite), so the eval
     /// scorecard can judge it with `git apply --check` (#30B) to tell a
@@ -218,8 +212,7 @@ impl Coder {
                     emission_shape: shape_label,
                     model_id,
                     files_written,
-                    first_emission: raw.clone(),
-                    raw_reply: raw,
+                    first_emission: raw,
                 })
             }
             // The first emission was diff-shaped and did not apply: either a
@@ -335,14 +328,7 @@ impl Coder {
                     // The first emission is the diff the model actually
                     // produced for the task; the scorecard judges *that*,
                     // not the rescued retry.
-                    first_emission: first_raw.clone(),
-                    // Keep an audit trail of both turns: the first
-                    // (rejected) diff and the retry that landed.
-                    raw_reply: format!(
-                        "[diff-apply failed, re-prompted for whole files]\n\
-                         --- first reply ---\n{first_raw}\n\
-                         --- retry reply ---\n{retry_raw}"
-                    ),
+                    first_emission: first_raw,
                 })
             }
             Err(e) => {

@@ -47,7 +47,7 @@ use common::{for_each_production_line, production_roots, workspace_root};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-const KNOWN_INERT_UNITS: usize = 56;
+const KNOWN_INERT_UNITS: usize = 51;
 const KNOWN_SANCTIONS: usize = 16;
 const KNOWN_SCRIPT_PARSE_FAILURES: usize = 1;
 const WORKFLOW_COMPILER: &str = r#"
@@ -188,19 +188,6 @@ macro_rules! unit {
 }
 
 const DEBT: &[Unit] = &[
-    unit!(
-        "X01",
-        Delete,
-        "exported streaming island has no production consumer.",
-        [
-            site("newt-inference/src/stream.rs", "pub struct ChatChunk"),
-            site("newt-inference/src/stream.rs", "pub type ChatStream"),
-            site(
-                "newt-inference/src/stream.rs",
-                "pub async fn collect_stream"
-            ),
-        ]
-    ),
     unit!(
         "X02",
         Wire,
@@ -347,15 +334,6 @@ const DEBT: &[Unit] = &[
             "newt-core/src/agentic/driver.rs",
             "pub const VISIBLE_TRANSCRIPT_ROLES"
         ),]
-    ),
-    unit!(
-        "X14",
-        Delete,
-        "default skill wrappers have zero callers and search-path variants supersede them.",
-        [
-            site("newt-skills/src/lib.rs", "pub fn discover_default"),
-            site("newt-skills/src/lib.rs", "pub fn load_body("),
-        ]
     ),
     unit!(
         "X15",
@@ -629,21 +607,6 @@ const DEBT: &[Unit] = &[
         ),]
     ),
     unit!(
-        "X32",
-        Delete,
-        "placeholder evaluator runner remains after the real subprocess runner shipped.",
-        [site(
-            "newt-eval/src/evaluators.rs",
-            "pub struct PendingRunner"
-        ),]
-    ),
-    unit!(
-        "F01",
-        Delete,
-        "raw_reply is written but never read; first_emission is the live audit value.",
-        [site("newt-coder/src/coder.rs", "pub raw_reply: String"),]
-    ),
-    unit!(
         "F02",
         Delete,
         "headless turn outcome stores a streaming flag no consumer reads.",
@@ -745,16 +708,6 @@ const DEBT: &[Unit] = &[
                 "newt-core/src/agentic/tools/exposure.rs",
                 "pub budget_tokens: Option<usize>"
             ),
-        ]
-    ),
-    unit!(
-        "F13",
-        Delete,
-        "diff hunk header counts are stored behind dead-code allows but never read.",
-        [
-            site("newt-tools/src/patch.rs", "old_count: usize"),
-            site("newt-tools/src/patch.rs", "new_start: usize"),
-            site("newt-tools/src/patch.rs", "new_count: usize"),
         ]
     ),
     unit!(
@@ -1563,7 +1516,7 @@ fn the_named_inventory_only_decreases() {
                 .filter(|unit| unit.resolution == Resolution::Document)
                 .count(),
         ),
-        (25, 29, 2),
+        (25, 24, 2),
         "the accepted WIRE/DELETE/DOCUMENT classification changed"
     );
     assert!(

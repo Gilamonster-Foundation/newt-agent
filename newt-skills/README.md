@@ -95,8 +95,7 @@ model-controlled input. `validate_skill_name` rejects anything that is not a
 single safe path component — `..` traversal, path separators, hidden `.`-names,
 control bytes — so a name can never escape a search root or an install
 destination. Discovery drops skills whose declared name fails that check, and
-`load_body` / `load_body_from` reject an unsafe request *before* touching the
-filesystem.
+`load_body_from` rejects an unsafe request *before* touching the filesystem.
 
 ## Errors
 

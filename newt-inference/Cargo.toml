@@ -23,8 +23,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-futures-core.workspace = true
-tokio-stream.workspace = true
 
 # Embedded in-process inference engine (#639) — pulled ONLY by the `embedded`
 # feature (default-off), so the default/headless build never sees them. Pure-Rust

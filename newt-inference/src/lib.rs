@@ -21,7 +21,6 @@ pub mod palette;
 pub mod provider_plugin;
 pub mod registry;
 pub mod responses;
-pub mod stream;
 
 // Step 9.7: the shared retry/backoff module moved to `newt-core` so the
 // relocated agentic loop (`newt_core::agentic`) can use it without a
@@ -37,4 +36,3 @@ pub use backend::{ChatReply, ChatRequest, InferenceBackend};
 pub use newt_core::retry::{with_backoff_notify, RetryPolicy};
 pub use registry::BackendRegistry;
 pub use responses::{openai_inference_backend, ResponsesBackend};
-pub use stream::{ChatChunk, ChatStream};
