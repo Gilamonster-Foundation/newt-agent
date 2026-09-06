@@ -1,6 +1,6 @@
 //! `newt crew edit [name]` / `/crew edit [name]` — an interactive form for a
 //! crew's settings (`[crews.<name>]`), written as a bare-`Crew` TOML file to
-//! `~/.newt/crews/<name>.toml` (the per-file crew discovery path, config.rs
+//! `~/.newt/crews/<name>.toml` (the per-file crew discovery path, config/crew.rs
 //! `merge_crews_from_dir`).
 //!
 //! **D1a (#1885): the form is interaction/controller state.** Everything the

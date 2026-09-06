@@ -2,7 +2,7 @@
 
 **Status:** Design (2026-06-18). Builds on merged work: `run_crew` + `BackendPool`
 + `Dispatcher` (newt-scheduler), the multi-attach session model (newt-core
-`session.rs`, #429), loadouts (newt-core `config.rs`), kits/profiles
+`session.rs`, #429), loadouts (newt-core `config/loadout.rs`), kits/profiles
 (newt-core `config/profile.rs`), and the rich-tui input surface (#416).
 Companion to `crew-loadout.md` (the *ensemble &
 config*), `workflow-swarm-harness.md` (count-adaptive dispatch, panel vs crew),
