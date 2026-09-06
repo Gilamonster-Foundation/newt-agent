@@ -87,12 +87,12 @@ const KNOWN_HAND_ROLLED_DIGESTS: usize = 20;
 fn expected_by_file() -> BTreeMap<&'static str, usize> {
     BTreeMap::from([
         // Tests comparing digests; convert with their subject. REPOINTED by
-        // #1899, not lowered: all five moved intact when `tools.rs`'s inline
-        // `execute_tool_branch_tests` became a sibling file. The path now
-        // says what the comment always did, and the row sits beside
-        // `mod_tests/artifact_provenance.rs`, which is the same shape.
+        // #1899, not lowered, when `tools.rs`'s inline tests became siblings;
+        // repointed again when the branch tests were grouped by behavior.
+        // All five sites remain intact in the file-artifact family, including
+        // two Unix-gated sites. This relocation pays no ratchet debt.
         (
-            "newt-core/src/agentic/tools_tests/execute_tool_branch_tests.rs",
+            "newt-core/src/agentic/tools_tests/execute_file_artifacts.rs",
             5,
         ),
         // Artifact digests over opaque bytes → RawContentId.
