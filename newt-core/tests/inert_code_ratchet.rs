@@ -527,7 +527,7 @@ const DEBT: &[Unit] = &[
         "F07",
         Wire,
         "bundle about text is parsed but never reaches the promised startup banner.",
-        [site("newt-core/src/config.rs", "pub about: Option<String>"),]
+        [site("newt-core/src/config/profile.rs", "pub about: Option<String>"),]
     ),
     unit!(
         "F08",
