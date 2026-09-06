@@ -1246,6 +1246,7 @@ fn collect_matching_files(
             if name == ".git"
                 || name == ".worktrees"
                 || name == "target"
+                || path.join(".git").exists()
                 || (!include_hidden && name.starts_with('.'))
             {
                 continue;
@@ -1761,6 +1762,40 @@ fn registered_inventory_probe_reads_a_seeded_unit() {
     assert_eq!(report.findings.len(), 1, "scanner missed the seeded unit");
     assert_eq!(report.findings[0].id, "Z99");
     assert_eq!(report.markers, expected_marker_identities(&[&SEED]));
+}
+
+/// Grounds the marker inventory's checkout boundary in real filesystem entries:
+/// hidden Markdown belongs to this checkout, nested worktrees and clones do not.
+#[test]
+fn markdown_scan_keeps_hidden_files_but_skips_nested_checkouts() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    std::fs::write(root.path().join(".git"), "gitdir: elsewhere\n").unwrap();
+    let owned = ".newt/bundled-skills/probe/SKILL.md";
+    let path = root.path().join(owned);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "<!-- INERT-CODE-RATCHET: Z96 DELETE: owned -->\n").unwrap();
+
+    for (nested, git_directory) in [(".claude/worktrees/sib", false), ("vendor/clone", true)] {
+        let checkout = root.path().join(nested);
+        std::fs::create_dir_all(checkout.join("docs")).unwrap();
+        if git_directory {
+            std::fs::create_dir(checkout.join(".git")).unwrap();
+        } else {
+            std::fs::write(checkout.join(".git"), "gitdir: elsewhere\n").unwrap();
+        }
+        std::fs::write(
+            checkout.join("docs/x.md"),
+            "<!-- INERT-CODE-RATCHET: Z97 DELETE: phantom -->\n",
+        )
+        .unwrap();
+    }
+
+    let report = scan_under(root.path(), &[]).expect("scan checkout boundaries");
+    assert_eq!(
+        report.markers,
+        BTreeMap::from([(("Z96".to_string(), owned.to_string()), 1)])
+    );
+    assert_eq!(report.stats.markdown_files, 1);
 }
 
 #[test]
