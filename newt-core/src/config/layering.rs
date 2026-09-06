@@ -119,7 +119,7 @@ pub(crate) const CONTROL_PLANE_KEYS: &[&str] = &[
     // operator which hosts they own.
     "network",
     // `[crews.*].test` / `loop_program` are shell verification commands run on
-    // `newt crew` (config.rs Crew.test → WorktreeWorkspace test_cmd → sh -c),
+    // `newt crew` (config/crew.rs Crew.test → WorktreeWorkspace test_cmd → sh -c),
     // and a `[loadouts.*]` with only a model passes validation — so a project
     // overlay could mint a command by declaring the sole crew (auto-selected).
     // Confined by `run_confined_build`, but still config-minted exec authority:
