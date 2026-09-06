@@ -177,10 +177,10 @@ symbol = "validated_call_id_nonempty"
 module = "NewtPolicy.ToolBatch"
 symbol = "executable"
 [[BHV-TOOLS-001.refs.rust_tests]]
-path = "newt-core/src/agentic/tools_tests/tests.rs"
+path = "newt-core/src/agentic/tools_tests/helper_validation.rs"
 symbol = "batch_valid_then_malformed_dispatches_zero"
 [[BHV-TOOLS-001.refs.rust_tests]]
-path = "newt-core/src/agentic/tools_tests/tests.rs"
+path = "newt-core/src/agentic/tools_tests/helper_validation.rs"
 symbol = "batch_all_valid_dispatches_every_call"
 [[BHV-TOOLS-001.refs.production]]
 path = "newt-core/src/agentic/tools.rs"
@@ -201,13 +201,13 @@ symbol = "validated_call_id_nonempty"
 module = "NewtPolicy.ToolBatch"
 symbol = "validated_batch_ids_distinct"
 [[BHV-TOOLS-002.refs.rust_tests]]
-path = "newt-core/src/agentic/tools_tests/tests.rs"
+path = "newt-core/src/agentic/tools_tests/helper_validation.rs"
 symbol = "batch_missing_id_is_correlation_impossible"
 [[BHV-TOOLS-002.refs.rust_tests]]
-path = "newt-core/src/agentic/tools_tests/tests.rs"
+path = "newt-core/src/agentic/tools_tests/helper_validation.rs"
 symbol = "batch_duplicate_id_is_correlation_impossible"
 [[BHV-TOOLS-002.refs.rust_tests]]
-path = "newt-core/src/agentic/tools_tests/tests.rs"
+path = "newt-core/src/agentic/tools_tests/helper_validation.rs"
 symbol = "batch_blank_id_is_correlation_impossible"
 [[BHV-TOOLS-002.refs.rust_tests]]
 path = "newt-core/src/agentic/mod_tests/tool_round_cap/responses_protocol.rs"

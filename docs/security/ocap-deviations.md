@@ -284,7 +284,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   agent-bridle 0.7.15, `agent-bridle-tool-shell` clears the ambient child env only under the Unix
   implementation; the Windows child env contract is still inherited. The route-level proof
   `run_command_windows_provider_env_inheritance_is_active`
-  (`newt-core/src/agentic/tools.rs`) launches through the real AppContainer backend and proves a
+  (`newt-core/src/agentic/tools_tests/helper_windows_appcontainer.rs`) launches through the real AppContainer backend and proves a
   parent-only `OPENAI_API_KEY` reaches the child. The separate `ConstrainedExecutor` seam does not have
   this leak: `appcontainer_child_does_not_inherit_provider_credentials`
   (`newt-core/tests/windows_appcontainer_adversarial.rs`) proves only explicitly granted env crosses
