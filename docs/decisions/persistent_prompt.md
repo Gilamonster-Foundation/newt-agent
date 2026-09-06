@@ -90,7 +90,8 @@ That gap was never a missing writer that phase 2's block lease had to create.
 The ONE spinner already existed; it was simply scoped to the *inference* call
 and gone before the tool ran, and `LiveToolOutput::start` is bookkeeping whose
 first paint is the child's **first byte**. Closed in the tool funnel
-(`execute_tool_with_display_cancellable`) by holding a per-call spinner that
+(`execute_tool_with_display_cancellable` in `newt-core/src/agentic/tools/dispatch.rs`)
+by holding a per-call spinner that
 yields the row to the live-output viewport on that first byte
 (`agentic::tools::live_output::ToolSpinner`). Zero arbiter changes; `LineCaps`
 gates it exactly as it gates the thinking spinner, so pipes stay byte-identical

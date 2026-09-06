@@ -5,20 +5,21 @@
 
 use super::artifact_read::{execute_artifact_read_silent, ArtifactReadContext};
 #[cfg(test)]
-use super::content_spill;
-use super::content_spill::SpillStore;
-use super::crew_tool::CrewRunner;
-use super::display::{ToolDisplay, ToolPresentation};
-use super::git_tool::GitTool;
+use super::content_spill::{self, SpillStore};
+#[cfg(test)]
+use super::display::ToolDisplay;
+use super::display::ToolPresentation;
 use super::mcp::{classify_mcp_effect, leash_mcp_call, McpEffect, McpGrant, McpTools};
-use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition, MemorySource};
-use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
+use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition};
+use super::note_sink::{execute_save_note, save_note_tool_definition};
 use super::permissions::{
     DenialKind, HumanQuestionOutcome, PermissionDecision, PermissionGate, PermissionRequest,
 };
 use super::prompt_intake::PromptDisposition;
-use super::prompt_read::{execute_prompt_read_silent, PromptReadContext};
-use super::recall::{execute_recall, recall_tool_definition, RecallSource};
+use super::prompt_read::execute_prompt_read_silent;
+#[cfg(test)]
+use super::prompt_read::PromptReadContext;
+use super::recall::{execute_recall, recall_tool_definition};
 use super::report::{execute_render_report, render_report_tool_definition};
 use crate::caveats::CaveatsExt as _;
 use crate::PermissionAction;
@@ -34,6 +35,13 @@ pub use output_budget::{
 };
 
 mod catalog;
+mod dispatch;
+#[cfg(test)]
+use dispatch::execute_tool_with_display_cancellable;
+pub use dispatch::{
+    execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt_and_artifacts,
+};
+pub(crate) use dispatch::{execute_tool_with_collaborators, ToolCollaborators};
 pub(crate) mod exposure;
 mod live_output;
 mod output_budget;
@@ -43,7 +51,7 @@ mod shell;
 /// for good. Unix-only — it needs a real pty pair.
 #[cfg(all(test, unix))]
 mod tool_spinner_pty_test;
-use live_output::{LiveOutputSession, ToolSpinner};
+use live_output::LiveOutputSession;
 pub use shell::venv_cmd_prefix;
 #[cfg(test)]
 use shell::{
@@ -2271,376 +2279,6 @@ fn artifact_postcondition_warning(
     let warning =
         format!("warning: {path} changed, but no file-change artifact was recorded: {detail}");
     format!("\n{warning}")
-}
-
-#[allow(clippy::too_many_arguments)]
-/// The optional collaborator seams a tool dispatch may carry, bundled into ONE
-/// value (reuse discipline: "prefer making a bug unrepresentable"). The
-/// positional form threaded ~19 `Option` params through every facade layer —
-/// and a bare-`None` run misaligned by one slot compiles fine while silently
-/// disabling the wrong seam (the exact hazard hit while threading `where_is`,
-/// #1285). Named fields + `..Default::default()` make that miswiring
-/// impossible, and a NEW seam is one field plus its construction sites, not a
-/// signature change through six layers.
-///
-/// `Default` is all-`None`: the bare dispatch a test or embedder starts from.
-#[derive(Default)]
-pub(crate) struct ToolCollaborators<'a> {
-    pub(crate) build_check_cmd: Option<&'a str>,
-    /// #1947: the turn's tool ledger, distilled — what `render_report`'s
-    /// capability claims are checked against.
-    ///
-    /// `Option` is load-bearing and not a convenience. `None` means there is
-    /// no RECORDER (eval, headless), which is not the same fact as an empty
-    /// ledger; conflating them would refute every report in those tiers for
-    /// a reason that has nothing to do with the report.
-    pub(crate) tool_evidence: Option<&'a super::capability_check::Evidence>,
-    pub(crate) note_sink: Option<&'a mut dyn NoteSink>,
-    pub(crate) recall_source: Option<&'a dyn RecallSource>,
-    pub(crate) memory_source: Option<&'a dyn MemorySource>,
-    pub(crate) prompt_context: Option<PromptReadContext<'a>>,
-    pub(crate) artifact_context: Option<ArtifactReadContext<'a>>,
-    pub(crate) artifact_sink: Option<&'a dyn super::artifact_read::PromptArtifactSink>,
-    pub(crate) permission_gate: Option<&'a mut dyn PermissionGate>,
-    pub(crate) exec_floor: Option<&'a crate::caveats::Scope<String>>,
-    pub(crate) git_tool: Option<&'a dyn GitTool>,
-    pub(crate) crew_runner: Option<&'a dyn CrewRunner>,
-    pub(crate) scratchpad_store: Option<&'a dyn super::scratchpad::ScratchpadStore>,
-    pub(crate) code_search: Option<super::semantic::CodeSearch<'a>>,
-    pub(crate) where_is: Option<&'a crate::where_is::WhereIsIndex>,
-    /// #1387 navigator tool context (usage/graph/project). `None` ⇒ tools degrade.
-    pub(crate) nav: Option<crate::navigator::NavToolCtx<'a>>,
-    pub(crate) experience_store: Option<&'a dyn super::experiential::ExperienceStore>,
-    pub(crate) step_ledger: Option<&'a dyn super::scheduled::StepLedger>,
-    pub(crate) operating_mode_control: Option<&'a dyn super::OperatingModeControl>,
-    pub(crate) plan_mode_control: Option<&'a dyn super::PlanModeControl>,
-    pub(crate) spill_store: Option<&'a dyn SpillStore>,
-    pub(crate) persona_tools: Option<&'a [String]>,
-    pub(crate) live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
-    /// Optional completed spill renderer for Rich TUI interactive viewport (#1640).
-    pub(crate) completed_spill_renderer:
-        Option<std::sync::Arc<dyn crate::agentic::CompletedSpillRenderer>>,
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn execute_tool(
-    name: &str,
-    args: &serde_json::Value,
-    workspace: &str,
-    color: bool,
-    tool_output_lines: usize,
-    caveats: &crate::caveats::Caveats,
-    mcp: &mut dyn McpTools,
-    build_check_cmd: Option<&str>,
-    note_sink: Option<&mut dyn NoteSink>,
-    recall_source: Option<&dyn RecallSource>,
-    memory_source: Option<&dyn MemorySource>,
-    permission_gate: Option<&mut dyn PermissionGate>,
-    exec_floor: Option<&crate::caveats::Scope<String>>,
-    git_tool: Option<&dyn GitTool>,
-    crew_runner: Option<&dyn CrewRunner>,
-    scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
-    code_search: Option<super::semantic::CodeSearch<'_>>,
-    where_is: Option<&crate::where_is::WhereIsIndex>,
-    experience_store: Option<&dyn super::experiential::ExperienceStore>,
-    step_ledger: Option<&dyn super::scheduled::StepLedger>,
-) -> String {
-    // The convenience wrapper carries no offload/persona/prompt surface —
-    // callers that need those seams use the wider entry points.
-    let collab = ToolCollaborators {
-        build_check_cmd,
-        // Reborrow the invariant `&mut dyn` seams to the local region (the
-        // same coercion the loop's call sites perform on ChatCtx fields).
-        note_sink: note_sink.map(|s| &mut *s as &mut dyn NoteSink),
-        recall_source,
-        memory_source,
-        permission_gate: permission_gate.map(|g| &mut *g as &mut dyn PermissionGate),
-        exec_floor,
-        git_tool,
-        crew_runner,
-        scratchpad_store,
-        code_search,
-        where_is,
-        nav: None,
-        experience_store,
-        step_ledger,
-        ..Default::default()
-    };
-    execute_tool_with_collaborators(
-        name,
-        args,
-        workspace,
-        color,
-        tool_output_lines,
-        caveats,
-        mcp,
-        collab,
-        false,
-        PromptDisposition::Act,
-        None,
-    )
-    .await
-    .expect("tool execution without a cancellation flag cannot be interrupted")
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn execute_tool_with_offload(
-    name: &str,
-    args: &serde_json::Value,
-    workspace: &str,
-    color: bool,
-    tool_output_lines: usize,
-    caveats: &crate::caveats::Caveats,
-    mcp: &mut dyn McpTools,
-    build_check_cmd: Option<&str>,
-    note_sink: Option<&mut dyn NoteSink>,
-    recall_source: Option<&dyn RecallSource>,
-    memory_source: Option<&dyn MemorySource>,
-    permission_gate: Option<&mut dyn PermissionGate>,
-    exec_floor: Option<&crate::caveats::Scope<String>>,
-    git_tool: Option<&dyn GitTool>,
-    crew_runner: Option<&dyn CrewRunner>,
-    scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
-    code_search: Option<super::semantic::CodeSearch<'_>>,
-    where_is: Option<&crate::where_is::WhereIsIndex>,
-    experience_store: Option<&dyn super::experiential::ExperienceStore>,
-    step_ledger: Option<&dyn super::scheduled::StepLedger>,
-    tool_offload: bool,
-    spill_store: Option<&dyn SpillStore>,
-    persona_tools: Option<&[String]>,
-) -> String {
-    let collab = ToolCollaborators {
-        build_check_cmd,
-        // Reborrow the invariant `&mut dyn` seams to the local region (the
-        // same coercion the loop's call sites perform on ChatCtx fields).
-        note_sink: note_sink.map(|s| &mut *s as &mut dyn NoteSink),
-        recall_source,
-        memory_source,
-        permission_gate: permission_gate.map(|g| &mut *g as &mut dyn PermissionGate),
-        exec_floor,
-        git_tool,
-        crew_runner,
-        scratchpad_store,
-        code_search,
-        where_is,
-        nav: None,
-        experience_store,
-        step_ledger,
-        spill_store,
-        persona_tools,
-        ..Default::default()
-    };
-    execute_tool_with_collaborators(
-        name,
-        args,
-        workspace,
-        color,
-        tool_output_lines,
-        caveats,
-        mcp,
-        collab,
-        tool_offload,
-        PromptDisposition::Act,
-        None,
-    )
-    .await
-    .expect("tool execution without a cancellation flag cannot be interrupted")
-}
-
-/// Prompt- and artifact-aware tool dispatcher used by inference loops.
-#[allow(clippy::too_many_arguments)]
-pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
-    name: &str,
-    args: &serde_json::Value,
-    workspace: &str,
-    color: bool,
-    tool_output_lines: usize,
-    caveats: &crate::caveats::Caveats,
-    mcp: &mut dyn McpTools,
-    build_check_cmd: Option<&str>,
-    note_sink: Option<&mut dyn NoteSink>,
-    recall_source: Option<&dyn RecallSource>,
-    memory_source: Option<&dyn MemorySource>,
-    prompt_context: Option<PromptReadContext<'_>>,
-    artifact_context: Option<ArtifactReadContext<'_>>,
-    artifact_sink: Option<&dyn super::artifact_read::PromptArtifactSink>,
-    permission_gate: Option<&mut dyn PermissionGate>,
-    exec_floor: Option<&crate::caveats::Scope<String>>,
-    git_tool: Option<&dyn GitTool>,
-    crew_runner: Option<&dyn CrewRunner>,
-    scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
-    code_search: Option<super::semantic::CodeSearch<'_>>,
-    where_is: Option<&crate::where_is::WhereIsIndex>,
-    experience_store: Option<&dyn super::experiential::ExperienceStore>,
-    step_ledger: Option<&dyn super::scheduled::StepLedger>,
-    tool_offload: bool,
-    spill_store: Option<&dyn SpillStore>,
-    persona_tools: Option<&[String]>,
-    disposition: PromptDisposition,
-) -> String {
-    let collab = ToolCollaborators {
-        build_check_cmd,
-        // Reborrow the invariant `&mut dyn` seams to the local region (the
-        // same coercion the loop's call sites perform on ChatCtx fields).
-        note_sink: note_sink.map(|s| &mut *s as &mut dyn NoteSink),
-        recall_source,
-        memory_source,
-        prompt_context,
-        artifact_context,
-        artifact_sink,
-        permission_gate: permission_gate.map(|g| &mut *g as &mut dyn PermissionGate),
-        exec_floor,
-        git_tool,
-        crew_runner,
-        scratchpad_store,
-        code_search,
-        where_is,
-        nav: None,
-        experience_store,
-        step_ledger,
-        spill_store,
-        persona_tools,
-        ..Default::default()
-    };
-    execute_tool_with_collaborators(
-        name,
-        args,
-        workspace,
-        color,
-        tool_output_lines,
-        caveats,
-        mcp,
-        collab,
-        tool_offload,
-        disposition,
-        None,
-    )
-    .await
-    .expect("tool execution without a cancellation flag cannot be interrupted")
-}
-
-/// Cancellation-aware loop entry point — the collaborator-struct core every
-/// public wrapper above flattens into. The header is written synchronously
-/// before the cancel-first race begins; an already-set interrupt therefore
-/// closes a complete audit block without ever polling the tool body.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn execute_tool_with_collaborators(
-    name: &str,
-    args: &serde_json::Value,
-    workspace: &str,
-    color: bool,
-    tool_output_lines: usize,
-    caveats: &crate::caveats::Caveats,
-    mcp: &mut dyn McpTools,
-    collab: ToolCollaborators<'_>,
-    tool_offload: bool,
-    disposition: PromptDisposition,
-    cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> Option<String> {
-    let mut display = ToolDisplay::new(
-        std::io::stdout(),
-        color,
-        super::display::term_cols(),
-        super::display::spill_lines(),
-        super::display::spill_summary(),
-    );
-    // Thread the completed spill renderer for Rich TUI interactive viewport (#1640)
-    if let Some(ref renderer) = collab.completed_spill_renderer {
-        display.set_completed_spill_renderer(renderer.clone());
-    }
-    execute_tool_with_display_cancellable(
-        &mut display,
-        name,
-        args,
-        workspace,
-        color,
-        tool_output_lines,
-        caveats,
-        mcp,
-        collab,
-        tool_offload,
-        disposition,
-        cancel,
-    )
-    .await
-}
-
-async fn wait_for_tool_cancellation(cancel: Option<&std::sync::atomic::AtomicBool>) {
-    match cancel {
-        None => std::future::pending::<()>().await,
-        Some(flag) => {
-            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn execute_tool_with_display_cancellable<W: std::io::Write + Send>(
-    display: &mut ToolDisplay<W>,
-    name: &str,
-    args: &serde_json::Value,
-    workspace: &str,
-    color: bool,
-    tool_output_lines: usize,
-    caveats: &crate::caveats::Caveats,
-    mcp: &mut dyn McpTools,
-    collab: ToolCollaborators<'_>,
-    tool_offload: bool,
-    disposition: PromptDisposition,
-    cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> Option<String> {
-    let (presentation_name, presentation_detail) =
-        tool_presentation(name, args, std::path::Path::new(workspace));
-    display.call(&presentation_name, &presentation_detail);
-    let result = {
-        // #1727: the row under the header is never silent while the tool is
-        // in flight. The spinner is scoped to this block, so it is erased
-        // before `display.result` below on every path — return, cancel, or
-        // panic — and the session's live sink is wrapped so the FIRST live
-        // chunk takes the row over from it. See `ToolSpinner`.
-        let spinner = ToolSpinner::start(&presentation_name, color);
-        let collab = ToolCollaborators {
-            live_tool_output: spinner.wrap(collab.live_tool_output),
-            ..collab
-        };
-        let execution = execute_tool_inner(
-            display,
-            name,
-            args,
-            workspace,
-            color,
-            tool_output_lines,
-            caveats,
-            mcp,
-            collab,
-            tool_offload,
-            disposition,
-        );
-        tokio::pin!(execution);
-        tokio::select! {
-            biased;
-            _ = wait_for_tool_cancellation(cancel) => None,
-            result = &mut execution => Some(result),
-        }
-    };
-    match result {
-        Some(result) => {
-            display.result(&result);
-            Some(result)
-        }
-        None => {
-            // The turn is being torn down — an interactive viewport painted
-            // here would outlive every dismiss hook (the provider loops
-            // return immediately) and strand a dead frame above the caller's
-            // interrupt notice. Static excerpt only.
-            display.drop_completed_spill_renderer();
-            let result = format!("error: {name} interrupted — tool cancelled before completion");
-            display.result(&result);
-            None
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
