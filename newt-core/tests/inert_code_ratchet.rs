@@ -47,7 +47,7 @@ use common::{for_each_production_line, production_roots, workspace_root};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-const KNOWN_INERT_UNITS: usize = 51;
+const KNOWN_INERT_UNITS: usize = 46;
 const KNOWN_SANCTIONS: usize = 16;
 const KNOWN_SCRIPT_PARSE_FAILURES: usize = 1;
 const WORKFLOW_COMPILER: &str = r#"
@@ -334,45 +334,6 @@ const DEBT: &[Unit] = &[
             "newt-core/src/agentic/driver.rs",
             "pub const VISIBLE_TRANSCRIPT_ROLES"
         ),]
-    ),
-    unit!(
-        "X15",
-        Delete,
-        "feature-gated schema helpers have zero consumers and the scalar macro supersedes them.",
-        [
-            site("newt-interaction/src/tag.rs", "pub fn name_schema"),
-            site("newt-interaction/src/tag.rs", "pub fn non_empty_schema"),
-        ]
-    ),
-    unit!(
-        "X16",
-        Delete,
-        "publishable-revision helper has zero consumers and only exposes an existing field.",
-        [site(
-            "newt-interaction/src/lifecycle.rs",
-            "pub fn publishable_revision"
-        ),]
-    ),
-    unit!(
-        "X17",
-        Delete,
-        "idempotency key display helper has zero consumers and adds no semantics.",
-        [site(
-            "newt-interaction/src/resolution.rs",
-            "pub fn key_display"
-        ),]
-    ),
-    unit!(
-        "X18",
-        Delete,
-        "setup wrapper has zero workspace callers; the with-model entry point is live.",
-        [
-            site("newt-tui/src/lib.rs", "pub async fn run_setup_target("),
-            site(
-                "newt-tui/src/lib.rs",
-                "run_setup_target_with_model(target, token_env, token_file, None, yes, config_path)"
-            ),
-        ]
     ),
     unit!(
         "X19",
@@ -754,18 +715,6 @@ const DEBT: &[Unit] = &[
                 "cost_usd: None",
                 "suppress unused warning until token usage is wired"
             ),
-        ]
-    ),
-    unit!(
-        "F17",
-        Delete,
-        "tab retry computes a degraded boolean and immediately discards it.",
-        [
-            site(
-                "newt-tui/src/tab_switch.rs",
-                "let still_degraded = restored.degraded.is_some()"
-            ),
-            site("newt-tui/src/tab_switch.rs", "let _ = still_degraded"),
         ]
     ),
     unit!(
@@ -1516,7 +1465,7 @@ fn the_named_inventory_only_decreases() {
                 .filter(|unit| unit.resolution == Resolution::Document)
                 .count(),
         ),
-        (25, 24, 2),
+        (25, 19, 2),
         "the accepted WIRE/DELETE/DOCUMENT classification changed"
     );
     assert!(

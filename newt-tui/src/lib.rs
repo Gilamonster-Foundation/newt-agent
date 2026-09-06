@@ -275,20 +275,6 @@ pub fn run_setup(color: bool) -> anyhow::Result<()> {
     setup::run(color)
 }
 
-/// Detect and configure every inference endpoint reachable through `target`.
-/// This is the scriptable `newt setup <host-or-url>` path; the no-target
-/// interactive wizard remains [`run_setup`].
-// INERT-CODE-RATCHET: X18 DELETE: setup wrapper has zero workspace callers; the with-model entry point is live.
-pub async fn run_setup_target(
-    target: &str,
-    token_env: Option<&str>,
-    token_file: Option<&std::path::Path>,
-    yes: bool,
-    config_path: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
-    run_setup_target_with_model(target, token_env, token_file, None, yes, config_path).await
-}
-
 pub async fn run_setup_target_with_model(
     target: &str,
     token_env: Option<&str>,

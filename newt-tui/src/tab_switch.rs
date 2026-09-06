@@ -733,8 +733,6 @@ pub(crate) fn handle_tab_action(
             // degraded marker and turns are allowed again; failure re-reports,
             // so the operator can iterate without losing the conversation.
             let restored = ctx.reset_and_overlay();
-            // INERT-CODE-RATCHET: F17 DELETE: tab retry computes a degraded boolean and immediately discards it.
-            let still_degraded = restored.degraded.is_some();
             tabs.active_mut().pin_degraded = restored.degraded.clone();
             match restored.degraded.as_ref() {
                 None => crate::print_newt(
@@ -748,7 +746,6 @@ pub(crate) fn handle_tab_action(
                     verbose,
                 ),
             }
-            let _ = still_degraded;
             TransitionOutcome::from_restore(&restored)
         }
         TabAction::Next => switch_to(ctx, tabs, (tabs.active_index() + 1) % tabs.len(), refuse),
