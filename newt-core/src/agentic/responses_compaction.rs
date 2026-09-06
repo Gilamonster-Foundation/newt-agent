@@ -370,8 +370,6 @@ pub(super) fn compaction_to_responses(messages: &[CompactionMessage]) -> Vec<Val
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PostBridgeBudgetExceeded {
     pub(super) actionable_budget: usize,
-    // INERT-CODE-RATCHET: F03 DELETE: stored pre-bridge estimate is unread after framing overhead is computed.
-    pub(super) pre_bridge_estimate: usize,
     pub(super) post_bridge_estimate: usize,
     pub(super) framing_overhead: usize,
 }
@@ -404,7 +402,6 @@ pub(super) fn check_post_bridge_budget(
     if post_bridge_estimate > actionable_budget {
         Err(PostBridgeBudgetExceeded {
             actionable_budget,
-            pre_bridge_estimate,
             post_bridge_estimate,
             framing_overhead: post_bridge_estimate.saturating_sub(pre_bridge_estimate),
         })
@@ -998,7 +995,6 @@ mod tests {
     fn post_bridge_budget_rejects_a_fence_inflated_request_with_attribution() {
         let err = check_post_bridge_budget(1000, 900, 1100).unwrap_err();
         assert_eq!(err.actionable_budget, 1000);
-        assert_eq!(err.pre_bridge_estimate, 900);
         assert_eq!(err.post_bridge_estimate, 1100);
         assert_eq!(
             err.framing_overhead, 200,

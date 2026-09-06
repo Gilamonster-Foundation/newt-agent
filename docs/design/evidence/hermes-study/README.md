@@ -10,6 +10,12 @@ adversarial verification panel instructed to *refute* the synthesis against
 both codebases. Studied trees: newt-agent @ `6b7d780`, hermes-agent
 (NousResearch, MIT) @ the local checkout of 2026-06-10.
 
+**Historical API note.** `report-newt-current.md` describes
+`MemoryManager::sync_all` at the studied revision. That obsolete wrapper has
+been removed; current turn persistence uses `MemoryManager::sync_all_with_active_task`
+in `newt-core/src/memory.rs`, called from `newt-tui/src/chat.rs`. The raw report
+is retained unchanged.
+
 | File | What it is |
 |---|---|
 | `report-hermes-context.md` | Reader 1: hermes context-window engine (context_engine, context_compressor, references, token accounting) |

@@ -373,7 +373,12 @@ async fn persona_set_starts_fresh_conversation_with_overlay() {
     let mut memory = newt_core::MemoryManager::new();
     memory.add_provider(newt_core::RollingWindow::new(5));
     memory
-        .sync_all("old task", "old reply", &newt_core::TurnMetrics::default())
+        .sync_all_with_active_task(
+            "old task",
+            "old reply",
+            &newt_core::TurnMetrics::default(),
+            "old task",
+        )
         .await;
     let mut system = rebuild_system_prompt(workspace, &memory, None, "test-session");
     let mut active_persona = None;
@@ -434,7 +439,12 @@ async fn new_conversation_preserves_active_persona() {
     let mut memory = newt_core::MemoryManager::new();
     memory.add_provider(newt_core::RollingWindow::new(5));
     memory
-        .sync_all("old task", "old reply", &newt_core::TurnMetrics::default())
+        .sync_all_with_active_task(
+            "old task",
+            "old reply",
+            &newt_core::TurnMetrics::default(),
+            "old task",
+        )
         .await;
     let active_persona = Some(test_persona(
         "terse",
@@ -1631,18 +1641,20 @@ async fn compressible_memory(turns: usize) -> newt_core::MemoryManager {
     let mut memory = newt_core::MemoryManager::new();
     memory.add_provider(newt_core::RollingWindow::new(50));
     memory
-        .sync_all(
+        .sync_all_with_active_task(
             "ORIGINAL TASK: port the parser",
             "starting on it",
             &newt_core::TurnMetrics::default(),
+            "ORIGINAL TASK: port the parser",
         )
         .await;
     for i in 0..turns {
         memory
-            .sync_all(
+            .sync_all_with_active_task(
                 &format!("question {i} {}", "u".repeat(300)),
                 &format!("answer {i} {}", "v".repeat(300)),
                 &newt_core::TurnMetrics::default(),
+                &format!("question {i} {}", "u".repeat(300)),
             )
             .await;
     }
@@ -1725,7 +1737,7 @@ async fn manual_compress_noop_reports_no_compression_possible() {
     let mut memory = newt_core::MemoryManager::new();
     memory.add_provider(newt_core::RollingWindow::new(50));
     memory
-        .sync_all("hi", "hello", &newt_core::TurnMetrics::default())
+        .sync_all_with_active_task("hi", "hello", &newt_core::TurnMetrics::default(), "hi")
         .await;
     let wire = session_wire_view(&memory, "you are newt");
     let mut state = newt_core::CompressState::new();
@@ -2086,7 +2098,12 @@ async fn conversation_restore_replaces_memory_and_restores_persona() {
     let mut memory = newt_core::MemoryManager::new();
     memory.add_provider(newt_core::RollingWindow::new(5));
     memory
-        .sync_all("old task", "old reply", &newt_core::TurnMetrics::default())
+        .sync_all_with_active_task(
+            "old task",
+            "old reply",
+            &newt_core::TurnMetrics::default(),
+            "old task",
+        )
         .await;
     let workspace_str = workspace.to_str().unwrap();
     let mut system = rebuild_system_prompt(workspace_str, &memory, None, "test-session");
@@ -3132,7 +3149,9 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
     let big = "x".repeat(200);
     for i in 0..5u32 {
         let task = format!("early task {i}");
-        memory.sync_all(&task, &big, &metrics(10 + i)).await;
+        memory
+            .sync_all_with_active_task(&task, &big, &metrics(10 + i), &task)
+            .await;
         save_successful_conversation_turn(
             &store,
             &id,
@@ -3152,7 +3171,9 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
         .unwrap();
     }
     // The over-budget turn mints the compaction record during sync.
-    memory.sync_all("final task", &big, &metrics(600)).await;
+    memory
+        .sync_all_with_active_task("final task", &big, &metrics(600), "final task")
+        .await;
     let record = memory.take_compaction_record();
     assert!(record.is_some(), "compression must mint a record");
     save_successful_conversation_turn(

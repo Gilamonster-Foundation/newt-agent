@@ -357,14 +357,6 @@ impl MemoryManager {
         ]
     }
 
-    /// Persist a completed turn to all providers.
-    // INERT-CODE-RATCHET: X31 DELETE: obsolete sync_all wrapper has only tests; active code uses the task-aware variant.
-    pub async fn sync_all(&mut self, user: &str, assistant: &str, metrics: &TurnMetrics) {
-        for p in &mut self.providers {
-            p.sync_turn(user, assistant, metrics).await;
-        }
-    }
-
     /// Persist submitted presentation text to every provider while allowing
     /// prompt-aware providers to compress against validated operator authority.
     pub async fn sync_all_with_active_task(
@@ -396,8 +388,8 @@ impl MemoryManager {
     }
 
     /// Drain the first pending compaction record from any provider — the
-    /// TUI's save site calls this after `sync_all` and persists the result
-    /// as a turn record (Step 18.5, #247).
+    /// TUI's save site calls this after `sync_all_with_active_task` and
+    /// persists the result as a turn record (Step 18.5, #247).
     pub fn take_compaction_record(&mut self) -> Option<String> {
         self.providers
             .iter_mut()
@@ -2491,9 +2483,11 @@ mod tests {
         assert!(mgr.take_compaction_record().is_none());
         let big = "x".repeat(200);
         for i in 0..5u32 {
-            mgr.sync_all(&big, &big, &metrics_with_input(10 + i)).await;
+            mgr.sync_all_with_active_task(&big, &big, &metrics_with_input(10 + i), &big)
+                .await;
         }
-        mgr.sync_all(&big, &big, &metrics_with_input(600)).await;
+        mgr.sync_all_with_active_task(&big, &big, &metrics_with_input(600), &big)
+            .await;
         let record = mgr
             .take_compaction_record()
             .expect("manager must surface the Summarizing provider's record");
@@ -3035,10 +3029,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_manager_sync_all() {
+    async fn memory_manager_sync_all_with_active_task() {
         let mut mgr = MemoryManager::new();
         mgr.add_provider(RollingWindow::new(5));
-        mgr.sync_all("q", "a", &dummy_metrics()).await;
+        mgr.sync_all_with_active_task("q", "a", &dummy_metrics(), "q")
+            .await;
         let usage = mgr.usage();
         assert_eq!(usage[0].1, 1); // 1 turn stored
     }
@@ -3047,7 +3042,7 @@ mod tests {
     async fn memory_manager_reset_all_clears_conversation_history() {
         let mut mgr = MemoryManager::new();
         mgr.add_provider(RollingWindow::new(5));
-        mgr.sync_all("old task", "old reply", &dummy_metrics())
+        mgr.sync_all_with_active_task("old task", "old reply", &dummy_metrics(), "old task")
             .await;
 
         let before = mgr.build_messages("system", "new task");
@@ -3066,7 +3061,7 @@ mod tests {
     async fn memory_manager_restore_turns_replaces_conversation_history() {
         let mut mgr = MemoryManager::new();
         mgr.add_provider(RollingWindow::new(5));
-        mgr.sync_all("old task", "old reply", &dummy_metrics())
+        mgr.sync_all_with_active_task("old task", "old reply", &dummy_metrics(), "old task")
             .await;
 
         mgr.restore_turns(&[

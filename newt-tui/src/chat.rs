@@ -8327,7 +8327,7 @@ fn session_body(
                                     &turn_phantom_reaches,
                                     usage,
                                     // 18.5: a compaction summary minted by the
-                                    // memory provider during sync_all persists as
+                                    // memory provider during sync_all_with_active_task persists as
                                     // its own turn record so restore can rehydrate
                                     // the prev-summary chain.
                                     compaction_record,
@@ -9925,7 +9925,7 @@ mod incomplete_turn_persistence_tests {
         assert_eq!(
             synced.len(),
             1,
-            "memory.sync_all must run on the cancel path too — it used to be Ok-only, \
+            "memory.sync_all_with_active_task must run on the cancel path too — it used to be Ok-only, \
              which lost the interrupted segment from resume context, not just forensics"
         );
         assert_eq!(synced[0].1, "partial streamed answer before the interrupt");

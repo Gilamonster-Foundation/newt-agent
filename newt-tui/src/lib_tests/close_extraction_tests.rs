@@ -15,10 +15,11 @@ async fn manager_with_turn(notes_path: &std::path::Path) -> newt_core::MemoryMan
     };
     memory.initialize_all(&ctx).await;
     memory
-        .sync_all(
+        .sync_all_with_active_task(
             "let's standardise on wiremock for HTTP tests",
             "agreed — wiremock it is",
             &newt_core::TurnMetrics::default(),
+            "let's standardise on wiremock for HTTP tests",
         )
         .await;
     memory

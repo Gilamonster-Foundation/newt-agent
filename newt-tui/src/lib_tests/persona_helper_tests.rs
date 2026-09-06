@@ -283,7 +283,12 @@ async fn handle_persona_command_show_and_clear() {
     let mut memory = newt_core::MemoryManager::new();
     memory.add_provider(newt_core::RollingWindow::new(5));
     memory
-        .sync_all("old task", "old reply", &newt_core::TurnMetrics::default())
+        .sync_all_with_active_task(
+            "old task",
+            "old reply",
+            &newt_core::TurnMetrics::default(),
+            "old task",
+        )
         .await;
     let mut active = Some(test_persona(
         "terse",
@@ -426,7 +431,12 @@ async fn persona_set_keep_context_preserves_history() {
     let mut memory = newt_core::MemoryManager::new();
     memory.add_provider(newt_core::RollingWindow::new(5));
     memory
-        .sync_all("old task", "old reply", &newt_core::TurnMetrics::default())
+        .sync_all_with_active_task(
+            "old task",
+            "old reply",
+            &newt_core::TurnMetrics::default(),
+            "old task",
+        )
         .await;
     let mut active: Option<Persona> = None;
     let mut system = rebuild_system_prompt(workspace, &memory, active.as_ref(), "test-session");
