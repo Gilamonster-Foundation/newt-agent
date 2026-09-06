@@ -1,6 +1,35 @@
 use super::*;
 
 #[test]
+fn clean_build_guidance_appends_one_exact_user_message_on_the_third_call() {
+    let original = serde_json::json!({"role": "user", "content": "build the project"});
+    let mut messages = vec![original.clone()];
+    let mut watch = crate::loop_watch::CleanBuildWatch::default();
+    let command = serde_json::json!({"command": "cargo clean && cargo check"});
+    for args in [serde_json::json!({}), serde_json::json!({"command": 42})] {
+        append_clean_build_warning(&mut messages, &mut watch, &args);
+    }
+    for _ in 0..2 {
+        append_clean_build_warning(&mut messages, &mut watch, &command);
+        assert_eq!(messages, vec![original.clone()]);
+    }
+    append_clean_build_warning(&mut messages, &mut watch, &command);
+    let expected = vec![
+        original,
+        serde_json::json!({
+            "role": "user",
+            "content": "[loop-guidance] This turn has repeatedly discarded build output and immediately \
+        rebuilt it. Your edits already invalidate the build fingerprint, so the \
+        clean step buys nothing and costs a full rebuild each time. Drop it and \
+        build directly.",
+        }),
+    ];
+    assert_eq!(messages, expected);
+    append_clean_build_warning(&mut messages, &mut watch, &command);
+    assert_eq!(messages, expected, "guidance is capped at once per turn");
+}
+
+#[test]
 fn loop_owned_tool_results_share_one_complete_spill_block() {
     let mut repeated = Vec::new();
     {

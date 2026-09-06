@@ -1465,6 +1465,25 @@ pub struct ChatCtx<'a> {
     pub steering: Option<&'a dyn SteeringInbox>,
 }
 
+/// #1948: observe completed calls and append at most one clean-build warning
+/// per turn. Keep this after repeat recording and before event timing.
+fn append_clean_build_warning(
+    messages: &mut Vec<serde_json::Value>,
+    clean_build: &mut crate::loop_watch::CleanBuildWatch,
+    args: &serde_json::Value,
+) {
+    if let Some(warning) = clean_build.observe(
+        args.get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+    ) {
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": format!("{} {warning}", compress::LOOP_GUIDANCE_PREFIX),
+        }));
+    }
+}
+
 /// Record a completed call only when the event sink is present. Keep elapsed
 /// sampling here, after backend bookkeeping and before phantom classification.
 fn record_completed_tool_event(
@@ -3917,19 +3936,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 round_progress = true;
             }
             repeat_calls.record(name, &args, ok, &result);
-            // #1948: a clean-then-build loop discards output its own
-            // edits already invalidated. Detection only — the call has
-            // already run, and this adds one guidance message per turn.
-            if let Some(warning) = clean_build.observe(
-                args.get("command")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
-            ) {
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": format!("{} {warning}", compress::LOOP_GUIDANCE_PREFIX),
-                }));
-            }
+            append_clean_build_warning(&mut messages, &mut clean_build, &args);
             if workflow_runtime.record_tool_result(&result) {
                 round_progress = true;
             }
@@ -7479,19 +7486,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 round_progress = true;
             }
             repeat_calls.record(name, &args, ok, &result);
-            // #1948: a clean-then-build loop discards output its own
-            // edits already invalidated. Detection only — the call has
-            // already run, and this adds one guidance message per turn.
-            if let Some(warning) = clean_build.observe(
-                args.get("command")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
-            ) {
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": format!("{} {warning}", compress::LOOP_GUIDANCE_PREFIX),
-                }));
-            }
+            append_clean_build_warning(&mut messages, &mut clean_build, &args);
             if workflow_runtime.record_tool_result(&result) {
                 round_progress = true;
             }
@@ -9335,19 +9330,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 round_progress = true;
             }
             repeat_calls.record(name, &args, ok, &result);
-            // #1948: a clean-then-build loop discards output its own
-            // edits already invalidated. Detection only — the call has
-            // already run, and this adds one guidance message per turn.
-            if let Some(warning) = clean_build.observe(
-                args.get("command")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
-            ) {
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": format!("{} {warning}", compress::LOOP_GUIDANCE_PREFIX),
-                }));
-            }
+            append_clean_build_warning(&mut messages, &mut clean_build, &args);
             if workflow_runtime.record_tool_result(&result) {
                 round_progress = true;
             }
@@ -10430,19 +10413,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             repeat_calls.record(name, &args, ok, &result);
-            // #1948: a clean-then-build loop discards output its own
-            // edits already invalidated. Detection only — the call has
-            // already run, and this adds one guidance message per turn.
-            if let Some(warning) = clean_build.observe(
-                args.get("command")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
-            ) {
-                input.push(serde_json::json!({
-                    "role": "user",
-                    "content": format!("{} {warning}", compress::LOOP_GUIDANCE_PREFIX),
-                }));
-            }
+            append_clean_build_warning(&mut input, &mut clean_build, &args);
             record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
             record_phantom_reach(
                 &mut phantom_reaches,
