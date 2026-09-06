@@ -70,6 +70,7 @@ pub struct CoderRun {
     /// NOTE: when the whole-file re-prompt fallback fires this becomes a
     /// composite first+retry transcript — use [`Self::first_emission`]
     /// when you need just the model's initial output.
+    // INERT-CODE-RATCHET: F01 DELETE: raw_reply is written but never read; first_emission is the live audit value.
     pub raw_reply: String,
     /// The model's *first* raw emission, before any re-prompt fallback.
     /// Always the initial reply (never a composite), so the eval

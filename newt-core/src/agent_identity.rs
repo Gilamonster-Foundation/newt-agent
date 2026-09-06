@@ -346,6 +346,7 @@ pub fn default_operator() -> Option<String> {
 /// companion to [`default_operator`]; the session loop (the caller) resolves
 /// it once and threads it into [`crate::attribution::CommitAttribution`],
 /// keeping the typed value's own constructor tool-less.
+// INERT-CODE-RATCHET: X09 DELETE: legacy operator-email wrapper has no caller; matched-pair identity resolution is live.
 pub fn default_operator_email() -> Option<String> {
     let from_git = std::process::Command::new("git")
         .args(["config", "--get", "user.email"])

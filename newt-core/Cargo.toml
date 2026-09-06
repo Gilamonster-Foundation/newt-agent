@@ -10,6 +10,7 @@ version.workspace = true
 exclude = [
     "tests/markup_sprawl_ratchet.rs",
     "tests/first_principle.rs",
+    "tests/inert_code_ratchet.rs",
     "tests/common",
 ]
 edition.workspace = true

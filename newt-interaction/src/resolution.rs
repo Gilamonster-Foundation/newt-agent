@@ -136,6 +136,7 @@ pub trait ResolutionStore {
 
 /// The key as a string, for a conflict message.
 #[must_use]
+// INERT-CODE-RATCHET: X17 DELETE: idempotency key display helper has zero consumers and adds no semantics.
 pub fn key_display(key: &IdempotencyKey) -> String {
     key.as_str().to_string()
 }

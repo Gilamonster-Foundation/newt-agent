@@ -66,6 +66,7 @@ impl FromStr for SessionId {
 /// Which logical stream an [`OutputChunk`] belongs to (a terminal styles each
 /// distinctly — stdout vs. the agent's thoughts vs. a tool call vs. a diff).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// INERT-CODE-RATCHET: X03 DELETE: multi-attach session island has no production consumer; SessionId stays live.
 pub enum OutputStream {
     Stdout,
     Stderr,

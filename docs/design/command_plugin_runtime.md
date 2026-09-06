@@ -1,6 +1,7 @@
 # Design: the command-plugin runtime (`~/.newt/commands/<name>/`)
 
 **Status:** Design / proposed (Shawn Hartsock, 2026-06-21)
+<!-- INERT-CODE-RATCHET: S04 DOCUMENT: three documents describe nonexistent forge resolver code as shipped or current. -->
 **Related:** `docs/design/transparent_command_layer.md` (the parse·route·govern
 model this realizes), `docs/decisions/structural_parsing_over_regex.md` (AST not
 regex at boundaries), `docs/decisions/ocap_confinement_model.md` (confined

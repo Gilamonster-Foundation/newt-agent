@@ -3789,6 +3789,7 @@ pub async fn execute_tool_with_offload(
 /// source-compatible for embedders; only loops carrying a verified active
 /// prompt need this extended seam.
 #[allow(clippy::too_many_arguments)]
+// INERT-CODE-RATCHET: X12 DELETE: offload-and-prompt wrapper is only reexported; collaborator dispatch is live.
 pub async fn execute_tool_with_offload_and_prompt(
     name: &str,
     args: &serde_json::Value,

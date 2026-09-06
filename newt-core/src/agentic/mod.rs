@@ -254,6 +254,7 @@ pub use semantic::{
 /// and gated on the optional `markdown-table-formatter` feature: identity unless
 /// enabled, so it never pulls comrak/wasm-bindgen into a default build.
 #[cfg(feature = "markdown-table-formatter")]
+// INERT-CODE-RATCHET: X26 DELETE: markdown table tidy function has only test and documentation consumers.
 pub fn tidy_markdown_tables(src: &str) -> String {
     markdown_table_formatter::format_tables(src)
 }
@@ -8090,6 +8091,7 @@ async fn final_summary_anthropic(
 ///
 /// Streaming is native and ON by default (SSE, printed token-by-token); the
 /// `NEWT_ANTHROPIC_STREAM=off` env valve selects the non-streaming mode.
+// INERT-CODE-RATCHET: X10 DELETE: public Anthropic wrappers have no entry caller; the private implementation is live.
 pub async fn anthropic_chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,

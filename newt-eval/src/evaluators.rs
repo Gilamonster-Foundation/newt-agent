@@ -571,6 +571,7 @@ pub trait CommandRunner: Send + Sync {
 /// Placeholder runner registered until the real subprocess runner (epic step 3)
 /// is wired. It runs nothing and says so honestly. `output_matches` is opt-in
 /// (never in [`default_evaluators`]), so no existing case is affected.
+// INERT-CODE-RATCHET: X32 DELETE: placeholder evaluator runner remains after the real subprocess runner shipped.
 pub struct PendingRunner;
 
 impl CommandRunner for PendingRunner {

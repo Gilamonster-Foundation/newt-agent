@@ -251,6 +251,7 @@ pub fn load_packs_from_dir(dir: &Path) -> Vec<LanguagePack> {
 /// need the complete extension set. Repository evidence tools should prefer
 /// [`source_extensions_for`] so they can also honor language names and aliases.
 #[must_use]
+// INERT-CODE-RATCHET: X07 DELETE: obsolete code-file projection helpers have zero consumers.
 pub fn code_file_extensions(packs: &[LanguagePack]) -> Vec<String> {
     let mut exts: Vec<String> = packs
         .iter()
@@ -657,6 +658,7 @@ impl MemoryProvider for ApiSurfaceProvider {
         Vec::new()
     }
 
+    // System-prompt-only provider; history is managed elsewhere.
     async fn sync_turn(&mut self, _user: &str, _assistant: &str, _metrics: &TurnMetrics) {}
 }
 

@@ -1,6 +1,7 @@
 # Decision: parse untrusted input with a real parser (AST), not a regex
 
 **Status:** Accepted (decided by Shawn Hartsock, 2026-06-21)
+<!-- INERT-CODE-RATCHET: S04 DOCUMENT: three documents describe nonexistent forge resolver code as shipped or current. -->
 **Date:** 2026-06-21
 **Related:** `docs/decisions/agentic_object_capability_security.md` (the OCAP
 leash this protects), `docs/decisions/ocap_confinement_model.md` (the honest

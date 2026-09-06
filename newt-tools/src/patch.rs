@@ -18,6 +18,7 @@ struct FilePatch {
 struct Hunk {
     old_start: usize,
     #[allow(dead_code)]
+    // INERT-CODE-RATCHET: F13 DELETE: diff hunk header counts are stored behind dead-code allows but never read.
     old_count: usize,
     #[allow(dead_code)]
     new_start: usize,

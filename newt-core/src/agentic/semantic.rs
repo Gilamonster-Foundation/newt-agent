@@ -367,6 +367,7 @@ pub(crate) fn build_code_evidence_block(
 
 /// Render the `<code_evidence>` block with the default budget cap (Step 26.5) —
 /// the TUI-facing entry called per turn. `None` when retrieval finds nothing.
+// INERT-CODE-RATCHET: X11 DELETE: code-evidence wrapper is only reexported; ranked retrieval is the live path.
 pub fn code_evidence_block(
     index: &dyn SemanticIndex,
     query: &[f32],

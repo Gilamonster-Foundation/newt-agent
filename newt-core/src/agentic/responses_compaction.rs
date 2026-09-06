@@ -370,6 +370,7 @@ pub(super) fn compaction_to_responses(messages: &[CompactionMessage]) -> Vec<Val
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PostBridgeBudgetExceeded {
     pub(super) actionable_budget: usize,
+    // INERT-CODE-RATCHET: F03 DELETE: stored pre-bridge estimate is unread after framing overhead is computed.
     pub(super) pre_bridge_estimate: usize,
     pub(super) post_bridge_estimate: usize,
     pub(super) framing_overhead: usize,

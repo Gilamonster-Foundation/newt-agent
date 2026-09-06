@@ -9,6 +9,7 @@ use crate::backend::ChatReply;
 
 /// A single chunk from a streaming inference response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// INERT-CODE-RATCHET: X01 DELETE: exported streaming island has no production consumer.
 pub struct ChatChunk {
     /// The incremental text content of this chunk.
     pub delta: String,

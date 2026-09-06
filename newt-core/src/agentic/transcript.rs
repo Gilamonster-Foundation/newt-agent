@@ -37,6 +37,7 @@ use crate::{MemMessage, Role};
 /// (color, alignment, gutter) on this. Mirrors the subset of [`Role`] a chat
 /// pane shows; system / tool turns are folded away by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// INERT-CODE-RATCHET: X20 DELETE: transcript rendering island has only test, documentation, and reexport consumers.
 pub enum TranscriptRole {
     /// A human turn.
     User,

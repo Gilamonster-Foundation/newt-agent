@@ -117,6 +117,7 @@ def prose_lines(text: str) -> list[str]:
     return out
 
 
+# INERT-CODE-RATCHET: S02 WIRE: documentation checker scans root and docs only, omitting tracked script reports.
 def markdown_files() -> list[Path]:
     """Repository-root markdown plus everything under `docs/`."""
     roots = sorted(p for p in REPO.glob("*.md") if p.is_file())

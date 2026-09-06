@@ -1466,6 +1466,7 @@ fn import_process_failpoint(step: &str) {
 }
 
 #[cfg(not(debug_assertions))]
+// Release builds deliberately compile out the debug-only import failpoint.
 fn import_process_failpoint(_step: &str) {}
 
 fn atomic_import_commit(

@@ -150,6 +150,7 @@ impl PoolBackend {
     /// supported (or it serves any), AND — if a model is pinned — it has that model.
     #[must_use]
     pub fn serves(&self, tier: Tier, model_pin: Option<&str>) -> bool {
+        // INERT-CODE-RATCHET: F15 WIRE: empty backend tiers are the default and match every requested tier.
         let tier_ok = self.tiers.is_empty() || self.tiers.contains(&tier);
         let model_ok = model_pin.is_none_or(|m| self.models.iter().any(|x| x == m));
         tier_ok && model_ok
@@ -179,6 +180,7 @@ impl From<&BackendConfig> for PoolBackend {
 
 /// How to dispatch, given how many LIVE backends can serve the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// INERT-CODE-RATCHET: X04 WIRE: dispatch strategy has no production consumer and FanOut measures candidates, not slots.
 pub enum DispatchStrategy {
     /// Nothing live can serve it — fail closed (do not silently pick a wrong model).
     Refuse,

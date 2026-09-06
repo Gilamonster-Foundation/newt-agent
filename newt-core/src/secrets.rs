@@ -660,6 +660,7 @@ pub fn resolve_token_file(path: &Path) -> Result<Option<String>, SecretsError> {
 
 /// TUI preflight: does `path` need a passphrase that is not yet available
 /// (cache, session, or env)? Never prompts, never hangs.
+// INERT-CODE-RATCHET: X25 WIRE: secret passphrase preflight and retry helpers are tested but absent from the TUI path.
 pub fn needs_passphrase(path: &Path) -> bool {
     if session().cached(path).is_some() || session().has_passphrase() {
         return false;
