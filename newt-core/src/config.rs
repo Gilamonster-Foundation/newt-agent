@@ -38,8 +38,7 @@ pub use layering::{ArrayMergeStrategy, MergeConfig};
 pub use newt_tuner::ModelTuning;
 pub use presentation::{
     markdown_is_session_pinned, session_markdown_mode, session_spill_lines,
-    set_session_spill_lines, ChatStyle, ColorMode, EditMode, FooterMode, MarkdownMode,
-    ThinkingMode,
+    set_session_spill_lines, ColorMode, EditMode, FooterMode, MarkdownMode, ThinkingMode,
 };
 pub use tool_exposure::{ExposureProfile, ToolExposureConfig};
 pub use tools::ToolsConfig;
@@ -946,10 +945,6 @@ impl Default for AgentsConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TuiConfig {
-    /// Whether to show "newt" / "you" labels before the carets.
-    // INERT-CODE-RATCHET: F05 WIRE: chat_style is parsed and defaulted but never changes TUI rendering.
-    pub chat_style: ChatStyle,
-
     /// PS1-style prompt template.
     ///
     /// Tokens: `\w` workspace basename, `\W` full path, `\h` hostname,
@@ -1960,7 +1955,6 @@ impl ToolPermissions {
 impl Default for TuiConfig {
     fn default() -> Self {
         Self {
-            chat_style: ChatStyle::Compact,
             prompt: None,
             no_splash: false,
             mouse_viewport: false,

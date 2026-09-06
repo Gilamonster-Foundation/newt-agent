@@ -312,30 +312,3 @@ impl EditMode {
         }
     }
 }
-
-/// Chat REPL display density.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ChatStyle {
-    /// Just the caret symbol — no "newt" / "you" labels.
-    #[default]
-    Compact,
-    /// Full "newt ▸" / "you $" labels before each message.
-    Verbose,
-}
-
-impl ChatStyle {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Compact => "compact",
-            Self::Verbose => "verbose",
-        }
-    }
-
-    pub fn toggle(&self) -> Self {
-        match self {
-            Self::Compact => Self::Verbose,
-            Self::Verbose => Self::Compact,
-        }
-    }
-}
