@@ -508,7 +508,8 @@ suites; ≥80% coverage floor (`just cov-ci`).
    trustworthy under `#319`.
 3. **Compression preserves signatures (the `#319` probe, extended).** Take the
    existing regression guard
-   (`compress.rs::tests::summarized_file_reads_get_a_reread_breadcrumb`, which
+   (`summarized_file_reads_get_a_reread_breadcrumb` in
+   `newt-core/src/agentic/compress_tests/retained_context.rs`, which
    today asserts `api_signature_survived=false` pre-fix and that the breadcrumb
    names the file) and add a sibling test asserting that **with the symbol
    provider wired, the verbatim `connect()` signature *does* survive** the same

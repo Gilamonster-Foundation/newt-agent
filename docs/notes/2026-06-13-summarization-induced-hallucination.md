@@ -155,7 +155,8 @@ Three corollaries that generalize past this codebase:
 
 This is not a flaky, model-dependent observation. The failure lives in the
 compression code and reproduces with no model at all
-(`compress.rs::tests::summarized_file_reads_get_a_reread_breadcrumb`): build a
+(`summarized_file_reads_get_a_reread_breadcrumb` in
+`newt-core/src/agentic/compress_tests/retained_context.rs`): build a
 message list where `src/api.rs` is read at round 2 and used after eight more
 rounds, run the real `compress()` with a stub summarizer that returns prose
 (as a real summarizer would), and assert on the assembled output. On the
@@ -248,4 +249,5 @@ labelled gaps* — is, we think, the genuinely transferable finding.
   (`docs/testing/results/context-baseline-f0f4f6e.md`).
 - Pipeline: `newt-core/src/agentic/compress.rs` (`compute_boundary`,
   `reread_breadcrumb`, `summary_message`).
-- Regression guard: `compress.rs::tests::summarized_file_reads_get_a_reread_breadcrumb`.
+- Regression guard: `summarized_file_reads_get_a_reread_breadcrumb` in
+  `newt-core/src/agentic/compress_tests/retained_context.rs`.

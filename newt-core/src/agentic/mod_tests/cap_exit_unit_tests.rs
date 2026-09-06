@@ -310,7 +310,7 @@ fn no_model_ingress_funnel_leaks_a_registered_session_secret() {
     // explicit `disclosure` param is `None` (the TLS is the uniform backstop).
     // Covers the tool-result chokepoint AND the summary path here; the
     // memory/observation/compaction/spill funnel (`redact_secrets`) is proven
-    // by `compress::tests::redact_secrets_value_filters_a_registered_session_secret`.
+    // by `compress::redaction_tests::redact_secrets_value_filters_a_registered_session_secret`.
     let canary = "NEWT-CANARY-e2e-7f3a9c2b1d";
     let mut f = crate::ocap::DisclosureFilter::new();
     f.register(canary);

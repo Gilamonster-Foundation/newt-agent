@@ -36,7 +36,7 @@ upstream authority laws this spec cites rather than restates).
 | **Cut / CutSet** | a declared omission carrying a class from the profile registry (§8). The CutSet is the **retained list of `(path, class)` pairs** the manifest names but extraction skipped — known by path and class, never by the symbols inside | the three silent truncation stages (api_surface.rs:308, 325-329; semantic.rs:498-499) made loud |
 | **Verdict (lookup)** | `Found \| NotGathered \| NoSuchSymbol` — total, exclusive, exhaustive under the **conservative rule** (SC-L5): `NoSuchSymbol` is assertable only on a cut-free snapshot | `SymbolIndex::classify` semantics (newt-core/src/symbols.rs:153-254), reformulated conservative |
 | **Lens / focus** | a re-render of the same index at the same budget with rich detail on one crate, one-liners elsewhere | `render(focus: Option<CrateId>)` |
-| **Frozen head** | the compaction-immune leading system messages; the surface block's residence. Mid-session block swaps require an explicit `MemoryProvider` contract amendment (§5.4) — the shipped contract freezes the block at session start (memory.rs:114-121) | `head_len` (compress.rs:998-1010); guarded by `knowledge_base_stable_base_survives_compression` (compress.rs:3018-3044) |
+| **Frozen head** | the compaction-immune leading system messages; the surface block's residence. Mid-session block swaps require an explicit `MemoryProvider` contract amendment (§5.4) — the shipped contract freezes the block at session start (memory.rs:114-121) | `head_len` (compress.rs:998-1010); guarded by `knowledge_base_stable_base_survives_compression` (`newt-core/src/agentic/compress_tests/retained_context.rs`) |
 | **Kernel crate** | the dedicated leaf crate (working name `newt-nav-kernel`) housing the pure kernels — `resolve_budget`, the merge fold, `select`/`render`, `classify`, `attenuate` — with an allowlisted dependency set (WF-2). Charon translates at crate granularity; this carve-out is the extraction precondition, not hygiene | §6.1 structural precondition |
 | **Layer** | a #1219 drop-in data file; artifacts resolve by merge-by-name fold | `merge_packs` (api_surface.rs:176-193), `load_packs_from_dir` (api_surface.rs:148-169) |
 | **Chain** | knob resolution: operator > model card > family > global default | #1218; #852 cards |
@@ -485,9 +485,9 @@ generation-indexed transcript `List Msg` with `head_len`
 `count_surface_blocks(swap_g(t, x)) = 1`; and `compress` is the identity on
 `[0, head_len)` — which **restates in the model what the shipped regression
 test** `knowledge_base_stable_base_survives_compression`
-(compress.rs:3018-3044) **checks executably**. The test remains normative and
-load-bearing (§6.2); the Lean model documents the invariant, it does not
-replace its enforcement.
+(`newt-core/src/agentic/compress_tests/retained_context.rs`) **checks executably**.
+The test remains normative and load-bearing (§6.2); the Lean model documents
+the invariant, it does not replace its enforcement.
 
 ### SC-L7 — Knowledge crosses the crew seam attenuated
 
@@ -762,7 +762,8 @@ mirror each PO executably.
   "unverifiable: snapshot superseded"
 - a CI map-lint that greps every rendered symbol back to its witness file
   over newt-agent itself
-- `knowledge_base_stable_base_survives_compression` (compress.rs:3018-3044)
+- `knowledge_base_stable_base_survives_compression`
+  (`newt-core/src/agentic/compress_tests/retained_context.rs`)
   remains **normative and load-bearing** as an SC-L4/SC-L6 conformance check,
   extended with a focused block and a map-line survival assertion
 
@@ -845,9 +846,11 @@ bench arm without a law.
   declared), the ceremony-L2 precedent of multiple directions in one law.
 - **Executed:** "head residency" refused as a standalone law — compaction
   identity on the head is shipped, regression-tested mechanism
-  (compress.rs:3018-3044); the genuinely new obligations (in-place swap,
-  exactly-one-block, tail-never, byte round-trip) were absorbed as
-  **SC-L6·(v)**, where the plain-Lean transcript model naturally lives.
+  (`knowledge_base_stable_base_survives_compression` in
+  `newt-core/src/agentic/compress_tests/retained_context.rs`); the genuinely new
+  obligations (in-place swap, exactly-one-block, tail-never, byte round-trip)
+  were absorbed as **SC-L6·(v)**, where the plain-Lean transcript model
+  naturally lives.
 - **Executed:** name-shaped queries demoted to **WF-1**; library/consumer
   split demoted to **WF-2** (dep predicates); counted-claim honesty demoted
   to **WF-4** (render-input predicate; #1214 does the refutation).

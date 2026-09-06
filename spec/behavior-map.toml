@@ -314,8 +314,8 @@ tla = "none"
 trace = "none"
 conformance = "partial"
 [[BHV-REPLAY-001.refs.rust_tests]]
-path = "newt-core/src/agentic/compress.rs"
-symbol = "tests::never_scope_protects_no_reasoning_tail"
+path = "newt-core/src/agentic/compress_tests/tool_groups.rs"
+symbol = "never_scope_protects_no_reasoning_tail"
 [[BHV-REPLAY-001.refs.production]]
 path = "newt-core/src/agentic/compress.rs"
 symbol = "protected_reasoning_tail_len"

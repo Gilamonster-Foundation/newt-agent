@@ -16,7 +16,7 @@
 //! summary has less it must preserve, and an import detail can't be lost to
 //! compression. This is the "inject the authoritative import surface as a stable
 //! base so there's less to summarize" half of the summarizer-effectiveness suite,
-//! verified by `compress::tests::knowledge_base_stable_base_survives_compression`.
+//! verified by `compress::retained_context_tests::knowledge_base_stable_base_survives_compression`.
 
 use async_trait::async_trait;
 use std::path::Path;
