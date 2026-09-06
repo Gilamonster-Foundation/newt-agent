@@ -418,7 +418,14 @@ const CATEGORIES: &[Category] = &[
             // The typed step (`ask_definition` / `InteractionDefinition`) is
             // still owed on all five, and is the reason they are armed here
             // rather than allowed to disappear.
-            ("newt-tui/src/lib.rs", 1),
+            // REPOINTED, not lowered: this site is the Codex-compat
+            // "OPENAI env detected: use it?" prompt, which moved from
+            // `lib.rs` to `newt-tui/src/codex_env.rs` with the rest of that
+            // family. Nothing was consolidated and the count is still 1 --
+            // the note above already warns that this table cannot tell a
+            // move from a deletion, and the failure text invites removing
+            // the row ("Progress!"), which here would be a false payment.
+            ("newt-tui/src/codex_env.rs", 1),
             // F0a (#1922) took all EIGHT `newt-cli` rows to zero — `dock_cmd`
             // (3), `dgx` (2), `ocap_cmd`, `dgx_card`, `mcp_probe_cmd`. #1911
             // had routed five of them through the seal and left them counted
