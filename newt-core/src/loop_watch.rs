@@ -416,14 +416,31 @@ mod loop_watch_tests {
         );
         let guards = src.matches("RepeatCallGuard::default()").count();
         let watches = src.matches("CleanBuildWatch::default()").count();
-        let observes = src.matches("clean_build.observe(").count();
         assert_eq!(
             watches, guards,
             "{guards} loops construct RepeatCallGuard but {watches} construct CleanBuildWatch"
         );
+        for (index, tail) in src.split("RepeatCallGuard::default()").skip(1).enumerate() {
+            let (loop_tail, _) = tail.split_once("\n}").expect("guarded loop has no end");
+            assert_eq!(
+                loop_tail.matches("append_clean_build_warning(").count(),
+                1,
+                "guarded loop {index} must observe each completed command exactly once"
+            );
+        }
+        let (_, helper) = src
+            .split_once("fn append_clean_build_warning(")
+            .expect("the shared clean-build observer is missing");
+        let (helper, _) = helper.split_once("\n}").expect("observer has no end");
         assert_eq!(
-            observes, guards,
-            "{guards} loops guard repeats but only {observes} observe the command"
+            helper.matches("clean_build.observe(").count(),
+            1,
+            "the shared helper must observe the command exactly once"
+        );
+        assert_eq!(
+            src.matches("clean_build.observe(").count(),
+            1,
+            "clean-build observation must have one shared owner"
         );
     }
 
