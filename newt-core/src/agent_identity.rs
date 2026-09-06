@@ -338,31 +338,6 @@ pub fn default_operator() -> Option<String> {
         .or_else(|| std::env::var("USER").ok().filter(|s| !s.is_empty()))
 }
 
-/// Derive the operator EMAIL from the host git identity when no configured
-/// source exists: `git config user.email`, then the `GIT_AUTHOR_EMAIL` env
-/// var. Returns `None` when no real email source resolves — NEVER invented
-/// (the operator-attribution contract: emit a `Co-authored-by:` for the
-/// operator only when a REAL email is known). This is the operator-email
-/// companion to [`default_operator`]; the session loop (the caller) resolves
-/// it once and threads it into [`crate::attribution::CommitAttribution`],
-/// keeping the typed value's own constructor tool-less.
-// INERT-CODE-RATCHET: X09 DELETE: legacy operator-email wrapper has no caller; matched-pair identity resolution is live.
-pub fn default_operator_email() -> Option<String> {
-    let from_git = std::process::Command::new("git")
-        .args(["config", "--get", "user.email"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    from_git.or_else(|| {
-        std::env::var("GIT_AUTHOR_EMAIL")
-            .ok()
-            .filter(|s| !s.is_empty())
-    })
-}
-
 /// Read a single `git config` value (`user.name` / `user.email`). Returns
 /// `None` when git is absent, the key is unset, or the value is empty — never
 /// invents. This is the matched-pair reader for [`host_operator_identity`]:

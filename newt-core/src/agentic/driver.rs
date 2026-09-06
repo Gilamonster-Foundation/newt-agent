@@ -61,7 +61,7 @@ use super::{
     chat_complete, ChatCtx, CodeSearch, CrewRunner, Embedder, NoMcp, PromptDisposition,
     SemanticIndex,
 };
-use crate::{BackendKind, CompactionTriggerPolicy, MemMessage, Role, TokenUsage};
+use crate::{BackendKind, CompactionTriggerPolicy, MemMessage, TokenUsage};
 
 /// Owned, cloneable retrieval handle for the headless driver — the `'static`
 /// counterpart of the borrow-heavy [`CodeSearch`] `ChatCtx` field (#1280). A
@@ -733,17 +733,12 @@ pub enum TurnDriverError {
     Busy,
 }
 
-/// Roles whose messages a transcript renderer typically shows to the human. The
-/// driver exposes it so a consumer's render can filter on the same set the
-/// newt-tui render uses (system + tool turns are usually hidden).
-// INERT-CODE-RATCHET: X13 DELETE: transcript role constant is reexported but no renderer reads it.
-pub const VISIBLE_TRANSCRIPT_ROLES: [Role; 2] = [Role::User, Role::Assistant];
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agentic::SessionSemanticIndex;
     use crate::caveats::{Caveats, CountBound, Scope};
+    use crate::Role;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
