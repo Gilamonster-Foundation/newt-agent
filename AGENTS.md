@@ -185,6 +185,38 @@ Rules:
   matching address from the table above. Reading these rules and hand-writing
   a newt-style trailer signs newt's account for work newt did not do.
 
+### What must never leave the machine
+
+Attribution is welcome. **Agent-session plumbing and private data are not.**
+The two are easy to confuse because a harness often offers them together in
+the same block, so the line is drawn here explicitly.
+
+**Never** put any of the following in a commit message, a PR title or body, an
+issue, a code comment, a released artifact, or any other text that leaves this
+machine:
+
+- **A harness session URL or id** — a `Claude-Session:` trailer, any
+  `https://claude.ai/code/session_…` link, or the equivalent from any other
+  harness. It is session plumbing, not repository provenance, and **this repo
+  is public**: once pushed it is cloned, forked and cached forever.
+- **Absolute local paths** that carry a username or machine layout
+  (`/Users/<name>/…`, `/home/<name>/…`). Use a repo-relative path.
+- **Host, network or infrastructure detail** — internal hostnames, LAN
+  addresses, private domains, runner names, tokens, or credentials of any
+  kind, including in a pasted error message or log excerpt.
+- **Anything proprietary or employer-internal.** Default to assuming this
+  repository is public, because it is.
+
+`Co-authored-by:` lines are the whole of what attribution needs here. If a
+harness hands you a block containing both, **keep the `Co-authored-by:` lines
+and drop the rest** — do not paste the block whole.
+
+The `.githooks/commit-msg` hook blocks the session-link case mechanically
+(installed by `just install-hooks` via `core.hooksPath`), and the
+`commit-messages` job in CI is the copy `--no-verify` cannot skip. **The hook
+is a backstop, not the rule** — it matches two known patterns and cannot see
+a leaked hostname or an absolute path.
+
 ## Coverage floor
 
 Ratchets up, never down. Bootstrap is 15% (current scaffold). Target
