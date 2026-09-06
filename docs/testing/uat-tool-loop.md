@@ -139,7 +139,7 @@ honest caveats), and note the model + endpoint + commit.
   observe 27.3/27.5 *live* you need a model weak enough to actually loop (the
   one from the original forensic session); the **deterministic** guarantee is the
   mocked `uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit` test
-  (`tool_round_cap_tests`), which scripts exactly that thrash. Use the live S6/S7
+  (`tool_round_cap_tests::cap_exit`), which scripts exactly that thrash. Use the live S6/S7
   runs to confirm a strong model *doesn't* loop, and the mock to confirm the
   guard *catches* one that does.
 - **Model-workflow / judgment gaps are often promptable, not harness bugs.**

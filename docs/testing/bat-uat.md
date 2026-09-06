@@ -27,8 +27,9 @@ externals) on every PR, and against **real test LLMs** on a schedule.
   `cargo test -p newt-eval --test mock_e2e`. Authoring: `newt-eval/cases/CASE_AUTHORING.md`.
 - **Agentic-loop acceptance** — wiremock-scripted scenarios that replay
   real-world loop behavior against a *simulated* model, in
-  `newt-core/src/agentic/mod.rs` (`tool_round_cap_tests`). Example: the Phase 27
-  `uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit` test scripts a model
+  `newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs`. Example: the Phase 27
+  `uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit` test in
+  `newt-core/src/agentic/mod_tests/tool_round_cap/cap_exit.rs` scripts a model
   that thrashes (a distinct failing tool call every round + a failing summary)
   and asserts the cap-exit is honest. These are the durable regression guard for
   the loop hardening and gate every PR.

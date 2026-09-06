@@ -11,7 +11,7 @@
 #                  plan ledger use (27.4), honest cap-exit (27.5).
 #
 # This is the LIVE counterpart to the mocked `tool_round_cap_tests`
-# (newt-core/src/agentic/mod.rs) and complements the golden-diff `newt-eval`
+# (newt-core/src/agentic/mod_tests/tool_round_cap_tests.rs) and complements the golden-diff `newt-eval`
 # cases — those assert diff correctness; this asserts loop BEHAVIOR end-to-end.
 #
 # GOTCHA (do not "fix"): NEVER `pkill -f <proxy-or-newt-name>` here — the pattern
