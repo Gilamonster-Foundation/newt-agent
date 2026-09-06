@@ -6,6 +6,7 @@
 //! This is the **local** impl of the universal `CrewRunner` primitive; a
 //! `MeshCrewRunner` (wyvern-agent#42) is the remote sibling, and a wyvern resident
 //! is the server side — same `(op, args, caveats) → rendered result` contract.
+//! INERT-CODE-RATCHET: S05 DOCUMENT: crew runner names a remote MeshCrewRunner type that does not exist.
 //!
 //! The inversion (newt-cli owns newt-scheduler + the worktree; newt-tui stays
 //! scheduler-free): the binary builds this and passes `&dyn CrewRunner` down into

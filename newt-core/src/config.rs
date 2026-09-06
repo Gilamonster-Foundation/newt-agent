@@ -604,6 +604,7 @@ pub struct LogConfig {
     /// Requires a `recorded_at` field in the log entry; entries without it
     /// are kept.
     #[serde(default)]
+    // INERT-CODE-RATCHET: F04 WIRE: max_age_days is parsed and defaulted but no retention decision reads it.
     pub max_age_days: u64,
 
     /// How many rotated copies to keep alongside the live log
@@ -1729,6 +1730,7 @@ impl Default for AgentsConfig {
 #[serde(default)]
 pub struct TuiConfig {
     /// Whether to show "newt" / "you" labels before the carets.
+    // INERT-CODE-RATCHET: F05 WIRE: chat_style is parsed and defaulted but never changes TUI rendering.
     pub chat_style: ChatStyle,
 
     /// PS1-style prompt template.
@@ -1996,6 +1998,7 @@ pub struct TuiConfig {
     /// `run_command`. Default `true`. The model never sees these; this governs
     /// only the human at the keyboard.
     #[serde(default = "default_allow_shell_commands")]
+    // INERT-CODE-RATCHET: F06 WIRE: shell admission and mutation knobs are parsed but neither shell path consults them.
     pub allow_shell_commands: bool,
     /// Whether the `tui-shell-commands` suite may MUTATE the filesystem
     /// (`mkdir`/`mv`, and `rm` via a recoverable graveyard). Default `false` —
@@ -2216,6 +2219,7 @@ impl Config {
 pub struct BundleConfig {
     /// One-line provenance, shown in the startup banner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    // INERT-CODE-RATCHET: F07 WIRE: bundle about text is parsed but never reaches the promised startup banner.
     pub about: Option<String>,
     /// Model-id prefixes this bundle auto-applies to (longest-prefix-wins). Empty ⇒
     /// a use-case bundle: chosen only via explicit `--bundle`, never auto-inferred.
@@ -3136,6 +3140,7 @@ pub struct BackendConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_path: Option<String>,
     #[serde(default)]
+    // INERT-CODE-RATCHET: F15 WIRE: empty backend tiers are the default and match every requested tier.
     pub tiers: Vec<Tier>,
     /// Which wire protocol this backend speaks. OPTIONAL (#backend-kind-probe):
     /// unset means "probe at connect" via [`crate::backend_probe::detect_endpoint`]

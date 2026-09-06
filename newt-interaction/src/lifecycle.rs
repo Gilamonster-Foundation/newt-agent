@@ -246,6 +246,7 @@ pub fn publish(
 /// Exposed so a host can mint a correct offer rather than discovering the
 /// mismatch at publication.
 #[must_use]
+// INERT-CODE-RATCHET: X16 DELETE: publishable-revision helper has zero consumers and only exposes an existing field.
 pub fn publishable_revision(definition: &InteractionDefinition) -> Revision {
     definition.revision
 }

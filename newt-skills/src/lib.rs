@@ -542,6 +542,7 @@ fn bundled_files_in(fs: &dyn SkillFs, dir: &Path) -> Vec<PathBuf> {
 /// Discover skills from the host-scoped default directory (`~/.newt/skills`).
 /// Returns an empty list when `$HOME` is unset or the directory is absent.
 #[must_use]
+// INERT-CODE-RATCHET: X14 DELETE: default skill wrappers have zero callers and search-path variants supersede them.
 pub fn discover_default() -> Vec<Skill> {
     match default_skills_dir() {
         Some(dir) => discover(dir),

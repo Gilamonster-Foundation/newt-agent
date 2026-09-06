@@ -1467,6 +1467,7 @@ pub struct Adoption {
     /// instead of forcing its pinned/first model to load — the cooperative path
     /// that avoids swapping a model another agent may be using. Always false for
     /// unmanaged / `Dedicated` backends and for instance serving.
+    // INERT-CODE-RATCHET: F11 WIRE: adoption computes warm-model and pin-conflict facts that the UI never reads.
     pub adopted_warm: bool,
     /// `Some(pinned)` when adopt-warm took the cooperative default (`model` = the
     /// warm model) but a DIFFERENT model was pinned/configured — the pinned model

@@ -51,6 +51,7 @@ use std::collections::{HashMap, HashSet};
 
 /// Default n-gram width. Wide enough that ordinary shared phrasing ("of the", "and then
 /// he") cannot register as novel; narrow enough to catch a fabricated sentence.
+// INERT-CODE-RATCHET: X19 DELETE: grounding API is a closed tested island with no production entry point.
 pub const DEFAULT_NGRAM: usize = 5;
 
 /// A quoted span shorter than this carries no evidence either way, and scoring it would

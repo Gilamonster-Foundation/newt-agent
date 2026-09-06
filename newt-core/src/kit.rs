@@ -12,6 +12,7 @@
 
 /// Where a component mounts in the harness loop — tells a driver how to run it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// INERT-CODE-RATCHET: X05 DELETE: registry taxonomy variants have no production construction or match.
 pub enum MountKind {
     /// A system-prompt provider, mounted pre-loop (the `MemoryProvider` seam).
     Provider,

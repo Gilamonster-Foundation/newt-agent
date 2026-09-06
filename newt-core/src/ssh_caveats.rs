@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 /// **keys** it may use/accept. Composed with — never merged into — the session
 /// `Caveats`. Default is fail-closed (`none`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// INERT-CODE-RATCHET: X02 WIRE: documented SSH authority types and gate have no production caller.
 pub struct SshCaveats {
     /// Hosts this surface may SSH to (git remotes, mesh peers, bastions).
     pub hosts: Scope<String>,

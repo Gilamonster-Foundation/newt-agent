@@ -244,6 +244,7 @@ pub struct TurnOutcome {
     /// Whether the reply was streamed token-by-token by the loop (it prints to
     /// stdout when `color` is on; the driver always runs headless, so this is
     /// informational).
+    // INERT-CODE-RATCHET: F02 DELETE: headless turn outcome stores a streaming flag no consumer reads.
     pub was_streamed: bool,
     /// Token usage for the turn, when the backend reported it.
     pub usage: Option<TokenUsage>,
@@ -735,6 +736,7 @@ pub enum TurnDriverError {
 /// Roles whose messages a transcript renderer typically shows to the human. The
 /// driver exposes it so a consumer's render can filter on the same set the
 /// newt-tui render uses (system + tool turns are usually hidden).
+// INERT-CODE-RATCHET: X13 DELETE: transcript role constant is reexported but no renderer reads it.
 pub const VISIBLE_TRANSCRIPT_ROLES: [Role; 2] = [Role::User, Role::Assistant];
 
 #[cfg(test)]

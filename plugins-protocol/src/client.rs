@@ -150,6 +150,7 @@ fn preserve_platform_process_env(cmd: &mut Command) {
 }
 
 #[cfg(not(windows))]
+// Non-Windows processes have no Windows platform environment to preserve.
 fn preserve_platform_process_env(_cmd: &mut Command) {}
 
 /// Spawns the plugin process, retrying briefly on `ETXTBSY`.

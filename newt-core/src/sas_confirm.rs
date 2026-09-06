@@ -28,6 +28,7 @@ use crate::tty::PromptWindow;
 
 /// What the terminal concluded about a staged candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// INERT-CODE-RATCHET: X24 WIRE: SAS confirmation is tested security plumbing with no production enrollment caller.
 pub enum SasVerdict {
     /// A human compared the words and said yes. The only promotable outcome.
     Confirmed,

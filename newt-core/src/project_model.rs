@@ -247,6 +247,7 @@ pub fn builtin_project_packs() -> Vec<ProjectPack> {
 /// mirroring [`crate::api_surface::merge_packs`]. Order within a layer is
 /// preserved; a later same-name pack replaces an earlier one in place.
 #[must_use]
+// INERT-CODE-RATCHET: X08 WIRE: project-pack loading and merge behavior is tested but never entered in production.
 pub fn merge_project_packs(layers: Vec<Vec<ProjectPack>>) -> Vec<ProjectPack> {
     let mut out: Vec<ProjectPack> = Vec::new();
     for layer in layers {

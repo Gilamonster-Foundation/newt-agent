@@ -1112,6 +1112,7 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
             ),
             _ => ("unauthorized", None),
         };
+        // INERT-CODE-RATCHET: F18 WIRE: permission refusal detail is promised to audit but explicitly discarded.
         let _ = refusal;
         self.record(req, "deny", scope);
         if let Some(message) = message {

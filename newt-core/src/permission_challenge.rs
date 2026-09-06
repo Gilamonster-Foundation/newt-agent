@@ -58,6 +58,7 @@
 /// scroller is authoritative about *what* is being authorized, because a
 /// compromised browser can render anything it likes next to the button.
 #[must_use]
+// INERT-CODE-RATCHET: X27 WIRE: terminal-echo authority helper is claimed as live but has no production caller.
 pub fn requires_terminal_echo(danger: &str) -> bool {
     let is_high = |t: &str| t.eq_ignore_ascii_case("high");
     let is_low = |t: &str| t.eq_ignore_ascii_case("low");

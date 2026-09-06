@@ -173,6 +173,7 @@ pub struct ExposurePlan {
     /// Names kept on the wire, in the catalog's original order.
     pub exposed: Vec<String>,
     /// Authorized names dropped from the wire (still dispatchable).
+    // INERT-CODE-RATCHET: F12 WIRE: exposure planning computes hidden and token-budget telemetry that production drops.
     pub hidden: Vec<String>,
     /// Estimated tokens of the exposed schema set.
     pub exposed_tokens: usize,

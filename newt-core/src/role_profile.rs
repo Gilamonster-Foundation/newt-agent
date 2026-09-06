@@ -82,6 +82,7 @@ pub struct RoleProfile {
     /// Preferred backend model id (router policy hint).
     pub model: Option<String>,
     /// Preferred router tier (router policy hint).
+    // INERT-CODE-RATCHET: F14 WIRE: role tier is displayed but never participates in backend placement.
     pub tier: Option<Tier>,
     /// Operating ALTITUDE — act (doer, the default) vs advise (coach). Selected
     /// in front-matter as `altitude = "coach"`. `None` = doer. Drives which base

@@ -132,6 +132,7 @@ macro_rules! string_scalar_schema {
 /// wire does not perform.
 #[cfg(feature = "schema")]
 #[must_use]
+// INERT-CODE-RATCHET: X15 DELETE: feature-gated schema helpers have zero consumers and the scalar macro supersedes them.
 pub fn name_schema(_: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
     let mut schema = schemars::schema::SchemaObject {
         instance_type: Some(schemars::schema::InstanceType::String.into()),

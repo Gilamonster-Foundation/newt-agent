@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 /// One voice on the panel: a label + the model it is pinned to (the diversity axis).
 #[derive(Debug, Clone)]
+// INERT-CODE-RATCHET: X22 DELETE: panel and voting API is a closed tested island with no production caller.
 pub struct VoiceSpec {
     pub name: String,
     pub model: String,

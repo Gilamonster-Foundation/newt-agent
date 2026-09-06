@@ -22,6 +22,7 @@ const MAXF = argv.max_facets || 7
 // not be inside the intended checkout at all (this is how a propose-verify
 // run once left real edits in an unrelated worktree — see
 // feedback_workflow_propose_agents_need_explicit_no_edit).
+// INERT-CODE-RATCHET: S01 WIRE: workflow declares the REPO lexical binding twice and cannot load.
 const REPO = argv.repo
   ? `The repo root is ${argv.repo} (given — use it verbatim, do not run git rev-parse or guess another path).`
   : 'Resolve the repo root via git rev-parse --show-toplevel (requires a cwd inside the newt-agent repo).'

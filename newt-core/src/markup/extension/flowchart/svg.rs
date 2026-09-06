@@ -26,6 +26,7 @@
 //! claim than "a diagram is present" — which is exactly the assertion that let
 //! the black-on-black regression through.
 
+// INERT-CODE-RATCHET: F19 DELETE: flowchart renderer imports NODE_H only to discard it.
 use super::layout::{Layout, NODE_H};
 use super::parse::{Direction, Graph};
 use std::fmt::Write as _;

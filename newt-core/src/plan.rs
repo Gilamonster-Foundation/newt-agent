@@ -45,6 +45,7 @@ pub struct Plan {
     pub goal: Option<String>,
     /// How child results are combined back into the plan (default `Concat`).
     #[serde(default)]
+    // INERT-CODE-RATCHET: F09 WIRE: serialized plan aggregation is never read or matched by the executor.
     pub aggregation: Aggregation,
     /// The subtasks, as TOML `[[subtask]]` tables. (Rust field `subtasks`,
     /// TOML key `subtask`.)
@@ -333,6 +334,7 @@ pub struct Subtask {
     pub deps: Vec<String>,
     /// May this subtask run concurrently with its ready siblings?
     #[serde(default)]
+    // INERT-CODE-RATCHET: F10 WIRE: parallel_ok is serialized but ready siblings still run sequentially.
     pub parallel_ok: bool,
     /// The leaf's FILE SCOPE — its write lane (#812), not reading material.
     /// At dispatch this is forwarded as `args["scope"]` and intersected into

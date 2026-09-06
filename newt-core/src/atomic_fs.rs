@@ -497,6 +497,7 @@ impl ResolvedPath {
 ///
 /// Existing symlinks resolve to their target.  For a new file the existing
 /// parent is canonicalized and the final component is appended.
+// INERT-CODE-RATCHET: X06 DELETE: four exported staging helpers have zero consumers.
 pub fn stable_path(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(ResolvedPath::resolve(path)?.path)
 }

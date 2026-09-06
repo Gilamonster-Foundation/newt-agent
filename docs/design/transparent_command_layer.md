@@ -1,6 +1,7 @@
 # Design: the transparent command layer (parse · route · never grant ambient authority)
 
 **Status:** Design / proposed (Shawn Hartsock, 2026-06-21)
+<!-- INERT-CODE-RATCHET: S04 DOCUMENT: three documents describe nonexistent forge resolver code as shipped or current. -->
 **Related:** `docs/decisions/structural_parsing_over_regex.md` (the AST rule this
 relies on), `docs/decisions/host_command_confinement.md` (the decision: fence the
 host suite, don't reimplement GNU, allow/attest/deny × presence on top),

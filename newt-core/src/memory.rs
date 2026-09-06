@@ -123,6 +123,7 @@ pub trait MemoryProvider: Send + Sync {
     /// Recall relevant context to prepend to the user turn **before** the API
     /// call.  Should be fast — use cached results, don't block.
     /// Return empty string to contribute nothing.
+    // INERT-CODE-RATCHET: X28 WIRE: memory prefetch default and manager fanout have no production caller.
     async fn prefetch(&self, _query: &str) -> anyhow::Result<String> {
         Ok(String::new())
     }
@@ -206,11 +207,13 @@ pub trait MemoryProvider: Send + Sync {
     /// Called **before** old messages are discarded (e.g. during compression).
     /// Extract anything worth keeping from `messages`; return it as a string
     /// to include in the compression summary. Return empty string for nothing.
+    // INERT-CODE-RATCHET: X29 WIRE: pre-compression hook has a real override but its manager entry point is never called.
     async fn on_pre_compress(&self, _messages: &[MemMessage]) -> String {
         String::new()
     }
 
     /// Called once when the session ends. Use for final extraction / cleanup.
+    // INERT-CODE-RATCHET: X30 WIRE: session-end memory hook and manager fanout have no production caller.
     async fn on_session_end(&mut self, _messages: &[MemMessage]) {}
 
     /// Report current usage for display (e.g. `/memory` command).
@@ -355,6 +358,7 @@ impl MemoryManager {
     }
 
     /// Persist a completed turn to all providers.
+    // INERT-CODE-RATCHET: X31 DELETE: obsolete sync_all wrapper has only tests; active code uses the task-aware variant.
     pub async fn sync_all(&mut self, user: &str, assistant: &str, metrics: &TurnMetrics) {
         for p in &mut self.providers {
             p.sync_turn(user, assistant, metrics).await;
