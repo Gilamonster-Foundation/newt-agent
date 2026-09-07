@@ -140,7 +140,15 @@ pub fn load_store(
 /// Matching is exact on the target string; a gate with richer matching
 /// normalizes the target before calling.
 pub fn evaluate_request(set: &PolicySet, kind: DenialKind, target: &str) -> Option<Verdict> {
-    set.evaluate(class_for(kind)?, target)
+    let mut request_policy = std::borrow::Cow::Borrowed(set);
+    if kind == DenialKind::FsWrite {
+        // The shared Fs class is mode-blind. Remove only read-only approvals;
+        // narrowing verdicts retain their coverage and the shared precedence.
+        if let Some(approve) = request_policy.to_mut().files.get_mut(&Verdict::Approve) {
+            approve.fs.retain(|entry| entry.write);
+        }
+    }
+    request_policy.evaluate(class_for(kind)?, target)
 }
 
 /// Bless an `approve.toml` (pure; the write half of #1207): re-sign EVERY entry
@@ -249,6 +257,90 @@ mod tests {
             evaluate_request(&s, DenialKind::FsWrite, "/ws"),
             Some(Verdict::Approve)
         );
+    }
+
+    /// Exercise the actual entry signatures and verifier without a filesystem
+    /// or operator key: every test gets a disposable in-memory root key.
+    fn signed_approve_store(approve: &str) -> PolicySet {
+        let key = agent_mesh_protocol::UserKey::generate();
+        let mut file = PolicyFile::parse(approve).unwrap();
+        let (signed, refused) = sign_approves(
+            &mut file,
+            |_, _| false,
+            |payload| key.sign(payload).to_bytes(),
+        );
+        assert_eq!(signed, file.exec.len() + file.fs.len() + file.net.len());
+        assert!(refused.is_empty());
+        let (set, warnings) = build_store(&[(Verdict::Approve, Some(file.to_toml().unwrap()))]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let verifier = Ed25519ApproveVerifier {
+            verifying_key: key.public().as_bytes(),
+        };
+        let (set, warnings) = verify_approves(set, Some(&verifier));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        set
+    }
+
+    #[test]
+    fn signed_readonly_fs_approval_does_not_cover_a_write_request() {
+        for mode in ["", "write = false\n"] {
+            let set = signed_approve_store(&format!(
+                "[[fs]]\npath = \"/fixture/notes.txt\"\n{mode}\
+                 [[fs]]\npath = \"/fixture/writable.txt\"\nwrite = true\n"
+            ));
+            assert_eq!(
+                evaluate_request(&set, DenialKind::FsRead, "/fixture/notes.txt"),
+                Some(Verdict::Approve),
+                "a verified read grant must remain usable"
+            );
+            assert_eq!(
+                evaluate_request(&set, DenialKind::FsWrite, "/fixture/writable.txt"),
+                Some(Verdict::Approve),
+                "a different target's write grant remains usable only there"
+            );
+            assert_eq!(
+                evaluate_request(&set, DenialKind::FsWrite, "/fixture/notes.txt"),
+                None,
+                "a read-only signature must not pre-answer a write request"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_fs_write_approval_covers_both_modes_regardless_of_entry_order() {
+        for modes in [[false, true], [true, false]] {
+            let set = signed_approve_store(&format!(
+                "[[fs]]\npath = \"/fixture/notes.txt\"\nwrite = {}\n\
+                 [[fs]]\npath = \"/fixture/notes.txt\"\nwrite = {}\n",
+                modes[0], modes[1]
+            ));
+            for kind in [DenialKind::FsRead, DenialKind::FsWrite] {
+                assert_eq!(
+                    evaluate_request(&set, kind, "/fixture/notes.txt"),
+                    Some(Verdict::Approve)
+                );
+                assert_eq!(evaluate_request(&set, kind, "/fixture/other.txt"), None);
+            }
+        }
+    }
+
+    #[test]
+    fn readonly_fs_restrictions_still_outrank_a_signed_write_approval() {
+        for verdict in [Verdict::Deny, Verdict::Passkey, Verdict::Ask] {
+            let mut set =
+                signed_approve_store("[[fs]]\npath = \"/fixture/notes.txt\"\nwrite = true\n");
+            set.files.insert(
+                verdict,
+                PolicyFile::parse("[[fs]]\npath = \"/fixture/notes.txt\"\n").unwrap(),
+            );
+            for kind in [DenialKind::FsRead, DenialKind::FsWrite] {
+                assert_eq!(
+                    evaluate_request(&set, kind, "/fixture/notes.txt"),
+                    Some(verdict),
+                    "filtering read-only approvals must not weaken narrowing verdicts"
+                );
+            }
+        }
     }
 
     #[test]

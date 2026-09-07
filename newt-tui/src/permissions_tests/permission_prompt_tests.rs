@@ -1091,6 +1091,111 @@ fn durable_ocap_approve_allows_without_prompting_and_grants_authority() {
     assert!(state.session_grants.is_empty());
 }
 
+/// Real-resource grounding for the core read/write-mode regression and the
+/// scripted durable-grant test above: persist a genuinely signed policy, load
+/// it through the production verifier, and inspect the gate's minted authority.
+/// Changing the saved write bit without re-signing must invalidate the grant.
+/// The policy and operator key exist only inside this test's temporary directory.
+#[test]
+fn durable_signed_readonly_fs_approval_prompts_before_granting_write_authority() {
+    use newt_core::ocap_store::{evaluate_request, load_store, sign_approves, PolicyFile, Verdict};
+
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("config.toml");
+    let key_path = root.path().join("identity.pem");
+    let key = newt_identity::UserKey::generate();
+    key.save(&key_path).unwrap();
+    let mut file = PolicyFile::parse("[[fs]]\npath = \"/fixture/notes.txt\"\n").unwrap();
+    let (signed, refused) = sign_approves(
+        &mut file,
+        |_, _| false,
+        |payload| key.sign(payload).to_bytes(),
+    );
+    assert_eq!(signed, 1);
+    assert!(refused.is_empty());
+    let policy_dir = root.path().join("ocap");
+    std::fs::create_dir(&policy_dir).unwrap();
+    std::fs::write(
+        policy_dir.join(Verdict::Approve.filename()),
+        file.to_toml().unwrap(),
+    )
+    .unwrap();
+    let (ocap_policy, warnings) = load_store(&config_path, Some(key.public().as_bytes()));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let mut state = PermissionPromptState {
+        ocap_policy,
+        ..Default::default()
+    };
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        base_caveats("/workspace"),
+        Some(key_path),
+        None,
+        vec![PromptChoice::Deny],
+        prompts.clone(),
+    );
+    let read = PermissionRequest {
+        tool: "read_file".into(),
+        kind: DenialKind::FsRead,
+        target: "/fixture/notes.txt".into(),
+        reason: String::new(),
+    };
+    match gate.ask(std::slice::from_ref(&read)) {
+        newt_core::PermissionDecision::Allow(caveats) => {
+            assert!(caveats.permits_fs_read(&read.target));
+            assert!(!caveats.permits_fs_write(&read.target));
+        }
+        newt_core::PermissionDecision::Deny => panic!("verified read approval must allow reads"),
+    }
+    assert_eq!(
+        prompts.get(),
+        0,
+        "verified reads do not need another prompt"
+    );
+    let write = PermissionRequest {
+        tool: "write_file".into(),
+        kind: DenialKind::FsWrite,
+        ..read
+    };
+    assert!(matches!(
+        gate.ask(&[write]),
+        newt_core::PermissionDecision::Deny
+    ));
+    assert_eq!(
+        prompts.get(),
+        1,
+        "the operator must decide the new write grant"
+    );
+    drop(gate);
+    assert!(state.session_grants.is_empty());
+    assert_eq!(state.decisions.len(), 2);
+    assert_eq!(state.decisions[0].scope, "ocap-approve");
+    assert_eq!(state.decisions[1].decision, "deny");
+
+    // Retain the original signature while tampering with its authority-bearing
+    // write bit. Reload from disk rather than mutating the verified live policy.
+    file.fs[0].write = true;
+    std::fs::write(
+        policy_dir.join(Verdict::Approve.filename()),
+        file.to_toml().unwrap(),
+    )
+    .unwrap();
+    let (tampered, warnings) = load_store(&config_path, Some(key.public().as_bytes()));
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("approve entry `/fixture/notes.txt` dropped:"),
+        "{warnings:?}"
+    );
+    for kind in [DenialKind::FsRead, DenialKind::FsWrite] {
+        assert_eq!(
+            evaluate_request(&tampered, kind, "/fixture/notes.txt"),
+            None,
+            "a tampered signature must not authorize either access mode"
+        );
+    }
+}
+
 #[test]
 fn durable_ocap_deny_refuses_without_prompting() {
     let mut state = PermissionPromptState {
