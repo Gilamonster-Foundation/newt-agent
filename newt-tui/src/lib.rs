@@ -2205,7 +2205,7 @@ fn make_loop_summarizer(
     // #661 group C: an embedded summarizer runs the in-process candle engine
     // (#659) instead of an HTTP backend — zero contention with the primary model.
     if kind == newt_core::BackendKind::Embedded {
-        return make_embedded_summarizer(model, model_path);
+        return make_embedded_summarizer(model, model_path, opts.timeout_secs);
     }
     Box::new(move |prompt: String| {
         let url = url.clone();
@@ -2262,13 +2262,18 @@ fn failing_summarizer(msg: String) -> newt_core::Summarizer {
     })
 }
 
-/// Build the in-process candle summarizer (#661 group C). The `EmbeddedBackend`
-/// (#659) loads its GGUF and is shared across calls; each summarize is one
-/// `complete` on a blocking thread, so it never contends the async runtime or the
-/// primary model. Falls back to a failing summarizer (→ static marker) when the
-/// model file is missing or the build lacks the `embedded` feature.
+/// Build the in-process candle summarizer (#661 group C). Backend metadata is
+/// shared across calls; each call loads its GGUF on a bounded blocking worker.
+/// The configured per-request timeout covers loading and generation, with
+/// cooperative cancellation between synchronous steps. Falls back to a failing
+/// summarizer (→ static marker) when the model file is missing or the build lacks
+/// the `embedded` feature.
 #[cfg_attr(not(feature = "embedded"), allow(unused_variables))]
-fn make_embedded_summarizer(model: String, model_path: Option<String>) -> newt_core::Summarizer {
+fn make_embedded_summarizer(
+    model: String,
+    model_path: Option<String>,
+    timeout_secs: u64,
+) -> newt_core::Summarizer {
     #[cfg(feature = "embedded")]
     {
         let Some(path) = model_path else {
@@ -2283,12 +2288,17 @@ fn make_embedded_summarizer(model: String, model_path: Option<String>) -> newt_c
                 Box::new(move |prompt: String| {
                     let backend = backend.clone();
                     Box::pin(async move {
-                        use newt_inference::InferenceBackend;
                         let req = newt_inference::ChatRequest {
                             messages: vec![newt_inference::backend::Message::user(prompt)],
                             max_tokens: Some(1024),
                         };
-                        backend.complete(req).await.map(|reply| reply.content)
+                        backend
+                            .complete_with_timeout(
+                                req,
+                                std::time::Duration::from_secs(timeout_secs),
+                            )
+                            .await
+                            .map(|reply| reply.content)
                     })
                 })
             }

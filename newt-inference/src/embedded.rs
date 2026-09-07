@@ -86,6 +86,46 @@ impl EmbeddedBackend {
     pub fn model(&self) -> &MiniModel {
         self.model
     }
+
+    /// Complete with a budget covering admission, model loading and generation.
+    /// Returning on timeout or dropping this future signals cooperative worker
+    /// cancellation; one synchronous load/forward may still be finishing.
+    ///
+    /// # Errors
+    /// An unrepresentable or expired deadline, busy worker, or inference error.
+    pub async fn complete_with_timeout(
+        &self,
+        req: ChatRequest,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<ChatReply> {
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| anyhow::anyhow!("embedded inference deadline is out of range"))?;
+        self.complete_until(req, Some(deadline)).await
+    }
+
+    async fn complete_until(
+        &self,
+        req: ChatRequest,
+        deadline: Option<std::time::Instant>,
+    ) -> anyhow::Result<ChatReply> {
+        let max_tokens = req.max_tokens.unwrap_or(512) as usize;
+        let prompt = engine::format_chatml(&req.messages);
+        let gguf = self.gguf_path.clone();
+        let tok = self.tokenizer_path.clone();
+        let arch = self.model.arch;
+        let model_id = self.model.name.to_string();
+        // candle is synchronous + CPU/GPU-bound; keep it off the async runtime.
+        let content = run_generation(generation_admission(), deadline, move |checkpoint| {
+            engine::generate(&gguf, &tok, arch, &prompt, max_tokens, checkpoint)
+        })
+        .await?;
+        Ok(ChatReply {
+            content,
+            model_id,
+            usage: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -111,24 +151,67 @@ impl InferenceBackend for EmbeddedBackend {
     }
 
     async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatReply> {
-        let max_tokens = req.max_tokens.unwrap_or(512) as usize;
-        let prompt = engine::format_chatml(&req.messages);
-        let gguf = self.gguf_path.clone();
-        let tok = self.tokenizer_path.clone();
-        let arch = self.model.arch;
-        let model_id = self.model.name.to_string();
-        // candle is synchronous + CPU/GPU-bound; keep it off the async runtime.
-        let content = tokio::task::spawn_blocking(move || {
-            engine::generate(&gguf, &tok, arch, &prompt, max_tokens)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("embedded inference task panicked: {e}"))??;
-        Ok(ChatReply {
-            content,
-            model_id,
-            usage: None,
-        })
+        self.complete_until(req, None).await
     }
+}
+
+// Process-wide: rebuilding a per-turn backend must not admit another model
+// while a cancelled call is still finishing its current synchronous step.
+fn generation_admission() -> std::sync::Arc<tokio::sync::Semaphore> {
+    static ADMISSION: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    ADMISSION
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+}
+
+/// Cancellation is cooperative, not a hard wall-clock interruption of Candle:
+/// one synchronous load/forward may finish after the caller returns. The worker
+/// keeps admission until it actually exits, including on panic; busy calls fail
+/// rather than building an unbounded blocking-task queue.
+async fn run_generation<F>(
+    admission: std::sync::Arc<tokio::sync::Semaphore>,
+    deadline: Option<std::time::Instant>,
+    generate: F,
+) -> anyhow::Result<String>
+where
+    F: FnOnce(&dyn Fn() -> anyhow::Result<()>) -> anyhow::Result<String> + Send + 'static,
+{
+    anyhow::ensure!(
+        deadline.is_none_or(|end| std::time::Instant::now() < end),
+        "embedded inference deadline exceeded"
+    );
+    let permit = admission.try_acquire_owned().map_err(|_| {
+        anyhow::anyhow!("embedded inference busy: another generation is still running")
+    })?;
+    // Dropping the caller's actual future drops this receiver. The synchronous
+    // worker can observe that through the existing oneshot channel, without a
+    // second cancellation protocol or an unsafe attempt to kill its thread.
+    let (caller, _caller_lifetime) = tokio::sync::oneshot::channel::<()>();
+    let worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let checkpoint = || {
+            anyhow::ensure!(!caller.is_closed(), "embedded inference cancelled");
+            anyhow::ensure!(
+                deadline.is_none_or(|end| std::time::Instant::now() < end),
+                "embedded inference deadline exceeded"
+            );
+            Ok(())
+        };
+        checkpoint()?;
+        let result = generate(&checkpoint);
+        checkpoint()?;
+        result
+    });
+    let result = match deadline {
+        Some(end) => tokio::time::timeout_at(tokio::time::Instant::from_std(end), worker)
+            .await
+            .map_err(|_| anyhow::anyhow!(
+                "embedded inference deadline exceeded; the current synchronous step may still be finishing"
+            ))?,
+        None => worker.await,
+    };
+    result.map_err(|e| anyhow::anyhow!("embedded inference task panicked: {e}"))?
 }
 
 /// The candle generation engine (synchronous; called via `spawn_blocking`).
@@ -219,7 +302,9 @@ pub(crate) mod engine {
         arch: ModelArch,
         prompt: &str,
         max_tokens: usize,
+        checkpoint: &dyn Fn() -> anyhow::Result<()>,
     ) -> anyhow::Result<String> {
+        checkpoint()?;
         if arch != ModelArch::Qwen2 {
             anyhow::bail!(
                 "the embedded engine currently supports the Qwen2 architecture only \
@@ -227,19 +312,22 @@ pub(crate) mod engine {
             );
         }
         let device = device()?;
+        checkpoint()?;
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("load tokenizer {}: {e}", tokenizer_path.display()))?;
-
+        checkpoint()?;
         let mut file = std::fs::File::open(gguf_path)
             .with_context(|| format!("open {}", gguf_path.display()))?;
         let content = gguf_file::Content::read(&mut file)
             .with_context(|| format!("read GGUF {}", gguf_path.display()))?;
+        checkpoint()?;
         let mut model = Qwen2::from_gguf(content, &mut file, &device)
             .context("load Qwen2 weights from GGUF")?;
-
+        checkpoint()?;
         let encoding = tokenizer
             .encode(prompt, true)
             .map_err(|e| anyhow::anyhow!("tokenize prompt: {e}"))?;
+        checkpoint()?;
         let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
         // Qwen2 ChatML end-of-turn; fall back to <|endoftext|>.
         let eos = tokenizer
@@ -248,32 +336,73 @@ pub(crate) mod engine {
             .unwrap_or(151_645);
 
         let mut logits_processor = LogitsProcessor::new(42, Some(0.2), None);
-        let mut generated: Vec<u32> = Vec::new();
-        let mut pos = 0usize;
-        let mut next: Vec<u32> = prompt_tokens;
-        for _ in 0..max_tokens {
-            let input = Tensor::new(next.as_slice(), &device)?.unsqueeze(0)?;
-            let logits = model.forward(&input, pos)?;
-            // Reduce to the last position's logits, [vocab].
-            let logits = logits.squeeze(0)?;
-            let logits = if logits.rank() == 2 {
-                logits.get(logits.dim(0)? - 1)?
-            } else {
-                logits
-            };
-            pos += next.len();
-            let token = logits_processor.sample(&logits)?;
-            if token == eos {
-                break;
-            }
-            generated.push(token);
-            next = vec![token];
-        }
+        let generated = generate_tokens(
+            prompt_tokens,
+            eos,
+            max_tokens,
+            checkpoint,
+            |next, pos| {
+                let input = Tensor::new(next, &device)?.unsqueeze(0)?;
+                let logits = model.forward(&input, pos)?.squeeze(0)?;
+                Ok(if logits.rank() == 2 {
+                    logits.get(logits.dim(0)? - 1)?
+                } else {
+                    logits
+                })
+            },
+            |logits| Ok(logits_processor.sample(logits)?),
+        )?;
+        checkpoint()?;
         tokenizer
             .decode(&generated, true)
             .map_err(|e| anyhow::anyhow!("decode reply: {e}"))
     }
+
+    pub(super) fn generate_tokens(
+        prompt_tokens: Vec<u32>,
+        eos: u32,
+        max_tokens: usize,
+        checkpoint: &dyn Fn() -> anyhow::Result<()>,
+        mut forward: impl FnMut(&[u32], usize) -> anyhow::Result<Tensor>,
+        mut sample: impl FnMut(&Tensor) -> anyhow::Result<u32>,
+    ) -> anyhow::Result<Vec<u32>> {
+        let mut generated = Vec::new();
+        if max_tokens == 0 {
+            return Ok(generated);
+        }
+        let (last, prefix) = prompt_tokens
+            .split_last()
+            .context("empty embedded prompt")?;
+        // Candle 0.8's Qwen2 mask is square over the current sequence, not the
+        // cached prefix plus that sequence. Single-token prefill avoids that
+        // multi-token chunk mismatch and gives cancellation a checkpoint per
+        // forward. It trades batch throughput for a smaller synchronous quantum.
+        // Prompt EOS tokens are input, and prefill must not consume RNG draws.
+        for (pos, token) in prefix.iter().enumerate() {
+            checkpoint()?;
+            let _ = forward(std::slice::from_ref(token), pos)?;
+            checkpoint()?;
+        }
+        let mut next = *last;
+        for pos in (prefix.len()..).take(max_tokens) {
+            checkpoint()?;
+            let logits = forward(std::slice::from_ref(&next), pos)?;
+            checkpoint()?;
+            let token = sample(&logits)?;
+            checkpoint()?;
+            if token == eos {
+                break;
+            }
+            generated.push(token);
+            next = token;
+        }
+        Ok(generated)
+    }
 }
+
+#[cfg(test)]
+#[path = "embedded_lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {

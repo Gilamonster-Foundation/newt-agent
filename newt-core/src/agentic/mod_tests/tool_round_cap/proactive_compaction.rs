@@ -1,5 +1,109 @@
 use super::*;
 
+async fn assert_pending_summary_is_cancelled(
+    kind: BackendKind,
+    responses: bool,
+    final_summary: bool,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let server = MockServer::start().await;
+    let uri = server.uri();
+    let task = "cancel pending context summarization";
+    let messages = overflowing_responses_history(task);
+    let caveats = Caveats::top();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let summarizer: Summarizer = {
+        let started = started.clone();
+        let dropped = dropped.clone();
+        Box::new(move |_| {
+            let started = started.clone();
+            let dropped = dropped.clone();
+            Box::pin(async move {
+                struct MarkDrop(Arc<AtomicBool>);
+                impl Drop for MarkDrop {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+                let _drop = MarkDrop(dropped);
+                started.notify_one();
+                std::future::pending().await
+            })
+        })
+    };
+    let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, kind);
+    ctx.safe_context = Some(12_000);
+    ctx.num_ctx = Some(12_000);
+    ctx.max_ok_input = None;
+    ctx.mid_loop_trim_threshold = 8;
+    ctx.max_tool_rounds = usize::from(!final_summary);
+    ctx.cancel = Some(&cancel);
+    ctx.summarizer = Some(&*summarizer);
+    let mut mcp = NoMcp;
+    let future = async {
+        if responses {
+            openai_responses_complete(ctx, &mut mcp).await
+        } else if kind == BackendKind::Openai {
+            // Pin the wire without depending on process-global API selection.
+            openai_chat_complete(ctx, &mut mcp).await
+        } else {
+            chat_complete(ctx, &mut mcp).await
+        }
+    };
+    tokio::pin!(future);
+    // First prove the actual compressor called the pending summarizer, then
+    // time only cancellation acknowledgement, not unrelated fixture startup.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::select! {
+            _ = started.notified() => {}
+            result = &mut future => panic!("loop exited before summary readiness: {result:?}"),
+        }
+    })
+    .await
+    .expect("summary must start");
+    cancel.store(true, Ordering::SeqCst);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut future)
+        .await
+        .expect("interrupt must drop the pending summarizer")
+        .expect("interrupt is a normal turn exit");
+    assert!(result.0.is_empty());
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "cancelled summarizer future stayed alive"
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "cancelled compaction dispatched inference"
+    );
+}
+
+#[tokio::test]
+async fn ollama_cancels_a_pending_compaction_summary() {
+    assert_pending_summary_is_cancelled(BackendKind::Ollama, false, false).await;
+}
+
+#[tokio::test]
+async fn chat_completions_cancels_a_pending_compaction_summary() {
+    assert_pending_summary_is_cancelled(BackendKind::Openai, false, false).await;
+}
+
+#[tokio::test]
+async fn anthropic_cancels_a_pending_compaction_summary() {
+    assert_pending_summary_is_cancelled(BackendKind::Anthropic, false, false).await;
+}
+
+#[tokio::test]
+async fn responses_cancels_a_pending_compaction_summary() {
+    assert_pending_summary_is_cancelled(BackendKind::Openai, true, false).await;
+}
+
+#[tokio::test]
+async fn responses_cancels_a_pending_final_compaction_summary() {
+    assert_pending_summary_is_cancelled(BackendKind::Openai, true, true).await;
+}
+
 #[tokio::test]
 async fn responses_proactively_compacts_before_the_first_dispatch() {
     // #1528 B3 (req 1/2): when the FIRST request is LOCALLY known to exceed the

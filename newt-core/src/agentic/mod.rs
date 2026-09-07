@@ -2603,7 +2603,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             // The endpoint's parsed hard limit is authoritative —
                             // a refuse on it is correct from here on (Step 20.3).
                             send_budget_authoritative = true;
-                            let outcome = compress(
+                            let compression = compress(
                                 CompressRequest {
                                     // Real-token budget minus real-token schema
                                     // overhead, converted into the pipeline's
@@ -2627,8 +2627,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 },
                                 summarizer,
                                 compress_state,
-                            )
-                            .await;
+                            );
+                            let Some(outcome) = cancellable(cancel, compression).await else {
+                                return Ok((
+                                    String::new(),
+                                    false,
+                                    accumulated_usage,
+                                    hallucination_count,
+                                ));
+                            };
                             if let Some(notice) = outcome.notice {
                                 print_harness_notice(&notice, color);
                             }
@@ -3312,7 +3319,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 .saturating_sub(tool_tokens_real),
                             cal,
                         );
-                        let outcome = compress(
+                        let compression = compress(
                             CompressRequest {
                                 messages: &messages,
                                 budget: target,
@@ -3332,8 +3339,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             },
                             summarizer,
                             compress_state,
-                        )
-                        .await;
+                        );
+                        let Some(outcome) = cancellable(cancel, compression).await else {
+                            return Ok((
+                                String::new(),
+                                false,
+                                accumulated_usage,
+                                hallucination_count,
+                            ));
+                        };
                         if let Some(notice) = outcome.notice {
                             print_harness_notice(&notice, color);
                         }
@@ -6147,7 +6161,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 // send budget rests on a believed ceiling (mirrors the Ollama
                 // loop). A lone-HWM guard is non-authoritative → fails open.
                 let token_fired = mid_loop_trim_tokens.is_some_and(|t| t > 0 && current > t);
-                let outcome = compress(
+                let compression = compress(
                     CompressRequest {
                         messages: &messages,
                         budget: pipeline_budget,
@@ -6173,8 +6187,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     },
                     summarizer,
                     compress_state,
-                )
-                .await;
+                );
+                let Some(outcome) = cancellable(cancel, compression).await else {
+                    return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                };
                 if let Some(notice) = outcome.notice {
                     print_harness_notice(&notice, color);
                 }
@@ -6434,7 +6450,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                             // The endpoint's parsed hard limit is authoritative
                             // from here on (Step 20.3; mirrors the Ollama path).
                             send_budget_authoritative = true;
-                            let outcome = compress(
+                            let compression = compress(
                                 CompressRequest {
                                     // Real-token cap minus real-token schema
                                     // overhead → pipeline chars/4 currency
@@ -6462,8 +6478,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 },
                                 summarizer,
                                 compress_state,
-                            )
-                            .await;
+                            );
+                            let Some(outcome) = cancellable(cancel, compression).await else {
+                                return Ok((
+                                    String::new(),
+                                    false,
+                                    accumulated_usage,
+                                    hallucination_count,
+                                ));
+                            };
                             if let Some(notice) = outcome.notice {
                                 print_harness_notice(&notice, color);
                             }
@@ -8194,7 +8217,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     trigger.budget
                 };
                 let token_fired = mid_loop_trim_tokens.is_some_and(|t| t > 0 && current > t);
-                let outcome = compress(
+                let compression = compress(
                     CompressRequest {
                         messages: &messages,
                         budget: pipeline_budget,
@@ -8216,8 +8239,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     },
                     summarizer,
                     compress_state,
-                )
-                .await;
+                );
+                let Some(outcome) = cancellable(cancel, compression).await else {
+                    return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                };
                 if let Some(notice) = outcome.notice {
                     print_harness_notice(&notice, color);
                 }
@@ -8401,7 +8426,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                             send_budget = Some(new_budget);
                             effective_input_ceiling = Some(new_budget);
                             send_budget_authoritative = true;
-                            let outcome = compress(
+                            let compression = compress(
                                 CompressRequest {
                                     messages: &messages,
                                     budget: calibrate_down(
@@ -8426,8 +8451,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                 },
                                 summarizer,
                                 compress_state,
-                            )
-                            .await;
+                            );
+                            let Some(outcome) = cancellable(cancel, compression).await else {
+                                return Ok((
+                                    String::new(),
+                                    false,
+                                    accumulated_usage,
+                                    hallucination_count,
+                                ));
+                            };
                             if let Some(notice) = outcome.notice {
                                 print_harness_notice(&notice, color);
                             }
@@ -9834,7 +9866,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     cal,
                 );
                 if before > budget {
-                    proactive_rejection = compact_responses_input(
+                    let compression = compact_responses_input(
                         &mut input,
                         instructions.as_deref(),
                         tools_supported.then_some(tools.as_slice()),
@@ -9849,9 +9881,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         summarizer,
                         compress_state,
                         color,
-                    )
-                    .await
-                    .rejection();
+                    );
+                    let Some(outcome) = cancellable(cancel, compression).await else {
+                        return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                    };
+                    proactive_rejection = outcome.rejection();
                 }
             }
             // #1528 B5: the ONE typed strict-wire gate. Build the EXACT body, then
@@ -9948,7 +9982,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                             // overhead ONLY if this recovered request actually carries
                             // tools (`tools_supported`) — after a tools-unsupported error
                             // it does not, so it must not subtract them.
-                            match compact_responses_input(
+                            let compression = compact_responses_input(
                                 &mut input,
                                 instructions.as_deref(),
                                 tools_supported.then_some(tools.as_slice()),
@@ -9963,9 +9997,16 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                 summarizer,
                                 compress_state,
                                 color,
-                            )
-                            .await
-                            {
+                            );
+                            let Some(outcome) = cancellable(cancel, compression).await else {
+                                return Ok((
+                                    String::new(),
+                                    false,
+                                    accumulated_usage,
+                                    hallucination_count,
+                                ));
+                            };
+                            match outcome {
                                 ResponsesCompaction::Compacted | ResponsesCompaction::NotFired => {}
                                 // ZERO second inference: surface the original 400 with the
                                 // local compaction context attached for headless callers.
@@ -10352,7 +10393,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             cal,
         );
         if before > budget {
-            summary_rejection = compact_responses_input(
+            let compression = compact_responses_input(
                 &mut input,
                 instructions.as_deref(),
                 None,
@@ -10367,9 +10408,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 summarizer,
                 compress_state,
                 color,
-            )
-            .await
-            .rejection();
+            );
+            let Some(outcome) = cancellable(cancel, compression).await else {
+                return Ok((String::new(), false, accumulated_usage, hallucination_count));
+            };
+            summary_rejection = outcome.rejection();
         }
     }
 

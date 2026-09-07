@@ -9,6 +9,15 @@ configuration is plain `~/.newt/config.toml` (see `newt config`), and the
 setup wizards (`newt init` / `newt setup`) probe for local or remote models and
 write that file plus one `backends/*.toml` drop-in per endpoint.
 
+## Context summaries
+
+Context summarization uses the shared progress row and can be interrupted while
+a provider's compaction is pending. `timeout_secs` in `summarizer.toml` also applies to
+the embedded engine, including model loading. It is a per-summary-request limit,
+not a deadline for an entire multi-chunk compaction. Embedded cancellation is
+cooperative: the caller returns while a synchronous load or forward may still be
+finishing, and another embedded generation is refused until that worker exits.
+
 ## Tool output spills
 
 Every completed tool call is rendered through the same bounded spill block;
