@@ -9,6 +9,22 @@ use background_warmup::{
     resolved_source_extensions, spawn_nav_warmup, spawn_semantic_indexing, SemanticIndexWarmup,
 };
 
+fn memory_fetch_source<'a>(
+    notes: Option<&'a newt_core::NoteStore>,
+    store: Option<&'a newt_core::ConversationStore>,
+    spill: &'a dyn newt_core::SpillStore,
+    compaction: &'a dyn newt_core::SpillStore,
+    prompt: Option<&'a dyn newt_core::agentic::PromptSource>,
+) -> newt_core::StoreMemorySource<'a> {
+    let source = newt_core::StoreMemorySource::from_stores(notes, store)
+        .with_spill_store(spill)
+        .with_compaction_store(compaction);
+    match prompt {
+        Some(prompt) => source.with_prompt_source(prompt),
+        None => source,
+    }
+}
+
 #[cfg(feature = "rich-tui")]
 fn block_open_delim(input: &str) -> Option<&'static str> {
     match input.lines().next().unwrap_or("").trim() {
@@ -6998,10 +7014,10 @@ fn session_body(
                         (None, None) => None,
                     };
                     // Progressive-disclosure memory (Workstream A MVP, #319):
-                    // wired ONLY under `[memory] disclosure = "index"`. Default
-                    // (`frozen`) leaves `memory_source: None` so the loop is
-                    // bit-for-bit unchanged — the `memory_fetch` tool is never
-                    // advertised. The source reads `note:` bodies from an
+                    // The `note:` reader is needed under disclosure = "index";
+                    // live spill/compaction retrieval is wired in every session,
+                    // independently of note disclosure or durable storage.
+                    // The source reads `note:` bodies from an
                     // independent read-only NoteStore over the same NOTES file
                     // the MemoryManager froze (the `note_sink` holds the only
                     // &mut to the manager), and `turn:` bodies from the session
@@ -7023,21 +7039,13 @@ fn session_body(
                     } else {
                         None
                     };
-                    let memory_source =
-                        match (mem_fetch_notes.as_ref(), conversation_store.as_ref()) {
-                            (Some(notes), Some(store)) => {
-                                // Step 26.3 (#584): attach the spill store so the
-                                // model can re-read offloaded payloads via `spill:`.
-                                let source = newt_core::StoreMemorySource::new(notes, store)
-                                    .with_spill_store(&spill_store)
-                                    .with_compaction_store(&compaction_store);
-                                Some(match prompt_source {
-                                    Some(prompt) => source.with_prompt_source(prompt),
-                                    None => source,
-                                })
-                            }
-                            _ => None,
-                        };
+                    let memory_source = memory_fetch_source(
+                        mem_fetch_notes.as_ref(),
+                        conversation_store.as_ref(),
+                        &spill_store,
+                        &compaction_store,
+                        prompt_source,
+                    );
                     // Compression summarizer (Step 18.4, #247): rebuilt per
                     // turn so a mid-session `/backend` or model switch takes
                     // effect immediately.
@@ -7493,12 +7501,9 @@ fn session_body(
                                         recall_source: recall_source
                                             .as_ref()
                                             .map(|source| source as &dyn newt_core::RecallSource),
-                                        // Progressive-disclosure memory_fetch (#319):
-                                        // present only under disclosure = "index"; None
-                                        // (the default) keeps the loop bit-for-bit.
-                                        memory_source: memory_source
-                                            .as_ref()
-                                            .map(|s| s as &dyn newt_core::MemorySource),
+                                        // The session spill/compaction reader stays
+                                        // available in both memory disclosure modes.
+                                        memory_source: Some(&memory_source),
                                         // Summarize-don't-discard (Step 18.4, #247).
                                         summarizer: Some(&*loop_summarizer),
                                         compress_state: Some(&mut compress_state),
@@ -8266,3 +8271,7 @@ mod prompt_ingress_tests;
 #[cfg(test)]
 #[path = "chat_tests/incomplete_turn_persistence.rs"]
 mod incomplete_turn_persistence_tests;
+
+#[cfg(test)]
+#[path = "chat_tests/memory_retrieval.rs"]
+mod memory_retrieval_tests;

@@ -46,11 +46,11 @@ pub struct MemoryConfig {
 
     /// How memory is disclosed to the model (progressive-disclosure memory,
     /// Workstream A MVP, #319). `Frozen` (the default) is today's behavior
-    /// exactly: NOTES are frozen verbatim into the system prompt and the
-    /// `memory_fetch` tool is not wired. `Index` opts in to the budgeted
-    /// memory INDEX (note titles/ids instead of full bodies) plus the
-    /// `memory_fetch` tool that pulls a body on demand. This is a context-cost
-    /// facet, never an authorization knob.
+    /// for notes: NOTES are frozen verbatim into the system prompt. `Index`
+    /// opts in to the budgeted memory INDEX (note titles/ids instead of full
+    /// bodies), with note bodies pulled through `memory_fetch` on demand.
+    /// Session spill and compaction retrieval is available in either mode.
+    /// This is a context-cost facet, never an authorization knob.
     #[serde(default)]
     pub disclosure: MemoryDisclosure,
 }
@@ -59,8 +59,8 @@ pub struct MemoryConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryDisclosure {
-    /// Today's behavior: NOTES frozen verbatim into the system prompt, no
-    /// `memory_fetch` tool. The MVP default — inert unless opted in.
+    /// NOTES frozen verbatim into the system prompt. Session spill and
+    /// compaction retrieval remains available through `memory_fetch`.
     #[default]
     Frozen,
     /// Progressive disclosure: a budgeted memory INDEX in the prompt plus the

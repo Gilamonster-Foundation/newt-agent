@@ -4421,7 +4421,7 @@ fn maybe_offload_tool_result(
 ) -> String {
     let out = if matches!(
         name,
-        "run_command" | "lifecycle" | "prompt_read" | "artifact_read"
+        "run_command" | "lifecycle" | "prompt_read" | "artifact_read" | "memory_fetch"
     ) {
         result
     } else {

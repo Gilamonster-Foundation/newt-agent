@@ -91,7 +91,7 @@ pub(super) fn cap_estimator() -> crate::tokens::TokenEstimation {
 }
 
 /// Should a `run_command` result's FULL output be spilled (redacted → recoverable
-/// via `memory_fetch("spill:<id>")`) before the model-facing head/tail cap?
+/// via `memory_fetch` with `{"address":"spill:<id>"}`) before the model-facing head/tail cap?
 ///
 /// Pure so it can be unit-tested with an explicit `max_tokens` (the caller reads
 /// the process-global). Spilling is only meaningful when `tool_offload` is on and
@@ -154,9 +154,8 @@ pub(super) fn cap_model_output_with_handle(
     let tail = take_tail_chars(text, tail_chars);
     let marker = match spill_id {
         Some(id) => format!(
-            "[… {elided} chars elided (head+tail shown). Full output: \
-             memory_fetch(\"spill:{id}\"); search it with \
-             memory_fetch(\"spill:{id}\", grep=\"<pattern>\") …]"
+            "[… {elided} chars elided (head+tail shown). {} …]",
+            crate::agentic::content_spill::tool_output_retrieval_hint(id)
         ),
         None => format!(
             "[… {elided} chars elided (head+tail shown; ~{max_tokens} token budget). \
