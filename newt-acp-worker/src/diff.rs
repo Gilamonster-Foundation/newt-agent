@@ -35,7 +35,7 @@ pub fn capture_diff(workspace: &Path) -> anyhow::Result<String> {
         workspace,
         &["diff", "--no-color", "--no-ext-diff", "--no-textconv"],
     )
-    .output();
+    .and_then(|mut command| command.output());
 
     match output {
         Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).to_string()),
