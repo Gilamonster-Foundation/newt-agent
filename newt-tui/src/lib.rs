@@ -425,6 +425,10 @@ use newt_core::tty::raw_mode::RawModeGuard;
 ///   `rich_input.rs` has an inline `#[cfg(test)]` item at :360, ~700 lines
 ///   above the code under test, so a first-occurrence split returned a prefix
 ///   that contained none of it.
+/// * It accepts BOTH shapes of test module — the inline `mod tests {` and a
+///   relocated `#[cfg(test)] #[path = "…"] mod …;` sibling — and cuts at
+///   whichever appears first. A file whose tests moved out is still a file
+///   whose production half ends where the test declaration begins.
 /// * It PANICS when the marker is missing instead of returning "". An empty
 ///   string satisfies every `count() == 0` assertion, so the failure mode of
 ///   the convenient version is a guard that passes because it read nothing.
@@ -435,13 +439,25 @@ use newt_core::tty::raw_mode::RawModeGuard;
 /// #1890 — the configuration that had no gate at all a day ago.
 #[cfg(all(test, feature = "rich-tui"))]
 pub(crate) fn production_source(src: &str) -> &str {
-    src.split("\n#[cfg(test)]\nmod tests {")
-        .next()
+    // TWO marker shapes, because a file's test module is either inline or
+    // relocated to a sibling file under `#[path]`. Widened here rather than
+    // forked at the call sites: this is the single owner of "where does
+    // production end", and a second copy is what the reuse discipline exists
+    // to prevent.
+    //
+    // The EARLIEST valid cut wins, not the first marker in this list. A file
+    // carrying both shapes must yield the prefix before whichever comes first,
+    // or production would be over-reported by everything between them.
+    ["\n#[cfg(test)]\nmod tests {", "\n#[cfg(test)]\n#[path = "]
+        .iter()
+        .filter_map(|marker| src.split(marker).next())
         .filter(|prefix| prefix.len() < src.len())
+        .min_by_key(|prefix| prefix.len())
         .expect(
-            "the file must end in an unindented `#[cfg(test)] mod tests {` — \
-             without the marker this helper would hand back an empty string, \
-             and every count-based assertion would pass having read nothing",
+            "the file must end in an unindented `#[cfg(test)] mod tests {` or \
+             `#[cfg(test)] #[path = …]` — without one of those markers this \
+             helper would hand back an empty string, and every count-based \
+             assertion would pass having read nothing",
         )
 }
 
