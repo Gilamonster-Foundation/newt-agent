@@ -125,7 +125,7 @@ the line count to go **up** at that step and down at the next one.
 
 ### Evidence discipline — a claim names the decision it changes
 
-> Canonical home: `CRAFT-15` (Craft Register v1.1), `steward-charter/docs/CRAFT.md`.
+> Canonical home: `CRAFT-18` (Craft Register v1.2), `steward-charter/docs/CRAFT.md`.
 
 The rules above govern how much *code* a change adds. This governs how much
 *claim* it adds. **A sentence, a table, or a number in a PR body earns its place
@@ -150,8 +150,10 @@ claims of wildly different value buries the finding worth challenging.
 seam is worse than length, exactly as it is for files. The fix direction is
 *removing unearned claims*, never *shortening earned ones*: a load-bearing
 justification deleted to hit a budget is a defect wearing the costume of
-concision. Under the arbiter, `CRAFT-15` is a rubric to vote on, not a hook to
-run — no regex judges whether a claim is load-bearing.
+concision. Under the arbiter, `CRAFT-18` is a rubric to vote on, not a hook to
+run — no regex judges whether a claim is load-bearing. It is the prose sibling
+of `CRAFT-17`: that law wants a verifier on a production path, this one wants a
+reader, and neither is discharged by writing the evidence down.
 
 ## Content-addressable data structures — the concrete instance of reuse discipline
 
