@@ -386,8 +386,44 @@ mod tests {
     /// or a shared clause — fails here.
     #[test]
     fn no_other_module_hand_writes_the_disposition_vocabulary() {
-        const OTHER_SITES: [(&str, &str); 4] = [
+        // `prompt_intake.rs` was split into `prompt_intake_tests/` (#2189 lane).
+        // EVERY child is listed: this is a NEGATIVE assertion over the included
+        // text, so a file that stops being scanned stops being checked without
+        // ever going red — the vacuous-negative shape of #2150.
+        const OTHER_SITES: [(&str, &str); 12] = [
             ("prompt_intake.rs", include_str!("prompt_intake.rs")),
+            (
+                "prompt_intake_tests/atomic_ask.rs",
+                include_str!("prompt_intake_tests/atomic_ask.rs"),
+            ),
+            (
+                "prompt_intake_tests/card_and_artifact.rs",
+                include_str!("prompt_intake_tests/card_and_artifact.rs"),
+            ),
+            (
+                "prompt_intake_tests/clarification_gate.rs",
+                include_str!("prompt_intake_tests/clarification_gate.rs"),
+            ),
+            (
+                "prompt_intake_tests/disposition_inference.rs",
+                include_str!("prompt_intake_tests/disposition_inference.rs"),
+            ),
+            (
+                "prompt_intake_tests/imperative_recognition.rs",
+                include_str!("prompt_intake_tests/imperative_recognition.rs"),
+            ),
+            (
+                "prompt_intake_tests/informational_authority.rs",
+                include_str!("prompt_intake_tests/informational_authority.rs"),
+            ),
+            (
+                "prompt_intake_tests/mod.rs",
+                include_str!("prompt_intake_tests/mod.rs"),
+            ),
+            (
+                "prompt_intake_tests/negation.rs",
+                include_str!("prompt_intake_tests/negation.rs"),
+            ),
             ("tool_search.rs", include_str!("tool_search.rs")),
             ("tools/catalog.rs", include_str!("tools/catalog.rs")),
             ("operating_mode.rs", include_str!("operating_mode.rs")),
