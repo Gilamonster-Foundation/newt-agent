@@ -602,7 +602,7 @@ mod tests {
             true,
             true,
             true,
-            true,
+            Some(&crate::caveats::Scope::All),
             true,
             true,
             true,

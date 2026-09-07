@@ -48,7 +48,7 @@ fn mid_sized_pair_budget(task: &str, responses_wire: bool) -> usize {
     );
     let head = protected_prompt_head_len(&messages, prompt_read::ACTIVE_PROMPT_PREFIX);
     let chat_tools = merged_tool_definitions(
-        &NoMcp, false, false, false, false, false, false, false, false, false, false, false, false,
+        &NoMcp, false, false, false, None, false, false, false, false, false, false, false, false,
     );
     let tools = if responses_wire {
         serde_json::Value::Array(tools_to_responses(&chat_tools))

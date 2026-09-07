@@ -5027,19 +5027,6 @@ fn build_system_prompt_with_persona(
         }
     }
 
-    // Recent git log (confused-deputy-safe, step-7.4: the workspace may be hostile)
-    let log = newt_core::git_hardening::hardened_git(
-        std::path::Path::new(workspace),
-        &["log", "--oneline", "-10"],
-    )
-    .and_then(|mut command| command.output())
-    .ok()
-    .and_then(|o| String::from_utf8(o.stdout).ok())
-    .unwrap_or_default();
-    if !log.is_empty() {
-        ctx.push_str(&format!("\nRecent commits:\n{log}"));
-    }
-
     ctx
 }
 
@@ -7048,11 +7035,15 @@ fn search_help_text() -> &'static str {
 
 /// Best-effort HEAD + dirty bit for lightweight index status (#1387). Runtime
 /// glue (not unit-tier) — absence is reported honestly as unavailable.
-fn lightweight_git_meta(workspace: &str) -> (Option<String>, Option<bool>) {
+fn lightweight_git_meta(
+    workspace: &str,
+    read_scope: &newt_core::Scope<String>,
+) -> (Option<String>, Option<bool>) {
     // Confused-deputy-safe (step-7.4): the workspace may be a hostile repo.
-    let head = newt_core::git_hardening::hardened_git(
+    let head = newt_core::git_hardening::metadata_git(
         std::path::Path::new(workspace),
         &["rev-parse", "HEAD"],
+        read_scope,
     )
     .and_then(|mut command| command.output())
     .ok()
@@ -7060,9 +7051,10 @@ fn lightweight_git_meta(workspace: &str) -> (Option<String>, Option<bool>) {
     .and_then(|o| String::from_utf8(o.stdout).ok())
     .map(|s| s.trim().to_string())
     .filter(|s| !s.is_empty());
-    let dirty = newt_core::git_hardening::hardened_git(
+    let dirty = newt_core::git_hardening::metadata_git(
         std::path::Path::new(workspace),
         &["status", "--porcelain"],
+        read_scope,
     )
     .and_then(|mut command| command.output())
     .ok()

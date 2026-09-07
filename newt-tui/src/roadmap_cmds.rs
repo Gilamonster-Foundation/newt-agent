@@ -305,7 +305,12 @@ struct LocalGitFacts {
 impl LocalGitFacts {
     fn open(workspace: &str) -> Self {
         Self {
-            engine: newt_git::GitEngine::open(std::path::Path::new(workspace)).ok(),
+            // Explicit operator `/roadmap eval|drive`, not an accepted model turn.
+            engine: newt_git::GitEngine::open(
+                std::path::Path::new(workspace),
+                &newt_core::Scope::All,
+            )
+            .ok(),
         }
     }
 }
@@ -490,15 +495,13 @@ fn production_fact_sources(
     )
 }
 
-/// #1062 auto-capture — the current git HEAD (short oid), or `None` when the
-/// workspace isn't a repo or HEAD is unborn. Read-only via newt-git. Snapshotted
-/// before a turn so the after-turn hook can tell whether a commit landed.
-pub(crate) fn git_head_short(workspace: &str) -> Option<String> {
-    newt_git::GitEngine::open(std::path::Path::new(workspace))
-        .ok()?
-        .status(&newt_core::git_caveats::GitCaveats::read_only())
-        .ok()?
+/// Preserve the roadmap's seven-character oid format from an already
+/// authorized observation; no second repository discovery or status scan.
+pub(crate) fn git_head_short(snapshot: Option<&newt_git::HeadSnapshot>) -> Option<String> {
+    snapshot?
         .head
+        .as_ref()
+        .map(|head| head.chars().take(7).collect())
 }
 
 /// #1062 auto-capture, PURE core: which Task should absorb the turn's commit? If
@@ -525,25 +528,22 @@ pub(crate) fn autocapture_target(
 /// #1062 auto-capture: after a bound conversation's turn, if a commit landed,
 /// attribute it to the bound Plan's next-uncaptured Task and persist. Returns a
 /// one-line notice, or `None` (no active roadmap / no new commit / not bound to a
-/// Plan / no ready Task). Orchestration around [`autocapture_target`]; the git
-/// read + [`ConversationStore::update_roadmap`] live here.
+/// Plan / no ready Task). Reuses the authorized turn snapshot; unavailable
+/// Git evidence skips capture, never invents a commit transition.
 pub(crate) fn autocapture_commit_after_turn(
     store: &newt_core::ConversationStore,
     active_roadmap_id: &Option<String>,
     active_conversation_id: &str,
-    workspace: &str,
+    head_after: Option<&newt_git::HeadSnapshot>,
     head_before: Option<&str>,
 ) -> Option<String> {
     let roadmap_id = active_roadmap_id.as_deref()?;
-    let status = newt_git::GitEngine::open(std::path::Path::new(workspace))
-        .ok()?
-        .status(&newt_core::git_caveats::GitCaveats::read_only())
-        .ok()?;
-    let head_now = status.head?;
+    let snapshot = head_after?;
+    let head_now = git_head_short(Some(snapshot))?;
     let mut rm = store.load_roadmap(roadmap_id).ok().flatten()?;
     let task_id = autocapture_target(&rm.tree, active_conversation_id, head_before, &head_now)?;
     rm.tree
-        .set_artifact_commit(&task_id, &head_now, status.branch.as_deref());
+        .set_artifact_commit(&task_id, &head_now, snapshot.branch.as_deref());
     store.update_roadmap(roadmap_id, &rm.tree).ok()?;
     let short = &head_now[..head_now.len().min(8)];
     Some(format!(
@@ -953,7 +953,10 @@ pub(crate) fn handle_roadmap_command(
                 );
             }
             // Resolve the commit: the given sha, or the workspace's current HEAD.
-            let engine = newt_git::GitEngine::open(std::path::Path::new(workspace)).ok();
+            // Explicit operator `/roadmap task ... commit` remains an admin read.
+            let engine =
+                newt_git::GitEngine::open(std::path::Path::new(workspace), &newt_core::Scope::All)
+                    .ok();
             let status = engine.as_ref().and_then(|e| {
                 e.status(&newt_core::git_caveats::GitCaveats::read_only())
                     .ok()

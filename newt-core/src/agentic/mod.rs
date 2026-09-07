@@ -209,7 +209,7 @@ pub use driver::{
 pub use experiential::{
     experience_block, ExperienceStore, SessionExperienceStore, EXPERIENCE_TOP_K,
 };
-pub use git_tool::{git_tool_definition, GitTool};
+pub use git_tool::{check_git_read_scope, git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{
     classify_mcp_effect, leash_mcp_call, LeasedMcpCall, LeashDenied, McpEffect, McpGrant, McpTools,
@@ -1993,7 +1993,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         advertise_save_note,
         advertise_recall,
         advertise_memory_fetch,
-        advertise_git,
+        advertise_git.then_some(&caveats.fs_read),
         advertise_team,
         advertise_scratchpad,
         advertise_code_search,
@@ -2100,7 +2100,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let mut observed_resolver = claim_check::workspace_resolver(workspace);
     // #1214: HEAD at turn start — the ground truth "did THIS turn actually
     // commit anything" compares against at cap-exit.
-    let turn_start_head = claim_check::git_head(workspace);
+    let turn_start_head = claim_check::git_head(workspace, &caveats.fs_read);
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds, with an optional
     // evidence-backed grace window when the normal cap lands during active
@@ -2835,6 +2835,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     &mut end_reason,
                     more_rounds,
                     workspace,
+                    &caveats.fs_read,
                     turn_start_head.as_deref(),
                     disclosure,
                 );
@@ -3152,6 +3153,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 let probe_content = finalize_final_text(
                     probe_content,
                     workspace,
+                    &caveats.fs_read,
                     turn_start_head.as_deref(),
                     disclosure,
                 );
@@ -3218,6 +3220,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     let probe_content = finalize_final_text(
                         probe_content,
                         workspace,
+                        &caveats.fs_read,
                         turn_start_head.as_deref(),
                         disclosure,
                     );
@@ -3482,6 +3485,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 let probe_content = finalize_final_text(
                     probe_content,
                     workspace,
+                    &caveats.fs_read,
                     turn_start_head.as_deref(),
                     disclosure,
                 );
@@ -3511,6 +3515,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 let out = finalize_final_text(
                     probe_content,
                     workspace,
+                    &caveats.fs_read,
                     turn_start_head.as_deref(),
                     disclosure,
                 );
@@ -3540,6 +3545,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     &mut end_reason,
                     more_rounds,
                     workspace,
+                    &caveats.fs_read,
                     turn_start_head.as_deref(),
                     disclosure,
                 );
@@ -3563,8 +3569,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             );
             // #1964: this normal (non-cap) finish gets the same claim check
             // + disclosure gate as a cap-exit summary.
-            let streamed =
-                finalize_final_text(streamed, workspace, turn_start_head.as_deref(), disclosure);
+            let streamed = finalize_final_text(
+                streamed,
+                workspace,
+                &caveats.fs_read,
+                turn_start_head.as_deref(),
+                disclosure,
+            );
             return Ok((
                 streamed,
                 true,
@@ -3860,7 +3871,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         },
     )
     .await?;
-    let text = finalize_final_text(text, workspace, turn_start_head.as_deref(), disclosure);
+    let text = finalize_final_text(
+        text,
+        workspace,
+        &caveats.fs_read,
+        turn_start_head.as_deref(),
+        disclosure,
+    );
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }
@@ -4476,6 +4493,11 @@ fn is_read_only_tool(name: &str) -> bool {
 
 fn is_read_only_call(name: &str, args: &serde_json::Value) -> bool {
     is_read_only_tool(name)
+        || (name == "git"
+            && args
+                .get("op")
+                .and_then(|op| op.as_str())
+                .is_some_and(git_tool::is_scoped_read_op))
         || (name == "run_command"
             && args
                 .get("command")
@@ -4776,6 +4798,7 @@ fn readonly_completion_handoff(
     end_reason: &mut Option<&mut Option<crate::TurnEndReason>>,
     more_rounds: bool,
     workspace: &str,
+    read_scope: &crate::Scope<String>,
     turn_start_head: Option<&str>,
     disclosure: Option<&crate::ocap::DisclosureFilter>,
 ) -> String {
@@ -4792,6 +4815,7 @@ fn readonly_completion_handoff(
              reply `continue` to resume the read-only check, or clarify what evidence you need."
         ),
         workspace,
+        read_scope,
         turn_start_head,
         disclosure,
     )
@@ -5414,13 +5438,14 @@ fn cap_exit_model_reply(
 fn finalize_final_text(
     text: String,
     workspace: &str,
+    read_scope: &crate::Scope<String>,
     turn_start_head: Option<&str>,
     disclosure: Option<&crate::ocap::DisclosureFilter>,
 ) -> String {
     let text = claim_check::annotate_against_workspace(text, workspace);
     let text = claim_check::annotate_action_claims(
         text,
-        claim_check::collect_git_evidence(workspace, turn_start_head).as_ref(),
+        claim_check::collect_git_evidence(workspace, read_scope, turn_start_head).as_ref(),
     );
     redact_model_facing(disclosure, text)
 }
@@ -5927,7 +5952,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         advertise_save_note,
         advertise_recall,
         advertise_memory_fetch,
-        advertise_git,
+        advertise_git.then_some(&caveats.fs_read),
         advertise_team,
         advertise_scratchpad,
         advertise_code_search,
@@ -5979,7 +6004,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut observed_paths = claim_check::ObservedPaths::default();
     let mut observed_resolver = claim_check::workspace_resolver(workspace);
     // #1214: HEAD at turn start (mirror of the Ollama path).
-    let turn_start_head = claim_check::git_head(workspace);
+    let turn_start_head = claim_check::git_head(workspace, &caveats.fs_read);
 
     // Narrate-then-stop rescue counter (mirror of the Ollama path).
     let mut narration_nudges: usize = 0;
@@ -6784,6 +6809,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     &mut end_reason,
                     more_rounds,
                     workspace,
+                    &caveats.fs_read,
                     turn_start_head.as_deref(),
                     disclosure,
                 );
@@ -7116,7 +7142,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // `stream_response`): on the streamed arm this runs AFTER the text
             // was printed, so a claim-check or disclosure edit changes the
             // returned string without changing what the operator saw.
-            let out = finalize_final_text(out, workspace, turn_start_head.as_deref(), disclosure);
+            let out = finalize_final_text(
+                out,
+                workspace,
+                &caveats.fs_read,
+                turn_start_head.as_deref(),
+                disclosure,
+            );
             return Ok((out, was_streamed, accumulated_usage, hallucination_count));
         }
 
@@ -7440,7 +7472,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         },
     )
     .await?;
-    let text = finalize_final_text(text, workspace, turn_start_head.as_deref(), disclosure);
+    let text = finalize_final_text(
+        text,
+        workspace,
+        &caveats.fs_read,
+        turn_start_head.as_deref(),
+        disclosure,
+    );
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }
@@ -8009,7 +8047,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         advertise_save_note,
         advertise_recall,
         advertise_memory_fetch,
-        advertise_git,
+        advertise_git.then_some(&caveats.fs_read),
         advertise_team,
         advertise_scratchpad,
         advertise_code_search,
@@ -8053,7 +8091,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut observed_paths = claim_check::ObservedPaths::default();
     let mut observed_resolver = claim_check::workspace_resolver(workspace);
     // #1214: HEAD at turn start (mirrors the OpenAI path).
-    let turn_start_head = claim_check::git_head(workspace);
+    let turn_start_head = claim_check::git_head(workspace, &caveats.fs_read);
 
     // Narrate-then-stop rescue counter (mirrors the OpenAI path).
     let mut narration_nudges: usize = 0;
@@ -8559,6 +8597,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             let out = finalize_final_text(
                 model_reply.text.clone(),
                 workspace,
+                &caveats.fs_read,
                 turn_start_head.as_deref(),
                 disclosure,
             );
@@ -8761,6 +8800,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     &mut end_reason,
                     more_rounds,
                     workspace,
+                    &caveats.fs_read,
                     turn_start_head.as_deref(),
                     disclosure,
                 );
@@ -8996,8 +9036,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             }
             // #1964: this normal (non-cap) finish gets the same claim check
             // + disclosure gate as a cap-exit summary.
-            let out =
-                finalize_final_text(content, workspace, turn_start_head.as_deref(), disclosure);
+            let out = finalize_final_text(
+                content,
+                workspace,
+                &caveats.fs_read,
+                turn_start_head.as_deref(),
+                disclosure,
+            );
             return Ok((out, streamed, accumulated_usage, hallucination_count));
         }
 
@@ -9304,7 +9349,13 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         },
     )
     .await?;
-    let text = finalize_final_text(text, workspace, turn_start_head.as_deref(), disclosure);
+    let text = finalize_final_text(
+        text,
+        workspace,
+        &caveats.fs_read,
+        turn_start_head.as_deref(),
+        disclosure,
+    );
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }
@@ -9672,7 +9723,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         advertise_save_note,
         advertise_recall,
         advertise_memory_fetch,
-        advertise_git,
+        advertise_git.then_some(&caveats.fs_read),
         advertise_team,
         advertise_scratchpad,
         advertise_code_search,
@@ -9775,7 +9826,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // It must record before result offload/compaction removes the source text.
     let mut observed_paths = claim_check::ObservedPaths::default();
     let mut observed_resolver = claim_check::workspace_resolver(workspace);
-    let turn_start_head = claim_check::git_head(workspace);
+    let turn_start_head = claim_check::git_head(workspace, &caveats.fs_read);
 
     let reasoning = responses_reasoning_field(cognition);
     let build_body = |input: &[serde_json::Value], with_tools: bool| {
@@ -10040,6 +10091,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 let out = finalize_final_text(
                     format!("(the model refused the request) {message}"),
                     workspace,
+                    &caveats.fs_read,
                     turn_start_head.as_deref(),
                     disclosure,
                 );
@@ -10080,6 +10132,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     &mut end_reason,
                     more_rounds,
                     workspace,
+                    &caveats.fs_read,
                     turn_start_head.as_deref(),
                     disclosure,
                 );
@@ -10115,7 +10168,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             // no calls, `text` is non-empty — return it as the turn's answer.
             // #1964: this normal (non-cap) finish gets the same claim check
             // + disclosure gate as a cap-exit summary.
-            let text = finalize_final_text(text, workspace, turn_start_head.as_deref(), disclosure);
+            let text = finalize_final_text(
+                text,
+                workspace,
+                &caveats.fs_read,
+                turn_start_head.as_deref(),
+                disclosure,
+            );
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
 
@@ -10454,6 +10513,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     progress.as_deref(),
                 ),
                 workspace,
+                &caveats.fs_read,
                 turn_start_head.as_deref(),
                 disclosure,
             );
@@ -10485,6 +10545,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         progress.as_deref(),
                     ),
                     workspace,
+                    &caveats.fs_read,
                     turn_start_head.as_deref(),
                     disclosure,
                 );
@@ -10509,7 +10570,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 false,
                 progress.as_deref(),
             );
-            let text = finalize_final_text(text, workspace, turn_start_head.as_deref(), disclosure);
+            let text = finalize_final_text(
+                text,
+                workspace,
+                &caveats.fs_read,
+                turn_start_head.as_deref(),
+                disclosure,
+            );
             if let Some(slot) = &mut end_reason {
                 **slot = Some(crate::TurnEndReason::RoundCap);
             }
@@ -10528,6 +10595,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     progress.as_deref(),
                 ),
                 workspace,
+                &caveats.fs_read,
                 turn_start_head.as_deref(),
                 disclosure,
             );
@@ -10544,7 +10612,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         &decoded.text,
         progress.as_deref(),
     );
-    let text = finalize_final_text(text, workspace, turn_start_head.as_deref(), disclosure);
+    let text = finalize_final_text(
+        text,
+        workspace,
+        &caveats.fs_read,
+        turn_start_head.as_deref(),
+        disclosure,
+    );
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }
@@ -11277,7 +11351,7 @@ mod cap_exit_unit_tests;
 pub(crate) fn builtin_catalog_tokens(disposition: PromptDisposition) -> usize {
     let tools = filter_tools_for_disposition(
         merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, None, false, false, false, false, false, false, false,
             false,
         ),
         disposition,

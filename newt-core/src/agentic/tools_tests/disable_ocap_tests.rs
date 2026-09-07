@@ -1031,6 +1031,7 @@ impl crate::agentic::GitTool for RoutingStubGit {
         op: &str,
         _args: &serde_json::Value,
         _caps: &crate::git_caveats::GitCaveats,
+        _session: &Caveats,
     ) -> Result<String, String> {
         match op {
             "status" => Ok("on branch main (routed via git built-in)".to_string()),
@@ -1124,17 +1125,19 @@ async fn routed_cat_goes_through_the_fs_floor_not_a_bypass() {
     );
 }
 
-/// TDD: read-only `git status` is silently routed to the governed `git`
-/// built-in (the stub proves the built-in served it). Revert the routing
-/// promotion and this is red — the command would instead hit the run_command
-/// corrective guard.
+/// Routing does not authorize the legacy engine's unbounded transitive reads.
+/// With unrestricted read authority it still needs no shell exec grant.
 #[tokio::test]
 async fn routed_git_status_dispatches_through_the_git_builtin() {
     let _l = env_lock().await;
     let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
     let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
     let ws = tempfile::TempDir::new().unwrap();
-    let caveats = caveats_no_exec(ws.path());
+    let mut caveats = caveats_no_exec(ws.path());
+    let denied = run_routed_with_git("git status", ws.path(), &caveats).await;
+    assert!(denied.contains("Git operation unavailable with scoped fs_read"));
+    caveats.fs_read = Scope::All;
+    assert_eq!(caveats.exec, Scope::none());
     let out = run_routed_with_git("git status", ws.path(), &caveats).await;
     assert!(
         out.contains("routed via git built-in"),

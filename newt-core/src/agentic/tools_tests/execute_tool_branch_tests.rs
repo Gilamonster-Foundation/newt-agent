@@ -266,6 +266,9 @@ async fn run_tool_with_disposition(
 #[cfg(test)]
 #[path = "execute_git.rs"]
 mod git;
+#[cfg(test)]
+#[path = "execute_git_scope.rs"]
+mod git_scope;
 
 #[cfg(test)]
 #[path = "execute_plan_disposition.rs"]

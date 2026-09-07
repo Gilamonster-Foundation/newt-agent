@@ -336,15 +336,20 @@ pub(crate) fn annotate_action_claims(text: String, evidence: Option<&TurnGitEvid
 /// fail-quiet: this check must never break a summary.
 pub(crate) fn collect_git_evidence(
     workspace: &str,
+    read_scope: &crate::Scope<String>,
     head_at_turn_start: Option<&str>,
 ) -> Option<TurnGitEvidence> {
-    let head_now = git_head(workspace)?;
-    let status = git_in(workspace, &["status", "--porcelain"])?;
-    let branches = git_in(workspace, &["branch", "--format=%(refname:short)"])?
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
+    let head_now = git_head(workspace, read_scope)?;
+    let status = git_in(workspace, &["status", "--porcelain"], read_scope)?;
+    let branches = git_in(
+        workspace,
+        &["branch", "--format=%(refname:short)"],
+        read_scope,
+    )?
+    .lines()
+    .map(|l| l.trim().to_string())
+    .filter(|l| !l.is_empty())
+    .collect();
     Some(TurnGitEvidence {
         head_moved: head_at_turn_start.is_some_and(|start| start != head_now),
         tree_dirty: !status.trim().is_empty(),
@@ -353,16 +358,16 @@ pub(crate) fn collect_git_evidence(
 }
 
 /// Current HEAD sha of `workspace`, or `None` off-repo / on failure.
-pub(crate) fn git_head(workspace: &str) -> Option<String> {
-    git_in(workspace, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string())
+pub(crate) fn git_head(workspace: &str, read_scope: &crate::Scope<String>) -> Option<String> {
+    git_in(workspace, &["rev-parse", "HEAD"], read_scope).map(|s| s.trim().to_string())
 }
 
 /// Run a read-only git plumbing command in `workspace`; `None` on any failure.
-fn git_in(workspace: &str, args: &[&str]) -> Option<String> {
+fn git_in(workspace: &str, args: &[&str], read_scope: &crate::Scope<String>) -> Option<String> {
     // Confused-deputy-safe: `workspace` may be a hostile repo whose `.git/config`
     // could turn a raw `git` read into out-of-fence code (core.fsmonitor, hooks,
-    // diff.external, …). `hardened_git` disarms that surface (step-7.4).
-    let out = crate::git_hardening::hardened_git(std::path::Path::new(workspace), args)
+    // diff.external, …). Metadata also requires explicit read authority.
+    let out = crate::git_hardening::metadata_git(std::path::Path::new(workspace), args, read_scope)
         .ok()?
         .output()
         .ok()?;

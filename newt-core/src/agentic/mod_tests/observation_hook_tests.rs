@@ -92,7 +92,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
 /// than making this regression depend on a frozen catalog size.
 fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
     let tools = merged_tool_definitions(
-        &NoMcp, false, false, false, false, false, false, false, false, false, false, false, false,
+        &NoMcp, false, false, false, None, false, false, false, false, false, false, false, false,
     );
     let mut wire_messages: Vec<serde_json::Value> = messages
             .iter()

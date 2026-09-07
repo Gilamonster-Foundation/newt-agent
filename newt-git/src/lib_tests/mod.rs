@@ -82,6 +82,9 @@ fn head_message(dir: &Path) -> String {
 #[path = "attribution.rs"]
 mod attribution;
 #[cfg(test)]
+#[path = "branch_list.rs"]
+mod branch_list;
+#[cfg(test)]
 #[path = "checkout_branch.rs"]
 mod checkout_branch;
 #[cfg(test)]
@@ -91,8 +94,14 @@ mod engine_read;
 #[path = "engine_write.rs"]
 mod engine_write;
 #[cfg(test)]
+#[path = "git_scope.rs"]
+mod git_scope;
+#[cfg(test)]
 #[path = "rebase.rs"]
 mod rebase;
+#[cfg(test)]
+#[path = "scoped_legacy.rs"]
+mod scoped_legacy;
 #[cfg(test)]
 #[path = "stash_and_unknown.rs"]
 mod stash_and_unknown;

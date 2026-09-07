@@ -53,7 +53,12 @@ pub fn register_handlers(
     granted.warn_to_stderr();
 
     register_initialize(server);
-    register_tools_list(server, toolset.clone(), persona_tools.clone());
+    register_tools_list(
+        server,
+        toolset.clone(),
+        persona_tools.clone(),
+        &granted.caveats.fs_read,
+    );
     register_tools_call(
         server,
         registry,
@@ -99,7 +104,9 @@ fn register_tools_list(
     server: &mut McpServer,
     toolset: Arc<Mutex<McpToolset>>,
     persona_tools: Arc<Option<Vec<String>>>,
+    read_scope: &agent_bridle::Scope<String>,
 ) {
+    let legacy_git_allowed = newt_core::agentic::check_git_read_scope("open", read_scope).is_ok();
     server.register("tools/list", move |_params| {
         let toolset = toolset.clone();
         let persona_tools = persona_tools.clone();
@@ -107,6 +114,9 @@ fn register_tools_list(
             let Value::Array(mut tools) = tool_definitions() else {
                 unreachable!("tool_definitions always returns a JSON array");
             };
+            if !legacy_git_allowed {
+                tools.retain(|tool| tool["name"] != "git");
+            }
             tools.extend(toolset.lock().await.mcp_tool_list());
             let tools = filter_persona_tool_list(tools, persona_tools.as_deref());
             Ok(serde_json::json!({ "tools": tools }))
@@ -169,7 +179,7 @@ fn tool_definitions() -> Value {
         }),
         serde_json::json!({
             "name": "git",
-            "description": "Run a git operation via the embedded engine (grit-lib), gated by GitCaveats derived from the granted Caveats leash. ops: status | log | diff | add | commit | branch. Local-only; network ops (clone/fetch/push) are fail-closed. A write op (add/commit/branch) under a read-only grant is DENIED (isError). Returns structured JSON.",
+            "description": "Run a git operation via the embedded engine (grit-lib), gated by GitCaveats derived from the granted Caveats leash. Requires unrestricted fs_read because legacy repository reads are not path-confined. ops: status | log | diff | add | commit | branch. Local-only; network ops (clone/fetch/push) are fail-closed. A write op (add/commit/branch) under a read-only grant is DENIED (isError). Returns structured JSON.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -341,7 +351,8 @@ fn handle_git(args: &Value, granted: &Caveats) -> anyhow::Result<Value> {
     // The git surface is bounded by the granted leash: read-only when fs_write is
     // empty, full-local when writable, network always denied.
     let caps = newt_core::git_caveats::GitCaveats::from_session(granted);
-    let eng = GitEngine::open(Path::new(repo)).map_err(|e| anyhow::anyhow!("git open: {e}"))?;
+    let eng = GitEngine::open(Path::new(repo), &granted.fs_read)
+        .map_err(|e| anyhow::anyhow!("git open: {e}"))?;
 
     let result: Value = match op {
         "status" => serde_json::to_value(eng.status(&caps).map_err(gerr)?)?,
@@ -741,7 +752,12 @@ mod tests {
         let toolset = Arc::new(Mutex::new(McpToolset::empty()));
         let persona_tools = Arc::new(None);
         register_initialize(&mut server);
-        register_tools_list(&mut server, toolset.clone(), persona_tools.clone());
+        register_tools_list(
+            &mut server,
+            toolset.clone(),
+            persona_tools.clone(),
+            &granted.fs_read,
+        );
         register_tools_call(
             &mut server,
             Arc::new(BackendRegistry::new()),
@@ -1047,6 +1063,43 @@ mod tests {
         let v: Value = serde_json::from_str(text).unwrap();
         assert_eq!(v["branch"], "main");
         assert_eq!(v["clean"], true);
+    }
+
+    /// Real repository reads ground the advertise/execute scope boundary:
+    /// the legacy MCP engine cannot honor a workspace-only read grant.
+    #[tokio::test]
+    async fn scoped_git_is_not_advertised_or_dispatched() {
+        let repo = temp_repo();
+        let mut granted = Caveats::top();
+        granted.fs_read = agent_bridle::Scope::only([repo.path().to_string_lossy().into_owned()]);
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 40, "method": "tools/call",
+            "params": {
+                "name": "git",
+                "arguments": { "op": "status", "repo": repo.path().to_str().unwrap() }
+            }
+        });
+        let control = rpc_with_caveats(Caveats::top(), &request).await;
+        assert!(control["result"].is_object(), "{control}");
+        let denied = rpc_with_caveats(granted.clone(), &request).await;
+        assert!(
+            denied["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("fs_read")),
+            "scoped MCP Git must refuse before discovery: {denied}"
+        );
+        let listed = rpc_with_caveats(
+            granted,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 41, "method": "tools/list", "params": {}
+            }),
+        )
+        .await;
+        assert!(listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["name"] != "git"));
     }
 
     #[tokio::test]

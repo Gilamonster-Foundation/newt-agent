@@ -384,6 +384,7 @@ fn readonly_completion_handoff_preserves_the_disclosure_boundary() {
         &mut None,
         false,
         workspace.path().to_str().unwrap(),
+        &crate::Scope::All,
         None,
         Some(&filter),
     );

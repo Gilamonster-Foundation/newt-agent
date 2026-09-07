@@ -1,6 +1,40 @@
 use super::*;
 
 #[test]
+fn read_only_git_catalog_exposes_only_read_operations() {
+    let full = serde_json::json!([crate::agentic::git_tool::git_tool_definition()]);
+    for disposition in [
+        PromptDisposition::Explain,
+        PromptDisposition::Research,
+        PromptDisposition::Plan,
+    ] {
+        let filtered = filter_tools_for_disposition(full.clone(), disposition);
+        assert_eq!(
+            filtered.as_array().unwrap().len(),
+            1,
+            "{disposition:?} needs repository observations"
+        );
+        assert_eq!(
+            filtered[0]["function"]["parameters"]["properties"]["op"]["enum"],
+            serde_json::json!(["branch-list"])
+        );
+        assert!(!filtered[0]["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("stage with add"));
+        assert!(!tool_allowed(disposition, "run_command"));
+    }
+    assert_eq!(
+        filter_tools_for_disposition(full.clone(), PromptDisposition::Act),
+        full
+    );
+    assert_eq!(
+        filter_tools_for_disposition(full, PromptDisposition::Ask),
+        serde_json::json!([])
+    );
+}
+
+#[test]
 fn exit_plan_mode_result_appends_mandatory_edit_only_when_tenacity_requires_it() {
     use crate::tenacity::Tenacity;
     // Advisory levels: plain result, no forcing directive.
@@ -34,8 +68,9 @@ fn exit_plan_mode_result_appends_mandatory_edit_only_when_tenacity_requires_it()
 /// catalog whole (the zero-cost path for every non-persona session).
 #[test]
 fn persona_allow_list_filters_the_advertised_catalog() {
+    let git = Some(&crate::caveats::Scope::All);
     let full = merged_tool_definitions(
-        &NoMcp, true, true, true, true, true, true, true, true, true, true, true, true,
+        &NoMcp, true, true, true, git, true, true, true, true, true, true, true, true,
     );
     let name_set = |v: &serde_json::Value| -> Vec<String> {
         v.as_array()
@@ -187,7 +222,7 @@ fn prompt_disposition_filters_catalog_and_unknown_names_fail_closed() {
     // → model dumps or reaches for `wc -l` → empty/denied).
     let research_catalog = filter_tools_for_disposition(
         merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, None, false, false, false, false, false, false, false,
             false,
         ),
         PromptDisposition::Research,

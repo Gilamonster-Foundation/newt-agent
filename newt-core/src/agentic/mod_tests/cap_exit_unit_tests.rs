@@ -223,6 +223,7 @@ fn cap_exit_finalizer_applies_workspace_claim_checks() {
     let text = finalize_final_text(
         "Updated src/definitely_not_present.rs and verified it.".to_string(),
         &workspace.path().to_string_lossy(),
+        &crate::Scope::All,
         None,
         None,
     );
@@ -354,6 +355,15 @@ fn write_tools_not_read_only() {
 
 #[test]
 fn read_only_call_classifies_simple_shell_probes() {
+    assert!(is_read_only_call(
+        "git",
+        &serde_json::json!({"op": "branch-list"})
+    ));
+    assert!(!is_read_only_call(
+        "git",
+        &serde_json::json!({"op": "branch", "name": "new"})
+    ));
+    assert!(!is_read_only_call("git", &serde_json::json!({})));
     assert!(is_read_only_call(
         "run_command",
         &serde_json::json!({"command": "grep -n 'help_lines' newt-tui/src/lib.rs"})

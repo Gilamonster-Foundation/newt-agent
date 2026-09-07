@@ -76,7 +76,7 @@
         "name": "code_search"
       },
       {
-        "description": "Run a git operation via the embedded engine (grit-lib), gated by GitCaveats derived from the granted Caveats leash. ops: status | log | diff | add | commit | branch. Local-only; network ops (clone/fetch/push) are fail-closed. A write op (add/commit/branch) under a read-only grant is DENIED (isError). Returns structured JSON.",
+        "description": "Run a git operation via the embedded engine (grit-lib), gated by GitCaveats derived from the granted Caveats leash. Requires unrestricted fs_read because legacy repository reads are not path-confined. ops: status | log | diff | add | commit | branch. Local-only; network ops (clone/fetch/push) are fail-closed. A write op (add/commit/branch) under a read-only grant is DENIED (isError). Returns structured JSON.",
         "inputSchema": {
           "properties": {
             "limit": {

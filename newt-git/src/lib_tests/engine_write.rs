@@ -4,7 +4,7 @@ use super::*;
 fn add_then_commit_advances_history() {
     let dir = repo_with_commit();
     std::fs::write(dir.path().join("new.txt"), "data\n").unwrap();
-    let eng = GitEngine::open(dir.path()).unwrap();
+    let eng = GitEngine::open(dir.path(), &Scope::All).unwrap();
     let caps = GitCaveats::top();
 
     let staged = eng.add(&caps, &["new.txt".to_string()]).unwrap();
@@ -40,7 +40,7 @@ fn add_then_commit_advances_history() {
 #[test]
 fn branch_creates_a_ref_at_head() {
     let dir = repo_with_commit();
-    let eng = GitEngine::open(dir.path()).unwrap();
+    let eng = GitEngine::open(dir.path(), &Scope::All).unwrap();
     let refname = eng.branch(&GitCaveats::top(), "feat/x").unwrap();
     assert_eq!(refname, "refs/heads/feat/x");
     let ok = Command::new("git")
@@ -55,7 +55,7 @@ fn branch_creates_a_ref_at_head() {
 fn writes_fail_closed_without_capability() {
     let dir = repo_with_commit();
     std::fs::write(dir.path().join("new.txt"), "x\n").unwrap();
-    let eng = GitEngine::open(dir.path()).unwrap();
+    let eng = GitEngine::open(dir.path(), &Scope::All).unwrap();
     let author = Author {
         name: "B".into(),
         email: "b@b".into(),

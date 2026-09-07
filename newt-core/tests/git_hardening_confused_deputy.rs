@@ -94,3 +94,47 @@ fn hardened_git_ignores_user_and_system_config_and_still_reads_the_repo() {
         "a committed-clean tree reports empty porcelain status under hardened_git"
     );
 }
+
+/// Real native Git grounds the distinction between execution hardening and
+/// read confinement: repository configuration can include an external file.
+#[test]
+#[serial]
+fn scoped_metadata_refuses_repository_config_indirection_before_spawn() {
+    use newt_core::git_hardening::metadata_git;
+    use newt_core::Scope;
+    let repo = tempdir().unwrap();
+    let config = tempdir().unwrap();
+    assert!(hardened_git(repo.path(), &["init", "-q"])
+        .unwrap()
+        .status()
+        .unwrap()
+        .success());
+    let marker = "owned-outside-scope-metadata-canary";
+    let include = config.path().join("included-config");
+    std::fs::write(&include, format!("[newt]\nmetadataCanary = {marker}\n")).unwrap();
+    std::fs::write(
+        repo.path().join(".git/config"),
+        format!("[include]\npath = \"{}\"\n", include.display()),
+    )
+    .unwrap();
+    let args = ["config", "--get", "newt.metadataCanary"];
+    let control = metadata_git(repo.path(), &args, &Scope::All)
+        .unwrap()
+        .output()
+        .unwrap();
+    assert!(control.status.success(), "{control:?}");
+    assert!(
+        String::from_utf8_lossy(&control.stdout).contains(marker),
+        "{control:?}"
+    );
+    for scope in [
+        Scope::none(),
+        Scope::only([repo.path().to_string_lossy().into_owned()]),
+    ] {
+        let result = metadata_git(repo.path(), &args, &scope);
+        assert!(
+            matches!(result, Err(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied),
+            "scoped metadata must refuse before command construction"
+        );
+    }
+}

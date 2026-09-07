@@ -9,12 +9,14 @@ fn commit_carries_the_coauthor_trailer_in_the_message() {
         "add",
         &serde_json::json!({"paths": ["c.txt"]}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     t.dispatch(
         "commit",
         &serde_json::json!({"message": "add c"}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     // Inspect the real commit message via system git.
@@ -58,6 +60,7 @@ fn bare_model_subject_still_gets_harness_managed_attribution() {
         "add",
         &serde_json::json!({"paths": ["p.txt"]}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     // Bare subject, no attribution text whatsoever from the model.
@@ -65,6 +68,7 @@ fn bare_model_subject_still_gets_harness_managed_attribution() {
         "commit",
         &serde_json::json!({"message": "fix the parser"}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     let body = head_message(dir.path());
@@ -115,12 +119,14 @@ fn model_switch_between_commits_attributes_each_to_the_live_model() {
         "add",
         &serde_json::json!({"paths": ["c1.txt"]}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     t.dispatch(
         "commit",
         &serde_json::json!({"message": "c1 under model A"}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     let body_c1 = head_message(p);
@@ -143,12 +149,14 @@ fn model_switch_between_commits_attributes_each_to_the_live_model() {
         "add",
         &serde_json::json!({"paths": ["c2.txt"]}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     t.dispatch(
         "commit",
         &serde_json::json!({"message": "c2 under model B"}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     let body_c2 = head_message(p);
@@ -188,12 +196,14 @@ fn model_switch_between_commits_attributes_each_to_the_live_model() {
         "add",
         &serde_json::json!({"paths": ["c3.txt"]}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     t.dispatch(
         "commit",
         &serde_json::json!({"message": "c3 back under model A"}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     let body_c3 = head_message(p);
@@ -222,12 +232,14 @@ fn amend_after_a_model_switch_resigns_with_the_live_model() {
         "add",
         &serde_json::json!({"paths": ["c1.txt"]}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     t.dispatch(
         "commit",
         &serde_json::json!({"message": "orig under model A"}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     assert!(head_message(p).contains(" | Model: model-a | "));
@@ -243,12 +255,14 @@ fn amend_after_a_model_switch_resigns_with_the_live_model() {
         "add",
         &serde_json::json!({"paths": ["c2.txt"]}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     t.dispatch(
         "amend",
         &serde_json::json!({"message": "reworded under model B"}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     let body = head_message(p);
@@ -288,12 +302,14 @@ fn amend_with_no_message_refreshes_attribution_after_a_model_switch() {
         "add",
         &serde_json::json!({"paths": ["c1.txt"]}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     t.dispatch(
         "commit",
         &serde_json::json!({"message": "orig under model A"}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     let before = head_message(p);
@@ -314,10 +330,16 @@ fn amend_with_no_message_refreshes_attribution_after_a_model_switch() {
         "add",
         &serde_json::json!({"paths": ["c2.txt"]}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
-    t.dispatch("amend", &serde_json::json!({}), &GitCaveats::top())
-        .unwrap();
+    t.dispatch(
+        "amend",
+        &serde_json::json!({}),
+        &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
+    )
+    .unwrap();
     let body = head_message(p);
     assert!(
         body.contains(" | Model: model-b | "),
@@ -338,7 +360,12 @@ fn local_git_tool_status_renders_readable_text() {
     let dir = repo_with_commit();
     let t = tool(dir.path());
     let out = t
-        .dispatch("status", &serde_json::json!({}), &GitCaveats::top())
+        .dispatch(
+            "status",
+            &serde_json::json!({}),
+            &GitCaveats::top(),
+            &newt_core::caveats::Caveats::top(),
+        )
         .unwrap();
     assert!(out.contains("on branch main"), "got: {out}");
     assert!(out.contains("working tree clean"), "got: {out}");
