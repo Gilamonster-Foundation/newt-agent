@@ -4504,13 +4504,17 @@ impl PersonaStore {
     /// binding (FR-4, #1041) preloads `gila-personal-assistant`, and its
     /// `tools:` allow-list (already enforced by FR-1) restricts it to that
     /// skill's `modulex__*` MCP tools plus infra tools; FR-PA-4 needed no new
-    /// code since `filter_advertised_tools` already does this. A user who
-    /// deletes a default gets it back next launch; empty the file to suppress
-    /// it.
+    /// code since `filter_advertised_tools` already does this. `steady`,
+    /// `direct`, and `sociable` contain only communication-style preferences,
+    /// not capability or action-policy settings. A user who deletes a default
+    /// gets it back next launch; empty the file to suppress it.
     const DEFAULT_PERSONAS: &'static [(&'static str, &'static str)] = &[
         (Self::DEFAULT_NAME, newt_core::DEFAULT_SOUL),
         ("coach", COACH_PERSONA),
         ("personal-assistant", PERSONAL_ASSISTANT_PERSONA),
+        ("steady", include_str!("../../personas/steady.md")),
+        ("direct", include_str!("../../personas/direct.md")),
+        ("sociable", include_str!("../../personas/sociable.md")),
     ];
 
     fn ensure_defaults(&self) -> anyhow::Result<()> {

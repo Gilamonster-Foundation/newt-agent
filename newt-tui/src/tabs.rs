@@ -46,6 +46,16 @@
 use newt_core::lifecycle::SessionId;
 use newt_core::prompt::TurnPromptContext;
 
+/// A session-only persona choice, never a cached capability-bearing profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersonaSelection {
+    Absent,
+    /// Reload the current file during activation preflight.
+    Named(String),
+    /// A runtime altitude carrier, not a same-named persona file.
+    SyntheticAltitude(newt_core::Altitude),
+}
+
 /// Session-shaped state that the conversation row does not persist, stashed
 /// while a tab is inactive.
 ///
@@ -56,6 +66,13 @@ use newt_core::prompt::TurnPromptContext;
 /// silently finishing another tab's work.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TabSidecar {
+    /// Unsaved style overrides for this conversation; omitted axes inherit
+    /// the active persona. Never copied into a capability-bearing profile.
+    pub personality: newt_core::role_profile::PersonalityTraits,
+    /// Last persona choice, captured when leaving a tab. `None` means
+    /// uncaptured, distinct from a known absent persona. Named selections
+    /// reload from the store, never from cached authority metadata.
+    pub persona_selection: Option<PersonaSelection>,
     /// Turns taken in this tab's current conversation; feeds close-time
     /// extraction.
     pub turns_this_conversation: u32,
@@ -146,7 +163,12 @@ impl TabState {
     /// does not make this a different session, and anything already attributed
     /// to this tab must stay attributed to it.
     pub fn hold_conversation(&mut self, conversation_id: impl Into<String>) {
-        self.conversation_id = conversation_id.into();
+        let conversation_id = conversation_id.into();
+        if self.conversation_id != conversation_id {
+            self.sidecar.personality = Default::default();
+            self.sidecar.persona_selection = None;
+            self.conversation_id = conversation_id;
+        }
     }
 }
 
@@ -709,6 +731,54 @@ mod tests {
             *set.active().session_id(),
             before,
             "resuming another conversation does not make this a different session"
+        );
+    }
+
+    #[test]
+    fn personality_overrides_are_tab_local_and_reset_only_for_a_new_conversation() {
+        use newt_core::role_profile::{PersonalityLevel, PersonalityTraits};
+        let mut set = TabSet::new(sid(1), "conv-1");
+        let a = PersonalityTraits {
+            warmth: Some(PersonalityLevel::try_from(80).unwrap()),
+            ..Default::default()
+        };
+        set.active_mut().sidecar.personality = a;
+        set.active_mut().sidecar.persona_selection = Some(PersonaSelection::Named("steady".into()));
+        let (second, _) = set.open(sid(2), "conv-2");
+        let _ = set.activate(second).unwrap();
+        assert_eq!(
+            set.active().sidecar.personality,
+            PersonalityTraits::default()
+        );
+        set.active_mut().sidecar.personality.extraversion =
+            Some(PersonalityLevel::try_from(0).unwrap());
+        let _ = set.activate(0).unwrap();
+        assert_eq!(
+            set.active().sidecar.personality,
+            a,
+            "return to A's own choices"
+        );
+        set.active_mut().hold_conversation("conv-1");
+        assert_eq!(
+            set.active().sidecar.persona_selection,
+            Some(PersonaSelection::Named("steady".into()))
+        );
+        assert_eq!(
+            set.active().sidecar.personality,
+            a,
+            "reconciliation is not a reset"
+        );
+        set.active_mut().hold_conversation("conv-3");
+        assert_eq!(set.active().sidecar.persona_selection, None);
+        assert_eq!(
+            set.active().sidecar.personality,
+            PersonalityTraits::default()
+        );
+        let _ = set.activate(second).unwrap();
+        assert_eq!(
+            set.active().sidecar.personality.extraversion,
+            Some(PersonalityLevel::try_from(0).unwrap()),
+            "B was not reset with A"
         );
     }
 

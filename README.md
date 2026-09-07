@@ -82,6 +82,24 @@ Tool output renders through a bounded, tail-biased spill that `/spill` tunes
 server, doctor, config, …) — the binary is the authority on its own surface, this
 file is not. Python bindings live in [`newt-agent-py/`](./newt-agent-py/).
 
+## Explore the TUI
+
+Start with the [settings walkthroughs](./demos/README.md), organized by what
+you want to control:
+
+| Control | Walkthrough |
+|---|---|
+| Session and presentation | [Settings, apply/cancel, and receipts](./demos/README.md#session-settings-and-presentation) |
+| Inference | [Backends and models](./demos/README.md#backends-and-models) |
+| Working style | [Psyche and named personas](./demos/README.md#psyche-and-personas) |
+| Authority | [Permissions and posture](./demos/README.md#permissions-and-posture) |
+| Context | [Context controls](./demos/README.md#context-controls) |
+
+The reusable widgets have their own [newtui demo gallery](https://github.com/Gilamonster-Foundation/newtui/tree/main/demos).
+Its [settings recording](https://github.com/Gilamonster-Foundation/newtui/blob/main/demos/settings.gif)
+demonstrates the standalone component; the walkthroughs above describe Newt's
+application workflows.
+
 ## Why Newt
 
 An agent *harness* helps the model do work; a **bridle** lets the operator

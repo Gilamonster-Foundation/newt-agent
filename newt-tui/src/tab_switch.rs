@@ -31,7 +31,7 @@
 //! Claims are held throughout: both the outgoing and incoming conversations
 //! stay claimed across a switch. Only **close** and **exit** release.
 
-use crate::tabs::{TabError, TabSet};
+use crate::tabs::{PersonaSelection, TabError, TabSet};
 
 /// The live session state a switch reads and rewrites.
 ///
@@ -141,6 +141,17 @@ impl TabSwitchCtx<'_> {
             tabs.active_mut().fresh_seed = None;
         }
         let outgoing = tabs.active_mut();
+        outgoing.sidecar.persona_selection = Some(match self.active_persona.as_ref() {
+            None => PersonaSelection::Absent,
+            Some(persona) => match persona
+                .profile
+                .altitude
+                .filter(|_| persona.path.as_os_str().is_empty())
+            {
+                Some(altitude) => PersonaSelection::SyntheticAltitude(altitude),
+                None => PersonaSelection::Named(persona.name.clone()),
+            },
+        });
         outgoing.sidecar.turns_this_conversation = *self.turns_this_conversation as u32;
         outgoing.sidecar.last_resume_listing = std::mem::take(self.last_resume_listing);
         outgoing.sidecar.active_roadmap_id = self.active_roadmap_id.take();
@@ -220,6 +231,7 @@ fn preflight(
     store: &newt_core::ConversationStore,
     persona_store: &crate::PersonaStore,
     id: &str,
+    persona_selection: Option<&PersonaSelection>,
 ) -> Result<PreparedIncoming, TabError> {
     #[cfg(test)]
     if let Some(reason) = test_seam::forced_failure(id) {
@@ -227,7 +239,27 @@ fn preflight(
     }
     match store.exists(id) {
         Ok(true) => match crate::prepare_conversation_restore(store, persona_store, id) {
-            Ok(prepared) => Ok(PreparedIncoming::Materialized(Box::new(prepared))),
+            Ok(mut prepared) => {
+                if let Some(selection) = persona_selection {
+                    prepared.persona = match selection {
+                        PersonaSelection::Absent => None,
+                        PersonaSelection::Named(name) => {
+                            Some(persona_store.load(name).map_err(|e| {
+                                TabError::PreflightFailed {
+                                    reason: format!(
+                                        "its selected persona `{name}` could not be read ({e})"
+                                    ),
+                                }
+                            })?)
+                        }
+                        PersonaSelection::SyntheticAltitude(altitude) => {
+                            Some(crate::synthetic_altitude_persona(*altitude))
+                        }
+                    };
+                    prepared.persona_warning = None;
+                }
+                Ok(PreparedIncoming::Materialized(Box::new(prepared)))
+            }
             Err(e) => Err(TabError::PreflightFailed {
                 reason: format!("its conversation could not be read ({e})"),
             }),
@@ -359,18 +391,22 @@ pub(crate) fn activate_tab(
     tabs: &mut TabSet,
     target: usize,
 ) -> Result<TransitionOutcome, TabError> {
-    let incoming_id = tabs
+    let incoming_tab = tabs
         .get(target)
-        .ok_or(TabError::OutOfRange { open: tabs.len() })?
-        .conversation_id()
-        .to_string();
+        .ok_or(TabError::OutOfRange { open: tabs.len() })?;
+    let incoming_id = incoming_tab.conversation_id().to_string();
     if target == tabs.active_index() {
         return Ok(TransitionOutcome {
             url_changed: false,
             degraded: tabs.active().pin_degraded.clone(),
         });
     }
-    let incoming = preflight(ctx.store, ctx.persona_store, &incoming_id)?;
+    let incoming = preflight(
+        ctx.store,
+        ctx.persona_store,
+        &incoming_id,
+        incoming_tab.sidecar.persona_selection.as_ref(),
+    )?;
 
     ctx.deactivate(tabs);
     let handoff = tabs.activate(target)?;

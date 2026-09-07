@@ -358,7 +358,7 @@ fn retry_step_reprompts_until_the_budget_is_spent() {
 #[test]
 fn inline_header_color_contains_brand_and_ready_lines() {
     let s = render_inline_header("/w", true);
-    assert!(s.contains("Free, friendly, local agentic coder"));
+    assert!(s.contains("Part of Newt-Agent, a free, friendly, local agentic coder."));
     assert!(s.contains(&format!("v{VERSION}")));
     assert!(s.contains("ready — type a task, /help for commands, /exit to quit"));
     // Text is placed just past the 20-col logo via absolute column moves.

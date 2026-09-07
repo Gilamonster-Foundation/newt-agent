@@ -49,6 +49,7 @@
 //! dispatch site, worker/MCP entry points reading the profile) is a deliberate
 //! follow-up. See `docs/design/role-profiles.md`.
 
+use content_addressable::{canonical, ContentAddressable, ContentError};
 use serde::{Deserialize, Serialize};
 
 use crate::router::Tier;
@@ -105,6 +106,170 @@ pub struct RoleProfile {
     /// CREW — when `true`, this persona runs with the multi-agent crew (`/team`)
     /// on by default. `None`/`false` = single-agent. Enforcement is a follow-up.
     pub crew: Option<bool>,
+    /// Operator-selected communication style. Unspecified traits inherit the
+    /// persona/backend's style; these levels never confer tool authority.
+    pub personality: Option<PersonalityTraits>,
+}
+
+/// An operator-selected style level, not a psychological measurement.
+/// Construction and deserialization both enforce the inclusive 0..=100 range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u8")]
+pub struct PersonalityLevel(u8);
+
+impl PersonalityLevel {
+    /// The validated integer selected by the operator.
+    #[must_use]
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl TryFrom<u8> for PersonalityLevel {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value <= 100 {
+            Ok(Self(value))
+        } else {
+            Err("personality levels must be integers from 0 through 100")
+        }
+    }
+}
+
+/// The shared ordering and names used by the persona parser and style controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersonalityTrait {
+    Agreeableness,
+    Extraversion,
+    Warmth,
+    Approachability,
+    ProsocialBehavior,
+}
+
+impl PersonalityTrait {
+    pub const ALL: [Self; 5] = [
+        Self::Agreeableness,
+        Self::Extraversion,
+        Self::Warmth,
+        Self::Approachability,
+        Self::ProsocialBehavior,
+    ];
+
+    /// The stable TOML field name.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Agreeableness => "agreeableness",
+            Self::Extraversion => "extraversion",
+            Self::Warmth => "warmth",
+            Self::Approachability => "approachability",
+            Self::ProsocialBehavior => "prosocial_behavior",
+        }
+    }
+
+    /// The operator-facing name.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ProsocialBehavior => "prosocial behavior",
+            _ => self.key(),
+        }
+    }
+
+    /// The lower/higher communication behavior this operator preference selects.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Agreeableness => "Lower: candid/challenging; higher: collaborative framing, without agreeing with incorrect claims.",
+            Self::Extraversion => "Lower: reserved; higher: conversational, without unsolicited actions.",
+            Self::Warmth => "Lower: neutral; higher: reassuring.",
+            Self::Approachability => "Lower: formal; higher: accessible.",
+            Self::ProsocialBehavior => "Lower: task-focused; higher: considering affected people/helpfulness, still no unauthorized acts.",
+        }
+    }
+}
+
+/// Optional style selections carried by the existing role-profile record.
+/// `None` is unspecified, not an implicit midpoint. These are communication
+/// preferences only: neither authority nor honesty is adjustable here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct PersonalityTraits {
+    pub agreeableness: Option<PersonalityLevel>,
+    pub extraversion: Option<PersonalityLevel>,
+    pub warmth: Option<PersonalityLevel>,
+    pub approachability: Option<PersonalityLevel>,
+    pub prosocial_behavior: Option<PersonalityLevel>,
+}
+
+impl PersonalityTraits {
+    #[must_use]
+    pub fn get(&self, kind: PersonalityTrait) -> Option<PersonalityLevel> {
+        match kind {
+            PersonalityTrait::Agreeableness => self.agreeableness,
+            PersonalityTrait::Extraversion => self.extraversion,
+            PersonalityTrait::Warmth => self.warmth,
+            PersonalityTrait::Approachability => self.approachability,
+            PersonalityTrait::ProsocialBehavior => self.prosocial_behavior,
+        }
+    }
+
+    pub fn set(&mut self, kind: PersonalityTrait, level: Option<PersonalityLevel>) {
+        let slot = match kind {
+            PersonalityTrait::Agreeableness => &mut self.agreeableness,
+            PersonalityTrait::Extraversion => &mut self.extraversion,
+            PersonalityTrait::Warmth => &mut self.warmth,
+            PersonalityTrait::Approachability => &mut self.approachability,
+            PersonalityTrait::ProsocialBehavior => &mut self.prosocial_behavior,
+        };
+        *slot = level;
+    }
+
+    /// Resolve only unspecified axes from the inherited persona. Explicit zero
+    /// is a selection, not an inheritance sentinel.
+    #[must_use]
+    pub fn resolve(mut self, inherited: Option<Self>) -> Self {
+        if let Some(inherited) = inherited {
+            for kind in PersonalityTrait::ALL {
+                self.set(kind, self.get(kind).or(inherited.get(kind)));
+            }
+        }
+        self
+    }
+
+    /// One communication-style overlay, omitted entirely when no axis is set.
+    /// The same canonical trait vocabulary drives both controls and rendering.
+    #[must_use]
+    pub fn prompt_block(&self) -> String {
+        let lines: Vec<_> = PersonalityTrait::ALL
+            .into_iter()
+            .filter_map(|kind| {
+                self.get(kind).map(|level| {
+                    format!(
+                        "- {}: {}/100\n  {}",
+                        kind.label(),
+                        level.get(),
+                        kind.describe()
+                    )
+                })
+            })
+            .collect();
+        if lines.is_empty() {
+            return String::new();
+        }
+        format!(
+            "## Communication style\nOperator-selected communication-style levels (0-100):\n{}\n\n\
+             These are communication-style preferences, not psychological measurements. They do not change tool authority, tenacity, or honesty. Remain civil and respectful even at low levels.",
+            lines.join("\n")
+        )
+    }
+}
+
+impl ContentAddressable for PersonalityTraits {
+    fn canonical_form(&self) -> Result<Vec<u8>, ContentError> {
+        canonical::to_canonical_dagcbor(self)
+    }
 }
 
 /// The persona's operating altitude (FR-5, #999). Decides whether the base
@@ -243,6 +408,8 @@ struct FrontMatter {
     tenacity: Option<Tenacity>,
     #[serde(default)]
     crew: Option<bool>,
+    #[serde(default)]
+    personality: Option<PersonalityTraits>,
 }
 
 /// A small, human-friendly serde shape for an agent-bridle capability profile.
@@ -594,7 +761,38 @@ impl RoleProfile {
             cognition: fm.cognition,
             tenacity: fm.tenacity,
             crew: fm.crew,
+            personality: fm.personality,
         })
+    }
+
+    /// Serialize all known metadata and the prompt through the existing TOML
+    /// envelope. Preserves parsed semantics, not source comments/formatting.
+    /// An empty envelope keeps a metadata-like prompt body unambiguous.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the front-matter cannot be serialized as TOML or
+    /// would exceed the envelope limit or contain a closing-fence line.
+    pub fn to_markdown(&self) -> anyhow::Result<String> {
+        let front_matter = FrontMatter {
+            role: self.role.clone(),
+            tools: self.tools.clone(),
+            skills: self.skills.clone(),
+            caveats: self.caveats.clone(),
+            model: self.model.clone(),
+            tier: self.tier,
+            altitude: self.altitude,
+            backend: self.backend.clone(),
+            cognition: self.cognition,
+            tenacity: self.tenacity,
+            crew: self.crew,
+            personality: self.personality,
+        };
+        crate::markup::assemble_newt_metadata(
+            &toml::to_string(&front_matter)?,
+            &format!("\n{}\n", self.prompt),
+        )
+        .map_err(Into::into)
     }
 
     /// `true` when this profile declares more than a prompt (i.e. front-matter
@@ -613,6 +811,7 @@ impl RoleProfile {
             || self.cognition.is_some()
             || self.tenacity.is_some()
             || self.crew.is_some()
+            || self.personality.is_some()
     }
 
     /// Load a named persona `.md` file from `dir` (#1021 PR 5.2 — the
@@ -751,6 +950,323 @@ You are Bob, a researcher.
         assert_eq!(rp.cognition, Some(Cognition::Pondering));
         assert!(rp.is_role_bound());
         assert_eq!(Cognition::default(), Cognition::Deliberating);
+    }
+
+    const PERSONALITY_TRAITS: [&str; 5] = [
+        "agreeableness",
+        "extraversion",
+        "warmth",
+        "approachability",
+        "prosocial_behavior",
+    ];
+
+    /// These integers are operator-selected style levels, not psychological
+    /// measurements. Every inclusive 0..=100 value must be accepted, and even
+    /// one explicitly selected trait makes the persona more than prompt-only.
+    #[test]
+    fn personality_only_front_matter_is_role_bound_for_each_valid_level() {
+        for (trait_name, trait_kind) in PERSONALITY_TRAITS.into_iter().zip(PersonalityTrait::ALL) {
+            assert_eq!(trait_kind.key(), trait_name);
+            for level in 0..=100 {
+                let text = format!(
+                    "+++\n[personality]\n{trait_name} = {level}\n+++\n\n# Friendly coder\n"
+                );
+                let rp = RoleProfile::parse(&text).unwrap();
+                assert!(
+                    rp.is_role_bound(),
+                    "{trait_name} = {level} must bind the role"
+                );
+                assert_eq!(rp.prompt, "# Friendly coder");
+                let traits = rp.personality.unwrap();
+                assert_eq!(traits.get(trait_kind).unwrap().get(), level);
+                for other in PersonalityTrait::ALL {
+                    if other != trait_kind {
+                        assert_eq!(traits.get(other), None);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn personality_traits_refuse_out_of_range_and_non_integer_levels() {
+        for trait_name in PERSONALITY_TRAITS {
+            for invalid in [
+                "-1", "101", "255", "256", "1.0", "nan", "inf", "\"50\"", "true", "[]", "{}",
+            ] {
+                let text = format!(
+                    "+++\n[personality]\n{trait_name} = {invalid}\n+++\n\n# Friendly coder\n"
+                );
+                assert!(
+                    RoleProfile::parse(&text).is_err(),
+                    "{trait_name} = {invalid} must be refused, not ignored or clamped"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn personality_metadata_preserves_the_complete_restrictive_role() {
+        let metadata = r#"role = "reviewer"
+tools = ["read_file"]
+skills = ["review-guidance"]
+altitude = "coach"
+model = "local-test-model"
+backend = "local"
+tier = "REVIEW"
+cognition = "pondering"
+tenacity = "relaxed"
+crew = false
+
+[caveats]
+fs_read = ["workspace"]
+fs_write = "none"
+exec = "none"
+net = "none"
+max_calls = 7
+"#;
+        let body = "# Reviewer\n\nExplain findings without editing files.";
+        let baseline = RoleProfile::parse(&format!("+++\n{metadata}+++\n\n{body}")).unwrap();
+        let personality = "[personality]\nagreeableness = 0\nextraversion = 25\nwarmth = 50\napproachability = 75\nprosocial_behavior = 100\n";
+        let styled =
+            RoleProfile::parse(&format!("+++\n{metadata}\n{personality}+++\n\n{body}")).unwrap();
+
+        assert!(styled.is_role_bound());
+        assert_eq!(styled.prompt, baseline.prompt);
+        assert_eq!(styled.role, baseline.role);
+        assert_eq!(styled.tools, baseline.tools);
+        assert_eq!(styled.skills, baseline.skills);
+        assert_eq!(styled.altitude, baseline.altitude);
+        assert_eq!(styled.model, baseline.model);
+        assert_eq!(styled.backend, baseline.backend);
+        assert_eq!(styled.tier, baseline.tier);
+        assert_eq!(styled.cognition, baseline.cognition);
+        assert_eq!(styled.tenacity, baseline.tenacity);
+        assert_eq!(styled.crew, baseline.crew);
+        assert_eq!(styled.caveats, baseline.caveats);
+        let mut escaped = styled.clone();
+        escaped.backend = Some("local \"quoted\" \\ route".to_string());
+        escaped
+            .prompt
+            .push_str("\n\nKeep `code`, \"quotes\", and \\ paths.");
+        let encoded = escaped.to_markdown().unwrap();
+        assert_eq!(RoleProfile::parse(&encoded).unwrap(), escaped);
+        let caveats = styled.caveats.unwrap().to_caveats();
+        assert_eq!(caveats.fs_read, Scope::only(["workspace".to_string()]));
+        assert_eq!(caveats.fs_write, Scope::none());
+        assert_eq!(caveats.exec, Scope::none());
+        assert_eq!(caveats.net, Scope::none());
+        assert_eq!(caveats.max_calls, CountBound::AtMost(7));
+    }
+
+    #[test]
+    fn to_markdown_preserves_prompt_only_semantics_even_with_a_metadata_like_body() {
+        for body in ["# Friendly coder", "+++\nThis is body text, not TOML.\n+++"] {
+            let profile = RoleProfile {
+                prompt: body.to_string(),
+                ..RoleProfile::default()
+            };
+            let decoded = RoleProfile::parse(&profile.to_markdown().unwrap()).unwrap();
+            assert_eq!(decoded, profile);
+            assert!(!decoded.is_role_bound());
+        }
+    }
+
+    #[test]
+    fn to_markdown_refuses_metadata_that_serializes_as_an_envelope_fence() {
+        // Escaped newlines make this a valid input profile, but the TOML writer
+        // emits a multiline value containing an actual closing-fence line.
+        let profile =
+            RoleProfile::parse("+++\nrole = \"reviewer\\n+++\\nextra\"\n+++\n\n# Reviewer\n")
+                .expect("escaped metadata is a valid source profile");
+        assert_eq!(profile.role.as_deref(), Some("reviewer\n+++\nextra"));
+        let error = profile
+            .to_markdown()
+            .expect_err("refuse an unreadable envelope before a saver can overwrite its source");
+        assert!(matches!(
+            error.downcast_ref::<crate::markup::EnvelopeError>(),
+            Some(crate::markup::EnvelopeError::FrontMatterContainsFence)
+        ));
+    }
+
+    #[test]
+    fn to_markdown_refuses_a_style_edit_that_outgrows_a_valid_envelope() {
+        let limit = crate::markup::MAX_ENVELOPE_BYTES;
+        let metadata = format!("role = \"{}\"\n", "r".repeat(limit - "role = \"\"\n".len()));
+        assert_eq!(metadata.len(), limit);
+        let mut profile = RoleProfile::parse(&format!("+++\n{metadata}+++\n\n# Reviewer\n"))
+            .expect("the source metadata fits exactly within the envelope limit");
+        let unchanged = profile
+            .to_markdown()
+            .expect("unchanged metadata still fits");
+        assert_eq!(RoleProfile::parse(&unchanged).unwrap(), profile);
+        profile.personality = Some(PersonalityTraits {
+            warmth: Some(PersonalityLevel::try_from(0).unwrap()),
+            ..Default::default()
+        });
+        let error = profile
+            .to_markdown()
+            .expect_err("a valid style edit must not save an oversized envelope");
+        assert!(matches!(
+            error.downcast_ref::<crate::markup::EnvelopeError>(),
+            Some(crate::markup::EnvelopeError::Oversized { bytes }) if *bytes > limit
+        ));
+    }
+
+    #[test]
+    fn personality_accessors_preserve_independent_values_and_content_identity() {
+        use content_addressable::ContentAddressable;
+
+        let mut traits = PersonalityTraits::default();
+        let initial_id = traits.content_id().unwrap();
+        for (index, kind) in PersonalityTrait::ALL.into_iter().enumerate() {
+            traits.set(
+                kind,
+                Some(PersonalityLevel::try_from((index * 25) as u8).unwrap()),
+            );
+        }
+        for (index, kind) in PersonalityTrait::ALL.into_iter().enumerate() {
+            assert_eq!(traits.get(kind).unwrap().get(), (index * 25) as u8);
+        }
+        assert_ne!(traits.content_id().unwrap(), initial_id);
+        let decoded: PersonalityTraits =
+            toml::from_str(&toml::to_string(&traits).unwrap()).unwrap();
+        assert_eq!(decoded.content_id().unwrap(), traits.content_id().unwrap());
+        for kind in PersonalityTrait::ALL {
+            traits.set(kind, None);
+        }
+        assert_eq!(traits.content_id().unwrap(), initial_id);
+        assert!(PersonalityLevel::try_from(101).is_err());
+        assert!(toml::from_str::<PersonalityTraits>("warmht = 50").is_err());
+    }
+
+    #[test]
+    fn personality_prompt_block_omits_unspecified_traits_and_keeps_style_guardrails() {
+        for kind in PersonalityTrait::ALL {
+            for level in [0, 50, 100] {
+                let mut traits = PersonalityTraits::default();
+                traits.set(kind, Some(PersonalityLevel::try_from(level).unwrap()));
+                let block = traits.prompt_block();
+                assert!(block.starts_with("## Communication style\n"), "{block}");
+                assert!(block.contains("Operator-selected communication-style levels (0-100)"));
+                let line = format!("- {}: {level}/100", kind.label());
+                assert_eq!(
+                    block.lines().filter(|candidate| *candidate == line).count(),
+                    1
+                );
+                for other in PersonalityTrait::ALL {
+                    if other != kind {
+                        assert!(!block.contains(&format!("- {}:", other.label())), "{block}");
+                    }
+                }
+                let meaning = match kind {
+                    PersonalityTrait::Agreeableness => [
+                        "candid/challenging",
+                        "collaborative framing",
+                        "without agreeing with incorrect claims",
+                    ],
+                    PersonalityTrait::Extraversion => {
+                        ["reserved", "conversational", "without unsolicited actions"]
+                    }
+                    PersonalityTrait::Warmth => ["neutral", "reassuring", "Lower"],
+                    PersonalityTrait::Approachability => ["formal", "accessible", "Lower"],
+                    PersonalityTrait::ProsocialBehavior => [
+                        "task-focused",
+                        "affected people/helpfulness",
+                        "no unauthorized acts",
+                    ],
+                };
+                for fragment in meaning {
+                    assert!(
+                        block.contains(fragment),
+                        "{} meaning missing: {block}",
+                        kind.key()
+                    );
+                }
+                assert!(block
+                    .contains("communication-style preferences, not psychological measurements"));
+                assert!(block.contains("do not change tool authority, tenacity, or honesty"));
+                assert!(block.contains("Remain civil and respectful even at low levels"));
+            }
+        }
+    }
+
+    #[test]
+    fn personality_prompt_block_is_empty_for_inherited_style_and_has_one_canonical_order() {
+        let mut traits = PersonalityTraits::default();
+        assert!(traits.prompt_block().is_empty());
+        for kind in PersonalityTrait::ALL.into_iter().rev() {
+            traits.set(kind, Some(PersonalityLevel::try_from(25).unwrap()));
+        }
+        let block = traits.prompt_block();
+        let lines: Vec<_> = block
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .collect();
+        let expected: Vec<_> = PersonalityTrait::ALL
+            .into_iter()
+            .map(|kind| format!("- {}: 25/100", kind.label()))
+            .collect();
+        assert_eq!(lines, expected);
+        assert_eq!(block.matches("## Communication style").count(), 1);
+        for kind in PersonalityTrait::ALL {
+            traits.set(kind, None);
+        }
+        assert!(traits.prompt_block().is_empty());
+    }
+
+    #[test]
+    fn personality_resolve_inherits_each_axis_but_explicit_zero_overrides_it() {
+        for kind in PersonalityTrait::ALL {
+            for level in [0, 100] {
+                let mut inherited = PersonalityTraits::default();
+                inherited.set(kind, Some(PersonalityLevel::try_from(level).unwrap()));
+                assert_eq!(
+                    PersonalityTraits::default().resolve(Some(inherited)),
+                    inherited
+                );
+                let mut explicit = PersonalityTraits::default();
+                explicit.set(kind, Some(PersonalityLevel::try_from(0).unwrap()));
+                assert_eq!(explicit.resolve(Some(inherited)), explicit);
+                assert_eq!(explicit.resolve(None), explicit);
+            }
+        }
+        assert_eq!(
+            PersonalityTraits::default().resolve(None),
+            PersonalityTraits::default()
+        );
+    }
+
+    #[test]
+    fn personality_resolve_combines_mixed_overrides_without_changing_unspecified_axes() {
+        let level = |value| Some(PersonalityLevel::try_from(value).unwrap());
+        let inherited = PersonalityTraits {
+            agreeableness: level(100),
+            extraversion: level(0),
+            warmth: level(25),
+            approachability: level(75),
+            prosocial_behavior: None,
+        };
+        let overrides = PersonalityTraits {
+            agreeableness: level(0),
+            extraversion: None,
+            warmth: level(100),
+            approachability: None,
+            prosocial_behavior: level(50),
+        };
+        let expected = PersonalityTraits {
+            agreeableness: level(0),
+            extraversion: level(0),
+            warmth: level(100),
+            approachability: level(75),
+            prosocial_behavior: level(50),
+        };
+        assert_eq!(overrides.resolve(Some(inherited)), expected);
+        assert_eq!(overrides.resolve(None), overrides);
+        assert_eq!(
+            overrides.resolve(Some(PersonalityTraits::default())),
+            overrides
+        );
     }
 
     #[test]

@@ -37,7 +37,7 @@ pub(crate) const LOGO_PLAIN: &str = include_str!("../../docs/logos/newt-ascii-40
 // partial override (or a wrong path) degrades gracefully rather than crashing.
 
 const DEFAULT_BRAND_NAME: &str = "newt";
-const DEFAULT_BRAND_TAGLINE: &str = "Free, friendly, local agentic coder";
+const DEFAULT_BRAND_TAGLINE: &str = "Part of Newt-Agent, a free, friendly, local agentic coder.";
 
 /// Pure core of [`brand_logo`]: resolve a logo from explicit override inputs so
 /// it is testable without mutating process-wide env. A missing dir, empty dir,
@@ -210,6 +210,23 @@ pub(crate) fn splash_top_header(context: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_tagline_names_the_parent_project_and_keeps_host_overrides() {
+        let expected = "Part of Newt-Agent, a free, friendly, local agentic coder.";
+        assert_eq!(brand_or(None, DEFAULT_BRAND_TAGLINE), expected);
+        assert_eq!(
+            brand_or(Some(String::new()), DEFAULT_BRAND_TAGLINE),
+            expected
+        );
+        assert_eq!(
+            brand_or(
+                Some("Host's own tagline".to_string()),
+                DEFAULT_BRAND_TAGLINE
+            ),
+            "Host's own tagline"
+        );
+    }
+
     use super::*;
 
     #[test]

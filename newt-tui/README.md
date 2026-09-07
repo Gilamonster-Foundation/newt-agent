@@ -4,10 +4,27 @@ Newt-Agent's terminal-facing chat, input, and active-tool presentation layer.
 
 A lean chat + agentic-coding TUI in the spirit of Codex / Claude Code,
 deliberately scoped to chat and agentic coding — not feature-rich. Splash +
-chat REPL + slash commands + ocap-gated tool use. It is NOT a settings UI:
-configuration is plain `~/.newt/config.toml` (see `newt config`), and the
+chat REPL + slash commands + ocap-gated tool use. Durable configuration lives
+in plain `~/.newt/config.toml` (see `newt config`), and the
 setup wizards (`newt init` / `newt setup`) probe for local or remote models and
 write that file plus one `backends/*.toml` drop-in per endpoint.
+
+## Settings and communication style
+
+The rich TUI offers `/settings`, `/backends`, `/models`, and `/psyche` controls.
+Their apply, cancel, and save behavior is documented in the
+[settings walkthroughs](../demos/README.md); a session change is not automatically
+a saved configuration change.
+
+`/psyche` includes independent agreeableness, extraversion, warmth,
+approachability, and prosocial-behavior dials. Select `steady`, `direct`, or
+`sociable`, adjust values from 0 through 100, and use `auto` to inherit a
+persona's value. Enter applies the draft; Esc cancels. `:w <name>` saves a named
+persona, while `:wq <name>` saves and applies. Existing names need explicit `!`
+overwrite. Style remains separate from cognition, tenacity, and tool authority.
+
+See [personality and named personas](../docs/guide/personality.md) for tab-local
+overrides, save/reload behavior, and the meaning of each preference.
 
 ## Context summaries
 

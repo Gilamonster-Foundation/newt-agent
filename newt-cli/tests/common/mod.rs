@@ -163,6 +163,30 @@ pub fn isolate<C: CommandEnv>(cmd: &mut C, root: &Path) {
     cmd.pin_cwd(root);
 }
 
+/// The same config isolation for a deterministic loopback chat fixture, without
+/// ambient authority/UI overrides, helper connections, or outbound proxies.
+/// Set the fixture's explicit chat options only after calling this helper.
+pub fn isolate_loopback_chat<C: CommandEnv>(cmd: &mut C, root: &Path) {
+    isolate(cmd, root);
+    for (key, _) in std::env::vars_os() {
+        if let Some(key) = key.to_str() {
+            if key.starts_with("NEWT_") || key.starts_with("HERDR_") {
+                cmd.scrub(key);
+            }
+        }
+    }
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        cmd.scrub(key);
+    }
+}
+
 /// A `newt` command that cannot see the developer's configuration, and the
 /// throwaway root it is pinned to.
 ///

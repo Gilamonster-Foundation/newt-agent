@@ -159,7 +159,7 @@ impl Harness {
         let (_, handoff) = tabs.open(new_session_id(), id);
         *ctx.active_conversation_id = id.to_string();
         let incoming =
-            preflight(ctx.store, ctx.persona_store, id).expect("fixture row must preflight");
+            preflight(ctx.store, ctx.persona_store, id, None).expect("fixture row must preflight");
         ctx.commit_incoming(tabs, id, incoming);
         handoff.apply();
     }
@@ -348,8 +348,8 @@ fn persona_named(name: &str) -> crate::Persona {
 
 /// A fresh tab owns its persona rather than borrowing the session's.
 ///
-/// Create B while persona **P** is active, visit a conversation whose
-/// persona is **Q**, return to still-rowless B: B must be back on P.
+/// Create B while persona **P** is active, select **Q** in A, then return
+/// to still-rowless B: B must be back on P.
 /// Before the seed, the `Fresh` arm restored no persona at all, so B
 /// silently ran under Q — and would have been STAMPED with Q at its first
 /// prompt, permanently, since the store has no persona UPDATE path.
@@ -357,11 +357,18 @@ fn persona_named(name: &str) -> crate::Persona {
 fn a_rowless_tab_keeps_its_own_persona_across_a_visit_to_another() {
     let _g = guard();
     let (mut h, mut tabs) = Harness::new(&["sol"]);
+    let dir = h._root.path().join("personas");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("p.md"), "Be helpful as persona P.").unwrap();
+    std::fs::write(dir.join("q.md"), "Be helpful as persona Q.").unwrap();
+    h.persona_store = crate::PersonaStore::new(dir);
+    let p = h.persona_store.load("p").unwrap();
+    let q = h.persona_store.load("q").unwrap();
     let a = h.active_conversation_id.clone();
     h.store.create_with_id(&a, "A", None).unwrap();
 
     // P is active when B is created.
-    h.active_persona = Some(persona_named("P"));
+    h.active_persona = Some(p.clone());
     {
         let mut ctx = h.ctx();
         let _ = create_fresh_tab(&mut ctx, &mut tabs).unwrap();
@@ -369,24 +376,27 @@ fn a_rowless_tab_keeps_its_own_persona_across_a_visit_to_another() {
     let b = h.active_conversation_id.clone();
     assert!(!h.store.exists(&b).unwrap(), "B is rowless");
     assert_eq!(
-        h.active_persona.as_ref().map(|p| p.name.as_str()),
-        Some("P"),
+        h.active_persona,
+        Some(p.clone()),
         "a fresh tab keeps the persona active when it was opened, as /new does"
     );
 
-    // Visit A, which has no persona at all (the Q=None case), then return.
+    // Visit A: its later selection of P survives even though its birth had
+    // no persona. Then explicitly select Q, as an operator could with
+    // `/persona set q --keep-context`, before returning to B.
     {
         let mut ctx = h.ctx();
         activate_tab(&mut ctx, &mut tabs, 0).unwrap();
     }
-    assert_eq!(h.active_persona.as_ref().map(|p| p.name.as_str()), None);
+    assert_eq!(h.active_persona, Some(p.clone()));
+    h.active_persona = Some(q);
     {
         let mut ctx = h.ctx();
         activate_tab(&mut ctx, &mut tabs, 1).unwrap();
     }
     assert_eq!(
-        h.active_persona.as_ref().map(|p| p.name.as_str()),
-        Some("P"),
+        h.active_persona,
+        Some(p),
         "returning to the rowless tab restores ITS persona, not the other tab's"
     );
     assert!(
@@ -505,10 +515,22 @@ fn a_preference_change_in_a_rowless_tab_survives_a_switch() {
 fn the_seed_is_dropped_once_the_row_materializes_and_cannot_re_apply() {
     let _g = guard();
     let (mut h, mut tabs) = Harness::new(&["sol"]);
+    let dir = h._root.path().join("personas");
+    std::fs::create_dir_all(&dir).unwrap();
+    h.persona_store = crate::PersonaStore::new(&dir);
+    for (name, prompt) in [
+        ("seeded", "The persona captured before the first turn."),
+        (
+            "durable",
+            "The persona selected before the row materializes.",
+        ),
+    ] {
+        std::fs::write(dir.join(format!("{name}.md")), prompt).unwrap();
+    }
     let a = h.active_conversation_id.clone();
     h.store.create_with_id(&a, "A", None).unwrap();
 
-    h.active_persona = Some(persona_named("seeded"));
+    h.active_persona = Some(h.persona_store.load("seeded").unwrap());
     {
         let mut ctx = h.ctx();
         let _ = create_fresh_tab(&mut ctx, &mut tabs).unwrap();
@@ -518,6 +540,10 @@ fn the_seed_is_dropped_once_the_row_materializes_and_cannot_re_apply() {
 
     // The row materializes with a DIFFERENT persona than the seed captured
     // — as it would if the operator switched persona before the first turn.
+    // Real row birth stamps the live selection; do not invent a mismatch
+    // between that selection and the newly written conversation metadata.
+    let durable = h.persona_store.load("durable").unwrap();
+    h.active_persona = Some(durable.clone());
     h.store.create_with_id(&b, "B", Some("durable")).unwrap();
 
     // Any switch away deactivates, which is where the seed is retired.
@@ -536,11 +562,9 @@ fn the_seed_is_dropped_once_the_row_materializes_and_cannot_re_apply() {
         activate_tab(&mut ctx, &mut tabs, 1).unwrap();
     }
     assert_eq!(
-        h.active_persona.as_ref().map(|p| p.name.as_str()),
-        None,
-        "the durable record owns the persona now — `durable` is not loadable from \
-             this test's empty persona dir, so the restore reports no persona rather \
-             than resurrecting the seed's `seeded`"
+        h.active_persona,
+        Some(durable),
+        "restore must use the current selected persona, not resurrect the stale seed"
     );
     assert!(tabs.active().fresh_seed.is_none());
 }
@@ -1741,4 +1765,173 @@ fn authority_state_is_bit_identical_across_any_switch_sequence() {
         cognition: _,
         tenacity: _,
     } = pin;
+}
+
+// ── 14. a materialized tab owns its selected persona name ────────────
+
+fn materialized_persona_fixture() -> (Harness, TabSet) {
+    let (mut h, tabs) = Harness::new(&["sol"]);
+    let dir = h._root.path().join("personas");
+    std::fs::create_dir_all(&dir).unwrap();
+    h.persona_store = crate::PersonaStore::new(&dir);
+    for (name, prompt) in [
+        ("birth", "The persona at conversation birth."),
+        ("selected", "The persona selected later in this tab."),
+    ] {
+        std::fs::write(dir.join(format!("{name}.md")), prompt).unwrap();
+    }
+    h.store
+        .create_with_id(&h.active_conversation_id, "A", Some("birth"))
+        .unwrap();
+    h.store
+        .append_turn(
+            &h.active_conversation_id,
+            "Earlier question.",
+            "Earlier answer.",
+        )
+        .unwrap();
+    // The same live input a successful `/persona set selected --keep-context`
+    // leaves for the production tab-switch state machine.
+    h.active_persona = Some(h.persona_store.load("selected").unwrap());
+    h.system = crate::rebuild_system_prompt(
+        &h.workspace,
+        &h.memory,
+        h.active_persona.as_ref(),
+        &h.active_conversation_id,
+    );
+    (h, tabs)
+}
+
+/// Grounds tab selection in real conversation/persona stores: a row's immutable
+/// birth metadata must not undo a later session selection on a round trip.
+#[test]
+fn materialized_tab_restores_its_later_selected_persona() {
+    let _g = guard();
+    let (mut h, mut tabs) = materialized_persona_fixture();
+    let a = h.active_conversation_id.clone();
+    let selected = h.active_persona.clone().unwrap();
+    let b = h.durable("B");
+    h.open_tab_on(&mut tabs, &b);
+    assert!(h.active_persona.is_none(), "B has no selected persona");
+
+    activate_tab(&mut h.ctx(), &mut tabs, 0).unwrap();
+
+    assert_eq!(h.active_conversation_id, a);
+    assert_eq!(h.active_persona, Some(selected.clone()));
+    assert!(h.system.contains(&selected.prompt));
+    assert!(!h.system.contains("The persona at conversation birth."));
+    assert_eq!(
+        h.store.load(&a).unwrap().persona.as_deref(),
+        Some("birth"),
+        "session selection must not rewrite historical birth metadata"
+    );
+}
+
+/// Grounds the name-only snapshot with a real file replacement: switching back
+/// must reload current restrictions, never restore a cached RoleProfile.
+#[test]
+fn materialized_tab_reloads_the_selected_personas_current_profile() {
+    let _g = guard();
+    let (mut h, mut tabs) = materialized_persona_fixture();
+    let original = h.active_persona.clone().unwrap();
+    let b = h.durable("B");
+    h.open_tab_on(&mut tabs, &b);
+    std::fs::write(
+        &original.path,
+        "+++\ntools = [\"read_file\"]\ncrew = false\n[caveats]\nfs_write = \"none\"\nexec = \"none\"\nnet = \"none\"\n+++\n\nThe newly restricted selected persona.",
+    )
+    .unwrap();
+    let current = h.persona_store.load("selected").unwrap();
+    assert_ne!(current.profile, original.profile, "the file really changed");
+
+    activate_tab(&mut h.ctx(), &mut tabs, 0).unwrap();
+
+    assert_eq!(h.active_persona, Some(current.clone()));
+    assert!(h.system.contains(&current.prompt));
+    assert!(!h.system.contains(&original.prompt));
+}
+
+/// Grounds synthetic identity in a real same-named persona file: the runtime
+/// altitude carrier must never acquire that file's prompt or role metadata.
+#[test]
+fn materialized_tab_preserves_synthetic_altitude_without_loading_its_display_name() {
+    let _g = guard();
+    let (mut h, mut tabs) = materialized_persona_fixture();
+    let synthetic = crate::synthetic_altitude_persona(newt_core::Altitude::Coach);
+    std::fs::write(
+        h._root.path().join("personas/coach.md"),
+        "+++\ntools = [\"read_file\"]\ncrew = false\nmodel = \"disk-coach-model\"\n[caveats]\nfs_write = \"none\"\nexec = \"none\"\nnet = \"none\"\n+++\n\nDISK_COACH_PERSONA_MUST_NOT_BE_SELECTED.",
+    )
+    .unwrap();
+    let disk = h.persona_store.load("coach").unwrap();
+    assert_eq!(
+        disk.name, synthetic.name,
+        "the display names really collide"
+    );
+    assert_ne!(disk.profile, synthetic.profile);
+    assert!(disk.profile.caveats.is_some());
+    assert!(synthetic.path.as_os_str().is_empty());
+    h.active_persona = Some(synthetic.clone());
+    h.system = crate::rebuild_system_prompt(
+        &h.workspace,
+        &h.memory,
+        h.active_persona.as_ref(),
+        &h.active_conversation_id,
+    );
+    let b = h.durable("B");
+    h.open_tab_on(&mut tabs, &b);
+
+    activate_tab(&mut h.ctx(), &mut tabs, 0).unwrap();
+
+    assert_eq!(h.active_persona, Some(synthetic));
+    assert!(!h.system.contains(&disk.prompt));
+    assert!(!h.system.contains("The persona at conversation birth."));
+}
+
+/// Grounds prepare-before-commit with an actual missing selected-persona file:
+/// a failed reload must leave the outgoing tab and all its live state intact.
+#[test]
+fn missing_selected_persona_refuses_a_materialized_tab_switch_atomically() {
+    let _g = guard();
+    let (mut h, mut tabs) = materialized_persona_fixture();
+    let selected = h.active_persona.clone().unwrap();
+    let b = h.durable("B");
+    h.open_tab_on(&mut tabs, &b);
+    h.turns_this_conversation = 7;
+    h.input_stash = "Unsubmitted text in B.".into();
+    let before = h.snapshot(&tabs);
+    let active_index = tabs.active_index();
+    let active_tab_id = tabs.active().session_id().clone();
+    let owner_before = newt_core::lifecycle::active_session();
+    std::fs::remove_file(&selected.path).unwrap();
+    assert!(h.persona_store.load("selected").is_err());
+
+    let result = activate_tab(&mut h.ctx(), &mut tabs, 0);
+
+    assert!(matches!(result, Err(TabError::PreflightFailed { .. })));
+    assert_eq!(tabs.active_index(), active_index);
+    assert_eq!(tabs.active().session_id(), &active_tab_id);
+    assert_eq!(newt_core::lifecycle::active_session(), owner_before);
+    assert_eq!(h.snapshot(&tabs), before);
+}
+
+/// A captured absence differs from an uncaptured selection. Ground that
+/// distinction against a real row that still names a birth persona.
+#[test]
+fn materialized_tab_keeps_a_known_absent_persona_instead_of_resurrecting_birth() {
+    let _g = guard();
+    let (mut h, mut tabs) = materialized_persona_fixture();
+    let a = h.active_conversation_id.clone();
+    h.active_persona = None;
+    h.system = crate::rebuild_system_prompt(&h.workspace, &h.memory, None, &a);
+    let b = h.durable("B");
+    h.open_tab_on(&mut tabs, &b);
+
+    activate_tab(&mut h.ctx(), &mut tabs, 0).unwrap();
+
+    assert_eq!(h.active_conversation_id, a);
+    assert!(h.active_persona.is_none());
+    assert!(!h.system.contains("The persona at conversation birth."));
+    assert!(!h.system.contains("The persona selected later in this tab."));
+    assert_eq!(h.store.load(&a).unwrap().persona.as_deref(), Some("birth"));
 }
