@@ -396,9 +396,9 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   byte-identical. The primitive's own matrix is guarded by `catches_base64url_reencoding`,
   `catches_base64_nopad_reencoding`, `catches_uppercase_hex`, `catches_percent_encoding`,
   `catches_string_escapes`, `catches_chunk_split_raw`, `catches_chunk_split_base64`,
-  `redact_withholds_chunk_split`, and `redact_post_condition_holds_for_every_form` (`ocap.rs`,
+  `redact_withholds_chunk_split`, and `redact_post_condition_holds_for_every_form` (`ocap_tests/disclosure.rs`,
   step-6.2). **step-6.5:** `session_filter_registers_a_real_provider_key` +
-  `session_filter_ignores_trivial_or_absent_key` (`ocap.rs`) prove the live registration; the summary
+  `session_filter_ignores_trivial_or_absent_key` (`ocap_tests/disclosure.rs`) prove the live registration; the summary
   redaction is `redact_model_facing` at the three `final_summary_*` returns (`agentic/mod.rs`).
 - **Status:** CLOSED — step-6.6. `verify_disclosure_gate()` now returns `Verified`: the session
   secret is registered at start (`session_disclosure_filter`, both live builders) and value-filtered
@@ -891,7 +891,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   render is a pure function of the report (no independent claim); a guarantee reported `enforced`
   implies its verifier is `Verified`.
 - **Ratchet guard:** `linux_report_matches_live_verifier_state`, `compound_guarantees_take_the_meet`,
-  `summary_lines_cover_every_guarantee_honestly` (`newt-core/src/ocap.rs`) +
+  `summary_lines_cover_every_guarantee_honestly` (`newt-core/src/ocap_tests/report.rs`) +
   `posture_lines_are_derived_from_the_report_not_prose` (`newt-cli/src/doctor.rs`). Adding a
   free-form-claim constructor or an over-claiming render breaks these.
 - **Status:** CLOSED — step-8.1 (typed `SecurityReport` derived from the verifiers, rendered by
@@ -925,7 +925,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `Enforced`, and `require_achieved` refuses it.
 - **Ratchet guard:** `ceiling_never_rounds_up`, `unknown_platform_is_fully_unsupported`,
   `require_achieved_refuses_unverified_and_unsupported`, `current_report_reflects_build_platform`
-  (`newt-core/src/ocap.rs`) + `unsupported_platform_never_renders_a_linux_equivalent_claim`
+  (`newt-core/src/ocap_tests/report.rs`) + `unsupported_platform_never_renders_a_linux_equivalent_claim`
   (`newt-cli/src/doctor.rs`). A permissive default arm or an `Enforced`-on-unsupported path breaks
   these.
 - **Status:** CLOSED — step-8.1 (platform ceiling `meet` + `require_achieved` refusal) · owner: — ·
