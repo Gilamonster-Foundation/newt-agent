@@ -2056,6 +2056,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // turn); the trigger is the configurable NudgeClassifier, so a genuine
     // conclusion (with or without prior tool calls this turn) is never nudged.
     let mut narration_nudges: usize = 0;
+    let mut readonly_completion_retried = false;
     // State-driven final-answer gate: a no-tool reply is suspicious when the
     // active plan still has open steps. Nudge once to update_plan / act / block.
     let mut pending_plan_nudges: usize = 0;
@@ -2805,6 +2806,33 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     );
                 }
             }
+            if !is_cancelled(cancel)
+                && readonly_completion_pending(
+                    prompt_disposition,
+                    &nudge_classifier,
+                    &probe_content,
+                )
+            {
+                let more_rounds = round + 1 < current_tool_round_limit;
+                if retry_readonly_completion(
+                    &mut messages,
+                    &probe_content,
+                    None,
+                    &mut readonly_completion_retried,
+                    more_rounds,
+                ) {
+                    continue 'round_loop;
+                }
+                let out = readonly_completion_handoff(
+                    &probe_content,
+                    &mut end_reason,
+                    more_rounds,
+                    workspace,
+                    turn_start_head.as_deref(),
+                    disclosure,
+                );
+                return Ok((out, false, accumulated_usage, hallucination_count));
+            }
             // A final text candidate can come from either the streaming re-issue
             // or the non-streamed probe fallback. Run both through the same
             // no-tool final-answer gates so "Let me inspect..." does not force a
@@ -3451,6 +3479,58 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 ));
             }
 
+            // A second inference may regress from an answer to a promise. The
+            // probe already passed the completion guard; preserve that answer.
+            if !is_cancelled(cancel)
+                && !probe_content.trim().is_empty()
+                && readonly_completion_pending(prompt_disposition, &nudge_classifier, &streamed)
+            {
+                emit_accepted(
+                    &mut on_round_usage,
+                    round_usage,
+                    truncation_suspect,
+                    round_est_raw,
+                );
+                if let Some(slot) = &mut end_reason {
+                    **slot = Some(crate::TurnEndReason::Completed);
+                }
+                let out = finalize_final_text(
+                    probe_content,
+                    workspace,
+                    turn_start_head.as_deref(),
+                    disclosure,
+                );
+                return Ok((
+                    out,
+                    false,
+                    merge_round_usage(accumulated_usage, stream_usage),
+                    hallucination_count,
+                ));
+            }
+            if !is_cancelled(cancel)
+                && readonly_completion_pending(prompt_disposition, &nudge_classifier, &streamed)
+            {
+                let more_rounds = round + 1 < current_tool_round_limit;
+                accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
+                if retry_readonly_completion(
+                    &mut messages,
+                    &streamed,
+                    None,
+                    &mut readonly_completion_retried,
+                    more_rounds,
+                ) {
+                    continue 'round_loop;
+                }
+                let out = readonly_completion_handoff(
+                    &streamed,
+                    &mut end_reason,
+                    more_rounds,
+                    workspace,
+                    turn_start_head.as_deref(),
+                    disclosure,
+                );
+                return Ok((out, false, accumulated_usage, hallucination_count));
+            }
             // Narrate-then-stop rescue: the model produced prose and no tool
             // call. If it has already acted this turn (mid-task) or the prose
             // reads as intent-to-act, nudge it to actually call the tool and run
@@ -4132,12 +4212,8 @@ impl WorkflowRuntimeState {
         if self.rediscovery_nudges >= Self::REDISCOVERY_NUDGE_CAP {
             return None;
         }
-        let classified_stall = classification.is_some_and(|c| {
-            matches!(
-                c.class,
-                crate::NudgeClass::PendingAction | crate::NudgeClass::PlanUpdate
-            )
-        });
+        let classified_stall =
+            classification.is_some_and(crate::NudgeClassification::is_pending_action);
         if !classified_stall && !looks_like_error_rediscovery(content) {
             return None;
         }
@@ -4632,6 +4708,79 @@ fn tail_on_char_boundary(s: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 fn looks_like_intent_to_act(content: &str) -> bool {
     crate::NudgeClassifier::builtin().is_pending_action(content)
+}
+
+/// Completing an evidence question is independent of permission to mutate.
+/// Reuse the classifier's bare-evidence-promise refinement. Findings, blockers,
+/// and future plans can themselves be the requested read-only deliverable.
+/// This is a conservative quality guard, not a general completion oracle.
+fn readonly_completion_pending(
+    disposition: PromptDisposition,
+    classifier: &crate::NudgeClassifier,
+    content: &str,
+) -> bool {
+    matches!(
+        disposition,
+        PromptDisposition::Explain | PromptDisposition::Research
+    ) && classifier.classify(content).class == crate::NudgeClass::DeferredAnswer
+}
+
+/// One quality retry, never action pressure or a permission change. Keep its
+/// state separate from action nudges so compaction cannot replenish the retry.
+fn retry_readonly_completion(
+    messages: &mut Vec<serde_json::Value>,
+    content: &str,
+    replay: Option<&[serde_json::Value]>,
+    retried: &mut bool,
+    more_rounds: bool,
+) -> bool {
+    if *retried || !more_rounds {
+        return false;
+    }
+    *retried = true;
+    strip_trailing_nudge_exchange(messages);
+    // Responses reasoning items must precede their answer, unchanged.
+    if let Some(items) = replay {
+        messages.extend_from_slice(items);
+    }
+    messages.push(serde_json::json!({"role": "assistant", "content": content}));
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": format!(
+            "{} Your reply promised another step but did not answer the request. \
+             Continue using only the read-only tools already available, or give the answer \
+             supported by the evidence. If something is missing, ask a concrete clarification \
+             or state the unresolved blocker. Do not end with another promise to check.",
+            compress::LOOP_GUIDANCE_PREFIX
+        ),
+    }));
+    true
+}
+
+fn readonly_completion_handoff(
+    content: &str,
+    end_reason: &mut Option<&mut Option<crate::TurnEndReason>>,
+    more_rounds: bool,
+    workspace: &str,
+    turn_start_head: Option<&str>,
+    disclosure: Option<&crate::ocap::DisclosureFilter>,
+) -> String {
+    if let Some(slot) = end_reason {
+        **slot = Some(if more_rounds {
+            crate::TurnEndReason::NarrationCapExhausted
+        } else {
+            crate::TurnEndReason::NarrationFinalRound
+        });
+    }
+    finalize_final_text(
+        format!(
+            "{content}\n\nThis response appears unfinished. If the request is still unresolved, \
+             reply `continue` to resume the read-only check, or clarify what evidence you need."
+        ),
+        workspace,
+        turn_start_head,
+        disclosure,
+    )
 }
 
 /// Heuristic: did the model stop because it *believes* a file changed under it,
@@ -5820,6 +5969,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 
     // Narrate-then-stop rescue counter (mirror of the Ollama path).
     let mut narration_nudges: usize = 0;
+    let mut readonly_completion_retried = false;
     // Self-verify gate (#23): times we've handed the model a round to run the
     // verification the workspace ships before letting it conclude. Capped so a
     // model that refuses to verify still ends the turn.
@@ -6593,6 +6743,29 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 }
             }
             let content = oa_content.clone();
+            if !is_cancelled(cancel)
+                && readonly_completion_pending(prompt_disposition, &nudge_classifier, &content)
+            {
+                let more_rounds = round + 1 < current_tool_round_limit;
+                if retry_readonly_completion(
+                    &mut messages,
+                    &content,
+                    None,
+                    &mut readonly_completion_retried,
+                    more_rounds,
+                ) {
+                    continue 'round_loop;
+                }
+                let out = readonly_completion_handoff(
+                    &content,
+                    &mut end_reason,
+                    more_rounds,
+                    workspace,
+                    turn_start_head.as_deref(),
+                    disclosure,
+                );
+                return Ok((out, false, accumulated_usage, hallucination_count));
+            }
             if content.is_empty() && debug {
                 print_debug(
                     "empty content with no tool calls — model produced nothing",
@@ -6884,7 +7057,15 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 // keeps what the probe already reported rather than zeroing it.
                 StreamOutcome::Printed(text, stream_usage) => {
                     accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
-                    (text, true)
+                    if !is_cancelled(cancel)
+                        && readonly_completion_pending(prompt_disposition, &nudge_classifier, &text)
+                    {
+                        // Re-use the accepted probe; it has already passed every
+                        // gate and the caller must print it after this promise.
+                        (content, false)
+                    } else {
+                        (text, true)
+                    }
                 }
                 // The re-issue produced no usable answer (or a cut fragment,
                 // announced as such). The probe answer is right here — never
@@ -7853,6 +8034,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
 
     // Narrate-then-stop rescue counter (mirrors the OpenAI path).
     let mut narration_nudges: usize = 0;
+    let mut readonly_completion_retried = false;
     // Self-verify gate (#23) — mirrors the OpenAI path.
     let mut self_verify_nudges: usize = 0;
     const SELF_VERIFY_CAP: usize = 2;
@@ -8529,6 +8711,29 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 }
             }
             let content = oa_content.clone();
+            if !is_cancelled(cancel)
+                && readonly_completion_pending(prompt_disposition, &nudge_classifier, &content)
+            {
+                let more_rounds = round + 1 < current_tool_round_limit;
+                if retry_readonly_completion(
+                    &mut messages,
+                    &content,
+                    None,
+                    &mut readonly_completion_retried,
+                    more_rounds,
+                ) {
+                    continue 'round_loop;
+                }
+                let out = readonly_completion_handoff(
+                    &content,
+                    &mut end_reason,
+                    more_rounds,
+                    workspace,
+                    turn_start_head.as_deref(),
+                    disclosure,
+                );
+                return Ok((out, false, accumulated_usage, hallucination_count));
+            }
             if content.is_empty() && debug {
                 print_debug(
                     "empty content with no tool calls — model produced nothing",
@@ -9532,6 +9737,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let mut tools_unsupported_notified = false;
     let mut unverified_exec_blocker_nudges: usize = 0;
     let mut run_command_denial_observed = false;
+    let mut readonly_completion_retried = false;
+    let nudge_classifier = crate::NudgeClassifier::load_default();
     // Keep the same cap-exit evidence ledger as the three chat-shaped wires.
     // It must record before result offload/compaction removes the source text.
     let mut observed_paths = claim_check::ObservedPaths::default();
@@ -9814,6 +10021,29 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         }
 
         if calls.is_empty() {
+            if !is_cancelled(cancel)
+                && readonly_completion_pending(prompt_disposition, &nudge_classifier, &text)
+            {
+                let more_rounds = round + 1 < max_tool_rounds;
+                if retry_readonly_completion(
+                    &mut input,
+                    &text,
+                    Some(&echo),
+                    &mut readonly_completion_retried,
+                    more_rounds,
+                ) {
+                    continue;
+                }
+                let out = readonly_completion_handoff(
+                    &text,
+                    &mut end_reason,
+                    more_rounds,
+                    workspace,
+                    turn_start_head.as_deref(),
+                    disclosure,
+                );
+                return Ok((out, false, accumulated_usage, hallucination_count));
+            }
             if should_ground_unverified_run_command_blocker(
                 &text,
                 &tools_chat,
