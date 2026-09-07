@@ -23,6 +23,13 @@ persona's value. Enter applies the draft; Esc cancels. `:w <name>` saves a named
 persona, while `:wq <name>` saves and applies. Existing names need explicit `!`
 overwrite. Style remains separate from cognition, tenacity, and tool authority.
 
+`/posture <name>` and `/settings posture <name>` are that tool-authority axis,
+and they share one resolved skill/framing plus an optional permission floor.
+Each accepted turn uses one snapshot for its prompt and enforced caveats.
+Invalid bindings leave the previous posture intact and report an error; `off`
+removes only the posture floor, never the underlying session restrictions. The
+binding survives conversation and persona changes within the session.
+
 See [personality and named personas](../docs/guide/personality.md) for tab-local
 overrides, save/reload behavior, and the meaning of each preference.
 

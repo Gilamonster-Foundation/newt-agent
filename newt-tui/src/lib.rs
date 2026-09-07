@@ -5139,21 +5139,19 @@ fn posture_status_lines(
 
 /// #307: handle `/posture <name>`. Atomically preloads any named skill body,
 /// applies an optional named permission preset as an authority floor, and
-/// carries framing into the live per-turn prompt. Mutates `active_posture` only
+/// carries framing into the live per-turn prompt. Installs the shared binding only
 /// after every configured component resolves successfully.
-fn handle_posture_command(
-    arg: &str,
-    cfg: &newt_core::Config,
-    active_posture: &mut Option<ActivePosture>,
-    color: bool,
-    verbose: bool,
-) {
+fn handle_posture_command(arg: &str, cfg: &newt_core::Config, color: bool, verbose: bool) {
     // Bare `/posture` and `/posture list` are discovery surfaces. `show` and
     // `status` keep the concise active-only form.
     if matches!(arg, "" | "list" | "show" | "status") {
         let include_available = matches!(arg, "" | "list");
-        let mut lines =
-            posture_status_lines(cfg, active_posture.as_ref(), include_available).into_iter();
+        let mut lines = posture_status_lines(
+            cfg,
+            newt_core::posture::active_posture().as_ref(),
+            include_available,
+        )
+        .into_iter();
         if let Some(first) = lines.next() {
             print_newt(&first, color, verbose);
         }
@@ -5165,7 +5163,9 @@ fn handle_posture_command(
 
     // Drop the clamp and its prompt guidance for the rest of the session.
     if matches!(arg, "off" | "clear" | "reset") {
-        if active_posture.take().is_some() {
+        let was_active = newt_core::posture::active_posture().is_some();
+        newt_core::posture::set_active_posture(None);
+        if was_active {
             print_newt(
                 "permission posture cleared — authority returns to the session base",
                 color,
@@ -5210,7 +5210,7 @@ fn handle_posture_command(
             posture.name, posture.preset_name, posture.clamp_summary
         )
     };
-    *active_posture = Some(posture);
+    newt_core::posture::set_active_posture(Some(posture));
     print_newt(&report, color, verbose);
 }
 

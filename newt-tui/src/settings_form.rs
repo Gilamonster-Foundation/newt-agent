@@ -630,13 +630,14 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
         Field::Posture => {
             if value == "off" {
                 newt_core::posture::set_active_posture(None);
-            } else if let Ok(cfg) = newt_core::Config::resolve() {
+            } else {
+                let cfg = newt_core::Config::resolve().map_err(|e| e.to_string())?;
                 let dirs = cfg.skill_search_dirs();
-                if let Ok(p) = newt_core::posture::build_posture(value, &cfg, |skill| {
+                let posture = newt_core::posture::build_posture(value, &cfg, |skill| {
                     newt_skills::load_body_from(&dirs, skill)
-                }) {
-                    newt_core::posture::set_active_posture(Some(p));
-                }
+                })
+                .map_err(|e| e.to_string())?;
+                newt_core::posture::set_active_posture(Some(posture));
             }
         }
         // Through the same writer `/spill` and `/detail` use, so the three
@@ -1298,6 +1299,95 @@ mod tests {
         assert!(
             newt_core::posture::active_posture().is_none(),
             "`off` releases the clamp rather than storing the word"
+        );
+    }
+
+    /// Grounds the atomic resolver tests in the real config-loading and
+    /// receipt path used by the settings form. A declared but invalid posture
+    /// must neither change authority nor journal a successful setting change.
+    #[tokio::test]
+    async fn posture_settings_resolution_failure_is_not_a_success_receipt() {
+        // Config::resolve also has unguarded readers and subprocess consumers
+        // in this test binary. Keep this new NEWT_CONFIG fixture in a child,
+        // so it cannot leak into another test's environment snapshot.
+        const CHILD: &str = "NEWT_POSTURE_CONFIG_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let fixture = tempfile::tempdir().unwrap();
+            let config_dir = fixture.path().join(".newt");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            let config = config_dir.join("config.toml");
+            std::fs::write(&config, "[modes.broken]\npreset = 'missing'\n").unwrap();
+            let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+            // Same three-axis policy as CLI common::isolate: an explicit
+            // config alone does not stop the project walk or user drop-ins.
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("NEWT_") {
+                    command.env_remove(key);
+                }
+            }
+            for key in [
+                "OPENAI_BASE_URL",
+                "OPENAI_API_KEY",
+                "OPENAI_MODEL",
+                "OLLAMA_HOST",
+            ] {
+                command.env_remove(key);
+            }
+            command.args([
+                    "--exact",
+                    "settings_form::tests::posture_settings_resolution_failure_is_not_a_success_receipt",
+                    "--nocapture",
+                ])
+                .current_dir(fixture.path())
+                .env("HOME", fixture.path())
+                .env("USERPROFILE", fixture.path())
+                .env("NEWT_CONFIG_DIR", &config_dir)
+                .env("NEWT_CONFIG", &config)
+                .env(CHILD, "1")
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+                .await
+                .expect("settings fixture watchdog expired; child is killed on drop")
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated settings fixture failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let _guard = settings_guard();
+        let receipts = std::env::current_dir().unwrap().join("receipts.jsonl");
+        let saved_posture = newt_core::posture::active_posture();
+        std::env::set_var(newt_core::settings_receipt::RECEIPT_PATH_ENV, &receipts);
+        let previous = newt_core::posture::ActivePosture {
+            name: "existing".into(),
+            preset_name: "strict".into(),
+            clamp: newt_core::Caveats::default(),
+            clamp_summary: "deny writes".into(),
+            skill_body: None,
+            framing: Some("Keep the existing guidance.".into()),
+        };
+        newt_core::posture::set_active_posture(Some(previous.clone()));
+        let result = apply_and_record(Field::Posture, "broken", "/settings posture");
+        let installed = newt_core::posture::active_posture();
+        newt_core::posture::set_active_posture(saved_posture);
+        let error = result.expect_err("an unresolved preset must fail");
+        assert!(
+            error.contains("names preset 'missing'")
+                && error.contains("[permission_presets.missing]"),
+            "must reach the missing-preset resolver, not an unrelated config error: {error}"
+        );
+        let installed = installed.expect("failed resolution must preserve the old posture");
+        assert_eq!(installed.name, previous.name);
+        assert_eq!(installed.clamp, previous.clamp);
+        assert_eq!(installed.framing, previous.framing);
+        assert!(
+            !receipts.exists(),
+            "failed settings must not emit success receipts"
         );
     }
 

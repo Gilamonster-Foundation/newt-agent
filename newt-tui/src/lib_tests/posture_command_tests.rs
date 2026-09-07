@@ -233,3 +233,114 @@ fn effective_caveats_intersect_base_with_the_posture_clamp() {
     // No posture ⇒ base unchanged (bit-for-bit).
     assert_eq!(effective_caveats(&base, None), base);
 }
+
+#[test]
+fn posture_command_and_settings_share_the_enforced_binding() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let saved = newt_core::posture::active_posture();
+    let mut cfg = newt_core::Config::default();
+    cfg.permission_presets.insert(
+        "locked".into(),
+        newt_core::NamedPermissionPreset {
+            readonly: true,
+            ..Default::default()
+        },
+    );
+    cfg.modes.insert(
+        "review".into(),
+        newt_core::config::ModeConfig {
+            skill: None,
+            preset: Some("locked".into()),
+            framing: Some("Investigate without modifying files.".into()),
+        },
+    );
+    newt_core::posture::set_active_posture(None);
+    handle_posture_command("review", &cfg, false, false);
+    let displayed = crate::settings_form::Field::Posture.current();
+    let installed = newt_core::posture::active_posture();
+    // Restore before asserting, including on the unfixed baseline whose
+    // settings guard does not yet restore the permission posture.
+    newt_core::posture::set_active_posture(saved);
+
+    assert_eq!(displayed, "review");
+    let installed = installed.expect("the command must install the shared binding");
+    assert!(
+        !effective_caveats(&newt_core::Caveats::top(), Some(&installed))
+            .permits_fs_write("/workspace/file")
+    );
+    assert!(posture_prompt(&installed).contains("Investigate without modifying files."));
+}
+
+#[test]
+fn posture_command_off_releases_a_settings_installed_binding() {
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let saved = newt_core::posture::active_posture();
+    newt_core::posture::set_active_posture(Some(ActivePosture {
+        name: "locked".into(),
+        preset_name: "strict".into(),
+        clamp: newt_core::Caveats::default(),
+        clamp_summary: "deny writes".into(),
+        skill_body: None,
+        framing: None,
+    }));
+    handle_posture_command("off", &newt_core::Config::default(), false, false);
+    let installed = newt_core::posture::active_posture();
+    newt_core::posture::set_active_posture(saved);
+    assert!(
+        installed.is_none(),
+        "off must release the same state settings installs"
+    );
+}
+
+#[test]
+fn posture_settings_guard_restores_the_permission_binding() {
+    let _outer = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    let saved = newt_core::posture::active_posture();
+    let existing = ActivePosture {
+        name: "existing".into(),
+        preset_name: "strict".into(),
+        clamp: newt_core::NamedPermissionPreset {
+            readonly: true,
+            ..Default::default()
+        }
+        .clamp(),
+        clamp_summary: "deny writes".into(),
+        skill_body: Some("Keep the existing skill body.".into()),
+        framing: Some("Keep the existing framing.".into()),
+    };
+    let restored = [None, Some(existing)].map(|prior| {
+        newt_core::posture::set_active_posture(prior.clone());
+        {
+            let _inner = newt_core::test_guard::GlobalSettingsGuard::acquire();
+            newt_core::posture::set_active_posture(Some(ActivePosture {
+                name: "temporary".into(),
+                preset_name: String::new(),
+                clamp: newt_core::Caveats::top(),
+                clamp_summary: "unconstrained".into(),
+                skill_body: None,
+                framing: None,
+            }));
+        }
+        (prior, newt_core::posture::active_posture())
+    });
+    newt_core::posture::set_active_posture(saved);
+    for (prior, actual) in &restored {
+        let binding = |posture: &'_ Option<ActivePosture>| {
+            posture.as_ref().map(|p| {
+                (
+                    p.name.clone(),
+                    p.preset_name.clone(),
+                    p.clamp.clone(),
+                    p.clamp_summary.clone(),
+                    p.skill_body.clone(),
+                    p.framing.clone(),
+                )
+            })
+        };
+        assert_eq!(
+            binding(actual),
+            binding(prior),
+            "restore the entire binding"
+        );
+    }
+}
