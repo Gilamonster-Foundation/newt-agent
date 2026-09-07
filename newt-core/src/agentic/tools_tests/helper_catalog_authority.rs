@@ -39,7 +39,7 @@ fn exit_plan_mode_result_appends_mandatory_edit_only_when_tenacity_requires_it()
     use crate::tenacity::Tenacity;
     // Advisory levels: plain result, no forcing directive.
     for t in [Tenacity::Relaxed, Tenacity::Standard] {
-        let out = exit_plan_mode_result(t);
+        let out = exit_plan_mode_result(t, true);
         assert!(out.starts_with("exited the model-entered PLAN PHASE"));
         assert!(
             !out.contains("must be a concrete"),
@@ -48,7 +48,7 @@ fn exit_plan_mode_result_appends_mandatory_edit_only_when_tenacity_requires_it()
     }
     // Forcing levels: the mandatory-edit directive is appended.
     for t in [Tenacity::Insistent, Tenacity::Relentless] {
-        let out = exit_plan_mode_result(t);
+        let out = exit_plan_mode_result(t, true);
         assert!(out.contains("now EXECUTE it"), "{t}: {out}");
         assert!(out.contains("must be a concrete"), "{t}: {out}");
         assert!(out.contains("edit_file or write_file"), "{t}: {out}");
@@ -56,10 +56,38 @@ fn exit_plan_mode_result_appends_mandatory_edit_only_when_tenacity_requires_it()
     // The two sets agree with the level's own predicate.
     for t in Tenacity::all() {
         assert_eq!(
-            exit_plan_mode_result(t).contains("now EXECUTE it"),
+            exit_plan_mode_result(t, true).contains("now EXECUTE it"),
             t.exit_plan_requires_edit()
         );
     }
+}
+
+#[test]
+fn confined_act_denial_results_do_not_claim_tool_success() {
+    for disposition in [
+        PromptDisposition::Explain,
+        PromptDisposition::Research,
+        PromptDisposition::Plan,
+        PromptDisposition::Ask,
+    ] {
+        let result = disposition_tool_denied_message(disposition, "write_file");
+        assert!(result.starts_with("capability denied: "), "{result}");
+        assert!(
+            result.contains("Tool `write_file` is not available for this request"),
+            "{result}"
+        );
+        assert!(
+            !tool_result_ok(&result),
+            "a refused write is not progress: {result}"
+        );
+    }
+    let result = persona_tool_denied_message("edit_file");
+    assert!(result.starts_with("capability denied: "), "{result}");
+    assert!(result.contains("Tool `edit_file` is not available under the active persona"));
+    assert!(
+        !tool_result_ok(&result),
+        "a hidden edit is not progress: {result}"
+    );
 }
 
 /// FR-1 part 2 (#997): a persona's `tools:` allow-list scopes the ADVERTISED

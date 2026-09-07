@@ -1,5 +1,19 @@
 use super::*;
 
+#[derive(Default)]
+struct TestPlanModeControl(std::sync::atomic::AtomicBool);
+
+impl crate::agentic::PlanModeControl for TestPlanModeControl {
+    fn is_plan_mode(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn set_plan_mode(&self, active: bool) -> Result<(), String> {
+        self.0.store(active, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+}
+
 async fn run_scheduled_tool(
     name: &str,
     args: &serde_json::Value,
@@ -54,20 +68,6 @@ fn plan_phase_seam_and_clamp() {
 #[tokio::test]
 async fn enter_and_exit_plan_mode_are_session_local_and_immediate() {
     use crate::agentic::PlanModeControl as _;
-
-    #[derive(Default)]
-    struct TestPlanModeControl(std::sync::atomic::AtomicBool);
-
-    impl crate::agentic::PlanModeControl for TestPlanModeControl {
-        fn is_plan_mode(&self) -> bool {
-            self.0.load(std::sync::atomic::Ordering::Acquire)
-        }
-
-        fn set_plan_mode(&self, active: bool) -> Result<(), String> {
-            self.0.store(active, std::sync::atomic::Ordering::Release);
-            Ok(())
-        }
-    }
 
     // enter_plan_mode / exit_plan_mode mutate only their injected session
     // control; there is no process-global flag shared with another session.
@@ -170,6 +170,288 @@ async fn enter_and_exit_plan_mode_are_session_local_and_immediate() {
         "{exit}"
     );
     assert!(!control.is_plan_mode(), "exit_plan_mode cleared the phase");
+}
+
+#[tokio::test]
+async fn confined_act_plan_exit_respects_underlying_write_authority_and_disposition() {
+    use crate::agentic::PlanModeControl as _;
+
+    let ws = tempfile::tempdir().unwrap();
+    for tenacity in crate::tenacity::Tenacity::all() {
+        let _tenacity = crate::tenacity::scoped_effective_tenacity(tenacity);
+        for (disposition, caveats, can_edit) in [
+            (PromptDisposition::Act, plan_phase_clamp(), false),
+            (PromptDisposition::Plan, caveats_rw(ws.path()), false),
+            (PromptDisposition::Act, caveats_rw(ws.path()), true),
+        ] {
+            let control = TestPlanModeControl(std::sync::atomic::AtomicBool::new(true));
+            let result = execute_tool_with_collaborators(
+                "exit_plan_mode",
+                &serde_json::json!({}),
+                &ws.path().to_string_lossy(),
+                false,
+                20,
+                &caveats,
+                &mut NoMcp,
+                ToolCollaborators {
+                    plan_mode_control: Some(&control),
+                    ..Default::default()
+                },
+                false,
+                disposition,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                !control.is_plan_mode(),
+                "the model's temporary phase must still end"
+            );
+            assert!(
+                result.starts_with("exited the model-entered PLAN PHASE"),
+                "{result}"
+            );
+            assert_eq!(
+                result.contains("must be a concrete"),
+                can_edit && tenacity.exit_plan_requires_edit(),
+                "tenacity={tenacity}, disposition={disposition:?}, can_edit={can_edit}: {result}"
+            );
+        }
+    }
+}
+
+/// Real file writes ground the plan-mode mock's phase transition: exiting the
+/// model's phase restores Act only when both the turn and its caveats allow it.
+#[tokio::test]
+async fn confined_act_plan_exit_restores_only_the_validated_turn_disposition() {
+    use crate::agentic::PlanModeControl as _;
+
+    let _tenacity =
+        crate::tenacity::scoped_effective_tenacity(crate::tenacity::Tenacity::Insistent);
+    for (disposition, writable) in [
+        (PromptDisposition::Act, true),
+        (PromptDisposition::Plan, true),
+        (PromptDisposition::Act, false),
+    ] {
+        let ws = tempfile::tempdir().unwrap();
+        let caveats = if writable {
+            caveats_rw(ws.path())
+        } else {
+            plan_phase_clamp()
+        };
+        let original = caveats.clone();
+        let control = TestPlanModeControl(std::sync::atomic::AtomicBool::new(true));
+        let can_edit = disposition == PromptDisposition::Act && writable;
+        let mut exit_result = String::new();
+        for tool in ["write_file", "exit_plan_mode", "write_file"] {
+            let was_planning = control.is_plan_mode();
+            let args = if tool == "write_file" {
+                serde_json::json!({"path": "transition.txt", "content": "authorized"})
+            } else {
+                serde_json::json!({})
+            };
+            let result = execute_tool_with_collaborators(
+                tool,
+                &args,
+                &ws.path().to_string_lossy(),
+                false,
+                20,
+                &caveats,
+                &mut NoMcp,
+                ToolCollaborators {
+                    plan_mode_control: Some(&control),
+                    ..Default::default()
+                },
+                false,
+                disposition,
+                None,
+            )
+            .await
+            .unwrap();
+            if tool == "exit_plan_mode" {
+                assert!(result.starts_with("exited the model-entered PLAN PHASE"));
+                assert!(!control.is_plan_mode());
+                exit_result = result;
+            } else {
+                let expected_write = !was_planning && can_edit;
+                assert_eq!(tool_result_ok(&result), expected_write, "{result}");
+                if !expected_write {
+                    assert!(result.starts_with("capability denied: "), "{result}");
+                }
+                assert_eq!(ws.path().join("transition.txt").exists(), expected_write);
+                if expected_write {
+                    assert_eq!(
+                        std::fs::read_to_string(ws.path().join("transition.txt")).unwrap(),
+                        "authorized"
+                    );
+                }
+            }
+        }
+        assert_eq!(caveats, original, "phase exit never grants authority");
+        assert_eq!(exit_result.contains("must be a concrete"), can_edit);
+    }
+}
+
+/// Real dispatch grounds the plan-exit direction: a disk write grant does not
+/// make a persona-hidden edit tool callable, while either exposed edit tool
+/// preserves the existing authorized-action behavior.
+#[tokio::test]
+async fn confined_act_plan_exit_respects_persona_hidden_edit_tools() {
+    use crate::agentic::PlanModeControl as _;
+
+    let _tenacity =
+        crate::tenacity::scoped_effective_tenacity(crate::tenacity::Tenacity::Insistent);
+    for allowed in ["read_file", "write_file", "edit_file"] {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("edit.txt"), "before").unwrap();
+        let caveats = caveats_rw(ws.path());
+        let original = caveats.clone();
+        let persona = vec![allowed.to_string()];
+        let control = TestPlanModeControl(std::sync::atomic::AtomicBool::new(true));
+        let mut exit_result = String::new();
+        for (tool, args) in [
+            ("exit_plan_mode", serde_json::json!({})),
+            (
+                "write_file",
+                serde_json::json!({"path": "write.txt", "content": "written"}),
+            ),
+            (
+                "edit_file",
+                serde_json::json!({"path": "edit.txt", "old_string": "before", "new_string": "after"}),
+            ),
+        ] {
+            let result = execute_tool_with_collaborators(
+                tool,
+                &args,
+                &ws.path().to_string_lossy(),
+                false,
+                20,
+                &caveats,
+                &mut NoMcp,
+                ToolCollaborators {
+                    plan_mode_control: Some(&control),
+                    persona_tools: Some(&persona),
+                    ..Default::default()
+                },
+                false,
+                PromptDisposition::Act,
+                None,
+            )
+            .await
+            .unwrap();
+            if tool == "exit_plan_mode" {
+                assert!(
+                    result.starts_with("exited the model-entered PLAN PHASE"),
+                    "{result}"
+                );
+                assert!(
+                    !control.is_plan_mode(),
+                    "persona restrictions cannot hide the phase exit"
+                );
+                exit_result = result;
+            } else {
+                assert_eq!(
+                    tool_result_ok(&result),
+                    tool == allowed,
+                    "persona={allowed}, tool={tool}: {result}"
+                );
+                if tool != allowed {
+                    assert!(result.starts_with("capability denied: "), "{result}");
+                }
+            }
+        }
+        assert_eq!(
+            ws.path().join("write.txt").exists(),
+            allowed == "write_file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("edit.txt")).unwrap(),
+            if allowed == "edit_file" {
+                "after"
+            } else {
+                "before"
+            }
+        );
+        assert_eq!(caveats, original);
+        assert_eq!(
+            exit_result.contains("must be a concrete"),
+            allowed != "read_file",
+            "persona={allowed}: {exit_result}"
+        );
+    }
+}
+
+/// A real descendant-only write grounds the authority predicate: an operator
+/// need not grant the whole workspace for authorized plan execution to remain
+/// available, and the exit must not widen that grant to sibling paths.
+#[tokio::test]
+async fn confined_act_plan_exit_preserves_nested_write_grant() {
+    use crate::agentic::PlanModeControl as _;
+
+    let _tenacity =
+        crate::tenacity::scoped_effective_tenacity(crate::tenacity::Tenacity::Insistent);
+    let ws = tempfile::tempdir().unwrap();
+    let writable = ws.path().join("writable");
+    std::fs::create_dir(&writable).unwrap();
+    let caveats = Caveats {
+        fs_write: crate::Scope::only([writable.to_string_lossy().into_owned()]),
+        ..caveats_rw(ws.path())
+    };
+    let original = caveats.clone();
+    assert!(!crate::caveats::permits_path(
+        &caveats.fs_write,
+        &ws.path().to_string_lossy()
+    ));
+    let control = TestPlanModeControl(std::sync::atomic::AtomicBool::new(true));
+    let mut exit_result = String::new();
+    for (tool, args, permitted) in [
+        ("exit_plan_mode", serde_json::json!({}), true),
+        (
+            "write_file",
+            serde_json::json!({"path": "writable/allowed.txt", "content": "authorized"}),
+            true,
+        ),
+        (
+            "write_file",
+            serde_json::json!({"path": "denied.txt", "content": "no"}),
+            false,
+        ),
+    ] {
+        let result = execute_tool_with_collaborators(
+            tool,
+            &args,
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            ToolCollaborators {
+                plan_mode_control: Some(&control),
+                ..Default::default()
+            },
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tool_result_ok(&result), permitted, "{result}");
+        if tool == "exit_plan_mode" {
+            assert!(result.starts_with("exited the model-entered PLAN PHASE"));
+            assert!(!control.is_plan_mode());
+            exit_result = result;
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(writable.join("allowed.txt")).unwrap(),
+        "authorized"
+    );
+    assert!(!ws.path().join("denied.txt").exists());
+    assert_eq!(caveats, original);
+    assert!(
+        exit_result.contains("must be a concrete"),
+        "the nested write remains actionable: {exit_result}"
+    );
 }
 
 /// A non-Act disposition is an executor boundary, not just a reduced tool

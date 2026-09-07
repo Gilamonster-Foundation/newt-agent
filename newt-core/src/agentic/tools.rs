@@ -52,6 +52,7 @@ mod shell;
 #[cfg(all(test, unix))]
 mod tool_spinner_pty_test;
 use live_output::LiveOutputSession;
+pub(crate) use shell::command_authority_available;
 pub use shell::venv_cmd_prefix;
 #[cfg(test)]
 use shell::{
@@ -328,6 +329,34 @@ pub fn plan_phase_clamp() -> crate::caveats::Caveats {
     }
 }
 
+/// The same immediate model-entered phase clamp used by dispatch and steering.
+pub(crate) fn effective_tool_disposition(
+    disposition: PromptDisposition,
+    plan_mode_control: Option<&dyn super::PlanModeControl>,
+) -> PromptDisposition {
+    if disposition == PromptDisposition::Act
+        && plan_mode_control.is_some_and(super::PlanModeControl::is_plan_mode)
+    {
+        PromptDisposition::Plan
+    } else {
+        disposition
+    }
+}
+
+/// Whether an edit tool has underlying authority at all. Concrete paths remain
+/// dispatch-checked: a descendant-only grant must not require the whole root.
+pub(crate) fn edit_authority_available(
+    caveats: &crate::caveats::Caveats,
+    disposition: PromptDisposition,
+    persona_tools: Option<&[String]>,
+) -> bool {
+    caveats.fs_write != crate::caveats::Scope::none()
+        && ["edit_file", "write_file"].into_iter().any(|name| {
+            tool_allowed(disposition, name)
+                && persona_tools.is_none_or(|allow| persona_tool_allowed(name, allow))
+        })
+}
+
 /// facade P4 (#780): is the convenience **routing** turned OFF for this call?
 ///
 /// True only when `NEWT_NO_ROUTE=1` — set by the CLI's `--no-route` flag. It
@@ -350,9 +379,8 @@ pub fn routing_disabled() -> bool {
 // The lexical-normalisation + prefix-containment helpers now live in one shared
 // place — `crate::caveats` — so the interactive tool gate here and the headless
 // `newt-coder` apply path decide containment identically (no drift surface).
-// Only the Linux object-bound helpers below normalise paths directly; the
-// prefix gate itself goes through `crate::caveats::permits_path`.
-#[cfg(target_os = "linux")]
+// Grant-root selection and the Linux object-bound helpers normalise paths
+// directly; the prefix gate goes through `crate::caveats::permits_path`.
 use crate::caveats::lexically_normalize;
 
 /// Returns true if `full_path` is permitted by `scope`, under prefix
@@ -371,8 +399,7 @@ pub(crate) fn tui_permits_path(scope: &crate::caveats::Scope<String>, full_path:
 /// object fence. `None` — not permitted. Mirrors [`tui_permits_path`]'s matching
 /// exactly (same normalisation + `starts_with`), so the object-bound read
 /// resolves beneath the very root the gate approved.
-#[cfg(target_os = "linux")]
-fn authorizing_root<'a>(
+pub(super) fn authorizing_root<'a>(
     scope: &'a crate::caveats::Scope<String>,
     full_path: &str,
 ) -> Option<Option<&'a str>> {
@@ -641,11 +668,12 @@ fn object_bound_delete(
 /// the other arms, `find` contains to the workspace *independent of the fs_read
 /// scope* (even under `Scope::All`) — a recursive read is dangerous, so the
 /// search root must stay in-tree. On Linux this is an object-bound
-/// `openat2(RESOLVE_BENEATH)` resolve of the root beneath the workspace fd
-/// (TOCTOU-free — replaces the old canonicalize-then-`starts_with`); `find` never
-/// follows symlinks during descent, so a contained root bounds the whole walk.
+/// `openat2(RESOLVE_BENEATH)` resolve of the root beneath the workspace fd.
+/// The verification scanner reuses this probe anchored to its authorizing read
+/// grant instead. The probe does not bind a subsequent pathname-based traversal
+/// to the opened descriptor; concurrent path replacement remains a residual.
 #[cfg(target_os = "linux")]
-fn find_root_contained(
+pub(super) fn find_root_contained(
     _scope: &crate::caveats::Scope<String>,
     workspace: &str,
     full: &std::path::Path,
@@ -670,7 +698,7 @@ fn find_root_contained(
 }
 
 #[cfg(not(target_os = "linux"))]
-fn find_root_contained(
+pub(super) fn find_root_contained(
     _scope: &crate::caveats::Scope<String>,
     workspace: &str,
     full: &std::path::Path,
@@ -2252,9 +2280,9 @@ fn record_governed_file_change(
 /// (#tenacity / #11). Lower levels leave plan exit advisory. The tenacity
 /// action-forcing loop (#10) then enforces it: a subsequent read-only round
 /// trips the forcing nudge within the level's (small) budget.
-fn exit_plan_mode_result(tenacity: crate::tenacity::Tenacity) -> String {
+fn exit_plan_mode_result(tenacity: crate::tenacity::Tenacity, can_edit: bool) -> String {
     let base = "exited the model-entered PLAN PHASE. Subsequent tool calls return to this turn's validated disposition and underlying session permissions; the next outer turn returns to the human-selected operating mode. `/mode plan` and other clamps still remain read-only.";
-    if tenacity.exit_plan_requires_edit() {
+    if can_edit && tenacity.exit_plan_requires_edit() {
         format!(
             "{base}\n\nThe plan is set — now EXECUTE it. Your NEXT action must be a concrete \
              change (edit_file or write_file) that begins the first step — not another \
@@ -2327,13 +2355,8 @@ async fn execute_tool_inner(
     // tool call in the same inference round. The outer TUI also resolves it
     // into Plan caveats on the next turn; this local clamp closes the
     // enter-then-write gap before that boundary is rebuilt.
-    let disposition = if plan_mode_control.is_some_and(super::PlanModeControl::is_plan_mode)
-        && disposition == PromptDisposition::Act
-    {
-        PromptDisposition::Plan
-    } else {
-        disposition
-    };
+    let validated_disposition = disposition;
+    let disposition = effective_tool_disposition(disposition, plan_mode_control);
 
     // Preserve the raw call for the absolute deny-list below. A narrowly
     // understood branch-list shell reach may use the embedded read capability
@@ -2703,7 +2726,10 @@ async fn execute_tool_inner(
         },
         "exit_plan_mode" => match plan_mode_control {
             Some(control) => match control.set_plan_mode(false) {
-                Ok(()) => exit_plan_mode_result(crate::tenacity::effective_tenacity()),
+                Ok(()) => exit_plan_mode_result(
+                    crate::tenacity::effective_tenacity(),
+                    edit_authority_available(caveats, validated_disposition, persona_tools),
+                ),
                 Err(error) => format!("error: exit_plan_mode: {error}"),
             },
             None => {

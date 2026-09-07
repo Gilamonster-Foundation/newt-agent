@@ -1089,15 +1089,15 @@ pub struct ChatCtx<'a> {
     /// Out-param: why the loop ended the turn ([`crate::TurnEndReason`]) —
     /// narration-acceptance forensics, round cap, empty reply. Lent fresh per
     /// turn like `tool_events`; the TUI folds it into `TurnMetrics` (footer +
-    /// usage.jsonl). `None` (eval / headless) ⇒ nothing reported. The
-    /// Responses-API loop does not report it.
+    /// usage.jsonl). `None` (eval / headless) ⇒ nothing reported. Local
+    /// cancellation must not be reported as normal completion.
     pub end_reason: Option<&'a mut Option<crate::TurnEndReason>>,
     /// Out-param: per-turn observability for the solve contract (W0 #1511) —
     /// the backend-reported served `model` plus per-round tool-call parse
     /// signals ([`observability::ParseSignal`]). Lent fresh per turn like
     /// `tool_events`; the headless driver folds it into the `TurnOutcome` and
     /// `newt solve` serializes it. `None` (TUI / eval) ⇒ nothing recorded.
-    /// The Responses-API loop does not report it (same as `end_reason`).
+    /// The Responses-API loop does not report it.
     pub solve_obs: Option<&'a mut observability::SolveObservation>,
     /// Prompted ocap grants (issue #263): when present, a capability denial
     /// inside `execute_tool` consults the human — allow once / session allow
@@ -1486,6 +1486,7 @@ fn parse_rebase_produced(result: &str) -> Option<usize> {
 fn drain_steering_into(
     steering: Option<&dyn SteeringInbox>,
     messages: &mut Vec<serde_json::Value>,
+    operator_messages: &mut Vec<String>,
     color: bool,
 ) -> usize {
     let Some(inbox) = steering else {
@@ -1493,6 +1494,7 @@ fn drain_steering_into(
     };
     let pending = inbox.drain_for_round();
     for text in &pending {
+        operator_messages.push(text.clone());
         messages.push(serde_json::json!({ "role": "user", "content": text }));
     }
     if !pending.is_empty() {
@@ -1502,6 +1504,23 @@ fn drain_steering_into(
         );
     }
     pending.len()
+}
+
+/// Capture exact user bytes before this turn adds harness corrections. A
+/// reserved-looking prefix is not proof that the operator did not write it.
+fn protected_operator_messages(messages: &[serde_json::Value]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| message["content"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn is_operator_message(message: &serde_json::Value, operator_messages: &[String]) -> bool {
+    message["role"] == "user"
+        && message["content"]
+            .as_str()
+            .is_some_and(|text| operator_messages.iter().any(|operator| operator == text))
 }
 
 /// Lexically normalize a path — collapse `.`, resolve `..`, drop empty components —
@@ -1941,11 +1960,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
     prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
+    let mut operator_messages = protected_operator_messages(&messages);
 
     // In-band memory nudge (Step 19.3): after `[memory] note_nudge_interval`
-    // user turns with zero organic save_note use, append a one-line reminder
-    // to this turn's user message. Only when a sink exists — without one the
-    // save_note tool isn't even advertised.
+    // user turns with zero organic save_note use, append a separate reminder.
+    // Only when a sink exists — without one save_note is not advertised.
     if note_sink.is_some() {
         if let Some(line) = note_nudge.as_deref_mut().and_then(NoteNudge::begin_turn) {
             append_nudge_line(&mut messages, &line);
@@ -2114,6 +2133,16 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let turn_started = std::time::Instant::now();
     let mut turn_heartbeat = TurnHeartbeat::default();
     'round_loop: for round in 0..hard_tool_rounds {
+        let (mut can_edit, mut can_exec) = steering_authority(
+            tools_supported.then_some(&tools),
+            caveats,
+            prompt_disposition,
+            plan_mode_control,
+            exec_floor,
+        );
+        let mut edit_nudges = action_nudges && can_edit;
+        let mut action_turn = action_turn && (can_edit || can_exec);
+        let mut exec_grounding_turn = exec_grounding_turn && can_exec;
         // Bounded to ONE line per interval, and the policy is pure over the
         // elapsed it is handed — this reads the clock, `due` does not.
         let turn_elapsed = turn_started.elapsed();
@@ -2131,7 +2160,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if workflow_grace_active {
                 break;
             }
-            if !action_nudges {
+            if !edit_nudges {
                 break;
             }
             let Some(nudge) = workflow_runtime.cap_grace_nudge(
@@ -2149,7 +2178,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     color,
                 );
             }
-            messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+            push_loop_guidance(&mut messages, &nudge);
         }
         // Interrupt checkpoint (Esc / Ctrl-C): bail before spending another
         // round on the model or a tool. The reply is empty — the caller sees
@@ -2161,7 +2190,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // call and AFTER any tool that was already running finished above.
         // Steering changes what the agent does NEXT; it never abandons the
         // turn (that is `cancel`, checked immediately above).
-        drain_steering_into(steering, &mut messages, color);
+        drain_steering_into(steering, &mut messages, &mut operator_messages, color);
         if round > 0 {
             // Brief separator between rounds so user can follow the flow.
             if color {
@@ -2181,12 +2210,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // 8/12 under drift). Compact + gated to multi-step in-progress plans.
         // Supersedes the env-gated NEWT_RESEAT_PLAN experiment that #629 carried
         // to main by accident.
-        if round > 0 && action_nudges {
+        if round > 0 && edit_nudges {
             if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
-                messages.push(serde_json::json!({ "role": "user", "content": ptr }));
+                push_loop_guidance(&mut messages, &ptr);
             }
             if let Some(nudge) = workflow_runtime.round_start_nudge(step_ledger) {
-                messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+                push_loop_guidance(&mut messages, &nudge);
             }
         }
 
@@ -2201,7 +2230,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // of 3; config + per-family wiring that lets an operator raise it lands
         // in a follow-up, plugging into exactly this seam.
         let read_only_nudge_after = crate::tenacity::Tenacity::Standard.read_only_nudge_after();
-        if action_nudges && read_only_rounds >= read_only_nudge_after {
+        if edit_nudges && read_only_rounds >= read_only_nudge_after {
             let remaining = current_tool_round_limit.saturating_sub(round + 1);
             // Sustained read-only exploration on a task that classifies as a
             // diagnose/fix workflow is exactly the shape `crew`/`team`
@@ -2210,15 +2239,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // ever telling the model to act inline.
             let delegate_hint = workflow_steerer
                 .delegate_hint(&workflow_classifier_text(&messages, ""), advertise_team);
-            messages.push(serde_json::json!({
-                "role": "user",
-                "content": read_only_action_nudge(
+            push_loop_guidance(
+                &mut messages,
+                &read_only_action_nudge(
                     read_only_rounds,
                     remaining,
                     step_ledger,
                     delegate_hint.as_deref(),
-                )
-            }));
+                ),
+            );
             read_only_rounds = 0;
         }
 
@@ -2375,8 +2404,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         outcome.action,
                         step_ledger,
                         prompt_context,
-                        round > 0,
-                        action_nudges,
+                        round > 0 && edit_nudges,
+                        &operator_messages,
                     );
                     // Persist provenance only after the transformed working
                     // set and its continuation have been installed.
@@ -2526,6 +2555,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     let malformed_xml_tool_call = is_ollama_tool_xml_error(&e);
                     if tools_supported && tools_unsupported {
                         tools_supported = false;
+                        // Recovery retries this logical round without tools.
+                        (can_edit, can_exec) = (false, false);
+                        (edit_nudges, action_turn, exec_grounding_turn) = (false, false, false);
+                        strip_unavailable_tool_guidance(&mut messages, &operator_messages);
                         if !tools_unsupported_notified {
                             tools_unsupported_notified = true;
                             let notice = format!(
@@ -2545,10 +2578,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             color,
                             false,
                         );
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": ollama_tool_xml_retry_nudge()
-                        }));
+                        push_loop_guidance(&mut messages, ollama_tool_xml_retry_nudge());
                         // Retry the SAME logical round (inner dispatch loop): the
                         // corrective nudge must reach a tool-CAPABLE round, else at
                         // max_tool_rounds == 1 it is only ever sent to the
@@ -2652,8 +2682,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     outcome.action,
                                     step_ledger,
                                     prompt_context,
-                                    round > 0,
-                                    action_nudges,
+                                    round > 0 && edit_nudges,
+                                    &operator_messages,
                                 );
                                 record_compaction_artifact(
                                     artifact_sink,
@@ -2816,6 +2846,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if !is_cancelled(cancel)
                 && readonly_completion_pending(
                     prompt_disposition,
+                    can_edit,
                     &nudge_classifier,
                     &probe_content,
                 )
@@ -2827,6 +2858,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     None,
                     &mut readonly_completion_retried,
                     more_rounds,
+                    &operator_messages,
                 ) {
                     continue 'round_loop;
                 }
@@ -2862,8 +2894,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 nudge_classifier.direction_for(crate::NudgeClass::PlanUpdate)
                             })
                             .flatten();
-                        let plan_nudge_hint =
-                            combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
+                        let plan_nudge_hint = can_edit.then(|| {
+                            combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref())
+                        }).flatten();
                         if should_ground_unverified_run_command_blocker(
                             content,
                             &tools,
@@ -2893,7 +2926,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             unverified_exec_blocker_nudges += 1;
                             continue 'round_loop;
                         }
-                        if action_nudges && round + 1 < current_tool_round_limit {
+                        if edit_nudges && round + 1 < current_tool_round_limit {
                             if let Some(nudge) = workflow_runtime.rediscovery_nudge(
                                 Some(&nudge_classification),
                                 content,
@@ -2971,7 +3004,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 "content": format!(
                         "{} {}",
                         compress::LOOP_GUIDANCE_PREFIX,
-                        stale_file_ground_truth_nudge()
+                        stale_file_ground_truth_nudge(can_exec, caveats, exec_floor)
                     ),
                             }));
                             stale_file_nudges += 1;
@@ -2991,7 +3024,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             }
                             // #1158: drop the PRIOR nudge exchange first so
                             // successive nudges replace rather than pile up.
-                            strip_trailing_nudge_exchange(&mut messages);
+                            strip_trailing_nudge_exchange(&mut messages, &operator_messages);
                             // Record the model's own narration, then the
                             // corrective, so the next round sees both (mirrors
                             // the has-tools assistant turn).
@@ -3004,11 +3037,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             // failed to convert intent into action, so
                             // escalate — name the active step, demand a bare
                             // tool call.
-                            let direction = if narration_nudges == 0 {
+                            let direction = if !can_edit {
+                                narration_action_nudge(false)
+                            } else if narration_nudges == 0 {
                                 nudge_classifier
                                     .direction_for(nudge_classification.class)
                                     .map(str::to_string)
-                                    .unwrap_or_else(narration_action_nudge)
+                                    .unwrap_or_else(|| narration_action_nudge(true))
                             } else {
                                 escalated_narration_action_nudge(
                                     narration_nudges + 1,
@@ -3280,10 +3315,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 hook(RoundObservation::ThinkingOnly);
                             }
                         }
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": suspicious_empty_retry_nudge(suspicious_empty_retries, &json)
-                        }));
+                        push_loop_guidance(
+                            &mut messages,
+                            &suspicious_empty_retry_nudge(
+                                suspicious_empty_retries,
+                                &json,
+                                tools_supported,
+                            ),
+                        );
                         accumulated_usage = merged;
                         suspicious_empty_retries += 1;
                         continue 'round_loop;
@@ -3363,8 +3402,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 outcome.action,
                                 step_ledger,
                                 prompt_context,
-                                round > 0,
-                                action_nudges,
+                                round > 0 && edit_nudges,
+                                &operator_messages,
                             );
                             record_compaction_artifact(
                                 artifact_sink,
@@ -3501,7 +3540,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // probe already passed the completion guard; preserve that answer.
             if !is_cancelled(cancel)
                 && !probe_content.trim().is_empty()
-                && readonly_completion_pending(prompt_disposition, &nudge_classifier, &streamed)
+                && readonly_completion_pending(
+                    prompt_disposition,
+                    can_edit,
+                    &nudge_classifier,
+                    &streamed,
+                )
             {
                 emit_accepted(
                     &mut on_round_usage,
@@ -3527,7 +3571,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 ));
             }
             if !is_cancelled(cancel)
-                && readonly_completion_pending(prompt_disposition, &nudge_classifier, &streamed)
+                && readonly_completion_pending(
+                    prompt_disposition,
+                    can_edit,
+                    &nudge_classifier,
+                    &streamed,
+                )
             {
                 let more_rounds = round + 1 < current_tool_round_limit;
                 accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
@@ -3537,6 +3586,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     None,
                     &mut readonly_completion_retried,
                     more_rounds,
+                    &operator_messages,
                 ) {
                     continue 'round_loop;
                 }
@@ -3688,9 +3738,6 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 messages.push(serde_json::json!({ "role": "tool", "content": steer }));
                 continue;
             }
-            if !is_read_only_call(name, &args) {
-                round_wrote = true;
-            }
             record_organic_note_use(name, &note_sink, &mut note_nudge);
             // retry technique: snapshot the file's pre-write bytes before the
             // write tool runs, so the post-turn gate can revert exactly newt's writes.
@@ -3798,6 +3845,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             ledger_note_attribution(attribution, model, name, &args, ok);
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
+            if ok && !is_read_only_call(name, &args) {
+                round_wrote = true;
+            }
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
@@ -4671,15 +4721,40 @@ fn looks_like_unverified_run_command_blocker(content: &str) -> bool {
         .any(|needle| lower.contains(needle))
 }
 
-fn run_command_is_advertised(tools: &serde_json::Value) -> bool {
+fn tool_is_advertised(tools: &serde_json::Value, name: &str) -> bool {
     tools.as_array().is_some_and(|defs| {
         defs.iter().any(|def| {
             def.pointer("/function/name")
                 .and_then(serde_json::Value::as_str)
-                == Some("run_command")
-                || (def.get("name").and_then(serde_json::Value::as_str) == Some("run_command"))
+                == Some(name)
+                || (def.get("name").and_then(serde_json::Value::as_str) == Some(name))
         })
     })
+}
+
+/// Available steering directions, not new grants. Recompute after each tool
+/// round because a model-entered Plan phase can change within the turn.
+fn steering_authority(
+    tools: Option<&serde_json::Value>,
+    caveats: &crate::caveats::Caveats,
+    disposition: PromptDisposition,
+    plan_mode_control: Option<&dyn PlanModeControl>,
+    exec_floor: Option<&crate::caveats::Scope<String>>,
+) -> (bool, bool) {
+    let Some(tools) = tools else {
+        return (false, false);
+    };
+    let disposition = tools::effective_tool_disposition(disposition, plan_mode_control);
+    let can_edit = tools::edit_authority_available(caveats, disposition, None)
+        && ["edit_file", "write_file"]
+            .into_iter()
+            .any(|name| tool_is_advertised(tools, name));
+    let can_exec = tools::tool_allowed(disposition, "run_command")
+        && tool_is_advertised(tools, "run_command")
+        && (caveats.exec != crate::caveats::Scope::none()
+            || (tools::ocap_disabled()
+                && exec_floor.is_none_or(|scope| *scope != crate::caveats::Scope::none())));
+    (can_edit, can_exec)
 }
 
 fn run_command_result_is_denial(tool_name: &str, ok: bool, result: &str) -> bool {
@@ -4718,7 +4793,7 @@ fn should_ground_unverified_run_command_blocker(
     action_nudges
         && nudges_used < UNVERIFIED_EXEC_BLOCKER_NUDGE_CAP
         && has_next_round
-        && run_command_is_advertised(tools)
+        && tool_is_advertised(tools, "run_command")
         && !denial_observed
         && looks_like_unverified_run_command_blocker(content)
 }
@@ -4749,16 +4824,19 @@ fn looks_like_intent_to_act(content: &str) -> bool {
 /// Completing an evidence question is independent of permission to mutate.
 /// Reuse the classifier's bare-evidence-promise refinement. Findings, blockers,
 /// and future plans can themselves be the requested read-only deliverable.
+/// Command access alone does not waive that obligation for a non-editing turn.
 /// This is a conservative quality guard, not a general completion oracle.
 fn readonly_completion_pending(
     disposition: PromptDisposition,
+    can_edit: bool,
     classifier: &crate::NudgeClassifier,
     content: &str,
 ) -> bool {
-    matches!(
+    (matches!(
         disposition,
         PromptDisposition::Explain | PromptDisposition::Research
-    ) && classifier.classify(content).class == crate::NudgeClass::DeferredAnswer
+    ) || (disposition == PromptDisposition::Act && !can_edit))
+        && classifier.classify(content).class == crate::NudgeClass::DeferredAnswer
 }
 
 /// One quality retry, never action pressure or a permission change. Keep its
@@ -4769,12 +4847,13 @@ fn retry_readonly_completion(
     replay: Option<&[serde_json::Value]>,
     retried: &mut bool,
     more_rounds: bool,
+    operator_messages: &[String],
 ) -> bool {
     if *retried || !more_rounds {
         return false;
     }
     *retried = true;
-    strip_trailing_nudge_exchange(messages);
+    strip_trailing_nudge_exchange(messages, operator_messages);
     // Responses reasoning items must precede their answer, unchanged.
     if let Some(items) = replay {
         messages.extend_from_slice(items);
@@ -4874,7 +4953,14 @@ fn looks_like_unverified_stale_file_blocker(content: &str) -> bool {
 
 /// The corrective injected when the model narrated its next action but emitted
 /// no tool call (the narrate-then-stop stall). Sibling of [`read_only_action_nudge`].
-fn narration_action_nudge() -> String {
+fn narration_action_nudge(can_edit: bool) -> String {
+    if !can_edit {
+        return "You described a next action but did not call a tool. Use an already available, \
+                authorized tool if another step is needed; otherwise answer from the evidence, \
+                ask a concrete clarification, or state the actual blocker. Do not announce \
+                another intention as the final answer."
+            .to_string();
+    }
     "You described what you were about to do but did not call any tool, so \
      nothing actually happened. If you intended to act, emit the tool call now \
      (for example edit_file or write_file with the real arguments) — do not just \
@@ -4962,7 +5048,7 @@ fn post_compaction_continuation(
 /// re-nudge a model that no longer remembers the correction. Prune-only and
 /// fit passes keep the corrective text, so they neither refund nor anchor.
 ///
-/// `mid_turn` (`round > 0` at the call sites) gates the directive: the
+/// `continue_turn` combines `round > 0` with current action authority: the
 /// pre-dispatch compaction also fires on round 0 of a FRESH turn (a long
 /// session's between-turn growth is first measured there), where "You are
 /// mid-task … do not summarize" would be false and would countermand an
@@ -4975,11 +5061,10 @@ fn apply_post_compaction_continuation(
     action: CompressAction,
     step_ledger: Option<&dyn scheduled::StepLedger>,
     prompt_context: prompt_read::PromptReadContext<'_>,
-    mid_turn: bool,
-    action_nudges: bool,
+    continue_turn: bool,
+    operator_messages: &[String],
 ) {
-    if !action_nudges
-        || !mid_turn
+    if !continue_turn
         || !matches!(
             action,
             CompressAction::Summarized | CompressAction::StaticFallback
@@ -4989,7 +5074,11 @@ fn apply_post_compaction_continuation(
     }
     *narration_nudges = 0;
     // At most one directive alive: drop any earlier copy before appending.
-    messages.retain(|m| !compress::is_continuation_message(m));
+    messages.retain(|m| {
+        m["role"] != "user"
+            || !compress::is_continuation_message(m)
+            || is_operator_message(m, operator_messages)
+    });
     messages.push(serde_json::json!({
         "role": "user",
         "content": post_compaction_continuation(step_ledger, prompt_context),
@@ -5019,7 +5108,23 @@ fn escalated_narration_action_nudge(
     )
 }
 
-fn stale_file_ground_truth_nudge() -> String {
+fn stale_file_ground_truth_nudge(
+    can_exec: bool,
+    caveats: &crate::caveats::Caveats,
+    exec_floor: Option<&crate::caveats::Scope<String>>,
+) -> String {
+    if !can_exec
+        || !["git", "wc"]
+            .into_iter()
+            .all(|command| tools::command_authority_available(caveats, exec_floor, command))
+    {
+        return "Your stale-file claim needs evidence. If the tools and read authority \
+             already available can verify the target, use that evidence to check the claim. \
+             Otherwise state the concrete limitation. Do not ask for broader permissions \
+             or recommend restoring/reverting a file without evidence of unwanted changes \
+             and the operator's approval."
+            .to_string();
+    }
     "You claimed the file changed under you or that your edit context is stale, \
      but you did not prove that with ground truth. Before stopping or asking the \
      operator to restore/revert anything, run read-only verification: git status \
@@ -5151,10 +5256,6 @@ fn read_only_action_nudge(
     )
 }
 
-/// Append the memory-nudge line to the current user message — the last
-/// message in the list per the memory-manager contract. Defensive fallback:
-/// if the last message somehow isn't a user turn, push a standalone user
-/// message instead (mirrors the read-only-rounds nudge injection).
 /// Make narration nudges EPHEMERAL (#1158): remove the previously-injected
 /// nudge exchange — a trailing `[assistant: narration][user: LOOP_GUIDANCE …]`
 /// pair — before the loop injects the next one. Without this, a narrate →
@@ -5166,9 +5267,13 @@ fn read_only_action_nudge(
 /// steer once, not a wall of its own hesitation. The escalation counter still
 /// climbs, so the escalated wording still fires — only the stale pairs are
 /// dropped. A no-op unless the tail actually is a nudge exchange.
-fn strip_trailing_nudge_exchange(messages: &mut Vec<serde_json::Value>) {
+fn strip_trailing_nudge_exchange(
+    messages: &mut Vec<serde_json::Value>,
+    operator_messages: &[String],
+) {
     let tail_is_nudge = messages.last().is_some_and(|m| {
         m["role"] == "user"
+            && !is_operator_message(m, operator_messages)
             && m["content"]
                 .as_str()
                 .is_some_and(|c| c.starts_with(compress::LOOP_GUIDANCE_PREFIX))
@@ -5181,14 +5286,32 @@ fn strip_trailing_nudge_exchange(messages: &mut Vec<serde_json::Value>) {
     }
 }
 
+fn push_loop_guidance(messages: &mut Vec<serde_json::Value>, guidance: &str) {
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": format!("{} {guidance}", compress::LOOP_GUIDANCE_PREFIX),
+    }));
+}
+
+/// Tool loss invalidates harness action corrections, not the operator's task,
+/// compaction summaries, or the correlated assistant/tool evidence.
+fn strip_unavailable_tool_guidance(
+    messages: &mut Vec<serde_json::Value>,
+    operator_messages: &[String],
+) {
+    messages.retain(|message| {
+        message["role"] != "user"
+            || is_operator_message(message, operator_messages)
+            || !compress::is_compaction_message(message)
+            || message["content"]
+                .as_str()
+                .is_some_and(compress::is_compaction_text)
+    });
+}
+
 fn append_nudge_line(messages: &mut Vec<serde_json::Value>, line: &str) {
-    match messages.last_mut() {
-        Some(last) if last["role"] == "user" => {
-            let cur = last["content"].as_str().unwrap_or_default();
-            last["content"] = serde_json::Value::String(format!("{cur}\n\n{line}"));
-        }
-        _ => messages.push(serde_json::json!({"role": "user", "content": line})),
-    }
+    // Do not mix harness instructions into the operator's exact submitted text.
+    push_loop_guidance(messages, line);
 }
 
 fn ollama_non_content_fields(json: &serde_json::Value) -> Vec<&'static str> {
@@ -5235,7 +5358,17 @@ fn ollama_response_shape(json: &serde_json::Value) -> String {
     )
 }
 
-fn suspicious_empty_retry_nudge(retry_index: u32, json: &serde_json::Value) -> String {
+fn suspicious_empty_retry_nudge(
+    retry_index: u32,
+    json: &serde_json::Value,
+    tools_supported: bool,
+) -> String {
+    if !tools_supported {
+        return "Your previous response produced generated tokens but no assistant-visible content. \
+                Reply with the answer supported by the available evidence, a concrete question, \
+                or the actual unresolved limitation. Do not continue with hidden-only reasoning."
+            .to_string();
+    }
     if retry_index == 0 {
         return "Your previous response produced generated tokens but no assistant-visible content \
                 and no tool call. Reply with either a tool call or final assistant content."
@@ -5907,6 +6040,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
     prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
+    let mut operator_messages = protected_operator_messages(&messages);
 
     // In-band memory nudge (Step 19.3) — mirrors the Ollama path.
     if note_sink.is_some() {
@@ -6046,6 +6180,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let turn_started = std::time::Instant::now();
     let mut turn_heartbeat = TurnHeartbeat::default();
     'round_loop: for round in 0..hard_tool_rounds {
+        let (mut can_edit, mut can_exec) = steering_authority(
+            tools_supported.then_some(&tools),
+            caveats,
+            prompt_disposition,
+            plan_mode_control,
+            exec_floor,
+        );
+        let mut edit_nudges = action_nudges && can_edit;
+        let mut action_turn = action_turn && (can_edit || can_exec);
+        let mut exec_grounding_turn = exec_grounding_turn && can_exec;
         // Bounded to ONE line per interval, and the policy is pure over the
         // elapsed it is handed — this reads the clock, `due` does not.
         let turn_elapsed = turn_started.elapsed();
@@ -6063,7 +6207,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if workflow_grace_active {
                 break;
             }
-            if !action_nudges {
+            if !edit_nudges {
                 break;
             }
             let Some(nudge) = workflow_runtime.cap_grace_nudge(
@@ -6081,7 +6225,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     color,
                 );
             }
-            messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+            push_loop_guidance(&mut messages, &nudge);
         }
         // Interrupt checkpoint (Esc / Ctrl-C), same contract as the Ollama path:
         // bail at the round boundary with an empty reply; tool dispatches below
@@ -6093,7 +6237,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // call and AFTER any tool that was already running finished above.
         // Steering changes what the agent does NEXT; it never abandons the
         // turn (that is `cancel`, checked immediately above).
-        drain_steering_into(steering, &mut messages, color);
+        drain_steering_into(steering, &mut messages, &mut operator_messages, color);
         if round > 0 && color {
             execute!(
                 io::stdout(),
@@ -6106,12 +6250,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 
         // Conditional plan re-seat (#630 b) — mirror of the Ollama path: re-show
         // the active step each round so a multi-step plan doesn't go stale.
-        if round > 0 && action_nudges {
+        if round > 0 && edit_nudges {
             if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
-                messages.push(serde_json::json!({ "role": "user", "content": ptr }));
+                push_loop_guidance(&mut messages, &ptr);
             }
             if let Some(nudge) = workflow_runtime.round_start_nudge(step_ledger) {
-                messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+                push_loop_guidance(&mut messages, &nudge);
             }
             // Tenacity action-forcing (#tenacity): the OpenAI-chat loop had no
             // read-only action nudge (only the Ollama loop did), so a model
@@ -6129,7 +6273,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         color,
                     );
                 }
-                messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+                push_loop_guidance(&mut messages, &nudge);
             }
         }
 
@@ -6259,8 +6403,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         outcome.action,
                         step_ledger,
                         prompt_context,
-                        round > 0,
-                        action_nudges,
+                        round > 0 && edit_nudges,
+                        &operator_messages,
                     );
                     record_compaction_artifact(
                         artifact_sink,
@@ -6412,6 +6556,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     // body omits tools) and session-persistent.
                     if tools_supported && is_tools_unsupported_error(&e) {
                         tools_supported = false;
+                        // Recovery retries this logical round without tools.
+                        (can_edit, can_exec) = (false, false);
+                        (edit_nudges, action_turn, exec_grounding_turn) = (false, false, false);
+                        strip_unavailable_tool_guidance(&mut messages, &operator_messages);
                         if !tools_unsupported_notified {
                             tools_unsupported_notified = true;
                             print_newt(
@@ -6528,8 +6676,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     outcome.action,
                                     step_ledger,
                                     prompt_context,
-                                    round > 0,
-                                    action_nudges,
+                                    round > 0 && edit_nudges,
+                                    &operator_messages,
                                 );
                                 record_compaction_artifact(
                                     artifact_sink,
@@ -6792,7 +6940,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             }
             let content = oa_content.clone();
             if !is_cancelled(cancel)
-                && readonly_completion_pending(prompt_disposition, &nudge_classifier, &content)
+                && readonly_completion_pending(
+                    prompt_disposition,
+                    can_edit,
+                    &nudge_classifier,
+                    &content,
+                )
             {
                 let more_rounds = round + 1 < current_tool_round_limit;
                 if retry_readonly_completion(
@@ -6801,6 +6954,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     None,
                     &mut readonly_completion_retried,
                     more_rounds,
+                    &operator_messages,
                 ) {
                     continue 'round_loop;
                 }
@@ -6835,8 +6989,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 .as_ref()
                 .filter(|classification| classification.is_plan_update())
                 .and_then(|_| nudge_classifier.direction_for(crate::NudgeClass::PlanUpdate));
-            let plan_nudge_hint =
-                combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
+            let plan_nudge_hint = can_edit
+                .then(|| combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref()))
+                .flatten();
             if should_ground_unverified_run_command_blocker(
                 &content,
                 &tools,
@@ -6863,7 +7018,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 unverified_exec_blocker_nudges += 1;
                 continue 'round_loop;
             }
-            if !content.is_empty() && round + 1 < current_tool_round_limit && action_turn {
+            if !content.is_empty()
+                && round + 1 < current_tool_round_limit
+                && action_turn
+                && can_edit
+            {
                 if let Some(nudge) = workflow_runtime.rediscovery_nudge(
                     nudge_classification.as_ref(),
                     &content,
@@ -6929,7 +7088,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     "content": format!(
                         "{} {}",
                         compress::LOOP_GUIDANCE_PREFIX,
-                        stale_file_ground_truth_nudge()
+                        stale_file_ground_truth_nudge(can_exec, caveats, exec_floor)
                     ),
                 }));
                 stale_file_nudges += 1;
@@ -6950,19 +7109,21 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     );
                 }
                 // #1158: ephemeral — replace the prior nudge, don't stack.
-                strip_trailing_nudge_exchange(&mut messages);
+                strip_trailing_nudge_exchange(&mut messages, &operator_messages);
                 messages.push(serde_json::json!({ "role": "assistant", "content": content }));
                 // First nudge: the (tunable) classifier direction. Later
                 // nudges (cap > 1) escalate — name the active step, demand a
                 // bare tool call (mirrors the Ollama loop).
-                let direction = if narration_nudges == 0 {
+                let direction = if !can_edit {
+                    narration_action_nudge(false)
+                } else if narration_nudges == 0 {
                     nudge_classification
                         .as_ref()
                         .and_then(|classification| {
                             nudge_classifier.direction_for(classification.class)
                         })
                         .map(str::to_string)
-                        .unwrap_or_else(narration_action_nudge)
+                        .unwrap_or_else(|| narration_action_nudge(true))
                 } else {
                     escalated_narration_action_nudge(
                         narration_nudges + 1,
@@ -6990,21 +7151,31 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // zero rounds left to actually run anything — step aside and accept.
             if self_verify::enabled()
                 && action_nudges
+                && can_exec
+                && tools_supported
                 && self_verify_nudges < SELF_VERIFY_CAP
                 && round + 1 < current_tool_round_limit
                 && !content.is_empty()
             {
-                let entries = self_verify::workspace_entries(std::path::Path::new(workspace));
-                let checks = self_verify::detect_checks(&entries, active_task);
+                let entries = self_verify::workspace_entries(
+                    std::path::Path::new(workspace),
+                    &caveats.fs_read,
+                );
+                let mut checks = self_verify::detect_checks(&entries, active_task);
+                checks.retain_mut(|check| {
+                    check.retain_authorized(|command| {
+                        tools::command_authority_available(caveats, exec_floor, command)
+                    })
+                });
                 let cmds = self_verify::commands_from_messages(&messages);
-                if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds) {
+                if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds, can_edit) {
                     if debug {
                         print_debug(
                             "concluding with unrun verification — self-verify nudge",
                             color,
                         );
                     }
-                    strip_trailing_nudge_exchange(&mut messages);
+                    strip_trailing_nudge_exchange(&mut messages, &operator_messages);
                     messages.push(serde_json::json!({ "role": "assistant", "content": content }));
                     messages.push(serde_json::json!({
                         "role": "user",
@@ -7107,7 +7278,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 StreamOutcome::Printed(text, stream_usage) => {
                     accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
                     if !is_cancelled(cancel)
-                        && readonly_completion_pending(prompt_disposition, &nudge_classifier, &text)
+                        && readonly_completion_pending(
+                            prompt_disposition,
+                            can_edit,
+                            &nudge_classifier,
+                            &text,
+                        )
                     {
                         // Re-use the accepted probe; it has already passed every
                         // gate and the caller must print it after this promise.
@@ -8003,6 +8179,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
     prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
+    let mut operator_messages = protected_operator_messages(&messages);
 
     // In-band memory nudge (Step 19.3) — mirrors the OpenAI path.
     if note_sink.is_some() {
@@ -8130,6 +8307,16 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let turn_started = std::time::Instant::now();
     let mut turn_heartbeat = TurnHeartbeat::default();
     'round_loop: for round in 0..hard_tool_rounds {
+        let (mut can_edit, mut can_exec) = steering_authority(
+            tools_supported.then_some(&tools),
+            caveats,
+            prompt_disposition,
+            plan_mode_control,
+            exec_floor,
+        );
+        let mut edit_nudges = action_nudges && can_edit;
+        let mut action_turn = action_turn && (can_edit || can_exec);
+        let mut exec_grounding_turn = exec_grounding_turn && can_exec;
         // Bounded to ONE line per interval, and the policy is pure over the
         // elapsed it is handed — this reads the clock, `due` does not.
         let turn_elapsed = turn_started.elapsed();
@@ -8147,7 +8334,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             if workflow_grace_active {
                 break;
             }
-            if !action_nudges {
+            if !edit_nudges {
                 break;
             }
             let Some(nudge) = workflow_runtime.cap_grace_nudge(
@@ -8165,7 +8352,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     color,
                 );
             }
-            messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+            push_loop_guidance(&mut messages, &nudge);
         }
         // Interrupt checkpoint (Esc / Ctrl-C) — mirrors the OpenAI path.
         if is_cancelled(cancel) {
@@ -8175,7 +8362,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // call and AFTER any tool that was already running finished above.
         // Steering changes what the agent does NEXT; it never abandons the
         // turn (that is `cancel`, checked immediately above).
-        drain_steering_into(steering, &mut messages, color);
+        drain_steering_into(steering, &mut messages, &mut operator_messages, color);
         if round > 0 && color {
             execute!(
                 io::stdout(),
@@ -8187,12 +8374,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         }
 
         // Conditional plan re-seat (#630 b) — mirrors the OpenAI path.
-        if round > 0 && action_nudges {
+        if round > 0 && edit_nudges {
             if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
-                messages.push(serde_json::json!({ "role": "user", "content": ptr }));
+                push_loop_guidance(&mut messages, &ptr);
             }
             if let Some(nudge) = workflow_runtime.round_start_nudge(step_ledger) {
-                messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+                push_loop_guidance(&mut messages, &nudge);
             }
             // Tenacity action-forcing — mirrors the OpenAI path.
             let remaining = current_tool_round_limit.saturating_sub(round + 1);
@@ -8207,7 +8394,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         color,
                     );
                 }
-                messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+                push_loop_guidance(&mut messages, &nudge);
             }
         }
 
@@ -8320,8 +8507,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         outcome.action,
                         step_ledger,
                         prompt_context,
-                        round > 0,
-                        action_nudges,
+                        round > 0 && edit_nudges,
+                        &operator_messages,
                     );
                     record_compaction_artifact(
                         artifact_sink,
@@ -8412,6 +8599,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     // notice once, and re-dispatch the same round.
                     if tools_supported && is_tools_unsupported_error(&e) {
                         tools_supported = false;
+                        // Recovery retries this logical round without tools.
+                        (can_edit, can_exec) = (false, false);
+                        (edit_nudges, action_turn, exec_grounding_turn) = (false, false, false);
+                        strip_unavailable_tool_guidance(&mut messages, &operator_messages);
                         if !tools_unsupported_notified {
                             tools_unsupported_notified = true;
                             print_newt(
@@ -8514,8 +8705,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                     outcome.action,
                                     step_ledger,
                                     prompt_context,
-                                    round > 0,
-                                    action_nudges,
+                                    round > 0 && edit_nudges,
+                                    &operator_messages,
                                 );
                                 record_compaction_artifact(
                                     artifact_sink,
@@ -8783,7 +8974,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             }
             let content = oa_content.clone();
             if !is_cancelled(cancel)
-                && readonly_completion_pending(prompt_disposition, &nudge_classifier, &content)
+                && readonly_completion_pending(
+                    prompt_disposition,
+                    can_edit,
+                    &nudge_classifier,
+                    &content,
+                )
             {
                 let more_rounds = round + 1 < current_tool_round_limit;
                 if retry_readonly_completion(
@@ -8792,6 +8988,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     None,
                     &mut readonly_completion_retried,
                     more_rounds,
+                    &operator_messages,
                 ) {
                     continue 'round_loop;
                 }
@@ -8826,8 +9023,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 .as_ref()
                 .filter(|classification| classification.is_plan_update())
                 .and_then(|_| nudge_classifier.direction_for(crate::NudgeClass::PlanUpdate));
-            let plan_nudge_hint =
-                combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
+            let plan_nudge_hint = can_edit
+                .then(|| combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref()))
+                .flatten();
             if should_ground_unverified_run_command_blocker(
                 &content,
                 &tools,
@@ -8854,7 +9052,11 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 unverified_exec_blocker_nudges += 1;
                 continue 'round_loop;
             }
-            if !content.is_empty() && round + 1 < current_tool_round_limit && action_turn {
+            if !content.is_empty()
+                && round + 1 < current_tool_round_limit
+                && action_turn
+                && can_edit
+            {
                 if let Some(nudge) = workflow_runtime.rediscovery_nudge(
                     nudge_classification.as_ref(),
                     &content,
@@ -8920,7 +9122,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     "content": format!(
                         "{} {}",
                         compress::LOOP_GUIDANCE_PREFIX,
-                        stale_file_ground_truth_nudge()
+                        stale_file_ground_truth_nudge(can_exec, caveats, exec_floor)
                     ),
                 }));
                 stale_file_nudges += 1;
@@ -8941,16 +9143,18 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     );
                 }
                 // #1158: ephemeral — replace the prior nudge, don't stack.
-                strip_trailing_nudge_exchange(&mut messages);
+                strip_trailing_nudge_exchange(&mut messages, &operator_messages);
                 messages.push(serde_json::json!({ "role": "assistant", "content": content }));
-                let direction = if narration_nudges == 0 {
+                let direction = if !can_edit {
+                    narration_action_nudge(false)
+                } else if narration_nudges == 0 {
                     nudge_classification
                         .as_ref()
                         .and_then(|classification| {
                             nudge_classifier.direction_for(classification.class)
                         })
                         .map(str::to_string)
-                        .unwrap_or_else(narration_action_nudge)
+                        .unwrap_or_else(|| narration_action_nudge(true))
                 } else {
                     escalated_narration_action_nudge(
                         narration_nudges + 1,
@@ -8968,21 +9172,31 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // Self-verify gate (#23) — mirrors the OpenAI path.
             if self_verify::enabled()
                 && action_nudges
+                && can_exec
+                && tools_supported
                 && self_verify_nudges < SELF_VERIFY_CAP
                 && round + 1 < current_tool_round_limit
                 && !content.is_empty()
             {
-                let entries = self_verify::workspace_entries(std::path::Path::new(workspace));
-                let checks = self_verify::detect_checks(&entries, active_task);
+                let entries = self_verify::workspace_entries(
+                    std::path::Path::new(workspace),
+                    &caveats.fs_read,
+                );
+                let mut checks = self_verify::detect_checks(&entries, active_task);
+                checks.retain_mut(|check| {
+                    check.retain_authorized(|command| {
+                        tools::command_authority_available(caveats, exec_floor, command)
+                    })
+                });
                 let cmds = self_verify::commands_from_messages(&messages);
-                if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds) {
+                if let Some(nudge) = self_verify::verify_gate_nudge(&checks, &cmds, can_edit) {
                     if debug {
                         print_debug(
                             "concluding with unrun verification — self-verify nudge",
                             color,
                         );
                     }
-                    strip_trailing_nudge_exchange(&mut messages);
+                    strip_trailing_nudge_exchange(&mut messages, &operator_messages);
                     messages.push(serde_json::json!({ "role": "assistant", "content": content }));
                     messages.push(serde_json::json!({
                         "role": "user",
@@ -9716,6 +9930,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     prompt_read::ensure_active_prompt_card(&mut msgs_json, prompt_context, prompt_intake);
+    let mut operator_messages = protected_operator_messages(&msgs_json);
     let exec_grounding_turn = action_nudges && prompt_disposition == PromptDisposition::Act;
     let (instructions, mut input) = crate::responses_wire::build_responses_input(&msgs_json);
     let tools_chat = merged_tool_definitions(
@@ -9862,6 +10077,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let turn_started = std::time::Instant::now();
     let mut turn_heartbeat = TurnHeartbeat::default();
     for round in 0..max_tool_rounds {
+        let (mut can_edit, can_exec) = steering_authority(
+            tools_supported.then_some(&tools_chat),
+            caveats,
+            prompt_disposition,
+            plan_mode_control,
+            exec_floor,
+        );
+        let mut exec_grounding_turn = exec_grounding_turn && can_exec;
         // Bounded to ONE line per interval, and the policy is pure over the
         // elapsed it is handed — this reads the clock, `due` does not.
         let turn_elapsed = turn_started.elapsed();
@@ -9880,7 +10103,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // call and AFTER any tool that was already running finished above.
         // Steering changes what the agent does NEXT; it never abandons the
         // turn (that is `cancel`, checked immediately above).
-        drain_steering_into(steering, &mut input, color);
+        drain_steering_into(steering, &mut input, &mut operator_messages, color);
         // #1528: inner recovery loop — a cw-400 (or a tools-unsupported error)
         // retries THIS logical round IN PLACE. Only a COMPLETED dispatch `break`s
         // out and lets `round` advance, so recovery never consumes a tool-capable
@@ -9978,6 +10201,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 Err(e) => {
                     if tools_supported && is_tools_unsupported_error(&e) {
                         tools_supported = false;
+                        (can_edit, exec_grounding_turn) = (false, false);
+                        strip_unavailable_tool_guidance(&mut input, &operator_messages);
                         if !tools_unsupported_notified {
                             tools_unsupported_notified = true;
                             print_newt(
@@ -10115,7 +10340,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
 
         if calls.is_empty() {
             if !is_cancelled(cancel)
-                && readonly_completion_pending(prompt_disposition, &nudge_classifier, &text)
+                && readonly_completion_pending(
+                    prompt_disposition,
+                    can_edit,
+                    &nudge_classifier,
+                    &text,
+                )
             {
                 let more_rounds = round + 1 < max_tool_rounds;
                 if retry_readonly_completion(
@@ -10124,6 +10354,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     Some(&echo),
                     &mut readonly_completion_retried,
                     more_rounds,
+                    &operator_messages,
                 ) {
                     continue;
                 }
@@ -10175,6 +10406,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 turn_start_head.as_deref(),
                 disclosure,
             );
+            if !is_cancelled(cancel) {
+                if let Some(slot) = &mut end_reason {
+                    **slot = Some(crate::TurnEndReason::Completed);
+                }
+            }
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
 

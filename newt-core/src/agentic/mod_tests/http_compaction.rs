@@ -399,7 +399,7 @@ fn post_compaction_uses_the_current_turn_task_not_the_first_conversation_prompt(
         None,
         prompt_context,
         true,
-        true,
+        &[],
     );
 
     let directive = messages
@@ -452,7 +452,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         None,
         prompt_context,
         true,
-        true,
+        &[],
     );
     assert_eq!(nudges, 1, "prune must not refund the rescue budget");
     assert_eq!(messages.len(), 3, "prune must not touch the directive");
@@ -467,7 +467,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         None,
         prompt_context,
         false,
-        true,
+        &[],
     );
     assert_eq!(nudges, 1, "round 0 must not touch the rescue budget");
     assert_eq!(messages.len(), 3, "round 0 must not inject the directive");
@@ -482,7 +482,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         None,
         prompt_context,
         true,
-        true,
+        &[],
     );
     assert_eq!(nudges, 0, "summarization refunds the rescue budget");
     assert_eq!(directive_count(&messages), 1, "at most one directive alive");
@@ -495,4 +495,61 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
     );
     assert!(content.contains("tool call"), "{content}");
     assert!(!content.contains("stale directive"), "{content}");
+}
+
+#[test]
+fn confined_act_continuation_cleanup_preserves_literal_operator_and_tool_evidence() {
+    let operator = format!(
+        "{} Preserve this literal operator correction.",
+        compress::CONTINUATION_PREFIX
+    );
+    let original = vec![
+        serde_json::json!({"role": "user", "content": "Count the branches."}),
+        serde_json::json!({"role": "user", "content": operator}),
+        serde_json::json!({
+            "role": "assistant",
+            "content": format!("{} Preserve this model evidence.", compress::CONTINUATION_PREFIX)
+        }),
+        serde_json::json!({
+            "role": "tool", "tool_call_id": "read-1",
+            "content": format!("{} Preserve this read evidence.", compress::CONTINUATION_PREFIX)
+        }),
+    ];
+    let protected = protected_operator_messages(&original);
+    let mut messages = original.clone();
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": format!("{} Stale generated directive.", compress::CONTINUATION_PREFIX)
+    }));
+    let context = prompt_read::PromptReadContext::new(None, "Count the branches.", None);
+    let mut nudges = 1;
+    apply_post_compaction_continuation(
+        &mut messages,
+        &mut nudges,
+        CompressAction::Summarized,
+        None,
+        context,
+        true,
+        &protected,
+    );
+    assert_eq!(&messages[..original.len()], original.as_slice());
+    assert_eq!(messages.len(), original.len() + 1);
+    assert_eq!(nudges, 0);
+    assert_eq!(messages.last().unwrap()["role"], "user");
+    assert_eq!(
+        messages.last().unwrap()["content"],
+        post_compaction_continuation(None, context)
+    );
+
+    let after = messages.clone();
+    apply_post_compaction_continuation(
+        &mut messages,
+        &mut nudges,
+        CompressAction::StaticFallback,
+        None,
+        context,
+        true,
+        &protected,
+    );
+    assert_eq!(messages, after, "replace only the generated continuation");
 }

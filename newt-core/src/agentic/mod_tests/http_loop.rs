@@ -29,6 +29,55 @@ fn msgs() -> Vec<MemMessage> {
 /// `an_armed_self_verify_gate_adds_a_round_when_the_workspace_ships_a_check`.
 const NO_CHECKS_WORKSPACE: &str = "newt-core-test-workspace-that-does-not-exist";
 
+pub(super) const READONLY_COUNT_TASK: &str =
+    "please count the branches in this repo (newt-agent repo)";
+pub(super) const READONLY_COUNT_FILE: &str = "branch-count.txt";
+pub(super) const READONLY_COUNT_DATA: &str =
+    "local branches: 2\nrefs/heads/main\nrefs/heads/feature\n";
+pub(super) const READONLY_COUNT_ANSWER: &str = "There are two local branches: main and feature.";
+
+/// A real native-read result beside a real verification affordance. Shared
+/// across the two provider loops that currently implement self-verification.
+pub(super) fn readonly_count_workspace() -> (tempfile::TempDir, Caveats) {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = 'fixture'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.path().join(READONLY_COUNT_FILE),
+        READONLY_COUNT_DATA,
+    )
+    .unwrap();
+    let caveats = Caveats {
+        fs_read: crate::Scope::only([workspace.path().to_string_lossy().into_owned()]),
+        ..tools::plan_phase_clamp()
+    };
+    (workspace, caveats)
+}
+
+pub(super) fn assert_no_impossible_verification_pressure(requests: &[Request]) {
+    for request in requests {
+        let body = body_json(request);
+        for message in body["messages"].as_array().unwrap() {
+            if message["role"] == "user" {
+                let content = message["content"].to_string();
+                for forbidden in [
+                    "verification this task ships",
+                    "run_command",
+                    "edit_file",
+                    "write_file",
+                    "request_permissions",
+                    "FIX the code",
+                ] {
+                    assert!(!content.contains(forbidden), "{content}");
+                }
+            }
+        }
+    }
+}
+
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
         rewrites_history: true,
@@ -262,12 +311,24 @@ mod mcp_routing;
 mod narration;
 
 #[cfg(test)]
+#[path = "http_authority_steering.rs"]
+mod authority_steering;
+
+#[cfg(test)]
+#[path = "http_stale_authority.rs"]
+pub(super) mod stale_authority;
+
+#[cfg(test)]
+#[path = "http_tools_unavailable.rs"]
+mod tools_unavailable;
+
+#[cfg(test)]
 #[path = "http_plan_handoff.rs"]
 mod plan_handoff;
 
 #[cfg(test)]
 #[path = "http_verification.rs"]
-mod verification;
+pub(super) mod verification;
 
 #[cfg(test)]
 #[path = "http_spill_retrieval.rs"]

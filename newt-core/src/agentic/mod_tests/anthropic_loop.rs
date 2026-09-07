@@ -15,14 +15,17 @@ use std::sync::{Arc, Mutex};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+#[path = "anthropic_authority_steering.rs"]
+mod authority_steering;
+
 /// Set/unset an env var for the test's duration, restoring prior state on
 /// drop (env vars are process-global — hence the serial lane above).
-struct EnvGuard {
+pub(super) struct EnvGuard {
     key: &'static str,
     prev: Option<String>,
 }
 impl EnvGuard {
-    fn set(key: &'static str, value: &str) -> Self {
+    pub(super) fn set(key: &'static str, value: &str) -> Self {
         let prev = std::env::var(key).ok();
         std::env::set_var(key, value);
         Self { key, prev }

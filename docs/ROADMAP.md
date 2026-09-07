@@ -1548,8 +1548,21 @@ fully-mocked unit tier, coverage ratchet.
   (`newt-core/src/agentic/mod.rs`, `compress.rs`). Salvage the `<plan>`/`<state>`
   ledger into the final summary; when rounds were hallucination/dead-tool
   dominated, say so rather than advising "raise max_tool_rounds".
+- **27.6** — **Authority-aware steering and factual-answer recovery**
+  (`newt-core/src/agentic/mod.rs`, `self_verify.rs`, `tools.rs`). Derive
+  continuation and verification guidance from the validated disposition,
+  effective capability ceiling and exposed tool catalog. Read-only and
+  command-only turns retain bounded answer recovery without demands for
+  unavailable edits or broader grants. Recompute guidance when a backend
+  rejects tools; preserve exact operator input, summaries and tool evidence
+  while removing obsolete harness corrections. Refused writes are not
+  progress, plan exit restores only validated authority, and cancellation
+  is not normal completion. Reuse the bounded Git operation from 27.2;
+  strict schema compatibility does not add Git authority. Static path
+  containment tests do not prove race-free filesystem access. Learned
+  dialogue-act classification and new grants are out of scope.
 
-**Recommended order:** 27.1 → 27.2 → 27.4 → 27.3 → 27.5. Each step carries the
+**Recommended order:** 27.1 → 27.2 → 27.4 → 27.3 → 27.5 → 27.6. Each step carries the
 acceptance contract (What / Test plan / Out of scope), wiremock'd Ollama mocks,
 in-memory store fakes, and the coverage ratchet. A `newt-eval` BAT/UAT case
 replays the real failing scenario ("persist context settings, then create the
