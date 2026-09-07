@@ -232,6 +232,40 @@ where
     seen
 }
 
+#[tokio::test]
+async fn readonly_completion_streamed_promise_cannot_replace_the_accepted_probe() {
+    let server = MockServer::start().await;
+    let seen = mount(&server, |_| {
+        sse_text(
+            &["Let me check the current implementation and identify any gaps."],
+            101,
+            11,
+        )
+    })
+    .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.prompt_disposition = PromptDisposition::Explain;
+    let (reply, streamed, usage, _) = chat_complete(c, &mut NoMcp).await.unwrap();
+    assert_eq!(reply, "the probe already answered");
+    assert!(
+        !streamed,
+        "the caller must render the accepted answer after the replay promise"
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "reuse the accepted probe without another inference"
+    );
+    assert_eq!(
+        usage.unwrap().output_tokens,
+        18,
+        "both requests remain accounted for"
+    );
+}
+
 // -----------------------------------------------------------------------
 // The BYTES: `openai_stream_final_answer` drives its output sink directly,
 // so these assert what actually reached the terminal.

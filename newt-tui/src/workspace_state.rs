@@ -38,6 +38,7 @@ fn git_stdout(workspace: &str, args: &[&str]) -> Option<String> {
     // Confused-deputy-safe (step-7.4): `workspace` may be a hostile repo whose
     // `.git/config` could turn this read into out-of-fence code.
     let output = newt_core::git_hardening::hardened_git(std::path::Path::new(workspace), args)
+        .ok()?
         .output()
         .ok()?;
     if !output.status.success() {

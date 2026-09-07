@@ -363,6 +363,7 @@ fn git_in(workspace: &str, args: &[&str]) -> Option<String> {
     // could turn a raw `git` read into out-of-fence code (core.fsmonitor, hooks,
     // diff.external, …). `hardened_git` disarms that surface (step-7.4).
     let out = crate::git_hardening::hardened_git(std::path::Path::new(workspace), args)
+        .ok()?
         .output()
         .ok()?;
     out.status

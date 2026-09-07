@@ -22,6 +22,17 @@ matchers = [
   "What remains: fix the compile error, add tests, and run the check.",
 ]
 
+[classes.deferred_answer]
+# This is a PendingAction refinement. Act still uses pending_action's nudge;
+# evidence-only turns can instead request a completed answer without mutations.
+# These tag existing pending_action prototypes; they do not add action triggers.
+# Replies must share a prototype's first three words to qualify for this subtype.
+nudge = ""
+matchers = [
+  "Let me understand what was already done on this branch and compare it with the issue requirements.",
+  "Let me check the current implementation and identify any gaps.",
+]
+
 [classes.plan_update]
 nudge = "Your findings changed the shape of the active work. Update the plan first, then call the next concrete tool for the new active repair step. Do not repeat the findings summary or hand off while this nudge is giving you another round."
 matchers = [

@@ -62,6 +62,7 @@ fn hardened_git_neutralizes_the_fsmonitor_gadget() {
     // The fix: `hardened_git` overrides `core.fsmonitor=` so the gadget CANNOT
     // run, whether or not this host's git fired it for the raw call.
     let _ = hardened_git(repo.path(), &["status", "--porcelain"])
+        .unwrap()
         .output()
         .unwrap();
     assert!(
@@ -84,6 +85,7 @@ fn hardened_git_ignores_user_and_system_config_and_still_reads_the_repo() {
     git(repo.path(), &["commit", "-q", "-m", "x"]);
 
     let out = hardened_git(repo.path(), &["status", "--porcelain"])
+        .unwrap()
         .output()
         .unwrap();
     assert!(out.status.success(), "hardened git status must succeed");

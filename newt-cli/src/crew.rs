@@ -144,11 +144,12 @@ fn run_confined_build(worktree: &Path, base: &Path, cmd: &str) -> Result<(bool, 
 /// config-gadget surface (`core.fsmonitor`, hooks, `diff.external`, pager, …).
 /// Diff callers additionally pass `--no-ext-diff --no-textconv`.
 pub(crate) fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = newt_core::git_hardening::hardened_git(dir, args).output()?;
+    let out = newt_core::git_hardening::hardened_git(dir, args)?.output()?;
     if !out.status.success() {
         anyhow::bail!(
-            "git {}: {}",
+            "git {} (status={}): {}",
             args.join(" "),
+            out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -2329,6 +2330,18 @@ mod tests {
         // A non-repo dir contributes nothing (authoring uses the goal text alone).
         let empty = tempfile::tempdir().unwrap();
         assert!(fetch_repo_context(empty.path()).is_empty());
+    }
+
+    #[test]
+    fn git_failure_retains_the_process_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = git(dir.path(), &["newt-invalid-test-operation"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("status="),
+            "stderr alone cannot explain an unsuccessful Git subprocess: {error}"
+        );
     }
 
     fn git_repo() -> tempfile::TempDir {

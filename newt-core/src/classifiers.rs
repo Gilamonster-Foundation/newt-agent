@@ -21,6 +21,9 @@ const BUNDLED_NUDGE_CLASSIFIER: &str = include_str!("classifiers/nudge.toml");
 pub enum NudgeClass {
     /// The assistant is announcing an action it has not actually performed.
     PendingAction,
+    /// A bare promise to gather evidence, with no answer or substantive finding.
+    /// A refinement of PendingAction; ordinary action-pressure behavior is shared.
+    DeferredAnswer,
     /// The assistant discovered prerequisite work that should revise the plan.
     PlanUpdate,
     /// The assistant appears to be giving a real final answer.
@@ -40,7 +43,7 @@ impl NudgeClassification {
     pub fn is_pending_action(&self) -> bool {
         matches!(
             self.class,
-            NudgeClass::PendingAction | NudgeClass::PlanUpdate
+            NudgeClass::PendingAction | NudgeClass::DeferredAnswer | NudgeClass::PlanUpdate
         )
     }
 
@@ -62,7 +65,7 @@ pub struct NudgeClassifierConfig {
     #[serde(default = "default_min_margin")]
     pub min_margin: f32,
     /// Class definitions keyed by canonical class names:
-    /// `pending_action`, `plan_update`, `final_answer`.
+    /// `pending_action`, `deferred_answer`, `plan_update`, `final_answer`.
     #[serde(default)]
     pub classes: BTreeMap<String, NudgeClassConfig>,
 }
@@ -217,12 +220,43 @@ impl NudgeClassifier {
             };
         }
 
+        let opening: Vec<_> = words(text).take(3).collect();
+        let deferred_prototypes: Vec<_> = self
+            .cfg
+            .classes
+            .iter()
+            .filter(|(name, _)| parse_nudge_class(name) == Some(NudgeClass::DeferredAnswer))
+            .flat_map(|(_, cfg)| &cfg.matchers)
+            .map(|example| tokens(example))
+            .collect();
+        let class_specificity = |class| {
+            self.cfg
+                .classes
+                .iter()
+                .filter(|(name, _)| parse_nudge_class(name) == Some(class))
+                .flat_map(|(_, cfg)| &cfg.matchers)
+                .filter(|example| {
+                    class != NudgeClass::DeferredAnswer
+                        || words(example).take(3).eq(opening.iter().cloned())
+                })
+                .map(|example| tokens(example))
+                .filter(|prototype| {
+                    class != NudgeClass::PendingAction || !deferred_prototypes.contains(prototype)
+                })
+                .map(|prototype| jaccard(&query, &prototype))
+                .fold(0.0_f32, f32::max)
+        };
         let mut scored: Vec<(NudgeClass, f32)> = self
             .cfg
             .classes
             .iter()
             .filter_map(|(class, class_cfg)| {
                 let class = parse_nudge_class(class)?;
+                // A subtype never competes with or expands the configured
+                // coarse corpus: Act's scores and ambiguity margin stay intact.
+                if class == NudgeClass::DeferredAnswer {
+                    return None;
+                }
                 let best = class_cfg
                     .matchers
                     .iter()
@@ -245,6 +279,22 @@ impl NudgeClassifier {
                 score,
             };
         }
+        // Refine by specificity, not the broad prototype-recall score: a short
+        // "Let me edit the file" prototype shares generic words with evidence
+        // promises. Jaccard accounts for the whole reply and preserves concrete
+        // findings. The subtype also requires its configured opening words:
+        // negated blockers and answers followed by a promise stay broad.
+        // Ambiguous cases and questions keep the broad class; as in prompt
+        // intake, a question mark conservatively preserves a real ask.
+        let class = if class == NudgeClass::PendingAction
+            && !text.contains('?')
+            && class_specificity(NudgeClass::DeferredAnswer)
+                > class_specificity(NudgeClass::PendingAction) + self.cfg.min_margin
+        {
+            NudgeClass::DeferredAnswer
+        } else {
+            class
+        };
         NudgeClassification { class, score }
     }
 
@@ -259,6 +309,10 @@ impl NudgeClassifier {
             .map(|class_cfg| class_cfg.nudge.as_str())
             .map(str::trim)
             .filter(|direction| !direction.is_empty())
+            .or_else(|| match class {
+                NudgeClass::DeferredAnswer => self.direction_for(NudgeClass::PendingAction),
+                _ => None,
+            })
     }
 }
 
@@ -271,6 +325,7 @@ pub fn classifier_config_dir() -> Option<PathBuf> {
 fn parse_nudge_class(s: &str) -> Option<NudgeClass> {
     match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "pending_action" | "continue" | "continuation" => Some(NudgeClass::PendingAction),
+        "deferred_answer" => Some(NudgeClass::DeferredAnswer),
         "plan_update" | "update_plan" | "stale_plan" | "replan" => Some(NudgeClass::PlanUpdate),
         "final_answer" | "final" | "done" => Some(NudgeClass::FinalAnswer),
         _ => None,
@@ -280,19 +335,21 @@ fn parse_nudge_class(s: &str) -> Option<NudgeClass> {
 fn nudge_class_key(class: NudgeClass) -> &'static str {
     match class {
         NudgeClass::PendingAction => "pending_action",
+        NudgeClass::DeferredAnswer => "deferred_answer",
         NudgeClass::PlanUpdate => "plan_update",
         NudgeClass::FinalAnswer => "final_answer",
         NudgeClass::Unknown => "unknown",
     }
 }
 
-fn tokens(s: &str) -> BTreeSet<String> {
+fn words(s: &str) -> impl Iterator<Item = String> + '_ {
     s.split(|c: char| !c.is_alphanumeric())
-        .filter_map(|raw| {
-            let t = raw.trim().to_ascii_lowercase();
-            (t.len() >= 3).then_some(t)
-        })
-        .collect()
+        .filter(|raw| !raw.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+fn tokens(s: &str) -> BTreeSet<String> {
+    words(s).filter(|t| t.len() >= 3).collect()
 }
 
 fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f32 {
@@ -360,6 +417,103 @@ Next steps needed:
                 .is_some_and(|d| d.contains("emit the tool call now")),
             "bundled classifier should carry output direction text"
         );
+    }
+
+    #[test]
+    fn nudge_classifier_refines_evidence_promises_without_changing_action_corpus() {
+        let classifier = NudgeClassifier::builtin();
+        for key in ["pending_action", "deferred_answer"] {
+            for text in &classifier.cfg.classes[key].matchers {
+                assert!(classifier.is_pending_action(text), "{key}: {text}");
+            }
+        }
+        assert_eq!(classifier.classify(
+            "Let me check the local branches and the top-level remote remotes to be complete."
+        ).class, NudgeClass::DeferredAnswer);
+        for text in [
+            "I found the issue: there is an extra closing brace causing a syntax error. I need to remove this stray brace.",
+            "Current blocker: the for loop needs a one line fix. Next steps needed: fix the iteration type error in lib.rs.",
+            "Next I will add the tests.",
+        ] {
+            assert_eq!(classifier.classify(text).class, NudgeClass::PendingAction, "{text}");
+        }
+        assert_eq!(
+            classifier.direction_for(NudgeClass::DeferredAnswer),
+            classifier.direction_for(NudgeClass::PendingAction)
+        );
+        let mut config = NudgeClassifierConfig::default();
+        config.classes.get_mut("deferred_answer").unwrap().matchers =
+            vec!["Checking the ledger comes before answering your question.".to_string()];
+        config
+            .classes
+            .get_mut("pending_action")
+            .unwrap()
+            .matchers
+            .push("Checking the ledger comes before answering your question.".to_string());
+        assert_eq!(
+            NudgeClassifier::from_config(config)
+                .classify("Checking the ledger comes before answering your question.")
+                .class,
+            NudgeClass::DeferredAnswer,
+            "refinement uses the same configurable data"
+        );
+    }
+
+    #[test]
+    fn nudge_classifier_refinement_requires_the_configured_opening() {
+        let classifier = NudgeClassifier::builtin();
+        for text in [
+            "There are three local branches. Let me check the current implementation and identify any gaps.",
+            "Let me be clear: I cannot check the current implementation because access is unavailable.",
+        ] {
+            assert_ne!(classifier.classify(text).class, NudgeClass::DeferredAnswer, "{text}");
+        }
+    }
+
+    #[test]
+    fn nudge_classifier_refines_legacy_defaults() {
+        let mut legacy = NudgeClassifierConfig::default();
+        let evidence = legacy.classes.remove("deferred_answer").unwrap().matchers;
+        let pending = &mut legacy.classes.get_mut("pending_action").unwrap().matchers;
+        for example in &evidence {
+            if !pending.contains(example) {
+                pending.push(example.clone());
+            }
+        }
+        // An old copied template has the evidence prototypes in PendingAction,
+        // no subtype class, and may use different casing or punctuation.
+        pending.push(evidence[0].to_uppercase());
+        let classifier = NudgeClassifier::from_config(legacy.clone());
+        for example in &evidence {
+            assert_eq!(
+                classifier.classify(example).class,
+                NudgeClass::DeferredAnswer,
+                "old copied default: {example}"
+            );
+        }
+    }
+
+    #[test]
+    fn nudge_classifier_preserves_custom_coarse_corpus() {
+        let mut legacy = NudgeClassifierConfig::default();
+        let evidence = legacy.classes.remove("deferred_answer").unwrap().matchers;
+        legacy.classes.get_mut("pending_action").unwrap().matchers =
+            vec!["Proceeding with the patch by editing the target file.".to_string()];
+        let before = NudgeClassifier {
+            cfg: legacy.clone(),
+        };
+        let after = NudgeClassifier::from_config(legacy);
+        for example in evidence {
+            let previous = before.classify(&example);
+            let mut current = after.classify(&example);
+            if current.class == NudgeClass::DeferredAnswer {
+                current.class = NudgeClass::PendingAction;
+            }
+            assert_eq!(
+                current, previous,
+                "subtype fallback must not expand a configured action corpus"
+            );
+        }
     }
 
     #[test]

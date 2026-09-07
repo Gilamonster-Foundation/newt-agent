@@ -14,6 +14,12 @@ paths. Built-in file tools include `read_file`, `write_file`, `edit_file`,
 `delete_file`, `list_dir`, and `find`, all mediated by the same caveat and
 prompted-permission checks.
 
+Harness-owned Git subprocesses share `git_hardening::hardened_git`, which
+returns a fallible command builder with repository config gadgets disabled and
+the child environment scrubbed. On macOS it resolves Git from PATH before
+spawning, avoiding the fork/pre-exec path in parallel launches. Missing or
+unusable PATH fails closed; it does not substitute another Git installation.
+
 Interactive front ends may inject the public `LiveToolOutput` interface into
 `ChatCtx` to observe streaming shell bytes without changing the authoritative
 tool result. Newt dispatches those bytes through a bounded presentation queue,

@@ -5384,7 +5384,7 @@ fn build_system_prompt_with_persona(
         std::path::Path::new(workspace),
         &["log", "--oneline", "-10"],
     )
-    .output()
+    .and_then(|mut command| command.output())
     .ok()
     .and_then(|o| String::from_utf8(o.stdout).ok())
     .unwrap_or_default();
@@ -7406,7 +7406,7 @@ fn lightweight_git_meta(workspace: &str) -> (Option<String>, Option<bool>) {
         std::path::Path::new(workspace),
         &["rev-parse", "HEAD"],
     )
-    .output()
+    .and_then(|mut command| command.output())
     .ok()
     .filter(|o| o.status.success())
     .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -7416,7 +7416,7 @@ fn lightweight_git_meta(workspace: &str) -> (Option<String>, Option<bool>) {
         std::path::Path::new(workspace),
         &["status", "--porcelain"],
     )
-    .output()
+    .and_then(|mut command| command.output())
     .ok()
     .filter(|o| o.status.success())
     .map(|o| !o.stdout.is_empty());

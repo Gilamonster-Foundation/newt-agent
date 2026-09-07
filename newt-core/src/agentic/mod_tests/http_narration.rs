@@ -214,15 +214,9 @@ async fn accepted_narration_reports_cap_exhausted_end_reason() {
 }
 
 #[tokio::test]
-async fn explain_turn_narration_reports_completed_not_cap_exhausted() {
-    // #1261 regression (the diagnosed ornith:35b footer): in a NON-Act turn the
-    // narration rescue can never arm (`action_nudges` is forced false, so
-    // `action_turn` is false) — the budget is untouched and no cap value could
-    // change anything. Ending on pending-action-looking prose is therefore this
-    // turn's LEGITIMATE completion. Before the fix the end reason was computed
-    // WITHOUT the gate's `action_turn` guard, reporting NarrationCapExhausted —
-    // rendered as "⚠ ended on narration (rescue budget spent)", blaming the
-    // model for a harness decision.
+async fn readonly_completion_retries_an_unfinished_promise_without_action_authority() {
+    // The branch-count incident ended after eighteen reads with only "Let me
+    // check...". A read-only boundary must not turn that promise into an answer.
     let server = MockServer::start().await;
     let round = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -231,10 +225,11 @@ async fn explain_turn_narration_reports_completed_not_cap_exhausted() {
             last_content: Default::default(),
             round: round.clone(),
             script: vec![
-                // The same pending-action phrasing the Act-turn test uses — the
-                // classifier sees "pending action" either way; only the turn
-                // type differs.
-                serde_json::json!({ "content": "Let me keep editing now." }),
+                serde_json::json!({"tool_calls": [{"id": "read_evidence", "function": {
+                    "name": "tool_search", "arguments": "{\"query\":\"read_file\"}"
+                }}]}),
+                serde_json::json!({ "content": "Let me check the local branches and the top-level remote remotes to be complete." }),
+                serde_json::json!({ "content": "Do you mean local branches or open pull requests?" }),
             ],
         })
         .mount(&server)
@@ -246,12 +241,46 @@ async fn explain_turn_narration_reports_completed_not_cap_exhausted() {
     let mut c = ctx(&uri, &messages, &caveats);
     c.kind = BackendKind::Openai;
     c.prompt_disposition = PromptDisposition::Explain;
+    c.task = "Can you tell me how many branches are open in this repo?";
+    c.action_nudges = false;
     c.end_reason = Some(&mut end_reason);
-    let _ = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+    assert_eq!(reply, "Do you mean local branches or open pull requests?");
+    assert_eq!(
+        round.load(Ordering::SeqCst),
+        3,
+        "one evidence read, promise, clarification"
+    );
+    let requests = server.received_requests().await.unwrap();
+    let recovery = body_json(&requests[2]);
+    let guidance = recovery["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(
+        guidance.contains("answer") && guidance.contains("read-only"),
+        "{guidance}"
+    );
+    assert!(
+        !guidance.contains("edit_file") && !guidance.contains("write_file"),
+        "{guidance}"
+    );
+    for request in requests {
+        let body = body_json(&request);
+        let names: Vec<_> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert!(
+            !names.contains(&"write_file") && !names.contains(&"run_command"),
+            "{names:?}"
+        );
+    }
     assert_eq!(
         end_reason,
         Some(crate::TurnEndReason::Completed),
-        "a non-Act turn ending on prose is a completion, never 'rescue budget spent'"
+        "a concrete clarification completes the turn"
     );
     // The footer stays clean too — the ⚠ never renders for Completed.
     let metrics = crate::TurnMetrics {
@@ -263,6 +292,212 @@ async fn explain_turn_narration_reports_completed_not_cap_exhausted() {
         "no warning may render: {}",
         metrics.display_line()
     );
+}
+
+#[tokio::test]
+async fn readonly_completion_repeated_promise_hands_back_unresolved_with_bounded_retry() {
+    let promise = "Let me check the current implementation and identify any gaps.";
+    for max_rounds in [1, 8] {
+        let server = MockServer::start().await;
+        let round = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ScriptedOpenAi {
+                last_content: Default::default(),
+                round: round.clone(),
+                script: vec![serde_json::json!({"content": promise})],
+            })
+            .mount(&server)
+            .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut end_reason = None;
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.prompt_disposition = PromptDisposition::Research;
+        c.max_tool_rounds = max_rounds;
+        c.end_reason = Some(&mut end_reason);
+        let (reply, streamed, _, _) = chat_complete(c, &mut NoMcp).await.unwrap();
+        assert!(
+            reply.contains("unresolved") && reply.contains("continue"),
+            "{reply}"
+        );
+        assert!(
+            reply.contains(promise),
+            "never discard the candidate: {reply}"
+        );
+        assert!(reply.contains("appears unfinished"), "{reply}");
+        assert!(!streamed, "the caller must print the unresolved handoff");
+        assert_ne!(end_reason, Some(crate::TurnEndReason::Completed));
+        assert_eq!(round.load(Ordering::SeqCst), max_rounds.min(2));
+    }
+}
+
+#[tokio::test]
+async fn readonly_completion_accepts_answers_questions_and_blockers_without_retry() {
+    for answer in [
+        "There are three local branches.",
+        "Do you mean local branches or open pull requests?",
+        "Should I check the current implementation and identify any gaps?",
+        "I cannot determine the remote count from the available evidence.",
+        "I cannot check the current implementation because access is unavailable.",
+        "There are three local branches. Let me check the current implementation and identify any gaps.",
+        "Here is a summary of what I found across the tool calls.",
+        "I found the issue: there is an extra closing brace causing a syntax error. I need to remove this stray brace.",
+        "Current blocker: the for loop needs a one line fix. Next steps needed: fix the iteration type error in lib.rs.",
+    ] {
+        let server = MockServer::start().await;
+        let round = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ScriptedOpenAi {
+                last_content: Default::default(),
+                round: round.clone(),
+                script: vec![serde_json::json!({"content": answer})],
+            })
+            .mount(&server)
+            .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.prompt_disposition = PromptDisposition::Explain;
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.unwrap();
+        assert_eq!(reply, answer);
+        assert_eq!(round.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// Grounds mocked exhausted-response retention in the real finalizer and a
+/// temporary workspace, proving retained text still crosses disclosure.
+#[test]
+fn readonly_completion_handoff_preserves_the_disclosure_boundary() {
+    let workspace = tempfile::tempdir().unwrap();
+    let canary = "NEWT-CANARY-completion-7f3a9c2b1d";
+    let mut filter = crate::ocap::DisclosureFilter::new();
+    filter.register(canary);
+    let candidate = format!("Let me check the current implementation: {canary}");
+    let reply = readonly_completion_handoff(
+        &candidate,
+        &mut None,
+        false,
+        workspace.path().to_str().unwrap(),
+        None,
+        Some(&filter),
+    );
+    assert!(reply.contains("Let me check the current implementation"));
+    assert!(reply.contains("[REDACTED]"), "{reply}");
+    assert!(!filter.leaks(&reply), "{reply}");
+}
+
+#[test]
+fn readonly_completion_shared_guard_preserves_authority_and_bounds_recovery() {
+    let classifier = crate::NudgeClassifier::builtin();
+    let promise = "Let me check the current implementation and identify any gaps.";
+    for disposition in [PromptDisposition::Explain, PromptDisposition::Research] {
+        assert!(readonly_completion_pending(
+            disposition,
+            &classifier,
+            promise
+        ));
+        assert!(!readonly_completion_pending(disposition, &classifier,
+            "Recommended next action if session resumes: fix duplicate functions, clean up broken tests, read lib.rs, then wire the progressive dispatch. The build is currently broken and that is the blocker for further progress."));
+    }
+    for disposition in [
+        PromptDisposition::Act,
+        PromptDisposition::Ask,
+        PromptDisposition::Plan,
+    ] {
+        assert!(!readonly_completion_pending(
+            disposition,
+            &classifier,
+            promise
+        ));
+    }
+    let mut retried = false;
+    let mut messages = vec![serde_json::json!({"role": "user", "content": "Count the branches?"})];
+    assert!(!retry_readonly_completion(
+        &mut messages,
+        promise,
+        None,
+        &mut retried,
+        false
+    ));
+    assert!(!retried, "no retry was spent without room to continue");
+    assert!(retry_readonly_completion(
+        &mut messages,
+        promise,
+        None,
+        &mut retried,
+        true
+    ));
+    let after_retry = messages.clone();
+    assert!(!retry_readonly_completion(
+        &mut messages,
+        promise,
+        None,
+        &mut retried,
+        true
+    ));
+    assert_eq!(
+        messages, after_retry,
+        "a persistent promise cannot replenish its retry"
+    );
+}
+
+#[tokio::test]
+async fn readonly_completion_ollama_and_responses_recover_with_the_same_readonly_guidance() {
+    for responses in [false, true] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(move |request: &Request| {
+                let body = body_json(request);
+                let text = if body.to_string().contains("Your reply promised another step") {
+                    "There are three local branches."
+                } else {
+                    "Let me check the current implementation and identify any gaps."
+                };
+                let reply = if responses {
+                    serde_json::json!({"status": "completed", "output": [{
+                        "type": "reasoning", "id": "rs_probe", "summary": [], "encrypted_content": "opaque"
+                    }, {
+                        "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]
+                    }]})
+                } else {
+                    serde_json::json!({"message": {"role": "assistant", "content": text}, "done": true})
+                };
+                ResponseTemplate::new(200).set_body_json(reply)
+            })
+            .mount(&server).await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.prompt_disposition = PromptDisposition::Explain;
+        c.action_nudges = false;
+        let (reply, _, _, _) = if responses {
+            openai_responses_complete(c, &mut NoMcp).await
+        } else {
+            chat_complete(c, &mut NoMcp).await
+        }
+        .unwrap();
+        assert_eq!(reply, "There are three local branches.");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), if responses { 2 } else { 3 });
+        if responses {
+            let second = body_json(&requests[1]);
+            assert!(
+                second["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["id"] == "rs_probe" && item["encrypted_content"] == "opaque"),
+                "the retry must preserve Responses reasoning items: {second}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
