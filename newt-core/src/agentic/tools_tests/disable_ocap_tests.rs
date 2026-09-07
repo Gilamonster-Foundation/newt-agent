@@ -14,6 +14,74 @@ pub(crate) async fn env_lock() -> MutexGuard<'static, ()> {
     ENV_LOCK.lock().await
 }
 
+/// A real manifest grounds the verification fixture while the launch bypass
+/// is enabled. The named-preset exec floor must still suppress impossible
+/// verification; removing that floor preserves the existing bounded gate.
+#[tokio::test]
+#[serial_test::serial(newt_self_verify_env)]
+async fn confined_act_verification_respects_exec_floor_under_ocap_bypass() {
+    let _lock = env_lock().await;
+    let _ocap = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+    let _self_verify = EnvVar::set("NEWT_SELF_VERIFY", "1");
+    assert!(
+        ocap_disabled(),
+        "the fixture must exercise the host bypass policy"
+    );
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(
+        ws.path().join("Cargo.toml"),
+        "[package]\nname = 'fixture'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    let caveats = Caveats {
+        fs_read: Scope::only([ws.path().to_string_lossy().into_owned()]),
+        ..plan_phase_clamp()
+    };
+    let original = caveats.clone();
+    for (floor, expected_rounds) in [
+        (Some(Scope::none()), 1),
+        (Some(Scope::only(["pwd".to_string()])), 1),
+        (None, 3),
+        (Some(Scope::only(["cargo".to_string()])), 3),
+    ] {
+        let (reply, rounds, requests) =
+            crate::agentic::http_loop_tests::verification::run_openai_script_in_with_authority(
+                vec![serde_json::json!({"content": "There are two branches."})],
+                &ws.path().to_string_lossy(),
+                "please count the branches in this repo (newt-agent repo)",
+                &caveats,
+                None,
+                floor.as_ref(),
+            )
+            .await;
+        assert_eq!(reply, "There are two branches.");
+        assert_eq!(rounds, expected_rounds, "exec_floor={floor:?}");
+        let mut verification_guidance = false;
+        for request in requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            for message in body["messages"].as_array().unwrap() {
+                if message["role"] == "user" {
+                    let content = message["content"].as_str().unwrap_or_default();
+                    verification_guidance |= content.contains("verification this task ships");
+                    for forbidden in [
+                        "edit_file",
+                        "write_file",
+                        "request_permissions",
+                        "FIX the code",
+                    ] {
+                        assert!(!content.contains(forbidden), "{content}");
+                    }
+                }
+            }
+        }
+        assert_eq!(verification_guidance, expected_rounds > 1);
+        assert_eq!(
+            caveats, original,
+            "guidance cannot widen the confined fallback"
+        );
+    }
+}
+
 /// RAII env override: set/unset `key` for the test body, restore the
 /// previous value on drop — including on a failed assertion, so yolo can
 /// never leak into a neighboring test.

@@ -573,7 +573,10 @@ pub(super) fn disposition_tool_denied_message(
         disposition != PromptDisposition::Act,
         "Act permits every tool and must never reach a disposition refusal"
     );
-    super::super::DispositionVoices::default().denied_block(disposition, name)
+    format!(
+        "capability denied: {}",
+        super::super::DispositionVoices::default().denied_block(disposition, name)
+    )
 }
 
 /// The refusal returned to the model when it calls a tool the active persona
@@ -581,7 +584,7 @@ pub(super) fn disposition_tool_denied_message(
 /// hatch, so the model self-corrects to a granted tool instead of looping.
 pub(super) fn persona_tool_denied_message(name: &str) -> String {
     format!(
-        "Tool `{name}` is not available under the active persona: its `tools:` \
+        "capability denied: Tool `{name}` is not available under the active persona: its `tools:` \
          front-matter restricts which tools it may call. Choose one of the \
          granted tools, or clear the persona (`/persona clear`) if broader \
          access is genuinely required."

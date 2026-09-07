@@ -219,3 +219,214 @@ async fn ollama_tool_xml_error_recovers_with_tools_still_available() {
         "the XML error probe, retry probe, and streaming re-issue all keep tools advertised"
     );
 }
+
+/// Ground chained recovery in a real native-read result: an XML parser retry
+/// keeps tools initially, but its action instruction cannot outlive tool loss.
+#[tokio::test]
+async fn confined_act_ollama_xml_retry_then_tool_loss_preserves_evidence_without_action_pressure() {
+    let (workspace, caveats) = readonly_count_workspace();
+    let original = caveats.clone();
+    let server = MockServer::start().await;
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let seen = request_count.clone();
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(
+            move |_: &Request| match seen.fetch_add(1, Ordering::SeqCst) {
+                0 => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"tool_calls": [{"function": {
+                        "name": "read_file", "arguments": {"path": READONLY_COUNT_FILE}
+                    }}]}, "done": true
+                })),
+                1 => ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": "XML syntax error on line 7: element <parameter> closed by </function>"
+                })),
+                2 => {
+                    ResponseTemplate::new(400).set_body_string("this model does not support tools")
+                }
+                _ => ndjson(&[serde_json::json!({
+                    "message": {"content": READONLY_COUNT_ANSWER}, "done": true
+                })]),
+            },
+        )
+        .mount(&server)
+        .await;
+    let messages = vec![MemMessage::user(READONLY_COUNT_TASK)];
+    let uri = server.uri();
+    let workspace_path = workspace.path().to_string_lossy();
+    let mut events = Vec::new();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.workspace = &workspace_path;
+    c.task = READONLY_COUNT_TASK;
+    c.tool_events = Some(&mut events);
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.unwrap();
+    assert_eq!(reply, READONLY_COUNT_ANSWER);
+    assert_eq!(events.len(), 1);
+    assert!(events[0].tool == "read_file" && events[0].ok);
+    assert_eq!(caveats, original);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join(READONLY_COUNT_FILE)).unwrap(),
+        READONLY_COUNT_DATA
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        5,
+        "read, XML failure, tools failure, answer and replay"
+    );
+    let xml_retry = body_json(&requests[2]);
+    assert!(xml_retry.get("tools").is_some());
+    assert!(
+        xml_retry["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["role"] == "user"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("exactly one valid native tool call"))
+            }),
+        "the first recovery must actually demand a native tool call: {xml_retry}"
+    );
+    for request in requests.iter().skip(3) {
+        let body = body_json(request);
+        assert!(body.get("tools").is_none());
+        let messages = body["messages"].as_array().unwrap();
+        assert!(messages
+            .iter()
+            .any(|message| message["role"] == "user" && message["content"] == READONLY_COUNT_TASK));
+        assert!(
+            messages.iter().any(|message| message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("refs/heads/feature"))),
+            "the actual read evidence must survive: {body}"
+        );
+        for message in messages.iter().filter(|message| message["role"] == "user") {
+            assert!(
+                !message["content"].to_string().contains("native tool call"),
+                "XML action guidance survived tool loss: {message}"
+            );
+        }
+    }
+}
+
+/// Reuse the existing two-stage empty-output fixture after tools become
+/// unavailable. Both quality retries must remain useful without tool pressure.
+#[tokio::test]
+async fn confined_act_ollama_empty_retry_without_tools_never_demands_tool_calls() {
+    let server = MockServer::start().await;
+    let probes = Arc::new(AtomicUsize::new(0));
+    let rejections = Arc::new(AtomicUsize::new(0));
+    let rejected = rejections.clone();
+    let responder = super::stream_empty::SuspiciousEmptyTwiceThenRecover {
+        probes: probes.clone(),
+        saw_strong_nudge: Arc::new(AtomicBool::new(false)),
+    };
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(move |request: &Request| {
+            if body_json(request).get("tools").is_some() {
+                rejected.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(400).set_body_string("this model does not support tools")
+            } else {
+                responder.respond(request)
+            }
+        })
+        .mount(&server)
+        .await;
+    let messages = vec![MemMessage::user(READONLY_COUNT_TASK)];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.task = READONLY_COUNT_TASK;
+    let (reply, streamed, _, _) = chat_complete(c, &mut NoMcp).await.unwrap();
+    assert_eq!(reply, "recovered after strong hidden-only nudge");
+    assert!(streamed);
+    assert_eq!(rejections.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        probes.load(Ordering::SeqCst),
+        3,
+        "two empty candidates then recovery"
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        7,
+        "one tools rejection and three probe/stream pairs"
+    );
+    for request in requests.iter().skip(1) {
+        let body = body_json(request);
+        assert!(body.get("tools").is_none());
+        for message in body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+        {
+            let text = message["content"].to_string();
+            assert!(
+                !text.contains("tool call"),
+                "empty-output recovery demanded unavailable tools: {text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn confined_act_append_nudge_preserves_operator_bytes_in_separate_tagged_notes() {
+    let operator = "  Please count the branches.\n\tKeep this spacing — unchanged.\n";
+    let original = vec![
+        serde_json::json!({"role": "system", "content": "Follow the task."}),
+        serde_json::json!({"role": "user", "content": operator}),
+    ];
+    let mut messages = original.clone();
+    for correction in ["Recover the malformed call.", "Return visible content."] {
+        append_nudge_line(&mut messages, correction);
+        assert_eq!(&messages[..original.len()], original.as_slice());
+        assert_eq!(
+            messages.last().unwrap(),
+            &serde_json::json!({
+                "role": "user",
+                "content": format!("{} {correction}", compress::LOOP_GUIDANCE_PREFIX)
+            })
+        );
+    }
+    assert_eq!(messages.len(), original.len() + 2);
+    assert_eq!(
+        messages[1]["content"].as_str().unwrap().as_bytes(),
+        operator.as_bytes()
+    );
+}
+
+#[test]
+fn confined_act_tool_loss_cleanup_preserves_byte_identical_operator_collisions() {
+    let correction = "Use the requested tool now.";
+    let operator = format!("{} {correction}", compress::LOOP_GUIDANCE_PREFIX);
+    let original = vec![
+        serde_json::json!({"role": "system", "content": "System context."}),
+        serde_json::json!({"role": "user", "content": operator}),
+        serde_json::json!({
+            "role": "assistant",
+            "content": format!("{} Preserve this assistant evidence.", compress::LOOP_GUIDANCE_PREFIX)
+        }),
+        serde_json::json!({
+            "role": "tool", "tool_call_id": "read-1",
+            "content": format!("{} Preserve this tool evidence.", compress::LOOP_GUIDANCE_PREFIX)
+        }),
+    ];
+    let protected = protected_operator_messages(&original);
+    assert_eq!(protected, [operator.clone()]);
+    let mut messages = original.clone();
+    push_loop_guidance(&mut messages, correction);
+    push_loop_guidance(&mut messages, "A distinct obsolete tool correction.");
+
+    strip_unavailable_tool_guidance(&mut messages, &protected);
+
+    // Equal strings are ambiguous: conservatively retain both rather than
+    // inventing occurrence identity or deleting the original operator input.
+    let mut expected = original;
+    expected.push(serde_json::json!({"role": "user", "content": operator}));
+    assert_eq!(messages, expected);
+}

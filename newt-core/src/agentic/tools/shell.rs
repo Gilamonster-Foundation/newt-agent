@@ -413,6 +413,19 @@ pub(super) fn exec_floor_permits(floor: Option<&crate::caveats::Scope<String>>, 
     }
 }
 
+/// Conservative eligibility for a concrete steering suggestion. Reuse the
+/// dispatch floor's simple-command check; a denied bypass still falls through
+/// to the already-composed confined exec scope, just as real dispatch does.
+pub(crate) fn command_authority_available(
+    caveats: &crate::caveats::Caveats,
+    exec_floor: Option<&crate::caveats::Scope<String>>,
+    command: &str,
+) -> bool {
+    !command.trim().is_empty()
+        && ((ocap_disabled() && exec_floor_permits(exec_floor, command))
+            || exec_floor_permits(Some(&caveats.exec), command))
+}
+
 /// INTERIM (#297): run `cmd` on the PLAIN host shell — no leash, no
 /// interceptor, no sandbox — and wrap the outcome in an envelope structurally
 /// identical to the confined shell's (`{ exit_code, stdout, stderr,

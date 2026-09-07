@@ -40,7 +40,7 @@ fn strip_trailing_nudge_keeps_only_the_current_correction() {
         json!({"role": "assistant", "content": "Let me start."}),
         json!({"role": "user", "content": guidance.clone()}),
     ];
-    strip_trailing_nudge_exchange(&mut msgs);
+    strip_trailing_nudge_exchange(&mut msgs, &[]);
     assert_eq!(msgs.len(), 1, "the narration + nudge pair is removed");
     assert_eq!(msgs[0]["content"], "do the thing");
 
@@ -49,12 +49,12 @@ fn strip_trailing_nudge_keeps_only_the_current_correction() {
         json!({"role": "assistant", "content": "here is the answer"}),
     ];
     let before = clean.clone();
-    strip_trailing_nudge_exchange(&mut clean);
+    strip_trailing_nudge_exchange(&mut clean, &[]);
     assert_eq!(clean, before, "a real answer tail is never stripped");
 
     let mut loop_msgs = vec![json!({"role": "user", "content": "fix it"})];
     for i in 0..3 {
-        strip_trailing_nudge_exchange(&mut loop_msgs);
+        strip_trailing_nudge_exchange(&mut loop_msgs, &[]);
         loop_msgs.push(json!({"role": "assistant", "content": format!("narration {i}")}));
         loop_msgs.push(json!({"role": "user", "content": guidance.clone()}));
     }
@@ -62,6 +62,50 @@ fn strip_trailing_nudge_keeps_only_the_current_correction() {
         loop_msgs.len(),
         3,
         "user task + exactly one (narration, nudge) pair — not three"
+    );
+}
+
+#[test]
+fn confined_act_narration_cleanup_preserves_literal_operator_steering_and_collisions() {
+    let correction = "Preserve the operator's literal correction.";
+    let operator = format!("{} {correction}", compress::LOOP_GUIDANCE_PREFIX);
+    let mut messages = vec![
+        serde_json::json!({"role": "user", "content": "Count the branches."}),
+        serde_json::json!({"role": "assistant", "content": "Preserved earlier answer."}),
+    ];
+    let mut protected = protected_operator_messages(&messages);
+    let inbox = SessionSteeringInbox::new();
+    inbox.submit(&operator);
+    assert_eq!(
+        drain_steering_into(Some(&inbox), &mut messages, &mut protected, false),
+        1
+    );
+    assert_eq!(inbox.pending(), 0);
+    let before = messages.clone();
+    strip_trailing_nudge_exchange(&mut messages, &protected);
+    assert_eq!(messages, before, "a literal operator tail is not a nudge");
+
+    let mut retried = false;
+    assert!(retry_readonly_completion(
+        &mut messages,
+        "Let me check the current implementation and identify any gaps.",
+        None,
+        &mut retried,
+        true,
+        &protected,
+    ));
+    assert!(retried);
+    assert_eq!(&messages[..before.len()], before.as_slice());
+    assert_eq!(messages.len(), before.len() + 2);
+    strip_trailing_nudge_exchange(&mut messages, &protected);
+    assert_eq!(messages, before, "only the generated retry pair is removed");
+
+    push_loop_guidance(&mut messages, correction);
+    let collision = messages.clone();
+    strip_trailing_nudge_exchange(&mut messages, &protected);
+    assert_eq!(
+        messages, collision,
+        "byte-identical ownership ambiguity must preserve operator text"
     );
 }
 
@@ -400,10 +444,11 @@ fn readonly_completion_shared_guard_preserves_authority_and_bounds_recovery() {
     for disposition in [PromptDisposition::Explain, PromptDisposition::Research] {
         assert!(readonly_completion_pending(
             disposition,
+            true,
             &classifier,
             promise
         ));
-        assert!(!readonly_completion_pending(disposition, &classifier,
+        assert!(!readonly_completion_pending(disposition, true, &classifier,
             "Recommended next action if session resumes: fix duplicate functions, clean up broken tests, read lib.rs, then wire the progressive dispatch. The build is currently broken and that is the blocker for further progress."));
     }
     for disposition in [
@@ -413,6 +458,7 @@ fn readonly_completion_shared_guard_preserves_authority_and_bounds_recovery() {
     ] {
         assert!(!readonly_completion_pending(
             disposition,
+            true,
             &classifier,
             promise
         ));
@@ -424,7 +470,8 @@ fn readonly_completion_shared_guard_preserves_authority_and_bounds_recovery() {
         promise,
         None,
         &mut retried,
-        false
+        false,
+        &[],
     ));
     assert!(!retried, "no retry was spent without room to continue");
     assert!(retry_readonly_completion(
@@ -432,7 +479,8 @@ fn readonly_completion_shared_guard_preserves_authority_and_bounds_recovery() {
         promise,
         None,
         &mut retried,
-        true
+        true,
+        &[],
     ));
     let after_retry = messages.clone();
     assert!(!retry_readonly_completion(
@@ -440,7 +488,8 @@ fn readonly_completion_shared_guard_preserves_authority_and_bounds_recovery() {
         promise,
         None,
         &mut retried,
-        true
+        true,
+        &[],
     ));
     assert_eq!(
         messages, after_retry,

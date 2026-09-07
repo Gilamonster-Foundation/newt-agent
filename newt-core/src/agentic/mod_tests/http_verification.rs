@@ -55,6 +55,27 @@ async fn openai_unverified_run_command_blocker_gets_ground_truth_retry() {
 /// [`run_openai_script`] against a workspace the caller chooses, so a test can
 /// point the loop at a directory that actually affords a verification.
 async fn run_openai_script_in(script: Vec<serde_json::Value>, workspace: &str) -> (String, usize) {
+    let (reply, rounds, _) = run_openai_script_in_with_authority(
+        script,
+        workspace,
+        "do the thing",
+        &Caveats::top(),
+        None,
+        None,
+    )
+    .await;
+    (reply, rounds)
+}
+
+pub(in crate::agentic) async fn run_openai_script_in_with_authority(
+    script: Vec<serde_json::Value>,
+    workspace: &str,
+    task: &str,
+    caveats: &Caveats,
+    persona_tools: Option<&[String]>,
+    exec_floor: Option<&crate::Scope<String>>,
+) -> (String, usize, Vec<Request>) {
+    let _tenacity = crate::tenacity::scoped_effective_tenacity(crate::tenacity::Tenacity::Standard);
     let server = MockServer::start().await;
     let round = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
@@ -66,14 +87,220 @@ async fn run_openai_script_in(script: Vec<serde_json::Value>, workspace: &str) -
         })
         .mount(&server)
         .await;
-    let messages = msgs();
-    let caveats = Caveats::top();
+    let messages = vec![MemMessage::system("you are a test"), MemMessage::user(task)];
     let uri = server.uri();
-    let mut c = ctx(&uri, &messages, &caveats);
+    let mut c = ctx(&uri, &messages, caveats);
     c.kind = BackendKind::Openai;
     c.workspace = workspace;
-    let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
-    (reply, round.load(Ordering::SeqCst))
+    c.task = task;
+    c.persona_tools = persona_tools;
+    c.exec_floor = exec_floor;
+    let (reply, _s, _u, _h) = openai_chat_complete(c, &mut NoMcp).await.expect("dispatch");
+    (
+        reply,
+        round.load(Ordering::SeqCst),
+        server.received_requests().await.unwrap(),
+    )
+}
+
+/// A real Cargo manifest grounds the scanner's mocked verification affordance.
+/// Its presence must not become exec or write authority after an evidence task.
+#[tokio::test]
+#[serial_test::serial(newt_self_verify_env)]
+async fn confined_act_self_verification_requires_authorized_and_exposed_command() {
+    let _self_verify = super::super::anthropic_loop_tests::EnvGuard::set("NEWT_SELF_VERIFY", "1");
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = 'fixture'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    let hidden = vec!["read_file".to_string()];
+    for (exec, persona, expected_rounds) in [
+        (crate::Scope::none(), None, 1),
+        (crate::Scope::only(["pwd".to_string()]), None, 1),
+        (
+            crate::Scope::only(["cargo".to_string()]),
+            Some(hidden.as_slice()),
+            1,
+        ),
+        // A matching exec grant still permits bounded verification recovery,
+        // but no write grant means a failure must not trigger edit pressure.
+        (crate::Scope::only(["cargo".to_string()]), None, 3),
+    ] {
+        let caveats = Caveats {
+            exec,
+            ..tools::plan_phase_clamp()
+        };
+        let original = caveats.clone();
+        let (reply, rounds, requests) = run_openai_script_in_with_authority(
+            vec![serde_json::json!({"content": "There are two branches."})],
+            &workspace.path().to_string_lossy(),
+            "please count the branches in this repo (newt-agent repo)",
+            &caveats,
+            persona,
+            None,
+        )
+        .await;
+        assert_eq!(reply, "There are two branches.");
+        assert_eq!(
+            rounds, expected_rounds,
+            "exec={:?}, persona={persona:?}",
+            caveats.exec
+        );
+        assert_eq!(
+            caveats, original,
+            "verification steering cannot grant authority"
+        );
+        for request in requests {
+            let body = body_json(&request);
+            for message in body["messages"].as_array().unwrap() {
+                if message["role"] == "user" {
+                    let content = message["content"].as_str().unwrap_or_default();
+                    for forbidden in [
+                        "edit_file",
+                        "write_file",
+                        "request_permissions",
+                        "FIX the code",
+                    ] {
+                        assert!(!content.contains(forbidden), "{content}");
+                    }
+                    if expected_rounds == 1 {
+                        assert!(
+                            !content.contains("verification this task ships"),
+                            "{content}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Grounds the no-exec steering regression after an actual native read, not
+/// merely a scripted answer: a manifest cannot turn that evidence into an
+/// obligation to run tests or request broader authority.
+#[tokio::test]
+#[serial_test::serial(newt_self_verify_env)]
+async fn confined_act_native_read_finishes_without_impossible_verification_openai() {
+    let _self_verify = super::super::anthropic_loop_tests::EnvGuard::set("NEWT_SELF_VERIFY", "1");
+    let _tenacity = crate::tenacity::scoped_effective_tenacity(crate::tenacity::Tenacity::Standard);
+    let (workspace, caveats) = readonly_count_workspace();
+    let original = caveats.clone();
+    let server = MockServer::start().await;
+    let round = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ScriptedOpenAi {
+            round: round.clone(),
+            last_content: Default::default(),
+            script: vec![
+                serde_json::json!({"tool_calls": [{
+                    "id": "count-read", "type": "function",
+                    "function": {"name": "read_file", "arguments":
+                        serde_json::json!({"path": READONLY_COUNT_FILE}).to_string()}
+                }]}),
+                serde_json::json!({"content": READONLY_COUNT_ANSWER}),
+            ],
+        })
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    let workspace_path = workspace.path().to_string_lossy();
+    let messages = vec![MemMessage::user(READONLY_COUNT_TASK)];
+    let mut tool_events = Vec::new();
+    let mut end_reason = None;
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.workspace = &workspace_path;
+    c.task = READONLY_COUNT_TASK;
+    c.action_nudges = true;
+    c.tool_events = Some(&mut tool_events);
+    c.end_reason = Some(&mut end_reason);
+    let (reply, _, _, _) = openai_chat_complete(c, &mut NoMcp).await.unwrap();
+    assert_eq!(reply, READONLY_COUNT_ANSWER);
+    assert_eq!(tool_events.len(), 1);
+    assert!(tool_events[0].ok && tool_events[0].tool == "read_file");
+    let requests = server.received_requests().await.unwrap();
+    let second = body_json(&requests[1]);
+    let read_result = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "count-read")
+        .expect("the successful native read reaches the answering round");
+    for line in READONLY_COUNT_DATA.lines() {
+        assert!(read_result["content"].as_str().unwrap().contains(line));
+    }
+    assert_eq!(
+        round.load(Ordering::SeqCst),
+        2,
+        "one read, then its grounded answer"
+    );
+    assert_eq!(end_reason, Some(crate::TurnEndReason::Completed));
+    assert_eq!(caveats, original);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join(READONLY_COUNT_FILE)).unwrap(),
+        READONLY_COUNT_DATA
+    );
+    assert_no_impossible_verification_pressure(&requests);
+}
+
+/// A real manifest grounds the scanner's affordance detection: metadata
+/// outside fs_read must not influence the mocked model's follow-up request.
+/// The allowed-root twin proves that absence of guidance is not a dark gate.
+#[tokio::test]
+#[serial_test::serial(newt_self_verify_env)]
+async fn confined_act_verification_cannot_use_an_unauthorized_manifest() {
+    let _self_verify = super::super::anthropic_loop_tests::EnvGuard::set("NEWT_SELF_VERIFY", "1");
+    let workspace = tempfile::tempdir().unwrap();
+    let readable = workspace.path().join("readable");
+    std::fs::create_dir(&readable).unwrap();
+    std::fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname = 'private_fixture'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    for (fs_read, expected_rounds) in [
+        (crate::Scope::none(), 1),
+        (
+            crate::Scope::only([readable.to_string_lossy().into_owned()]),
+            1,
+        ),
+        (
+            crate::Scope::only([workspace.path().to_string_lossy().into_owned()]),
+            3,
+        ),
+    ] {
+        let caveats = Caveats {
+            fs_read,
+            exec: crate::Scope::only(["cargo".to_string()]),
+            ..tools::plan_phase_clamp()
+        };
+        let original = caveats.clone();
+        let (reply, rounds, requests) = run_openai_script_in_with_authority(
+            vec![serde_json::json!({"content": "There are two branches."})],
+            &workspace.path().to_string_lossy(),
+            "please count the branches in this repo (newt-agent repo)",
+            &caveats,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(reply, "There are two branches.");
+        assert_eq!(rounds, expected_rounds, "fs_read={:?}", caveats.fs_read);
+        assert_eq!(caveats, original);
+        let verification_guidance = requests.iter().any(|request| {
+            let body = body_json(request);
+            body["messages"].as_array().unwrap().iter().any(|message| {
+                message["role"] == "user"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("verification this task ships"))
+            })
+        });
+        assert_eq!(verification_guidance, expected_rounds > 1);
+    }
 }
 
 /// **The wiring #1943 arms, proved end to end through the loop.**
@@ -297,7 +524,7 @@ fn looks_like_unverified_stale_file_blocker_requires_file_stale_and_blocker_cues
 
 #[test]
 fn stale_file_ground_truth_nudge_names_read_only_checks_and_revert_guard() {
-    let nudge = stale_file_ground_truth_nudge();
+    let nudge = stale_file_ground_truth_nudge(true, &Caveats::top(), None);
     assert!(nudge.contains("git status --short"), "{nudge}");
     assert!(nudge.contains("git diff -- <file>"), "{nudge}");
     assert!(nudge.contains("wc -l <file>"), "{nudge}");

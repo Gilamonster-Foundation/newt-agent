@@ -277,9 +277,9 @@ async fn suspicious_empty_generated_output_retries_with_nudge() {
     );
 }
 
-struct SuspiciousEmptyTwiceThenRecover {
-    probes: Arc<AtomicUsize>,
-    saw_strong_nudge: Arc<AtomicBool>,
+pub(super) struct SuspiciousEmptyTwiceThenRecover {
+    pub(super) probes: Arc<AtomicUsize>,
+    pub(super) saw_strong_nudge: Arc<AtomicBool>,
 }
 impl Respond for SuspiciousEmptyTwiceThenRecover {
     fn respond(&self, req: &Request) -> ResponseTemplate {

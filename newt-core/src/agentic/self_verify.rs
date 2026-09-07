@@ -36,19 +36,41 @@ pub struct VerifyCheck {
     /// Lower-case substrings whose presence in a run_command marks this check as
     /// having been run this turn. Any match satisfies the check.
     pub run_markers: Vec<String>,
+    /// Concrete commands for authority checks; evidence substrings are not commands.
+    pub commands: Vec<String>,
 }
 
 impl VerifyCheck {
-    fn new(label: impl Into<String>, markers: &[&str]) -> Self {
+    fn new(label: impl Into<String>, markers: &[&str], commands: &[&str]) -> Self {
         Self {
             label: label.into(),
             run_markers: markers.iter().map(|m| m.to_ascii_lowercase()).collect(),
+            commands: commands
+                .iter()
+                .map(|command| (*command).to_string())
+                .collect(),
         }
     }
 
     /// Was this check run by `command` (a single run_command invocation)?
     fn run_by(&self, command_lc: &str) -> bool {
         self.run_markers.iter().any(|m| command_lc.contains(m))
+    }
+
+    /// Keep only suggestions the turn may execute, without narrowing what
+    /// already-observed verification can count as evidence.
+    pub fn retain_authorized(&mut self, permits: impl Fn(&str) -> bool) -> bool {
+        let previous = self.commands.len();
+        self.commands.retain(|command| permits(command));
+        if self.commands.len() != previous {
+            self.label = self
+                .commands
+                .iter()
+                .map(|command| format!("`{command}`"))
+                .collect::<Vec<_>>()
+                .join(" / ");
+        }
+        !self.commands.is_empty()
     }
 }
 
@@ -84,15 +106,18 @@ pub fn detect_checks(entries: &[String], instruction: &str) -> Vec<VerifyCheck> 
                     "test_",
                     "_test.py",
                 ],
+                &["pytest", "python -m unittest", "python3 -m unittest"],
             ));
         }
         match el.as_str() {
             "makefile" => checks.push(VerifyCheck::new(
                 "`make test` (the Makefile)",
                 &["make test", "make check", "make ci"],
+                &["make test", "make check", "make ci"],
             )),
             "justfile" => checks.push(VerifyCheck::new(
                 "`just test` (the justfile)",
+                &["just test", "just check"],
                 &["just test", "just check"],
             )),
             "package.json" => checks.push(VerifyCheck::new(
@@ -104,6 +129,7 @@ pub fn detect_checks(entries: &[String], instruction: &str) -> Vec<VerifyCheck> 
                     "pnpm test",
                     "npm run check",
                 ],
+                &["npm test", "yarn test", "pnpm test", "npm run check"],
             )),
             "cargo.toml" => {
                 // `cargo check` is deliberately NOT a marker (#1942). It is a
@@ -123,9 +149,14 @@ pub fn detect_checks(entries: &[String], instruction: &str) -> Vec<VerifyCheck> 
                 checks.push(VerifyCheck::new(
                     "`cargo test`",
                     &["cargo test", "cargo nextest"],
+                    &["cargo test", "cargo nextest run"],
                 ));
             }
-            "go.mod" => checks.push(VerifyCheck::new("`go test ./...`", &["go test"])),
+            "go.mod" => checks.push(VerifyCheck::new(
+                "`go test ./...`",
+                &["go test"],
+                &["go test ./..."],
+            )),
             _ => {}
         }
     }
@@ -135,6 +166,7 @@ pub fn detect_checks(entries: &[String], instruction: &str) -> Vec<VerifyCheck> 
         checks.push(VerifyCheck::new(
             format!("the command the task says to run: `{cmd}`"),
             &[marker.as_str()],
+            &[cmd.as_str()],
         ));
     }
     checks
@@ -185,7 +217,11 @@ pub fn unrun<'a>(checks: &'a [VerifyCheck], commands: &[String]) -> Vec<&'a Veri
 /// The nudge to hand the model when it is concluding with unrun verifications —
 /// or `None` when there is nothing to verify (no checks detected) or everything
 /// was already run. The loop injects the `Some` text and grants one more round.
-pub fn verify_gate_nudge(checks: &[VerifyCheck], commands: &[String]) -> Option<String> {
+pub fn verify_gate_nudge(
+    checks: &[VerifyCheck],
+    commands: &[String],
+    can_edit: bool,
+) -> Option<String> {
     let pending = unrun(checks, commands);
     if pending.is_empty() {
         return None;
@@ -195,11 +231,17 @@ pub fn verify_gate_nudge(checks: &[VerifyCheck], commands: &[String]) -> Option<
         .map(|c| c.label.as_str())
         .collect::<Vec<_>>()
         .join("; ");
+    let outcome = if can_edit {
+        "read the output, and if it fails, FIX the code and run it again until it passes. \
+         Only conclude once you have seen it pass (or have proven there is nothing to run)."
+    } else {
+        "read the output, and report the observed result. If it fails, report that failure \
+         and the actual authority limit; do not claim it passed or exceed the turn's permissions."
+    };
     Some(format!(
         "Before you finish: you have NOT run the verification this task ships — {named}. \
          Do not declare the task done on an unverified solution. Run it now with run_command, \
-         read the output, and if it fails, FIX the code and run it again until it passes. \
-         Only conclude once you have seen it pass (or have proven there is nothing to run)."
+         {outcome}"
     ))
 }
 
@@ -362,14 +404,29 @@ fn collect_entry_names(
 /// unreadable directory contributes nothing, so a missing/denied dir weakens
 /// the gate rather than failing the turn.
 ///
-/// **Symlinked directories are not followed.** `file_type()` does not traverse
+/// **Child directory symlinks are not descended into.** `file_type()` does not traverse
 /// the final symlink, so a link is identified before it is entered — the same
 /// hard boundary [`crate::verify_gate`] draws, and for the stronger reason
 /// here that a link into `/usr/lib` would have this gate demand the model run
 /// a dependency's test suite. A symlink is still reported as a NAME, because a
 /// symlinked `Cargo.toml` is a real manifest.
-pub fn workspace_entries(dir: &std::path::Path) -> Vec<String> {
+/// Each directory is also containment-probed beneath its authorizing read grant
+/// before listing, rejecting static root/ancestor symlink escapes. The probe
+/// and `read_dir` resolve paths separately: this is not descriptor-bound or
+/// race-free scanning. Concurrent path replacement remains a separate follow-up.
+pub fn workspace_entries(
+    dir: &std::path::Path,
+    fs_read: &crate::caveats::Scope<String>,
+) -> Vec<String> {
     collect_entry_names(dir, MAX_DEPTH, MAX_ENTRIES, &|d| {
+        let full = d.to_string_lossy();
+        match super::tools::authorizing_root(fs_read, &full) {
+            None => return Vec::new(),
+            Some(Some(root)) if !super::tools::find_root_contained(fs_read, root, d, &full) => {
+                return Vec::new();
+            }
+            _ => {}
+        }
         std::fs::read_dir(d)
             .map(|rd| {
                 rd.filter_map(Result::ok)
@@ -390,6 +447,71 @@ mod tests {
 
     fn entries(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Real directories ground the mocked scanner's read-scope boundary:
+    /// neither the scan root nor an ancestor may redirect into ungranted files.
+    /// This tests static symlink escapes, not concurrent path replacement.
+    #[cfg(unix)]
+    #[test]
+    fn confined_act_workspace_entries_rejects_symlink_scope_escape() {
+        let granted = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let readable = granted.path().join("readable");
+        std::fs::create_dir(&readable).unwrap();
+        std::fs::write(readable.join("Cargo.toml"), "# authorized manifest\n").unwrap();
+        std::fs::write(outside.path().join("Cargo.toml"), "# outside manifest\n").unwrap();
+        std::fs::create_dir(outside.path().join("nested")).unwrap();
+        std::fs::write(outside.path().join("nested/package.json"), "{}\n").unwrap();
+        let link = granted.path().join("escape");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let scope = crate::Scope::only([granted.path().to_string_lossy().into_owned()]);
+
+        assert_eq!(workspace_entries(&readable, &scope), ["Cargo.toml"]);
+        let escaped = [&link, &link.join("nested")]
+            .into_iter()
+            .map(|path| {
+                assert!(crate::caveats::permits_path(
+                    &scope,
+                    &path.to_string_lossy()
+                ));
+                workspace_entries(path, &scope)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            escaped.iter().all(Vec::is_empty),
+            "root and ancestor symlinks must not expose outside manifests: {escaped:?}"
+        );
+    }
+
+    #[test]
+    fn confined_act_verification_only_names_authorized_candidates() {
+        let original = detect_checks(&entries(&["package.json"]), "").remove(0);
+        let mut allowed = original.clone();
+        assert!(allowed.retain_authorized(|_| true));
+        assert_eq!(
+            allowed, original,
+            "full authority keeps the existing check unchanged"
+        );
+
+        let mut partial = original.clone();
+        assert!(partial.retain_authorized(|command| command == "pnpm test"));
+        assert_eq!(partial.commands, ["pnpm test"]);
+        assert_eq!(partial.label, "`pnpm test`");
+        assert_eq!(partial.run_markers, original.run_markers);
+        assert!(
+            partial.run_by("npm test"),
+            "previous evidence is not a future suggestion"
+        );
+
+        let mut denied = original;
+        assert!(!denied.retain_authorized(|_| false));
+        assert!(denied.commands.is_empty() && denied.label.is_empty());
+
+        let mut python = detect_checks(&entries(&["pytest.ini"]), "").remove(0);
+        assert!(python.retain_authorized(|command| command == "python3 -m unittest"));
+        assert_eq!(python.label, "`python3 -m unittest`");
+        assert!(python.run_by("python3 -m unittest"));
     }
 
     #[test]
@@ -445,7 +567,7 @@ mod tests {
             "cargo clippy --workspace -- -D warnings",
         ] {
             assert!(
-                verify_gate_nudge(&checks, &[only.into()]).is_some(),
+                verify_gate_nudge(&checks, &[only.into()], true).is_some(),
                 "`{only}` runs no test, so the gate must still fire"
             );
         }
@@ -471,7 +593,7 @@ mod tests {
             "cargo nextest run -p newt-core",
         ] {
             assert_eq!(
-                verify_gate_nudge(&checks, &[ran.into()]),
+                verify_gate_nudge(&checks, &[ran.into()], true),
                 None,
                 "`{ran}` ran the tests, so the gate must be silent"
             );
@@ -500,7 +622,7 @@ mod tests {
         let checks = detect_checks(&entries(&["test_outputs.py"]), "");
         // The model only edited + catted, never ran the tests.
         let commands = vec!["cat solution.py".into(), "ls -la".into()];
-        let nudge = verify_gate_nudge(&checks, &commands);
+        let nudge = verify_gate_nudge(&checks, &commands, true);
         assert!(nudge.is_some());
         assert!(nudge.unwrap().contains("Python tests"));
     }
@@ -510,22 +632,22 @@ mod tests {
         let checks = detect_checks(&entries(&["test_outputs.py"]), "");
         // A pytest invocation satisfies the check → no nudge.
         let commands = vec!["python -m pytest test_outputs.py -q".into()];
-        assert_eq!(verify_gate_nudge(&checks, &commands), None);
+        assert_eq!(verify_gate_nudge(&checks, &commands, true), None);
     }
 
     #[test]
     fn nudge_silent_when_the_instruction_command_was_run() {
         let checks = detect_checks(&entries(&["m.py"]), "Run `python check.py` to verify.");
-        assert!(verify_gate_nudge(&checks, &["python check.py".into()]).is_none());
+        assert!(verify_gate_nudge(&checks, &["python check.py".into()], true).is_none());
         // But if it ran something else, the nudge still fires.
-        assert!(verify_gate_nudge(&checks, &["python m.py".into()]).is_some());
+        assert!(verify_gate_nudge(&checks, &["python m.py".into()], true).is_some());
     }
 
     #[test]
     fn nudge_silent_when_no_checks_detected() {
-        assert_eq!(verify_gate_nudge(&[], &["anything".into()]), None);
+        assert_eq!(verify_gate_nudge(&[], &["anything".into()], true), None);
         assert_eq!(
-            verify_gate_nudge(&detect_checks(&entries(&["a.txt"]), ""), &[]),
+            verify_gate_nudge(&detect_checks(&entries(&["a.txt"]), ""), &[], true),
             None
         );
     }
@@ -533,7 +655,10 @@ mod tests {
     #[test]
     fn run_marker_match_is_case_insensitive() {
         let checks = detect_checks(&entries(&["Makefile"]), "");
-        assert_eq!(verify_gate_nudge(&checks, &["MAKE TEST".into()]), None);
+        assert_eq!(
+            verify_gate_nudge(&checks, &["MAKE TEST".into()], true),
+            None
+        );
     }
 
     // ---------------------------------------------------------------
@@ -797,7 +922,7 @@ mod tests {
         ];
         let cmds = commands_from_messages(&messages);
         assert_eq!(
-            verify_gate_nudge(&checks, &cmds),
+            verify_gate_nudge(&checks, &cmds, true),
             None,
             "an attempted check satisfies the gate — otherwise a workspace \
              where the check CANNOT run pays a nudge every round"
@@ -837,6 +962,6 @@ mod tests {
             "tool_calls": [{ "function": { "name": "run_command", "arguments": "{\"command\": \"python -m pytest\"}" }}]
         })];
         let cmds = commands_from_messages(&messages);
-        assert_eq!(verify_gate_nudge(&checks, &cmds), None);
+        assert_eq!(verify_gate_nudge(&checks, &cmds, true), None);
     }
 }
