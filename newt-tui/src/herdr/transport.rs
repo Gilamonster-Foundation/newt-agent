@@ -251,6 +251,10 @@ pub(crate) mod cli {
                 "pane.release_agent" => {
                     v.push("release-agent".into());
                     v.push(pane);
+                    v.push("--source".into());
+                    v.push(p.get("source")?.as_str()?.to_string());
+                    v.push("--agent".into());
+                    v.push(p.get("agent")?.as_str()?.to_string());
                 }
                 // report_metadata_title and anything else: no CLI verb → skip.
                 _ => return None,
@@ -305,10 +309,23 @@ pub(crate) mod cli {
         }
 
         #[test]
-        fn release_agent_maps_to_the_typed_cli_verb() {
+        fn release_agent_maps_to_the_typed_cli_verb_with_reported_identity() {
             let call = release_agent("w1:p2");
             let argv = CliSink::argv(&call).unwrap();
-            assert_eq!(argv, vec!["pane", "release-agent", "w1:p2"]);
+            // The CLI requires the same (pane, source, agent) identity as the
+            // report; omitting either flag cannot release that lifecycle lease.
+            assert_eq!(
+                argv,
+                vec![
+                    "pane",
+                    "release-agent",
+                    "w1:p2",
+                    "--source",
+                    "custom:newt",
+                    "--agent",
+                    "newt",
+                ]
+            );
         }
 
         #[test]
