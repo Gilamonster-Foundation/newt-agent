@@ -622,7 +622,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `connect_*` uncompilable, and both the decision and the wired planner behaviour are proven by
   executable tests.
 - **Ratchet guard:** `admit_denies_untrusted_and_disabled_admits_trusted`
-  (`newt-core/src/mcp.rs`, mocked unit tier) proves the gate *decides* deny for untrusted + disabled
+  (`newt-core/src/mcp_tests/admission.rs`, mocked unit tier) proves the gate *decides* deny for untrusted + disabled
   and admit for trusted; `headless_planner_never_spawns_an_untrusted_server`
   (`newt-mcp-client/tests/headless_admission_gate.rs`, real-resource tier, grounds the mocked gate)
   drives `McpToolset::connect` over an untrusted stdio entry whose command would `touch` a marker
@@ -851,8 +851,8 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   `leash_mints_only_from_a_structural_grant_never_the_name` (`agentic/mcp.rs`). Removing the witness
   requirement makes the un-leashed dispatch compile again; re-adding a name-based auto-grant
   re-fails the adversarial test. The secret-forwarding narrow is guarded by
-  `admit_denies_untrusted_and_disabled_admits_trusted` + `untrusted_structured_ref_is_rejected`
-  (`newt-core/src/mcp.rs`) and `untrusted_env_structured_cmd_ref_is_rejected` (`newt-mcp-client`) —
+  `admit_denies_untrusted_and_disabled_admits_trusted` (`newt-core/src/mcp_tests/admission.rs`) +
+  `untrusted_structured_ref_is_rejected` (`newt-core/src/mcp_tests/trust_boundary.rs`) and `untrusted_env_structured_cmd_ref_is_rejected` (`newt-mcp-client`) —
   an untrusted origin is neither admitted nor able to resolve a newt secret reference.
 - **0.8.0 disposition:** does not block v0.8.0 — CLOSED. Closed on the unreleased 0.8.0 line: the
   witness-typed call-time leash + the structural `McpGrant` (authority is never the server-chosen
