@@ -666,6 +666,8 @@ pub(crate) struct PromptPermissionGate<
     pub(crate) config_path: Option<std::path::PathBuf>,
     /// Re-applied after widening so grants cannot pierce a named preset.
     pub(crate) preset_clamp: Option<newt_core::Caveats>,
+    /// Immutable inherited ceiling, independent of the current posture.
+    pub(crate) delegation: Option<&'a newt_identity::VerifiedDelegation>,
     pub(crate) danger: danger::DangerTable,
     pub(crate) color: bool,
     pub(crate) verbose: bool,

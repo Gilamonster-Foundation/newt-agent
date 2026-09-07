@@ -27,6 +27,7 @@ pub(crate) struct SessionCapability {
     /// capability then degrades to a plain caveats floor (still narrowing-only).
     op: Option<newt_identity::AgentKey>,
     caveats: newt_core::caveats::Caveats,
+    delegation: Option<newt_identity::VerifiedDelegation>,
 }
 
 impl SessionCapability {
@@ -35,6 +36,7 @@ impl SessionCapability {
         tui: Option<newt_core::TuiConfig>,
         key_path: Option<&std::path::Path>,
         workspace: &str,
+        delegation: Option<newt_identity::VerifiedDelegation>,
     ) -> Self {
         let policy = policy_for(tui, workspace);
         let op = key_path.and_then(|p| mint_operating_key(p, &policy).ok());
@@ -42,7 +44,16 @@ impl SessionCapability {
             Some(k) => newt_identity::enforced_caveats(k).unwrap_or(policy),
             None => policy,
         };
-        Self { op, caveats }
+        Self {
+            op,
+            caveats,
+            delegation,
+        }
+    }
+
+    /// The inherited ceiling is distinct from a removable named posture.
+    pub(crate) fn delegation(&self) -> Option<&newt_identity::VerifiedDelegation> {
+        self.delegation.as_ref()
     }
 
     /// The active enforcement caveats the tool loop consults.

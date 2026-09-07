@@ -1375,7 +1375,8 @@ fn session_body(
     });
     apply_openai_api_env(choice.api);
     let key_path = newt_identity::default_key_path().ok();
-    let mut cap = SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace);
+    let mut cap =
+        SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace, None);
     // Session working style. This never grants authority; plan/diagnose only
     // narrow the existing prompt-disposition and caveat boundaries.
     let mut active_operating_mode = OperatingMode::Chat;
@@ -7163,6 +7164,7 @@ fn session_body(
                         denials_path: permission_denials_path.clone(),
                         config_path: permission_config_path.clone(),
                         preset_clamp: preset_clamp.clone(),
+                        delegation: cap.delegation(),
                         danger: production_danger_table(),
                         color,
                         verbose,

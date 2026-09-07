@@ -81,7 +81,7 @@ fn establish_unconfigured_is_signed_read_only() {
     // the signed-capability path; the per-user key was generated.
     let dir = tempfile::TempDir::new().unwrap();
     let key = dir.path().join("identity.pem");
-    let cap = SessionCapability::establish(None, Some(&key), "/ws");
+    let cap = SessionCapability::establish(None, Some(&key), "/ws", None);
     assert_ne!(*cap.caveats(), newt_core::caveats::Caveats::top());
     assert!(!cap.caveats().permits_exec("cargo"));
     // Reads locked to the workspace (see absent_config_is_read_only).
@@ -96,7 +96,7 @@ fn establish_without_key_is_read_only_policy() {
     // / NEWT_VENV via scan_cli_exec_grants.
     let _env = crate::test_env_guard::env_write_guard();
     let _preset = ForceDefaultPreset::new();
-    let cap = SessionCapability::establish(None, None, "/ws");
+    let cap = SessionCapability::establish(None, None, "/ws", None);
     assert_ne!(*cap.caveats(), newt_core::caveats::Caveats::top());
     assert!(!cap.caveats().permits_exec("cargo"));
 }
@@ -119,6 +119,7 @@ fn plugin_envelope_chain_roots_at_operator_userkey() {
         Some(tui_with(newt_core::PermissionPreset::WorkspaceDev)),
         Some(&key_path),
         "/ws",
+        None,
     );
 
     // Re-load the user key to get its fingerprint for the chain walk.
@@ -158,7 +159,7 @@ fn plugin_envelope_unavailable_without_operating_key() {
     // degrades to a caveats-only floor. The plugin-spawn chokepoint
     // returns None — the caller must NOT manufacture an AgentKey
     // (issue #93). No synthetic-key fallback exists.
-    let cap = SessionCapability::establish(None, None, "/ws");
+    let cap = SessionCapability::establish(None, None, "/ws", None);
     assert!(
         cap.plugin_envelope_for("tui-plugin", newt_core::Caveats::top())
             .is_none(),
@@ -178,6 +179,7 @@ fn establish_configured_is_workspace_dev() {
         Some(newt_core::TuiConfig::default()),
         Some(&dir.path().join("identity.pem")),
         "/ws",
+        None,
     );
     assert!(cap.caveats().permits_exec("cargo"), "workspace-dev tools");
     assert!(!cap.caveats().permits_exec("rm"), "dangerous cmds denied");
@@ -197,6 +199,7 @@ fn reapply_narrows_but_cannot_widen() {
         Some(tui_with(newt_core::PermissionPreset::WorkspaceDev)),
         Some(&dir.path().join("identity.pem")),
         "/ws",
+        None,
     );
     assert!(
         cap.caveats().permits_exec("cargo"),
@@ -231,9 +234,192 @@ fn reapply_without_key_still_narrows() {
         Some(tui_with(newt_core::PermissionPreset::WorkspaceDev)),
         None,
         "/ws",
+        None,
     );
     assert!(cap.caveats().permits_exec("cargo"));
     let clamped = cap.reapply(Some(tui_with(newt_core::PermissionPreset::ReadOnly)), "/ws");
     assert!(!clamped);
     assert!(!cap.caveats().permits_exec("cargo"));
+}
+
+pub(crate) fn verified_delegation(
+    ceiling: newt_core::Caveats,
+) -> newt_identity::VerifiedDelegation {
+    let parent = newt_identity::session_root(&newt_identity::UserKey::generate());
+    let envelope = newt_identity::delegate_for_plugin(&parent, "newt-helper", ceiling).unwrap();
+    newt_identity::verify_delegation(
+        envelope.as_bytes(),
+        &newt_identity::RawContentId::from_content(envelope.as_bytes()),
+    )
+    .unwrap()
+}
+
+fn delegated_ceiling() -> newt_core::Caveats {
+    newt_core::Caveats {
+        fs_read: newt_core::Scope::only(["/ws".to_string()]),
+        fs_write: newt_core::Scope::none(),
+        exec: newt_core::Scope::none(),
+        net: newt_core::Scope::none(),
+        max_calls: newt_core::CountBound::AtMost(7),
+        valid_for_generation: newt_core::Scope::All,
+    }
+}
+
+/// Grounds the delegated constructor's no-root-mint contract against a real
+/// missing identity path; the ordinary-session control must create its key.
+#[test]
+fn delegated_session_does_not_create_an_operator_root_key() {
+    let _env = crate::test_env_guard::env_read_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let child_key = dir.path().join("child-root.pem");
+    let ceiling = delegated_ceiling();
+    let cap = SessionCapability::establish(
+        Some(tui_with(newt_core::PermissionPreset::FullAccess)),
+        Some(&child_key),
+        "/ws",
+        Some(verified_delegation(ceiling.clone())),
+    );
+    assert!(
+        !child_key.exists(),
+        "a delegated session must not mint a root"
+    );
+    assert_eq!(cap.caveats(), &ceiling);
+    assert!(cap.plugin_envelope_for("nested-helper", ceiling).is_none());
+
+    let operator_key = dir.path().join("operator-root.pem");
+    let ordinary = SessionCapability::establish(None, Some(&operator_key), "/ws", None);
+    assert!(
+        operator_key.exists(),
+        "ordinary startup still establishes its identity"
+    );
+    assert!(ordinary.delegation().is_none());
+}
+
+#[test]
+fn delegated_session_without_a_key_path_still_enforces_its_signed_ceiling() {
+    let _env = crate::test_env_guard::env_read_guard();
+    let ceiling = delegated_ceiling();
+    let cap = SessionCapability::establish(
+        Some(tui_with(newt_core::PermissionPreset::FullAccess)),
+        None,
+        "/ws",
+        Some(verified_delegation(ceiling.clone())),
+    );
+    assert_eq!(cap.caveats(), &ceiling);
+    assert_eq!(cap.delegation().unwrap().caveats(), &ceiling);
+    assert!(cap.plugin_envelope_for("nested-helper", ceiling).is_none());
+}
+
+#[test]
+fn delegated_session_reapply_and_posture_off_cannot_remove_the_parent_ceiling() {
+    let _env = crate::test_env_guard::env_read_guard();
+    let ceiling = delegated_ceiling();
+    let mut cap = SessionCapability::establish(
+        Some(tui_with(newt_core::PermissionPreset::FullAccess)),
+        None,
+        "/ws",
+        Some(verified_delegation(ceiling.clone())),
+    );
+    assert!(cap.reapply(
+        Some(tui_with(newt_core::PermissionPreset::FullAccess)),
+        "/elsewhere"
+    ));
+    // No named posture is the same authority path used by `/posture off`.
+    let turn = crate::effective_caveats(cap.caveats(), None);
+    assert_eq!(turn, ceiling);
+    assert_eq!(cap.delegation().unwrap().caveats(), &ceiling);
+}
+
+#[test]
+fn delegated_session_meets_a_stricter_local_policy_with_the_parent_ceiling() {
+    let _env = crate::test_env_guard::env_write_guard();
+    let _preset = ForceDefaultPreset::new();
+    let tui = tui_with(newt_core::PermissionPreset::ReadOnly);
+    let local = policy_for(Some(tui.clone()), "/ws");
+    let ceiling = newt_core::Caveats {
+        max_calls: newt_core::CountBound::AtMost(7),
+        ..newt_core::Caveats::top()
+    };
+    // Keep explicit CLI grants in the local policy. Neither their absence nor
+    // an ambient full-access override should decide this meet regression.
+    let expected = local.meet(&ceiling);
+    assert_ne!(expected, ceiling, "the local policy is strictly narrower");
+    assert_ne!(expected, local, "the signed call bound also narrows policy");
+
+    let cap = SessionCapability::establish(
+        Some(tui),
+        None,
+        "/ws",
+        Some(verified_delegation(ceiling.clone())),
+    );
+    assert_eq!(cap.caveats(), &expected);
+    assert_eq!(cap.delegation().unwrap().caveats(), &ceiling);
+}
+
+#[test]
+fn delegated_session_reapply_preserves_local_narrowing_below_the_parent_ceiling() {
+    let _env = crate::test_env_guard::env_write_guard();
+    let _preset = ForceDefaultPreset::new();
+    let ceiling = newt_core::Caveats {
+        max_calls: newt_core::CountBound::AtMost(7),
+        ..newt_core::Caveats::top()
+    };
+    let mut cap = SessionCapability::establish(
+        Some(tui_with(newt_core::PermissionPreset::FullAccess)),
+        None,
+        "/ws",
+        Some(verified_delegation(ceiling.clone())),
+    );
+    let read_only = tui_with(newt_core::PermissionPreset::ReadOnly);
+    let narrowed = policy_for(Some(read_only.clone()), "/ws").meet(&ceiling);
+    assert_ne!(narrowed, ceiling, "reload must remove some authority");
+    cap.reapply(Some(read_only), "/ws");
+    assert_eq!(cap.caveats(), &narrowed);
+
+    assert!(cap.reapply(
+        Some(tui_with(newt_core::PermissionPreset::FullAccess)),
+        "/ws"
+    ));
+    assert_eq!(
+        cap.caveats(),
+        &narrowed,
+        "reload cannot restore removed axes"
+    );
+    assert_eq!(cap.delegation().unwrap().caveats(), &ceiling);
+}
+
+/// Grounds the no-operating-key boundary against a real, already-valid key.
+/// This proves no authority is acquired and no bytes change, not absence of a
+/// filesystem read; the ordinary-session control proves the key is usable.
+#[test]
+fn delegated_session_does_not_acquire_operating_authority_from_an_existing_key() {
+    let _env = crate::test_env_guard::env_read_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("operator-root.pem");
+    newt_identity::UserKey::generate().save(&key_path).unwrap();
+    let before = std::fs::read(&key_path).unwrap();
+    let ceiling = delegated_ceiling();
+    let cap = SessionCapability::establish(
+        Some(tui_with(newt_core::PermissionPreset::FullAccess)),
+        Some(&key_path),
+        "/ws",
+        Some(verified_delegation(ceiling.clone())),
+    );
+    assert!(cap
+        .plugin_envelope_for("nested-helper", ceiling.clone())
+        .is_none());
+    assert_eq!(cap.caveats(), &ceiling);
+    assert_eq!(std::fs::read(&key_path).unwrap(), before);
+
+    let ordinary = SessionCapability::establish(
+        Some(tui_with(newt_core::PermissionPreset::FullAccess)),
+        Some(&key_path),
+        "/ws",
+        None,
+    );
+    ordinary
+        .plugin_envelope_for("ordinary-plugin", ceiling)
+        .expect("an ordinary session can use the existing operator key")
+        .expect("the control delegation stays inside ordinary authority");
+    assert_eq!(std::fs::read(&key_path).unwrap(), before);
 }
