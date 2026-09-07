@@ -15,7 +15,21 @@ counts and full ref names for local branches and cached remote-tracking
 branches (`scope=local|remote|all`, default `all`), excluding symbolic remote
 aliases. It does not contact remotes or count open pull requests. This is the
 only Git operation exposed in Explain, Research, and Plan dispositions; other
-operations retain their existing Act boundary.
+operations require Act disposition and unrestricted filesystem reads.
+
+For any session with bounded filesystem read grants (`Scope::Only`),
+`branch-list` is the only supported Git operation, including in Act turns.
+Normal ReadOnly and WorkspaceEdit interactive launches are workspace-fenced,
+so this restriction applies to those ordinary defaults too: embedded `status`,
+`log`, and `commit` are unavailable. Restoring those workflows requires a
+capability-safe Git executor; the harness does not widen the read grant.
+The legacy engine constructor requires the same read scope before repository
+discovery. Optional snapshots and automatic Git metadata become unavailable
+under bounded read grants; they do not fabricate clean state or commit evidence.
+Legacy operations require unrestricted filesystem reads (`Scope::All`): their
+object databases, alternate stores, index overrides, and config cascades do not
+yet enforce bounded grants. Git write permission cannot override this limit,
+and the tool will not request a write grant to bypass it.
 
 Branch listing reads the files-backed ref store without opening an object
 database or loading the global Git configuration cascade. Linked worktrees

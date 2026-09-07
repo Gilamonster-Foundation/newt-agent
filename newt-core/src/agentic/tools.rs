@@ -2789,7 +2789,7 @@ async fn execute_tool_inner(
                     note_sink.is_some(),
                     recall_source.is_some(),
                     memory_source.is_some(),
-                    git_tool.is_some(),
+                    git_tool.map(|_| &caveats.fs_read),
                     crew_runner.is_some(),
                     scratchpad_store.is_some(),
                     code_search.is_some(),
@@ -2812,8 +2812,13 @@ async fn execute_tool_inner(
         // without an injected impl the tool was never advertised.
         "git" => match git_tool {
             Some(tool) => {
-                let gc = crate::git_caveats::GitCaveats::from_session(caveats);
                 let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("");
+                // This engine-read boundary is independent of disposition and
+                // Git write grants. Refuse before any confirmation or retry.
+                if let Err(error) = super::git_tool::check_git_read_scope(op, &caveats.fs_read) {
+                    return format!("error: {error}");
+                }
+                let gc = crate::git_caveats::GitCaveats::from_session(caveats);
                 // #1191: data-loss ops (stash-drop / branch-delete) are gated
                 // ALWAYS — even under --full-access — because they destroy work
                 // irrecoverably. A confused (e.g. post-compaction) model must

@@ -55,9 +55,27 @@ const GIT_HARDENING_OVERRIDES: &[&str] = &[
     "protocol.ext.allow=never", // no `ext::` transport
 ];
 
+/// Construct automatic Git metadata only with unrestricted read authority.
+///
+/// Execution hardening does not confine config includes, object alternates,
+/// linked administrative directories, or child symlinks. Until those reads
+/// are capability-aware, optional metadata must be unavailable under a bounded
+/// grant. This check precedes even executable lookup and command construction.
+pub fn metadata_git(
+    cwd: &Path,
+    args: &[&str],
+    read_scope: &crate::Scope<String>,
+) -> io::Result<Command> {
+    crate::agentic::check_git_read_scope("metadata", read_scope)
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+    hardened_git(cwd, args)
+}
+
 /// Build a **confused-deputy-safe** `git` [`Command`] running in `cwd` with
 /// `args`. Every harness `git` subprocess that touches a (possibly hostile)
 /// workspace must go through this instead of a raw `Command::new("git")`.
+/// This is execution hardening, not filesystem read confinement. Automatic
+/// optional metadata must use [`metadata_git`] with the turn's read scope.
 ///
 /// On macOS, resolve the executable in the parent before scrubbing PATH.
 /// A bare program plus a changed PATH makes Rust fall back from `posix_spawn`

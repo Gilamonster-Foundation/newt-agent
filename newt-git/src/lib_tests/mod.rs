@@ -100,6 +100,9 @@ mod git_scope;
 #[path = "rebase.rs"]
 mod rebase;
 #[cfg(test)]
+#[path = "scoped_legacy.rs"]
+mod scoped_legacy;
+#[cfg(test)]
 #[path = "stash_and_unknown.rs"]
 mod stash_and_unknown;
 #[cfg(test)]

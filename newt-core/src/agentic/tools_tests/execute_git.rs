@@ -61,11 +61,7 @@ async fn read_only_git_dispatch_accepts_reads_without_granting_writes() {
     ] {
         for (name, args, accepted) in [
             ("git", serde_json::json!({"op": "branch-list"}), true),
-            (
-                "git",
-                serde_json::json!({"op": "status"}),
-                disposition == PromptDisposition::Act,
-            ),
+            ("git", serde_json::json!({"op": "status"}), false),
             (
                 "git",
                 serde_json::json!({"op": "branch", "name": "created"}),

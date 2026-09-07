@@ -223,6 +223,7 @@ fn cap_exit_finalizer_applies_workspace_claim_checks() {
     let text = finalize_final_text(
         "Updated src/definitely_not_present.rs and verified it.".to_string(),
         &workspace.path().to_string_lossy(),
+        &crate::Scope::All,
         None,
         None,
     );

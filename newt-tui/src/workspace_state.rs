@@ -8,20 +8,34 @@ pub(crate) struct WorkspaceStateSnapshot {
     pub(crate) git_status_available: bool,
 }
 
-pub(crate) fn workspace_state_block(workspace: &str) -> String {
-    format_workspace_state_block(&collect_workspace_state(workspace))
+pub(crate) fn workspace_state_block(
+    workspace: &str,
+    read_scope: &newt_core::Scope<String>,
+) -> String {
+    let mut block = format_workspace_state_block(&collect_workspace_state(workspace, read_scope));
+    // Recent history belongs to the current authorized observation, not the
+    // frozen prompt that can outlive a posture/authority change.
+    if let Some(log) = git_stdout(workspace, &["log", "--oneline", "-10"], read_scope)
+        .filter(|log| !log.is_empty())
+    {
+        block.push_str(&format!("\n\nRecent commits:\n{log}"));
+    }
+    block
 }
 
-fn collect_workspace_state(workspace: &str) -> WorkspaceStateSnapshot {
+fn collect_workspace_state(
+    workspace: &str,
+    read_scope: &newt_core::Scope<String>,
+) -> WorkspaceStateSnapshot {
     let timestamp = chrono::Local::now().to_rfc3339();
-    let branch = git_stdout(workspace, &["branch", "--show-current"])
+    let branch = git_stdout(workspace, &["branch", "--show-current"], read_scope)
         .filter(|b| !b.trim().is_empty())
         .or_else(|| {
-            git_stdout(workspace, &["rev-parse", "--short", "HEAD"])
+            git_stdout(workspace, &["rev-parse", "--short", "HEAD"], read_scope)
                 .filter(|h| !h.trim().is_empty())
                 .map(|h| format!("detached HEAD ({h})"))
         });
-    let status = git_stdout(workspace, &["status", "--porcelain=v1"]);
+    let status = git_stdout(workspace, &["status", "--porcelain=v1"], read_scope);
     let dirty_files = status
         .as_deref()
         .map(parse_git_porcelain_dirty_files)
@@ -34,13 +48,18 @@ fn collect_workspace_state(workspace: &str) -> WorkspaceStateSnapshot {
     }
 }
 
-fn git_stdout(workspace: &str, args: &[&str]) -> Option<String> {
+fn git_stdout(
+    workspace: &str,
+    args: &[&str],
+    read_scope: &newt_core::Scope<String>,
+) -> Option<String> {
     // Confused-deputy-safe (step-7.4): `workspace` may be a hostile repo whose
     // `.git/config` could turn this read into out-of-fence code.
-    let output = newt_core::git_hardening::hardened_git(std::path::Path::new(workspace), args)
-        .ok()?
-        .output()
-        .ok()?;
+    let output =
+        newt_core::git_hardening::metadata_git(std::path::Path::new(workspace), args, read_scope)
+            .ok()?
+            .output()
+            .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -75,7 +94,9 @@ pub(crate) fn format_workspace_state_block(state: &WorkspaceStateSnapshot) -> St
     } else if state.git_status_available {
         lines.push("branch: detached or unknown".to_string());
     } else {
-        lines.push("git: unavailable (not a git worktree or git command failed)".to_string());
+        lines.push(
+            "git: unavailable (read authority, repository, or command unavailable)".to_string(),
+        );
     }
 
     if state.git_status_available {

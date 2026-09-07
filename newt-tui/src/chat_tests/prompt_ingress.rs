@@ -41,6 +41,9 @@ fn session_artifact_store_rebinds_when_conversation_rotates() {
 #[test]
 fn git_head_snapshot_requires_effective_workspace_read_authority() {
     let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".git/objects")).unwrap();
+    std::fs::create_dir_all(tmp.path().join(".git/refs/heads")).unwrap();
+    std::fs::write(tmp.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     let tool = newt_git::LocalGitTool {
         root: tmp.path().to_path_buf(),
         author: newt_git::Author {
@@ -55,6 +58,22 @@ fn git_head_snapshot_requires_effective_workspace_read_authority() {
     denied.fs_read = newt_core::Scope::none();
     assert!(git_head_snapshot(Some(&tool), &denied).is_none());
     assert!(git_head_snapshot(None, &newt_core::Caveats::top()).is_none());
+    // A real repository grounds the optional-metadata policy: passing the
+    // workspace path check is not authority for legacy discovery/config reads.
+    assert!(git_head_snapshot(Some(&tool), &newt_core::Caveats::top()).is_some());
+    denied.fs_read = newt_core::Scope::only([tmp.path().to_string_lossy().into_owned()]);
+    assert!(git_head_snapshot(Some(&tool), &denied).is_none());
+    let workspace = tmp.path().to_str().unwrap();
+    let unavailable = workspace_state_block(workspace, &denied.fs_read);
+    assert!(unavailable.contains("git: unavailable"));
+    assert!(!unavailable.contains("local changes: clean"));
+    assert!(!unavailable.contains("Recent commits:"));
+    assert_eq!(
+        lightweight_git_meta(workspace, &denied.fs_read),
+        (None, None)
+    );
+    let control = workspace_state_block(workspace, &newt_core::Scope::All);
+    assert!(control.contains("local changes: clean"), "{control}");
 }
 
 #[test]

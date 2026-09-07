@@ -193,7 +193,11 @@ pub struct GitEngine {
 
 impl GitEngine {
     /// Discover and open the repository containing `root` (walks up for `.git`).
-    pub fn open(root: &Path) -> Result<Self, GitError> {
+    /// Legacy discovery/config/ODB reads require unrestricted read authority;
+    /// the separate refs-only branch listing does not open this engine.
+    pub fn open(root: &Path, read_scope: &Scope<String>) -> Result<Self, GitError> {
+        newt_core::agentic::check_git_read_scope("open", read_scope)
+            .map_err(GitError::Unsupported)?;
         let repo = Repository::discover(Some(root))?;
         Ok(Self { repo })
     }
@@ -218,7 +222,7 @@ impl GitEngine {
 
     /// Read only the current branch and complete HEAD object id.
     ///
-    /// This is the bounded observation primitive used by provenance hooks; it
+    /// This is the small observation payload used by provenance hooks; it
     /// deliberately avoids the O(worktree) status scan. Requires `read` just
     /// like every other repository observation.
     pub fn head_snapshot(&self, caps: &GitCaveats) -> Result<HeadSnapshot, GitError> {
@@ -1030,8 +1034,12 @@ impl LocalGitTool {
     /// Capability-governed, O(HEAD) repository identity for harness
     /// provenance. Opening afresh matches [`GitTool::dispatch`]'s stateless
     /// behavior and never invents read authority.
-    pub fn head_snapshot(&self, caps: &GitCaveats) -> Result<HeadSnapshot, GitError> {
-        GitEngine::open(&self.root)?.head_snapshot(caps)
+    pub fn head_snapshot(
+        &self,
+        caps: &GitCaveats,
+        session: &Caveats,
+    ) -> Result<HeadSnapshot, GitError> {
+        GitEngine::open(&self.root, &session.fs_read)?.head_snapshot(caps)
     }
 
     /// The ONE first-class commit-message attribution boundary (#1709
@@ -1112,6 +1120,7 @@ impl newt_core::agentic::GitTool for LocalGitTool {
         caps: &GitCaveats,
         session: &Caveats,
     ) -> Result<String, String> {
+        newt_core::agentic::check_git_read_scope(op, &session.fs_read).map_err(str::to_owned)?;
         if op == "branch-list" && !caps.permits_read() {
             return Err(GitError::Denied("read").to_string());
         }

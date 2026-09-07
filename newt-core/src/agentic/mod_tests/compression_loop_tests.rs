@@ -694,7 +694,7 @@ fn multi_turn_msgs() -> Vec<MemMessage> {
 /// catalog rather than a stale numeric snapshot of its schema overhead.
 fn initial_request_budget(messages: &[MemMessage], task: &str) -> usize {
     let tools = merged_tool_definitions(
-        &NoMcp, false, false, false, false, false, false, false, false, false, false, false, false,
+        &NoMcp, false, false, false, None, false, false, false, false, false, false, false, false,
     );
     let mut wire_messages: Vec<serde_json::Value> = messages
             .iter()

@@ -564,7 +564,7 @@ fn git_head_snapshot(
         return None;
     }
     let git_caveats = newt_core::git_caveats::GitCaveats::from_session(caveats);
-    tool.head_snapshot(&git_caveats).ok()
+    tool.head_snapshot(&git_caveats, caveats).ok()
 }
 
 /// Text that may be labelled as the active task in derived memory artifacts.
@@ -3925,7 +3925,11 @@ fn session_body(
                                                 &source_extensions,
                                                 newt_core::GatherCaps::default(),
                                             );
-                                            let (git_head, dirty) = lightweight_git_meta(workspace);
+                                            // Explicit operator `/search status`, not automatic turn metadata.
+                                            let (git_head, dirty) = lightweight_git_meta(
+                                                workspace,
+                                                &newt_core::Scope::All,
+                                            );
                                             index_status.generation =
                                                 index_status.generation.saturating_add(1);
                                             index_status.manifest = Some(manifest);
@@ -6759,9 +6763,19 @@ fn session_body(
                         turn_operating_mode,
                         active_posture.as_ref(),
                     );
+                    // Resolve the turn's authority before automatic Git metadata,
+                    // not only before tool dispatch. The same value is the gate
+                    // base and the ChatCtx authority later in this turn.
+                    let turn_caveats = operating_mode_caveats(
+                        turn_operating_mode,
+                        meet_persona_caveats(
+                            effective_caveats(cap.caveats(), active_posture.as_ref()),
+                            active_persona.as_ref(),
+                        ),
+                    );
                     let mut turn_system = format!(
                         "{}\n\n{}\n\n{system}\n\n{session_controls}",
-                        workspace_state_block(workspace),
+                        workspace_state_block(workspace, &turn_caveats.fs_read),
                         runtime_context_block(&inf_model, &inf_url, inf_kind, &session_identity)
                     );
                     if is_clarification_answer {
@@ -6876,7 +6890,8 @@ fn session_body(
                                 &source_extensions,
                                 newt_core::GatherCaps::default(),
                             );
-                            let (git_head, dirty) = lightweight_git_meta(workspace);
+                            let (git_head, dirty) =
+                                lightweight_git_meta(workspace, &turn_caveats.fs_read);
                             index_status.generation = index_status.generation.saturating_add(1);
                             index_status.manifest = Some(manifest);
                             index_status.git_head = git_head;
@@ -7072,21 +7087,6 @@ fn session_body(
                     // turn's `phantom_reaches` column.
                     let mut turn_phantom_reaches: Vec<newt_core::PhantomReach> = Vec::new();
                     let mut turn_end_reason: Option<newt_core::TurnEndReason> = None;
-                    // #307: the EFFECTIVE caveats for this turn — the session
-                    // base intersected with the active posture's preset clamp
-                    // (a FLOOR). This single `meet` is what the gate base, the
-                    // ChatCtx dispatch, and (via the preset clamp + exec_floor)
-                    // the --disable-ocap bypass all enforce, so authority can
-                    // never exceed the preset. With no posture it is the base
-                    // unchanged. Computed once so all three consult one value.
-                    let mut turn_caveats = meet_persona_caveats(
-                        effective_caveats(cap.caveats(), active_posture.as_ref()),
-                        active_persona.as_ref(),
-                    );
-                    // The effective turn mode includes both `/mode` and any
-                    // model-entered legacy plan phase, so one clamp keeps the
-                    // prompt card, catalog, and authority boundary aligned.
-                    turn_caveats = operating_mode_caveats(turn_operating_mode, turn_caveats);
                     // FR-1 part 2 (#997): the active persona's tool allow-list
                     // (its `tools:` front-matter). Threaded into `ChatCtx` so the
                     // loop advertises ONLY these tools and the executor refuses
@@ -7247,7 +7247,7 @@ fn session_body(
                     // skip the git read entirely.
                     let head_before_turn = active_roadmap_id
                         .as_ref()
-                        .and_then(|_| git_head_short(workspace));
+                        .and_then(|_| git_head_short(artifact_head_before_turn.as_ref()));
                     // #1235: publish the universal tool spill-view height for
                     // this turn (process-wide knob, output_budget precedent).
                     // #1640: on the LEAN surface the committed excerpt is the
@@ -8065,7 +8065,7 @@ fn session_body(
                                         store,
                                         &active_roadmap_id,
                                         &active_conversation_id,
-                                        workspace,
+                                        artifact_head_after_turn.as_ref(),
                                         head_before_turn.as_deref(),
                                     ) {
                                         print_newt(&note, color, verbose);

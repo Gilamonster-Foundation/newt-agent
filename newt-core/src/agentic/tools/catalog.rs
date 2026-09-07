@@ -314,13 +314,15 @@ pub fn lifecycle_tool_definition() -> serde_json::Value {
 /// definition (progressive-disclosure memory, Workstream A MVP, #319) the same
 /// way on a supplied `MemorySource` — `None` ⇒ the tool is never advertised,
 /// so eval / headless / ACP sessions are unaffected bit-for-bit.
-#[allow(clippy::too_many_arguments)] // presence-gated tool advertisers (one bool each)
+// Git presence carries its required read scope: a bare presence flag cannot
+// advertise legacy operations to a session whose filesystem authority is fenced.
+#[allow(clippy::too_many_arguments)] // presence-gated tool advertisers
 pub(crate) fn merged_tool_definitions(
     mcp: &dyn McpTools,
     with_save_note: bool,
     with_recall: bool,
     with_memory_fetch: bool,
-    with_git: bool,
+    git_read_scope: Option<&crate::caveats::Scope<String>>,
     with_team: bool,
     with_scratchpad: bool,
     with_code_search: bool,
@@ -350,7 +352,7 @@ pub(crate) fn merged_tool_definitions(
             with_save_note,
             with_recall,
             with_memory_fetch,
-            with_git,
+            git_read_scope.is_some(),
             with_team,
             with_scratchpad,
             with_code_search,
@@ -360,7 +362,12 @@ pub(crate) fn merged_tool_definitions(
             with_plan_mode_control,
             with_plan_mode_active,
         ) {
-            defs.push((spec.definition)());
+            defs.push(match (spec.gate, git_read_scope) {
+                (Gate::Git, Some(scope)) => {
+                    super::super::git_tool::definition_for_read_scope(scope)
+                }
+                _ => (spec.definition)(),
+            });
         }
     }
     // MCP `_meta` is connector-side catalog metadata, not part of either

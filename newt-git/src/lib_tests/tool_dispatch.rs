@@ -9,7 +9,7 @@ fn dispatch_init_creates_a_repo_in_a_non_repo_dir_then_commit_works() {
     // useful there. (Would previously fail: "unknown git op 'init'".)
     let dir = tempfile::tempdir().unwrap();
     assert!(
-        GitEngine::open(dir.path()).is_err(),
+        GitEngine::open(dir.path(), &Scope::All).is_err(),
         "precondition: not a repo yet"
     );
     let t = tool(dir.path());
@@ -23,7 +23,7 @@ fn dispatch_init_creates_a_repo_in_a_non_repo_dir_then_commit_works() {
         .unwrap();
     assert!(out.contains("initialized"), "got: {out}");
     assert!(
-        GitEngine::open(dir.path()).is_ok(),
+        GitEngine::open(dir.path(), &Scope::All).is_ok(),
         "init created a real, openable repo"
     );
     // ...and the rest of the tool now works against the fresh repo.
@@ -347,7 +347,7 @@ fn dispatch_init_is_denied_without_write_permission() {
     );
     assert!(res.is_err(), "read-only session must not create a repo");
     assert!(
-        GitEngine::open(dir.path()).is_err(),
+        GitEngine::open(dir.path(), &Scope::All).is_err(),
         "a denied init created nothing"
     );
 }

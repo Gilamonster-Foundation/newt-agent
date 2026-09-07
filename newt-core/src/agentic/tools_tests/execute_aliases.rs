@@ -332,7 +332,7 @@ fn get_context_remaining_is_a_real_tool_not_a_phantom() {
     .is_none());
     // The always-advertised def rides in every session (empty MCP).
     let defs = merged_tool_definitions(
-        &NoMcp, false, false, false, false, false, false, false, false, false, false, false, false,
+        &NoMcp, false, false, false, None, false, false, false, false, false, false, false, false,
     );
     assert!(defs
         .as_array()

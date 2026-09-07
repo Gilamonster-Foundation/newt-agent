@@ -1523,7 +1523,16 @@ fully-mocked unit tier, coverage ratchet.
   the ops actually supported. The read-only repair adds a distinct `branch-list`
   operation for local and cached remote-tracking counts, gated by repository
   and Git metadata filesystem grants. Explain/Research/Plan expose only this
-  bounded operation; shell execution and other Git operations are not widened.
+  bounded operation. Sessions with bounded filesystem read grants also expose
+  only this operation in Act: legacy Git reads cannot yet honor that scope.
+  Normal ReadOnly/WorkspaceEdit launches are workspace-fenced, so this also
+  withholds legacy status/log/commit in those defaults; a capability-safe Git
+  executor is still needed to restore the remaining workflow.
+  The same required read scope gates legacy engine discovery, MCP Git, and
+  optional automatic Git metadata; unavailable evidence is not clean state.
+  ACP worker required index-diff capture remains a separate read-confinement
+  gap, not fixed by execution hardening or by substituting an empty diff.
+  Shell execution and other Git operations are not widened.
 - **27.3** — **Loop/dup guard + dead-shell suppression**
   (`newt-core/src/agentic/mod.rs`, `tools.rs`). Track failed `(tool, args)` and
   short-circuit exact repeats with a redirect nudge (mirrors the existing

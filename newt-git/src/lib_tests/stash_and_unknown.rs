@@ -7,7 +7,7 @@ fn stash_push_resets_worktree_and_pop_restores() {
     let dir = repo_with_commit();
     let p = dir.path();
     std::fs::write(p.join("a.txt"), "changed\n").unwrap(); // dirty a tracked file
-    let eng = GitEngine::open(p).unwrap();
+    let eng = GitEngine::open(p, &Scope::All).unwrap();
     let author = Author {
         name: "T".into(),
         email: "t@e.x".into(),

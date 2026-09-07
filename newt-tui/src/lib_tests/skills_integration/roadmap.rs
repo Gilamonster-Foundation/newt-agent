@@ -212,6 +212,21 @@ parent = "pl"
 }
 
 #[test]
+fn roadmap_head_reuses_authorized_snapshot_without_changing_oid_format() {
+    let mut snapshot = newt_git::HeadSnapshot {
+        branch: Some("main".into()),
+        head: Some("abcdef0123456789abcdef0123456789abcdef01".into()),
+    };
+    assert_eq!(
+        crate::roadmap_cmds::git_head_short(Some(&snapshot)).as_deref(),
+        Some("abcdef0")
+    );
+    assert!(crate::roadmap_cmds::git_head_short(None).is_none());
+    snapshot.head = None;
+    assert!(crate::roadmap_cmds::git_head_short(Some(&snapshot)).is_none());
+}
+
+#[test]
 fn render_marks_the_next_ready_node_with_the_cursor() {
     // road (branch, pending) → task-1 (leaf, pending). next_ready_node = task-1.
     let toml = "\

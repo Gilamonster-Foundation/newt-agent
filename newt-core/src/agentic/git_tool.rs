@@ -15,12 +15,39 @@
 use crate::git_caveats::GitCaveats;
 
 /// Operations whose complete filesystem read surface is bounded at the
-/// injected seam. Other observational ops still require Act until their
-/// engine reads receive equivalent scope enforcement.
+/// injected seam. Other ops require unrestricted filesystem reads until
+/// their engine reads receive equivalent scope enforcement, even in Act.
 pub(crate) const SCOPED_READ_OPS: &[&str] = &["branch-list"];
 
 pub(crate) fn is_scoped_read_op(op: &str) -> bool {
     SCOPED_READ_OPS.contains(&op)
+}
+
+fn requires_scoped_ops(read_scope: &crate::caveats::Scope<String>) -> bool {
+    !matches!(read_scope, crate::caveats::Scope::All)
+}
+
+/// Refuse legacy engine reads that cannot honor a bounded filesystem grant.
+/// Git write permission and prompt disposition cannot widen this read scope.
+pub fn check_git_read_scope(
+    op: &str,
+    read_scope: &crate::caveats::Scope<String>,
+) -> Result<(), &'static str> {
+    if requires_scoped_ops(read_scope) && !is_scoped_read_op(op) {
+        Err("Git operation unavailable with scoped fs_read; only branch-list has bounded reads")
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn definition_for_read_scope(
+    read_scope: &crate::caveats::Scope<String>,
+) -> serde_json::Value {
+    if requires_scoped_ops(read_scope) {
+        read_only_definition()
+    } else {
+        git_tool_definition()
+    }
 }
 
 pub(crate) fn read_only_definition() -> serde_json::Value {
@@ -30,7 +57,7 @@ pub(crate) fn read_only_definition() -> serde_json::Value {
          scope=local|remote|all (default all). Remote-tracking refs are local cached data; \
          this does not fetch or count open pull requests. Repository and Git metadata \
          must be within the session's filesystem read grants. Other Git operations \
-         are unavailable for this read-only request."
+         are unavailable under this turn's authority."
     );
     def["function"]["parameters"]["properties"]["op"]["enum"] = serde_json::json!(SCOPED_READ_OPS);
     def["function"]["parameters"]["additionalProperties"] = serde_json::json!(false);
@@ -61,7 +88,7 @@ pub trait GitTool: Send + Sync {
 }
 
 /// The advertised `git` tool definition — pushed into the tool list only when a
-/// [`GitTool`] is injected (`merged_tool_definitions(.., with_git = true)`), so
+/// [`GitTool`] is injected with its filesystem read scope, so
 /// eval / headless / non-repo sessions never see it.
 pub fn git_tool_definition() -> serde_json::Value {
     serde_json::json!({
