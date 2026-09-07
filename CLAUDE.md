@@ -123,6 +123,38 @@ list per new file. Decomposition *adds* lines; only deduplication removes
 them. Split when a file has stopped having one reason to change, and expect
 the line count to go **up** at that step and down at the next one.
 
+### Evidence discipline — a claim names the decision it changes
+
+> Canonical home: `CRAFT-18` (Craft Register v1.2), `steward-charter/docs/CRAFT.md`.
+
+The rules above govern how much *code* a change adds. This governs how much
+*claim* it adds. **A sentence, a table, or a number in a PR body earns its place
+by naming a decision that changes if it is false.** Evidence is carried in
+proportion to how surprising the claim is, and every figure is graded
+**measured** (it was run, the output can be shown), **derived** (it follows from
+something measured, and the step is shown), or **believed** (unverified).
+
+**Why: this repo's doctrine actively selects for the failure.** The acceptance
+contract asks for tables, before-and-after counts, and enumerated negatives —
+and a model will supply the *shape* of that far more cheaply than the substance.
+The measured instance is #2206: a four-line semantic fix (stop counting blank
+lines as production, `saturating_sub` → `checked_sub`, one `#[cfg(test)]`)
+carrying a ~2,000-word body. Its findings were true. Its evidence was **flat** —
+a nine-row index sweep, a four-suite before/after ratchet table, and a paragraph
+justifying the deletion of an env var nothing referenced, all weighted the same
+as its one genuinely surprising result (45 files silently reporting zero test
+lines, because the clamp absorbed the arithmetic error). Uniform density across
+claims of wildly different value buries the finding worth challenging.
+
+**This is not a word budget, and it must not become one.** Compression along no
+seam is worse than length, exactly as it is for files. The fix direction is
+*removing unearned claims*, never *shortening earned ones*: a load-bearing
+justification deleted to hit a budget is a defect wearing the costume of
+concision. Under the arbiter, `CRAFT-18` is a rubric to vote on, not a hook to
+run — no regex judges whether a claim is load-bearing. It is the prose sibling
+of `CRAFT-17`: that law wants a verifier on a production path, this one wants a
+reader, and neither is discharged by writing the evidence down.
+
 ## Content-addressable data structures — the concrete instance of reuse discipline
 
 The rule above says "do not add a second implementation of something that
