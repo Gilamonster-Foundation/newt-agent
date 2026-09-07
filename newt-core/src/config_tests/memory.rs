@@ -27,9 +27,8 @@ fn memory_extract_notes_on_close_defaults_off_and_parses() {
 
 #[test]
 fn memory_disclosure_defaults_to_frozen_and_parses_index() {
-    // INERT BY DEFAULT (#319): the disclosure facet defaults to Frozen —
-    // today's behavior, the memory_fetch tool unwired — and only `index`
-    // opts in to progressive disclosure.
+    // The disclosure facet defaults to Frozen; only `index` replaces note
+    // bodies with an index. Session spill retrieval is independent of this.
     assert_eq!(MemoryConfig::default().disclosure, MemoryDisclosure::Frozen);
     let cfg: MemoryConfig = toml::from_str("provider = \"rolling_window\"").unwrap();
     assert_eq!(cfg.disclosure, MemoryDisclosure::Frozen);

@@ -151,17 +151,15 @@ pub trait MemorySource: Send + Sync {
 /// Both surfaces already exist (the MVP adds no persistence): `note:` reads the
 /// live `NoteStore` entries, `turn:` reads a single past turn by `(conv, seq)`.
 pub struct StoreMemorySource<'a> {
-    notes: &'a crate::notes::NoteStore,
-    store: &'a crate::store::ConversationStore,
-    /// Session spill store for `spill:` re-reads (Step 26.3, #584). `None` when
-    /// the `tool_offload` feature is off / headless — `spill:` then resolves to
-    /// a labelled absence, never a panic.
+    notes: Option<&'a crate::notes::NoteStore>,
+    store: Option<&'a crate::store::ConversationStore>,
+    /// Session spill store for `spill:` re-reads (Step 26.3, #584). An absent
+    /// store or unknown handle resolves to a labelled absence, never a panic.
     spill: Option<&'a dyn super::content_spill::SpillStore>,
     /// Session store for `compaction:` re-reads (#661 group B): the verbatim
     /// (redacted) middle span the compressor evicted, retrievable losslessly.
-    /// A SEPARATE store from `spill` (its own id space). `None` headless / when
-    /// progressive disclosure is off — `compaction:` then resolves to a labelled
-    /// absence.
+    /// A SEPARATE store from `spill` (its own id space). `None` when the caller
+    /// has no compaction store — resolves to a labelled absence.
     compaction: Option<&'a dyn super::content_spill::SpillStore>,
     /// Optional compatibility route for `memory_fetch prompt:<uuid>`. The
     /// always-on `prompt_read` tool remains the primary prompt surface.
@@ -172,6 +170,15 @@ impl<'a> StoreMemorySource<'a> {
     pub fn new(
         notes: &'a crate::notes::NoteStore,
         store: &'a crate::store::ConversationStore,
+    ) -> Self {
+        Self::from_stores(Some(notes), Some(store))
+    }
+
+    /// Persistent memory is optional: frozen notes and ephemeral sessions must
+    /// still be able to attach readers for their live spills and compactions.
+    pub fn from_stores(
+        notes: Option<&'a crate::notes::NoteStore>,
+        store: Option<&'a crate::store::ConversationStore>,
     ) -> Self {
         Self {
             notes,
@@ -272,7 +279,7 @@ fn resolve_content_spill(
 impl MemorySource for StoreMemorySource<'_> {
     fn fetch(&self, addr: &MemAddr) -> anyhow::Result<MemPayload> {
         match addr {
-            MemAddr::Note { id } => match self.notes.body_by_id(id) {
+            MemAddr::Note { id } => match self.notes.and_then(|notes| notes.body_by_id(id)) {
                 Some(body) => Ok(MemPayload::Found(body.to_string())),
                 None => Ok(MemPayload::NotFound {
                     reason: format!(
@@ -284,7 +291,12 @@ impl MemorySource for StoreMemorySource<'_> {
                 // Workspace-fenced + §6-ordered by the store (load_turn joins
                 // on workspace_key and keys on the seq tick; nothing here
                 // re-sorts by clock).
-                match self.store.load_turn(conversation, *seq)? {
+                match self
+                    .store
+                    .map(|store| store.load_turn(conversation, *seq))
+                    .transpose()?
+                    .flatten()
+                {
                     Some(turn) => Ok(MemPayload::Found(render_turn(&turn))),
                     None => Ok(MemPayload::NotFound {
                         reason: format!(

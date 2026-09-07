@@ -260,6 +260,20 @@ fn prompt_read_exact_recovery_is_never_spilled() {
 }
 
 #[test]
+fn memory_fetch_exact_recovery_is_never_spilled() {
+    let store = content_spill::SessionSpillStore::new([7u8; 16]);
+    let padding = "x".repeat(content_spill::TOOL_RESULT_SPILL_CAP);
+    let exact = format!("{padding}\nRECOVERED_MIDDLE_DETAIL\n{padding}");
+    let output = maybe_offload_tool_result("memory_fetch", exact.clone(), true, Some(&store), None);
+    assert!(
+        output.contains("RECOVERED_MIDDLE_DETAIL"),
+        "fetching an offloaded body must recover its middle, not another retrieval marker"
+    );
+    assert_eq!(output, exact);
+    assert_eq!(content_spill::SpillStore::unique_objects(&store), 0);
+}
+
+#[test]
 fn disclosure_chokepoint_redacts_registered_canary_in_every_encoding() {
     // step-6.1a ratchet guard (`disclosure-gate-live-path`): a value registered
     // at session start must not reach the model-facing tool message in ANY

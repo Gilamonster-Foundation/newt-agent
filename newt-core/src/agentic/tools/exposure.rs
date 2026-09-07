@@ -70,6 +70,9 @@ const EXPOSURE_CLASSES: &[(&str, ExposureClass)] = &[
     // Kernel: discovery must always be present so a budget-clipped model can
     // still find what was hidden.
     ("tool_search", ExposureClass::Kernel),
+    // Any tool result can spill, before intent or recent use can promote its
+    // reader. Keep recovery callable whenever its source and authority allow it.
+    ("memory_fetch", ExposureClass::Kernel),
     // Recovery affordances — only meaningful when their artifact/context exists.
     ("resume_context", ExposureClass::RecoveryOnly),
     ("prompt_read", ExposureClass::RecoveryOnly),
@@ -81,7 +84,6 @@ const EXPOSURE_CLASSES: &[(&str, ExposureClass)] = &[
     ("lifecycle", ExposureClass::ByIntent),
     ("save_note", ExposureClass::ByIntent),
     ("recall", ExposureClass::ByIntent),
-    ("memory_fetch", ExposureClass::ByIntent),
     ("git", ExposureClass::ByIntent),
     ("compose_roster", ExposureClass::ByIntent),
     ("crew", ExposureClass::ByIntent),
@@ -512,6 +514,41 @@ mod tests {
         assert!(plan.exposed.contains(&"tool_search".to_string()));
         assert!(plan.hidden.contains(&"git".to_string()));
         assert!(plan.hidden.contains(&"impact".to_string()));
+    }
+
+    #[test]
+    fn memory_fetch_survives_minimal_and_budget_clipped_exposure_when_authorized() {
+        // Any tool result can spill, including on the first turn before this
+        // retrieval tool has entered the sticky active set.
+        let defs = json!([
+            tool("read_file", "kernel"),
+            tool("memory_fetch", "recover offloaded results"),
+            tool("git", "optional"),
+        ]);
+        for (profile, budget) in [
+            (ExposureProfile::Minimal, None),
+            (ExposureProfile::Auto, Some(10)),
+        ] {
+            let settings = ExposureSettings {
+                profile,
+                schema_budget_pct: 1,
+                max_initial_tools: 1,
+            };
+            let out = select_exposed(defs.clone(), &settings, budget, &BTreeSet::new(), est());
+            assert_eq!(
+                out,
+                json!([defs[0], defs[1]]),
+                "recovery must survive both schema and count budgets"
+            );
+
+            // Presence and authority are upstream: exposure must not create
+            // a memory_fetch entry when those gates excluded it.
+            let unavailable = json!([defs[0], defs[2]]);
+            assert_eq!(
+                select_exposed(unavailable, &settings, budget, &BTreeSet::new(), est()),
+                json!([defs[0]])
+            );
+        }
     }
 
     #[test]

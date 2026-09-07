@@ -395,6 +395,17 @@ pub(crate) const TOOL_RESULT_SPILL_CAP: usize = 16_000;
 const HEAD_CHARS: usize = 800;
 const TAIL_CHARS: usize = 800;
 
+/// Shared recovery instructions for tool-output spill markers. Spell out the
+/// callable tool and its JSON parameter rather than an executable-looking URL.
+pub(crate) fn tool_output_retrieval_hint(handle: &str) -> String {
+    let arguments = serde_json::json!({"address": format!("spill:{handle}")});
+    format!(
+        "Call the memory_fetch tool with JSON arguments {arguments} to read the full \
+         (secret-redacted) payload. To search, add \"grep\":\"<pattern>\" to the arguments. \
+         The spill address is local to this session."
+    )
+}
+
 /// The teaser injected in place of an offloaded payload: head + a re-read marker +
 /// tail. Already-redacted input; kept short so it cannot re-overflow. `handle` is the
 /// content CID (`bafyr4i…`) the model pastes back into `memory_fetch`.
@@ -406,10 +417,8 @@ fn head_tail_excerpt(redacted: &str, handle: &str) -> String {
         .iter()
         .skip(total.saturating_sub(TAIL_CHARS))
         .collect();
-    format!(
-        "{head}\n\n[… tool output truncated: {total} chars offloaded. Use \
-         memory_fetch(\"spill:{handle}\") to read the full (secret-redacted) payload …]\n\n{tail}"
-    )
+    let retrieval = tool_output_retrieval_hint(handle);
+    format!("{head}\n\n[… tool output truncated: {total} chars offloaded. {retrieval} …]\n\n{tail}")
 }
 
 /// Offload an oversized tool result (Step 26.3). Returns `result` UNCHANGED when
@@ -811,6 +820,17 @@ mod tests {
         ))
         .unwrap();
         assert!(out.contains(&format!("spill:{}", cid.to_handle())));
+        let arguments = serde_json::json!({"address": format!("spill:{}", cid.to_handle())});
+        assert!(
+            out.contains(&format!(
+                "memory_fetch tool with JSON arguments {arguments}"
+            )),
+            "teaser must name the real tool and its address parameter: {out}"
+        );
+        assert!(
+            !out.contains("memory_fetch("),
+            "teaser must not teach a pseudo-call that can be mistaken for a URL"
+        );
         assert_eq!(store.fetch(&cid).unwrap().redacted_text, big);
     }
 

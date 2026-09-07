@@ -1372,8 +1372,11 @@ mod tests {
     // -----------------------------------------------------------------------
     // #1410 — arbiter registration + the paint gate
     //
-    // These take the `prompt_stdin` serial lane. `Terminal::suspend_for_prompt`
-    // sets a PROCESS-GLOBAL flag, so a window held while the ~15 unserialized
+    // These take both the `prompt_stdin` and `tty_arbiter` serial lanes.
+    // Region-owning tests use the latter: their held rows would make this
+    // Refuse-policy prompt inert rather than suspending the viewport.
+    // `Terminal::suspend_for_prompt` sets a PROCESS-GLOBAL flag, so a window
+    // held while the ~15 unserialized
     // paint tests above run in parallel would make them fail intermittently.
     // That global reach is also exactly why the gate hangs off the per-renderer
     // registration handle rather than reading the flag unconditionally: the
@@ -1387,7 +1390,7 @@ mod tests {
     /// but *nothing* stopped the next paint from putting it straight back —
     /// under the question — and `restore()` would then rewind through the
     /// question to erase it.
-    #[serial_test::serial(prompt_stdin)]
+    #[serial_test::serial(tty_arbiter, prompt_stdin)]
     #[test]
     fn a_registered_viewport_paints_nothing_while_a_prompt_is_up() {
         let writer = SharedWriter::default();
@@ -1404,6 +1407,10 @@ mod tests {
         );
         // The arbiter erased us on the way in; that write is expected.
         let after_erase = writer.0.lock().unwrap().len();
+        assert!(
+            after_erase > before,
+            "the prompt must acquire the terminal and erase the registered frame"
+        );
 
         // Now the two real painters try again, exactly as they would in
         // production: a further tool chunk, and a geometry-driven repaint.
@@ -1428,7 +1435,7 @@ mod tests {
     /// Negative control: the same sequence with NO registration paints happily
     /// over the question. Without this, the test above could pass for the wrong
     /// reason (e.g. the writes were dropped for some unrelated cause).
-    #[serial_test::serial(prompt_stdin)]
+    #[serial_test::serial(tty_arbiter, prompt_stdin)]
     #[test]
     fn an_unregistered_viewport_is_what_the_bug_looked_like() {
         let writer = SharedWriter::default();
@@ -1456,7 +1463,7 @@ mod tests {
     /// `Ephemeral::erase` must be idempotent: the trait doc requires it, and
     /// `Terminal::emit_line` relies on it (it erases every registered ephemeral
     /// with no matching restore, so a second erase must write nothing).
-    #[serial_test::serial(prompt_stdin)]
+    #[serial_test::serial(tty_arbiter, prompt_stdin)]
     #[test]
     fn erase_is_idempotent_and_writes_nothing_when_nothing_is_painted() {
         use newt_core::tty::Ephemeral as _;
@@ -1487,7 +1494,7 @@ mod tests {
 
     /// Dropping the renderer must deregister it, or the arbiter accumulates
     /// dead entries and `suspend_for_prompt` walks them on every prompt.
-    #[serial_test::serial(prompt_stdin)]
+    #[serial_test::serial(tty_arbiter, prompt_stdin)]
     #[test]
     fn dropping_the_renderer_deregisters_it() {
         let writer = SharedWriter::default();

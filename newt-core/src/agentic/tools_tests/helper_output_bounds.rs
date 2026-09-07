@@ -260,8 +260,15 @@ fn shell_envelope_output_spills_full_output_before_head_tail_cap() {
         .and_then(|s| s.split('"').next())
         .expect("teaser names a spill handle");
     let cid = content_spill::SpillCid::parse(handle).expect("handle is a canonical CID");
+    let arguments = serde_json::json!({"address": format!("spill:{handle}")});
     assert!(
-        out.contains("grep=\"<pattern>\""),
+        out.contains(&format!(
+            "memory_fetch tool with JSON arguments {arguments}"
+        )),
+        "retrieval tool and address parameter missing: {out}"
+    );
+    assert!(
+        out.contains("\"grep\":\"<pattern>\""),
         "search affordance missing: {out}"
     );
     let stored = store.fetch(&cid).expect("full output stored").redacted_text;
@@ -276,7 +283,7 @@ fn shell_envelope_output_spills_full_output_before_head_tail_cap() {
         "operator spill lost the raw shell tail: {rendered}"
     );
     assert!(
-        !rendered.contains("memory_fetch(\"spill:"),
+        !rendered.contains("memory_fetch tool"),
         "operator saw the model teaser instead of raw shell output: {rendered}"
     );
 }
