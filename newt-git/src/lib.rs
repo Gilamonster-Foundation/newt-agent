@@ -13,9 +13,10 @@
 //! fail-closed under the OCAP deviation ratchet, riding the SSH transport. We depend
 //! ONLY on the MIT `grit-lib`, never the GPL-2.0 `grit-legacy`.
 
+use newt_core::caveats::{Caveats, Scope};
 use newt_core::git_caveats::GitCaveats;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use grit_lib::diff::{diff_index_to_tree, diff_index_to_worktree, DiffEntry, DiffStatus};
 use grit_lib::index::{entry_from_stat, IndexEntry, MODE_REGULAR};
@@ -1109,7 +1110,12 @@ impl newt_core::agentic::GitTool for LocalGitTool {
         op: &str,
         args: &serde_json::Value,
         caps: &GitCaveats,
+        session: &Caveats,
     ) -> Result<String, String> {
+        if op == "branch-list" && !caps.permits_read() {
+            return Err(GitError::Denied("read").to_string());
+        }
+        let read_scope = canonical_read_scope(session);
         // `init` CREATES a repo, so it runs BEFORE opening one — every other op
         // requires an existing repo (`GitEngine::open` below). It is a write:
         // gate it on the commit/write capability so a read-only session cannot
@@ -1119,14 +1125,34 @@ impl newt_core::agentic::GitTool for LocalGitTool {
             if !caps.permits_commit() {
                 return Err(GitError::Denied("init").to_string());
             }
-            if GitEngine::open(&self.root).is_ok() {
+            checked_git_read(&self.root, &read_scope).map_err(|e| e.to_string())?;
+            // An existing gitfile must not be mistaken for a missing repo
+            // merely because its target is outside the read grant.
+            if checked_optional_git_read(&self.root.join(".git"), &read_scope)
+                .map_err(|e| e.to_string())?
+            {
+                scoped_repository_paths(&self.root, &read_scope).map_err(|e| e.to_string())?;
+                return Ok("git: already a repository here".into());
+            }
+            if scoped_repository_paths(&self.root, &read_scope).is_ok() {
                 return Ok("git: already a repository here".into());
             }
             grit_lib::repo::init_repository(&self.root, false, "main", None, "files")
                 .map_err(|e| format!("init failed: {e}"))?;
             return Ok("initialized empty git repository on branch 'main'".into());
         }
-        let eng = GitEngine::open(&self.root).map_err(|e| e.to_string())?;
+        let (git_dir, common_dir, worktree) =
+            scoped_repository_paths(&self.root, &read_scope).map_err(|e| e.to_string())?;
+        if op == "branch-list" {
+            validate_branch_ref_inputs(&git_dir, &common_dir, &read_scope)
+                .map_err(|e| e.to_string())?;
+            return render_branch_list(&git_dir, args).map_err(|e| e.to_string());
+        }
+        // Explicit open: discovery must not override the injected root through
+        // ambient GIT_DIR / GIT_WORK_TREE after the filesystem scope check.
+        let eng = GitEngine {
+            repo: Repository::open(&git_dir, worktree.as_deref()).map_err(|e| e.to_string())?,
+        };
         let s = |e: GitError| e.to_string();
         match op {
             "status" => Ok(render_status(&eng.status(caps).map_err(s)?)),
@@ -1315,10 +1341,255 @@ impl newt_core::agentic::GitTool for LocalGitTool {
             "stash-drop" => eng.stash_drop(caps, stash_index(args)).map_err(s),
             other => Err(format!(
                 "unknown git op '{other}' (use init|status|log|diff|add|commit|amend|rebase|\
-                 branch|checkout|branch-delete|stash|stash-list|stash-pop|stash-apply|stash-drop)"
+                 branch|branch-list|checkout|branch-delete|stash|stash-list|stash-pop|stash-apply|stash-drop)"
             )),
         }
     }
+}
+
+fn canonical_read_scope(session: &Caveats) -> Scope<String> {
+    match &session.fs_read {
+        Scope::All => Scope::All,
+        Scope::Only(paths) => Scope::only(paths.iter().filter_map(|path| {
+            Path::new(path)
+                .canonicalize()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        })),
+    }
+}
+
+fn checked_git_read(path: &Path, scope: &Scope<String>) -> Result<PathBuf, GitError> {
+    let canonical = path.canonicalize()?;
+    if !newt_core::caveats::permits_path(scope, &canonical.to_string_lossy()) {
+        return Err(GitError::Refused(format!(
+            "capability denied: fs_read for Git path {}",
+            path.display()
+        )));
+    }
+    let metadata = canonical.metadata()?;
+    if !metadata.is_dir() && !metadata.is_file() {
+        return Err(GitError::Unsupported(
+            "non-regular Git input cannot be read",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn checked_optional_git_read(path: &Path, scope: &Scope<String>) -> Result<bool, GitError> {
+    match path.symlink_metadata() {
+        Ok(_) => {
+            checked_git_read(path, scope)?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Discover only inside authorized ancestors, then authorize both the resolved
+/// gitfile target and the shared worktree metadata before any engine read.
+fn scoped_repository_paths(
+    root: &Path,
+    scope: &Scope<String>,
+) -> Result<(PathBuf, PathBuf, Option<PathBuf>), GitError> {
+    let mut current = checked_git_read(root, scope)?;
+    let (git_dir, worktree) = loop {
+        let dot_git = current.join(".git");
+        if checked_optional_git_read(&dot_git, scope)? {
+            break (
+                checked_git_read(&grit_lib::repo::resolve_dot_git(&dot_git)?, scope)?,
+                Some(current),
+            );
+        }
+        if current.join("HEAD").exists() && current.join("objects").is_dir() {
+            break (current, None);
+        }
+        current = checked_git_read(
+            current
+                .parent()
+                .ok_or(GitError::Unsupported("not a Git repository"))?,
+            scope,
+        )?;
+    };
+    if !checked_optional_git_read(&git_dir.join("HEAD"), scope)? {
+        return Err(GitError::Unsupported("Git directory has no HEAD"));
+    }
+    let common_dir = if checked_optional_git_read(&git_dir.join("commondir"), scope)? {
+        checked_git_read(
+            &grit_lib::refs::common_dir(&git_dir)
+                .ok_or(GitError::Unsupported("invalid Git commondir"))?,
+            scope,
+        )?
+    } else {
+        git_dir.clone()
+    };
+    Ok((git_dir, common_dir, worktree))
+}
+
+fn render_branch_list(git_dir: &Path, args: &serde_json::Value) -> Result<String, GitError> {
+    if !args.as_object().is_some_and(|args| {
+        args.keys()
+            .all(|key| matches!(key.as_str(), "op" | "scope"))
+    }) {
+        return Err(GitError::Unsupported(
+            "branch-list accepts only op and scope",
+        ));
+    }
+    let scope = match args.get("scope") {
+        None => "all",
+        Some(serde_json::Value::String(scope))
+            if matches!(scope.as_str(), "local" | "remote" | "all") =>
+        {
+            scope
+        }
+        _ => {
+            return Err(GitError::Unsupported(
+                "branch-list scope must be local, remote, or all",
+            ))
+        }
+    };
+    let mut groups = Vec::new();
+    for (kind, label, prefix) in [
+        ("local", "local branches", "refs/heads/"),
+        ("remote", "cached remote-tracking branches", "refs/remotes/"),
+    ] {
+        if scope != "all" && scope != kind {
+            continue;
+        }
+        let mut names = Vec::new();
+        for (name, _) in grit_lib::refs::list_refs(git_dir, prefix)? {
+            // Packed refs can contain arbitrary names. Validate before the
+            // symbolic lookup turns one into a path, or it contributes a count.
+            if !name.starts_with(prefix)
+                || grit_lib::check_ref_format::check_refname_format(
+                    &name,
+                    &grit_lib::check_ref_format::RefNameOptions::default(),
+                )
+                .is_err()
+            {
+                return Err(GitError::Refused("invalid branch ref name".into()));
+            }
+            if kind != "remote" || grit_lib::refs::read_symbolic_ref(git_dir, &name)?.is_none() {
+                names.push(name);
+            }
+        }
+        groups.push((label, names));
+    }
+    // Put every count first so a long ref list may spill without hiding the
+    // remote/local distinction the operator needs to interpret the answer.
+    let mut out = groups
+        .iter()
+        .map(|(label, names)| format!("{label}: {}", names.len()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push_str("\nRemote-tracking refs are cached locally; no network access. These are branch refs, not open pull requests.\n");
+    for (_, names) in groups {
+        for name in names {
+            out.push_str(&name);
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+/// Grit's files-backed ref reader follows child paths and symbolic targets.
+/// Preflight those inputs before invoking its existing parser/enumerator. This
+/// is canonical containment, not protection against concurrent path replacement
+/// (the existing object-bound filesystem confinement deviation still applies).
+fn validate_branch_ref_inputs(
+    git_dir: &Path,
+    common_dir: &Path,
+    scope: &Scope<String>,
+) -> Result<(), GitError> {
+    // This operation reports the injected repository's physical branches, not
+    // an ambient process namespace. Refuse rather than silently changing the
+    // meaning of its counts, and never mutate process-global environment.
+    if grit_lib::ref_namespace::raw_git_namespace_from_env().is_some() {
+        return Err(GitError::Unsupported(
+            "GIT_NAMESPACE is unsupported for branch-list",
+        ));
+    }
+    for dir in [git_dir, common_dir] {
+        for name in ["config", "commondir", "packed-refs"] {
+            checked_optional_git_read(&dir.join(name), scope)?;
+        }
+        let config = dir.join("config");
+        if config.exists() {
+            // Pure parsing of this authorized file: no global configuration
+            // or include cascade. Handles Git quoting/comments correctly.
+            let parsed = grit_lib::config::ConfigFile::parse(
+                &config,
+                &std::fs::read_to_string(&config)?,
+                grit_lib::config::ConfigScope::Local,
+            )?;
+            if let Some(storage) = parsed.get("extensions.refStorage") {
+                if !storage.eq_ignore_ascii_case("files") {
+                    return Err(GitError::Refused(format!(
+                        "unsupported refStorage={storage} for branch-list"
+                    )));
+                }
+            }
+        }
+    }
+    if common_dir != git_dir && common_dir.join("commondir").exists() {
+        return Err(GitError::Unsupported(
+            "nested Git commondir is unsupported for branch-list",
+        ));
+    }
+    // Reftables have a separate manifest and symbolic-resolution surface. Do
+    // not return zero/incomplete counts when that layout has not been scoped.
+    if grit_lib::reftable::is_reftable_repo(git_dir) {
+        return Err(GitError::Unsupported(
+            "reftable branch-list is not yet supported",
+        ));
+    }
+    for dir in [git_dir, common_dir] {
+        let refs = dir.join("refs");
+        if !checked_optional_git_read(&refs, scope)? {
+            continue;
+        }
+        let mut pending = vec![refs];
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(path) = pending.pop() {
+            let canonical = checked_git_read(&path, scope)?;
+            if path.is_dir() {
+                if !visited.insert(canonical) {
+                    return Err(GitError::Unsupported(
+                        "repeated ref directory is unsupported for branch-list",
+                    ));
+                }
+                for entry in std::fs::read_dir(&path)? {
+                    pending.push(entry?.path());
+                }
+            } else {
+                let target = match grit_lib::refs::read_ref_file(&path) {
+                    Ok(grit_lib::refs::Ref::Symbolic(target)) => target,
+                    // Match the enumerator: an empty lock/invalid non-ref
+                    // contributes no ref, but IO failures still fail closed.
+                    Ok(grit_lib::refs::Ref::Direct(_))
+                    | Err(grit_lib::error::Error::InvalidRef(_)) => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                // All refs/ paths were traversed above/below. Restrict target
+                // resolution to that namespace; root/worktree pseudo-refs and
+                // path-like targets could otherwise select an unchecked file.
+                if !target.starts_with("refs/")
+                    || grit_lib::check_ref_format::check_refname_format(
+                        &target,
+                        &grit_lib::check_ref_format::RefNameOptions::default(),
+                    )
+                    .is_err()
+                {
+                    return Err(GitError::Unsupported("symbolic ref target outside the refs namespace is unsupported for branch-list"));
+                }
+            }
+        }
+        if git_dir == common_dir {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Parse the `plan` array (`[{commit, action, message?}]`) into `RebaseStep`s.

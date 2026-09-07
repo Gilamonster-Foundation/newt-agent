@@ -1841,12 +1841,8 @@ pub(crate) fn tool_presentation(
     }
 
     if name == "run_command" && !routing_disabled() {
-        let command = raw_args
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
         if let super::routing::RouteDecision::Route { tool, args } =
-            super::routing::RouteTable::builtin().classify(command)
+            super::routing::RouteTable::builtin().classify_call(raw_args)
         {
             let detail = tool_call_detail(tool, &args, workspace);
             return (tool.to_string(), detail);
@@ -2339,11 +2335,43 @@ async fn execute_tool_inner(
         disposition
     };
 
+    // Preserve the raw call for the absolute deny-list below. A narrowly
+    // understood branch-list shell reach may use the embedded read capability
+    // without advertising or granting shell execution. Do not discard cwd or
+    // unknown argument semantics during this rewrite.
+    let (raw_name, raw_args) = (name, args);
+    let routed_read =
+        if disposition != PromptDisposition::Act && name == "run_command" && !routing_disabled() {
+            match super::routing::RouteTable::builtin().classify_call(args) {
+                super::routing::RouteDecision::Route { tool: "git", args }
+                    if args
+                        .get("op")
+                        .and_then(|op| op.as_str())
+                        .is_some_and(super::git_tool::is_scoped_read_op) =>
+                {
+                    Some(args)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+    let (name, args) = routed_read
+        .as_ref()
+        .map_or((name, args), |args| ("git", args));
+
     // Prompt-comprehension boundary: enforce the validated disposition BEFORE
     // every other routing or grant path. In particular, unknown names (including
     // generic `server__tool` MCP calls) fail closed under a non-Act disposition;
     // there is no safe way to infer a remote tool's authority from its name.
-    if !tool_allowed(disposition, name) {
+    if !tool_allowed(disposition, name)
+        || (name == "git"
+            && disposition != PromptDisposition::Act
+            && !args
+                .get("op")
+                .and_then(|op| op.as_str())
+                .is_some_and(super::git_tool::is_scoped_read_op))
+    {
         let msg = disposition_tool_denied_message(disposition, name);
         return msg;
     }
@@ -2367,7 +2395,7 @@ async fn execute_tool_inner(
     // name + args (pre-rewrite) so a shell alias or a routed command can't slip
     // past — and only the exec TARGET is matched, so the same words quoted in a
     // coach's question or a runbook note are untouched.
-    if let Some(denied) = super::deny::deny_check(name, args) {
+    if let Some(denied) = super::deny::deny_check(raw_name, raw_args) {
         return denied.reason;
     }
 
@@ -2491,7 +2519,7 @@ async fn execute_tool_inner(
     let routed: Option<(&'static str, serde_json::Value)> =
         if name == "run_command" && !routing_disabled() {
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            let decision = super::routing::RouteTable::builtin().classify(command);
+            let decision = super::routing::RouteTable::builtin().classify_call(args);
             // §4.4: log every silent rewrite (the original command + the
             // governed built-in it routed to). `None` ⇒ nothing was rewritten.
             if let Some(line) = super::routing::audit_line(command, &decision) {
@@ -2806,7 +2834,7 @@ async fn execute_tool_inner(
                         return refusal;
                     }
                 }
-                let mut out = match tool.dispatch(op, args, &gc) {
+                let mut out = match tool.dispatch(op, args, &gc, caveats) {
                     Ok(rendered) => rendered,
                     // Denials + engine errors surface verbatim so the model
                     // sees WHY (e.g. "denied: commit" on a read-only session).
@@ -2824,7 +2852,7 @@ async fn execute_tool_inner(
                         .as_deref_mut()
                         .is_some_and(|gate| git_gate_allows(gate, op));
                     if granted {
-                        out = match tool.dispatch(op, args, &crate::git_caveats::GitCaveats::top())
+                        out = match tool.dispatch(op, args, &crate::git_caveats::GitCaveats::top(), caveats)
                         {
                             Ok(rendered) => rendered,
                             Err(e) => format!("error: {e}"),

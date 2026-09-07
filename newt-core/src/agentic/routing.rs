@@ -94,11 +94,9 @@ const SHELL_ROUTES: &[ShellRoute] = &[
 /// These map one-to-one onto the embedded git tool's read ops
 /// (`status`/`log`/`diff`). State-modifying subcommands (`add`, `stash`,
 /// `checkout`, `reset`, `commit`, `push`, `amend`, `rebase`, `branch-delete`,
-/// …) are **NOT** here: they GATE as exec (owner decision 2). `show` and a
-/// bare `branch` (list) are read-only too, but the embedded git tool has no
-/// read-only op for them yet, so routing them would surface a misleading op
-/// error — they gate for now and join this set as a one-line data edit once
-/// the git tool grows the matching read ops (follow-up).
+/// …) are **NOT** here: they GATE as exec (owner decision 2). `show` has no
+/// embedded read op yet. `branch` mixes reads and mutations, so it uses the
+/// exact argument translation in [`branch_list_route`] instead of this set.
 const GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &["status", "log", "diff"];
 
 /// Shell control / redirection / substitution metacharacters. A command
@@ -134,6 +132,28 @@ impl RouteTable {
         }
     }
 
+    /// Classify a complete call without discarding argument semantics on the
+    /// newly scoped Git read route. Other routes retain their existing policy.
+    #[must_use]
+    pub(crate) fn classify_call(&self, call: &Value) -> RouteDecision {
+        let decision = self.classify(call.get("command").and_then(Value::as_str).unwrap_or(""));
+        let scoped_git_read = matches!(
+            &decision,
+            RouteDecision::Route { tool: "git", args }
+                if args.get("op").and_then(Value::as_str)
+                    .is_some_and(super::git_tool::is_scoped_read_op)
+        );
+        if scoped_git_read
+            && !call
+                .as_object()
+                .is_some_and(|args| args.keys().all(|key| key == "command"))
+        {
+            RouteDecision::Exec
+        } else {
+            decision
+        }
+    }
+
     /// Classify a `run_command` shell-command string. **Pure** — no fs, no env,
     /// no I/O — so it is a direct table lookup (TDD: data-driven decision).
     #[must_use]
@@ -156,7 +176,11 @@ impl RouteTable {
         // DATA). A read-only subcommand routes to the embedded git tool's read
         // path; a state-modifying / unknown / absent subcommand GATES as exec.
         if program == "git" {
-            return match tokens.next() {
+            let sub = tokens.next();
+            if sub == Some("branch") {
+                return branch_list_route(&tokens.collect::<Vec<_>>());
+            }
+            return match sub {
                 Some(sub) if self.git_read_only.contains(&sub) => RouteDecision::Route {
                     tool: "git",
                     args: json!({ "op": sub }),
@@ -171,6 +195,24 @@ impl RouteTable {
         };
         let rest: Vec<&str> = tokens.collect();
         build_shell_route(route.tool, &rest)
+    }
+}
+
+/// Only list shapes whose namespace the embedded operation can preserve.
+/// Never drop a branch operand, mutation flag, or unsupported result filter.
+fn branch_list_route(rest: &[&str]) -> RouteDecision {
+    let scope = match rest {
+        [] | ["--list"] => "local",
+        [flag] | ["--list", flag] | [flag, "--list"] => match *flag {
+            "-a" | "--all" => "all",
+            "-r" | "--remotes" => "remote",
+            _ => return RouteDecision::Exec,
+        },
+        _ => return RouteDecision::Exec,
+    };
+    RouteDecision::Route {
+        tool: "git",
+        args: json!({ "op": "branch-list", "scope": scope }),
     }
 }
 
@@ -376,6 +418,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn branch_listing_routes_preserve_the_requested_namespace() {
+        for (cmd, scope) in [
+            ("git branch", "local"),
+            ("git branch --list", "local"),
+            ("git branch -a", "all"),
+            ("git branch --all", "all"),
+            ("git branch --list --all", "all"),
+            ("git branch -a --list", "all"),
+            ("git branch -r", "remote"),
+            ("git branch --remotes", "remote"),
+            ("git branch --list -r", "remote"),
+            ("git branch --remotes --list", "remote"),
+        ] {
+            assert_eq!(
+                classify(cmd),
+                RouteDecision::Route {
+                    tool: "git",
+                    args: json!({ "op": "branch-list", "scope": scope }),
+                },
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_listing_call_routes_preserve_argument_semantics() {
+        let table = RouteTable::builtin();
+        for command in ["git branch", "git branch --all", "git branch --remotes"] {
+            assert_eq!(
+                table.classify_call(&json!({"command": command})),
+                classify(command)
+            );
+            for extra in [json!({"cwd": "elsewhere"}), json!({"timeout": 5})] {
+                let mut call = extra;
+                call["command"] = json!(command);
+                assert_eq!(table.classify_call(&call), RouteDecision::Exec, "{call}");
+            }
+        }
+        // This repair does not alter the existing routes' argument policy.
+        for command in ["git status", "cat file", "ls"] {
+            assert_eq!(
+                table.classify_call(&json!({"command": command, "cwd": "elsewhere"})),
+                classify(command)
+            );
+        }
+    }
+
+    #[test]
+    fn branch_mutations_and_unrepresented_filters_never_become_listing() {
+        for cmd in [
+            "git branch topic",
+            "git branch topic HEAD",
+            "git branch -d topic",
+            "git branch -D topic",
+            "git branch -m old new",
+            "git branch -M topic",
+            "git branch -c old new",
+            "git branch -C topic",
+            "git branch --set-upstream-to=origin/main",
+            "git branch --unset-upstream",
+            "git branch --track topic origin/main",
+            "git branch --edit-description",
+            "git branch --list topic",
+            "git branch --list 'feat/*'",
+            "git branch --merged",
+            "git branch --no-merged main",
+            "git branch --contains HEAD",
+            "git branch --format=%(refname)",
+            "git branch --sort=-committerdate",
+            "git branch --show-current",
+            "git branch --unknown",
+            "git branch -a -r",
+            "git branch -ar",
+            "git -C other branch",
+            "git --git-dir=other branch",
+            "git branch -a | wc -l",
+            "git branch -a > branches.txt",
+            "git branch --all && git branch topic",
+        ] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
     /// TDD: state-modifying git is GATED as exec — NOT silently routed (owner
     /// decision 2). Revert the gate (route every git) and this is red.
     #[test]
@@ -391,7 +517,7 @@ mod tests {
             // read-only but not yet built-in-served (follow-up) → gate, not a
             // misleading routed op error.
             "git show HEAD",
-            "git branch",
+            "git branch topic",
             // a bare / unknown git reach gates.
             "git",
             "git frobnicate",

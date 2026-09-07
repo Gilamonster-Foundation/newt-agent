@@ -5,7 +5,12 @@ fn local_git_tool_log_lists_commits() {
     let dir = repo_with_commit();
     let t = tool(dir.path());
     let out = t
-        .dispatch("log", &serde_json::json!({"limit": 5}), &GitCaveats::top())
+        .dispatch(
+            "log",
+            &serde_json::json!({"limit": 5}),
+            &GitCaveats::top(),
+            &newt_core::caveats::Caveats::top(),
+        )
         .unwrap();
     assert!(out.contains("first commit"), "got: {out}");
 }
@@ -19,6 +24,7 @@ fn local_git_tool_add_then_commit_succeeds_when_permitted() {
             "add",
             &serde_json::json!({"paths": ["b.txt"]}),
             &GitCaveats::top(),
+            &newt_core::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(staged.contains("b.txt"), "got: {staged}");
@@ -27,6 +33,7 @@ fn local_git_tool_add_then_commit_succeeds_when_permitted() {
             "commit",
             &serde_json::json!({"message": "add b"}),
             &GitCaveats::top(),
+            &newt_core::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(committed.starts_with("committed "), "got: {committed}");
@@ -41,12 +48,14 @@ fn local_git_tool_amend_rewords_head_without_adding_a_commit() {
         "add",
         &serde_json::json!({"paths": ["d.txt"]}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     t.dispatch(
         "commit",
         &serde_json::json!({"message": "add d"}),
         &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
     )
     .unwrap();
     let count_before = commit_count(dir.path());
@@ -57,6 +66,7 @@ fn local_git_tool_amend_rewords_head_without_adding_a_commit() {
             "amend",
             &serde_json::json!({"message": "add d (reworded)"}),
             &GitCaveats::top(),
+            &newt_core::caveats::Caveats::top(),
         )
         .unwrap();
     assert!(out.starts_with("amended "), "got: {out}");
@@ -75,8 +85,13 @@ fn local_git_tool_amend_keeps_message_when_omitted() {
     let dir = repo_with_commit();
     let t = tool(dir.path());
     // Amend with no message → keep "first commit".
-    t.dispatch("amend", &serde_json::json!({}), &GitCaveats::top())
-        .unwrap();
+    t.dispatch(
+        "amend",
+        &serde_json::json!({}),
+        &GitCaveats::top(),
+        &newt_core::caveats::Caveats::top(),
+    )
+    .unwrap();
     assert!(head_message(dir.path()).contains("first commit"));
 }
 #[test]
@@ -88,6 +103,7 @@ fn local_git_tool_amend_denied_on_read_only() {
             "amend",
             &serde_json::json!({"message": "x"}),
             &GitCaveats::read_only(),
+            &newt_core::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(
@@ -105,6 +121,7 @@ fn local_git_tool_commit_denied_on_read_only_caveats() {
             "commit",
             &serde_json::json!({"message": "nope"}),
             &GitCaveats::read_only(),
+            &newt_core::caveats::Caveats::top(),
         )
         .unwrap_err();
     assert!(
@@ -113,6 +130,11 @@ fn local_git_tool_commit_denied_on_read_only_caveats() {
     );
     // …but a read op is allowed under the same caveats.
     assert!(t
-        .dispatch("status", &serde_json::json!({}), &GitCaveats::read_only())
+        .dispatch(
+            "status",
+            &serde_json::json!({}),
+            &GitCaveats::read_only(),
+            &newt_core::caveats::Caveats::top()
+        )
         .is_ok());
 }

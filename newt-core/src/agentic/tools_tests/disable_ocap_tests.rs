@@ -1031,6 +1031,7 @@ impl crate::agentic::GitTool for RoutingStubGit {
         op: &str,
         _args: &serde_json::Value,
         _caps: &crate::git_caveats::GitCaveats,
+        _session: &Caveats,
     ) -> Result<String, String> {
         match op {
             "status" => Ok("on branch main (routed via git built-in)".to_string()),

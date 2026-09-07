@@ -355,6 +355,15 @@ fn write_tools_not_read_only() {
 #[test]
 fn read_only_call_classifies_simple_shell_probes() {
     assert!(is_read_only_call(
+        "git",
+        &serde_json::json!({"op": "branch-list"})
+    ));
+    assert!(!is_read_only_call(
+        "git",
+        &serde_json::json!({"op": "branch", "name": "new"})
+    ));
+    assert!(!is_read_only_call("git", &serde_json::json!({})));
+    assert!(is_read_only_call(
         "run_command",
         &serde_json::json!({"command": "grep -n 'help_lines' newt-tui/src/lib.rs"})
     ));

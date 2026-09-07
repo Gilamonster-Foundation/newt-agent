@@ -12,9 +12,11 @@ impl crate::agentic::GitTool for StubGit {
         op: &str,
         _args: &serde_json::Value,
         caps: &crate::git_caveats::GitCaveats,
+        _session: &Caveats,
     ) -> Result<String, String> {
         match op {
             "status" => Ok("on branch main (HEAD abc123)".to_string()),
+            "branch-list" => Ok("local branches: 1\nrefs/heads/main".to_string()),
             "commit" if !caps.permits_commit() => {
                 Err("capability denied: git commit not permitted".to_string())
             }
@@ -25,6 +27,150 @@ impl crate::agentic::GitTool for StubGit {
             "branch-delete" => Ok("deleted branch feature".to_string()),
             other => Err(format!("unknown git op '{other}'")),
         }
+    }
+}
+
+#[tokio::test]
+async fn read_only_git_dispatch_accepts_reads_without_granting_writes() {
+    // Share the routing-switch tests' lock and restore every override. This
+    // fixture requires routing enabled with OCAP enforcement still on.
+    let _lock = super::disable_ocap_tests::env_lock().await;
+    let _routing = super::disable_ocap_tests::EnvVar::set("NEWT_NO_ROUTE", "0");
+    let _ocap = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
+    let imperative = crate::agentic::PromptIntake::analyze(
+        "please count the branches in this repo (newt-agent repo)",
+    );
+    assert_eq!(imperative.disposition(), PromptDisposition::Act);
+    let question = crate::agentic::PromptIntake::analyze(
+        "Can you tell me how many branches are open in this repo?",
+    );
+    assert_eq!(question.disposition(), PromptDisposition::Explain);
+    let ws = tempfile::tempdir().unwrap();
+    let caveats = Caveats {
+        fs_read: Scope::only([ws.path().to_string_lossy().into_owned()]),
+        fs_write: Scope::none(),
+        exec: Scope::none(),
+        net: Scope::none(),
+        ..Caveats::top()
+    };
+    for disposition in [
+        imperative.disposition(),
+        question.disposition(),
+        PromptDisposition::Research,
+        PromptDisposition::Plan,
+    ] {
+        for (name, args, accepted) in [
+            ("git", serde_json::json!({"op": "branch-list"}), true),
+            (
+                "git",
+                serde_json::json!({"op": "status"}),
+                disposition == PromptDisposition::Act,
+            ),
+            (
+                "git",
+                serde_json::json!({"op": "branch", "name": "created"}),
+                false,
+            ),
+            (
+                "git",
+                serde_json::json!({"op": "commit", "message": "unexpected"}),
+                false,
+            ),
+            (
+                "git",
+                serde_json::json!({"op": "branch-delete", "name": "main"}),
+                false,
+            ),
+            ("git", serde_json::json!({"op": "fetch"}), false),
+            ("git", serde_json::json!({}), false),
+            (
+                "run_command",
+                serde_json::json!({"command": "git branch --all"}),
+                true,
+            ),
+            (
+                "run_command",
+                serde_json::json!({"command": "git branch --all", "cwd": "elsewhere"}),
+                false,
+            ),
+            (
+                "run_command",
+                serde_json::json!({"command": "git branch created"}),
+                false,
+            ),
+        ] {
+            if name == "run_command" {
+                let (presented_name, _) = tool_presentation(name, &args, ws.path());
+                assert_eq!(
+                    presented_name,
+                    if accepted { "git" } else { "run_command" },
+                    "presentation must not discard argument semantics: {args}"
+                );
+            }
+            let mut gate = MockGate::new(true, &caveats);
+            let out = execute_tool_with_collaborators(
+                name,
+                &args,
+                &ws.path().to_string_lossy(),
+                false,
+                20,
+                &caveats,
+                &mut NoMcp,
+                ToolCollaborators {
+                    git_tool: Some(&StubGit),
+                    permission_gate: if disposition == PromptDisposition::Act {
+                        None
+                    } else {
+                        Some(&mut gate)
+                    },
+                    ..Default::default()
+                },
+                false,
+                disposition,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                out.contains("local branches: 1") || out.contains("on branch main"),
+                accepted,
+                "{disposition:?} {name} {args}: {out}"
+            );
+            if !accepted && disposition != PromptDisposition::Act {
+                assert!(
+                    out.contains("not available for this request"),
+                    "must reject before dispatch: {out}"
+                );
+            }
+            assert!(
+                gate.asks.is_empty(),
+                "read-only calls never request an authority grant"
+            );
+        }
+        let allow = vec!["read_file".to_owned()];
+        let out = execute_tool_with_collaborators(
+            "run_command",
+            &serde_json::json!({"command": "git branch"}),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            ToolCollaborators {
+                git_tool: Some(&StubGit),
+                persona_tools: Some(&allow),
+                ..Default::default()
+            },
+            false,
+            disposition,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.contains("persona") && !out.contains("local branches: 1"),
+            "{out}"
+        );
     }
 }
 

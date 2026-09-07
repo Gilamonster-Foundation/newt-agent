@@ -4462,6 +4462,11 @@ fn is_read_only_tool(name: &str) -> bool {
 
 fn is_read_only_call(name: &str, args: &serde_json::Value) -> bool {
     is_read_only_tool(name)
+        || (name == "git"
+            && args
+                .get("op")
+                .and_then(|op| op.as_str())
+                .is_some_and(git_tool::is_scoped_read_op))
         || (name == "run_command"
             && args
                 .get("command")

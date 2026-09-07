@@ -14,13 +14,40 @@
 
 use crate::git_caveats::GitCaveats;
 
+/// Operations whose complete filesystem read surface is bounded at the
+/// injected seam. Other observational ops still require Act until their
+/// engine reads receive equivalent scope enforcement.
+pub(crate) const SCOPED_READ_OPS: &[&str] = &["branch-list"];
+
+pub(crate) fn is_scoped_read_op(op: &str) -> bool {
+    SCOPED_READ_OPS.contains(&op)
+}
+
+pub(crate) fn read_only_definition() -> serde_json::Value {
+    let mut def = git_tool_definition();
+    def["function"]["description"] = serde_json::json!(
+        "List and count local and cached remote-tracking branches with op=branch-list. \
+         scope=local|remote|all (default all). Remote-tracking refs are local cached data; \
+         this does not fetch or count open pull requests. Repository and Git metadata \
+         must be within the session's filesystem read grants. Other Git operations \
+         are unavailable for this read-only request."
+    );
+    def["function"]["parameters"]["properties"]["op"]["enum"] = serde_json::json!(SCOPED_READ_OPS);
+    def["function"]["parameters"]["additionalProperties"] = serde_json::json!(false);
+    if let Some(properties) = def["function"]["parameters"]["properties"].as_object_mut() {
+        properties.retain(|name, _| matches!(name.as_str(), "op" | "scope"));
+    }
+    def
+}
+
 /// The injected git capability. Object-safe and shareable (the loop holds
 /// `&dyn GitTool`; `Send + Sync` because the borrow lives across `.await`
 /// points, exactly like [`RecallSource`](super::recall::RecallSource)).
 ///
 /// `op` is one of `status` | `log` | `diff` | `add` | `commit` | `branch`;
 /// `args` is the tool-call argument object. The implementation enforces
-/// `caveats` (fail-closed) and returns either a rendered, model-readable result
+/// both the Git operation caveats and the required session filesystem caveats
+/// (fail-closed), and returns either a rendered, model-readable result
 /// string (`Ok`) or an error string the tool layer surfaces verbatim (`Err`) —
 /// including capability denials, so the model can see *why* a write was refused.
 pub trait GitTool: Send + Sync {
@@ -29,6 +56,7 @@ pub trait GitTool: Send + Sync {
         op: &str,
         args: &serde_json::Value,
         caveats: &GitCaveats,
+        session: &crate::caveats::Caveats,
     ) -> Result<String, String>;
 }
 
@@ -41,10 +69,11 @@ pub fn git_tool_definition() -> serde_json::Value {
         "function": {
             "name": "git",
             "description": "Run a git operation through the embedded engine \
-                            (NOT run_command; this is always available — do not \
+                            (NOT run_command; use this advertised tool — do not \
                             look for a separate git tool). Local-only: initialize \
                             a repo here with init (when the workspace is not yet a \
-                            git repo), read status/log/diff, stage with add, \
+                            git repo), read status/log/diff, list and count branches \
+                            (branch-list; local and cached remote-tracking refs), stage with add, \
                             commit, amend the last commit, create a branch \
                             (branch), switch to / create-and-switch a branch \
                             (checkout), delete a branch (branch-delete), and \
@@ -58,8 +87,13 @@ pub fn git_tool_definition() -> serde_json::Value {
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["init", "status", "log", "diff", "add", "commit", "amend", "branch", "rebase", "checkout", "branch-delete", "stash", "stash-list", "stash-pop", "stash-apply", "stash-drop"],
+                        "enum": ["init", "status", "log", "diff", "add", "commit", "amend", "branch", "branch-list", "rebase", "checkout", "branch-delete", "stash", "stash-list", "stash-pop", "stash-apply", "stash-drop"],
                         "description": "The git operation to run."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["local", "remote", "all"],
+                        "description": "For op=branch-list: local branches, cached remote-tracking branches, or both (default all). Excludes symbolic remote aliases; no network access."
                     },
                     "index": {
                         "type": "integer",

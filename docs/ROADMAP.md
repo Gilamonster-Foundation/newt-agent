@@ -1516,11 +1516,14 @@ fully-mocked unit tier, coverage ratchet.
   tool + signature; a genuinely-unknown name returns the real tool catalog plus
   a nearest-name (Levenshtein) suggestion instead of a dead-end "unknown tool".
   `ALL_TOOL_NAMES` becomes the single source of truth for `is_hallucination`.
-- **27.2** — **`git checkout` (create+switch) + `branch-delete`; drop net ops**
+- **27.2** — **Embedded Git repairs: checkout, branch-delete, scoped branch listing**
   (`newt-git/src/lib.rs`, `newt-core/src/agentic/git_tool.rs`). Implement the
   advertised-but-missing ops the model reaches for; remove `pull`/`fetch`/`push`
   from the schema (newt is local-only); fix the "unknown git op" help to list
-  the ops actually supported.
+  the ops actually supported. The read-only repair adds a distinct `branch-list`
+  operation for local and cached remote-tracking counts, gated by repository
+  and Git metadata filesystem grants. Explain/Research/Plan expose only this
+  bounded operation; shell execution and other Git operations are not widened.
 - **27.3** — **Loop/dup guard + dead-shell suppression**
   (`newt-core/src/agentic/mod.rs`, `tools.rs`). Track failed `(tool, args)` and
   short-circuit exact repeats with a redirect nudge (mirrors the existing

@@ -476,6 +476,9 @@ fn common_read_only_tool_allowed(name: &str) -> bool {
         name,
         // Workspace / prompt / artifact recovery.
         "read_file"
+                // Only argument-checked, filesystem-scoped read ops survive
+                // advertisement and dispatch; never the full Git surface.
+                | "git"
                 | "list_dir"
                 | "find"
                 | "prompt_read"
@@ -536,6 +539,13 @@ pub fn filter_tools_for_disposition(
     serde_json::Value::Array(
         arr.into_iter()
             .filter(|def| tool_def_name(def).is_some_and(|name| tool_allowed(disposition, name)))
+            .map(|def| {
+                if tool_def_name(&def) == Some("git") {
+                    super::super::git_tool::read_only_definition()
+                } else {
+                    def
+                }
+            })
             .collect(),
     )
 }

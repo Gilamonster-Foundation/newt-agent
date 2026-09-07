@@ -42,7 +42,12 @@ fn stash_is_a_known_op_and_write_gated() {
     let p = dir.path();
     let t = tool(p);
     let out = t
-        .dispatch("stash-list", &serde_json::json!({}), &GitCaveats::top())
+        .dispatch(
+            "stash-list",
+            &serde_json::json!({}),
+            &GitCaveats::top(),
+            &newt_core::caveats::Caveats::top(),
+        )
         .unwrap();
     assert!(
         !out.contains("unknown git op"),
@@ -51,7 +56,12 @@ fn stash_is_a_known_op_and_write_gated() {
     // Push is a write → denied under read-only caps (fail-closed like commit).
     std::fs::write(p.join("a.txt"), "dirty\n").unwrap();
     let err = t
-        .dispatch("stash", &serde_json::json!({}), &GitCaveats::read_only())
+        .dispatch(
+            "stash",
+            &serde_json::json!({}),
+            &GitCaveats::read_only(),
+            &newt_core::caveats::Caveats::top(),
+        )
         .unwrap_err();
     assert!(
         err.contains("not permitted"),
