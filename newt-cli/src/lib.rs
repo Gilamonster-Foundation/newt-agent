@@ -2443,18 +2443,16 @@ mod tests {
     #[test]
     fn abs_grant_path_expands_tilde_and_absolutises() {
         use std::path::Path;
-        // A leading ~ expands to the home dir. Use a platform-absolute HOME so
-        // the expansion is itself absolute on both Unix and Windows (a bare
-        // `/home/u` is NOT absolute on Windows, where it would be re-based).
-        let home = if cfg!(windows) {
-            r"C:\home\u"
-        } else {
-            "/home/u"
-        };
-        std::env::set_var("HOME", home);
+        let original_home = std::env::var_os("HOME");
+        // Exercise the process's real home without mutating HOME: other
+        // parallel tests launch subprocesses and resolve configuration from it.
+        // join also handles a relative home or the no-home tilde fallback.
+        let expected_home = std::env::current_dir()
+            .unwrap()
+            .join(home_dir().unwrap_or_else(|| PathBuf::from("~")));
         assert_eq!(
             abs_grant_path(Path::new("~/.newt")),
-            PathBuf::from(home).join(".newt")
+            expected_home.join(".newt")
         );
         // An already-absolute path is unchanged.
         let abs = if cfg!(windows) {
@@ -2467,6 +2465,11 @@ mod tests {
         let rel = abs_grant_path(Path::new("sub/file"));
         assert!(rel.is_absolute(), "relative grant absolutised: {rel:?}");
         assert!(rel.ends_with("sub/file"));
+        assert_eq!(
+            std::env::var_os("HOME"),
+            original_home,
+            "grant-path fixtures must not change the environment seen by parallel tests"
+        );
     }
 
     #[test]
