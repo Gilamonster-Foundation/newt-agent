@@ -38,6 +38,8 @@ fn session_artifact_store_rebinds_when_conversation_rotates() {
     assert_ne!(ledger.conversation_id(), first_id);
 }
 
+/// Real repository reads ground the workspace formatter's distinction between
+/// an unavailable optional snapshot and the native tool's bounded authority.
 #[test]
 fn git_head_snapshot_requires_effective_workspace_read_authority() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -61,15 +63,47 @@ fn git_head_snapshot_requires_effective_workspace_read_authority() {
     // A real repository grounds the optional-metadata policy: passing the
     // workspace path check is not authority for legacy discovery/config reads.
     assert!(git_head_snapshot(Some(&tool), &newt_core::Caveats::top()).is_some());
-    denied.fs_read = newt_core::Scope::only([tmp.path().to_string_lossy().into_owned()]);
-    assert!(git_head_snapshot(Some(&tool), &denied).is_none());
     let workspace = tmp.path().to_str().unwrap();
-    let unavailable = workspace_state_block(workspace, &denied.fs_read);
-    assert!(unavailable.contains("git: unavailable"));
+    let mut read_only = read_only_caveats(workspace);
+    newt_core::caveats::lock_fs_to_workspace(&mut read_only, workspace, &[], &[]);
+    assert_eq!(read_only.fs_write, newt_core::Scope::none());
+    assert_eq!(read_only.exec, newt_core::Scope::none());
+    assert_eq!(read_only.net, newt_core::Scope::none());
+    assert!(git_head_snapshot(Some(&tool), &read_only).is_none());
+    assert_eq!(
+        newt_core::git_hardening::metadata_git(
+            tmp.path(),
+            &["status", "--porcelain=v1"],
+            &read_only.fs_read,
+        )
+        .unwrap_err()
+        .kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "optional metadata must not bypass bounded reads"
+    );
+    let branches = newt_core::agentic::GitTool::dispatch(
+        &tool,
+        "branch-list",
+        &serde_json::json!({"scope": "all"}),
+        &newt_core::git_caveats::GitCaveats::from_session(&read_only),
+        &read_only,
+    )
+    .expect("native branch-list works with the same bounded read-only capability");
+    assert!(branches.contains("local branches: 0"), "{branches}");
+    assert!(
+        branches.contains("cached remote-tracking branches: 0"),
+        "{branches}"
+    );
+    let unavailable = workspace_state_block(workspace, &read_only.fs_read);
+    assert!(
+        unavailable.contains("automatic git metadata: unavailable"),
+        "{unavailable}"
+    );
+    assert!(!unavailable.contains("git: unavailable"), "{unavailable}");
     assert!(!unavailable.contains("local changes: clean"));
     assert!(!unavailable.contains("Recent commits:"));
     assert_eq!(
-        lightweight_git_meta(workspace, &denied.fs_read),
+        lightweight_git_meta(workspace, &read_only.fs_read),
         (None, None)
     );
     let control = workspace_state_block(workspace, &newt_core::Scope::All);

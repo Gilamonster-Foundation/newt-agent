@@ -95,7 +95,8 @@ pub(crate) fn format_workspace_state_block(state: &WorkspaceStateSnapshot) -> St
         lines.push("branch: detached or unknown".to_string());
     } else {
         lines.push(
-            "git: unavailable (read authority, repository, or command unavailable)".to_string(),
+            "automatic git metadata: unavailable; consult the current tool catalog for available operations"
+                .to_string(),
         );
     }
 
@@ -138,6 +139,25 @@ pub(crate) fn format_workspace_state_block(state: &WorkspaceStateSnapshot) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_optional_metadata_defers_tool_availability_to_the_catalog() {
+        let block = format_workspace_state_block(&WorkspaceStateSnapshot {
+            timestamp: "2026-07-16T00:00:00Z".into(),
+            branch: None,
+            dirty_files: Vec::new(),
+            git_status_available: false,
+        });
+
+        assert!(
+            block.contains("automatic git metadata: unavailable"),
+            "{block}"
+        );
+        assert!(!block.contains("git: unavailable"), "{block}");
+        assert!(block.contains("tool catalog"), "{block}");
+        assert!(block.contains("dirty files: unknown"), "{block}");
+        assert!(!block.contains("local changes: clean"), "{block}");
+    }
 
     #[test]
     fn dirty_file_overflow_is_reported_without_listing_every_file() {
