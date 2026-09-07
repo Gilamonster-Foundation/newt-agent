@@ -1449,6 +1449,8 @@ impl RichSurface {
                 // render as a permanent "ghost" line. Clearing first means only
                 // blank rows get scrolled up, so the region grows in place.
                 terminal.clear()?;
+                // Release the old region before the replacement requests rows.
+                drop(terminal);
                 terminal = make_terminal(want)?;
                 terminal.clear()?;
                 cur_h = want;

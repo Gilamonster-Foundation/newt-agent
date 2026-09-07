@@ -23,6 +23,23 @@
 
 use std::os::unix::io::{FromRawFd, RawFd};
 
+/// The semantic terminal settings, without `termios`' platform-specific padding.
+///
+/// Comparing these initialized fields (rather than bytes of a C struct) proves
+/// exact restoration, including settings an operator deliberately customized.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TermiosSnapshot {
+    pub input_flags: libc::tcflag_t,
+    pub output_flags: libc::tcflag_t,
+    pub control_flags: libc::tcflag_t,
+    pub local_flags: libc::tcflag_t,
+    pub control_chars: [libc::cc_t; libc::NCCS],
+    pub input_speed: libc::speed_t,
+    pub output_speed: libc::speed_t,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub line_discipline: libc::cc_t,
+}
+
 /// A pty pair: we hold the master and read what the terminal was shown, while
 /// a child process runs against the slave believing it owns a real terminal.
 pub struct Pty {
@@ -210,6 +227,40 @@ impl Pty {
         wait_for_bytes(&self.drained, 0, needle, timeout)
     }
 
+    /// Wait for `needle` strictly after `after`, preserving the whole buffer.
+    ///
+    /// Fixture synchronization, not a terminal-state change. An old prompt
+    /// cannot satisfy a post-answer readiness check, and neither marker is lost
+    /// when both arrive in one drain or a marker spans several drains. Like
+    /// [`Pty::wait_for_screen`], this peeks: do not concurrently take `screen()`.
+    pub fn wait_for_screen_after(
+        &self,
+        after: &str,
+        needle: &str,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let started = std::time::Instant::now();
+        if !self.wait_for_screen(after, timeout) {
+            return false;
+        }
+        let from = {
+            let buf = self
+                .drained
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            String::from_utf8_lossy(&buf)
+                .find(after)
+                .expect("the marker remains buffered until screen() takes it")
+                + after.len()
+        };
+        wait_for_bytes(
+            &self.drained,
+            from,
+            needle,
+            timeout.saturating_sub(started.elapsed()),
+        )
+    }
+
     /// Everything the child wrote, waiting for the pty to reach EOF first.
     ///
     /// **This is the exact replacement for the sleep, and it is not a longer
@@ -313,22 +364,69 @@ impl Pty {
         assert_eq!(rc, 0, "TIOCSWINSZ (pty resize) failed");
     }
 
-    /// Is the pty currently in RAW mode?
+    /// Are canonical input or echo currently disabled?
     ///
-    /// The strongest postcondition a terminal-restoration test can assert
-    /// (#1677). Line-discipline settings belong to the pty *device*, not to a
+    /// Line-discipline settings belong to the pty *device*, not to a
     /// particular file descriptor, so a `tcgetattr` on the parent's own slave
     /// fd observes the state the CHILD installed with `enable_raw_mode()`.
     /// That makes this KERNEL state — not an inference from escape bytes the
     /// child may have emitted, buffered, or never flushed.
     ///
-    /// Raw here means what crossterm's `enable_raw_mode` does: canonical mode
-    /// and echo off. Cooked (restored) is both back on.
+    /// This is deliberately a narrow raw-input predicate, NOT proof of full
+    /// restoration: signals, newline translation and output processing can
+    /// still be disabled when canonical input and echo are both enabled.
+    /// Compare [`Pty::termios_snapshot`] before/after for that stronger claim.
     pub fn is_raw(&self) -> bool {
+        let t = self.termios_snapshot();
+        (t.local_flags & libc::ICANON) == 0 || (t.local_flags & libc::ECHO) == 0
+    }
+
+    /// Read all semantic terminal settings from the parent's retained slave.
+    /// Sample before [`Pty::screen_to_eof`], which closes that descriptor.
+    pub fn termios_snapshot(&self) -> TermiosSnapshot {
         let mut t: libc::termios = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::tcgetattr(self.slave, &mut t) };
         assert_eq!(rc, 0, "tcgetattr on the pty slave failed");
-        (t.c_lflag & libc::ICANON) == 0 || (t.c_lflag & libc::ECHO) == 0
+        TermiosSnapshot {
+            input_flags: t.c_iflag,
+            output_flags: t.c_oflag,
+            control_flags: t.c_cflag,
+            local_flags: t.c_lflag,
+            control_chars: t.c_cc,
+            input_speed: unsafe { libc::cfgetispeed(&t) },
+            output_speed: unsafe { libc::cfgetospeed(&t) },
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            line_discipline: t.c_line,
+        }
+    }
+
+    /// Seed a test's explicit baseline, or restore a previously read snapshot.
+    /// This changes only this owned PTY, never the test runner's terminal.
+    pub fn set_termios_snapshot(&self, snapshot: &TermiosSnapshot) {
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::tcgetattr(self.slave, &mut t) }, 0);
+        t.c_iflag = snapshot.input_flags;
+        t.c_oflag = snapshot.output_flags;
+        t.c_cflag = snapshot.control_flags;
+        t.c_lflag = snapshot.local_flags;
+        t.c_cc = snapshot.control_chars;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            t.c_line = snapshot.line_discipline;
+        }
+        assert_eq!(
+            unsafe { libc::cfsetispeed(&mut t, snapshot.input_speed) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::cfsetospeed(&mut t, snapshot.output_speed) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::tcsetattr(self.slave, libc::TCSANOW, &t) },
+            0,
+            "tcsetattr on the pty slave failed"
+        );
     }
 
     /// A fresh duplicate of the slave as a `Stdio`, for handing to a child.
@@ -544,7 +642,90 @@ pub fn screen_grid(screen: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
     use std::time::{Duration, Instant};
+
+    /// Grounds the CLI's post-answer synchronization in real PTY drains:
+    /// peeking must retain markers that arrive together, not discard readiness.
+    #[test]
+    fn wait_for_screen_after_keeps_same_chunk_readiness() {
+        let pty = Pty::open();
+        let bytes = b"READY before ANSWER then READY";
+        assert_eq!(
+            unsafe { libc::write(pty.slave, bytes.as_ptr().cast(), bytes.len()) },
+            bytes.len() as isize
+        );
+        assert!(pty.wait_for_screen_after("ANSWER", "READY", Duration::from_secs(2)));
+        assert_eq!(pty.screen(), String::from_utf8_lossy(bytes));
+    }
+
+    /// An earlier prompt is not fresh readiness, even when the answer and
+    /// subsequent prompt each span separate, observed kernel drains.
+    #[test]
+    fn wait_for_screen_after_ignores_old_markers_and_keeps_split_markers() {
+        let pty = Pty::open();
+        for bytes in [b"READY before ANS".as_slice(), b"WER then REA"] {
+            assert_eq!(
+                unsafe { libc::write(pty.slave, bytes.as_ptr().cast(), bytes.len()) },
+                bytes.len() as isize
+            );
+            assert!(
+                pty.wait_for_screen(std::str::from_utf8(bytes).unwrap(), Duration::from_secs(2))
+            );
+        }
+        assert!(pty.wait_for_screen("ANSWER", Duration::from_secs(2)));
+        assert!(!pty.wait_for_screen_after("ANSWER", "READY", Duration::from_millis(20)));
+        let tail = b"DY";
+        assert_eq!(
+            unsafe { libc::write(pty.slave, tail.as_ptr().cast(), tail.len()) },
+            tail.len() as isize
+        );
+        assert!(pty.wait_for_screen_after("ANSWER", "READY", Duration::from_secs(2)));
+        assert_eq!(pty.screen(), "READY before ANSWER then READY");
+    }
+
+    /// Grounds restoration assertions in real kernel state: the old mocked
+    /// canonical/echo postcondition misses this partially restored terminal.
+    #[test]
+    fn termios_snapshot_detects_partial_restore_that_is_raw_misses() {
+        let pty = Pty::open();
+        let mut baseline = pty.termios_snapshot();
+        baseline.local_flags |= libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN;
+        baseline.input_flags |= libc::ICRNL;
+        baseline.output_flags |= libc::OPOST;
+        pty.set_termios_snapshot(&baseline);
+        assert_eq!(pty.termios_snapshot(), baseline);
+
+        let mut partial = baseline.clone();
+        partial.local_flags &= !(libc::ISIG | libc::IEXTEN);
+        partial.input_flags &= !libc::ICRNL;
+        partial.output_flags &= !libc::OPOST;
+        pty.set_termios_snapshot(&partial);
+        assert!(!pty.is_raw(), "canonical input and echo are still enabled");
+        assert_ne!(pty.termios_snapshot(), baseline);
+        assert_eq!(pty.termios_snapshot(), partial);
+    }
+
+    /// Grounds exact-save/restore guard tests: restoring defaults is wrong
+    /// when the real terminal started with customized flags or keys. Speeds
+    /// remain observed values: on Linux they are also encoded in c_cflag.
+    #[test]
+    fn termios_snapshot_round_trip_preserves_nondefault_settings() {
+        let pty = Pty::open();
+        let original = pty.termios_snapshot();
+        let mut custom = original.clone();
+        custom.input_flags ^= libc::IXON;
+        custom.output_flags ^= libc::OPOST;
+        custom.local_flags ^= libc::IEXTEN;
+        custom.control_chars[libc::VERASE] = 8;
+        pty.set_termios_snapshot(&custom);
+        assert_eq!(pty.termios_snapshot(), custom);
+        assert_ne!(custom, original);
+        pty.set_termios_snapshot(&original);
+        assert_eq!(pty.termios_snapshot(), original);
+        pty.set_termios_snapshot(&custom);
+        assert_eq!(pty.termios_snapshot(), custom);
+    }
 
     /// Wait for a child, or give up. Deliberately not `child.wait()`: the
     /// defect under test is a child that never exits, and a test that hangs
@@ -561,6 +742,18 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         None
+    }
+
+    /// A test-owned child must be reaped even if an assertion or EOF check
+    /// unwinds before the parent releases its stdin barrier.
+    struct ChildGuard(std::process::Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     /// **A child may write more than the pty buffer holds before anyone
@@ -622,21 +815,31 @@ mod tests {
     #[test]
     fn screen_returns_only_what_has_not_been_returned_before() {
         let pty = Pty::open();
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("printf FIRST; sleep 0.4; printf SECOND")
-            .stdout(pty.slave_stdio())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn the writer");
+        let mut child = ChildGuard(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("printf FIRST; IFS= read -r task_release || exit 0; printf SECOND")
+                .stdin(std::process::Stdio::piped())
+                .stdout(pty.slave_stdio())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the writer"),
+        );
 
-        // Long enough for FIRST to land and short enough to precede SECOND.
-        std::thread::sleep(Duration::from_millis(200));
+        // SECOND cannot exist until this parent releases the stdin barrier.
+        assert!(pty.wait_for_screen("FIRST", Duration::from_secs(10)));
         let first = pty.screen();
         assert!(first.contains("FIRST"), "first read: {first:?}");
         assert!(!first.contains("SECOND"), "read the future: {first:?}");
 
-        assert!(wait(&mut child, Duration::from_secs(10)).is_some());
+        child
+            .0
+            .stdin
+            .take()
+            .expect("piped release barrier")
+            .write_all(b"continue\n")
+            .expect("release SECOND");
+        assert!(wait(&mut child.0, Duration::from_secs(10)).is_some_and(|s| s.success()));
         let second = pty.screen_to_eof();
         assert!(second.contains("SECOND"), "second read: {second:?}");
         assert!(
@@ -689,20 +892,31 @@ mod tests {
     #[test]
     fn wait_for_screen_waits_for_late_output_without_consuming_it() {
         let pty = Pty::open();
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("printf EARLY; sleep 0.5; printf THE-MARKER")
-            .stdout(pty.slave_stdio())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn the writer");
+        let mut child = ChildGuard(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("printf EARLY; IFS= read -r task_release || exit 0; printf THE-MARKER")
+                .stdin(std::process::Stdio::piped())
+                .stdout(pty.slave_stdio())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the writer"),
+        );
 
-        // Not there yet: proves the wait below is doing the waiting, rather
-        // than the marker having arrived before we looked.
+        // The child has emitted EARLY, but cannot emit THE-MARKER while its
+        // stdin barrier is held. No scheduling delay can reverse that order.
+        assert!(pty.wait_for_screen("EARLY", Duration::from_secs(10)));
         assert!(
             !pty.wait_for_screen("THE-MARKER", Duration::from_millis(50)),
             "the marker cannot already be on screen"
         );
+        child
+            .0
+            .stdin
+            .take()
+            .expect("piped release barrier")
+            .write_all(b"continue\n")
+            .expect("release THE-MARKER");
         assert!(
             pty.wait_for_screen("THE-MARKER", Duration::from_secs(10)),
             "the marker never arrived"
@@ -714,7 +928,7 @@ mod tests {
         assert!(screen.contains("THE-MARKER"), "waiting ate it: {screen:?}");
         assert!(screen.contains("EARLY"), "waiting ate the head: {screen:?}");
 
-        assert!(wait(&mut child, Duration::from_secs(10)).is_some());
+        assert!(wait(&mut child.0, Duration::from_secs(10)).is_some_and(|s| s.success()));
     }
 
     /// **An unrelated child must not hold this pty open** (#2086 CI).
@@ -738,43 +952,53 @@ mod tests {
     #[test]
     fn an_unrelated_childs_inherited_descriptors_do_not_block_eof() {
         let pty = Pty::open();
-        let mut writer = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("printf DONE-WRITING")
-            .stdout(pty.slave_stdio())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn the writer");
+        let mut writer = ChildGuard(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("printf DONE-WRITING")
+                .stdout(pty.slave_stdio())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the writer"),
+        );
 
         // An interloper with NOTHING to do with this pty, alive across the
-        // read below — the shape of any sibling test's child.
-        let mut interloper = std::process::Command::new("sleep")
-            .arg("30")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn the interloper");
+        // read below: only the parent can release its stdin barrier. Unlike
+        // a sleep, it cannot end by itself while a slow runner reaches EOF.
+        let mut interloper = ChildGuard(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("IFS= read -r task_release || exit 0")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the interloper"),
+        );
 
         assert!(
-            wait(&mut writer, Duration::from_secs(10)).is_some_and(|s| s.success()),
+            wait(&mut writer.0, Duration::from_secs(10)).is_some_and(|s| s.success()),
             "the writer never finished"
         );
 
-        let started = std::time::Instant::now();
+        assert!(interloper.0.try_wait().unwrap().is_none());
         let screen = pty.screen_to_eof();
-        let _ = interloper.kill();
-        let _ = interloper.wait();
+        assert!(
+            interloper.0.try_wait().unwrap().is_none(),
+            "EOF must not depend on the unrelated child exiting"
+        );
+        interloper
+            .0
+            .stdin
+            .take()
+            .expect("piped release barrier")
+            .write_all(b"continue\n")
+            .expect("release the interloper");
+        assert!(wait(&mut interloper.0, Duration::from_secs(10)).is_some_and(|s| s.success()));
 
         assert!(
             screen.contains("DONE-WRITING"),
             "the writer's bytes must survive: {screen:?}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "EOF was blocked by an unrelated child holding an inherited slave \
-             descriptor — took {:?}",
-            started.elapsed()
         );
     }
 

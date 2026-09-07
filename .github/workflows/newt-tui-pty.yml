@@ -36,6 +36,8 @@ on:
       - "newt-tui/src/prompt_visibility_test.rs"
       - "newt-tui/src/cockpit/**"
       - "newt-tui/src/rich_input.rs"
+      - "newt-tui/src/rich_input/**"
+      - "newt-cli/tests/terminal_exit_pty.rs"
       - "newt-tui/src/transcript_pager.rs"
       - "newt-tui/src/transcript_pager_pty_test.rs"
       - "newt-tui/src/permissions.rs"
@@ -128,6 +130,11 @@ jobs:
         run: |
           cargo test -p newt-tui --features rich-tui cockpit:: \
             -- --test-threads=1
+
+      - name: Run CLI exit and editor-resize real-PTY tests
+        run: |
+          cargo test -p newt-agent --test terminal_exit_pty -- --test-threads=1
+          cargo test -p newt-agent --no-default-features --test terminal_exit_pty -- --test-threads=1
 
       - name: Run prompt control-key real-PTY tests
         run: |
