@@ -125,14 +125,22 @@ the line count to go **up** at that step and down at the next one.
 
 ### Evidence discipline — a claim names the decision it changes
 
-> Canonical home: `CRAFT-18` (Craft Register v1.2), `steward-charter/docs/CRAFT.md`.
+> Canonical home: `CRAFT-18` (Craft Register v2.0), `steward-charter/docs/CRAFT.md`.
 
 The rules above govern how much *code* a change adds. This governs how much
 *claim* it adds. **A sentence, a table, or a number in a PR body earns its place
 by naming a decision that changes if it is false.** Evidence is carried in
 proportion to how surprising the claim is, and every figure is graded
-**measured** (it was run, the output can be shown), **derived** (it follows from
-something measured, and the step is shown), or **believed** (unverified).
+**measured** (it was run, and its output **is shown** — the command and what it
+printed, not a description of them), **derived** (it follows from something
+measured, and the step is shown), or **believed** (unverified). A figure whose
+output is merely *producible* is `believed` until it is produced.
+
+**The narrowing in v2.0 was paid for here.** #2208 — the PR that added this very
+section — published a grep, its result, and the phrase "verified before writing"
+in one pass with none of it run. The printed command did not execute and the
+real output contradicted the claim. A reread caught it; nothing else could,
+because no gate reads a PR body.
 
 **Why: this repo's doctrine actively selects for the failure.** The acceptance
 contract asks for tables, before-and-after counts, and enumerated negatives —
