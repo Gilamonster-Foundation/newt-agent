@@ -376,21 +376,26 @@ mod tests {
         );
     }
 
-    /// The single-owner ratchet, over every owned output and every consuming
-    /// site. `include_str!` is compile-time, so this stays inside the
-    /// fully-mocked unit tier — no filesystem at run time.
+    /// Every site [`no_other_module_hand_writes_the_disposition_vocabulary`]
+    /// scans, **validated on the way out** (#2191).
     ///
-    /// Four sites once carried their own copy of this vocabulary. The count
-    /// may only go DOWN, and a site that reconstructs any owned sentence by
-    /// hand — a card line, a refusal, the scope note, the next-turn sentence,
-    /// or a shared clause — fails here.
-    #[test]
-    fn no_other_module_hand_writes_the_disposition_vocabulary() {
+    /// That guard is a NEGATIVE assertion — `!source.contains(sentence)` — and
+    /// a negative assertion fails OPEN against haystack loss: a source that
+    /// contributes nothing satisfies it trivially. The owned sentences were
+    /// already floored (`assert!(!text.is_empty())`); the haystacks were not.
+    /// Measured rather than theorised — the control is in the #2191 thread.
+    ///
+    /// Modelled on `newt-tui`'s `production_source`: the check lives at the one
+    /// place every consumer goes through, so a future consumer cannot forget to
+    /// write it. It deliberately does NOT borrow that helper's literal-marker
+    /// cut — that is the ceiling #2202 is about, and this guard scans whole
+    /// files rather than production halves, so it has no reason to inherit it.
+    fn scanned_sites() -> [(&'static str, &'static str); 12] {
         // `prompt_intake.rs` was split into `prompt_intake_tests/` (#2189 lane).
         // EVERY child is listed: this is a NEGATIVE assertion over the included
         // text, so a file that stops being scanned stops being checked without
         // ever going red — the vacuous-negative shape of #2150.
-        const OTHER_SITES: [(&str, &str); 12] = [
+        const SITES: [(&str, &str); 12] = [
             ("prompt_intake.rs", include_str!("prompt_intake.rs")),
             (
                 "prompt_intake_tests/atomic_ask.rs",
@@ -428,6 +433,105 @@ mod tests {
             ("tools/catalog.rs", include_str!("tools/catalog.rs")),
             ("operating_mode.rs", include_str!("operating_mode.rs")),
         ];
+
+        // FLOOR 1 — PER ENTRY, never aggregate. An aggregate byte count would
+        // let a 73 kB `tools/catalog.rs` mask an emptied 2 kB family file. The
+        // per-file rows in `content_addressable_ratchet.rs` exist for exactly
+        // this reason: "the aggregate alone would net to zero and report
+        // success while the rule was being broken".
+        //
+        // The floor is "any text at all", NOT a byte count, and that is a
+        // deliberate departure from `progress_sink.rs`'s `> 1_000`. Its three
+        // subjects are whole driver modules; these twelve are not comparable.
+        // The smallest legitimate member here is 2,294 bytes today, but a
+        // one-test family file is half that and the decomposition lane keeps
+        // producing smaller ones — a floor that tracks how big these files
+        // happen to be must be revised every time one is split, and a floor
+        // revised under time pressure is the one that gets lowered. This floor
+        // is chosen for what makes `!contains` vacuous instead.
+        for (name, source) in SITES {
+            assert!(
+                !source.trim().is_empty(),
+                "{name} scanned as empty — a negative assertion over it would \
+                 pass having read nothing"
+            );
+        }
+
+        // FLOOR 2 — on the SET, which is the failure this guard actually had.
+        //
+        // #2190: `prompt_intake.rs` became eight children while this list still
+        // named four sites, and the privacy clause pasted VERBATIM into a
+        // relocated child passed. No per-entry check can see a site that is not
+        // in the list, so completeness is DERIVED rather than pinned by hand:
+        // every `#[path = "…"]` module a scanned source declares must itself be
+        // scanned. Split a file into more children and forget this list, and
+        // the guard fails instead of quietly narrowing.
+        //
+        // Applied to EVERY scanned source, not only module roots. A source
+        // declaring no out-of-line module contributes nothing here, which is
+        // correct — `tool_search.rs`, `tools/catalog.rs` and `operating_mode.rs`
+        // declare none today. Restricting the check to `*/mod.rs` would have
+        // missed `prompt_intake.rs`'s own declaration of the module root, and
+        // that row going missing is the same defect one level up.
+        let mut declarations = 0usize;
+        for (name, source) in SITES {
+            // `#[path]` on an out-of-line module resolves against the directory
+            // holding the declaring file, which is what these names are
+            // relative to.
+            let dir = name.rsplit_once('/').map_or("", |(parent, _)| parent);
+            for rest in source.split("#[path = \"").skip(1) {
+                let declared = rest
+                    .split('"')
+                    .next()
+                    .expect("a `#[path = \"…\"]` attribute closes its quote");
+                declarations += 1;
+                let expected = if dir.is_empty() {
+                    declared.to_string()
+                } else {
+                    format!("{dir}/{declared}")
+                };
+                assert!(
+                    SITES.iter().any(|(listed, _)| *listed == expected),
+                    "{name} declares module `{declared}`, but {expected} is not \
+                     scanned. A site that is not listed is a site this guard \
+                     does not check — ADD the row; never drop one to make this \
+                     pass."
+                );
+            }
+        }
+
+        // The parse is itself a predicate over a set, so it gets the same
+        // treatment this whole guard is about. If rustfmt ever respelled the
+        // attribute (`#[path="x.rs"]`, no spaces), every split above would
+        // yield nothing and the loop would pass having found nothing — this
+        // issue's own defect, reappearing inside the fix for it. Eight
+        // declarations are parsed today; the floor is that SOMETHING is.
+        assert!(
+            declarations > 0,
+            "no `#[path = \"…\"]` declaration parsed out of any scanned source, \
+             so the completeness check above read nothing. The attribute's \
+             exact spelling is load-bearing here."
+        );
+
+        // What this does NOT cover, stated so it is not read as more than it
+        // is: dropping a row for a file that is not a module root — say
+        // `tool_search.rs` — is still caught only in review. Nothing available
+        // at compile time enumerates "every file that could hand-write this
+        // vocabulary". Floor 2 covers the SPLIT case, which is the one that
+        // actually failed.
+        SITES
+    }
+
+    /// The single-owner ratchet, over every owned output and every consuming
+    /// site. `include_str!` is compile-time, so this stays inside the
+    /// fully-mocked unit tier — no filesystem at run time.
+    ///
+    /// Four sites once carried their own copy of this vocabulary. The count
+    /// may only go DOWN, and a site that reconstructs any owned sentence by
+    /// hand — a card line, a refusal, the scope note, the next-turn sentence,
+    /// or a shared clause — fails here.
+    #[test]
+    fn no_other_module_hand_writes_the_disposition_vocabulary() {
         let voices = DispositionVoices::default();
         let mut owned: Vec<(String, String)> = Vec::new();
         for disposition in EVERY_DISPOSITION {
@@ -457,7 +561,7 @@ mod tests {
         owned.push(("refusal clause".into(), voices.denied_privacy.clone()));
         owned.push(("discovery scope".into(), voices.discovery_scope.clone()));
         owned.push(("next-turn scope".into(), voices.next_turn_scope.clone()));
-        for (name, source) in OTHER_SITES {
+        for (name, source) in scanned_sites() {
             for (what, text) in &owned {
                 assert!(!text.is_empty(), "{what} is empty");
                 assert!(
