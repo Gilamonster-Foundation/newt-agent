@@ -1,5 +1,32 @@
 use super::{default_summarizer_choice, SummarizerChoice};
 
+#[cfg(feature = "embedded")]
+#[tokio::test]
+async fn embedded_summarizer_honors_configured_zero_timeout_before_loading() {
+    let dir = tempfile::tempdir().unwrap();
+    let gguf = dir.path().join("fixture.gguf");
+    std::fs::write(&gguf, b"not model weights").unwrap();
+    std::fs::write(dir.path().join("tokenizer.json"), b"{}").unwrap();
+    let cfg = newt_core::SummarizerConfig {
+        timeout_secs: 0,
+        ..Default::default()
+    };
+    let opts = super::summarizer_opts(&cfg, &newt_core::Config::default(), None, false);
+    let summarize = super::make_loop_summarizer(
+        String::new(),
+        "qwen2.5-0.5b".into(),
+        newt_core::BackendKind::Embedded,
+        None,
+        Some(gguf.to_string_lossy().into_owned()),
+        opts,
+    );
+    let error = summarize("summarize this".into()).await.unwrap_err();
+    assert!(
+        error.to_string().contains("deadline"),
+        "configured timeout was ignored: {error:#}"
+    );
+}
+
 #[test]
 fn summarizer_defaults_to_embedded_never_the_session_model() {
     // REGRESSION GUARD (#661 / feedback_summarizer_defaults_to_embedded_cpu):
