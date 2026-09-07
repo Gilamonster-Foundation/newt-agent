@@ -207,6 +207,43 @@ mod tests {
     use super::*;
     use crate::{Health, PoolBackend, StaticSource};
 
+    #[tokio::test]
+    async fn cancelled_permit_owner_releases_its_slot_immediately() {
+        use std::future::Future as _;
+        use std::task::{Context, Poll, Waker};
+
+        for slots in [1, 3] {
+            let runtime = BackendRuntime::new(slots);
+            // Model N pending inferences holding the real runtime's permits.
+            let mut owners: Vec<_> = (0..slots)
+                .map(|_| {
+                    Box::pin(async {
+                        let _permit = runtime.acquire().await.unwrap();
+                        std::future::pending::<()>().await;
+                    })
+                })
+                .collect();
+            let mut queued = Box::pin(runtime.acquire());
+            let mut cx = Context::from_waker(Waker::noop());
+            for owner in &mut owners {
+                assert!(owner.as_mut().poll(&mut cx).is_pending());
+            }
+            assert!(
+                queued.as_mut().poll(&mut cx).is_pending(),
+                "N live owners must retain all N slots"
+            );
+
+            drop(owners.pop());
+            assert!(
+                matches!(queued.as_mut().poll(&mut cx), Poll::Ready(Ok(_))),
+                "cancellation must release the slot before the very next poll"
+            );
+            assert_eq!(runtime.permits.available_permits(), 1);
+            drop(owners);
+            assert_eq!(runtime.permits.available_permits(), slots);
+        }
+    }
+
     fn be(name: &str, model: &str, health: Health) -> PoolBackend {
         PoolBackend::new(name, format!("http://{name}:11434"), BackendKind::Ollama)
             .with_models([model])

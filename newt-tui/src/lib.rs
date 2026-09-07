@@ -2023,7 +2023,7 @@ impl Default for SummarizerOpts {
 }
 
 /// Live summarizer-progress notices (Step 24.7, #559). The summarizer runs
-/// under the `compressing context…` spinner, so each notice has to scroll into
+/// under the `summarizing context…` spinner, so each notice has to scroll into
 /// history *without* destroying the row the spinner is redrawing.
 ///
 /// These are the pure text builders; [`summarizer_notice`] wraps one in a
@@ -2167,7 +2167,7 @@ async fn summarize_one_model(
     for attempt in 0..=opts.retries {
         if attempt > 0 {
             // Step 24.7 (#559): surface the retry live (scrolls above the
-            // `compressing context…` spinner) so the recovery is honest.
+            // `summarizing context…` spinner) so the recovery is honest.
             summarizer_notice(retry_progress_msg(attempt + 1, opts.retries + 1)).emit(
                 opts.caps,
                 newt_core::tty::Sink::Stdout,
@@ -8261,15 +8261,33 @@ fn build_session_summarizer(
         inf_key,
         embedded_summarizer_default(),
     );
-    make_loop_summarizer(
-        url,
-        model,
-        kind,
-        key,
-        model_path,
-        summarizer_opts(sum_cfg, cfg, num_ctx, color),
-    )
+    let opts = summarizer_opts(sum_cfg, cfg, num_ctx, color);
+    let caps = opts.caps;
+    let summarizer = make_loop_summarizer(url, model, kind, key, model_path, opts);
+    with_summary_progress(summarizer, caps, color)
 }
+
+/// One progress row covers warmup, retries, fallback, and embedded inference.
+/// The shared spinner releases it when the summary finishes or is cancelled.
+fn with_summary_progress(
+    summarizer: newt_core::Summarizer,
+    caps: newt_core::tty::LineCaps,
+    color: bool,
+) -> newt_core::Summarizer {
+    Box::new(move |prompt| {
+        Box::pin(newt_core::tty::with_spinner(
+            caps,
+            "summarizing context…",
+            newt_core::tty::Sink::Stdout,
+            color,
+            summarizer(prompt),
+        ))
+    })
+}
+
+#[cfg(test)]
+#[path = "lib_tests/compaction_progress_tests.rs"]
+mod compaction_progress_tests;
 
 /// Build the decision adjudicator (#1749).
 ///
