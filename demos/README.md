@@ -18,6 +18,16 @@ the shell, then reopen `/settings` and inspect Audit for its settings receipt.
 Audit is a snapshot taken when the shell opens; the write happens after the
 shell closes. Leaving a section alone returns to the index.
 
+Include mode, action-pressure nudges, and tool-round limits through
+`/settings mode`, `/settings nudge`, and `/settings rounds`. Record the starting
+mode and restore it after the comparison; toggle nudges off and back on. Set a
+round limit, then use `auto` to release that override. Inspect the resolved state
+after each change; selecting a mode or toggling nudges is not a reset to config.
+
+Also demonstrate the Settings-to-Backends door: opening the backend chooser
+can apply pending Session changes. Cancelling that chooser does not undo those
+already applied changes. Reopen Settings and inspect the values and Audit.
+
 The deep-link form, such as `/settings prompt`, reaches the same setting; it is
 not an independent preference. A session override, a receipt, and a saved
 configuration are different things. Do not infer persistence across restarts
@@ -67,17 +77,25 @@ display name.
 
 Use newly named disposable personas in this save walkthrough. After saving,
 reload the file and check the persona's prose, tool list, skills, and caveats
-as well as the edited dials. The saver preserves parsed metadata and prose,
-not the original TOML comments or formatting. An unavailable persona refuses
-saving instead of replacing a profile whose restrictions are unknown.
+as well as the full projected posture. `:w` and `:wq` snapshot personality,
+cognition, tenacity, backend, and crew, including inherited values and existing
+session overrides even when those rows were untouched. The saver preserves
+other parsed metadata and prose, not the original TOML comments or formatting.
+An unavailable persona refuses saving instead of replacing a profile whose
+restrictions are unknown.
 
 The five personality rows control agreeableness, extraversion, warmth,
 approachability, and prosocial behavior. Start with `steady`, `direct`, or
 `sociable`; compare an explicit zero with `auto` inheritance. The recording
-must include save/reload/reselection and show that editing style retains the
-persona's other fields and restrictions. Switch tabs to check isolation, then
-clear the persona and inspect the new conversation's empty persona selection
-and released session style overrides.
+must distinguish applying only edited personality axes from saving the full
+projected posture. Include save/reload/reselection with unrelated session dials
+already set: verify those projected values are saved while prose and non-panel
+metadata, including restrictions, remain intact. Switch tabs to check isolation,
+then clear the persona and inspect the new conversation's empty persona
+selection and released session style overrides.
+
+Use ordinary persistence in the disposable configuration for the tab and restart
+checks: `--ephemeral` deliberately disables tabs and cannot prove this workflow.
 
 Read more: [personality controls](../docs/guide/personality.md),
 [role profiles](../docs/design/role-profiles.md), and

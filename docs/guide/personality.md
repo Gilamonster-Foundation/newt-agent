@@ -21,9 +21,10 @@ An omitted value is unspecified, not an implicit midpoint.
 
 Every setting remains civil and honest. Agreeableness is not factual agreement,
 and warmth is not flattery. Extraversion does not authorize unsolicited actions.
-These controls do not change OCAP grants, tool restrictions, model routing,
-cognition, or tenacity. Tenacity governs how the agent approaches completing
-work; personality governs its communication style.
+Applying edits to only the five personality rows does not change OCAP grants,
+tool restrictions, model routing, cognition, or tenacity. Tenacity governs how
+the agent approaches completing work; personality governs its communication
+style. Selecting or saving a whole persona is a separate operation.
 
 ## Edit, apply, cancel, save
 
@@ -43,11 +44,18 @@ retains those overrides; `auto` allows the new persona to supply that trait.
 Starting a new conversation resets the tab's unsaved overrides. Named persona
 files survive restarts; unsaved session edits do not.
 
-Saving retains the selected profile's prose and parsed metadata, including its
-tools, skills, and caveats. It does not preserve the original TOML comments or
-formatting. A failed save leaves the draft open; it must not be reported as an
-applied setting. An unavailable profile cannot safely be reconstructed from a
-display name alone.
+Saving with `:w` or `:wq` snapshots the panel's full projected posture, not only
+the edited style axes: personality, cognition, tenacity, backend, and crew.
+Inherited values and existing session overrides can become explicit settings
+in the saved file, even when their rows were untouched. Reselecting that saved
+persona can therefore affect more than communication style; inspect the full
+projection before saving.
+
+The save retains the selected profile's prose and other parsed metadata,
+including its tools, skills, and caveats. It does not preserve the original TOML
+comments or formatting. A failed save leaves the draft open; it must not be
+reported as an applied setting. An unavailable profile cannot safely be
+reconstructed from a display name alone.
 
 ## Named styles
 

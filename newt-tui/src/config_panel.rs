@@ -1869,6 +1869,77 @@ Read the code and explain findings. Do not edit files or run commands.
         assert_eq!(store.load("restricted").unwrap(), original);
     }
 
+    /// Grounds the full-posture save contract in the real persona store: a
+    /// style-only draft snapshots unrelated projected dials, but never drops
+    /// the source profile's prose or non-panel restriction metadata.
+    #[test]
+    #[serial_test::serial(real_fs)]
+    fn style_only_draft_save_snapshots_projected_posture_and_preserves_restrictions() {
+        let _g = GlobalSettingsGuard::acquire();
+        set_cli_cognition(CognitionOverride::Set(Cognition::Contemplating));
+        set_cli_tenacity(Tenacity::Relentless);
+        newt_core::process_env::set_var("NEWT_TEAM", "1");
+        let _ = newt_core::runtime::drain_preference_actions();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::PersonaStore::new(tmp.path());
+        let document = "+++\nrole = \"reviewer\"\ntools = [\"read_file\"]\n\
+            skills = [\"code-review\"]\nmodel = \"review-model\"\ntier = \"REVIEW\"\n\
+            altitude = \"coach\"\n[caveats]\nfs_read = [\"src/\"]\n\
+            fs_write = \"none\"\nexec = \"none\"\nnet = \"none\"\nmax_calls = 3\n\
+            +++\n\n# Sparse reviewer\n\nRead the code and explain findings without editing.\n";
+        let original_path = store.save("sparse", document, false).unwrap();
+        let original = store.load("sparse").unwrap();
+        assert!(original.profile.backend.is_none() && original.profile.crew.is_none());
+        assert!(original.profile.cognition.is_none() && original.profile.tenacity.is_none());
+        let mut s = panel(
+            Some("sparse"),
+            vec![PersonaChoice::from(original.clone())],
+            Tenacity::Standard,
+        );
+        for _ in 0..6 {
+            s.down(); // warmth: leave cognition, tenacity and model untouched
+        }
+        s.cycle(1); // auto -> explicit zero
+        assert_eq!(s.persona_action(), PersonaAction::Keep);
+        assert!(!s.cognition.is_dirty() && !s.tenacity.is_dirty() && !s.model.is_dirty());
+        let mut persist = |name: &str, content: &str, overwrite: bool| match store
+            .save(name, content, overwrite)
+        {
+            Ok(_) => SaveResult::Saved { name: name.into() },
+            Err(err) => SaveResult::Failed(format!("{err:?}")),
+        };
+        s.begin_command("w sparse-copy");
+        assert_eq!(
+            s.run_command(&mut persist),
+            None,
+            "save alone does not apply"
+        );
+        assert_eq!(s.saved.as_deref(), Some("sparse-copy"));
+        let mut expected = original.profile.clone();
+        expected.backend = Some("sol".into()); // the fixture's operator baseline
+        expected.cognition = Some(Cognition::Contemplating);
+        expected.tenacity = Some(Tenacity::Relentless);
+        expected.crew = Some(true);
+        expected.personality = Some(PersonalityTraits {
+            warmth: Some(PersonalityLevel::try_from(0).unwrap()),
+            ..Default::default()
+        });
+        let saved = store.load("sparse-copy").unwrap();
+        assert_eq!(
+            saved.profile, expected,
+            "only projected panel fields change"
+        );
+        assert_eq!(saved.prompt, original.prompt);
+        assert_eq!(std::fs::read_to_string(original_path).unwrap(), document);
+        assert_eq!(store.load("sparse").unwrap(), original);
+        assert_eq!(
+            cli_cognition(),
+            CognitionOverride::Set(Cognition::Contemplating)
+        );
+        assert_eq!(cli_tenacity(), Some(Tenacity::Relentless));
+        assert!(newt_core::runtime::drain_preference_actions().is_empty());
+    }
+
     #[test]
     fn personality_controls_are_independent_named_rows() {
         let _g = GlobalSettingsGuard::acquire();
