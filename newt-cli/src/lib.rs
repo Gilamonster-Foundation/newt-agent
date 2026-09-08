@@ -848,12 +848,12 @@ pub enum Command {
         /// refused rather than resolved by precedence.
         #[arg(long, conflicts_with_all = ["resume", "resume_from"])]
         hermetic: bool,
-        /// Start a resumable chain. The run's frame may be named as the parent
-        /// of a later run, at the cost of the reproducibility `--hermetic` gives.
-        #[arg(long, conflicts_with = "hermetic")]
-        resume: bool,
-        /// Continue from a prior frame, named by its content id. Implies
-        /// `--resume`.
+        /// Continue from a prior frame, named by its content id. Starts a
+        /// resumable chain, at the cost of the reproducibility `--hermetic`
+        /// gives. The bare "resumable, but no named parent" case is the
+        /// EXISTING global `--resume <NAME>` (#1671): there is one `--resume`
+        /// in this binary and it means non-hermetic continuity, whether the
+        /// thing continued is a named conversation or a named frame.
         #[arg(long, value_name = "CID", conflicts_with = "hermetic")]
         resume_from: Option<String>,
     },
@@ -1721,15 +1721,15 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             context_window,
             model_digest,
             hermetic,
-            resume,
             resume_from,
         } => {
             // Refuse an illegal combination BEFORE any work starts. `clap`'s
             // `conflicts_with` above already catches it at the terminal with a
             // better message; this is the same rule where a non-CLI caller can
             // reach it, so the two consumers cannot disagree about what is legal.
-            let launch = newt_launch::LaunchConfig::from_flags(hermetic, resume, resume_from)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let launch =
+                newt_launch::LaunchConfig::from_flags(hermetic, cli.resume.is_some(), resume_from)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
             let code = solve::run(solve::SolveArgs {
                 cwd: cwd.unwrap_or_else(|| PathBuf::from(".")),
                 instruction_file,
@@ -2297,6 +2297,68 @@ mod tests {
         assert!(Cli::try_parse_from(["newt"]).unwrap().resume.is_none());
         // Resume-a-conversation and never-persist cannot both be meant.
         assert!(Cli::try_parse_from(["newt", "--resume", "x", "--ephemeral"]).is_err());
+    }
+
+    /// The continuity flags share the ONE global `--resume`; `solve` must not
+    /// redeclare that id. A second definition under a different type does not
+    /// fail to compile — it panics at parse time with "Mismatch between
+    /// definition and access of `resume`", so a plain `newt solve` dies before
+    /// doing any work. This pins that `solve` still parses bare, which is the
+    /// shape the panic broke.
+    #[test]
+    fn solve_continuity_flags_share_the_one_global_resume() {
+        assert!(Cli::try_parse_from([
+            "newt",
+            "solve",
+            "--instruction-file",
+            "x.md",
+            "--max-rounds",
+            "1"
+        ])
+        .is_ok());
+        assert!(
+            Cli::try_parse_from(["newt", "solve", "--instruction-file", "x.md", "--hermetic"])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from([
+            "newt",
+            "solve",
+            "--instruction-file",
+            "x.md",
+            "--resume",
+            "a name"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "newt",
+            "solve",
+            "--instruction-file",
+            "x.md",
+            "--resume-from",
+            "bafy"
+        ])
+        .is_ok());
+        // Hermetic refuses either shape of continuity, not one of them.
+        assert!(Cli::try_parse_from([
+            "newt",
+            "solve",
+            "--instruction-file",
+            "x.md",
+            "--hermetic",
+            "--resume",
+            "n"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "newt",
+            "solve",
+            "--instruction-file",
+            "x.md",
+            "--hermetic",
+            "--resume-from",
+            "b"
+        ])
+        .is_err());
     }
 
     // ── plan --one-shot (#646) ──────────────────────────────────────────
