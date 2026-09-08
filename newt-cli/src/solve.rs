@@ -506,10 +506,23 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // with no trajectory at all.
     let o_opt = outcome.as_ref().ok();
     let clean = matches!(&outcome, Ok(o) if o.error.is_none());
-    let (status, error) = match &outcome {
-        Ok(o) if o.error.is_none() => ("completed", None),
-        Ok(o) => ("failed", o.error.clone()),
-        Err(e) => ("failed", Some(e.clone())),
+    // ONE derivation, two renderings (#2212). `outcome` is decided first and
+    // `status` is a function of it, so the trace line and the contract record
+    // cannot disagree about whether the turn finished. They used to be
+    // independent expressions over the same `o`, twenty-four lines apart, and
+    // a round-cap exit satisfied one and not the other.
+    let outcome_label = solve_contract::outcome_label(
+        clean,
+        match &outcome {
+            Ok(o) => o.error_class,
+            Err(_) => None,
+        },
+        o_opt.and_then(|o| o.end_reason),
+    );
+    let status = solve_contract::status_label(outcome_label);
+    let error = match &outcome {
+        Ok(o) => o.error.clone(),
+        Err(e) => Some(e.clone()),
     };
     let reply_chars = o_opt.map(|o| o.reply.len()).unwrap_or(0);
     let usage = o_opt.and_then(|o| o.usage.as_ref().map(|u| u.total()));
@@ -571,15 +584,6 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
                 .map(solve_contract::behavior_signal_line),
         );
     }
-    // Outcome: structural, from the TYPED class the driver carried over. A
-    // spawn/thread `Err` never reached a dispatch → no class → harness_error.
-    let outcome_label = solve_contract::outcome_label(
-        clean,
-        match &outcome {
-            Ok(o) => o.error_class,
-            Err(_) => None,
-        },
-    );
     // effective_model: the response body's `model` field when the backend
     // reported one (the served reality), else the request model — a turn
     // that never got a response body has nothing truer to report.
