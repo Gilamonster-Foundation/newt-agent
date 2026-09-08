@@ -1,0 +1,33 @@
+[package]
+name = "newt-launch"
+# NOT `version.workspace = true`. This crate tracks its own lifecycle toward a
+# 0.0.1 release rather than the workspace's 0.8.0: it is new, it has an external
+# consumer (a Python package via pyO3), and its shape should be exercised by the
+# CLI wiring before anything depends on a stable number. Bump the rc as bugs are
+# found; cut 0.0.1 when a candidate survives use.
+version = "0.0.1-rc.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "The validated launch configuration a newt run started with: continuity mode, defaults, and a validation that fails startup rather than a check every call site must remember."
+keywords = ["newt", "agent", "configuration", "hermetic", "resume"]
+categories = ["command-line-utilities", "config"]
+
+# NO dependencies, deliberately.
+#
+# The point of this crate is that a Python caller reaching newt through pyO3
+# gets the SAME legality rules as the CLI. clap's `conflicts_with` already
+# enforces mutual exclusion for the CLI (six sites use it today) — but a caller
+# constructing a config programmatically never passes through clap and would
+# inherit none of it. Two consumers, one rule, so the rule lives where both can
+# reach it and neither can route around it.
+#
+# Anything pulled in here becomes a dependency of the Python wheel, so this stays
+# std-only until something genuinely requires otherwise.
+[dependencies]
+
+[lints]
+workspace = true

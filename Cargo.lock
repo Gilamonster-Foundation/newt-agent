@@ -4507,6 +4507,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "newt-launch"
+version = "0.0.1-rc.1"
+
+[[package]]
 name = "newt-mcp-client"
 version = "0.8.0"
 dependencies = [
