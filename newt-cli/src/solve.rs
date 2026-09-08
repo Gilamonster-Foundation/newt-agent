@@ -511,7 +511,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // cannot disagree about whether the turn finished. They used to be
     // independent expressions over the same `o`, twenty-four lines apart, and
     // a round-cap exit satisfied one and not the other.
-    let outcome_label = solve_contract::outcome_label(
+    let terminal = solve_contract::terminal(
         clean,
         match &outcome {
             Ok(o) => o.error_class,
@@ -519,7 +519,8 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         },
         o_opt.and_then(|o| o.end_reason),
     );
-    let status = solve_contract::status_label(outcome_label);
+    let outcome_label = solve_contract::outcome_label(terminal);
+    let status = solve_contract::status_label(terminal);
     let error = match &outcome {
         Ok(o) => o.error.clone(),
         Err(e) => Some(e.clone()),
