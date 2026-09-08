@@ -265,20 +265,32 @@ pub(crate) fn validate_tool_call_batch(
 /// there is NO config-file key, so the bypass can never silently persist; it
 /// must be asserted per invocation.
 ///
-/// Scope: `run_command` only. On stub-shell builds (the only crates.io-
-/// publishable configuration) agent-bridle's `shell` tool fails closed on
-/// every command, which makes agentic coding impossible without the brush
-/// `CommandInterceptor` patch underneath. `web_fetch` is NOT bypassed: the
-/// stub-shell branch stubs only the shell tool — `agent-bridle-tool-web`
-/// ships the real leash-enforcing implementation (verified at agent-bridle
-/// rev `2129c91`), so it does not fail closed. The fs tools keep the
+/// Scope: `run_command` only.
+///
+/// **The stub-shell caveat this paragraph used to carry is no longer true, and
+/// its own removal condition has been met.** It said stub-shell builds were the
+/// only crates.io-publishable configuration and that agent-bridle's `shell`
+/// tool failed closed on every command there. Measured on 2026-09-08:
+/// `cargo tree -p newt-core --no-default-features -i agent-bridle-tool-shell
+/// -e features` reports the `brush` and `carried-coreutils` features enabled,
+/// from the unconditional dependency edge in `newt-core/Cargo.toml`; no newt
+/// feature disables the shell backend, there is no `[patch]` section in the
+/// workspace, and `brush-ocap-*` resolve from crates.io in `Cargo.lock`. The
+/// publishable configuration and the real-shell configuration are the same
+/// configuration. `web_fetch` is NOT bypassed, and never was affected by the
+/// caveat above either way — `agent-bridle-tool-web` ships the real
+/// leash-enforcing implementation (verified at agent-bridle rev `2129c91`), so
+/// it does not fail closed. The fs tools keep the
 /// newt-native workspace fence untouched: yolo is unconfined exec, fenced fs
 /// — never a global authority-off switch.
 ///
-/// Remove (or demote to a debug flag) when brush upstreams the
-/// `CommandInterceptor` hook (reubeno/brush#1184) and agent-bridle's real
-/// confined shell becomes the default everywhere — see agent-bridle#20 and
-/// the `[patch.crates-io]` note in the workspace Cargo.toml.
+/// The removal condition recorded here — "when agent-bridle's real confined
+/// shell becomes the default everywhere" — has been met, by published
+/// `brush-ocap-*` crates rather than by an upstream brush merge
+/// (reubeno/brush#1184 remains open). Whether the `--disable-ocap` escape
+/// hatch itself should now be removed or demoted to a debug flag is a separate
+/// question about the bypass, not about shell availability, and is not decided
+/// here.
 pub fn ocap_disabled() -> bool {
     // Reads the process's FROZEN `LaunchAuthority` (resolved once from
     // `NEWT_DISABLE_OCAP` near startup), never the live env — so a switch that

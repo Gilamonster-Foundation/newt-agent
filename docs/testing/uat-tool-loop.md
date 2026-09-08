@@ -61,12 +61,15 @@ run through `newt code` in an isolated sandbox `HOME`, with a **dual assertion**
 - **Endpoint reliability:** prefer **dgx1** (`REDACTED-HOST:11434`) — it is
   reliable under load. **gpu-runner-ollama flakes** on multi-turn / large-`num_ctx`
   sessions (connection drops → timeouts), which silently aborts longer probes.
-- **`run_command` is the dead stub** on the crates.io-publishable build
-  ("temporarily unavailable in this build") **yet still advertised** — so any
-  shell-dependent scenario is really testing *dead-tool handling* (27.3 + the
-  honest cap-exit), which is exactly the originally-reported failure
-  ("repeated the same dead `run_command` 3×"). On a `--yolo`/real-shell build it
-  tests real command failures instead. Either way the loop behavior is the SUT.
+- **`run_command` is NOT a dead stub on any buildable configuration.** This
+  bullet previously said it was, on the crates.io-publishable build, quoting an
+  error string ("temporarily unavailable in this build") that appears in no
+  newt source file and in no vendored `agent-bridle` crate. Measured
+  2026-09-08: `cargo tree -p newt-agent --no-default-features -i
+  agent-bridle-tool-shell -e features` reports `brush` and `carried-coreutils`
+  enabled, so a shell-dependent scenario tests **real command
+  behaviour**, not dead-tool handling. A scenario that needs a genuinely dead
+  tool must arrange one some other way; do not assume the build supplies it.
 - **NEVER `pkill -f <name>` for a proxy/newt** in the runner — the pattern
   matches the runner's own command line and self-kills the shell (exit 144,
   empty output, no artifacts; this cost real debugging time). Kill helpers by
