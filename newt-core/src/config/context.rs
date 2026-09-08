@@ -320,7 +320,7 @@ impl ContextFeatureSet {
 
     /// The base feature set *before* `[context.features]` / session overrides:
     /// the `manager` preset's bundle, with **every available context-management
-    /// feature defaulted ON** (#727). The one exception is `provenance`, which
+    /// feature defaulted ON** (#984). The one exception is `provenance`, which
     /// is not yet implemented (`ContextFeature::available()` is `false`) and so
     /// stays OFF until it lands. This makes the full context toolkit — tool
     /// offload, the `<state>`/`<plan>` scratchpad ledger, semantic retrieval,
