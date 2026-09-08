@@ -793,9 +793,14 @@ kind = "openai"
     // ── the honesty clause (Phase 27.5) ───────────────────────────────────
     // RED against current main: newt-cli/src/solve.rs derives `status` from
     // `outcome.error.is_none()` alone and never consults `end_reason`.
-    assert_ne!(
-        result["status"], "completed",
-        "a run that ended at the tool-round cap must not report itself completed \
+    // #2215 landed the typed vocabulary, so this binds the VALUE now rather
+    // than only the relationship: `status_label` maps round_cap/empty/cancelled
+    // to "incomplete". Asserting the exact token means a future change that
+    // quietly reroutes a cap exit back to "completed" fails here even if it
+    // keeps the two fields consistent with each other.
+    assert_eq!(
+        result["status"], "incomplete",
+        "a run that ended at the tool-round cap must report itself incomplete \
          — end_reason says RoundCap on the same line: {result}"
     );
 
@@ -806,8 +811,8 @@ kind = "openai"
     // chooses. `contract_from` also pins that exactly one contract record
     // exists, so a run that emitted none cannot pass here.
     let contract = contract_from(&events_path);
-    assert_ne!(
-        contract["outcome"], "completed",
-        "the contract record must not report a cap exit as completed either: {contract}"
+    assert_eq!(
+        contract["outcome"], "round_cap",
+        "the contract record must name the wall this run hit: {contract}"
     );
 }
