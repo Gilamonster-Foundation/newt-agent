@@ -1534,7 +1534,9 @@ fully-mocked unit tier, coverage ratchet.
   ACP worker required index-diff capture remains a separate read-confinement
   gap, not fixed by execution hardening or by substituting an empty diff.
   Shell execution and other Git operations are not widened.
-- **27.3** — **Loop/dup guard + dead-shell suppression**
+- **27.3** — **COMPLETE (dup guard shipped; the presence gate has no
+  condition to gate — see the status note below).**
+  **Loop/dup guard + dead-shell suppression**
   (`newt-core/src/agentic/mod.rs`, `tools.rs`). Track failed `(tool, args)` and
   short-circuit exact repeats with a redirect nudge (mirrors the existing
   `read_only_rounds` nudge); presence-gate `run_command` out of the catalog when
@@ -1607,13 +1609,43 @@ them as a list, not a ranking.
   message a model reads once it has already lost the catalog did not mention
   the capability-grant path.
 
-- **27.3's dup-guard half is already implemented; its presence-gate half is
-  not.** *(traced by reading; commit date derived from `git show`.)*
+- **27.3's dup-guard half is implemented, and its presence-gate half has no
+  condition to gate.** *(dup guard: traced by reading, commit date derived from
+  `git show`. Absence of the gate condition: measured — `cargo tree` output
+  below.)*
   `64d7b0f2` (#928, 2026-07-04) landed the repeat-call guard, and the
   identical-failed-call tracker with its redirect nudge lives in
   `newt-core/src/agentic/mod.rs`. No shell-availability gate exists anywhere in
-  `newt-core` or `newt-cli`. A constraint for whoever takes the remaining half:
-  ten alias names rewrite to `run_command`, so gating it out of
+  `newt-core` or `newt-cli` — and none is needed.
+
+  **What the step assumes exists:** a build in which `run_command` is
+  advertised to the model while the shell cannot execute anything — described
+  at `tools.rs` as the stub-shell case, "the only crates.io-publishable
+  configuration".
+
+  **What was run to look for it** (resolution only; nothing compiled):
+
+  ```
+  cargo tree -p newt-agent --no-default-features -i agent-bridle-tool-shell -e features
+  cargo tree -p newt-core  --no-default-features -i agent-bridle-tool-shell -e features
+  ```
+
+  **What both returned:** `agent-bridle-tool-shell` features `brush` and
+  `carried-coreutils` are enabled — under the lean strip-down config and under
+  newt-core's own leanest config. They come from the unconditional dependency
+  edge at `newt-core/Cargo.toml`, and newt-core's `[features]` block forwards
+  only `windows-appcontainer` and `macos-seatbelt` to agent-bridle, so no newt
+  feature disables the shell backend. There is no `[patch]` section in the
+  workspace, and `brush-ocap-core` / `brush-ocap-builtins` /
+  `brush-ocap-coreutils-builtins` resolve from crates.io in `Cargo.lock`.
+
+  **Therefore:** the configuration the presence gate would defend cannot be
+  produced by any supported feature combination. A gate built for it could
+  never fire, and its RED control could not be written, because the "before"
+  state does not exist. The remaining half of 27.3 is not open work.
+
+  The constraint recorded for whoever took the remaining half is retained for
+  reference only: ten alias names rewrite to `run_command`, so gating it out of
   `ALL_TOOL_NAMES` would strand them on a name `is_hallucination` then rejects.
 
 - **27.4 is COMPLETE, and separately its TEXT is STALE — the two are different
@@ -1665,11 +1697,12 @@ them as a list, not a ranking.
 
 Re-measure a Phase 27 step against the code before building it.
 
-**Recommended order:** 27.2 → 27.3. **27.1 and 27.4 are struck: both
-are COMPLETE** (each shipped in the same push as its own bullet and was never
-ticked — see the status note above). **27.5 is also done**, fixed by #2215, and
-is kept out of the sequence for that reason. **27.3 remains available work**;
-its dup-guard half is already done, so only the presence-gate half is open.
+**Recommended order:** 27.2. **27.1, 27.3 and 27.4 are struck.** 27.1 and
+27.4 are COMPLETE (each shipped in the same push as its own bullet and was
+never ticked — see the status note above). **27.3 is complete too**: its
+dup-guard half shipped in `64d7b0f2`, and its presence-gate half has no
+condition to gate (measured — see the status note). **27.5 is also done**,
+fixed by #2215.
 Each remaining step carries the
 acceptance contract (What / Test plan / Out of scope), wiremock'd Ollama mocks,
 in-memory store fakes, and the coverage ratchet. A `newt-eval` BAT/UAT case
