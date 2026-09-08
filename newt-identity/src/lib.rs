@@ -48,6 +48,10 @@ use newt_core::Caveats;
 /// delegate from it without depending on `agent-mesh-protocol` directly.
 pub use agent_mesh_protocol::{AgentKey, AgentMetadata};
 
+mod delegation;
+pub use content_addressable::RawContentId;
+pub use delegation::{verify_delegation, DelegationError, VerifiedDelegation};
+
 /// The debug-only "no caveats" lattice element used by the headless
 /// ACP worker's `--allow-no-key` fallback. Behaviorally identical to
 /// the upstream `Caveats::top()` but indirected through this helper so

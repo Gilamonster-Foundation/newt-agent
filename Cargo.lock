@@ -4458,6 +4458,7 @@ dependencies = [
  "agent-mesh-protocol",
  "base64 0.22.1",
  "chrono",
+ "content-addressable",
  "newt-core",
  "serde_json",
  "tempfile",

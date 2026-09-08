@@ -601,6 +601,40 @@ pub(crate) fn exec_grant_basename(cmd: &str) -> &str {
         .unwrap_or(cmd)
 }
 
+/// Whether an inherited ceiling can be shown to permit one request.
+///
+/// Only the four caveat axes can express authority, so only they can express a
+/// *bound* on it. `RemoteTool` and `GitWrite` deliberately widen no axis
+/// (`widen_caveats` skips both): a remote-tool allow means "proceed with this
+/// call" and a git-write allow re-dispatches under a projected surface. That
+/// makes them inexpressible in a signed ceiling — there is no axis in which to
+/// read whether the parent granted them — so a delegated session **fails
+/// closed** on both rather than treating "no axis to check" as "nothing to
+/// check". `GitWrite` gets the sharper answer it can support: the ceiling's own
+/// projected `GitCaveats`, the same predicate the preset floor already uses a
+/// few lines below.
+///
+/// This is the fail-closed law applied to a gap in the vocabulary, not a
+/// judgement that these two are dangerous. If a later axis makes either
+/// expressible, this is the one place that changes.
+fn ceiling_permits(
+    ceiling: &newt_core::Caveats,
+    kind: newt_core::DenialKind,
+    target: &str,
+) -> bool {
+    use newt_core::caveats::CaveatsExt as _;
+    match kind {
+        newt_core::DenialKind::Exec => ceiling.permits_exec(target),
+        newt_core::DenialKind::FsRead => ceiling.permits_fs_read(target),
+        newt_core::DenialKind::FsWrite => ceiling.permits_fs_write(target),
+        newt_core::DenialKind::Net => ceiling.permits_net(target),
+        newt_core::DenialKind::GitWrite => {
+            newt_core::git_caveats::GitCaveats::from_session(ceiling).permits_commit()
+        }
+        newt_core::DenialKind::RemoteTool => false,
+    }
+}
+
 /// Match exact grants, plus a basename-normalized exec request.
 pub(crate) fn session_grant_covers(
     grants: &std::collections::BTreeSet<(newt_core::DenialKind, String)>,
@@ -666,6 +700,8 @@ pub(crate) struct PromptPermissionGate<
     pub(crate) config_path: Option<std::path::PathBuf>,
     /// Re-applied after widening so grants cannot pierce a named preset.
     pub(crate) preset_clamp: Option<newt_core::Caveats>,
+    /// Immutable inherited ceiling, independent of the current posture.
+    pub(crate) delegation: Option<&'a newt_identity::VerifiedDelegation>,
     pub(crate) danger: danger::DangerTable,
     pub(crate) color: bool,
     pub(crate) verbose: bool,
@@ -730,6 +766,26 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> PromptPerm
         // Re-clamping is load-bearing: widening may repopulate an emptied scope.
         if let Some(clamp) = &self.preset_clamp {
             policy = policy.meet(clamp);
+        }
+        // The inherited ceiling clamps AFTER the preset and independently of
+        // it. A preset is a posture the operator can name off; a delegation is
+        // authority this session was never granted in the first place, so an
+        // operator sitting at this prompt cannot approve past it — approving
+        // what you do not hold is amplification, not consent. This is the same
+        // widening path `preset_clamp` guards, which is why the clamp belongs
+        // here rather than only at `establish`: `mint` re-derives caveats from
+        // `base` plus grants, so a ceiling applied only at session start would
+        // be re-widened away on the first granted prompt.
+        if let Some(d) = self.delegation {
+            policy = policy.meet(d.caveats());
+            // And it stops here. A delegated session does not re-root a grant:
+            // minting from `key_path` would produce a key chained to the
+            // OPERATOR root rather than to the parent's certificate, which is a
+            // fresh authority rather than an attenuation of the inherited one.
+            // The clamped caveats ARE the receipt; there is no key to enforce
+            // them with, and `establish` has already left `op` as `None` for
+            // the same reason.
+            return policy;
         }
         match self
             .key_path
@@ -1215,6 +1271,26 @@ impl<F: FnMut(&PromptWindow, &InteractionDefinition) -> PromptChoice> newt_core:
                 self.record(req, "deny", "authorization-prompts-disabled");
             }
             return Deny;
+        }
+        // A delegated session's inherited ceiling is preflighted over the WHOLE
+        // batch, before any prompt is opened, any cache is consulted, and any
+        // durable approval is honoured. Clamping the result afterwards would be
+        // too late: prompting, granting and persisting are side effects, and a
+        // child asking its operator to approve authority the child never held
+        // is the amplification this exists to prevent. One forbidden request
+        // denies the batch — a lawful sibling must not buy a side effect for a
+        // request that cannot be granted.
+        if let Some(d) = self.delegation {
+            let ceiling = d.caveats();
+            if requests
+                .iter()
+                .any(|r| !ceiling_permits(ceiling, r.kind, &r.target))
+            {
+                for r in requests {
+                    self.record(r, "deny", "delegated-ceiling");
+                }
+                return Deny;
+            }
         }
         // Previously recorded session, permanent, and OCAP denials short-circuit.
         if requests.iter().any(|r| {
