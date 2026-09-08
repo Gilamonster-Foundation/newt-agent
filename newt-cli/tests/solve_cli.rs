@@ -804,15 +804,29 @@ kind = "openai"
          — end_reason says RoundCap on the same line: {result}"
     );
 
-    // The contract line carries the SAME claim through a second derivation
-    // (`solve_contract::outcome_label`), so it can drift from `status` unless
-    // both are pinned. Asserted in the same relationship form — NOT against a
-    // literal value — so this stays correct under any naming the honesty fix
-    // chooses. `contract_from` also pins that exactly one contract record
-    // exists, so a run that emitted none cannot pass here.
+    // ── the contract clause (#2218) ───────────────────────────────────────
+    // THIS ASSERTION WAS POINTING THE WRONG WAY. It pinned `"round_cap"` — the
+    // exact value that broke the bench — so a regression gate was protecting
+    // the regression, and anyone fixing the contract break would have been
+    // failed by it.
+    //
+    // `gilamonster-bench/src/contract.rs:20` declares `Outcome` as a CLOSED
+    // serde enum with no `serde(other)`, and `SUPPORTED_VERSIONS = ["1"]`. An
+    // unknown value does not deserialize, so a cap-exit run did not score
+    // badly — it DROPPED OUT of the matrix silently.
+    //
+    // `timeout` is the v1 bucket for "exhausted its budget without reaching the
+    // goal": `is_real_attempt()` is `Completed | ModelError`, so it correctly
+    // excludes the run from capability scoring. The honesty claim has not
+    // moved — it lives in `status` above, on newt's own line.
+    //
+    // `contract_from` also pins that exactly one contract record exists, so a
+    // run that emitted none cannot pass here.
     let contract = contract_from(&events_path);
     assert_eq!(
-        contract["outcome"], "round_cap",
-        "the contract record must name the wall this run hit: {contract}"
+        contract["outcome"], "timeout",
+        "a cap exit must file in a bucket the bench's closed enum can parse \
+         AND that excludes it from capability scoring; which wall it hit is \
+         `status` and `end_reason`'s to report: {contract}"
     );
 }

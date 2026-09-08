@@ -61,73 +61,127 @@ pub struct ContractInputs<'a> {
     pub gen_tokens: Option<u64>,
 }
 
-/// Map the turn result to the contract `outcome` taxonomy.
+/// How a turn ended, decided ONCE (#2212, corrected by #2218).
 ///
-/// **Two signals end a turn, and BOTH are read here (#2212).** A failed turn
-/// takes its TYPED class, and a failure with no class at all (spawn/thread
-/// error before any dispatch) files as `harness_error` — fail-closed, never a
-/// guess from message text. But an error is not the only way to stop short:
-/// three [`TurnEndReason`] variants describe a turn that produced no error and
-/// did not finish either, and this function used to take `clean` alone and
-/// call every one of them `completed`.
+/// Two fields render this, and they answer DIFFERENT questions — which is why
+/// they legitimately differ rather than drifting:
 ///
-/// That was measured, not theorised. A dogfood run against this repo produced
-/// a correct implementation, exhausted its round budget, never ran the test
-/// its task required, and emitted `"outcome":"completed"` beside
-/// `"end_reason":"Some(RoundCap)"` in the same JSON line — because the two
-/// fields were computed from different sources in the same scope.
+/// * `outcome`, in the versioned contract record, answers **"was this a real
+///   attempt?"**. `gilamonster-bench/CONTRACT.md` is explicit: *"`completed` —
+///   the agent drove the model to a terminal state. Pass/fail is the suite
+///   verifier's call, not this field's."* The taxonomy's whole purpose is a
+///   *Real attempt?* column; `transport_error` / `timeout` / `harness_error`
+///   are ❌ because the model was never meaningfully exercised.
+/// * `status`, in newt's own trace line, answers **"did this run finish what
+///   it set out to do?"**. That is the question #2212 found being answered
+///   dishonestly, and it has no external consumer.
 ///
-/// `completed` now means exactly one thing: the loop reached a genuine final
-/// answer. Anything else says which wall it hit.
-pub fn outcome_label(
+/// Deciding once and rendering twice is what keeps them from drifting the way
+/// they did before #2215, while still letting them disagree where the two
+/// questions genuinely have different answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Terminal {
+    /// A genuine final answer.
+    Completed,
+    /// No error, but the loop stopped before finishing — a wall, not a
+    /// failure. The model was reached and did real work, so this is still a
+    /// real attempt in contract terms.
+    StoppedShort(TurnEndReason),
+    /// The turn failed; the TYPED class decides which failure.
+    Failed(Option<ErrorClass>),
+}
+
+/// Classify the turn from every signal that can end it.
+pub fn terminal(
     clean: bool,
     class: Option<ErrorClass>,
     end_reason: Option<TurnEndReason>,
-) -> &'static str {
-    if clean {
-        // No error, but not necessarily finished. Match explicitly rather than
-        // with a `_` arm: a NEW `TurnEndReason` variant must fail to compile
-        // here and be classified deliberately, not silently inherit
-        // `completed` — which is how this defect arrived in the first place.
-        return match end_reason {
-            Some(TurnEndReason::RoundCap) => "round_cap",
-            Some(TurnEndReason::Empty) => "empty",
-            Some(TurnEndReason::Cancelled) => "cancelled",
-            Some(
-                TurnEndReason::Completed
-                | TurnEndReason::NarrationCapExhausted
-                | TurnEndReason::NarrationFinalRound,
-            )
-            | None => "completed",
-            // `Failed` cannot reach here: it implies an error, so `clean` is
-            // false. Classified anyway rather than left to a wildcard.
-            Some(TurnEndReason::Failed) => "harness_error",
-        };
+) -> Terminal {
+    if !clean {
+        return Terminal::Failed(class);
     }
-    match class {
-        Some(ErrorClass::Model) => "model_error",
-        Some(ErrorClass::Transport) => "transport_error",
-        Some(ErrorClass::Timeout) => "timeout",
-        Some(ErrorClass::Harness) | None => "harness_error",
+    // Matched explicitly, with no `_` arm: a NEW `TurnEndReason` variant must
+    // fail to compile here and be classified deliberately rather than silently
+    // inherit a terminal state. Silent inheritance is how #2212 arrived.
+    match end_reason {
+        Some(
+            reason @ (TurnEndReason::RoundCap | TurnEndReason::Empty | TurnEndReason::Cancelled),
+        ) => Terminal::StoppedShort(reason),
+        Some(
+            TurnEndReason::Completed
+            | TurnEndReason::NarrationCapExhausted
+            | TurnEndReason::NarrationFinalRound,
+        )
+        | None => Terminal::Completed,
+        // `Failed` implies an error, so `clean` is false and this is
+        // unreachable. Classified anyway rather than left to a wildcard.
+        Some(TurnEndReason::Failed) => Terminal::Failed(Some(ErrorClass::Harness)),
     }
 }
 
-/// The `status` field of the `solve_result` trace line, derived FROM the
-/// contract outcome rather than computed beside it.
+/// The contract record's `outcome` — **exactly the five values `CONTRACT.md`
+/// defines**, and no others. The bench's `Outcome` is a CLOSED serde enum with
+/// no `serde(other)` (`gilamonster-bench/src/contract.rs:20`), so an unknown
+/// value does not deserialize: the run does not score badly, it DROPS OUT of
+/// the matrix. #2215 emitted `round_cap` here and silently deleted rows.
 ///
-/// This is the structural half of the #2212 fix. The two fields disagreed
-/// because they were two independent expressions over the same data; making
-/// one a function of the other means they cannot drift again, whatever future
-/// variants either taxonomy grows.
+/// **A cap exit maps to `timeout`, and that is defensible on the merits rather
+/// than a compromise (#2218).** The contract needs a bucket for "exhausted its
+/// budget without achieving the goal", and at v1 granularity both flavours of
+/// budget belong in it: `is_real_attempt()` is `Completed | ModelError`, so
+/// `timeout` correctly excludes a run that did not finish from capability
+/// scoring. A cap exit without any continuation — and newt offers none today —
+/// is a failure, not a terminal state worth scoring.
 ///
-/// `status` stays coarse — it is the field the psyche-ab matrix reads into
-/// `results.csv` — but it no longer reports a turn that stopped short as
-/// `completed`.
-pub fn status_label(outcome: &str) -> &'static str {
-    match outcome {
-        "completed" => "completed",
-        "round_cap" | "empty" | "cancelled" => "incomplete",
-        _ => "failed",
+/// **What this conflates, recorded so the next reader knows it was decided:**
+/// a wall-clock timeout and a round-cap grind become indistinguishable here.
+/// They want different fixes (more time vs. stop the grinding). v2 should split
+/// them, ideally distinguishing a cap exit that leaves resumable state from one
+/// that leaves nothing, since only the second is unambiguously a failure. The
+/// true reason is not lost meanwhile — `status` and `end_reason` both carry it
+/// on newt's own trace line, where no external vocabulary is at stake.
+pub fn outcome_label(t: Terminal) -> &'static str {
+    match t {
+        Terminal::Completed => "completed",
+        // Budget exhausted without reaching the goal. `Cancelled` is
+        // unreachable from this binary — it is set only in
+        // `newt-tui/src/chat.rs` on an operator interrupt — but an abandoned
+        // run did not finish either, so it files the same way rather than
+        // falling through to a wildcard.
+        Terminal::StoppedShort(TurnEndReason::RoundCap | TurnEndReason::Cancelled) => "timeout",
+        // The model WAS reached and emitted unusable content, which is
+        // `CONTRACT.md`'s `model_error` verbatim: "reached but errored
+        // (refused, emitted invalid output)". `is_real_attempt()` includes it,
+        // correctly — the model ran. This is a change from pre-#2215 behaviour
+        // beyond the cap-exit case, made deliberately: `completed` for a
+        // placeholder reply is the same falsehood #2212 identified.
+        Terminal::StoppedShort(TurnEndReason::Empty) => "model_error",
+        // The remaining variants cannot construct `StoppedShort`; listed so a
+        // new one fails to compile rather than inheriting a bucket.
+        Terminal::StoppedShort(
+            TurnEndReason::Completed
+            | TurnEndReason::NarrationCapExhausted
+            | TurnEndReason::NarrationFinalRound
+            | TurnEndReason::Failed,
+        ) => "harness_error",
+        Terminal::Failed(Some(ErrorClass::Model)) => "model_error",
+        Terminal::Failed(Some(ErrorClass::Transport)) => "transport_error",
+        Terminal::Failed(Some(ErrorClass::Timeout)) => "timeout",
+        Terminal::Failed(Some(ErrorClass::Harness) | None) => "harness_error",
+    }
+}
+
+/// The `solve_result` trace line's `status` — newt's own field, free to carry
+/// a vocabulary no external contract constrains.
+///
+/// This is the half of #2212 that was a real defect: a run that stopped at a
+/// wall reported itself `completed`, and every downstream signal — eval scores,
+/// CI gates, an operator reading a summary — rested on that.
+pub fn status_label(t: Terminal) -> &'static str {
+    match t {
+        Terminal::Completed => "completed",
+        Terminal::StoppedShort(_) => "incomplete",
+        Terminal::Failed(_) => "failed",
     }
 }
 
@@ -216,23 +270,48 @@ mod tests {
     /// in the same JSON line. A cap-exit is not an error, and `outcome` was
     /// derived only from the absence of one.
     #[test]
-    fn a_round_cap_exit_is_not_completed() {
+    fn a_round_cap_exit_files_as_timeout_not_completed() {
         assert_eq!(
-            outcome_label(true, None, Some(TurnEndReason::RoundCap)),
-            "round_cap",
-            "a turn that ran out of rounds reported success"
+            outcome_label(terminal(true, None, Some(TurnEndReason::RoundCap))),
+            "timeout",
+            "a run that exhausted its round budget without reaching the goal \
+             must be excluded from capability scoring — is_real_attempt() is \
+             Completed|ModelError. #2215 emitted `round_cap`, which the bench's \
+             closed enum cannot parse, so the row vanished instead."
+        );
+    }
+
+    #[test]
+    fn a_round_cap_exit_reports_an_incomplete_run() {
+        assert_eq!(
+            status_label(terminal(true, None, Some(TurnEndReason::RoundCap))),
+            "incomplete",
+            "a run that ended at the tool-round cap reported itself finished"
+        );
+    }
+
+    /// The two fields answer different questions, so the SAME turn renders
+    /// differently — deliberately, from one classification.
+    #[test]
+    fn one_classification_renders_two_honest_answers() {
+        let t = terminal(true, None, Some(TurnEndReason::RoundCap));
+        assert_eq!(outcome_label(t), "timeout", "excluded from scoring");
+        assert_eq!(
+            status_label(t),
+            "incomplete",
+            "and honestly named on our own line"
         );
     }
 
     #[test]
     fn clean_turn_is_completed() {
-        assert_eq!(outcome_label(true, None, None), "completed");
+        assert_eq!(outcome_label(terminal(true, None, None)), "completed");
     }
 
     #[test]
     fn model_class_is_model_error() {
         assert_eq!(
-            outcome_label(false, Some(ErrorClass::Model), None),
+            outcome_label(terminal(false, Some(ErrorClass::Model), None)),
             "model_error"
         );
     }
@@ -240,7 +319,7 @@ mod tests {
     #[test]
     fn transport_class_is_transport_error() {
         assert_eq!(
-            outcome_label(false, Some(ErrorClass::Transport), None),
+            outcome_label(terminal(false, Some(ErrorClass::Transport), None)),
             "transport_error"
         );
     }
@@ -248,7 +327,7 @@ mod tests {
     #[test]
     fn timeout_class_is_timeout() {
         assert_eq!(
-            outcome_label(false, Some(ErrorClass::Timeout), None),
+            outcome_label(terminal(false, Some(ErrorClass::Timeout), None)),
             "timeout"
         );
     }
@@ -256,12 +335,12 @@ mod tests {
     #[test]
     fn harness_class_and_unclassified_failures_are_harness_error() {
         assert_eq!(
-            outcome_label(false, Some(ErrorClass::Harness), None),
+            outcome_label(terminal(false, Some(ErrorClass::Harness), None)),
             "harness_error"
         );
         // A spawn/thread failure never reached a dispatch — no class at all.
         // Fail-closed: it must not masquerade as a model result.
-        assert_eq!(outcome_label(false, None, None), "harness_error");
+        assert_eq!(outcome_label(terminal(false, None, None)), "harness_error");
     }
 
     // --- one test per parse-status signal line ---
