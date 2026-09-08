@@ -30,8 +30,7 @@ fn add_then_commit_advances_history() {
     assert!(eng.status(&caps).unwrap().clean, "clean after commit");
 
     // The system `git` agrees grit wrote a real, readable history.
-    let out = std::process::Command::new("git")
-        .current_dir(dir.path())
+    let out = git_cmd(dir.path())
         .args(["log", "--oneline"])
         .output()
         .unwrap();
@@ -43,8 +42,7 @@ fn branch_creates_a_ref_at_head() {
     let eng = GitEngine::open(dir.path(), &Scope::All).unwrap();
     let refname = eng.branch(&GitCaveats::top(), "feat/x").unwrap();
     assert_eq!(refname, "refs/heads/feat/x");
-    let ok = Command::new("git")
-        .current_dir(dir.path())
+    let ok = git_cmd(dir.path())
         .args(["rev-parse", "--verify", "refs/heads/feat/x"])
         .status()
         .unwrap()

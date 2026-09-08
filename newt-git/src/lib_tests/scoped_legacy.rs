@@ -7,20 +7,7 @@ fn scoped_legacy_git_refuses_external_alternates_before_opening_the_engine() {
     use newt_core::caveats::{Caveats, Scope};
     let external = repo_with_commit();
     let marker = "external alternate commit must not be disclosed";
-    git(
-        external.path(),
-        &[
-            "-c",
-            "user.name=Tester",
-            "-c",
-            "user.email=t@example.com",
-            "commit",
-            "--amend",
-            "-q",
-            "-m",
-            marker,
-        ],
-    );
+    git(external.path(), &["commit", "--amend", "-q", "-m", marker]);
     let repo = tempfile::tempdir().unwrap();
     git(repo.path(), &["init", "-q", "-b", "main"]);
     std::fs::copy(

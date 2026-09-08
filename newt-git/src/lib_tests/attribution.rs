@@ -20,8 +20,7 @@ fn commit_carries_the_coauthor_trailer_in_the_message() {
     )
     .unwrap();
     // Inspect the real commit message via system git.
-    let log = Command::new("git")
-        .current_dir(dir.path())
+    let log = git_cmd(dir.path())
         .args(["log", "-1", "--pretty=%B"])
         .output()
         .unwrap();
@@ -170,8 +169,7 @@ fn model_switch_between_commits_attributes_each_to_the_live_model() {
     );
 
     // The switch did not retroactively rewrite C1 — model A is still there.
-    let c1_again = Command::new("git")
-        .current_dir(p)
+    let c1_again = git_cmd(p)
         .args(["log", "--pretty=%B", "--skip=1", "-1"])
         .output()
         .unwrap();

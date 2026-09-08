@@ -10,25 +10,12 @@ fn repo_with_three() -> (tempfile::TempDir, Vec<String>) {
     let mk = |name: &str, content: &str, msg: &str| {
         std::fs::write(p.join(name), content).unwrap();
         git(p, &["add", name]);
-        git(
-            p,
-            &[
-                "-c",
-                "user.name=T",
-                "-c",
-                "user.email=t@e.c",
-                "commit",
-                "-q",
-                "-m",
-                msg,
-            ],
-        );
+        git(p, &["commit", "-q", "-m", msg]);
     };
     mk("a.txt", "v1\n", "c1");
     mk("b.txt", "b\n", "c2");
     mk("c.txt", "c\n", "c3");
-    let out = Command::new("git")
-        .current_dir(p)
+    let out = git_cmd(p)
         .args(["log", "--format=%H", "--reverse"])
         .output()
         .unwrap();
@@ -59,8 +46,7 @@ fn rebase_rewords_a_middle_commit() {
     assert!(out.starts_with("rebased onto"), "got: {out}");
     assert_eq!(commit_count(dir.path()), 3, "same number of commits");
     // History: c1, b reworded, c3.
-    let log = Command::new("git")
-        .current_dir(dir.path())
+    let log = git_cmd(dir.path())
         .args(["log", "--format=%s", "--reverse"])
         .output()
         .unwrap();
@@ -137,8 +123,7 @@ fn rebase_squashes_two_commits_into_one() {
         "got: {body}"
     );
     // Both files landed in the squashed tree.
-    let files = Command::new("git")
-        .current_dir(dir.path())
+    let files = git_cmd(dir.path())
         .args(["ls-tree", "--name-only", "-r", "HEAD"])
         .output()
         .unwrap();
@@ -166,8 +151,7 @@ fn rebase_drops_a_commit() {
     )
     .unwrap();
     assert_eq!(commit_count(dir.path()), 2);
-    let names = Command::new("git")
-        .current_dir(dir.path())
+    let names = git_cmd(dir.path())
         .args(["ls-tree", "--name-only", "-r", "HEAD"])
         .output()
         .unwrap();
@@ -272,31 +256,14 @@ fn rebase_aborts_on_conflict_leaving_the_branch_unchanged() {
     let mk = |content: &str, msg: &str| {
         std::fs::write(p.join("a.txt"), content).unwrap();
         git(p, &["add", "a.txt"]);
-        git(
-            p,
-            &[
-                "-c",
-                "user.name=T",
-                "-c",
-                "user.email=t@e.c",
-                "commit",
-                "-q",
-                "-m",
-                msg,
-            ],
-        );
+        git(p, &["commit", "-q", "-m", msg]);
     };
     mk("v1\n", "c1");
     mk("v2\n", "c2");
     mk("v3\n", "c3");
-    let head_before = Command::new("git")
-        .current_dir(p)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .unwrap();
+    let head_before = git_cmd(p).args(["rev-parse", "HEAD"]).output().unwrap();
     let oids: Vec<String> = String::from_utf8_lossy(
-        &Command::new("git")
-            .current_dir(p)
+        &git_cmd(p)
             .args(["log", "--format=%H", "--reverse"])
             .output()
             .unwrap()
@@ -322,11 +289,7 @@ fn rebase_aborts_on_conflict_leaving_the_branch_unchanged() {
         "got: {err}"
     );
     // The branch ref did NOT move.
-    let head_after = Command::new("git")
-        .current_dir(p)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .unwrap();
+    let head_after = git_cmd(p).args(["rev-parse", "HEAD"]).output().unwrap();
     assert_eq!(
         head_before.stdout, head_after.stdout,
         "branch must be unchanged"
