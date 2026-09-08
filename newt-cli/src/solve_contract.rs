@@ -238,10 +238,181 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
     record
 }
 
+/// The consumer's permitted `outcome` values, checked in beside this code.
+///
+/// See the file's own header for why a copy is the right shape here. In short:
+/// the authority lives in another repository that deliberately shares no type
+/// with this one, so nothing in this workspace can fail on a contract
+/// violation — and #2218 recorded that gap after `round_cap` silently deleted
+/// bench rows. This constant, and the test that drives every reachable
+/// classification through it, is that gap closed at the one place newt chooses
+/// a wire value.
+#[cfg(test)]
+const BENCH_OUTCOME_VALUES: &str = include_str!("../contract/bench_outcome_values_v1.txt");
+
+/// Parse the checked-in permitted set: one value per line, `#` comments and
+/// blank lines ignored.
+#[cfg(test)]
+fn permitted_outcomes() -> Vec<&'static str> {
+    BENCH_OUTCOME_VALUES
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use newt_core::{BehaviorSignal, ToolCallDialect};
+
+    /// Every `TurnEndReason`, and a compile-time guard that this list stays
+    /// complete.
+    ///
+    /// The guard is the load-bearing half. A hand-written list of variants is
+    /// the classic vacuous negative (#2150): add an eighth variant and the
+    /// coverage test still passes, having simply stopped looking at it. The
+    /// index match below has no wildcard arm, so a new variant fails to
+    /// COMPILE; and the density assertion in
+    /// `every_reachable_outcome_is_a_value_the_bench_can_parse` fails unless
+    /// the new arm's index is also added to this array. Neither direction can
+    /// be satisfied by ignoring it.
+    const ALL_END_REASONS: &[TurnEndReason] = &[
+        TurnEndReason::Completed,
+        TurnEndReason::NarrationCapExhausted,
+        TurnEndReason::NarrationFinalRound,
+        TurnEndReason::RoundCap,
+        TurnEndReason::Empty,
+        TurnEndReason::Cancelled,
+        TurnEndReason::Failed,
+    ];
+
+    fn end_reason_index(r: TurnEndReason) -> usize {
+        match r {
+            TurnEndReason::Completed => 0,
+            TurnEndReason::NarrationCapExhausted => 1,
+            TurnEndReason::NarrationFinalRound => 2,
+            TurnEndReason::RoundCap => 3,
+            TurnEndReason::Empty => 4,
+            TurnEndReason::Cancelled => 5,
+            TurnEndReason::Failed => 6,
+        }
+    }
+
+    /// Every `ErrorClass`, guarded the same way.
+    const ALL_ERROR_CLASSES: &[ErrorClass] = &[
+        ErrorClass::Model,
+        ErrorClass::Transport,
+        ErrorClass::Timeout,
+        ErrorClass::Harness,
+    ];
+
+    fn error_class_index(c: ErrorClass) -> usize {
+        match c {
+            ErrorClass::Model => 0,
+            ErrorClass::Transport => 1,
+            ErrorClass::Timeout => 2,
+            ErrorClass::Harness => 3,
+        }
+    }
+
+    /// Every `Terminal` this binary can construct.
+    fn all_terminals() -> Vec<Terminal> {
+        let mut out = vec![Terminal::Completed, Terminal::Failed(None)];
+        out.extend(ALL_END_REASONS.iter().copied().map(Terminal::StoppedShort));
+        out.extend(
+            ALL_ERROR_CLASSES
+                .iter()
+                .copied()
+                .map(|c| Terminal::Failed(Some(c))),
+        );
+        out
+    }
+
+    /// **#2227 layer 2, and the specific gate that failed in #2215.**
+    ///
+    /// A green CI in this repo cannot mean "contract-conforming": the bench
+    /// re-declares its own structs so the ruler stays independent of the thing
+    /// it measures, which is correct and must not be traded away. The cost is
+    /// that a wire value newt invents is caught by nobody — and because the
+    /// consumer's enum is closed, an unparseable value does not score badly,
+    /// it removes the row from the matrix.
+    ///
+    /// This drives EVERY reachable classification through `outcome_label` and
+    /// requires the result to be a value the checked-in permitted set contains.
+    /// It would have failed on `round_cap` before #2215 merged.
+    #[test]
+    fn every_reachable_outcome_is_a_value_the_bench_can_parse() {
+        // The variant lists must be complete before anything derived from them
+        // proves a thing. Indices are dense and unique iff every arm of the
+        // (wildcard-free) index match appears exactly once in the array.
+        let mut seen: Vec<usize> = ALL_END_REASONS
+            .iter()
+            .copied()
+            .map(end_reason_index)
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..ALL_END_REASONS.len()).collect::<Vec<_>>(),
+            "ALL_END_REASONS stopped covering TurnEndReason — a variant was \
+             added to the index match but not to the array, so the coverage \
+             below is measuring less than it appears to"
+        );
+        let mut seen: Vec<usize> = ALL_ERROR_CLASSES
+            .iter()
+            .copied()
+            .map(error_class_index)
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..ALL_ERROR_CLASSES.len()).collect::<Vec<_>>(),
+            "ALL_ERROR_CLASSES stopped covering ErrorClass"
+        );
+
+        let permitted = permitted_outcomes();
+        assert!(
+            !permitted.is_empty(),
+            "the permitted set parsed empty — a checked-in file that reads as \
+             'nothing is allowed' would fail every case below for the wrong \
+             reason, and one that reads as 'everything' would pass them all"
+        );
+        for t in all_terminals() {
+            let label = outcome_label(t);
+            assert!(
+                permitted.contains(&label),
+                "outcome_label({t:?}) emitted {label:?}, which \
+                 gilamonster-bench's closed `Outcome` enum cannot deserialize. \
+                 The run will not score badly — its row will VANISH from the \
+                 matrix. Permitted: {permitted:?}. If the contract genuinely \
+                 moved, update contract/bench_outcome_values_v1.txt against the \
+                 upstream enum, in its own commit."
+            );
+        }
+    }
+
+    /// The permitted set is a copy of a specific upstream shape, so it is
+    /// pinned exactly rather than merely non-empty. A silent edit — adding a
+    /// value to make a failing case pass — is the failure mode the file exists
+    /// to prevent, and changing this list is how a reviewer is made to look.
+    #[test]
+    fn the_checked_in_permitted_set_matches_contract_version_one() {
+        assert_eq!(
+            permitted_outcomes(),
+            vec![
+                "completed",
+                "model_error",
+                "transport_error",
+                "timeout",
+                "harness_error"
+            ],
+            "the checked-in copy of gilamonster-bench's `Outcome` changed. That \
+             is a deliberate act tracking an upstream contract change, not a \
+             way to make a test pass — re-read `gilamonster-bench/src/\
+             contract.rs` and confirm `contract_version` before editing this."
+        );
+    }
 
     fn inputs() -> ContractInputs<'static> {
         ContractInputs {
