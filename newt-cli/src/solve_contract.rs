@@ -13,7 +13,7 @@
 //! per solve — the bench keys on the presence of `contract_version` and
 //! rejects ambiguous traces.
 
-use newt_core::{BehaviorSignal, ErrorClass, ParseSignal};
+use newt_core::{BehaviorSignal, ErrorClass, ParseSignal, TurnEndReason};
 
 /// The contract version this emitter declares. Bumped only on a breaking
 /// change to field names/semantics; adding an optional field is not breaking.
@@ -61,19 +61,73 @@ pub struct ContractInputs<'a> {
     pub gen_tokens: Option<u64>,
 }
 
-/// Map the turn result to the contract `outcome` taxonomy. `clean` = the turn
-/// completed with no error; a failed turn takes its TYPED class, and a
-/// failure with no class at all (spawn/thread error before any dispatch)
-/// files as `harness_error` — fail-closed, never a guess from message text.
-pub fn outcome_label(clean: bool, class: Option<ErrorClass>) -> &'static str {
+/// Map the turn result to the contract `outcome` taxonomy.
+///
+/// **Two signals end a turn, and BOTH are read here (#2212).** A failed turn
+/// takes its TYPED class, and a failure with no class at all (spawn/thread
+/// error before any dispatch) files as `harness_error` — fail-closed, never a
+/// guess from message text. But an error is not the only way to stop short:
+/// three [`TurnEndReason`] variants describe a turn that produced no error and
+/// did not finish either, and this function used to take `clean` alone and
+/// call every one of them `completed`.
+///
+/// That was measured, not theorised. A dogfood run against this repo produced
+/// a correct implementation, exhausted its round budget, never ran the test
+/// its task required, and emitted `"outcome":"completed"` beside
+/// `"end_reason":"Some(RoundCap)"` in the same JSON line — because the two
+/// fields were computed from different sources in the same scope.
+///
+/// `completed` now means exactly one thing: the loop reached a genuine final
+/// answer. Anything else says which wall it hit.
+pub fn outcome_label(
+    clean: bool,
+    class: Option<ErrorClass>,
+    end_reason: Option<TurnEndReason>,
+) -> &'static str {
     if clean {
-        return "completed";
+        // No error, but not necessarily finished. Match explicitly rather than
+        // with a `_` arm: a NEW `TurnEndReason` variant must fail to compile
+        // here and be classified deliberately, not silently inherit
+        // `completed` — which is how this defect arrived in the first place.
+        return match end_reason {
+            Some(TurnEndReason::RoundCap) => "round_cap",
+            Some(TurnEndReason::Empty) => "empty",
+            Some(TurnEndReason::Cancelled) => "cancelled",
+            Some(
+                TurnEndReason::Completed
+                | TurnEndReason::NarrationCapExhausted
+                | TurnEndReason::NarrationFinalRound,
+            )
+            | None => "completed",
+            // `Failed` cannot reach here: it implies an error, so `clean` is
+            // false. Classified anyway rather than left to a wildcard.
+            Some(TurnEndReason::Failed) => "harness_error",
+        };
     }
     match class {
         Some(ErrorClass::Model) => "model_error",
         Some(ErrorClass::Transport) => "transport_error",
         Some(ErrorClass::Timeout) => "timeout",
         Some(ErrorClass::Harness) | None => "harness_error",
+    }
+}
+
+/// The `status` field of the `solve_result` trace line, derived FROM the
+/// contract outcome rather than computed beside it.
+///
+/// This is the structural half of the #2212 fix. The two fields disagreed
+/// because they were two independent expressions over the same data; making
+/// one a function of the other means they cannot drift again, whatever future
+/// variants either taxonomy grows.
+///
+/// `status` stays coarse — it is the field the psyche-ab matrix reads into
+/// `results.csv` — but it no longer reports a turn that stopped short as
+/// `completed`.
+pub fn status_label(outcome: &str) -> &'static str {
+    match outcome {
+        "completed" => "completed",
+        "round_cap" | "empty" | "cancelled" => "incomplete",
+        _ => "failed",
     }
 }
 
@@ -156,38 +210,58 @@ mod tests {
 
     // --- one test per outcome class ---
 
+    /// **The #2212 defect, as a test.** Tonight's dogfood run produced a
+    /// correct implementation, ran out of rounds, never ran the test the task
+    /// required, and reported `outcome: completed` with `end_reason: RoundCap`
+    /// in the same JSON line. A cap-exit is not an error, and `outcome` was
+    /// derived only from the absence of one.
+    #[test]
+    fn a_round_cap_exit_is_not_completed() {
+        assert_eq!(
+            outcome_label(true, None, Some(TurnEndReason::RoundCap)),
+            "round_cap",
+            "a turn that ran out of rounds reported success"
+        );
+    }
+
     #[test]
     fn clean_turn_is_completed() {
-        assert_eq!(outcome_label(true, None), "completed");
+        assert_eq!(outcome_label(true, None, None), "completed");
     }
 
     #[test]
     fn model_class_is_model_error() {
-        assert_eq!(outcome_label(false, Some(ErrorClass::Model)), "model_error");
+        assert_eq!(
+            outcome_label(false, Some(ErrorClass::Model), None),
+            "model_error"
+        );
     }
 
     #[test]
     fn transport_class_is_transport_error() {
         assert_eq!(
-            outcome_label(false, Some(ErrorClass::Transport)),
+            outcome_label(false, Some(ErrorClass::Transport), None),
             "transport_error"
         );
     }
 
     #[test]
     fn timeout_class_is_timeout() {
-        assert_eq!(outcome_label(false, Some(ErrorClass::Timeout)), "timeout");
+        assert_eq!(
+            outcome_label(false, Some(ErrorClass::Timeout), None),
+            "timeout"
+        );
     }
 
     #[test]
     fn harness_class_and_unclassified_failures_are_harness_error() {
         assert_eq!(
-            outcome_label(false, Some(ErrorClass::Harness)),
+            outcome_label(false, Some(ErrorClass::Harness), None),
             "harness_error"
         );
         // A spawn/thread failure never reached a dispatch — no class at all.
         // Fail-closed: it must not masquerade as a model result.
-        assert_eq!(outcome_label(false, None), "harness_error");
+        assert_eq!(outcome_label(false, None, None), "harness_error");
     }
 
     // --- one test per parse-status signal line ---
