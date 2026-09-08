@@ -798,4 +798,16 @@ kind = "openai"
         "a run that ended at the tool-round cap must not report itself completed \
          — end_reason says RoundCap on the same line: {result}"
     );
+
+    // The contract line carries the SAME claim through a second derivation
+    // (`solve_contract::outcome_label`), so it can drift from `status` unless
+    // both are pinned. Asserted in the same relationship form — NOT against a
+    // literal value — so this stays correct under any naming the honesty fix
+    // chooses. `contract_from` also pins that exactly one contract record
+    // exists, so a run that emitted none cannot pass here.
+    let contract = contract_from(&events_path);
+    assert_ne!(
+        contract["outcome"], "completed",
+        "the contract record must not report a cap exit as completed either: {contract}"
+    );
 }
