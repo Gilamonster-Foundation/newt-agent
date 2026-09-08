@@ -836,6 +836,26 @@ pub enum Command {
         /// when absent — never fabricated.
         #[arg(long, value_name = "SHA256")]
         model_digest: Option<String>,
+        /// Inherit nothing: every frame is genesis, and the run is bit-for-bit
+        /// reproducible. The default, and the lane benchmarks run in — a run
+        /// that exhausts its round budget here has no continuation available by
+        /// construction, so a cap exit is a failure rather than a pause.
+        ///
+        /// Mutually exclusive with `--resume` / `--resume-from`. Unlike the
+        /// `--confined` / `--unsafe-host-exec` pair — where confinement wins
+        /// because one side is safe and the other is not — neither of these is
+        /// safer than the other. They are incompatible, so supplying both is
+        /// refused rather than resolved by precedence.
+        #[arg(long, conflicts_with_all = ["resume", "resume_from"])]
+        hermetic: bool,
+        /// Start a resumable chain. The run's frame may be named as the parent
+        /// of a later run, at the cost of the reproducibility `--hermetic` gives.
+        #[arg(long, conflicts_with = "hermetic")]
+        resume: bool,
+        /// Continue from a prior frame, named by its content id. Implies
+        /// `--resume`.
+        #[arg(long, value_name = "CID", conflicts_with = "hermetic")]
+        resume_from: Option<String>,
     },
     /// Print resolved config.
     Config,
@@ -1700,7 +1720,16 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             max_rounds,
             context_window,
             model_digest,
+            hermetic,
+            resume,
+            resume_from,
         } => {
+            // Refuse an illegal combination BEFORE any work starts. `clap`'s
+            // `conflicts_with` above already catches it at the terminal with a
+            // better message; this is the same rule where a non-CLI caller can
+            // reach it, so the two consumers cannot disagree about what is legal.
+            let launch = newt_launch::LaunchConfig::from_flags(hermetic, resume, resume_from)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             let code = solve::run(solve::SolveArgs {
                 cwd: cwd.unwrap_or_else(|| PathBuf::from(".")),
                 instruction_file,
@@ -1713,6 +1742,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 max_rounds,
                 context_window,
                 model_digest,
+                launch,
             })
             .await?;
             if code != 0 {

@@ -4279,6 +4279,7 @@ dependencies = [
  "newt-core",
  "newt-identity",
  "newt-inference",
+ "newt-launch",
  "newt-mcp-client",
  "newt-mcp-server",
  "newt-scheduler",

@@ -219,6 +219,11 @@ async fn fire_solve(
         unsafe_host_exec: false,
         confined: false,
         events: None,
+        // Hermetic: a timer fires an independent turn from a freshly written
+        // prompt file and has no prior frame to continue. Inheriting nothing is
+        // both correct here and the default, stated rather than defaulted so a
+        // future reader sees it was decided.
+        launch: newt_launch::LaunchConfig::default(),
         max_rounds: None,
         context_window: None,
         model_digest: None,
