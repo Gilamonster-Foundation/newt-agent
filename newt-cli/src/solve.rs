@@ -71,6 +71,12 @@ pub struct SolveArgs {
     /// flag). Wins over `--unsafe-host-exec`.
     pub confined: bool,
     pub events: Option<PathBuf>,
+    /// The validated continuity mode this run launched under.
+    ///
+    /// Already proved legal by `LaunchConfig::from_flags` at the call site, so
+    /// nothing here re-checks it. Carried rather than re-derived so the record
+    /// can state what the run could and could not inherit.
+    pub launch: newt_launch::LaunchConfig,
     pub max_rounds: Option<usize>,
     /// The served model's FULL context window (e.g. llama.cpp `--ctx-size`).
     /// Newt gates input at the tighter of `[context].input_ceiling_pct` and the
@@ -565,6 +571,19 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         "tool_calls": tool_calls,
         "write_calls": write_calls,
         "end_reason": end_reason,
+        // What this run could and could not inherit. A cap exit under
+        // `hermetic` is a failure — there was no continuation available by
+        // construction — while the same `end_reason` under `resume` may be a
+        // pause. Without this a reader cannot tell those apart, which is how a
+        // failure class gets attributed to the wrong cause.
+        //
+        // Deliberately on the solve_result line and NOT in the contract record:
+        // the record is parsed by gilamonster-bench with its own re-declared
+        // structs, and adding a field there needs the unknown-field question
+        // answered first (#2218). This line is newt's own.
+        "continuity": args.launch.continuity.as_str(),
+        "continuity_note": args.launch.describe(),
+        "resume_from": args.launch.continuity.parent_frame(),
         "trajectory": trajectory,
         "error": error,
     });

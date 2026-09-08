@@ -328,6 +328,9 @@ newt-mcp-client   = { path = "newt-mcp-client",   version = "=0.8.0" }
 newt-coder        = { path = "newt-coder",        version = "=0.8.0" }
 newt-identity     = { path = "newt-identity",     version = "=0.8.0" }
 newt-tuner        = { path = "crates/newt-tuner", version = "=0.8.0" }
+# Pinned to its own rc, not the workspace 0.8.0: this crate tracks a separate
+# lifecycle toward 0.0.1 and has an external consumer (pyO3). Bump as rcs land.
+newt-launch       = { path = "crates/newt-launch", version = "=0.0.1-rc.1" }
 newt-eval         = { path = "newt-eval",         version = "=0.8.0" }
 plugins-protocol  = { path = "plugins-protocol",  version = "=0.8.0" }
 
