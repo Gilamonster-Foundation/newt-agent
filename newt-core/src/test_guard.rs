@@ -50,6 +50,9 @@
 //!   same commands: an action marked by one test and never drained would be
 //!   attributed to the NEXT test's conversation, and a recorded CLI axis would
 //!   silently suppress another test's pin apply.
+//! - [`crate::posture::ActivePosture`]: the resolved permission clamp and
+//!   guidance shared by `/posture`, settings, and accepted turns. This is
+//!   distinct from the preference-action accumulator above.
 //!
 //! Plus the env vars below, which are *upstream* (model / backend selection →
 //! `ACTIVE_FAMILY`) or *downstream* (cognition wire emission) of the resolutions
@@ -104,6 +107,7 @@ pub struct GlobalSettingsGuard {
     cognition: Option<CognitionRuntimeSnapshot>,
     tenacity: Option<TenacityRuntimeSnapshot>,
     posture: Option<PreferenceRuntimeSnapshot>,
+    permission_posture: Option<crate::posture::ActivePosture>,
     env: Vec<(&'static str, Option<String>)>,
 }
 
@@ -133,6 +137,7 @@ impl GlobalSettingsGuard {
             cognition: Some(crate::cognition::snapshot_runtime_state()),
             tenacity: Some(crate::tenacity::snapshot_runtime_state()),
             posture: Some(crate::runtime::snapshot_runtime_state()),
+            permission_posture: crate::posture::active_posture(),
             env,
         }
     }
@@ -149,6 +154,7 @@ impl Drop for GlobalSettingsGuard {
         if let Some(snap) = self.posture.take() {
             crate::runtime::restore_runtime_state(snap);
         }
+        crate::posture::set_active_posture(self.permission_posture.take());
         for (k, v) in &self.env {
             // Still under this guard's own lock (it drops after us), and
             // `set_or_remove` re-takes it reentrantly on this same thread.

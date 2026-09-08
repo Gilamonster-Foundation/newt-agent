@@ -11,11 +11,10 @@
 //! caller still supplies `newt_skills::load_body_from` over the config-rooted
 //! search dirs, exactly as the `use_skill` tool resolves them.
 //!
-//! The value is a process-global under the #1850 lock, the same shape as
-//! `session_markdown_mode`, `session_operating_mode`,
-//! `session_compaction_trigger_policy` and `session_spill_lines`. A fifth
-//! spelling of "the operator pinned this for the session" is how they come to
-//! disagree.
+//! The value is a process-global mutex-protected binding. Settings and slash
+//! commands install it here; accepted turns clone one snapshot for guidance
+//! and enforcement. `GlobalSettingsGuard` restores the complete binding for
+//! tests, separately from the preference-action accumulator.
 
 use std::sync::Mutex;
 
@@ -123,8 +122,9 @@ static ACTIVE_POSTURE: Mutex<Option<ActivePosture>> = Mutex::new(None);
 
 /// Install (or clear, with `None`) the session's active posture.
 ///
-/// The ONE writer: `/posture`, `/settings posture` and a persona swap all land
-/// here, so the verb and the field cannot install different bindings.
+/// The ONE writer: `/posture` and `/settings posture` both land here, so the
+/// verb and the field cannot install different bindings. Persona changes keep
+/// the installed session binding.
 pub fn set_active_posture(posture: Option<ActivePosture>) {
     if let Ok(mut slot) = ACTIVE_POSTURE.lock() {
         *slot = posture;

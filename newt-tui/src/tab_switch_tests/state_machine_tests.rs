@@ -1709,9 +1709,7 @@ fn activation_is_history_independent_over_the_full_projected_state() {
 /// machinery" deserves better than a comment:
 ///
 /// 1. **By construction.** `TabSwitchCtx` has no authority, permission, or
-///    credential field. `active_posture` is a `run_chat` local the switch
-///    machinery cannot name, so no activation *can* mutate it — the code
-///    that would do so does not compile.
+///    credential field. The preference pin cannot carry a permission posture.
 /// 2. **By measurement.** A pin names backends and dials ONLY, so applying
 ///    one must leave every authority-relevant process global bit-identical.
 ///    This walks a full switch sequence and compares them exactly.
@@ -1734,6 +1732,16 @@ fn authority_state_is_bit_identical_across_any_switch_sequence() {
         .unwrap();
     h.open_tab_on(&mut tabs, &b);
 
+    // The permission binding is shared session state, not a conversation pin.
+    newt_core::posture::set_active_posture(Some(newt_core::posture::ActivePosture {
+        name: "locked".into(),
+        preset_name: "strict".into(),
+        clamp: newt_core::Caveats::default(),
+        clamp_summary: "deny writes".into(),
+        skill_body: Some("Inspect only.".into()),
+        framing: Some("Keep the session clamp across conversations.".into()),
+    }));
+
     // Everything authority-shaped that a switch could plausibly disturb.
     // Deliberately exact comparison — no "close enough" for security state.
     let authority = || {
@@ -1742,6 +1750,16 @@ fn authority_state_is_bit_identical_across_any_switch_sequence() {
             std::env::var(newt_core::denial_journal::DENIAL_JOURNAL_PATH_ENV).ok(),
             std::env::var("NEWT_POSTURE").ok(),
             std::env::var("NEWT_EPHEMERAL").ok(),
+            newt_core::posture::active_posture().map(|p| {
+                (
+                    p.name,
+                    p.preset_name,
+                    p.clamp,
+                    p.clamp_summary,
+                    p.skill_body,
+                    p.framing,
+                )
+            }),
         )
     };
     let before = authority();

@@ -1382,9 +1382,9 @@ fn session_body(
     // Model-selected working style while the human leaves `/mode auto`
     // active. Bound to the requesting conversation and never authority.
     let conversation_mode_states = ConversationModeStates::default();
-    // #307: the active `/posture` preset clamp (an authority FLOOR), if any.
-    // It persists across conversations for the life of this process.
-    let mut active_posture: Option<ActivePosture> = None;
+    // #307/#2009: one session binding shared by the verb, settings and turns.
+    // Clear only at session startup, not at conversation/persona boundaries.
+    newt_core::posture::set_active_posture(None);
     // Step 25.4 (#568): per-session Markdown override set by `/markdown on|off`.
     // `None` defers to `[tui].markdown`; `Some(b)` forces it for the session.
     // #1235: per-session live spill height. `None` follows `[tui].spill_lines`;
@@ -2930,7 +2930,9 @@ fn session_body(
                             lines.push(format!("active mode: {}", active_operating_mode.as_str()));
                             lines.push(format!(
                                 "active posture: {}",
-                                active_posture.as_ref().map_or("off", |p| p.name.as_str())
+                                newt_core::posture::active_posture()
+                                    .as_ref()
+                                    .map_or("off", |p| p.name.as_str())
                             ));
                             if let Some(path) = permission_log_path.as_deref() {
                                 lines.push(format!("permission log: {}", path.display()));
@@ -3159,7 +3161,7 @@ fn session_body(
                             prompt_permissions_enabled,
                             permission_log_path.as_deref(),
                             // #307: surface the active posture's preset clamp.
-                            active_posture.as_ref(),
+                            newt_core::posture::active_posture().as_ref(),
                         );
                         // #2009 PR10a / #1979: bare `/permissions` on a rich
                         // TTY opens the chooser, the way `/backends` does. It
@@ -3269,7 +3271,7 @@ fn session_body(
                     }
                     if slash_command == "posture" || slash_command.starts_with("posture ") {
                         let arg = slash_command.strip_prefix("posture").unwrap_or("").trim();
-                        handle_posture_command(arg, &cfg, &mut active_posture, color, verbose);
+                        handle_posture_command(arg, &cfg, color, verbose);
                         surface.save_history();
                         println!();
                         continue;
@@ -5551,7 +5553,7 @@ fn session_body(
                             &permission_state,
                             prompt_permissions_enabled,
                             permission_log_path.as_deref(),
-                            active_posture.as_ref(),
+                            newt_core::posture::active_posture().as_ref(),
                         );
                         if let Some(path) = permission_log_path.as_deref() {
                             permission_rows.push(String::new());
@@ -6339,6 +6341,10 @@ fn session_body(
                         }
                     }
 
+                    // Freeze one resolved binding for this accepted turn: its
+                    // guidance, dispatch caveats and grant clamp must agree.
+                    let turn_posture = newt_core::posture::active_posture();
+
                     // Prompt comprehension is deliberately after receipt
                     // creation (so every manifest has a durable origin) and
                     // before hardware discovery, retrieval, inference, or any
@@ -6790,7 +6796,7 @@ fn session_body(
                     let session_controls = session_control_prompt(
                         active_operating_mode,
                         turn_operating_mode,
-                        active_posture.as_ref(),
+                        turn_posture.as_ref(),
                     );
                     // Resolve the turn's authority before automatic Git metadata,
                     // not only before tool dispatch. The same value is the gate
@@ -6798,7 +6804,7 @@ fn session_body(
                     let turn_caveats = operating_mode_caveats(
                         turn_operating_mode,
                         meet_persona_caveats(
-                            effective_caveats(cap.caveats(), active_posture.as_ref()),
+                            effective_caveats(cap.caveats(), turn_posture.as_ref()),
                             active_persona.as_ref(),
                         ),
                     );
@@ -7167,7 +7173,7 @@ fn session_body(
                     // The active posture's optional clamp is threaded to the
                     // gate (re-clamps any session grant). A skill/framing-only
                     // compatibility binding is genuinely `None` here.
-                    let preset_clamp = active_posture
+                    let preset_clamp = turn_posture
                         .as_ref()
                         .and_then(ActivePosture::permission_clamp)
                         .cloned();
