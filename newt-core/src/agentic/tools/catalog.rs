@@ -1433,15 +1433,18 @@ pub(super) fn nearest_tool_name(name: &str) -> Option<&'static str> {
 /// catalog gets a path back instead of a dead end (Step 27.1). Kept
 /// `unknown tool: {name}`-prefixed so existing `starts_with` checks hold.
 pub(super) fn unknown_tool_message(name: &str) -> String {
-    const BASE: &str =
-        "run_command, read_file, write_file, edit_file, delete_file, list_dir, find, use_skill, web_fetch";
+    // DERIVED from `BASE_TOOL_NAMES`, not restated. The hand-written literal
+    // this replaces had already drifted: it listed nine of the ten base tools
+    // and omitted `request_permissions`, so the message a model reads when it
+    // has lost the catalog never mentioned the capability-grant path.
+    let base = BASE_TOOL_NAMES.join(", ");
     match nearest_tool_name(name) {
         Some(sugg) => format!(
             "unknown tool: {name}. Did you mean '{sugg}'? Available tools include: \
-             {BASE} (plus git and any memory/plan tools enabled this session)."
+             {base} (plus git and any memory/plan tools enabled this session)."
         ),
         None => format!(
-            "unknown tool: {name}. Available tools include: {BASE} (plus git and \
+            "unknown tool: {name}. Available tools include: {base} (plus git and \
              any memory/plan tools enabled this session)."
         ),
     }
