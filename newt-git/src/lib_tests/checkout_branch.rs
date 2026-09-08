@@ -8,8 +8,7 @@ fn checkout_creates_and_switches_to_a_new_branch() {
     let msg = eng.checkout(&GitCaveats::top(), "feat/y", true).unwrap();
     assert!(msg.contains("created and switched"), "{msg}");
     // The system git agrees HEAD now points at the new branch.
-    let out = Command::new("git")
-        .current_dir(dir.path())
+    let out = git_cmd(dir.path())
         .args(["symbolic-ref", "--short", "HEAD"])
         .output()
         .unwrap();
@@ -32,27 +31,14 @@ fn checkout_refuses_existing_branch_at_a_different_commit() {
     git(p, &["checkout", "-q", "-b", "ahead"]);
     std::fs::write(p.join("a.txt"), "v2\n").unwrap();
     git(p, &["add", "a.txt"]);
-    git(
-        p,
-        &[
-            "-c",
-            "user.name=T",
-            "-c",
-            "user.email=t@e.c",
-            "commit",
-            "-q",
-            "-m",
-            "c2",
-        ],
-    );
+    git(p, &["commit", "-q", "-m", "c2"]);
     git(p, &["checkout", "-q", "main"]);
     let eng = GitEngine::open(p, &Scope::All).unwrap();
     let err = eng
         .checkout(&GitCaveats::top(), "ahead", false)
         .unwrap_err();
     assert!(matches!(err, GitError::Refused(_)), "{err}");
-    let out = Command::new("git")
-        .current_dir(p)
+    let out = git_cmd(p)
         .args(["symbolic-ref", "--short", "HEAD"])
         .output()
         .unwrap();
@@ -72,8 +58,7 @@ fn branch_delete_removes_a_non_current_branch() {
     eng.branch(&GitCaveats::top(), "scratch").unwrap();
     let msg = eng.branch_delete(&GitCaveats::top(), "scratch").unwrap();
     assert_eq!(msg, "deleted branch 'scratch'");
-    let exists = Command::new("git")
-        .current_dir(dir.path())
+    let exists = git_cmd(dir.path())
         .args(["rev-parse", "--verify", "--quiet", "refs/heads/scratch"])
         .status()
         .unwrap()

@@ -50,8 +50,7 @@ fn branch_list_counts_ref_names_not_oids_and_respects_scope() {
         !out.contains("origin/HEAD") && !out.contains("not-a-branch"),
         "{out}"
     );
-    let oracle = Command::new("git")
-        .current_dir(p)
+    let oracle = git_cmd(p)
         .args([
             "for-each-ref",
             "--format=%(refname)%09%(symref)",
