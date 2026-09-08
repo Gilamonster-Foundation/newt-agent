@@ -1507,7 +1507,8 @@ a flat "unknown tool"; `git checkout` is advertised but unimplemented. Raising
 *productive*. Home: `newt-core::agentic` (benefits TUI + ACP). One PR per step,
 fully-mocked unit tier, coverage ratchet.
 
-- **27.1** — **Tool-alias resolution + corrective catalog feedback**
+- **27.1** — **COMPLETE (already shipped; see the status note below).**
+  **Tool-alias resolution + corrective catalog feedback**
   (`newt-core/src/agentic/tools.rs`). A `resolve_tool_alias` layer ahead of the
   dispatch match: compatible-arg aliases (`execute`/`exec`/`bash`/`shell`/… →
   `run_command`) rewrite and dispatch transparently; incompatible-arg aliases
@@ -1538,7 +1539,10 @@ fully-mocked unit tier, coverage ratchet.
   short-circuit exact repeats with a redirect nudge (mirrors the existing
   `read_only_rounds` nudge); presence-gate `run_command` out of the catalog when
   the shell is unavailable so the model isn't dangled a dead tool.
-- **27.4** — **Default-on `<plan>` + `<state>` for the local loadout + plan
+- **27.4** — **COMPLETE (already shipped; see the status note below). The
+  step text below is also STALE — it names tools that no longer exist and a
+  backend branch that was superseded; do not implement from it.**
+  **Default-on `<plan>` + `<state>` for the local loadout + plan
   nudge** (`newt-core/src/config.rs`, `newt-tui/src/lib.rs`). Make the Phase 26
   scratchpad + scheduled-plan features default-on for local/Ollama loadouts
   (cloud unchanged; explicit `[context.features]` still wins) and nudge
@@ -1549,7 +1553,124 @@ fully-mocked unit tier, coverage ratchet.
   ledger into the final summary; when rounds were hallucination/dead-tool
   dominated, say so rather than advising "raise max_tool_rounds".
 
-**Recommended order:** 27.1 → 27.2 → 27.4 → 27.3 → 27.5. Each step carries the
+### Status correction (2026-09-07) — measurement against the premise
+
+Phase 27's premise is the nemotron-3-nano forensics, where hallucinated tool
+names were the dominant failure. That forensic record is real and weak local
+models remain a first-class target. What is corrected here is the *estimate of
+what is left to build*. This corrects those estimates; it does not rescope the
+goal.
+
+Each row below records what was verified about one step, with the commit that
+establishes it. Rows are not explained by a common cause: earlier drafts of this
+note proposed three successive unifying accounts of *why* Phase 27 decayed
+("written against a codebase that moved", a mis-attributed superseding issue,
+and a "born stale" claim) and all three were refuted on review. The operational
+facts survived every check; the explanations did not. So no account of the decay
+is offered here — where two rows share no demonstrated common cause, they sit
+side by side unexplained.
+
+**One method note, because it is checkable rather than explanatory:**
+`git log -S'<symbol>' --pretty='%h %ad %s' --date=short` answers "when did this
+arrive" in one command, and would have settled several of the claims above
+before they were written.
+
+Rows below are in roadmap order, NOT ranked by importance. They are not of
+equal weight — the `solve`-wiring row is an inactive code path while the others
+are misleading sentences — but ordering them by value is a judgement about what
+counts as important, which is an operator's call and has not been made. Read
+them as a list, not a ranking.
+
+- **27.1 is COMPLETE — it shipped WITH the bullet that describes it, in
+  `7161c317` (#609), and was never ticked.** *(traced by reading.)* Every
+  element the step describes exists and is wired ahead of the dispatch match:
+  `resolve_tool_alias` and `AliasOutcome`
+  (`newt-core/src/agentic/tools/catalog.rs`), called from three production
+  sites in `tools.rs` (1834, 2414, 2499) and two in `catalog.rs`
+  (`is_context_remaining_call`, `classify_phantom_reach`); the corrective
+  `unknown_tool_message` with a Levenshtein `nearest_tool_name` suggestion,
+  reached by the dispatch fallthrough arm; and `ALL_TOOL_NAMES` derived from
+  `BASE_TOOL_NAMES` + `EXTENDED_TOOL_REGISTRY` as the single source of truth
+  for `is_hallucination`, pinned bidirectionally by
+  `tools_tests/helper_catalog.rs`. Coverage is 16 tests in
+  `tools_tests/execute_aliases.rs`. The alias table spans roughly 14 families,
+  well beyond the names the step enumerates.
+  **What remained was one drift defect, fixed alongside this note** (a control
+  test was run red-then-green; the output is not reproduced in this document,
+  so treat this line as a pointer — the evidence lives in #2217)**:**
+  `unknown_tool_message` restated its catalog as a string literal instead of
+  deriving it, and had already drifted — nine of the ten base tools, silently
+  omitting `request_permissions`. Scope, stated precisely: base tools carry no
+  gate and `classify` makes them `ExposureClass::Kernel`, which exposure never
+  drops, so `request_permissions` was advertised in **every** build and
+  remained callable. The omission degraded only the recovery hint — the
+  message a model reads once it has already lost the catalog did not mention
+  the capability-grant path.
+
+- **27.3's dup-guard half is already implemented; its presence-gate half is
+  not.** *(traced by reading; commit date derived from `git show`.)*
+  `64d7b0f2` (#928, 2026-07-04) landed the repeat-call guard, and the
+  identical-failed-call tracker with its redirect nudge lives in
+  `newt-core/src/agentic/mod.rs`. No shell-availability gate exists anywhere in
+  `newt-core` or `newt-cli`. A constraint for whoever takes the remaining half:
+  ten alias names rewrite to `run_command`, so gating it out of
+  `ALL_TOOL_NAMES` would strand them on a name `is_hallucination` then rejects.
+
+- **27.4 is COMPLETE, and separately its TEXT is STALE — the two are different
+  defects and must not be merged into one sentence.** *(derived — read from
+  `git show` / `git log -S` output; traced by the 27.4 lane and re-verified
+  here.)*
+  *It is complete*: `5cd3257a` (#612,
+  2026-06-23 17:33:17 — ten seconds after the bullet, same push) implemented
+  both halves including the plan nudge. Never ticked. Do not build it.
+  *The text is separately falsified*, which 27.1's is not: `e384bef7` (#715
+  PR2 / #736, 2026-06-29) removed the `plan_set` / `plan_advance` the bullet
+  names, six days after it was written; `7a8d176e` (#984, 2026-07-07) made
+  `base_for` ignore its `BackendKind` argument (`_kind`, with the doc comment
+  "defaults no longer branch on it"), superseding the backend branch the bullet
+  describes, two weeks after. A stale comment at `newt-tui/src/lib.rs:8085`
+  still asserts the superseded behaviour and is labelled "Step 27.4"; it was
+  added by #612 itself and falsified by #984, not left behind by a later
+  change. **Cite the commit `7a8d176e` / #984 for the supersession — NOT #727**,
+  which is only the rationale issue named in a code comment; that conflation
+  travelled through two lanes and an operator brief before anyone checked it.
+
+- **The `solve` path never had the plan/scratchpad ledger wired in at all.**
+  *(traced by reading, not executed.)* `TurnDriverConfig` carries no feature
+  field; `apply_context_config` (`newt-cli/src/solve.rs:147`) does not copy
+  `ContextConfig::features` — `features` appears zero times in `solve.rs`; and
+  `driver.rs:583/584/604` hardcode `scratchpad: false`, `scratchpad_store:
+  None`, `step_ledger: None`. This differs in kind from the rows around it:
+  those are sentences that mislead a reader, this is an inactive feature set on
+  the path `newt solve`, the eval harness, `newt-acp-worker`, and
+  newt-as-a-wyvern-worker all take.
+  **The limit of this claim, stated in the same breath as the claim:** it
+  establishes the ledger was never live on that path. It does **not** establish
+  that a live ledger would have prevented #2212's wasted calls — those were
+  successful `text_search` / `read_file`, and nobody has re-run that task with
+  features on. The gap is traced; the causal story is *believed*.
+
+- **27.5 was the one row whose premise survived contact — and it is now
+  FIXED.** *(Evidence lives in #2215 and #2216, not in this document. #2216's
+  gate is reported to have been proven sensitive against the pre-fix commit
+  rather than merely observed green after it — that is the grade the register
+  asks for, and it is cited here, not confirmed here.)* It was a real defect (#2212): `outcome` and `status` were computed
+  from the absence of an error, and a round-cap exit is not an error, so a run
+  that exhausted its rounds reported itself completed. #2215 landed the fix —
+  `solve_contract::outcome_label` now takes `end_reason` and matches it
+  exhaustively, and `status` is derived from the outcome via `status_label`
+  rather than computed beside it, so the two fields cannot drift again. This
+  row is the phase's success case, not its failure: the one step whose premise
+  held was actionable and got acted on.
+
+Re-measure a Phase 27 step against the code before building it.
+
+**Recommended order:** 27.2 → 27.3. **27.1 and 27.4 are struck: both
+are COMPLETE** (each shipped in the same push as its own bullet and was never
+ticked — see the status note above). **27.5 is also done**, fixed by #2215, and
+is kept out of the sequence for that reason. **27.3 remains available work**;
+its dup-guard half is already done, so only the presence-gate half is open.
+Each remaining step carries the
 acceptance contract (What / Test plan / Out of scope), wiremock'd Ollama mocks,
 in-memory store fakes, and the coverage ratchet. A `newt-eval` BAT/UAT case
 replays the real failing scenario ("persist context settings, then create the

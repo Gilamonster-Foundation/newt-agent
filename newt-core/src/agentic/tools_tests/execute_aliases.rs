@@ -298,6 +298,38 @@ fn unknown_tool_message_names_catalog_and_suggestion() {
     assert!(m2.contains("Available tools include:"), "{m2}");
 }
 
+/// Guards against REINTRODUCING a hand-written catalog literal. That is the
+/// whole of what this test claims — read the limits below before trusting it.
+///
+/// **This assertion is tautological against the current implementation.** Both
+/// sides read `BASE_TOOL_NAMES`: the message joins it, and this test iterates
+/// it. So long as the derivation stands, this cannot fail, and it is asserting
+/// a property of `join()` rather than a property of the catalog. A new base
+/// tool is covered by the *derivation*, not by this test — nothing here would
+/// notice if the derivation were correct but the tool were wrong.
+///
+/// It earns its place only on the one path where it CAN fail: someone replaces
+/// the derivation with a literal again, as the code it was written against did.
+/// Then the two sides diverge and this fails. That is a real regression to
+/// guard, and it is the only one.
+///
+/// Historical note — the drift it was written to catch: the message hand-listed
+/// nine of the ten base tools and omitted `request_permissions`, the tool a
+/// model needs after a `capability denied` result. The omission was
+/// unconditional (base tools carry no gate and `classify` makes them
+/// `ExposureClass::Kernel`, which exposure never drops), so it degraded only
+/// this recovery hint, never the advertised catalog.
+#[test]
+fn unknown_tool_message_names_every_base_tool() {
+    let m = unknown_tool_message("zzzzzzzzzzzz");
+    for t in BASE_TOOL_NAMES {
+        assert!(
+            m.contains(t),
+            "corrective catalog omits base tool `{t}`: {m}"
+        );
+    }
+}
+
 /// An incompatible-arg alias is corrected (not dead-ended) by execute_tool:
 /// a model that emits `str_replace_editor` is told to use edit_file. The
 /// correction returns before any fs/caveat work, so this is deterministic.
