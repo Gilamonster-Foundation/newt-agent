@@ -266,6 +266,10 @@ green before opening any PR.
   failure you could fix quickly (run `just check` locally when you can). When
   #1098 lands a fast, changed-code-only hook, delete this exception —
   `--no-verify` is forbidden again. If a check fails, fix the issue.
+  **The hook fires on every ref update, not just on pushing code** — including
+  `git push origin --delete <branch>`, which will sit in a full workspace build
+  to delete a merged branch, with no output to say why. `--no-verify` belongs on
+  those too.
 - One step per PR. Don't bundle "Step 0.2 + 0.3 because they're
   related" unless the bundle is itself explicitly authorized.
 - The PR body must include "What this PR does", "Test plan", and
