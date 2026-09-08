@@ -62,7 +62,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use newt_core::cognition::{cli_cognition, CognitionOverride};
-use newt_core::role_profile::Cognition;
+use newt_core::role_profile::{Cognition, PersonalityLevel, PersonalityTrait, PersonalityTraits};
 use newt_core::tenacity::{cli_tenacity, Tenacity};
 
 /// The cognition dial's ladder of OVERRIDE positions (auto/inherit → off → levels).
@@ -93,9 +93,20 @@ enum Row {
     Model,
     Cognition,
     Tenacity,
+    Personality(PersonalityTrait),
 }
 
-const ROWS: [Row; 4] = [Row::Persona, Row::Model, Row::Cognition, Row::Tenacity];
+const ROWS: [Row; 9] = [
+    Row::Persona,
+    Row::Model,
+    Row::Cognition,
+    Row::Tenacity,
+    Row::Personality(PersonalityTrait::Agreeableness),
+    Row::Personality(PersonalityTrait::Extraversion),
+    Row::Personality(PersonalityTrait::Warmth),
+    Row::Personality(PersonalityTrait::Approachability),
+    Row::Personality(PersonalityTrait::ProsocialBehavior),
+];
 
 /// One entry in the model spinner (#1666): a model the active backend serves,
 /// plus its cached conformance tag (the same symbol `/models` prints; empty
@@ -127,6 +138,8 @@ pub(crate) struct PanelSeed {
     pub base_tenacity: Tenacity,
     pub models: Option<Vec<ModelChoice>>,
     pub current_model: String,
+    /// Raw overrides owned by the active tab, not a cached persona profile.
+    pub personality: PersonalityTraits,
 }
 
 /// A value the operator may have changed: `Inherit` (untouched — do NOT write) or
@@ -159,16 +172,41 @@ enum Mode {
     Command(String),
 }
 
-/// A persona the panel can select, with the declarations needed to PROJECT its
-/// effective posture (review-3 §3). Built by the caller from each persona's role
-/// profile; `None` fields mean the persona inherits that dial.
+/// A persona the panel can select. Retain the loaded profile so saving a dial
+/// change preserves its prompt and restrictions. `None` is an unavailable
+/// active persona, which remains selectable but cannot safely be saved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PersonaChoice {
     pub name: String,
-    pub cognition: Option<Cognition>,
-    pub tenacity: Option<Tenacity>,
-    pub backend: Option<String>,
-    pub crew: Option<bool>,
+    pub profile: Option<newt_core::RoleProfile>,
+}
+
+impl From<crate::Persona> for PersonaChoice {
+    fn from(persona: crate::Persona) -> Self {
+        Self {
+            name: persona.name,
+            profile: Some(persona.profile),
+        }
+    }
+}
+
+impl PersonaChoice {
+    /// Preview the profile actually active in this session, even if its file
+    /// changed or disappeared. Other choices remain the freshly loaded ones.
+    pub(crate) fn for_panel(
+        loaded: Vec<crate::Persona>,
+        active: Option<&crate::Persona>,
+    ) -> Vec<Self> {
+        let mut choices: Vec<Self> = loaded.into_iter().map(Self::from).collect();
+        if let Some(active) = active {
+            if let Some(choice) = choices.iter_mut().find(|p| p.name == active.name) {
+                *choice = active.clone().into();
+            } else {
+                choices.push(active.clone().into());
+            }
+        }
+        choices
+    }
 }
 
 /// What the operator chose to do with the persona selector.
@@ -211,6 +249,9 @@ pub(crate) enum PanelOutcome {
     Applied {
         persona: PersonaAction,
         model: Option<String>,
+        /// Only edited axes. An untouched old override must not be resurrected
+        /// if the persona action starts a new conversation before application.
+        personality: Vec<(PersonalityTrait, Option<PersonalityLevel>)>,
     },
     /// `:w` then cancel: the file was persisted, but dials were NOT applied.
     Saved { name: String },
@@ -220,6 +261,7 @@ pub(crate) enum PanelOutcome {
         name: String,
         persona: PersonaAction,
         model: Option<String>,
+        personality: Vec<(PersonalityTrait, Option<PersonalityLevel>)>,
     },
 }
 
@@ -241,6 +283,7 @@ pub(crate) struct PanelState {
     current_persona: Option<String>,
     cognition: Dial<CognitionOverride>,
     tenacity: Dial<Option<Tenacity>>,
+    personality: [Dial<Option<PersonalityLevel>>; 5],
     /// The active backend's served models (#1666); `None` = the backend could
     /// not be listed when the panel opened — the row renders but won't dial.
     model_opts: Option<Vec<ModelChoice>>,
@@ -279,6 +322,7 @@ impl PanelState {
             base_tenacity,
             models,
             current_model,
+            personality,
         } = seed;
         let current_model = current_model.as_str();
         // Same guarantee as the persona ghost below (#1666): the ACTIVE model is
@@ -309,10 +353,7 @@ impl PanelState {
             if !personas.iter().any(|p| &p.name == cur) {
                 personas.push(PersonaChoice {
                     name: cur.clone(),
-                    cognition: None,
-                    tenacity: None,
-                    backend: None,
-                    crew: None,
+                    profile: None,
                 });
             }
         }
@@ -332,6 +373,7 @@ impl PanelState {
             current_persona,
             cognition: Dial::Inherit(cli_cognition()),
             tenacity: Dial::Inherit(cli_tenacity()),
+            personality: PersonalityTrait::ALL.map(|kind| Dial::Inherit(personality.get(kind))),
             model_opts,
             model: Dial::Inherit(model_idx),
             current_model: current_model.to_string(),
@@ -385,6 +427,19 @@ impl PanelState {
                     .position(|t| *t == self.tenacity.value())
                     .unwrap_or(0);
                 self.tenacity.set(ladder[clamp_step(i, dir, ladder.len())]);
+            }
+            Row::Personality(kind) => {
+                let (_, dial) = PersonalityTrait::ALL
+                    .into_iter()
+                    .zip(self.personality.iter_mut())
+                    .find(|(candidate, _)| *candidate == kind)
+                    .expect("every personality row has one dial");
+                let at = dial.value().map_or(0, |level| usize::from(level.get()) + 1);
+                let next = clamp_step(at, dir, 102); // auto, then 0..=100
+                dial.set((next > 0).then(|| {
+                    PersonalityLevel::try_from((next - 1) as u8)
+                        .expect("clamped personality position")
+                }));
             }
         }
     }
@@ -451,6 +506,7 @@ impl PanelState {
         !self.cognition.is_dirty()
             && !self.tenacity.is_dirty()
             && !self.model.is_dirty()
+            && !self.personality.iter().any(|dial| dial.is_dirty())
             && self.persona_action() == PersonaAction::Keep
     }
 
@@ -467,6 +523,17 @@ impl PanelState {
             .as_ref()
             .and_then(|opts| opts.get(self.model.value()))
             .map(|m| m.name.clone())
+    }
+
+    fn chosen_personality(&self) -> Vec<(PersonalityTrait, Option<PersonalityLevel>)> {
+        PersonalityTrait::ALL
+            .into_iter()
+            .zip(self.personality)
+            .filter_map(|(kind, dial)| match dial {
+                Dial::Set(level) => Some((kind, level)),
+                Dial::Inherit(_) => None,
+            })
+            .collect()
     }
 
     fn model_label(&self) -> String {
@@ -496,6 +563,10 @@ impl PanelState {
         }
     }
 
+    fn selected_profile(&self) -> Option<&newt_core::RoleProfile> {
+        self.selected_persona().and_then(|p| p.profile.as_ref())
+    }
+
     /// The cognition that WILL be in effect for the selected persona after Apply:
     /// an explicit override wins, else the selected persona's declared level, else
     /// none.
@@ -503,7 +574,7 @@ impl PanelState {
         match self.cognition.value() {
             CognitionOverride::Set(c) => Some(c),
             CognitionOverride::Off => None,
-            CognitionOverride::Unset => self.selected_persona().and_then(|p| p.cognition),
+            CognitionOverride::Unset => self.selected_profile().and_then(|p| p.cognition),
         }
     }
 
@@ -514,23 +585,39 @@ impl PanelState {
         match self.tenacity.value() {
             Some(t) => t,
             None => self
-                .selected_persona()
+                .selected_profile()
                 .and_then(|p| p.tenacity)
                 .unwrap_or(self.base_tenacity),
         }
     }
 
+    fn personality_overrides(&self) -> PersonalityTraits {
+        let clears_conversation = self.persona_action() == PersonaAction::Clear;
+        let mut traits = PersonalityTraits::default();
+        for (kind, dial) in PersonalityTrait::ALL.into_iter().zip(self.personality) {
+            if dial.is_dirty() || !clears_conversation {
+                traits.set(kind, dial.value());
+            }
+        }
+        traits
+    }
+
+    fn projected_personality(&self) -> PersonalityTraits {
+        self.personality_overrides()
+            .resolve(self.selected_profile().and_then(|p| p.personality))
+    }
+
     /// The backend that WILL be in effect: the selected persona's declared backend,
     /// else the operator baseline (what a no-backend persona reverts to on apply).
     fn projected_backend(&self) -> Option<String> {
-        self.selected_persona()
+        self.selected_profile()
             .and_then(|p| p.backend.clone())
             .or_else(|| self.backend.clone())
     }
 
     /// The crew launch gate that the selected persona declares, else the base.
     fn projected_crew(&self) -> bool {
-        self.selected_persona()
+        self.selected_profile()
             .and_then(|p| p.crew)
             .unwrap_or(self.base_crew)
     }
@@ -609,7 +696,13 @@ impl PanelState {
             self.status = Some("save needs a name: :w <name>".to_string());
             return false;
         }
-        let content = self.persona_content(&name);
+        let content = match self.persona_content(&name) {
+            Ok(content) => content,
+            Err(err) => {
+                self.status = Some(format!("save failed: {err}"));
+                return false;
+            }
+        };
         match persist(&name, &content, overwrite) {
             SaveResult::Saved { name } => {
                 self.status = Some(format!("saved persona '{name}'"));
@@ -643,27 +736,31 @@ impl PanelState {
         self.projected_tenacity()
     }
 
-    fn persona_content(&self, name: &str) -> String {
-        let mut s = String::from("+++\n");
-        s.push_str(&format!("role = \"{name}\"\n"));
-        if let Some(b) = self.projected_backend() {
-            s.push_str(&format!("backend = \"{b}\"\n"));
+    fn persona_content(&self, name: &str) -> anyhow::Result<String> {
+        let mut profile = match self.selected_persona() {
+            Some(persona) => persona.profile.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "persona '{}' is unavailable; its unknown profile cannot be saved",
+                    persona.name
+                )
+            })?,
+            None => newt_core::RoleProfile {
+                role: Some(name.to_string()),
+                prompt: format!(
+                    "# {name}\n\nSaved from the psyche panel — the dials above define this persona's posture."
+                ),
+                ..Default::default()
+            },
+        };
+        profile.backend = self.projected_backend();
+        profile.cognition = self.cognition_for_save();
+        profile.tenacity = Some(self.tenacity_for_save());
+        profile.crew = profile.crew.or_else(|| self.base_crew.then_some(true));
+        let personality = self.projected_personality();
+        if personality != PersonalityTraits::default() || profile.personality.is_some() {
+            profile.personality = Some(personality);
         }
-        if let Some(c) = self.cognition_for_save() {
-            s.push_str(&format!("cognition = \"{}\"\n", c.label()));
-        }
-        s.push_str(&format!(
-            "tenacity = \"{}\"\n",
-            self.tenacity_for_save().label()
-        ));
-        if self.projected_crew() {
-            s.push_str("crew = true\n");
-        }
-        s.push_str("+++\n\n");
-        s.push_str(&format!(
-            "# {name}\n\nSaved from the psyche panel — the dials above define this persona's posture.\n"
-        ));
-        s
+        profile.to_markdown()
     }
 
     // ── Rendering ────────────────────────────────────────────────────────
@@ -685,7 +782,7 @@ impl PanelState {
             Some(t) => (t.label().to_string(), "override".to_string()),
             None => {
                 let val = format!("auto → {}", self.projected_tenacity().label());
-                let from_persona = self.selected_persona().and_then(|p| p.tenacity).is_some();
+                let from_persona = self.selected_profile().and_then(|p| p.tenacity).is_some();
                 (val, self.inherit_provenance(from_persona))
             }
         }
@@ -716,7 +813,7 @@ impl PanelState {
     fn view_rows(&self) -> Vec<RowView> {
         let (cog_val, cog_prov) = self.cognition_cell();
         let (ten_val, ten_prov) = self.tenacity_cell();
-        vec![
+        let mut rows = vec![
             RowView {
                 label: "persona",
                 value: self.persona_label(),
@@ -766,12 +863,40 @@ impl PanelState {
                 selected: false,
                 editable: false,
             },
-        ]
+        ];
+        let overrides = self.personality_overrides();
+        let projected = self.projected_personality();
+        let traits = PersonalityTrait::ALL.into_iter().map(|kind| {
+            let (value, provenance) = match overrides.get(kind) {
+                Some(level) => (format!("{}/100", level.get()), "override".into()),
+                None => (
+                    format!(
+                        "auto → {}",
+                        projected.get(kind).map_or_else(
+                            || "unspecified".into(),
+                            |level| format!("{}/100", level.get())
+                        )
+                    ),
+                    self.inherit_provenance(projected.get(kind).is_some()),
+                ),
+            };
+            RowView {
+                label: kind.label(),
+                value,
+                provenance,
+                selected: ROWS[self.sel] == Row::Personality(kind),
+                editable: true,
+            }
+        });
+        rows.splice(4..4, traits);
+        rows
     }
 
     fn backend_provenance(&self) -> String {
         match self.selected_persona() {
-            Some(p) if p.backend.is_some() => format!("persona: {}", p.name),
+            Some(p) if p.profile.as_ref().is_some_and(|p| p.backend.is_some()) => {
+                format!("persona: {}", p.name)
+            }
             // No declared backend → the selection reverts to the operator baseline
             // on apply (NOT the outgoing persona's backend).
             _ => "base".to_string(),
@@ -779,7 +904,7 @@ impl PanelState {
     }
     fn crew_provenance(&self) -> String {
         match self.selected_persona() {
-            Some(p) if p.crew.is_some() => {
+            Some(p) if p.profile.as_ref().is_some_and(|p| p.crew.is_some()) => {
                 format!("declaration: {}; applies next launch", p.name)
             }
             _ => "current launch gate".to_string(),
@@ -827,8 +952,8 @@ pub(crate) fn clamp_step(i: usize, dir: i32, len: usize) -> usize {
     (i32::try_from(i).unwrap_or(i32::MAX) + dir).clamp(0, n) as usize
 }
 
-/// Bordered block (2) + six rows + a hint/command/status row.
-const PANEL_HEIGHT: u16 = 10;
+/// Editable rows + provider/crew, a footer, and the two border rows.
+const PANEL_HEIGHT: u16 = ROWS.len() as u16 + 5;
 
 fn draw(f: &mut ratatui::Frame, state: &PanelState) {
     let bottom = if let Mode::Command(buf) = &state.mode {
@@ -845,7 +970,7 @@ fn draw(f: &mut ratatui::Frame, state: &PanelState) {
         " psyche — operator dials ",
         &state.view_rows(),
         bottom,
-        11,
+        19,
         26,
     );
 }
@@ -874,8 +999,11 @@ pub(crate) fn render_panel(
         },
     );
 
+    let visible = usize::from(inner.height.saturating_sub(1));
+    let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
+    let top = crate::list_cursor::ListCursor::new(rows.len(), visible, selected).top();
     let mut lines: Vec<Line> = Vec::new();
-    for row in rows {
+    for row in rows.iter().skip(top).take(visible) {
         let marker = if row.selected { "❯ " } else { "  " };
         let name = format!("{marker}{:<label_w$}", row.label);
         let val = if row.selected && row.editable {
@@ -1053,13 +1181,19 @@ fn close_outcome(applied: bool, state: &PanelState) -> PanelOutcome {
         state.apply();
         let persona = state.persona_action();
         let model = state.chosen_model();
+        let personality = state.chosen_personality();
         match state.saved.clone() {
             Some(name) => PanelOutcome::SavedAndApplied {
                 name,
                 persona,
                 model,
+                personality,
             },
-            None => PanelOutcome::Applied { persona, model },
+            None => PanelOutcome::Applied {
+                persona,
+                model,
+                personality,
+            },
         }
     } else {
         match state.saved.clone() {
@@ -1173,6 +1307,103 @@ mod tests {
         );
     }
 
+    fn rendered_panel_lines(
+        rows: &[RowView],
+        bottom: Line<'static>,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_panel(frame, " panel ", rows, bottom.clone(), 10, 12))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn render_test_rows(selected: Option<usize>) -> Vec<RowView> {
+        [
+            "row-00", "row-01", "row-02", "row-03", "row-04", "row-05", "row-06", "row-07",
+            "row-08", "row-09", "row-10",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, label)| RowView {
+            label,
+            value: "value".into(),
+            provenance: String::new(),
+            selected: selected == Some(index),
+            editable: true,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn shared_panel_reveals_every_selected_row_and_keeps_the_exit_hint() {
+        for height in [4, 7, 14] {
+            for selected in 0..11 {
+                let rows = render_test_rows(Some(selected));
+                let lines = rendered_panel_lines(&rows, hint_line("Esc cancel"), 48, height);
+                let screen = lines.join("\n");
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.contains(&format!("❯ row-{selected:02}"))),
+                    "height={height}, selected={selected}:\n{screen}"
+                );
+                assert!(screen.contains("Esc cancel"), "{screen}");
+                assert_eq!(screen.matches('❯').count(), 1, "{screen}");
+            }
+        }
+    }
+
+    #[test]
+    fn shared_panel_keeps_command_and_status_footers_with_empty_or_unselected_rows() {
+        for rows in [
+            Vec::new(),
+            render_test_rows(None),
+            render_test_rows(Some(10)),
+        ] {
+            for height in [3, 7] {
+                for (bottom, expected) in [
+                    (command_line("w copy"), ":w copy▏"),
+                    (status_line("save refused"), "save refused"),
+                ] {
+                    let screen = rendered_panel_lines(&rows, bottom, 48, height).join("\n");
+                    assert!(screen.contains(expected), "height={height}:\n{screen}");
+                    if height == 3 {
+                        assert!(!screen.contains("row-"), "footer owns the only body row");
+                    } else if !rows.is_empty() && rows.iter().all(|row| !row.selected) {
+                        assert!(screen.contains("row-00"), "no selection starts at the top");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_panel_zero_and_tiny_rectangles_are_safe() {
+        for width in [0, 1, 2, 48] {
+            for height in 0..=3 {
+                for rows in [Vec::new(), render_test_rows(Some(10))] {
+                    let lines = rendered_panel_lines(&rows, hint_line("Esc cancel"), width, height);
+                    assert_eq!(lines.len(), usize::from(height));
+                    if width == 48 && height == 3 {
+                        assert!(lines[1].contains("Esc cancel"), "{lines:?}");
+                        assert!(!lines[1].contains("row-"), "footer precedes hidden rows");
+                    }
+                }
+            }
+        }
+    }
+
     fn choice(
         name: &str,
         cognition: Option<Cognition>,
@@ -1180,10 +1411,13 @@ mod tests {
     ) -> PersonaChoice {
         PersonaChoice {
             name: name.to_string(),
-            cognition,
-            tenacity,
-            backend: Some("sol".to_string()),
-            crew: None,
+            profile: Some(newt_core::RoleProfile {
+                prompt: format!("# {name}"),
+                cognition,
+                tenacity,
+                backend: Some("sol".to_string()),
+                ..Default::default()
+            }),
         }
     }
 
@@ -1212,6 +1446,7 @@ mod tests {
             base_tenacity: base_ten,
             models,
             current_model: current_model.to_string(),
+            personality: PersonalityTraits::default(),
         }
     }
 
@@ -1447,7 +1682,7 @@ mod tests {
         assert_eq!(s.run_command(&mut persist), None);
         assert_eq!(s.saved.as_deref(), Some("clone"));
         // The content passed to persist reproduces the projection.
-        let content = s.persona_content("clone");
+        let content = s.persona_content("clone").unwrap();
         let rp = newt_core::RoleProfile::parse(&content).unwrap();
         assert_eq!(rp.cognition, Some(Cognition::Contemplating));
         assert_eq!(rp.tenacity, Some(Tenacity::Relentless));
@@ -1463,6 +1698,438 @@ mod tests {
         assert!(s.persona_label().contains("ghost"));
         assert!(s.persona_label().contains("(active)"));
         assert_eq!(s.persona_action(), PersonaAction::Keep);
+    }
+
+    #[test]
+    fn saving_an_unavailable_persona_refuses_instead_of_replacing_its_unknown_profile() {
+        let _g = GlobalSettingsGuard::acquire();
+        let mut s = panel(Some("unavailable"), two_personas(), Tenacity::Standard);
+        let mut writes = 0;
+        let mut persist = |name: &str, _content: &str, _overwrite: bool| {
+            writes += 1;
+            SaveResult::Saved { name: name.into() }
+        };
+        s.begin_command("wq! unavailable");
+        assert_eq!(s.run_command(&mut persist), None, "keep the draft open");
+        assert_eq!(writes, 0, "unknown restrictions must never be overwritten");
+        assert!(s.saved.is_none());
+        assert!(s
+            .status
+            .as_deref()
+            .is_some_and(|s| s.contains("unavailable")));
+    }
+
+    #[test]
+    fn saved_persona_preserves_explicit_false_and_escapes_backend_names() {
+        let _g = GlobalSettingsGuard::acquire();
+        set_cli_cognition(CognitionOverride::Unset);
+        clear_cli_tenacity();
+        let backend = "local \"quoted\" \\ route";
+        let personas = vec![PersonaChoice {
+            name: "quiet".into(),
+            profile: Some(newt_core::RoleProfile {
+                prompt: "# Quiet".into(),
+                backend: Some(backend.into()),
+                crew: Some(false),
+                ..Default::default()
+            }),
+        }];
+        let s = panel(Some("quiet"), personas, Tenacity::Standard);
+        let saved = newt_core::RoleProfile::parse(&s.persona_content("quiet-copy").unwrap())
+            .expect("the panel must serialize valid TOML, including quoted values");
+        assert_eq!(saved.backend.as_deref(), Some(backend));
+        assert_eq!(
+            saved.crew,
+            Some(false),
+            "explicit false must not become inherit"
+        );
+    }
+
+    /// Grounds serialization refusal in the same real store used by panel
+    /// saves: even an explicit overwrite must not replace a valid restricted
+    /// persona with a document that the shared metadata reader cannot reload.
+    #[test]
+    #[serial_test::serial(real_fs)]
+    fn saving_invalid_metadata_never_overwrites_an_existing_persona() {
+        let _guard = GlobalSettingsGuard::acquire();
+        set_cli_cognition(CognitionOverride::Unset);
+        clear_cli_tenacity();
+        let original = "+++\ntools = [\"read_file\"]\n[caveats]\nfs_write = \"none\"\nexec = \"none\"\n+++\n\nKeep these restrictions and this prose.\n";
+        for (case, backend) in [
+            ("multiline fence", "first\n+++\nlast".to_string()),
+            (
+                "oversized header",
+                "x".repeat(newt_core::markup::MAX_ENVELOPE_BYTES + 1),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = crate::PersonaStore::new(tmp.path());
+            let path = store.save("protected", original, false).unwrap();
+            let before = store.load("protected").unwrap();
+            let mut state = panel(
+                Some("candidate"),
+                vec![PersonaChoice {
+                    name: "candidate".into(),
+                    profile: Some(newt_core::RoleProfile {
+                        prompt: "Candidate body remains in the draft.".into(),
+                        backend: Some(backend),
+                        ..Default::default()
+                    }),
+                }],
+                Tenacity::Standard,
+            );
+            let mut writes = 0;
+            let mut persist = |name: &str, content: &str, overwrite: bool| {
+                writes += 1;
+                match store.save(name, content, overwrite) {
+                    Ok(_) => SaveResult::Saved { name: name.into() },
+                    Err(err) => SaveResult::Failed(format!("{err:?}")),
+                }
+            };
+            state.begin_command("wq! protected");
+            let outcome = state.run_command(&mut persist);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original, "{case}");
+            assert_eq!(
+                writes, 0,
+                "invalid metadata must not reach persistence: {case}"
+            );
+            assert_eq!(outcome, None, "failed save keeps the draft open: {case}");
+            assert!(state.saved.is_none(), "{case}");
+            assert!(
+                state
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| s.contains("save failed")),
+                "{case}: {:?}",
+                state.status
+            );
+            assert_eq!(store.load("protected").unwrap(), before, "{case}");
+            assert_eq!(state.persona_action(), PersonaAction::Keep, "{case}");
+        }
+    }
+
+    /// Grounds the injected save tests in the real store and the same loaded-
+    /// persona conversion used by the chat loop: a save must preserve the body
+    /// and every restriction, not just the panel's projected dials.
+    #[test]
+    #[serial_test::serial(real_fs)]
+    fn saving_a_loaded_persona_preserves_its_full_restrictive_profile() {
+        let _g = GlobalSettingsGuard::acquire();
+        set_cli_cognition(CognitionOverride::Unset);
+        clear_cli_tenacity();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::PersonaStore::new(tmp.path());
+        let document = r#"+++
+role = "reviewer"
+tools = ["read_file"]
+skills = ["code-review"]
+model = "review-model"
+tier = "REVIEW"
+altitude = "coach"
+backend = "review-backend"
+cognition = "pondering"
+tenacity = "relaxed"
+crew = false
+
+[caveats]
+fs_read = ["src/"]
+fs_write = "none"
+exec = "none"
+net = "none"
+max_calls = 3
++++
+
+# Restricted reviewer
+
+Read the code and explain findings. Do not edit files or run commands.
+"#;
+        store.save("restricted", document, false).unwrap();
+        let original = store.load("restricted").unwrap();
+        let mut s = panel(
+            Some("restricted"),
+            vec![PersonaChoice::from(original.clone())],
+            Tenacity::Standard,
+        );
+        let mut persist = |name: &str, content: &str, overwrite: bool| match store
+            .save(name, content, overwrite)
+        {
+            Ok(_) => SaveResult::Saved { name: name.into() },
+            Err(err) => SaveResult::Failed(format!("{err:?}")),
+        };
+        s.begin_command("w restricted-copy");
+        assert_eq!(
+            s.run_command(&mut persist),
+            None,
+            "save alone does not apply"
+        );
+        assert_eq!(s.saved.as_deref(), Some("restricted-copy"));
+        let saved = store.load("restricted-copy").unwrap();
+        assert_eq!(saved.profile, original.profile);
+        assert_eq!(saved.prompt, original.prompt);
+        assert_eq!(store.load("restricted").unwrap(), original);
+    }
+
+    /// Grounds the full-posture save contract in the real persona store: a
+    /// style-only draft snapshots unrelated projected dials, but never drops
+    /// the source profile's prose or non-panel restriction metadata.
+    #[test]
+    #[serial_test::serial(real_fs)]
+    fn style_only_draft_save_snapshots_projected_posture_and_preserves_restrictions() {
+        let _g = GlobalSettingsGuard::acquire();
+        set_cli_cognition(CognitionOverride::Set(Cognition::Contemplating));
+        set_cli_tenacity(Tenacity::Relentless);
+        newt_core::process_env::set_var("NEWT_TEAM", "1");
+        let _ = newt_core::runtime::drain_preference_actions();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::PersonaStore::new(tmp.path());
+        let document = "+++\nrole = \"reviewer\"\ntools = [\"read_file\"]\n\
+            skills = [\"code-review\"]\nmodel = \"review-model\"\ntier = \"REVIEW\"\n\
+            altitude = \"coach\"\n[caveats]\nfs_read = [\"src/\"]\n\
+            fs_write = \"none\"\nexec = \"none\"\nnet = \"none\"\nmax_calls = 3\n\
+            +++\n\n# Sparse reviewer\n\nRead the code and explain findings without editing.\n";
+        let original_path = store.save("sparse", document, false).unwrap();
+        let original = store.load("sparse").unwrap();
+        assert!(original.profile.backend.is_none() && original.profile.crew.is_none());
+        assert!(original.profile.cognition.is_none() && original.profile.tenacity.is_none());
+        let mut s = panel(
+            Some("sparse"),
+            vec![PersonaChoice::from(original.clone())],
+            Tenacity::Standard,
+        );
+        for _ in 0..6 {
+            s.down(); // warmth: leave cognition, tenacity and model untouched
+        }
+        s.cycle(1); // auto -> explicit zero
+        assert_eq!(s.persona_action(), PersonaAction::Keep);
+        assert!(!s.cognition.is_dirty() && !s.tenacity.is_dirty() && !s.model.is_dirty());
+        let mut persist = |name: &str, content: &str, overwrite: bool| match store
+            .save(name, content, overwrite)
+        {
+            Ok(_) => SaveResult::Saved { name: name.into() },
+            Err(err) => SaveResult::Failed(format!("{err:?}")),
+        };
+        s.begin_command("w sparse-copy");
+        assert_eq!(
+            s.run_command(&mut persist),
+            None,
+            "save alone does not apply"
+        );
+        assert_eq!(s.saved.as_deref(), Some("sparse-copy"));
+        let mut expected = original.profile.clone();
+        expected.backend = Some("sol".into()); // the fixture's operator baseline
+        expected.cognition = Some(Cognition::Contemplating);
+        expected.tenacity = Some(Tenacity::Relentless);
+        expected.crew = Some(true);
+        expected.personality = Some(PersonalityTraits {
+            warmth: Some(PersonalityLevel::try_from(0).unwrap()),
+            ..Default::default()
+        });
+        let saved = store.load("sparse-copy").unwrap();
+        assert_eq!(
+            saved.profile, expected,
+            "only projected panel fields change"
+        );
+        assert_eq!(saved.prompt, original.prompt);
+        assert_eq!(std::fs::read_to_string(original_path).unwrap(), document);
+        assert_eq!(store.load("sparse").unwrap(), original);
+        assert_eq!(
+            cli_cognition(),
+            CognitionOverride::Set(Cognition::Contemplating)
+        );
+        assert_eq!(cli_tenacity(), Some(Tenacity::Relentless));
+        assert!(newt_core::runtime::drain_preference_actions().is_empty());
+    }
+
+    #[test]
+    fn personality_controls_are_independent_named_rows() {
+        let _g = GlobalSettingsGuard::acquire();
+        let s = panel(None, two_personas(), Tenacity::Standard);
+        let rows = s.view_rows();
+        for label in [
+            "agreeableness",
+            "extraversion",
+            "warmth",
+            "approachability",
+            "prosocial behavior",
+        ] {
+            let matches: Vec<_> = rows.iter().filter(|row| row.label == label).collect();
+            assert_eq!(matches.len(), 1, "one operator dial for {label}");
+            assert!(matches[0].editable, "{label} is an operator control");
+        }
+    }
+
+    #[test]
+    fn personality_panel_keeps_the_selected_dial_and_exit_hint_visible_when_short() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let _g = GlobalSettingsGuard::acquire();
+        let mut s = panel(None, two_personas(), Tenacity::Standard);
+        for _ in 0..8 {
+            s.down();
+        }
+        let mut term = Terminal::new(TestBackend::new(100, 7)).unwrap();
+        term.draw(|f| draw(f, &s)).unwrap();
+        let buf = term.backend().buffer();
+        let screen: String = buf.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(screen.contains("❯ prosocial behavior"), "{screen}");
+        assert!(screen.contains("Esc cancel"), "{screen}");
+    }
+
+    #[test]
+    fn personality_apply_returns_only_edited_axes_after_an_explicit_apply() {
+        use newt_core::role_profile::{PersonalityLevel, PersonalityTrait, PersonalityTraits};
+        let _g = GlobalSettingsGuard::acquire();
+        let mut initial = seed(None, two_personas(), Tenacity::Standard, None, "");
+        initial.personality = PersonalityTraits {
+            warmth: Some(PersonalityLevel::try_from(73).unwrap()),
+            ..Default::default()
+        };
+        let mut s = PanelState::new(initial);
+        assert_eq!(close_outcome(true, &s), PanelOutcome::Cancelled);
+        for _ in 0..4 {
+            s.down();
+        }
+        s.cycle(1);
+        assert_eq!(close_outcome(false, &s), PanelOutcome::Cancelled);
+        assert_eq!(
+            close_outcome(true, &s),
+            PanelOutcome::Applied {
+                persona: PersonaAction::Keep,
+                model: None,
+                personality: vec![(
+                    PersonalityTrait::Agreeableness,
+                    Some(PersonalityLevel::try_from(0).unwrap()),
+                )],
+            }
+        );
+    }
+
+    #[test]
+    fn personality_clear_does_not_reapply_untouched_overrides_to_the_new_conversation() {
+        use newt_core::role_profile::{PersonalityLevel, PersonalityTrait, PersonalityTraits};
+        let _g = GlobalSettingsGuard::acquire();
+        let mut initial = seed(Some("bob"), two_personas(), Tenacity::Standard, None, "");
+        initial.personality = PersonalityTraits {
+            warmth: Some(PersonalityLevel::try_from(73).unwrap()),
+            ..Default::default()
+        };
+        let mut s = PanelState::new(initial);
+        s.cycle(-1); // clear persona, which starts a new conversation
+        for _ in 0..4 {
+            s.down();
+        }
+        s.cycle(1);
+        assert_eq!(
+            close_outcome(true, &s),
+            PanelOutcome::Applied {
+                persona: PersonaAction::Clear,
+                model: None,
+                personality: vec![(
+                    PersonalityTrait::Agreeableness,
+                    Some(PersonalityLevel::try_from(0).unwrap()),
+                )],
+            }
+        );
+        let saved = newt_core::RoleProfile::parse(&s.persona_content("copy").unwrap()).unwrap();
+        assert_eq!(
+            saved.personality.unwrap().warmth,
+            None,
+            "the saved preview agrees with the new-conversation reset"
+        );
+    }
+
+    #[test]
+    fn personality_dials_save_each_axis_without_switching_persona_or_other_dials() {
+        use newt_core::role_profile::{PersonalityLevel, PersonalityTrait};
+        let _g = GlobalSettingsGuard::acquire();
+        set_cli_cognition(CognitionOverride::Unset);
+        clear_cli_tenacity();
+        for (index, kind) in PersonalityTrait::ALL.into_iter().enumerate() {
+            let mut s = panel(
+                Some("base"),
+                vec![choice("base", None, None)],
+                Tenacity::Standard,
+            );
+            for _ in 0..4 + index {
+                s.down();
+            }
+            s.cycle(1); // inherit -> explicit 0, never an implicit midpoint
+            assert_eq!(s.persona_action(), PersonaAction::Keep, "{}", kind.key());
+            assert!(!s.cognition.is_dirty() && !s.tenacity.is_dirty());
+            assert!(!s.is_noop(), "moving {} is an explicit edit", kind.key());
+            let saved = newt_core::RoleProfile::parse(&s.persona_content("copy").unwrap()).unwrap();
+            let traits = saved.personality.expect("save the projected style");
+            for other in PersonalityTrait::ALL {
+                let expected = (other == kind).then(|| PersonalityLevel::try_from(0).unwrap());
+                assert_eq!(
+                    traits.get(other),
+                    expected,
+                    "{} / {}",
+                    kind.key(),
+                    other.key()
+                );
+            }
+            assert_eq!(close_outcome(false, &s), PanelOutcome::Cancelled);
+        }
+    }
+
+    #[test]
+    fn personality_dial_projects_persona_inheritance_and_validated_endpoints() {
+        use newt_core::role_profile::{PersonalityLevel, PersonalityTrait};
+        let _g = GlobalSettingsGuard::acquire();
+        let profile = newt_core::RoleProfile::parse(
+            "+++\n[personality]\nagreeableness = 73\n+++\nKeep the review evidence-based.",
+        )
+        .unwrap();
+        let mut s = panel(
+            Some("reviewer"),
+            vec![PersonaChoice {
+                name: "reviewer".into(),
+                profile: Some(profile.clone()),
+            }],
+            Tenacity::Standard,
+        );
+        let saved = |s: &PanelState| {
+            newt_core::RoleProfile::parse(&s.persona_content("copy").unwrap()).unwrap()
+        };
+        assert_eq!(
+            saved(&s).personality,
+            profile.personality,
+            "untouched inherits"
+        );
+        for _ in 0..4 {
+            s.down();
+        }
+        s.cycle(1);
+        assert_eq!(
+            saved(&s)
+                .personality
+                .unwrap()
+                .get(PersonalityTrait::Agreeableness),
+            Some(PersonalityLevel::try_from(0).unwrap())
+        );
+        for _ in 0..110 {
+            s.cycle(1);
+        }
+        assert_eq!(
+            saved(&s)
+                .personality
+                .unwrap()
+                .get(PersonalityTrait::Agreeableness),
+            Some(PersonalityLevel::try_from(100).unwrap())
+        );
+        for _ in 0..110 {
+            s.cycle(-1);
+        }
+        assert_eq!(
+            saved(&s).personality,
+            profile.personality,
+            "inherit releases the override"
+        );
+        assert_eq!(
+            saved(&s).prompt,
+            profile.prompt,
+            "style edits retain the body"
+        );
     }
 
     #[test]
@@ -1518,6 +2185,7 @@ mod tests {
             PanelOutcome::Applied {
                 persona: PersonaAction::Keep,
                 model: Some("m3".to_string()),
+                personality: vec![],
             }
         );
         assert!(
@@ -1580,10 +2248,10 @@ mod tests {
         let _g = GlobalSettingsGuard::acquire();
         let personas = vec![PersonaChoice {
             name: "alice".to_string(),
-            cognition: None,
-            tenacity: None,
-            backend: None,
-            crew: None,
+            profile: Some(newt_core::RoleProfile {
+                prompt: "# Alice".into(),
+                ..Default::default()
+            }),
         }];
         let mut s = PanelState::new(seed(None, personas, Tenacity::Standard, None, ""));
         s.cycle(1); // none → alice
@@ -1773,6 +2441,7 @@ mod tests {
             PanelOutcome::Applied {
                 persona: PersonaAction::Keep,
                 model: None,
+                personality: vec![],
             }
         );
         assert_eq!(
@@ -1788,5 +2457,98 @@ mod tests {
 
         set_cli_cognition(CognitionOverride::Unset);
         set_cli_tenacity(Tenacity::Standard);
+    }
+
+    #[test]
+    fn panel_choices_use_the_loaded_active_profile_instead_of_changed_disk_content() {
+        let mut active = crate::test_persona("reviewer", "The loaded prompt.", "loaded.md".into());
+        active.profile.tools = Some(vec!["read_file".into()]);
+        active.profile.crew = Some(false);
+        let disk = crate::test_persona("reviewer", "A later disk edit.", "edited.md".into());
+        let other = crate::test_persona("writer", "Another persona.", "writer.md".into());
+
+        let choices = PersonaChoice::for_panel(vec![disk, other.clone()], Some(&active));
+
+        assert_eq!(choices.len(), 2, "the active name must not be duplicated");
+        assert_eq!(
+            choices.iter().find(|p| p.name == "reviewer"),
+            Some(&PersonaChoice::from(active)),
+            "Keep previews the profile already loaded by the chat loop"
+        );
+        assert_eq!(
+            choices.iter().find(|p| p.name == "writer"),
+            Some(&PersonaChoice::from(other)),
+            "unselected disk candidates remain unchanged"
+        );
+    }
+
+    /// Grounds the candidate-merge rule in a real save/reload: deleting the
+    /// source file does not make an already loaded, known profile a ghost.
+    #[test]
+    #[serial_test::serial(real_fs)]
+    fn panel_choices_keep_a_missing_but_loaded_active_persona_saveable() {
+        let _g = GlobalSettingsGuard::acquire();
+        set_cli_cognition(CognitionOverride::Unset);
+        clear_cli_tenacity();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::PersonaStore::new(tmp.path());
+        store
+            .save(
+                "reviewer",
+                r#"+++
+role = "reviewer"
+tools = ["read_file"]
+backend = "sol"
+tenacity = "standard"
+crew = false
+[caveats]
+fs_write = "none"
+exec = "none"
+net = "none"
+[personality]
+warmth = 73
++++
+
+Keep this loaded prompt and its restrictions.
+"#,
+                false,
+            )
+            .unwrap();
+        let active = store.load("reviewer").unwrap();
+        std::fs::remove_file(&active.path).unwrap();
+        assert!(store.load("reviewer").is_err(), "the source is absent");
+        let choices = PersonaChoice::for_panel(Vec::new(), Some(&active));
+        assert_eq!(choices, vec![PersonaChoice::from(active.clone())]);
+        let mut s = panel(Some("reviewer"), choices, Tenacity::Standard);
+        let mut persist = |name: &str, content: &str, overwrite: bool| match store
+            .save(name, content, overwrite)
+        {
+            Ok(_) => SaveResult::Saved { name: name.into() },
+            Err(err) => SaveResult::Failed(format!("{err:?}")),
+        };
+
+        s.begin_command("w reviewer-copy");
+        assert_eq!(s.run_command(&mut persist), None, "save is not Apply");
+        assert_eq!(s.saved.as_deref(), Some("reviewer-copy"));
+        let saved = store.load("reviewer-copy").unwrap();
+        assert_eq!(saved.profile, active.profile);
+        assert_eq!(saved.prompt, active.prompt);
+    }
+
+    #[test]
+    fn panel_choices_without_an_active_persona_preserve_all_loaded_candidates() {
+        let mut first = crate::test_persona("first", "First prompt.", "first.md".into());
+        first.profile.crew = Some(false);
+        let mut second = crate::test_persona("second", "Second prompt.", "second.md".into());
+        second.profile.tools = Some(vec!["read_file".into()]);
+        let expected = vec![
+            PersonaChoice::from(first.clone()),
+            PersonaChoice::from(second.clone()),
+        ];
+
+        assert_eq!(
+            PersonaChoice::for_panel(vec![first, second], None),
+            expected
+        );
     }
 }

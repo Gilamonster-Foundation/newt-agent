@@ -674,15 +674,13 @@ fn apply(field: Field, value: &str) -> Result<String, String> {
 /// Pure, so the whole decision is exercised with no filesystem: the write
 /// itself belongs to `settings_receipt::record`.
 fn change_for(
-    field: Field,
+    setting: &str,
     from: newt_core::settings_receipt::SettingValue,
     to: newt_core::settings_receipt::SettingValue,
     via: &str,
 ) -> Option<SettingChange> {
-    match crate::slash_registry::receipt_for(field.name()) {
-        crate::slash_registry::Receipt::Journal => {
-            Some(SettingChange::new(field.name(), from, to, via))
-        }
+    match crate::slash_registry::receipt_for(setting) {
+        crate::slash_registry::Receipt::Journal => Some(SettingChange::new(setting, from, to, via)),
         _ => None,
     }
 }
@@ -719,9 +717,23 @@ fn recorded<T>(
     via: &str,
     write: impl FnOnce() -> Result<T, String>,
 ) -> Result<(T, Option<SettingChange>), String> {
-    let from = field.value_now();
-    let applied = write()?;
-    let change = change_for(field, from, field.value_now(), via);
+    recorded_values(field.name(), field.value_now(), via, || {
+        let applied = write()?;
+        Ok((applied, field.value_now()))
+    })
+}
+
+/// Shared recorder for both process-owned fields and caller-owned tab state.
+/// A failed write produces no receipt; every successful write consults the
+/// same registry destination and stores the actual typed before/after values.
+fn recorded_values<T>(
+    setting: &str,
+    from: newt_core::settings_receipt::SettingValue,
+    via: &str,
+    write: impl FnOnce() -> Result<(T, newt_core::settings_receipt::SettingValue), String>,
+) -> Result<(T, Option<SettingChange>), String> {
+    let (applied, to) = write()?;
+    let change = change_for(setting, from, to, via);
     if let Some(change) = change.clone() {
         let _ = newt_core::settings_receipt::record(change);
     }
@@ -809,6 +821,31 @@ fn journalled_tenacity(
             Field::Tenacity.label(),
             Field::Tenacity.current()
         ))
+    })
+    .unwrap_or_else(|never| (never, None))
+}
+
+/// Apply only to the caller's active tab. Style cannot mark cognition,
+/// tenacity, model preferences or change capability-bearing persona metadata.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn apply_personality(
+    current: &mut newt_core::role_profile::PersonalityTraits,
+    next: newt_core::role_profile::PersonalityTraits,
+    via: &str,
+) -> String {
+    journalled_personality(current, next, via).0
+}
+
+#[cfg(feature = "rich-tui")]
+fn journalled_personality(
+    current: &mut newt_core::role_profile::PersonalityTraits,
+    next: newt_core::role_profile::PersonalityTraits,
+    via: &str,
+) -> (String, Option<SettingChange>) {
+    recorded_values("psyche", (*current).into(), via, || {
+        *current = next;
+        let to = newt_core::settings_receipt::SettingValue::from(*current);
+        Ok((format!("personality overrides: {to}"), to))
     })
     .unwrap_or_else(|never| (never, None))
 }
@@ -1512,7 +1549,7 @@ mod tests {
                 "/settings {} has no declared receipt destination",
                 field.name()
             );
-            assert!(change_for(*field, "a".into(), "b".into(), "/settings").is_some());
+            assert!(change_for(field.name(), "a".into(), "b".into(), "/settings").is_some());
         }
         // **Anti-vacuous.** If the column read `Journal` for everything,
         // reading it would prove nothing. `/setup` mutates and records no
@@ -1535,8 +1572,8 @@ mod tests {
     /// half of the event a reader cannot reconstruct from the resulting state.
     #[test]
     fn the_recorded_change_names_the_route_and_the_transition() {
-        let change =
-            change_for(Field::EditMode, "vi".into(), "emacs".into(), "/vi").expect("declared");
+        let change = change_for(Field::EditMode.name(), "vi".into(), "emacs".into(), "/vi")
+            .expect("declared");
         assert_eq!(change.setting, "edit-mode");
         assert_eq!(change.from.to_string(), "vi");
         assert_eq!(change.to.to_string(), "emacs");
@@ -1644,7 +1681,7 @@ mod tests {
         let from = Field::Rounds.value_now();
         apply(Field::Rounds, "320").expect("in range");
         let to = Field::Rounds.value_now();
-        let change = change_for(Field::Rounds, from, to, "/max-rounds").expect("declared");
+        let change = change_for(Field::Rounds.name(), from, to, "/max-rounds").expect("declared");
 
         let SettingValue::ToolRounds(after) = &change.to else {
             panic!("the cap was recorded as a bare token: {:?}", change.to);
@@ -1657,7 +1694,7 @@ mod tests {
         // Anti-vacuous: a token-valued field is still a token, so the branch
         // above is about `Rounds` and not about every field.
         let token = change_for(
-            Field::EditMode,
+            Field::EditMode.name(),
             Field::EditMode.value_now(),
             Field::EditMode.value_now(),
             "/vi",
@@ -1863,5 +1900,40 @@ mod tests {
         let notice = moved_notice("vi", Field::EditMode);
         assert!(notice.contains("/vi still works"), "{notice}");
         assert!(notice.contains("/settings edit-mode"), "{notice}");
+    }
+
+    #[cfg(feature = "rich-tui")]
+    #[test]
+    fn personality_apply_records_typed_override_and_inherit_without_pinning_other_dials() {
+        use newt_core::role_profile::{PersonalityLevel, PersonalityTraits};
+        use newt_core::settings_receipt::SettingValue;
+        let _g = newt_core::test_guard::GlobalSettingsGuard::acquire();
+        let _ = newt_core::runtime::drain_preference_actions();
+        let before_cognition = newt_core::cognition::cli_cognition();
+        let before_tenacity = newt_core::tenacity::cli_tenacity();
+        let mut current = PersonalityTraits::default();
+        let next = PersonalityTraits {
+            warmth: Some(PersonalityLevel::try_from(0).unwrap()),
+            ..Default::default()
+        };
+        let (_, receipt) = journalled_personality(&mut current, next, "/psyche edit");
+        assert_eq!(current, next);
+        let receipt = receipt.expect("psyche declares its journal destination");
+        assert_eq!(receipt.setting, "psyche");
+        assert_eq!(receipt.via, "/psyche edit");
+        assert_eq!(
+            receipt.from,
+            SettingValue::from(PersonalityTraits::default())
+        );
+        assert_eq!(receipt.to, SettingValue::from(next));
+        let (_, reset) =
+            journalled_personality(&mut current, PersonalityTraits::default(), "/psyche");
+        let reset = reset.unwrap();
+        assert_eq!(reset.from, SettingValue::from(next));
+        assert_eq!(reset.to, SettingValue::from(PersonalityTraits::default()));
+        assert_eq!(current, PersonalityTraits::default());
+        assert_eq!(newt_core::cognition::cli_cognition(), before_cognition);
+        assert_eq!(newt_core::tenacity::cli_tenacity(), before_tenacity);
+        assert!(newt_core::runtime::drain_preference_actions().is_empty());
     }
 }

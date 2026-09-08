@@ -24,6 +24,52 @@ fn normalize_persona_name_lowercases_and_validates() {
     assert!(normalize_persona_name("näme").is_err());
 }
 
+/// Real persona files ground the named-preset picker: seeding, loading and
+/// repeated startup use the same store as the TUI, never a demo-only catalog.
+#[test]
+fn named_personality_presets_have_five_traits_without_adding_authority() {
+    use newt_core::role_profile::PersonalityTrait;
+    let tmp = tempfile::tempdir().unwrap();
+    let store = PersonaStore::new(tmp.path());
+    store.ensure_defaults().unwrap();
+    let mut profiles = Vec::new();
+    for name in ["steady", "direct", "sociable"] {
+        let persona = store.load(name).expect("named style preset is seeded");
+        let profile = persona.profile;
+        let traits = profile.personality.expect("preset declares its style");
+        for kind in PersonalityTrait::ALL {
+            assert!(traits.get(kind).is_some(), "{name} declares {}", kind.key());
+        }
+        assert!(profile.tools.is_none() && profile.caveats.is_none());
+        assert!(profile.role.is_none() && profile.skills.is_none() && profile.altitude.is_none());
+        assert!(profile.backend.is_none() && profile.model.is_none() && profile.tier.is_none());
+        assert!(
+            profile.cognition.is_none() && profile.tenacity.is_none() && profile.crew.is_none()
+        );
+        profiles.push(traits);
+    }
+    assert_ne!(profiles[0], profiles[1]);
+    assert_ne!(profiles[1], profiles[2]);
+    assert_ne!(profiles[0], profiles[2]);
+}
+
+#[test]
+fn personality_default_seeding_never_overwrites_an_operator_owned_named_persona() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = PersonaStore::new(tmp.path());
+    let original =
+        "+++\ntools = [\"read_file\"]\n[personality]\nwarmth = 73\n+++\nMy own persona, unchanged.";
+    let path = tmp.path().join("steady.md");
+    fs::write(&path, original).unwrap();
+    store.ensure_defaults().unwrap();
+    store.ensure_defaults().unwrap();
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
+    assert_eq!(
+        store.load("steady").unwrap().profile,
+        newt_core::RoleProfile::parse(original).unwrap()
+    );
+}
+
 #[cfg(feature = "rich-tui")]
 #[test]
 fn persona_save_is_atomic_and_refuses_existing_without_overwrite() {
@@ -266,9 +312,10 @@ fn store_list_message_shows_none_when_all_personas_empty() {
     // Every persona file — including the shipped defaults — is empty. FR-16
     // per-file seeding SKIPS files that already exist (even empty ones), so
     // it doesn't refill them, and the listing is genuinely empty → (none).
-    for f in ["coder.md", "coach.md", "personal-assistant.md", "blank.md"] {
-        fs::write(dir.join(f), "").unwrap();
+    for &(name, _) in PersonaStore::DEFAULT_PERSONAS {
+        fs::write(dir.join(format!("{name}.md")), "").unwrap();
     }
+    fs::write(dir.join("blank.md"), "").unwrap();
     let store = PersonaStore::new(dir);
     let msg = store.list_message().unwrap();
     assert!(msg.contains("(none)"), "got: {msg}");

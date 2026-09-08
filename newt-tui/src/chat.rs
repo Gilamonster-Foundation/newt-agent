@@ -5654,21 +5654,17 @@ fn session_body(
                             // review-3 §3: hand the panel each persona's declarations
                             // so it can PROJECT the selected persona's effective
                             // posture, plus the config/family tenacity base.
-                            let personas: Vec<PersonaChoice> = persona_store
-                                .list()
-                                .map(|v| {
-                                    v.into_iter()
-                                        .filter_map(|s| persona_store.load(&s.name).ok())
-                                        .map(|p| PersonaChoice {
-                                            name: p.name.clone(),
-                                            cognition: p.profile.cognition,
-                                            tenacity: p.profile.tenacity,
-                                            backend: p.profile.backend.clone(),
-                                            crew: p.profile.crew,
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
+                            let personas = PersonaChoice::for_panel(
+                                persona_store
+                                    .list()
+                                    .map(|v| {
+                                        v.into_iter()
+                                            .filter_map(|s| persona_store.load(&s.name).ok())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                                active_persona.as_ref(),
+                            );
                             // review-3 §3: the projection fallback for a persona that
                             // declares no backend is the operator BASELINE — what
                             // apply_persona_backend reverts to — NOT the outgoing
@@ -5721,6 +5717,7 @@ fn session_body(
                                     current_persona,
                                     backend,
                                     base_tenacity,
+                                    personality: tabs.active().sidecar.personality,
                                     models: served_models,
                                     current_model: panel_choice
                                         .as_ref()
@@ -5737,18 +5734,28 @@ fn session_body(
                             // action, reroute the backend, route the model pick through
                             // the /model path, then report the committed posture from
                             // FRESH runtime state (never the working copy).
-                            let (persona_action, saved_name, chosen_model, applied) = match outcome
-                            {
-                                PanelOutcome::Cancelled => (None, None, None, false),
-                                PanelOutcome::Saved { name } => (None, Some(name), None, false),
-                                PanelOutcome::Applied { persona, model } => {
-                                    (Some(persona), None, model, true)
+                            let (
+                                persona_action,
+                                saved_name,
+                                chosen_model,
+                                personality_edits,
+                                applied,
+                            ) = match outcome {
+                                PanelOutcome::Cancelled => (None, None, None, vec![], false),
+                                PanelOutcome::Saved { name } => {
+                                    (None, Some(name), None, vec![], false)
                                 }
+                                PanelOutcome::Applied {
+                                    persona,
+                                    model,
+                                    personality,
+                                } => (Some(persona), None, model, personality, true),
                                 PanelOutcome::SavedAndApplied {
                                     name,
                                     persona,
                                     model,
-                                } => (Some(persona), Some(name), model, true),
+                                    personality,
+                                } => (Some(persona), Some(name), model, personality, true),
                             };
                             if let Some(name) = &saved_name {
                                 print_newt(&format!("saved persona '{name}'"), color, verbose);
@@ -5807,7 +5814,12 @@ fn session_body(
                                             &mut reset_ctx,
                                         ) {
                                             Ok(msg) => msg,
-                                            Err(e) => format!("error: {e}"),
+                                            Err(e) => {
+                                                print_newt(&format!("error: {e}"), color, verbose);
+                                                surface.save_history();
+                                                println!();
+                                                continue; // no style apply/receipt for a failed selection
+                                            }
                                         };
                                         if active_conversation_id != conversation_id_before {
                                             interrupted_objective = None;
@@ -5828,6 +5840,23 @@ fn session_body(
                                             verbose,
                                         );
                                     }
+                                }
+                                // A persona clear starts a new conversation. Reset
+                                // the tab before applying only the explicitly edited
+                                // axes; do not resurrect its old untouched overrides.
+                                tabs.active_mut().hold_conversation(&active_conversation_id);
+                                if !personality_edits.is_empty() {
+                                    let current = &mut tabs.active_mut().sidecar.personality;
+                                    let mut next = *current;
+                                    for (kind, level) in personality_edits {
+                                        next.set(kind, level);
+                                    }
+                                    let message = crate::settings_form::apply_personality(
+                                        current,
+                                        next,
+                                        psyche_route.unwrap_or("/psyche"),
+                                    );
+                                    print_newt(&message, color, verbose);
                                 }
                                 // #1666: the model pick goes through the /model
                                 // path — same #1122 served-validation gate, same
@@ -6778,6 +6807,20 @@ fn session_body(
                         workspace_state_block(workspace, &turn_caveats.fs_read),
                         runtime_context_block(&inf_model, &inf_url, inf_kind, &session_identity)
                     );
+                    // Resolve current tab overrides against the current persona
+                    // on every accepted turn. Never bake style into the frozen
+                    // system/history: switching or clearing a persona must not
+                    // leave an old block behind. Unspecified style adds no bytes.
+                    let communication_style = tabs
+                        .active()
+                        .sidecar
+                        .personality
+                        .resolve(active_persona.as_ref().and_then(|p| p.profile.personality))
+                        .prompt_block();
+                    if !communication_style.is_empty() {
+                        turn_system.push_str("\n\n");
+                        turn_system.push_str(&communication_style);
+                    }
                     if is_clarification_answer {
                         turn_system = format!(
                             "<clarification_context>\n\

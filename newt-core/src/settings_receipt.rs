@@ -41,6 +41,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use crate::role_profile::{PersonalityTrait, PersonalityTraits};
+
 /// Schema tag. Bumping it re-addresses every receipt, by construction.
 pub const SETTING_CHANGE_SCHEMA_V1: &str = "newt.setting-change/v1";
 
@@ -66,8 +68,9 @@ pub const RECEIPT_PATH_ENV: &str = "NEWT_SETTINGS_RECEIPTS";
 /// `#[serde(untagged)]` is load-bearing, not tidiness: a token serializes as a
 /// bare string, exactly as the plain `String` field it replaced did, so every
 /// receipt already written keeps parsing AND keeps its content address. The
-/// two variants are disjoint on the wire (a string versus an object), so the
-/// untagged read cannot go wrong.
+/// existing variants keep their wire shapes. Personality uses the validated
+/// trait record, whose optional levels preserve explicit zero versus inheritance;
+/// its known trait keys differ from the required tool-round derivation fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SettingValue {
@@ -75,6 +78,8 @@ pub enum SettingValue {
     Token(String),
     /// A tool-round cap AND the derivation that produced it (#1982).
     ToolRounds(crate::tenacity::ToolRoundLimit),
+    /// Operator-selected style axes, with unspecified levels left explicit.
+    Personality(PersonalityTraits),
 }
 
 impl From<&str> for SettingValue {
@@ -95,6 +100,12 @@ impl From<crate::tenacity::ToolRoundLimit> for SettingValue {
     }
 }
 
+impl From<PersonalityTraits> for SettingValue {
+    fn from(traits: PersonalityTraits) -> Self {
+        Self::Personality(traits)
+    }
+}
+
 impl std::fmt::Display for SettingValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -106,6 +117,21 @@ impl std::fmt::Display for SettingValue {
                 limit.source.as_str(),
                 limit.configured
             ),
+            Self::Personality(traits) => {
+                let values: Vec<_> = PersonalityTrait::ALL
+                    .into_iter()
+                    .filter_map(|kind| {
+                        traits
+                            .get(kind)
+                            .map(|level| format!("{}={}", kind.label(), level.get()))
+                    })
+                    .collect();
+                if values.is_empty() {
+                    f.write_str("inherit")
+                } else {
+                    f.write_str(&values.join(", "))
+                }
+            }
         }
     }
 }
@@ -434,6 +460,133 @@ mod tests {
             read[0].change.to.to_string(),
             "320 (from override, over a configured 40)"
         );
+    }
+
+    #[test]
+    fn a_personality_receipt_preserves_zero_inheritance_and_each_traits_identity() {
+        use crate::role_profile::{PersonalityLevel, PersonalityTrait, PersonalityTraits};
+
+        for kind in PersonalityTrait::ALL {
+            let inherited = PersonalityTraits::default();
+            let mut selected = inherited;
+            selected.set(kind, Some(PersonalityLevel::try_from(0).unwrap()));
+            let change = SettingChange::new("personality", inherited, selected, "/psyche");
+            let receipt = SettingReceipt::mint(change).unwrap();
+            let line = receipt.render_line().unwrap();
+            let wire: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert!(wire["change"]["from"].is_object());
+            assert!(wire["change"]["to"].is_object());
+            for candidate in PersonalityTrait::ALL {
+                assert!(wire["change"]["from"][candidate.key()].is_null());
+                if candidate == kind {
+                    assert_eq!(wire["change"]["to"][candidate.key()], 0);
+                } else {
+                    assert!(wire["change"]["to"][candidate.key()].is_null());
+                }
+            }
+            let decoded = read_jsonl(&line);
+            assert_eq!(decoded, vec![receipt.clone()]);
+            assert!(decoded[0].is_intact());
+            assert!(
+                matches!(decoded[0].change.to, SettingValue::Personality(value) if value == selected)
+            );
+            assert!(receipt
+                .change
+                .to
+                .to_string()
+                .contains(&format!("{}=0", kind.label())));
+            assert_eq!(receipt.change.from.to_string(), "inherit");
+
+            let mut edited = receipt.clone();
+            edited.change.to = SettingValue::Personality(inherited);
+            assert!(
+                !edited.is_intact(),
+                "clearing {} must change the content id",
+                kind.key()
+            );
+            let mut higher = selected;
+            higher.set(kind, Some(PersonalityLevel::try_from(100).unwrap()));
+            edited.change.to = SettingValue::Personality(higher);
+            assert!(
+                !edited.is_intact(),
+                "changing {} must change the content id",
+                kind.key()
+            );
+        }
+    }
+
+    #[test]
+    fn personality_receipt_values_validate_levels_instead_of_treating_them_as_tokens() {
+        use crate::role_profile::PersonalityTrait;
+
+        for kind in PersonalityTrait::ALL {
+            for level in [0, 50, 100] {
+                let wire = serde_json::json!({(kind.key()): level});
+                let decoded: SettingValue = serde_json::from_value(wire).unwrap();
+                assert!(
+                    matches!(decoded, SettingValue::Personality(traits) if traits.get(kind).unwrap().get() == level)
+                );
+            }
+            for invalid in [
+                serde_json::json!(-1),
+                serde_json::json!(101),
+                serde_json::json!(50.0),
+                serde_json::json!("50"),
+                serde_json::json!(true),
+                serde_json::json!([]),
+            ] {
+                assert!(serde_json::from_value::<SettingValue>(
+                    serde_json::json!({(kind.key()): invalid})
+                )
+                .is_err());
+            }
+        }
+        assert!(serde_json::from_value::<SettingValue>(serde_json::json!({"warmht": 50})).is_err());
+    }
+
+    /// The fixed pre-personality wire shapes still encode to the same canonical
+    /// bytes. A new tagged enum or renamed field would change their identities.
+    #[test]
+    fn legacy_token_and_round_receipts_keep_their_wire_shape_and_canonical_identity() {
+        let fixtures = [
+            (
+                "edit-mode",
+                serde_json::json!("vi"),
+                serde_json::json!("emacs"),
+                "/vi",
+            ),
+            (
+                "rounds",
+                serde_json::json!({"rounds":40,"source":"config","configured":40,"tenacity":null}),
+                serde_json::json!({"rounds":320,"source":"override","configured":40,"tenacity":"relentless"}),
+                "/rounds",
+            ),
+        ];
+        for (setting, from, to, via) in fixtures {
+            let wire = serde_json::json!({
+                "schema": "newt.setting-change/v1",
+                "setting": setting,
+                "from": from,
+                "to": to,
+                "via": via,
+                "ts_claim": "2026-01-01T00:00:00Z"
+            });
+            let canonical_before = canonical::to_canonical_dagcbor(&wire).unwrap();
+            let change: SettingChange = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&change).unwrap(), wire);
+            assert_eq!(change.canonical_form().unwrap(), canonical_before);
+            match setting {
+                "edit-mode" => assert!(matches!(change.to, SettingValue::Token(_))),
+                "rounds" => assert!(matches!(change.to, SettingValue::ToolRounds(_))),
+                _ => unreachable!(),
+            }
+            let receipt = SettingReceipt::mint(change).unwrap();
+            assert_eq!(
+                read_jsonl(&receipt.render_line().unwrap()),
+                vec![receipt.clone()]
+            );
+            assert!(receipt.is_intact());
+        }
     }
 
     /// The path is overridable, which is also how a caller keeps the journal
