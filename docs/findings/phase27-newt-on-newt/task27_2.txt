@@ -1,0 +1,54 @@
+Task: make the scoped read-only Git tool catalog conform to OpenAI strict
+function-calling, and make the branch-list parser treat a null scope the same as
+an omitted scope.
+
+This is roadmap step 27.2 in docs/ROADMAP.md. Work only in this repository.
+
+There are exactly three files to change. Do not change anything else.
+
+1. `newt-core/src/agentic/git_tool.rs`, in `read_only_definition()`.
+
+   OpenAI's strict function-calling contract requires:
+     - the function is marked strict
+     - `additionalProperties` is false (already true here)
+     - EVERY property listed in `properties` also appears in `required`
+     - a property that is semantically optional must therefore be expressed as
+       a NULLABLE type rather than by being left out of `required`
+
+   The tool exposes two properties: `op` and `scope`. `scope` is semantically
+   optional — omitting it means "all". Under strict, it must still be required,
+   and must accept null. So:
+     - mark the function strict
+     - give `scope` a type that permits a string OR null
+     - give `scope` an enum of its three legal values PLUS null
+     - make `required` list both `op` and `scope`
+
+2. `newt-git/src/lib.rs`, in `render_branch_list()`.
+
+   It currently maps an ABSENT `scope` argument to "all". Now that the schema
+   permits an explicit null, an explicit null must reach the same branch. A JSON
+   null must not fall through to whatever the absent/invalid path does.
+
+3. `newt-git/src/lib_tests/git_scope.rs` — add ONE test named exactly:
+
+     confined_act_branch_list_null_scope_matches_omitted_bounded_all
+
+   It must prove, against a REAL repository with at least one local branch and
+   one remote-tracking ref, that dispatching `branch-list` with scope omitted
+   and with scope explicitly null produce the SAME listing, and that this works
+   using only a bounded read grant for that repository — not ambient authority.
+   Follow the conventions already in that file for building the repo, the
+   session grant, and the dispatch call; do not invent new helpers.
+
+Constraints:
+- Do not weaken, delete, or rename any existing test.
+- Do not add a dependency.
+- Do not edit docs/ROADMAP.md.
+- Match the file's existing style.
+
+When done, run exactly this and make it pass:
+
+  cargo test -p newt-git --lib git_scope
+
+Report at the end: the three files you changed with a one-line description of
+each change, and the final test result line.
