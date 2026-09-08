@@ -575,3 +575,244 @@ api = "chat_completions"
     let contract = contract_from(&events_path);
     assert_eq!(contract["effective_config"]["cognition"], "default");
 }
+
+// ── Phase 27 BAT/UAT: the round-cap honesty gate ──────────────────────────
+//
+// Replays the SHAPE of the 2026-09-07 newt-on-newt run (issue #2212) against a
+// SCRIPTED model: writes land early, then the run grinds read-only calls until
+// the tool-round cap ends it. Measured from that trajectory — `edit_file` at
+// calls 25, 26 and 27 of 128, then 101 further calls with no write among them,
+// so 79% of the run happened after the work was done. It exited
+// `end_reason: Some(RoundCap)` and the summary line still said
+// `"status": "completed"`.
+//
+// THE ASSERTION IS ABOUT THE HARNESS, NOT THE MODEL. A model that over-elaborates
+// is not a defect this gate can fix. Reporting that run as `completed` is.
+//
+//   If the turn ended at the tool-round cap, the emitted summary must not
+//   report the run as completed.
+//
+// Both fields already exist and are already emitted — `TurnEndReason::RoundCap`
+// (newt-core/src/metrics.rs) and the solve_result line's `status`. So this gate
+// invents no vocabulary and binds no field that is still being designed: it
+// pins the RELATIONSHIP between two shipped fields. Whatever names the 27.5
+// honesty fix chooses, `status` must stop saying "completed" here.
+//
+// Deliberately ONE reason to be red. Naming the dominant failure mode
+// (write-complete-then-grind) needs a typed vocabulary that does not exist in
+// `TurnEndReason` or the solve contract today; asserting it as a substring of
+// prose would be a gate the fix could satisfy without fixing anything. That is
+// specified as a follow-up against #2212, not smuggled in here.
+//
+// Why real tools, not hallucinated ones: `resolve_tool_alias`
+// (agentic/tools/catalog.rs) may now correct an unknown name, and
+// `RepeatCallGuard` (agentic/mod.rs) short-circuits an EXACT repeat before
+// dispatch. This fixture therefore calls only real tools and gives every
+// read-only round a DISTINCT path, so the rounds are burned the way the
+// captured run burned them — by legitimate, succeeding, redundant work — and
+// not by a mechanism that already has its own guard.
+const CAP_ROUNDS: usize = 8;
+const EARLY_WRITES: usize = 3;
+
+/// Reads the ONE `solve_result` line. Sibling of [`contract_from`], which
+/// filters for the contract record; this filters for its complement.
+fn solve_result_from(path: &std::path::Path) -> serde_json::Value {
+    let raw = std::fs::read_to_string(path).expect("read solve events");
+    let mut results = raw
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event line is JSON"))
+        .filter(|record| record.get("kind").and_then(|k| k.as_str()) == Some("solve_result"));
+    let result = results.next().expect("one solve_result record");
+    assert!(results.next().is_none(), "exactly one solve_result record");
+    result
+}
+
+/// Writes on the first [`EARLY_WRITES`] rounds, then grinds distinct read-only
+/// calls forever — never volunteering a final answer.
+struct WritesEarlyThenGrindsReadOnly {
+    round: AtomicUsize,
+    rounds_served: Arc<AtomicUsize>,
+}
+
+impl Respond for WritesEarlyThenGrindsReadOnly {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("chat request is JSON");
+
+        // No tools advertised => this is the cap-exit summary request, not a
+        // tool round. Answer it plausibly: the point of the gate is that a
+        // WELL-FORMED summary is still reported dishonestly.
+        if body.get("tools").is_none() {
+            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": NEMOTRON_MODEL,
+                "choices": [{
+                    "message": {"role": "assistant", "content": "I made the three edits and verified them."},
+                    "finish_reason": "stop"
+                }]
+            }));
+        }
+
+        let n = self.rounds_served.fetch_add(1, Ordering::SeqCst);
+        let _ = self.round.fetch_add(1, Ordering::SeqCst);
+
+        let call = if n < EARLY_WRITES {
+            // The work itself — real writes, counted by `write_calls`.
+            serde_json::json!({
+                "id": format!("write_{n}"),
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": serde_json::to_string(&serde_json::json!({
+                        "path": format!("src/produced_{n}.rs"),
+                        "content": format!("pub const PRODUCED_{n}: u32 = {n};\n"),
+                    })).expect("write args serialize")
+                }
+            })
+        } else {
+            // The grind — succeeding, legitimate, redundant, and DISTINCT each
+            // round so the repeat guard does not absorb it.
+            serde_json::json!({
+                "id": format!("read_{n}"),
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": serde_json::to_string(&serde_json::json!({
+                        "path": format!("src/seed_{n}.rs"),
+                    })).expect("read args serialize")
+                }
+            })
+        };
+
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "model": NEMOTRON_MODEL,
+            "choices": [{
+                "message": {"role": "assistant", "content": null, "tool_calls": [call]},
+                "finish_reason": "tool_calls"
+            }]
+        }))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn round_cap_exit_is_not_reported_as_a_completed_run() {
+    let server = MockServer::start().await;
+    let rounds_served = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(WritesEarlyThenGrindsReadOnly {
+            round: AtomicUsize::new(0),
+            rounds_served: rounds_served.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace = tempfile::tempdir().expect("temporary solve workspace");
+    let src = workspace.path().join("src");
+    std::fs::create_dir_all(&src).expect("workspace src dir");
+    // One readable seed per grinding round, so every read SUCCEEDS. A grind
+    // made of failures would be a different defect (thrash), already covered by
+    // `uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit`.
+    for n in 0..(CAP_ROUNDS + 4) {
+        std::fs::write(
+            src.join(format!("seed_{n}.rs")),
+            format!("pub const SEED_{n}: u32 = {n};\n"),
+        )
+        .expect("write seed file");
+    }
+
+    let config_path = workspace.path().join("solve.toml");
+    let instruction_path = workspace.path().join("instruction.md");
+    let events_path = workspace.path().join("events.jsonl");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"default_backend = "capped"
+
+[[backends]]
+name = "capped"
+endpoint = "{}"
+model = "{NEMOTRON_MODEL}"
+kind = "openai"
+"#,
+            server.uri()
+        ),
+    )
+    .expect("write solve config");
+    std::fs::write(
+        &instruction_path,
+        "Add the three produced constants, then verify them.\n",
+    )
+    .expect("write solve instruction");
+
+    Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["solve", "--cwd"])
+        .arg(workspace.path())
+        .arg("--instruction-file")
+        .arg(&instruction_path)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", &CAP_ROUNDS.to_string()])
+        .assert()
+        .success();
+
+    let result = solve_result_from(&events_path);
+
+    // ── anti-vacuity ──────────────────────────────────────────────────────
+    // A replay harness that silently ran zero rounds must not be able to pass.
+    // Three INDEPENDENT counters: the scripted model's own count, the harness's
+    // dispatch count, and the early-write count that makes this THIS scenario
+    // rather than any capped run.
+    let served = rounds_served.load(Ordering::SeqCst);
+    assert_eq!(
+        served, CAP_ROUNDS,
+        "the scripted model must have served exactly {CAP_ROUNDS} tool rounds; \
+         served {served} — the replay did not run the trajectory it claims to"
+    );
+    assert_eq!(
+        result["tool_calls"], CAP_ROUNDS as u64,
+        "the harness must have dispatched every scripted round: {result}"
+    );
+    assert_eq!(
+        result["write_calls"], EARLY_WRITES as u64,
+        "the early-write half of the shape must have happened — without it this \
+         is a generic capped run, not the write-complete-then-grind case: {result}"
+    );
+
+    // ── the precondition ──────────────────────────────────────────────────
+    // If the run did not actually end at the cap, the fixture failed to
+    // reproduce the scenario and the honesty assertion below would be vacuous.
+    assert_eq!(
+        result["end_reason"], "Some(RoundCap)",
+        "fixture must reproduce a cap exit, else the honesty assertion is vacuous: {result}"
+    );
+
+    // ── the honesty clause (Phase 27.5) ───────────────────────────────────
+    // RED against current main: newt-cli/src/solve.rs derives `status` from
+    // `outcome.error.is_none()` alone and never consults `end_reason`.
+    // #2215 landed the typed vocabulary, so this binds the VALUE now rather
+    // than only the relationship: `status_label` maps round_cap/empty/cancelled
+    // to "incomplete". Asserting the exact token means a future change that
+    // quietly reroutes a cap exit back to "completed" fails here even if it
+    // keeps the two fields consistent with each other.
+    assert_eq!(
+        result["status"], "incomplete",
+        "a run that ended at the tool-round cap must report itself incomplete \
+         — end_reason says RoundCap on the same line: {result}"
+    );
+
+    // The contract line carries the SAME claim through a second derivation
+    // (`solve_contract::outcome_label`), so it can drift from `status` unless
+    // both are pinned. Asserted in the same relationship form — NOT against a
+    // literal value — so this stays correct under any naming the honesty fix
+    // chooses. `contract_from` also pins that exactly one contract record
+    // exists, so a run that emitted none cannot pass here.
+    let contract = contract_from(&events_path);
+    assert_eq!(
+        contract["outcome"], "round_cap",
+        "the contract record must name the wall this run hit: {contract}"
+    );
+}
