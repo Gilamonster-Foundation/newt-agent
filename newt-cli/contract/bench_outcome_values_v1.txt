@@ -1,0 +1,32 @@
+# The consumer's permitted `outcome` values — contract_version "1".
+#
+# THIS FILE IS A COPY, AND THAT IS THE POINT. The authority is
+# `gilamonster-bench/src/contract.rs` (`enum Outcome`, `#[serde(rename_all =
+# "snake_case")]`), in a DIFFERENT repository that shares no Rust type with this
+# one. That independence is deliberate — the ruler must not change when the
+# thing being measured is refactored — and it is exactly why nothing in this
+# workspace can fail on a contract violation. A green CI here cannot mean
+# "contract-conforming"; it can only mean "nothing in this repo objected".
+#
+# So this copy is the objection. `outcome_label` is pinned against it, and a
+# value that is not listed here fails the build rather than reaching the bench.
+#
+# WHY THAT MATTERS MORE THAN A TYPO CHECK: the consumer's enum is CLOSED — no
+# `#[serde(other)]` — so an unrecognized value does not deserialize. The run
+# does not score badly. Its row DROPS OUT of the matrix entirely, and the
+# average silently improves. #2215 emitted `round_cap` here and deleted rows
+# that way; #2218 recorded that no gate could have caught it.
+#
+# UPDATING THIS FILE IS A DELIBERATE ACT. Re-read the upstream enum, confirm the
+# contract version still matches, and change this file in its own commit that
+# says which upstream change it is tracking. Editing it to make a failing test
+# pass is the failure mode it exists to prevent: this file has no authority of
+# its own, it only records what the consumer was last confirmed to accept.
+#
+# Format: one wire value per line. Blank lines and `#` comments ignored.
+
+completed
+model_error
+transport_error
+timeout
+harness_error
