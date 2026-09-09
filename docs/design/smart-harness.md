@@ -6,15 +6,24 @@
 > this builds on: `docs/decisions/1528b3-cid-spill-identity.md`,
 > `docs/decisions/1528b3-proactive-compaction.md`.
 
-**Status:** DESIGN UNDER REVISION, 2026-09-08. Nothing implemented.
+**Status:** DESIGN UNDER REVISION. Revised 2026-09-08, made self-consistent
+2026-09-09. Nothing implemented.
 
 An earlier revision of this file marked all thirteen decisions **LOCKED** and
 said implementation could begin. **That status was not supported by the
 evidence** and is withdrawn. A design review checked the claims against source
-and found six that are false or overclaimed, one of which inverts the central
-before/after argument. The corrections are recorded below rather than quietly
-edited away, because the failure this design exists to prevent — a confident
-claim nobody checked — is exactly what produced them.
+and found seven that are false or overclaimed, one of which inverts the central
+before/after argument.
+
+**The body of this document now says what the code actually does.** The first
+revision recorded the corrections in §6b but left the original claims standing
+in the inventory, the diagrams and the prose above it — so the document
+asserted and denied the same things in one file, and a reader who stopped
+before §6b was misled by every one of them. That is fixed: the inventory, the
+§3 and §4 diagrams, and §5 have been rewritten to the verified behaviour, and
+§6b is now a **retrospective** of what the failed revision claimed. Nothing is
+lost by making the present tense accurate — git history holds the revision that
+got it wrong, and §6b holds the accounting of how.
 
 D10–D13 remain the operator's decisions and stand as *choices*. What does not
 stand is my characterisation of what the code already does, and several
@@ -38,9 +47,9 @@ Per the provenance-audit rule: enumerate what exists before designing the gap.
 | `MerkleNode<T>` (payload + ordered parent set, id over both), `ContentId`, `NodeStore`, canonical dag-cbor | `content-addressable` 0.1.2, already a workspace dependency | **the node, the id, the store trait.** Hand-rolling any of these is a defect |
 | `Op = concise \| elide \| generate`; `depthAfter: generate ⇒ d+1`; `Unit { op, depth, root, life, addressed }`; `Unit.wf: depth ≤ 1` | `agent-frame/formal/ContextOps.lean` — machine-checked | **the derivation laws** |
 | invariants §1–§8; ledger newt 29 ✓ / 6 partial / 5 open / 1 rejected | `agent-frame/docs/INVARIANTS.md`, `V0-DECISION.md` | **the obligations** |
-| `SpillStore` + `SpillProvenance::CompactionSpan` — content-addressed, redact-on-store, fail-closed on collision | `newt-core` | **storage.** agent-frame v0 defers the session store *"specifically because it already exists in newt"* |
-| `adjudicate.rs` — one bounded, tool-less side call; strict reply parse; `AdjudicationFailure` returned so the harness *tells* the operator | `newt-core/src/agentic/adjudicate.rs`, live at `newt-tui/src/chat.rs:6680` | **the harness-llm call shape** |
-| `BackendKind::Embedded` (#639), `BackendRef` | `newt-core/src/config.rs` | **the non-contending backend** and its override |
+| `SpillStore` + `SpillProvenance::CompactionSpan` — content-addressed, redact-on-store, fail-closed on collision | `newt-core/src/agentic/content_spill.rs` | **storage, for a live session only.** `SessionSpillStore` is a `Mutex<HashMap<String, SpillRecordV1>>`; its own module doc (`:29`) says it is "session-scoped, and discarded at `/new`; it was NEVER persisted, so an old handle could not survive a process/session restart". agent-frame v0 defers the session store *"specifically because it already exists in newt"* — but a durable frame needs a durable path this does not provide (C2) |
+| `adjudicate.rs` — one bounded, tool-less side call; `AdjudicationFailure` returned so the harness *tells* the operator | `newt-core/src/agentic/adjudicate.rs`, live at `newt-tui/src/chat.rs:6680` | **the harness-llm call shape.** The *call shape* is what is reused. The parse is **not** strict: `parse_adjudication_reply` strips a fence, then takes `find('[')`..`rfind(']')`, so prose on either side of the array is accepted. The "does NOT hunt for a decision inside prose" assurance is a doc comment the code does not implement (C3) — an explicit parser contract is owed |
+| `BackendKind::Embedded` (#639), `BackendRef` | `newt-core/src/config.rs`; device selector at `newt-inference/src/embedded.rs:9` | **a separately addressable backend** and its override. Not automatically a *non-contending* one: it is CPU **by default**, not CPU-only — `NEWT_EMBEDDED_DEVICE = cpu\|metal\|cuda\|auto`, plus `embedded-metal` / `embedded-cuda` features — so "never contends with the primary" is a constraint D10 must specify and enforce, not a property inherited from the enum (C4) |
 
 **What is new:** one node payload type, one navigation loop, one classifier
 adoption, and the rule that harness output is never evidence. That is the whole
@@ -120,58 +129,74 @@ flowchart TB
 
 Highlighted nodes are **this turn's projection**: `{G, U1, E1, A1, U2}`. The
 elided pair `{T1, R1}` is still in the DAG; the projection carries `E1`, a
-pointer to them with a re-read directive. **Nothing was deleted.** That is the
-entire difference from compaction, and it is what invariant 3.4 already asks
-for: *name what was compacted with a re-read directive*. Content-addressing
-makes the name verifiable.
+pointer to them with a re-read directive. Nothing was deleted — which satisfies
+invariant 3.4's *name what was compacted with a re-read directive*.
 
-A genesis node has no parents. `--hermetic` therefore reduces to "start at
-genesis"; `--resume <cid>` starts at a node that has one. The flag and the data
-structure say the same thing from two directions.
+**Retention is not the difference from compaction.** Today's compaction already
+retains the span and already advertises a resolvable content-addressed handle
+(§4, C1). What this picture adds over that is narrower, and it is worth stating
+without inflation:
+
+- **one typed node shape for every derived thing**, instead of one bespoke
+  record for compaction spans and nothing for the rest;
+- **a derivation constraint** (`op`, `depth`, parent set) checked at
+  construction and at decode, so an elision cannot silently become a
+  generation;
+- **an auditable projection**: the cut is a named set of CIDs a cold reader can
+  re-derive, rather than a prompt string nobody can reconstruct.
+
+A genesis node has no parents, so `--hermetic` and `--resume <cid>` are
+distinguishable at the data structure: one starts at a node with no parents, the
+other at a node with one. That is a statement about **graph origin only**.
+Hermeticity is a stronger property — which inputs are admitted, and what ambient
+state the run may read — and parentage does not establish it (C7). D6 must
+specify admitted inputs and ambient-state assumptions separately.
 
 ---
 
-## 4. Compaction vs navigation — the one edge that changes
+## 4. Compaction vs navigation — what actually changes
+
+**Both sides retain the span.** The difference is in the *type system around the
+handle*, not in whether the bytes survive.
 
 ```mermaid
 flowchart LR
-    subgraph today ["TODAY — compaction (destructive)"]
-        S1["span"] -->|"summarizer<br/>op: generate, depth 1"| SUM["summary"]
-        SUM -->|"REPLACES"| P1["prompt"]
-        S1 -.->|"dropped"| X(("✗"))
+    subgraph today ["TODAY — compaction (span retained, handle untyped)"]
+        S1["span<br/><i>redacted, staged in SpillStore</i>"] -->|"summarizer<br/>op: generate, depth 1"| SUM["summary"]
+        SUM -->|"REPLACES in prompt"| P1["prompt"]
+        S1 -->|"stage_compaction_span<br/>content-addressed handle<br/>fail-closed"| H1[("SpillStore<br/><i>session-scoped, not persisted</i>")]
     end
     subgraph design ["DESIGN — navigation (projective)"]
         S2["span<br/><i>retained in DAG</i>"] -->|"elide<br/>op: elide, depth 0<br/>verified by re-derive"| PTR["pointer + re-read"]
         PTR -->|"appears in"| P2["projection"]
         P2 -->|"re-read follows CID"| S2
     end
-    style X fill:#B5551B33,stroke:#B5551B
 ```
 
-> ### CORRECTION — the left-hand side is not what newt does today
->
-> **Today's compaction already retains the span and already advertises a
-> resolvable handle.** `newt-core/src/agentic/compress.rs:2398`
-> `stage_compaction_span` stages the **redacted** verbatim span into a
-> `SpillStore` under `SpillProvenance::CompactionSpan`, returns a
-> content-addressed handle, and is fail-closed: *"A failed store must never name
-> a handle that resolves to nothing (BHV-SPILL-001)."* Its own doc calls it "the
-> one minting site" and says a second encoding "would be a content-addressable
-> law violation".
->
-> So the `✗ dropped` arrow above is **false about the current system**, and the
-> before/after comparison it anchors is not the contribution this design makes.
->
-> **The honest incremental contribution** is narrower and still worth having:
-> uniform *typed* provenance over every derived thing rather than one bespoke
-> record for compaction spans; a derivation constraint that is checked at
-> construction and decode; and an auditable projection policy. Retention and
-> re-read references are **not** new — they exist, and rebuilding them under
-> another name would be the mistake this line has already made once (#1786).
+`newt-core/src/agentic/compress.rs:2398` `stage_compaction_span` stages the
+**redacted** verbatim span into a `SpillStore` under
+`SpillProvenance::CompactionSpan`, returns a content-addressed handle, and is
+fail-closed: *"A failed store must never name a handle that resolves to nothing
+(BHV-SPILL-001)."* Its own doc calls it "the one minting site" and says a second
+encoding "would be a content-addressable law violation".
+
+So **retention and re-read references are not what this design contributes** —
+they exist. Rebuilding them under another name is the mistake this line has
+already made once (#1786). What actually changes across the two panels:
+
+| | today | design |
+|---|---|---|
+| span survives | yes, redacted, in `SpillStore` | yes, in the DAG |
+| handle | content-addressed, one bespoke provenance variant | `MerkleNode` id, uniform across every derived thing |
+| derivation recorded | implicit — the summary does not name its `op` or depth | explicit `op`/`depth`/parent set, checked at construction **and** decode |
+| durability | session-scoped; discarded at `/new`, gone at restart (C2) | owed — D9 is **OPEN** for exactly this reason |
+| projection auditable | no — the prompt string is not reconstructible | yes — a named CID set a cold reader re-derives |
+
+The honest incremental contribution is those four rows, not the first one.
 
 ---
 
-## 5. The #2239 fix, structurally
+## 5. What the frame contributes to #2239 (necessary, not sufficient)
 
 ```mermaid
 sequenceDiagram
@@ -183,14 +208,17 @@ sequenceDiagram
     H->>M: "…if genuinely finished, say so in one sentence"
     M-->>K: "I'm finished — the answer above is complete."
     K->>K: Jaccard(reply, prototypes) ≥ 0.28, margin 0.03
-    K-->>H: final_answer → turn COMMITTED as success
+    K-->>H: EITHER final_answer → TurnEndReason::Completed
+    K-->>H: OR narration → TurnEndReason::NarrationCapExhausted
+    Note over H,K: both map to Terminal::Completed — committed as success either way
     end
     rect rgba(15,124,138,0.10)
     Note over H,K: DESIGN
     H->>M: same nudge — recorded as node N (harness-origin, generate, depth 1)
     M-->>K: same reply — recorded as node R, parents: [N]
     K->>K: adjudicate(R, parents) — sees N is a scripted request
-    K-->>H: compliance with a harness script is not a deliverable → NOT committed (loud)
+    K-->>H: compliance with a harness script is not a deliverable → verdict node, loud
+    Note over H,K: still needs §6c: a loud verdict that maps to Terminal::Completed is still a scored success
     end
 ```
 
@@ -200,6 +228,21 @@ parent is a harness script is not evidence of completion, by rule. This is
 invariant 2.4 — *harness process-corrections must not enter the summarizer
 input; a small model echoes loop guidance back* — enforced by the DAG instead
 of hoped for.
+
+**This does not, on its own, fix #2239 (C6).** The bug is not only that the
+harness misreads the reply; it is that *every* narration exit is filed as an
+ordinary completion downstream. Get the classification perfectly right and the
+turn is still recorded as a success, because `terminal()` puts
+`NarrationCapExhausted` in the same bucket as `Completed`. The frame improves
+the **evidence**; §6c fixes the **outcome**. Both are needed, they are
+independent, and the outcome half ships first because it depends on nothing
+here.
+
+One constraint the frame must respect, stated here because it is easy to get
+backwards: **ancestry is evidence about causality, not a completion oracle.** A
+genuine answer that happens to follow a nudge stays deliverable. "Parent is a
+harness node" is an input to adjudication, never by itself a verdict of
+incompleteness.
 
 ---
 
@@ -222,20 +265,28 @@ error rather than a policy.
 
 ---
 
-## 6b. Corrections — claims this document made that source does not support
+## 6b. RETROSPECTIVE — claims the failed revision made that source does not support
 
-Each row was checked against `origin/main` by opening the file. "Obligation" is
-what an implementation still owes; none of it is done.
+**These claims are no longer live anywhere in this document.** The body above
+has been rewritten to the verified behaviour; this section is kept as the
+accounting of how a revision of this file came to assert seven things the code
+does not do, and as the standing list of what an implementation still owes.
 
-| # | The claim I made | What source says | Obligation |
-|---|---|---|---|
-| C1 | Today's compaction **drops** the span; navigation would retain it | `compress.rs:2398` `stage_compaction_span` already stages the redacted span into `SpillStore` and advertises a content-addressed handle, fail-closed (BHV-SPILL-001) | Restate the contribution as typed provenance + derivation constraints + auditable projection, **not** retention. Do not rebuild recovery infrastructure that exists |
-| C2 | `SpillStore` is the frame's storage; `--resume <cid>` resumes a session | `SessionSpillStore` is `Mutex<HashMap<String, SpillRecordV1>>`; the module doc states the store "was NEVER persisted, so an old handle could not survive a process/session restart" | Either name a durable path that restores the graph closure, schema **and** authorization context after restart, or scope resume/navigation **explicitly to a live session**. Do not promise cross-process resume on ephemeral state |
-| C3 | The adjudication side call has a **strict** parse | `adjudicate.rs:58` does `find('[')` / `rfind(']')`, so prose on either side is accepted. The "does NOT hunt inside prose" assurance is a *comment*, not the code | State the parser's actual accepted language and choose an explicit contract. Any production parser change is a **separate** PR with its own tests |
-| C4 | Route the adjudicator to an "auxiliary / CPU-local" backend so it never contends with the primary | `embedded.rs:7-9` is **CPU by default, not CPU-only** — `NEWT_EMBEDDED_DEVICE = cpu\|metal\|cuda\|auto`, with `embedded-metal` / `embedded-cuda` features | D10 must specify placement constraints, timeout ownership, cancellation propagation, unavailable-at-startup behaviour, and an explicit fallback. An override must not silently violate placement |
-| C5 | A third class "cannot be carried" by the Jaccard matcher because the margin is 0.03 | A winner/runner-up margin does not bound how many classes a classifier can represent. The reasoning is invalid | Remove the impossibility claim. Justify model-backed classification as an **empirical hypothesis** about discrimination and context-sensitivity, with a comparison plan against the deterministic baseline |
-| C6 | Fixing the classifier (or adding causal parentage) fixes #2239 | `solve_contract.rs:106-115` maps `NarrationCapExhausted` into `Terminal::Completed` — the same bucket as a genuine completion. A correct classifier still yields a scored success | See §"the real defect". The fix is in **completion semantics**, is separately shippable, and depends on neither the frame nor a new model |
-| C7 | `--hermetic` "reduces to always genesis" | A genesis node establishes a graph **origin**. It says nothing about admitted inputs or ambient state | Narrow the claim: specify admitted inputs and ambient-state assumptions separately from parentage |
+Each row was checked against `origin/main` by opening the file, and re-verified
+on 2026-09-09 during the consistency pass. "Obligation" is what an
+implementation still owes; none of it is done. The "corrected in" column names
+where the live text now says the right thing, so a reader can check that the
+retraction actually took.
+
+| # | The claim the failed revision made | What source says | Corrected in | Obligation |
+|---|---|---|---|---|
+| C1 | Today's compaction **drops** the span; navigation would retain it | `compress.rs:2398` `stage_compaction_span` already stages the redacted span into `SpillStore` and advertises a content-addressed handle, fail-closed (BHV-SPILL-001) | §3 (contribution restated), §4 (diagram + table) | Restate the contribution as typed provenance + derivation constraints + auditable projection, **not** retention. Do not rebuild recovery infrastructure that exists |
+| C2 | `SpillStore` is the frame's storage; `--resume <cid>` resumes a session | `SessionSpillStore` is `Mutex<HashMap<String, SpillRecordV1>>`; the module doc states the store "was NEVER persisted, so an old handle could not survive a process/session restart" | §0 inventory (`SpillStore` row), §4 table (durability row) | Either name a durable path that restores the graph closure, schema **and** authorization context after restart, or scope resume/navigation **explicitly to a live session**. Do not promise cross-process resume on ephemeral state |
+| C3 | The adjudication side call has a **strict** parse | `adjudicate.rs:58` does `find('[')` / `rfind(']')`, so prose on either side is accepted. The "does NOT hunt inside prose" assurance is a *comment*, not the code | §0 inventory (`adjudicate.rs` row) | State the parser's actual accepted language and choose an explicit contract. Any production parser change is a **separate** PR with its own tests |
+| C4 | Route the adjudicator to an "auxiliary / CPU-local" backend so it never contends with the primary | `newt-inference/src/embedded.rs:9` is **CPU by default, not CPU-only** — `NEWT_EMBEDDED_DEVICE = cpu\|metal\|cuda\|auto`, with `embedded-metal` / `embedded-cuda` features | §0 inventory (`BackendKind::Embedded` row) | D10 must specify placement constraints, timeout ownership, cancellation propagation, unavailable-at-startup behaviour, and an explicit fallback. An override must not silently violate placement |
+| C5 | A third class "cannot be carried" by the Jaccard matcher because the margin is 0.03 | A winner/runner-up margin does not bound how many classes a classifier can represent. The reasoning is invalid | not present in live text; D13 rationale withdrawn | Remove the impossibility claim. Justify model-backed classification as an **empirical hypothesis** about discrimination and context-sensitivity, with a comparison plan against the deterministic baseline |
+| C6 | Fixing the classifier (or adding causal parentage) fixes #2239 | `solve_contract.rs:106-115` maps `NarrationCapExhausted` into `Terminal::Completed` — the same bucket as a genuine completion. A correct classifier still yields a scored success | §5 (retitled, closing paragraphs), §6c | See §"the real defect". The fix is in **completion semantics**, is separately shippable, and depends on neither the frame nor a new model |
+| C7 | `--hermetic` "reduces to always genesis" | A genesis node establishes a graph **origin**. It says nothing about admitted inputs or ambient state | §3 (genesis ≠ hermetic) | Narrow the claim: specify admitted inputs and ambient-state assumptions separately from parentage |
 
 **Not yet addressed at all** — named here so they are visible rather than
 implied-solved:
@@ -259,7 +310,12 @@ implied-solved:
 
 ## 6c. The real defect behind #2239, and its separately shippable fix
 
-**Confirmed on `origin/main`.** `newt-cli/src/solve_contract.rs:106-115`:
+**Confirmed on `origin/main` as of 2026-09-09** (`e3f42a36`), where the code
+below is still live. A fix is proposed in **PR #2251, open and unmerged** — so
+this section describes the current state, not a landed one. When #2251 lands,
+replace the snippet with the landed mapping and mark this paragraph resolved.
+
+`newt-cli/src/solve_contract.rs:106-115`:
 
 ```rust
 Some(
@@ -289,6 +345,27 @@ Two constraints on that fix:
 - Exhausted rescue must **preserve prior observations** and surface the actual
   incomplete outcome, rather than discarding content or asserting completion.
 
+**A second, independent hole, found while verifying the above.** Probing the
+OpenAI loop on `origin/main` with a scripted reply to the rescue nudge, the
+recorded `end_reason` is:
+
+```
+Completed              <- "Yes, I am finished."
+Completed              <- "I am genuinely finished."
+Completed              <- "Done."
+NarrationCapExhausted  <- "I'm finished — the answer above is the complete
+                           deliverable; there is nothing to edit or run."
+```
+
+The nudge asks the model to "say so explicitly in one sentence"; the compliant
+one-sentence replies never reach `NarrationCapExhausted` at all — they are
+stamped `Completed` at the core accept site. #2239's transcript was the *verbose*
+phrasing, which is the only one that trips the bag-of-words matcher into the
+warning. So the terminal-mapping fix above makes the reported failure honest but
+reaches a minority of affected turns; the accept-site half is issue ask #4 and is
+a separate change in `newt-core`. Both are downstream of the same mistake:
+**scoring text the harness itself dictated.**
+
 Note the lockstep hazard: PR #2242 (merged 2026-09-08) pins emitted outcome
 values against `newt-cli/contract/bench_outcome_values_v1.txt`. A change to an
 emitted outcome string must update that permitted set in the same PR.
@@ -305,7 +382,7 @@ implementation.
 | # | decision | grounded in | status |
 |---|---|---|---|
 | **D1** | A frame primitive is `MerkleNode<Primitive>`; `Primitive` carries agent-frame's `Unit` fields (`op`, `depth`, `root`, `life`, `addressed`) plus the typed payload. No hand-rolled id, chain, or manifest. | `content-addressable::merkle`, `ContextOps.lean` | **SETTLED** (type) — storage unresolved, see C2 |
-| **D2** | Context is a projection of the frame — a selected node set rendered for one turn. Compaction is replaced by elision + re-read. The DAG is never pruned within a session. | invariants 3.1, 3.4 | **RESTATE** — see C1; retention already exists |
+| **D2** | Context is a projection of the frame — a selected node set rendered for one turn, auditable as a named CID set. Compaction is replaced by elision + re-read. The DAG is never pruned within a session. **The contribution is typed provenance, a construction-and-decode derivation constraint, and an auditable projection — not retention**, which already exists (§4). | invariants 3.1, 3.4 | **RESTATED** in §3/§4 per C1 — durability still owed, see D9 |
 | **D3** | The harness-llm is the only navigator. It is a bounded, tool-less side call in the `adjudicate.rs` shape. | `adjudicate.rs` (#1749), live | **SETTLED** (shape) — parser contract owed, C3 |
 | **D4** | Harness-origin nodes (nudges, adjudications, verdicts) are tagged in `life`/`root` and are **never** summarizer input and **never** evidence of model completion. | invariant 2.4 | **SETTLED** — but does not fix #2239 alone, C6 |
 | **D5** | `depth ≤ 1`. A verdict over a reply is depth 1; a summary of a summary is rejected at construction. | `Unit.wf` | **OPEN** — edge relation + decode check owed |
@@ -322,14 +399,18 @@ implementation.
 
 ## 8. What this is NOT
 
-- **Not a new store.** `SpillStore` and `MerkleNode` exist.
+- **Not a new node type or id scheme.** `MerkleNode` and `ContentId` exist and
+  hand-rolling either is a defect. A **durable** store, on the other hand, is
+  genuinely absent: `SessionSpillStore` is an in-memory map discarded at `/new`
+  (C2), so D9 is open and "not a new store" must not be read as "storage is
+  solved".
 - **Not a smarter summarizer.** The summarizer is demoted, not improved.
 - **Not a 0.8.0 item.** agent-frame is pre-implementation and its 0.0.1 is the
   gate. This is the 0.9.0 stream. What it *does* change for 0.8.0: fix #979 so
   a turn cannot hang, fix #2239 so the harness stops reading its own script as
   evidence, and **spend nothing further on the compaction pipeline**.
 - **Not a rewrite.** Every settled row names the thing it reuses — and §6b
-  records where that reuse claim was wrong.
+  records, as a retrospective, where that reuse claim was wrong.
 
 ---
 
