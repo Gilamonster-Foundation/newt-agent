@@ -4505,7 +4505,16 @@ fn is_read_only_call(name: &str, args: &serde_json::Value) -> bool {
                 .is_some_and(is_read_only_shell_probe))
 }
 
-fn is_workspace_write_call(name: &str) -> bool {
+/// The tools that actually modify the workspace tree — `write_file` and
+/// `edit_file`. Aliases the model sometimes invents (`create_file`,
+/// `str_replace`, `apply_patch`) get a coaching reply and change nothing, so
+/// they are deliberately NOT in the set.
+///
+/// Public because the `solve_result` trace line reports on writes too, and a
+/// second copy of this literal set in the CLI is exactly the drift the reuse
+/// discipline forbids: adding a write tool here would silently stop being
+/// counted there.
+pub fn is_workspace_write_call(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file")
 }
 
