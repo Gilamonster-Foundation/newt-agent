@@ -1,5 +1,5 @@
 name = "caveat-lattice"
-defaultTargets = ["CaveatLattice", "ProjectModel", "NewtPolicy", "CompactionProvenance", "CompactionLifecycle", "CompactionSpill", "ResponsesUsage", "ResponsesWire", "NewtInteraction"]
+defaultTargets = ["CaveatLattice", "ProjectModel", "NewtPolicy", "CompactionProvenance", "CompactionLifecycle", "CompactionSpill", "ResponsesUsage", "ResponsesWire", "NewtInteraction", "ContextOps", "ContentAddressed"]
 
 # Machine-checked formal specs. Self-contained: no Mathlib, so it builds from a
 # bare Lean toolchain (see lean-toolchain). `lake build` checks every theorem; a
@@ -59,3 +59,19 @@ name = "ResponsesWire"
 # expired offer authorizes (and synthesizes) nothing.
 [[lean_lib]]
 name = "NewtInteraction"
+
+# ContextOps — agent-frame's fidelity algebra: compaction typed as concision /
+# elision / generation, the packet chain that makes "never derive from a
+# derivation" a SHAPE rather than a rule, provenance roots, and the depth bound.
+# Mirrored in Rust by `agent-frame/` and checked against it by
+# `agent-frame/tests/kernel_laws.rs`; see
+# docs/decisions/agent-frame-v0-monorepo.md.
+[[lean_lib]]
+name = "ContextOps"
+
+# ContentAddressed — the content-addressable FIRST PRINCIPLE as checkable laws:
+# append-only growth, edit-as-append preserving the original, tamper detection
+# given an injective address function, provenance traceability, and the theorem
+# that unverified evidence is indistinguishable from no evidence.
+[[lean_lib]]
+name = "ContentAddressed"

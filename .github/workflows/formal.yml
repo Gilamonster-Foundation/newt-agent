@@ -9,6 +9,11 @@ name: formal (Lean proofs)
 # install in every developer's pre-push would be disproportionate. The gate is
 # CI-only by design; `formal/README.md` documents `lake build` for local checks.
 # Runs only when the formal tree changes (paths filter below).
+#
+# RECIPE PARITY: `just formal` runs the same two steps this job does — `lake
+# build` then `formal/check-libraries.sh`. When you edit either here, edit the
+# recipe in `justfile` to match. (The TLA+ half of `formal/` is checked by
+# `.github/workflows/behavior-formal.yml`, which `just formal` also mirrors.)
 
 on:
   push:
@@ -31,3 +36,15 @@ jobs:
       - name: lake build (checks every theorem; toolchain pinned in lean-toolchain)
         working-directory: formal
         run: lake build
+
+      - name: Assert the build actually proved something
+        # ANTI-VACUOUS. `lake build` on a mis-configured package exits 0 having
+        # checked nothing. The guard compares three INDEPENDENT sources — the
+        # git-tracked `<Name>.lean` roots, the `[[lean_lib]]` entries, and the
+        # built oleans — so a manifest that silently stops building a library
+        # whose proofs still exist is an error rather than a smaller green tick.
+        # Its own regression suite is `formal/test-check-libraries.sh`.
+        run: bash formal/check-libraries.sh
+
+      - name: Guard regression suite (the guard is itself checked)
+        run: bash formal/test-check-libraries.sh

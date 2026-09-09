@@ -541,3 +541,23 @@ install-hooks:
 [windows]
 install-hooks:
     git config core.hooksPath .githooks; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; git config url."https://github.com/".pushInsteadOf "git@github.com:"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Write-Output "core.hooksPath -> .githooks (pre-push gate wired)"; Write-Output "pushes to git@github.com:* rewritten to https://github.com/* (#276)"; git config --get-urlmatch credential.helper https://github.com *> $null; if ($LASTEXITCODE -ne 0) { Write-Warning "no git credential helper for https://github.com - run: gh auth setup-git" }
+
+# PIPELINE PARITY for the `formal` recipe below: it mirrors two workflows, and
+# both name it back:
+#   * .github/workflows/formal.yml          — `lake build` + check-libraries.sh
+#                                             + the guard's own regression suite
+#   * .github/workflows/behavior-formal.yml — the NAMED formal/tla models
+# When you edit either workflow, edit this recipe to match.
+#
+# HOOK PARITY: intentionally NONE, matching formal.yml's own note. Requiring a
+# Lean toolchain and a JDK in every developer's pre-push would be
+# disproportionate, and #1098 is cutting that hook down rather than growing it.
+# CI is the gate; this recipe is how you reproduce it locally before pushing a
+# formal/ change.
+
+# Re-check the machine-checked core: Lean proofs + TLA+ models.
+formal:
+    cd formal && lake build
+    bash formal/check-libraries.sh
+    bash formal/test-check-libraries.sh
+    TLA_SPEC_DIR="$PWD/formal/tla" bash spec/tla/check.sh ContentAddressableLog

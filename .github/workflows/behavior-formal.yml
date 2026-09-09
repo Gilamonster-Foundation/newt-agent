@@ -59,3 +59,25 @@ jobs:
           specs="$(cd spec/tla && ls -1 *.cfg 2>/dev/null | sed 's/\.cfg$//' | tr '\n' ' ')"
           test -n "$count" && [ "$count" -ge 1 ] || { echo "no specs checked"; exit 1; }
           echo "::notice title=TLC::tla2tools 1.7.4 fetched+verified on a clean cache; checked ${count} spec(s): ${specs}"
+
+      - name: TLC — formal/tla models, each NAMED explicitly
+        env:
+          TLA2TOOLS_JAR: ''
+          XDG_CACHE_HOME: ${{ runner.temp }}/tla-cache
+        # The step above uses the runner's DEFAULT discovery, which resolves to
+        # the runner's own directory (`spec_dir="${TLA_SPEC_DIR:-$here}"`, i.e.
+        # spec/tla). So every model under formal/tla was checked by nothing at
+        # all — the job was green while ContentAddressableLog had never been
+        # model-checked once. Point the same checksum-pinned runner at formal/tla
+        # and NAME each model, so a model that silently stops being checked is a
+        # failure here rather than an unnoticed drop in a count.
+        run: |
+          set -euo pipefail
+          models="ContentAddressableLog"
+          for model in $models; do
+            out="$(TLA_SPEC_DIR="$PWD/formal/tla" bash spec/tla/check.sh "$model" 2>&1)"
+            printf '%s\n' "$out"
+            count="$(printf '%s\n' "$out" | sed -n 's/^tla-checked-count=//p')"
+            [ "$count" = 1 ] || { echo "::error::$model was not model-checked"; exit 1; }
+            echo "::notice title=TLC::formal/tla/$model.tla model-checked"
+          done
