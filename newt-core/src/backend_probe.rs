@@ -702,8 +702,19 @@ impl BackendApi for OpenAiApi {
         // `max_model_len` — the authoritative window (vLLM pre-allocates KV for
         // exactly it). Without this a 256k model got NO window and compacted at
         // a tiny default.
-        let json = openai_models_json(client, endpoint, api_key).await.ok()?;
-        parse_openai_models_window(&json, model)
+        if let Ok(json) = openai_models_json(client, endpoint, api_key).await {
+            if let Some(window) = parse_openai_models_window(&json, model) {
+                return Some(window);
+            }
+        }
+        // #2248: llama.cpp declares nothing in `/v1/models`, so until now this
+        // returned `None` for it and the window stayed whatever a human typed
+        // into `--context-window` or a tunings file — a declaration corrected
+        // only by failing (`cw_overflow` shrinks 20% per rejected request). Its
+        // `/props` carries the real number. Second, not first, so every
+        // endpoint that answers today keeps answering identically; this only
+        // fills a `None`.
+        llamacpp_served_window(client, endpoint, model, api_key).await
     }
 
     fn serving(&self, served_count: usize) -> Serving {
@@ -891,16 +902,17 @@ pub fn builtin_engine_fingerprints() -> &'static [EngineFingerprint] {
 /// (`--context-window`), and a declaration that is too LARGE is discovered only
 /// by failing: `cw_overflow::core_recover_overflow` shrinks 20% per attempt, so
 /// a declared 200k against a served 65536 costs about five rejected requests
-/// before the turn converges. The server already tells us the number, in a body
-/// [`detect_engine`] fetches and discards.
+/// before the turn converges. The server states the number; nothing was reading
+/// it.
 ///
 /// Reads `default_generation_settings.n_ctx`, then a top-level `n_ctx`.
 ///
 /// **Zero is not an answer.** A llama-swap style router with nothing loaded
 /// answers `{"default_generation_settings":{"n_ctx":0},"model_path":"none"}`.
 /// Treating that as a ceiling would clamp every request to nothing, so a
-/// non-positive value is `None` — unknown, not zero. Ask with `?model=<id>` to
-/// get a loaded model's real window.
+/// non-positive value is `None` — unknown, not zero. Naming the model
+/// (`?model=<id>`, which [`llamacpp_served_window`] does) is what gets a real
+/// window back.
 #[must_use]
 pub fn served_context_window(json: &serde_json::Value) -> Option<u32> {
     json.get("default_generation_settings")
@@ -911,23 +923,34 @@ pub fn served_context_window(json: &serde_json::Value) -> Option<u32> {
         .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
 }
 
-/// Reconcile a declared context window against what the server reports.
+/// Fetch one MODEL's served window from a llama.cpp `/props` body.
 ///
-/// Returns the window to use plus `true` when the declaration was **wrong high**
-/// — the caller should say so once, loudly, because that is a misconfiguration
-/// and the only other way to learn it is a string of rejected requests.
+/// `?model=` is not decoration. On a llama-swap style router bare `/props`
+/// answers for whatever is loaded — `n_ctx: 0` / `model_path: "none"` when that
+/// is nothing — so the model has to be named or the answer is about the wrong
+/// model. Context is per-model: one endpoint serves many, with different
+/// windows, which is why this takes `model` and why no single number belongs on
+/// an endpoint-wide probe result.
 ///
-/// A declaration SMALLER than the served window is left alone: an operator
-/// tightening deliberately (to leave room for output, or to test behaviour under
-/// pressure) is not a mistake, and #859 exists precisely to exploit a window
-/// larger than newt believed.
-#[must_use]
-pub fn reconcile_context_window(declared: Option<u32>, served: Option<u32>) -> (Option<u32>, bool) {
-    match (declared, served) {
-        (Some(d), Some(s)) if d > s => (Some(s), true),
-        (Some(d), _) => (Some(d), false),
-        (None, served) => (served, false),
+/// Fail-soft like the rest of [`BackendApi`]: any transport error, non-success
+/// status, non-JSON body, or non-positive `n_ctx` is `None` — unknown, never a
+/// guessed ceiling.
+async fn llamacpp_served_window(
+    client: &reqwest::Client,
+    endpoint: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Option<u32> {
+    let url = format!("{}/props", endpoint.trim_end_matches('/'));
+    // `.query` percent-encodes; model ids carry `/` and `:`.
+    let resp = maybe_bearer(client.get(&url).query(&[("model", model)]), api_key)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
     }
+    served_context_window(&resp.json().await.ok()?)
 }
 
 /// Does `json` satisfy `marker`? Pure — unit-tested without a server.
@@ -961,27 +984,10 @@ pub async fn detect_engine(
     kind: BackendKind,
     api_key: Option<&str>,
 ) -> Option<Engine> {
-    detect_engine_and_window(client, endpoint, kind, api_key)
-        .await
-        .0
-}
-
-/// [`detect_engine`], plus the served context window when the matching
-/// fingerprint body carried one.
-///
-/// One pass, not two: the `/props` body that identifies llama.cpp is the same
-/// body that reports `n_ctx`, and fetching it twice to read two fields would be
-/// a second round-trip for nothing.
-pub async fn detect_engine_and_window(
-    client: &reqwest::Client,
-    endpoint: &str,
-    kind: BackendKind,
-    api_key: Option<&str>,
-) -> (Option<Engine>, Option<u32>) {
     match kind {
-        BackendKind::Ollama => return (Some(Engine::Ollama), None),
+        BackendKind::Ollama => return Some(Engine::Ollama),
         BackendKind::Openai => {}
-        BackendKind::Embedded | BackendKind::Anthropic => return (None, None),
+        BackendKind::Embedded | BackendKind::Anthropic => return None,
     }
     let base = endpoint.trim_end_matches('/');
     for fp in builtin_engine_fingerprints() {
@@ -996,10 +1002,10 @@ pub async fn detect_engine_and_window(
             continue;
         };
         if fingerprint_matches(&fp.marker, &json) {
-            return (Some(fp.engine), served_context_window(&json));
+            return Some(fp.engine);
         }
     }
-    (None, None)
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,13 +1125,6 @@ pub struct EndpointProbeResult {
     /// The warm (loaded-in-memory) subset of `models`, in server order.
     /// Empty = none reported or capability absent. Fail-soft.
     pub warm: Vec<String>,
-    /// The context window the server reports it is SERVING, when it says so
-    /// (llama.cpp `/props`). `None` = the server did not report one, or
-    /// reported a non-positive placeholder — never guess a ceiling from
-    /// silence. Use [`reconcile_context_window`] to reconcile it with a
-    /// declared window; a declaration larger than this is a misconfiguration
-    /// whose only other symptom is a string of rejected requests.
-    pub served_context: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -1308,7 +1307,7 @@ async fn finish_probe(
     api_key: Option<&str>,
 ) -> EndpointProbeResult {
     let serving = api_for(kind).serving(models.len());
-    let (engine, served_context) = detect_engine_and_window(client, endpoint, kind, api_key).await;
+    let engine = detect_engine(client, endpoint, kind, api_key).await;
     let warm = match engine {
         // The vLLM served list IS the warm list — no second fetch.
         Some(Engine::Vllm) => models.clone(),
@@ -1324,7 +1323,6 @@ async fn finish_probe(
         serving,
         engine,
         warm,
-        served_context,
     }
 }
 

@@ -197,45 +197,114 @@ fn a_body_without_a_window_yields_none() {
     );
 }
 
-/// The reconciliation rule, which is the whole point: a declaration LARGER than
-/// the served window is a misconfiguration and gets capped + flagged; a
-/// declaration SMALLER is an operator tightening deliberately and is left alone.
-#[test]
-fn a_declaration_larger_than_the_served_window_is_capped_and_flagged() {
-    // The failure this feature exists to prevent: declared 200k, served 64k.
+/// **The wiring, which is the whole point.** `served_context_window` is a pure
+/// parser; what makes it matter is that the ONE per-model window method every
+/// production path already calls now reaches it.
+///
+/// Both live callers go through `BackendApi::context_window`: session-start
+/// adopt (`newt-tui/src/lib.rs`, which sets `choice.context_window` from the
+/// SELECTED model) and the cache-side probe (`newt-tui/src/probe.rs`
+/// `fetch_context_window` → `ensure_context_window`). From there the discovered
+/// window takes precedence over a tunings-file declaration and becomes
+/// `safe_context`. Before this, llama.cpp got `None` from both and the window
+/// stayed whatever a human typed.
+///
+/// `?model=` is load-bearing: this server answers only when asked about a
+/// named model, exactly as a llama-swap router does.
+#[tokio::test]
+async fn openai_context_window_reads_a_llamacpp_served_window_per_model() {
+    let server = MockServer::start().await;
+    // No `max_model_len` anywhere — llama.cpp's `/v1/models` declares nothing,
+    // which is why the window was previously unknowable.
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "Ornith-1.5-35B-Q8_0"}, {"id": "qwen3-coder"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/props"))
+        .and(query_param("model", "Ornith-1.5-35B-Q8_0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "default_generation_settings": {"n_ctx": 65536},
+            "model_path": "/models/Ornith-1.5-35B-Q8_0.gguf",
+        })))
+        .mount(&server)
+        .await;
+    // The router's answer when asked about nothing in particular: not a window.
+    Mock::given(method("GET"))
+        .and(path("/props"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "default_generation_settings": {"n_ctx": 0}, "model_path": "none"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = reqwest::Client::new();
     assert_eq!(
-        reconcile_context_window(Some(200_000), Some(65_536)),
-        (Some(65_536), true),
-        "over-declaration must be capped AND reported"
+        api_for(BackendKind::Openai)
+            .context_window(&client, &server.uri(), "Ornith-1.5-35B-Q8_0", None)
+            .await,
+        Some(65_536),
+        "the served window must reach the method adopt and the cache probe call"
+    );
+    // Context is per-MODEL: a sibling on the same endpoint is a separate
+    // question, and an unloaded answer is unknown rather than a zero ceiling.
+    assert_eq!(
+        api_for(BackendKind::Openai)
+            .context_window(&client, &server.uri(), "qwen3-coder", None)
+            .await,
+        None,
+        "one endpoint serves many models; a window is never endpoint-wide"
     );
 }
 
-#[test]
-fn a_smaller_declaration_is_respected_and_not_flagged() {
-    // Deliberate tightening — leaving room for output, or testing under
-    // pressure. Not a mistake, so no flag and no widening.
+/// vLLM's `max_model_len` still wins outright, and `/props` is never consulted
+/// when it does — the new read is a fallback that fills a `None`, so no
+/// endpoint that answered before can start answering differently.
+#[tokio::test]
+async fn a_declared_max_model_len_still_wins_without_a_props_fetch() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "m", "max_model_len": 262_144}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/props"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "default_generation_settings": {"n_ctx": 4096}
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
     assert_eq!(
-        reconcile_context_window(Some(8_192), Some(65_536)),
-        (Some(8_192), false)
-    );
-    // Equal is not "wrong high".
-    assert_eq!(
-        reconcile_context_window(Some(65_536), Some(65_536)),
-        (Some(65_536), false)
+        api_for(BackendKind::Openai)
+            .context_window(&reqwest::Client::new(), &server.uri(), "m", None)
+            .await,
+        Some(262_144)
     );
 }
 
-#[test]
-fn a_missing_half_falls_back_without_flagging() {
-    // No server signal: keep the declaration, say nothing.
+/// A server with no `/props` at all (a plain OpenAI proxy) stays `None` rather
+/// than erroring — the whole path is fail-soft.
+#[tokio::test]
+async fn no_props_route_yields_no_window_not_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "m"}]
+        })))
+        .mount(&server)
+        .await;
     assert_eq!(
-        reconcile_context_window(Some(200_000), None),
-        (Some(200_000), false)
+        api_for(BackendKind::Openai)
+            .context_window(&reqwest::Client::new(), &server.uri(), "m", None)
+            .await,
+        None
     );
-    // No declaration: adopt what the server reports.
-    assert_eq!(
-        reconcile_context_window(None, Some(65_536)),
-        (Some(65_536), false)
-    );
-    assert_eq!(reconcile_context_window(None, None), (None, false));
 }
