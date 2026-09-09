@@ -21,6 +21,11 @@ members = [
     "crates/newt-tuner",
     "newt-eval",
     "newt-agent-py",
+    # The derivation kernel. Incubated here rather than in its own repo through
+    # 0.1.0 -- see docs/decisions/agent-frame-v0-monorepo.md. It is a LEAF: it
+    # must never acquire newt-core's closure, and tests/no_service_edge.rs
+    # asserts it has no HTTP or inference dependency edge.
+    "agent-frame",
     "plugins-protocol",
     "providers/openai",
     "tests/common",

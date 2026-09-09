@@ -541,3 +541,10 @@ install-hooks:
 [windows]
 install-hooks:
     git config core.hooksPath .githooks; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; git config url."https://github.com/".pushInsteadOf "git@github.com:"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Write-Output "core.hooksPath -> .githooks (pre-push gate wired)"; Write-Output "pushes to git@github.com:* rewritten to https://github.com/* (#276)"; git config --get-urlmatch credential.helper https://github.com *> $null; if ($LASTEXITCODE -ne 0) { Write-Warning "no git credential helper for https://github.com - run: gh auth setup-git" }
+
+# Re-check every theorem in the machine-checked core (agent-frame).
+# PIPELINE PARITY: mirrors the `formal` job in .github/workflows/ci.yml.
+# Deliberately NOT in the pre-push hook -- see that job's comment (#1098).
+formal:
+    cd formal && lake build
+

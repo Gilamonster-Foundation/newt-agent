@@ -105,3 +105,7 @@ wip/
 # Cursor agent test target (local)
 target-cursor-tests/
 .worktrees/
+
+# Lean build artifacts (agent-frame formal core)
+formal/.lake/
+formal/tla/states/
