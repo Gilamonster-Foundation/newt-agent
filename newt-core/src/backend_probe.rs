@@ -702,8 +702,19 @@ impl BackendApi for OpenAiApi {
         // `max_model_len` — the authoritative window (vLLM pre-allocates KV for
         // exactly it). Without this a 256k model got NO window and compacted at
         // a tiny default.
-        let json = openai_models_json(client, endpoint, api_key).await.ok()?;
-        parse_openai_models_window(&json, model)
+        if let Ok(json) = openai_models_json(client, endpoint, api_key).await {
+            if let Some(window) = parse_openai_models_window(&json, model) {
+                return Some(window);
+            }
+        }
+        // #2248: llama.cpp declares nothing in `/v1/models`, so until now this
+        // returned `None` for it and the window stayed whatever a human typed
+        // into `--context-window` or a tunings file — a declaration corrected
+        // only by failing (`cw_overflow` shrinks 20% per rejected request). Its
+        // `/props` carries the real number. Second, not first, so every
+        // endpoint that answers today keeps answering identically; this only
+        // fills a `None`.
+        llamacpp_served_window(client, endpoint, model, api_key).await
     }
 
     fn serving(&self, served_count: usize) -> Serving {
@@ -882,6 +893,64 @@ pub fn builtin_engine_fingerprints() -> &'static [EngineFingerprint] {
             marker: FingerprintMarker::ModelsArrayWithState,
         },
     ]
+}
+
+/// The context window a llama.cpp server reports it is actually serving, from
+/// a `/props` body. Pure — unit-tested without a server.
+///
+/// **Why this exists.** `safe_context` is otherwise whatever a human declared
+/// (`--context-window`), and a declaration that is too LARGE is discovered only
+/// by failing: `cw_overflow::core_recover_overflow` shrinks 20% per attempt, so
+/// a declared 200k against a served 65536 costs about five rejected requests
+/// before the turn converges. The server states the number; nothing was reading
+/// it.
+///
+/// Reads `default_generation_settings.n_ctx`, then a top-level `n_ctx`.
+///
+/// **Zero is not an answer.** A llama-swap style router with nothing loaded
+/// answers `{"default_generation_settings":{"n_ctx":0},"model_path":"none"}`.
+/// Treating that as a ceiling would clamp every request to nothing, so a
+/// non-positive value is `None` — unknown, not zero. Naming the model
+/// (`?model=<id>`, which [`llamacpp_served_window`] does) is what gets a real
+/// window back.
+#[must_use]
+pub fn served_context_window(json: &serde_json::Value) -> Option<u32> {
+    json.get("default_generation_settings")
+        .and_then(|g| g.get("n_ctx"))
+        .or_else(|| json.get("n_ctx"))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|n| *n > 0)
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+}
+
+/// Fetch one MODEL's served window from a llama.cpp `/props` body.
+///
+/// `?model=` is not decoration. On a llama-swap style router bare `/props`
+/// answers for whatever is loaded — `n_ctx: 0` / `model_path: "none"` when that
+/// is nothing — so the model has to be named or the answer is about the wrong
+/// model. Context is per-model: one endpoint serves many, with different
+/// windows, which is why this takes `model` and why no single number belongs on
+/// an endpoint-wide probe result.
+///
+/// Fail-soft like the rest of [`BackendApi`]: any transport error, non-success
+/// status, non-JSON body, or non-positive `n_ctx` is `None` — unknown, never a
+/// guessed ceiling.
+async fn llamacpp_served_window(
+    client: &reqwest::Client,
+    endpoint: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Option<u32> {
+    let url = format!("{}/props", endpoint.trim_end_matches('/'));
+    // `.query` percent-encodes; model ids carry `/` and `:`.
+    let resp = maybe_bearer(client.get(&url).query(&[("model", model)]), api_key)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    served_context_window(&resp.json().await.ok()?)
 }
 
 /// Does `json` satisfy `marker`? Pure — unit-tested without a server.
