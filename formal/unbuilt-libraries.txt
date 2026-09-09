@@ -1,0 +1,22 @@
+# Libraries whose proof source lives in formal/ but which are DELIBERATELY not
+# built by lakefile.toml.
+#
+# `formal/check-libraries.sh` fails when a `<Name>.lean` library root exists but
+# no `[[lean_lib]]` builds it — that is how nine libraries silently vanishing
+# from the manifest gets caught. This file is the escape hatch for an
+# INTENTIONAL removal, and it is deliberately noisy:
+#
+#   * every entry is echoed as a CI ::warning:: on each run;
+#   * a stale entry — one naming a library the manifest DOES declare, or one
+#     with no proof source at all — is a hard error;
+#   * adding a name here is a reviewable diff, which is the whole point.
+#
+# One library name per line. Give a reason above each entry.
+# Prefer deleting the proof source outright: a library nobody builds is a
+# library nobody checks, and an unchecked proof is worse than no proof.
+#
+# Format:
+#   # why: <reason>, <date>, <issue>
+#   SomeLibrary
+#
+# (No entries. Every library root in formal/ is declared and built.)

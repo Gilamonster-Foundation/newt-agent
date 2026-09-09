@@ -56,13 +56,34 @@ Needs a Lean toolchain (via [`elan`](https://github.com/leanprover/elan); the
 version is pinned in `lean-toolchain`). No Mathlib.
 
 ```sh
-cd formal
-lake build        # checks every theorem; exit 0 iff all proofs go through
+just formal       # the whole gate, exactly as CI runs it
 ```
 
-CI runs this on every change under `formal/` (`.github/workflows/formal.yml`), so
-a Rust change that would break a proven invariant fails the build — the "formal
-specifications engine" of #902 in its first, smallest form.
+That is four steps, and `lake build` alone is only the first:
+
+```sh
+cd formal && lake build            # checks every theorem; exit 0 iff all proofs go through
+bash formal/check-libraries.sh     # ANTI-VACUOUS: proves the build checked EVERY library
+bash formal/test-check-libraries.sh# the guard's own regression suite
+TLA_SPEC_DIR="$PWD/formal/tla" bash spec/tla/check.sh ContentAddressableLog
+```
+
+**Why `lake build` is not enough on its own.** It exits 0 on a mis-configured
+package having checked nothing, so a green tick is not evidence that a theorem
+was proved. `check-libraries.sh` supplies that evidence by comparing three
+independent sources — the git-tracked `<Name>.lean` roots, the `[[lean_lib]]`
+entries, and the built oleans — so a manifest that silently stops building a
+library whose proofs still exist is an error, not a quieter success. To remove a
+library on purpose, record it in `unbuilt-libraries.txt`.
+
+**Why the TLA+ line names its model.** `spec/tla/check.sh` defaults to
+discovering specs in its OWN directory, so models under `formal/tla` are checked
+by nothing unless `TLA_SPEC_DIR` points at them and the model is named.
+
+CI runs the Lean half on every change under `formal/`
+(`.github/workflows/formal.yml`) and the TLA+ half in
+`.github/workflows/behavior-formal.yml`, so a Rust change that would break a
+proven invariant fails the build — the "formal specifications engine" of #902.
 
 ## Roadmap (#902)
 
