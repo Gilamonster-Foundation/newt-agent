@@ -4280,10 +4280,12 @@ dependencies = [
 name = "newt-agent"
 version = "0.8.0"
 dependencies = [
+ "agent-frame",
  "anyhow",
  "assert_cmd",
  "async-trait",
  "clap",
+ "content-addressable",
  "libc",
  "newt-acp-worker",
  "newt-core",

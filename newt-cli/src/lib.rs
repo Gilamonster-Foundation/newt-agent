@@ -21,6 +21,7 @@ pub mod dgx_status;
 pub mod dgx_vllm;
 mod dock_cmd;
 mod doctor;
+mod frame_cmd;
 pub mod help_suite;
 mod identity_cmd;
 mod mcp_cmd;
@@ -994,6 +995,20 @@ pub enum Command {
         #[command(subcommand)]
         cmd: Option<summarizer_cmd::SummarizerCmd>,
     },
+    /// Forensics over the derivation frame: establish which source material a
+    /// unit represents and how it was derived.
+    ///
+    /// `verify` recomputes a unit's claims from the source bytes and compares,
+    /// exiting non-zero on mismatch. `explain` reports the derivation.
+    /// `trace` walks a packet's parents to genesis.
+    ///
+    /// Every subcommand takes `--json` and emits a structured report a second
+    /// program can consume; the human rendering is a projection of that same
+    /// report, never a separate set of facts.
+    Frame {
+        #[command(subcommand)]
+        cmd: frame_cmd::FrameCmd,
+    },
 }
 
 /// clap `value_parser` for `--color`: parse a keyword into a
@@ -1752,6 +1767,10 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Config => config_cmd::run(cli.config.as_deref()),
         Command::Compaction => compaction_cmd::run(cli.config.as_deref()),
+        Command::Frame { cmd } => {
+            let code = frame_cmd::run(&cmd)?;
+            std::process::exit(code);
+        }
         Command::Identity { cmd } => identity_cmd::run(cli.config.as_deref(), cmd),
         Command::Init => newt_tui::run_init(newt_tui::color_supported()),
         Command::Setup {

@@ -33,8 +33,10 @@ newt-mcp-server.workspace = true
 newt-mcp-client.workspace = true
 newt-identity.workspace = true
 newt-launch.workspace = true
+agent-frame = { path = "../agent-frame" }
 anyhow.workspace = true
 clap.workspace = true
+content-addressable = { workspace = true }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

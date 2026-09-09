@@ -10,35 +10,49 @@
 //! to do, `agent-mesh` asks who am I talking to, **agent-frame asks what do I
 //! know and how do I know it**, and `agent-store` holds durable ordering.
 //!
+//! # A unit's address is self-validating
+//!
+//! The single property this crate exists to provide: **given a unit's id and
+//! the source bytes, a consumer who did not run the build can establish which
+//! material the unit represents and how it was derived.**
+//!
+//! That is a claim about the *hash*, not about a comment. A [`Unit`]'s id is
+//! the id of its [`Derivation`] — `{ op, source, span, elided, root }` — so two
+//! elisions over different sources, or over different ranges of one source,
+//! cannot collide. [`verify::verify_unit`] recomputes all three claims from the
+//! bytes and compares.
+//!
+//! An earlier revision failed this. It hashed `{ op, depth, root_kind, life,
+//! addressed }`, which names no material: every elision with the same root kind
+//! minted the *same* id, and `addressed: true` was a declaration rather than an
+//! address. See `docs/decisions/agent-frame-v0-monorepo.md`.
+//!
+//! # The admission boundary is closed
+//!
+//! [`Unit`] does not implement [`serde::Deserialize`]. Foreign bytes decode to
+//! [`RawUnit`] and cross into a `Unit` only through the fallible
+//! [`TryFrom`] impl, which enforces the v0 contract. Deriving `Deserialize`
+//! made the constructor one path of two, and the decoder was the unchecked one.
+//!
 //! # The machine-checked referent
 //!
 //! Every table in [`op`] and every rule in [`unit`] mirrors
-//! `formal/ContextOps/Basic.lean`, which CI builds. A change that breaks a
-//! proven invariant fails the Lean build, not just the Rust tests. The
-//! correspondence is the point: these are not two implementations that happen
-//! to agree, they are one law and its executable form.
+//! `formal/ContextOps/Basic.lean`, which CI builds.
 //!
 //! ```text
 //! Op          concise | elide | generate
 //! depthAfter  generate => d+1 ;  concise, elide => d
-//! Unit        { op, depth, root, life, addressed }
 //! Unit.wf     depth <= 1
+//! checkOf     .elide = .rederive
 //! ```
 //!
 //! # v0 mints elision only
 //!
-//! [`Op::Concise`] and [`Op::Generate`] exist in the type; [`Unit::seal`]
-//! refuses them. The referent is `checkOf .elide = .rederive`: elision asserts
-//! nothing and is verified by re-derivation, so **every v0 assertion is a
-//! deterministic recompute** — no model, no corpus, no grounding threshold, no
-//! flake.
-//!
-//! The elision cut also dissolves the largest hole in the formal core rather
-//! than deferring it. The predicate *"this segment is SOURCE, not prior packet
-//! prose"* is definable nowhere on a `Unit`, which carries no content. Elision
-//! addresses a byte range of the source, so the question is answered by
-//! construction — and that predicate becomes the gate on ever enabling
-//! generation.
+//! [`Op::Concise`] and [`Op::Generate`] exist in the type; [`Unit::seal`] and
+//! the admission boundary both refuse them. The referent is `checkOf .elide =
+//! .rederive`: elision asserts nothing and is verified by re-derivation, so
+//! **every v0 assertion is a deterministic recompute** — and
+//! [`verify::verify_unit`] is that recompute, not a word for one.
 //!
 //! # What this crate is not
 //!
@@ -50,13 +64,22 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Derivations: the addressed fact a unit's identity is computed over.
+pub mod derivation;
 /// The operation algebra: what was done, what it asserts, how it is checked.
 pub mod op;
 /// Packets: the chain, and identity over the whole body.
 pub mod packet;
+/// Roots: which event caused a derivation.
+pub mod root;
 /// Units: what a derived thing is, and what it owes its source.
 pub mod unit;
+/// The one verification decision, and its resolver seam.
+pub mod verify;
 
+pub use derivation::{Derivation, Span};
 pub use op::{Check, Op};
-pub use packet::{Packet, PacketId, UnitId};
-pub use unit::{Life, Root, SealError, Unit};
+pub use packet::{Packet, PacketBody, PacketId, UnitId};
+pub use root::{RootEvent, RootKind};
+pub use unit::{AdmitError, Life, RawUnit, SealError, Unit};
+pub use verify::{verify_unit, verify_unit_with, Mismatch, SourceResolver, Verified, VerifyError};
