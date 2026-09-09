@@ -105,14 +105,27 @@ pub fn terminal(
     // inherit a terminal state. Silent inheritance is how #2212 arrived.
     match end_reason {
         Some(
-            reason @ (TurnEndReason::RoundCap | TurnEndReason::Empty | TurnEndReason::Cancelled),
+            reason @ (TurnEndReason::RoundCap
+            | TurnEndReason::Empty
+            | TurnEndReason::Cancelled
+            // #2239: the rescue budget ran out and the loop accepted the
+            // narration as the answer. The reported transcript's whole reply
+            // was the rescue nudge's own "I'm finished" sentence, and it was
+            // recorded here as an ordinary success — indistinguishable from an
+            // answered question in `outcome`, in `status`, and to every
+            // consumer downstream. That is the #2212 falsehood in a second
+            // place: the loop stopped before finishing, so it stopped short.
+            | TurnEndReason::NarrationCapExhausted),
         ) => Terminal::StoppedShort(reason),
-        Some(
-            TurnEndReason::Completed
-            | TurnEndReason::NarrationCapExhausted
-            | TurnEndReason::NarrationFinalRound,
-        )
-        | None => Terminal::Completed,
+        // `NarrationFinalRound` is deliberately NOT moved with it. It is a
+        // different exit — the round limit arrived while the model happened to
+        // be narrating — and no report stands behind reclassifying it. It is
+        // the same class and probably belongs beside `RoundCap`; that is a
+        // separate decision with its own bench-row consequences, not a
+        // wildcard to sweep along with this one.
+        Some(TurnEndReason::Completed | TurnEndReason::NarrationFinalRound) | None => {
+            Terminal::Completed
+        }
         // `Failed` implies an error, so `clean` is false and this is
         // unreachable. Classified anyway rather than left to a wildcard.
         Some(TurnEndReason::Failed) => Terminal::Failed(Some(ErrorClass::Harness)),
@@ -156,13 +169,30 @@ pub fn outcome_label(t: Terminal) -> &'static str {
         // beyond the cap-exit case, made deliberately: `completed` for a
         // placeholder reply is the same falsehood #2212 identified.
         Terminal::StoppedShort(TurnEndReason::Empty) => "model_error",
+        // #2239. `model_error`, NOT `timeout`, and the distinction is the
+        // whole point of moving it.
+        //
+        // `CONTRACT.md`'s `model_error` is "reached but errored (refused,
+        // emitted invalid output)" — exactly this turn: the model ran for
+        // several rounds, was handed the rescue, and returned prose where an
+        // answer was required. That is unusable content from a model that WAS
+        // meaningfully exercised, which is the `Empty` argument above applied
+        // to a non-empty placeholder.
+        //
+        // It is not `timeout`, and the code says so: `NarrationCapExhausted`
+        // REQUIRES `round + 1 < current_tool_round_limit` at all three accept
+        // sites in `newt-core/src/agentic/mod.rs` — there were rounds left. No
+        // budget wall was hit; the harness ran out of patience with the model's
+        // narration, which is a model-behavior failure, not a resource one.
+        // Filing it `timeout` would also drop the row from the matrix
+        // (`is_real_attempt()` is `Completed | ModelError`) and quietly improve
+        // the average — the exact harm `bench_outcome_values_v1.txt` warns
+        // about. `model_error` keeps the row and scores it as the failure it is.
+        Terminal::StoppedShort(TurnEndReason::NarrationCapExhausted) => "model_error",
         // The remaining variants cannot construct `StoppedShort`; listed so a
         // new one fails to compile rather than inheriting a bucket.
         Terminal::StoppedShort(
-            TurnEndReason::Completed
-            | TurnEndReason::NarrationCapExhausted
-            | TurnEndReason::NarrationFinalRound
-            | TurnEndReason::Failed,
+            TurnEndReason::Completed | TurnEndReason::NarrationFinalRound | TurnEndReason::Failed,
         ) => "harness_error",
         Terminal::Failed(Some(ErrorClass::Model)) => "model_error",
         Terminal::Failed(Some(ErrorClass::Transport)) => "transport_error",
@@ -459,6 +489,54 @@ mod tests {
                  upstream enum, in its own commit."
             );
         }
+    }
+
+    /// **#2239.** A turn the loop gave up on must not be recorded as an
+    /// ordinary success.
+    ///
+    /// The reported transcript's entire stored reply was the rescue nudge's own
+    /// sentence — "I'm finished — the answer above is the complete deliverable"
+    /// — with no answer above it. `end_reason` was `NarrationCapExhausted`, and
+    /// the operator's only signal was a `⚠` glyph in a footer. Everything a
+    /// consumer reads said `completed`: the contract record's `outcome`, the
+    /// trace line's `status`, and `Terminal` itself.
+    ///
+    /// This asserts all three, because the defect was that all three agreed on
+    /// the wrong answer. Before the fix each `assert` below reads "completed".
+    #[test]
+    fn an_exhausted_narration_rescue_is_not_recorded_as_a_completion() {
+        let t = terminal(true, None, Some(TurnEndReason::NarrationCapExhausted));
+        assert_eq!(
+            t,
+            Terminal::StoppedShort(TurnEndReason::NarrationCapExhausted),
+            "the loop stopped before finishing — that is StoppedShort, not a \
+             genuine final answer"
+        );
+        assert_eq!(
+            status_label(t),
+            "incomplete",
+            "newt's own trace line must say the run did not finish what it set \
+             out to do (#2212's question, asked of a second exit)"
+        );
+        assert_eq!(
+            outcome_label(t),
+            "model_error",
+            "the model WAS reached and emitted unusable content — a real \
+             attempt that failed, not a budget wall and not a clean completion"
+        );
+
+        // The over-correction guard, in both directions. A genuine completion
+        // is untouched, and `NarrationFinalRound` — deliberately left behind,
+        // see `terminal` — must not have been swept along.
+        assert_eq!(
+            terminal(true, None, Some(TurnEndReason::Completed)),
+            Terminal::Completed
+        );
+        assert_eq!(
+            terminal(true, None, Some(TurnEndReason::NarrationFinalRound)),
+            Terminal::Completed
+        );
+        assert_eq!(outcome_label(Terminal::Completed), "completed");
     }
 
     /// The permitted set is a copy of a specific upstream shape, so it is

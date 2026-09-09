@@ -158,6 +158,56 @@ fn read_scope(paths: &[&Path]) -> newt_core::caveats::Caveats {
     }
 }
 
+/// Real refs ground the strict catalog's nullable scope: null and omission
+/// both enumerate all branches using only the bounded repository read grant.
+#[test]
+fn confined_act_branch_list_null_scope_matches_omitted_bounded_all() {
+    let repo = repo_with_commit();
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    let session = read_scope(&[repo.path()]);
+    let t = tool(repo.path());
+    let dispatch = |args: serde_json::Value| {
+        t.dispatch("branch-list", &args, &GitCaveats::read_only(), &session)
+    };
+    let omitted = dispatch(serde_json::json!({"op": "branch-list"})).unwrap();
+    assert!(omitted.contains("local branches: 1"), "{omitted}");
+    assert!(
+        omitted.contains("cached remote-tracking branches: 1"),
+        "{omitted}"
+    );
+    assert_eq!(
+        omitted
+            .lines()
+            .filter(|line| line.starts_with("refs/"))
+            .collect::<Vec<_>>(),
+        ["refs/heads/main", "refs/remotes/origin/main"]
+    );
+    assert_eq!(
+        dispatch(serde_json::json!({"op": "branch-list", "scope": "all"})).unwrap(),
+        omitted
+    );
+    for invalid in [
+        serde_json::json!("everything"),
+        serde_json::json!(1),
+        serde_json::json!(true),
+        serde_json::json!([]),
+        serde_json::json!({}),
+    ] {
+        let out = dispatch(serde_json::json!({"op": "branch-list", "scope": invalid}));
+        assert!(
+            matches!(out, Err(ref error) if error.contains("scope must be local, remote, or all")),
+            "{out:?}"
+        );
+    }
+    assert_eq!(
+        dispatch(serde_json::json!({"op": "branch-list", "scope": null})).unwrap(),
+        omitted
+    );
+}
+
 /// Real repositories ground the dispatch mock's authority boundary. Git's
 /// read bit cannot substitute for the session's repository filesystem grant.
 #[test]
