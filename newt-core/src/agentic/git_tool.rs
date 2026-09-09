@@ -59,7 +59,13 @@ pub(crate) fn read_only_definition() -> serde_json::Value {
          must be within the session's filesystem read grants. Other Git operations \
          are unavailable under this turn's authority."
     );
+    def["function"]["strict"] = serde_json::json!(true);
     def["function"]["parameters"]["properties"]["op"]["enum"] = serde_json::json!(SCOPED_READ_OPS);
+    def["function"]["parameters"]["properties"]["scope"]["type"] =
+        serde_json::json!(["string", "null"]);
+    def["function"]["parameters"]["properties"]["scope"]["enum"] =
+        serde_json::json!(["local", "remote", "all", null]);
+    def["function"]["parameters"]["required"] = serde_json::json!(["op", "scope"]);
     def["function"]["parameters"]["additionalProperties"] = serde_json::json!(false);
     if let Some(properties) = def["function"]["parameters"]["properties"].as_object_mut() {
         properties.retain(|name, _| matches!(name.as_str(), "op" | "scope"));
