@@ -29,6 +29,12 @@
 //! `/Applications/Xcode.app/…/libxcrun.dylib`) is the same mechanism on the
 //! other backend — `/Applications` is absent from the macOS `base_read_paths`.
 //!
+//! `$HOME/.gitconfig` is not the only ambient path the fence refuses. CI (which
+//! has `/etc/gitconfig`; a dev box may not) showed git fatal on the SYSTEM config
+//! first — `/etc` is not in the read base either. Both tests therefore set
+//! `GIT_CONFIG_NOSYSTEM=1` so the only axis they vary is `$HOME`; see the comment
+//! at the env map.
+//!
 //! Linux-only and `#[serial]`, matching `confined_exec_landlock.rs`: the
 //! invariant is the kernel's own enforcement on a real child.
 
@@ -95,6 +101,22 @@ async fn confined_commit(ws: &Path, home: &Path, read_grants: &[String]) -> serd
             // Bare-name resolution for the granted `git`. A real session
             // inherits this from the operator's PATH.
             "PATH": "/usr/bin:/bin",
+            // Isolate the ONE axis these tests vary: `$HOME`.
+            //
+            // Git reads the SYSTEM config (`/etc/gitconfig`) before the user's,
+            // and `/etc` is not in the sandbox read base — only a short list of
+            // specific `/etc` files is (ld.so.cache, nsswitch.conf, resolv.conf,
+            // ssl, ca-certificates …), and `gitconfig` is not among them. So on
+            // any host that HAS `/etc/gitconfig`, git fatals there before it ever
+            // reaches `$HOME`, and the control below would fail for a reason that
+            // has nothing to do with the grant under test. That is exactly what
+            // happened on CI (`/etc/gitconfig: Permission denied`, exit 128) while
+            // passing on a dev box that has no `/etc/gitconfig` at all.
+            //
+            // Switching the system config off makes both tests depend on `$HOME`
+            // and nothing else, on every host. It does not weaken either
+            // assertion — it removes a second, unrelated cause.
+            "GIT_CONFIG_NOSYSTEM": "1",
         },
     });
     // The safe-subset engine, not `agent_bridle::registry()`'s brush default:
@@ -145,12 +167,18 @@ async fn default_fence_blocks_git_commit_because_home_is_unreadable() {
         out["exit_code"],
         serde_json::json!(0),
         "#1016 no longer reproduces — `git commit` now succeeds under the \
-         default fence. If that is intended, delete this file and close #1016: {out}"
+         default fence. If that is intended, delete this file and close the issue: {out}"
     );
+    // Name the cause: it must be `$HOME/.gitconfig` that was refused, not some
+    // other out-of-fence read. Paired with `GIT_CONFIG_NOSYSTEM` above, this is
+    // what makes the control's success attributable to the `$HOME` grant alone.
     let stderr = out["stderr"].as_str().unwrap_or_default();
+    let gitconfig = home.path().join(".gitconfig");
     assert!(
-        stderr.contains("Author identity unknown") || stderr.contains("Permission denied"),
-        "expected the config read to be what failed, got: {out}"
+        stderr.contains(&gitconfig.to_string_lossy().into_owned())
+            && stderr.contains("Permission denied"),
+        "the reproduction must fail on {} specifically, got: {out}",
+        gitconfig.display()
     );
 }
 
