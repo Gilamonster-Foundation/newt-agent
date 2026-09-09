@@ -274,3 +274,82 @@ async fn responses_valid_request_dispatches_exactly_once() {
     let reqs = server.received_requests().await.expect("journal");
     assert_eq!(reqs.len(), 1, "a validated request dispatches exactly once");
 }
+
+/// The scoped read-only Git catalog must be usable on the Responses wire.
+///
+/// `read_only_definition()` is the shared source for BOTH live call sites —
+/// `definition_for_read_scope` under a scoped `fs_read` grant
+/// (`tools/catalog.rs`) and `filter_tools_for_disposition`, which substitutes it
+/// for EVERY non-Act disposition. Its `parameters.additionalProperties: false`
+/// with no top-level `strict: true` is exactly the `StrictSchemaLoss` shape
+/// `validate_tools` refuses, and `openai_responses_complete` propagates that
+/// refusal with `?` — so the whole turn aborts before dispatch. This pins the
+/// repair at the shared definition, plus the strict optional-scope semantics it
+/// needs (every field required, while `null` retains the default scope) without
+/// standing up a second schema validator.
+#[test]
+fn scoped_read_only_git_catalog_survives_the_responses_strict_gate() {
+    let policy = responses_wire_validation::ResponsesWirePolicy {
+        store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
+        tools_permitted: true,
+        model: "test-model",
+        authoritative_budget: None,
+        calibration: 1.0,
+        estimation: crate::tokens::TokenEstimation::default(),
+        spill: None,
+        compaction: None,
+    };
+    for (path, definition) in [
+        (
+            "scoped fs_read",
+            crate::agentic::git_tool::definition_for_read_scope(&crate::Scope::only([
+                "workspace".to_string()
+            ])),
+        ),
+        (
+            "non-Act disposition",
+            crate::agentic::git_tool::read_only_definition(),
+        ),
+    ] {
+        let body = serde_json::json!({
+            "model": "test-model",
+            "store": crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
+            "instructions": "be terse",
+            "input": [{"role": "user", "content": "Count the branches."}],
+            "tools": tools_to_responses(&serde_json::json!([definition])),
+        });
+        responses_wire_validation::validate_responses_request(&body, &policy).unwrap_or_else(|e| {
+            panic!("the real scoped Git schema must dispatch on Responses ({path}): {e}")
+        });
+        let git = &body["tools"][0];
+        assert_eq!(git["strict"], true, "{path}");
+        let parameters = &git["parameters"];
+        assert_eq!(parameters["additionalProperties"], false, "{path}");
+        assert_eq!(
+            parameters["required"],
+            serde_json::json!(["op", "scope"]),
+            "{path}: strict mode requires every advertised property"
+        );
+        let properties = parameters["properties"].as_object().unwrap();
+        assert_eq!(
+            properties.len(),
+            2,
+            "{path}: no broader Git operations or arguments"
+        );
+        assert_eq!(
+            properties["op"]["enum"],
+            serde_json::json!(["branch-list"]),
+            "{path}"
+        );
+        assert_eq!(
+            properties["scope"]["type"],
+            serde_json::json!(["string", "null"]),
+            "{path}: required-and-nullable is how strict mode spells optional"
+        );
+        assert_eq!(
+            properties["scope"]["enum"],
+            serde_json::json!(["local", "remote", "all", null]),
+            "{path}"
+        );
+    }
+}
