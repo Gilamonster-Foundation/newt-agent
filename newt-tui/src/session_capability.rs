@@ -27,6 +27,7 @@ pub(crate) struct SessionCapability {
     /// capability then degrades to a plain caveats floor (still narrowing-only).
     op: Option<newt_identity::AgentKey>,
     caveats: newt_core::caveats::Caveats,
+    delegation: Option<newt_identity::VerifiedDelegation>,
 }
 
 impl SessionCapability {
@@ -35,14 +36,48 @@ impl SessionCapability {
         tui: Option<newt_core::TuiConfig>,
         key_path: Option<&std::path::Path>,
         workspace: &str,
+        delegation: Option<newt_identity::VerifiedDelegation>,
     ) -> Self {
         let policy = policy_for(tui, workspace);
+        // A delegated session inherits its ceiling; it does not establish one.
+        //
+        // `key_path` is deliberately still accepted and deliberately still
+        // ignored here. The dangerous shape is not "a delegated session with no
+        // key" — it is a delegated session that CAN see an operator key, on
+        // disk, at a path it was handed, and must decline to root itself in it
+        // anyway. So the enforcement is written for that case rather than for
+        // the absence of the temptation: no key is minted, no existing key is
+        // read or rewritten, and `op` stays `None`, which is what makes
+        // `plugin_envelope_for` refuse to mint nested envelopes.
+        //
+        // The ceiling is MET with the local policy, never taken from it: a
+        // delegated session may narrow itself further (a tighter preset still
+        // applies) but the parent's signed ceiling is the cap. That is
+        // attenuate-never-amplify at the session boundary — the same law
+        // `enforced_caveats` provides on the ordinary path.
+        if let Some(d) = delegation {
+            let caveats = policy.meet(d.caveats());
+            return Self {
+                op: None,
+                caveats,
+                delegation: Some(d),
+            };
+        }
         let op = key_path.and_then(|p| mint_operating_key(p, &policy).ok());
         let caveats = match &op {
             Some(k) => newt_identity::enforced_caveats(k).unwrap_or(policy),
             None => policy,
         };
-        Self { op, caveats }
+        Self {
+            op,
+            caveats,
+            delegation: None,
+        }
+    }
+
+    /// The inherited ceiling is distinct from a removable named posture.
+    pub(crate) fn delegation(&self) -> Option<&newt_identity::VerifiedDelegation> {
+        self.delegation.as_ref()
     }
 
     /// The active enforcement caveats the tool loop consults.

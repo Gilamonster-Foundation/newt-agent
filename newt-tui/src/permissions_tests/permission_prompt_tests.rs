@@ -72,6 +72,7 @@ fn web_decisions_publish_and_consume_a_web_verdict_without_the_tty() {
         denials_path: None,
         config_path: None,
         preset_clamp: None,
+        delegation: None,
         danger: danger::DangerTable::builtin(),
         color: false,
         verbose: false,
@@ -112,6 +113,7 @@ fn web_decision_timeout_resolves_and_denies_without_hanging() {
         denials_path: None,
         config_path: None,
         preset_clamp: None,
+        delegation: None,
         danger: danger::DangerTable::builtin(),
         color: false,
         verbose: false,
@@ -151,6 +153,7 @@ fn web_publish_failure_records_web_unavailable_scope() {
         denials_path: None,
         config_path: None,
         preset_clamp: None,
+        delegation: None,
         danger: danger::DangerTable::builtin(),
         color: false,
         verbose: false,
@@ -267,6 +270,7 @@ macro_rules! web_gate {
             denials_path: None,
             config_path: None,
             preset_clamp: None,
+            delegation: None,
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
@@ -818,6 +822,7 @@ fn allow_permanent_records_session_scope_when_net_persist_fails() {
             denials_path: None,
             config_path: Some(config.clone()),
             preset_clamp: None,
+            delegation: None,
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
@@ -861,6 +866,7 @@ pub(super) fn scripted_gate<'a>(
         denials_path: None,
         config_path: None,
         preset_clamp: None,
+        delegation: None,
         danger: danger::DangerTable::builtin(),
         color: false,
         verbose: false,
@@ -1280,6 +1286,7 @@ fn permanently_deny_persists_and_reloads_without_reprompting() {
             denials_path: Some(denials.clone()),
             config_path: None,
             preset_clamp: None,
+            delegation: None,
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
@@ -1317,6 +1324,7 @@ fn permanently_deny_persists_and_reloads_without_reprompting() {
             denials_path: Some(denials.clone()),
             config_path: None,
             preset_clamp: None,
+            delegation: None,
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
@@ -1391,6 +1399,7 @@ fn allow_permanently_grants_now_and_persists_host_to_config() {
             denials_path: None,
             config_path: Some(config.clone()),
             preset_clamp: None,
+            delegation: None,
             danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
@@ -1877,6 +1886,336 @@ fn allow_remints_from_the_user_root_and_never_widens_the_baseline() {
     let policy = newt_core::widen_caveats(&base, &[(DenialKind::Exec, "npm".to_string())]);
     let key = mint_operating_key(&key_path, &policy).unwrap();
     assert_eq!(newt_identity::enforced_caveats(&key).unwrap(), minted);
+}
+
+#[test]
+fn delegated_grants_cannot_cross_the_parent_ceiling_or_persist_approval() {
+    use crate::caveat_policy_tests::verified_delegation;
+    let ceiling = Caveats {
+        fs_write: Scope::none(),
+        exec: Scope::none(),
+        ..base_caveats("/ws")
+    };
+    let delegation = verified_delegation(ceiling.clone());
+    let requests = [
+        exec_request("npm"),
+        PermissionRequest {
+            tool: "read_file".into(),
+            kind: DenialKind::FsRead,
+            target: "/outside".into(),
+            reason: String::new(),
+        },
+        PermissionRequest {
+            tool: "write_file".into(),
+            kind: DenialKind::FsWrite,
+            target: "/ws".into(),
+            reason: String::new(),
+        },
+        PermissionRequest {
+            tool: "web_fetch".into(),
+            kind: DenialKind::Net,
+            target: "example.com".into(),
+            reason: String::new(),
+        },
+        PermissionRequest {
+            tool: "git".into(),
+            kind: DenialKind::GitWrite,
+            target: "commit".into(),
+            reason: String::new(),
+        },
+        PermissionRequest {
+            tool: "remote__write".into(),
+            kind: DenialKind::RemoteTool,
+            target: "remote__write".into(),
+            reason: String::new(),
+        },
+    ];
+    for choice in [
+        PromptChoice::AllowOnce,
+        PromptChoice::AllowSession,
+        PromptChoice::AllowPermanent,
+    ] {
+        for req in &requests {
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("config.toml");
+            let key_path = dir.path().join("identity.pem");
+            let prompts = Rc::new(Cell::new(0));
+            let mut state = PermissionPromptState::default();
+            let mut gate = scripted_gate(
+                &mut state,
+                ceiling.clone(),
+                Some(key_path.clone()),
+                None,
+                vec![choice],
+                prompts.clone(),
+            );
+            gate.delegation = Some(&delegation);
+            gate.config_path = Some(config_path.clone());
+            assert!(
+                matches!(
+                    gate.ask(std::slice::from_ref(req)),
+                    newt_core::PermissionDecision::Deny
+                ),
+                "delegated {:?} cannot grant {:?}",
+                choice,
+                req.kind
+            );
+            drop(gate);
+            assert_eq!(
+                prompts.get(),
+                0,
+                "the child cannot ask to remove its parent ceiling"
+            );
+            assert!(
+                !config_path.exists(),
+                "denied authority must not be persisted"
+            );
+            assert!(!key_path.exists(), "the child must not re-root a grant");
+            assert!(state.session_grants.is_empty());
+            assert!(state.pending_once_grants.is_empty());
+            assert!(state
+                .decisions
+                .iter()
+                .all(|record| record.decision == "deny"));
+        }
+    }
+}
+
+#[test]
+fn delegated_grants_reject_cached_approvals_outside_the_ceiling() {
+    use crate::caveat_policy_tests::verified_delegation;
+    let ceiling = Caveats {
+        exec: Scope::none(),
+        ..base_caveats("/ws")
+    };
+    let delegation = verified_delegation(ceiling.clone());
+    for cached_once in [false, true] {
+        let prompts = Rc::new(Cell::new(0));
+        let mut state = PermissionPromptState::default();
+        let key = (DenialKind::Exec, "npm".to_string());
+        if cached_once {
+            state.pending_once_grants.insert(key);
+        } else {
+            state.session_grants.insert(key);
+        }
+        let mut gate = scripted_gate(
+            &mut state,
+            ceiling.clone(),
+            None,
+            None,
+            vec![],
+            prompts.clone(),
+        );
+        gate.delegation = Some(&delegation);
+        assert!(matches!(
+            gate.ask(&[exec_request("npm")]),
+            newt_core::PermissionDecision::Deny
+        ));
+        assert_eq!(prompts.get(), 0);
+    }
+}
+
+/// Grounds delegated batch preflight against a real config file: a forbidden
+/// later request must prevent even a lawful earlier request from opening the
+/// mocked prompt or persisting an approval. The three choices also cover both
+/// session and proactive allow-once caches.
+#[test]
+fn delegated_grants_preflight_the_whole_batch_before_approval_side_effects() {
+    use crate::caveat_policy_tests::verified_delegation;
+    let base = base_caveats("/ws");
+    let ceiling = Caveats {
+        net: Scope::only(["github.com".to_string()]),
+        ..base.clone()
+    };
+    let delegation = verified_delegation(ceiling.clone());
+    let requests = [
+        PermissionRequest {
+            tool: "request_permissions".into(),
+            kind: DenialKind::Net,
+            target: "github.com".into(),
+            reason: String::new(),
+        },
+        PermissionRequest {
+            tool: "request_permissions".into(),
+            ..exec_request("npm")
+        },
+    ];
+    assert!(!base.permits_net(&requests[0].target));
+    assert!(ceiling.permits_net(&requests[0].target));
+    assert!(!ceiling.permits_exec(&requests[1].target));
+    for choice in [
+        PromptChoice::AllowPermanent,
+        PromptChoice::AllowSession,
+        PromptChoice::AllowOnce,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let original = "# batch canary\n[tui.permissions]\nnet = []\n";
+        std::fs::write(&config, original).unwrap();
+        let prompts = Rc::new(Cell::new(0));
+        let mut state = PermissionPromptState::default();
+        let mut gate = scripted_gate(
+            &mut state,
+            base.clone(),
+            None,
+            None,
+            vec![choice, PromptChoice::Deny],
+            prompts.clone(),
+        );
+        gate.delegation = Some(&delegation);
+        gate.config_path = Some(config.clone());
+        assert_ne!(
+            gate.danger.classify(requests[0].kind, &requests[0].target),
+            danger::DangerTier::High,
+            "the earlier request must permit every scripted approval choice"
+        );
+        assert!(matches!(
+            gate.ask(&requests),
+            newt_core::PermissionDecision::Deny
+        ));
+        drop(gate);
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        assert!(state.session_grants.is_empty(), "{choice:?}");
+        assert!(state.pending_once_grants.is_empty(), "{choice:?}");
+        assert!(state
+            .decisions
+            .iter()
+            .all(|record| record.decision == "deny"));
+        assert_eq!(prompts.get(), 0, "batch preflight must precede {choice:?}");
+    }
+}
+
+/// Grounds the returned-authority clamp against a real missing root-key path.
+/// A lawful request must not carry an unrelated cached grant into its receipt.
+#[test]
+fn delegated_grants_do_not_return_unrelated_cached_authority() {
+    use crate::caveat_policy_tests::verified_delegation;
+    let ceiling = Caveats {
+        exec: Scope::only(["cargo".to_string(), "npm".to_string()]),
+        ..base_caveats("/ws")
+    };
+    let delegation = verified_delegation(ceiling.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("identity.pem");
+    let prompts = Rc::new(Cell::new(0));
+    let mut state = PermissionPromptState::default();
+    state
+        .session_grants
+        .insert((DenialKind::FsWrite, "/outside".to_string()));
+    let mut gate = scripted_gate(
+        &mut state,
+        base_caveats("/ws"),
+        Some(key_path.clone()),
+        None,
+        vec![PromptChoice::AllowOnce],
+        prompts.clone(),
+    );
+    gate.delegation = Some(&delegation);
+    let newt_core::PermissionDecision::Allow(granted) = gate.ask(&[exec_request("npm")]) else {
+        panic!("an unrelated cached grant must not prevent a lawful approval");
+    };
+    assert!(granted.permits_exec("npm"));
+    assert!(
+        granted.leq(&ceiling),
+        "the receipt must clamp all cached grants, not just the requested grant"
+    );
+    assert!(!granted.permits_fs_write("/outside"));
+    assert_eq!(prompts.get(), 1);
+    assert!(!key_path.exists(), "the child must not re-root a grant");
+}
+
+/// Grounds the durable-approval shortcut's refusal against missing key/config
+/// paths. Store signature verification has its own tests; this supplies an
+/// already-loaded approval through the same fixture as the ordinary gate test.
+#[test]
+fn delegated_grants_reject_durable_ocap_approval_outside_the_ceiling() {
+    use crate::caveat_policy_tests::verified_delegation;
+    let ceiling = Caveats {
+        exec: Scope::none(),
+        ..base_caveats("/ws")
+    };
+    let delegation = verified_delegation(ceiling.clone());
+    let mut state = PermissionPromptState {
+        ocap_policy: ocap(
+            newt_core::ocap_store::Verdict::Approve,
+            "[[exec]]\ntarget = \"git\"\n",
+        ),
+        ..Default::default()
+    };
+    assert_eq!(
+        newt_core::ocap_store::evaluate_request(&state.ocap_policy, DenialKind::Exec, "git"),
+        Some(newt_core::ocap_store::Verdict::Approve)
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("identity.pem");
+    let config_path = dir.path().join("config.toml");
+    let prompts = Rc::new(Cell::new(0));
+    let mut gate = scripted_gate(
+        &mut state,
+        ceiling,
+        Some(key_path.clone()),
+        None,
+        vec![], // any prompt would panic (script exhausted)
+        prompts.clone(),
+    );
+    gate.delegation = Some(&delegation);
+    gate.config_path = Some(config_path.clone());
+    assert_ne!(
+        gate.danger.classify(DenialKind::Exec, "git"),
+        danger::DangerTier::High,
+        "the fixture must reach the durable-approval shortcut"
+    );
+    assert!(matches!(
+        gate.ask(&[exec_request("git")]),
+        newt_core::PermissionDecision::Deny
+    ));
+    drop(gate);
+    assert_eq!(prompts.get(), 0);
+    assert!(!key_path.exists(), "the child must not re-root a grant");
+    assert!(
+        !config_path.exists(),
+        "denied authority must not be persisted"
+    );
+    assert!(state.session_grants.is_empty());
+    assert!(state.pending_once_grants.is_empty());
+    assert_eq!(state.decisions.len(), 1);
+    assert_eq!(state.decisions[0].decision, "deny");
+}
+
+/// Grounds bounded approval against a real missing root-key path. The lawful
+/// approval must succeed without creating an operator key; a missing-file
+/// assertion does not prove absence of reads from an already-existing key.
+#[test]
+fn delegated_grants_allow_within_the_ceiling_without_creating_a_root_key() {
+    use crate::caveat_policy_tests::verified_delegation;
+    let ceiling = Caveats {
+        exec: Scope::only(["cargo".to_string(), "npm".to_string()]),
+        ..base_caveats("/ws")
+    };
+    let delegation = verified_delegation(ceiling.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("identity.pem");
+    let prompts = Rc::new(Cell::new(0));
+    let mut state = PermissionPromptState::default();
+    let mut gate = scripted_gate(
+        &mut state,
+        base_caveats("/ws"),
+        Some(key_path.clone()),
+        None,
+        vec![PromptChoice::AllowOnce],
+        prompts.clone(),
+    );
+    gate.delegation = Some(&delegation);
+    let newt_core::PermissionDecision::Allow(granted) = gate.ask(&[exec_request("npm")]) else {
+        panic!("a lawful grant within the inherited ceiling must still work");
+    };
+    assert!(granted.permits_exec("npm"));
+    assert!(granted.leq(&ceiling));
+    assert_eq!(prompts.get(), 1);
+    assert!(
+        !key_path.exists(),
+        "delegated approval must not create an operator root key"
+    );
 }
 
 #[serial_test::serial(real_fs)]
