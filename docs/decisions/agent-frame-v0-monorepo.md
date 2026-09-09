@@ -67,19 +67,29 @@ a measured ceiling of 40. Living in this workspace must never give it
 `newt-core`'s 644-crate closure. The test carries an anti-vacuous twin: the same
 walker, pointed at `newt-core`, must come back finding `tokio`.
 
-**It starts gating nine libraries that nothing was checking.** `formal/` already
-existed here, with `CaveatLattice`, `ProjectModel`, `NewtPolicy`,
-`CompactionProvenance`, `CompactionLifecycle`, `CompactionSpill`,
-`ResponsesUsage`, `ResponsesWire` and `NewtInteraction` — and **no CI job built
-any of them**. Nine machine-checked libraries, unchecked. The `formal` job added
-here builds all eleven (39 lake jobs, green), so the pre-existing proofs stop
-being decoration too.
+**Correction — the nine existing libraries were already gated.** An earlier
+draft of this ADR claimed `formal/` held nine machine-checked libraries that no
+CI job built. **That was wrong.** `.github/workflows/formal.yml` has been
+running `lake build` over them, and `behavior-formal.yml` runs Lean plus a TLC
+harness. Both are **path-filtered** to `formal/**`, which is why they do not
+appear on an ordinary Rust PR — "built only when they change" is not the same
+as "built by nothing", and the difference is the whole claim.
 
-That absence had teeth: bringing agent-frame's `formal/` across by copy
-initially *replaced* the lakefile and silently dropped all nine libraries from
-the build, and nothing in the repo could have caught it. The lakefiles are now
-merged rather than replaced, and the job's anti-vacuous step requires an
-`.olean` for every declared library so the same mistake fails loudly next time.
+The path filter is the right design, not a gap: `lake build` checks the Lean,
+while the Lean↔Rust correspondence is checked by
+`agent-frame/tests/kernel_laws.rs`, which runs in the ordinary `test` job on
+every push.
+
+So this change adds **no new Lean job**. It adds the two agent-frame libraries
+to the existing lakefile, and one anti-vacuous step to `formal.yml`: `lake
+build` on a mis-configured package exits 0 having checked nothing, so the job
+now requires an `.olean` for every library the lakefile declares — the list
+derived from the lakefile rather than duplicated in the workflow, since a
+hand-copied list is the next thing to go stale.
+
+That step is not hypothetical. Copying agent-frame's `formal/` in initially
+**replaced** this repo's lakefile and silently dropped all nine libraries from
+the build, and nothing in CI would have caught it.
 
 **The correspondence is checked on both sides.** `formal/` proves the laws;
 `agent-frame/tests/kernel_laws.rs` asserts the Rust obeys the same ones, naming

@@ -31,3 +31,26 @@ jobs:
       - name: lake build (checks every theorem; toolchain pinned in lean-toolchain)
         working-directory: formal
         run: lake build
+
+      - name: Assert the build actually proved something
+        working-directory: formal
+        # ANTI-VACUOUS. `lake build` on a mis-configured package exits 0 having
+        # checked nothing, so a green tick here is not by itself evidence that
+        # any theorem was checked. Require an olean for EVERY library the
+        # lakefile declares, derived from the lakefile rather than a list
+        # duplicated here -- a hand-copied list is the next thing to go stale.
+        #
+        # Not hypothetical: on 2026-09-08 a lakefile copied in from another repo
+        # replaced this one and silently dropped nine libraries from the build.
+        # Nothing in CI would have caught it.
+        run: |
+          set -euo pipefail
+          libs=$(grep -A1 '^\[\[lean_lib\]\]' lakefile.toml \
+                 | sed -n 's/^name *= *"\(.*\)"/\1/p')
+          [ -n "$libs" ] || { echo "::error::no lean_lib declared -- nothing proved"; exit 1; }
+          for lib in $libs; do
+            find .lake/build -name "$lib.olean" | grep -q . || {
+              echo "::error::declared library $lib produced no olean"; exit 1; }
+            echo "ok: $lib"
+          done
+          echo "::notice title=Lean::$(echo "$libs" | wc -w) libraries checked"
