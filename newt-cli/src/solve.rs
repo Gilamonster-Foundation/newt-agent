@@ -537,24 +537,26 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // The per-tool trajectory — the material for the failure taxonomy. The
     // single highest-signal field is `write_calls`: a failed task with 0 writes
     // never ACTED (the tenacity target); with writes it acted but wrong. Only
-    // newt's real workspace-write tools count — `write_file`/`edit_file` (the
-    // `is_workspace_write_call` set); aliases like `create_file`/`str_replace`/
-    // `apply_patch` get a coaching reply and never modify the tree.
-    let (tool_calls, write_calls, end_reason, trajectory) = match o_opt {
+    // newt's real workspace-write tools count, via `is_workspace_write_call`
+    // itself rather than a second copy of its literal set — aliases like
+    // `create_file`/`str_replace`/`apply_patch` get a coaching reply and never
+    // modify the tree.
+    let (tool_calls, write_calls, calls_after_last_write, end_reason, trajectory) = match o_opt {
         Some(o) => {
-            let names: Vec<&str> = o.tool_events.iter().map(|e| e.tool.as_str()).collect();
-            let writes = names
+            let writes = o
+                .tool_events
                 .iter()
-                .filter(|n| matches!(**n, "write_file" | "edit_file"))
+                .filter(|e| newt_core::agentic::is_workspace_write_call(&e.tool))
                 .count();
             (
-                names.len(),
+                o.tool_events.len(),
                 writes,
+                solve_contract::calls_after_last_write(&o.tool_events),
                 format!("{:?}", o.end_reason),
                 serde_json::to_value(&o.tool_events).unwrap_or(serde_json::Value::Null),
             )
         }
-        None => (0, 0, "None".to_string(), serde_json::Value::Null),
+        None => (0, 0, None, "None".to_string(), serde_json::Value::Null),
     };
     let record = serde_json::json!({
         "kind": "solve_result",
@@ -570,6 +572,22 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         "wall_secs": wall_secs,
         "tool_calls": tool_calls,
         "write_calls": write_calls,
+        // Calls spent after the last SUCCESSFUL write (#2214) — what the
+        // rounds went ON, which `end_reason: RoundCap` cannot say. Thrash, a
+        // too-small cap, and write-complete-then-grind are one value today;
+        // this separates the third, and only the third deserves "raise the
+        // cap". `null` means the run never landed a write at all.
+        //
+        // A THRESHOLD is deliberately not applied here: the integer is the
+        // measurement, and which tail length counts as a grind is the
+        // consumer's call. It gates on `ok`, unlike `write_calls` above.
+        //
+        // Deliberately on the solve_result line and NOT in the contract
+        // record, for the same reason as `continuity` below: the record is
+        // parsed by gilamonster-bench with its own re-declared structs, and
+        // adding a field there needs the unknown-field question answered
+        // first (#2218).
+        "calls_after_last_write": calls_after_last_write,
         "end_reason": end_reason,
         // What this run could and could not inherit. A cap exit under
         // `hermetic` is a failure — there was no continuation available by

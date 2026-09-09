@@ -215,6 +215,29 @@ pub fn status_label(t: Terminal) -> &'static str {
     }
 }
 
+/// How many tool calls the run spent AFTER its last SUCCESSFUL workspace
+/// write — the write-complete-then-grind measurement (#2214).
+///
+/// `RoundCap` alone cannot separate three runs that all hit the same wall:
+/// thrash (rounds spent on failures), a genuinely-too-small cap (rounds spent
+/// on real remaining work), and grind (rounds spent re-verifying work already
+/// finished). This is the third one as a value a gate can assert, rather than
+/// a substring of the advice prose the reply happens to carry.
+///
+/// `None` when the run never landed a successful write. That is the "never
+/// acted" case — a distinct failure class, not a grind of length zero — and
+/// collapsing the two would report every unproductive run as a grind.
+///
+/// Note it gates on `ok`, while the neighbouring `write_calls` on the same
+/// line counts by NAME only. The two can legitimately disagree: a run whose
+/// three writes were all DENIED reports `write_calls: 3` and `null` here.
+pub fn calls_after_last_write(events: &[newt_core::ToolEvent]) -> Option<usize> {
+    let last = events
+        .iter()
+        .rposition(|e| e.ok && newt_core::agentic::is_workspace_write_call(&e.tool))?;
+    Some(events.len() - 1 - last)
+}
+
 /// One JSONL trace line per parse signal (the ADR §5 events
 /// `recovered_tool_call{dialect}` / `no_parseable_tool_call`). These lines
 /// carry no `contract_version`, so the bench's contract scan skips them.
@@ -316,6 +339,52 @@ mod tests {
         TurnEndReason::Cancelled,
         TurnEndReason::Failed,
     ];
+
+    fn tool_event(tool: &str, ok: bool) -> newt_core::ToolEvent {
+        newt_core::ToolEvent::from_call(tool, &serde_json::json!({"path": tool}), ok, None)
+    }
+
+    /// The "never acted" run is NOT a grind of length zero. `write_calls`
+    /// already distinguishes a run that never wrote; this field must not
+    /// re-report that run as "finished the work then ground", which is what
+    /// any `unwrap_or(0)` or `unwrap_or(len)` fallback would do.
+    #[test]
+    fn a_run_that_never_landed_a_write_has_no_grind_measurement() {
+        let events = [
+            tool_event("read_file", true),
+            // A write that FAILED is not a write. This is the ok-gate that
+            // separates this field from `write_calls`, which counts by name.
+            tool_event("write_file", false),
+            tool_event("run_command", true),
+        ];
+        assert_eq!(calls_after_last_write(&events), None);
+        assert_eq!(calls_after_last_write(&[]), None);
+    }
+
+    /// The other end: a run whose last act WAS the write ground for zero
+    /// calls. Distinguishing this from `None` is the whole point of the
+    /// `Option` — both are "no grind", for opposite reasons.
+    #[test]
+    fn a_write_as_the_final_call_is_a_grind_of_zero() {
+        assert_eq!(
+            calls_after_last_write(&[tool_event("read_file", true), tool_event("edit_file", true)]),
+            Some(0)
+        );
+    }
+
+    /// The measured shape from #2212, in miniature: writes early, then a tail
+    /// of succeeding, redundant calls. Only the LAST successful write counts —
+    /// an implementation keying on the FIRST would say 4 here.
+    #[test]
+    fn the_grind_is_measured_from_the_last_successful_write() {
+        let events = [
+            tool_event("write_file", true),
+            tool_event("edit_file", true),
+            tool_event("read_file", true),
+            tool_event("text_search", true),
+        ];
+        assert_eq!(calls_after_last_write(&events), Some(2));
+    }
 
     fn end_reason_index(r: TurnEndReason) -> usize {
         match r {
