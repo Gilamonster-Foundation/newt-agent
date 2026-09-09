@@ -6,10 +6,9 @@
 > this builds on: `docs/decisions/1528b3-cid-spill-identity.md`,
 > `docs/decisions/1528b3-proactive-compaction.md`.
 
-**Status:** DESIGN FOR REVIEW, 2026-09-08. Nothing implemented. Every decision
-below is either **LOCKED** (grounded in code or a machine-checked law that
-already exists) or **OPEN** (needs the operator's call). Implementation does not
-start until every OPEN row is closed.
+**Status:** DESIGN LOCKED, 2026-09-08. Nothing implemented yet. **All thirteen
+decisions are LOCKED** — nine against code or a machine-checked law that already
+exists, and D10–D13 by the operator on 2026-09-08. Implementation may begin.
 
 Companion: knowledge board `2026-09-08_harness-as-a-tiny-llm-DESIGN.md` (the
 thesis and its recovery). This document is the accounting.
@@ -209,10 +208,10 @@ error rather than a policy.
 | **D7** | Adjudicator unavailable ⇒ `AdjudicationFailure` surfaced to the operator and recorded as a node. **Never** a silent fallback to Jaccard. A re-read whose CID is absent fails closed — absence is a finding. | `AdjudicationFailure`, invariant §8 | **LOCKED** |
 | **D8** | The legal cut set is computed (tool-pair atomicity, unseen results never elided, last operator message pinned), not a caller responsibility. | invariants 5b.1, 2.3, 3.2 | **LOCKED** |
 | **D9** | Storage is newt's `SpillStore` now; `agent-store`'s opaque `Entry.payload` later. agent-frame v0 stays a library that mints elision. | `V0-DECISION.md` §3 | **LOCKED** |
-| **D10** | Which backend runs the *narration* adjudicator. Intake adjudication is correctly kept on the steering model (reads operator intent). Narration classification is mechanical and belongs on the auxiliary backend. **Recommend:** auxiliary by default, `BackendRef` override, recorded in the run manifest. | `config/shell.rs:113`, `BackendKind::Embedded` | **OPEN** |
-| **D11** | Does the main LLM get a `re-read` tool, or is retrieval harness-only? Invariant 3.4's *re-read directive* implies the model needs the affordance. **Recommend:** yes, a single `re_read(cid)` tool, results appended as nodes. | invariant 3.4 | **OPEN** |
-| **D12** | In the hermetic bench lane, does the adjudication side call count against the round budget, and is it declared in the run's configuration? **Recommend:** does not count against rounds (it is harness, not model); MUST be declared and recorded (#2227). | #2227 | **OPEN** |
-| **D13** | The `question` class from #1020 — nudge to *ask* rather than *do* when the reply is a question to the operator. **Recommend:** yes, as a third verdict alongside answer / narration. | #1020 | **OPEN** |
+| **D10** | The narration adjudicator runs on the **auxiliary / CPU-local backend** (`BackendKind::Embedded`, or the summarizer's CPU-local default), with a `BackendRef` override, and the run manifest records which adjudicator judged the turn. It never contends with the primary model or the round budget. The reason `config/shell.rs:113` gives for keeping *intake* adjudication on the steering model — *"adjudication reads operator intent, which is the steering model's own job"* — does not transfer: narration classification is mechanical classification of model output, which is the summarizer's kind of work. | `config/shell.rs:113`, `BackendKind::Embedded` (#639), `BackendRef` | **LOCKED** 2026-09-08 |
+| **D11** | The main LLM **gets one `re_read(cid)` tool**. Retrieval is not harness-only: invariant 3.4's *re-read directive* is addressed to the model, so the model needs the affordance to act on it. Results are appended to the frame as nodes whose parent is the pointer that was followed, so a retrieval is itself provenanced and a later reader can see what the model chose to re-read. | invariant 3.4 | **LOCKED** 2026-09-08 |
+| **D12** | The adjudication side call **does not count against the round budget** — it is harness work, not model work, and charging it would penalise an arm for harness overhead and make round-cap comparisons across harnesses unfair. It **must** be declared in the run configuration and recorded in the contract record, or two runs are not comparable. This is #2227's "verify the instrument" applied to the classifier. | #2227 | **LOCKED** 2026-09-08 |
+| **D13** | The **`question` class ships** as a third verdict alongside answer / narration: a reply that asks the operator something is nudged to *ask*, not to *do*. This is #1020's original complaint (the model offered "Option A, B, or C?" and was nudged to act). It is also a class the Jaccard matcher structurally cannot carry — a third class crowds a margin that is already 0.03 — so it lands with the adjudicator, not before it. | #1020 | **LOCKED** 2026-09-08 |
 
 ---
 
