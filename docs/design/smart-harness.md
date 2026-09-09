@@ -6,9 +6,23 @@
 > this builds on: `docs/decisions/1528b3-cid-spill-identity.md`,
 > `docs/decisions/1528b3-proactive-compaction.md`.
 
-**Status:** DESIGN LOCKED, 2026-09-08. Nothing implemented yet. **All thirteen
-decisions are LOCKED** — nine against code or a machine-checked law that already
-exists, and D10–D13 by the operator on 2026-09-08. Implementation may begin.
+**Status:** DESIGN UNDER REVISION, 2026-09-08. Nothing implemented.
+
+An earlier revision of this file marked all thirteen decisions **LOCKED** and
+said implementation could begin. **That status was not supported by the
+evidence** and is withdrawn. A design review checked the claims against source
+and found six that are false or overclaimed, one of which inverts the central
+before/after argument. The corrections are recorded below rather than quietly
+edited away, because the failure this design exists to prevent — a confident
+claim nobody checked — is exactly what produced them.
+
+D10–D13 remain the operator's decisions and stand as *choices*. What does not
+stand is my characterisation of what the code already does, and several
+"grounded in existing law" claims that the law does not actually support.
+
+**Implementation of the frame does not begin from this document in its current
+state.** The separately-shippable #2239 fix (§"the real defect", below) does not
+depend on it and should proceed independently.
 
 Companion: knowledge board `2026-09-08_harness-as-a-tiny-llm-DESIGN.md` (the
 thesis and its recovery). This document is the accounting.
@@ -134,13 +148,26 @@ flowchart LR
     style X fill:#B5551B33,stroke:#B5551B
 ```
 
-Left: the span is replaced by a `generate` (depth 1) and then dropped — the
-9/10-silently-wrong failure recorded under invariant 3.1. Right: the span is
-retained; the projection carries an `elide` (depth 0, `checkOf .elide =
-.rederive`, so it asserts nothing and is verified by deterministic recompute —
-exactly what agent-frame v0 mints and nothing more); and the arrow back is the
-re-read. **The summarizer is not made smarter. It is demoted to one navigation
-strategy among several.**
+> ### CORRECTION — the left-hand side is not what newt does today
+>
+> **Today's compaction already retains the span and already advertises a
+> resolvable handle.** `newt-core/src/agentic/compress.rs:2398`
+> `stage_compaction_span` stages the **redacted** verbatim span into a
+> `SpillStore` under `SpillProvenance::CompactionSpan`, returns a
+> content-addressed handle, and is fail-closed: *"A failed store must never name
+> a handle that resolves to nothing (BHV-SPILL-001)."* Its own doc calls it "the
+> one minting site" and says a second encoding "would be a content-addressable
+> law violation".
+>
+> So the `✗ dropped` arrow above is **false about the current system**, and the
+> before/after comparison it anchors is not the contribution this design makes.
+>
+> **The honest incremental contribution** is narrower and still worth having:
+> uniform *typed* provenance over every derived thing rather than one bespoke
+> record for compaction spans; a derivation constraint that is checked at
+> construction and decode; and an auditable projection policy. Retention and
+> re-read references are **not** new — they exist, and rebuilding them under
+> another name would be the mistake this line has already made once (#1786).
 
 ---
 
@@ -195,23 +222,101 @@ error rather than a policy.
 
 ---
 
+## 6b. Corrections — claims this document made that source does not support
+
+Each row was checked against `origin/main` by opening the file. "Obligation" is
+what an implementation still owes; none of it is done.
+
+| # | The claim I made | What source says | Obligation |
+|---|---|---|---|
+| C1 | Today's compaction **drops** the span; navigation would retain it | `compress.rs:2398` `stage_compaction_span` already stages the redacted span into `SpillStore` and advertises a content-addressed handle, fail-closed (BHV-SPILL-001) | Restate the contribution as typed provenance + derivation constraints + auditable projection, **not** retention. Do not rebuild recovery infrastructure that exists |
+| C2 | `SpillStore` is the frame's storage; `--resume <cid>` resumes a session | `SessionSpillStore` is `Mutex<HashMap<String, SpillRecordV1>>`; the module doc states the store "was NEVER persisted, so an old handle could not survive a process/session restart" | Either name a durable path that restores the graph closure, schema **and** authorization context after restart, or scope resume/navigation **explicitly to a live session**. Do not promise cross-process resume on ephemeral state |
+| C3 | The adjudication side call has a **strict** parse | `adjudicate.rs:58` does `find('[')` / `rfind(']')`, so prose on either side is accepted. The "does NOT hunt inside prose" assurance is a *comment*, not the code | State the parser's actual accepted language and choose an explicit contract. Any production parser change is a **separate** PR with its own tests |
+| C4 | Route the adjudicator to an "auxiliary / CPU-local" backend so it never contends with the primary | `embedded.rs:7-9` is **CPU by default, not CPU-only** — `NEWT_EMBEDDED_DEVICE = cpu\|metal\|cuda\|auto`, with `embedded-metal` / `embedded-cuda` features | D10 must specify placement constraints, timeout ownership, cancellation propagation, unavailable-at-startup behaviour, and an explicit fallback. An override must not silently violate placement |
+| C5 | A third class "cannot be carried" by the Jaccard matcher because the margin is 0.03 | A winner/runner-up margin does not bound how many classes a classifier can represent. The reasoning is invalid | Remove the impossibility claim. Justify model-backed classification as an **empirical hypothesis** about discrimination and context-sensitivity, with a comparison plan against the deterministic baseline |
+| C6 | Fixing the classifier (or adding causal parentage) fixes #2239 | `solve_contract.rs:106-115` maps `NarrationCapExhausted` into `Terminal::Completed` — the same bucket as a genuine completion. A correct classifier still yields a scored success | See §"the real defect". The fix is in **completion semantics**, is separately shippable, and depends on neither the frame nor a new model |
+| C7 | `--hermetic` "reduces to always genesis" | A genesis node establishes a graph **origin**. It says nothing about admitted inputs or ambient state | Narrow the claim: specify admitted inputs and ambient-state assumptions separately from parentage |
+
+**Not yet addressed at all** — named here so they are visible rather than
+implied-solved:
+
+- **Bounded navigation as a workflow** (not just a bounded call): per-request
+  catalog size, fetched bytes, dereference count, auxiliary calls, retries,
+  total time, and a deterministic no-progress condition. A catalog that emits
+  one card per historical node does not survive history growth.
+- **Oversized unseen results.** Following a pointer can yield more than fits
+  while unseen-result protection forbids eviction. Needs bounded slices or
+  continuation with truthful completeness metadata — never a silent truncation
+  presented as a complete reread.
+- **Depth laundering through retrieval.** Observing that a retrieval happened
+  must not reset the retrieved artifact's origin or depth. The depth-one rule
+  needs a stated edge relation and validation at **both** construction and
+  decode.
+- **Record before adjudicate.** The turn lifecycle must commit the observation
+  before any advisory adjudication can influence its fate, with defined
+  behaviour for interruption, malformed output, timeout and storage failure —
+  and no claim of byte-perfect replay over redacted content.
+
+## 6c. The real defect behind #2239, and its separately shippable fix
+
+**Confirmed on `origin/main`.** `newt-cli/src/solve_contract.rs:106-115`:
+
+```rust
+Some(
+    TurnEndReason::Completed
+    | TurnEndReason::NarrationCapExhausted
+    | TurnEndReason::NarrationFinalRound,
+)
+| None => Terminal::Completed,
+```
+
+Exhausted narration is classified as an ordinary successful completion. **That
+is the defect** — not the classifier being fooled. A rescue that ran out of
+budget without satisfying the task contract reports the same terminal state as a
+turn that genuinely finished.
+
+The fix is in completion semantics and needs three concepts kept apart:
+**response classification** (is this text an answer, narration, or a question),
+**control outcome** (continue, await operator, deliver, terminate incomplete,
+cancel, fail), and **task-success evidence** (did the claimed external actions
+actually happen). Delivering a response is not evidence that a claimed
+repository modification occurred.
+
+Two constraints on that fix:
+
+- A genuine answer that follows a nudge **stays deliverable**. Ancestry is
+  evidence about causality, not a completion oracle.
+- Exhausted rescue must **preserve prior observations** and surface the actual
+  incomplete outcome, rather than discarding content or asserting completion.
+
+Note the lockstep hazard: PR #2242 (merged 2026-09-08) pins emitted outcome
+values against `newt-cli/contract/bench_outcome_values_v1.txt`. A change to an
+emitted outcome string must update that permitted set in the same PR.
+
 ## 7. Decisions
+
+Statuses below were revised after the review in §6b. **CHOSEN** means the
+operator picked the option and it stands; it does not mean the semantics,
+failure behaviour and verification obligations are all specified. **SETTLED**
+means those are specified. **OPEN** and **RESTATE** mean work is owed before
+implementation.
+
 
 | # | decision | grounded in | status |
 |---|---|---|---|
-| **D1** | A frame primitive is `MerkleNode<Primitive>`; `Primitive` carries agent-frame's `Unit` fields (`op`, `depth`, `root`, `life`, `addressed`) plus the typed payload. No hand-rolled id, chain, or manifest. | `content-addressable::merkle`, `ContextOps.lean` | **LOCKED** |
-| **D2** | Context is a projection of the frame — a selected node set rendered for one turn. Compaction is replaced by elision + re-read. The DAG is never pruned within a session. | invariants 3.1, 3.4 | **LOCKED** |
-| **D3** | The harness-llm is the only navigator. It is a bounded, tool-less side call in the `adjudicate.rs` shape. | `adjudicate.rs` (#1749), live | **LOCKED** |
-| **D4** | Harness-origin nodes (nudges, adjudications, verdicts) are tagged in `life`/`root` and are **never** summarizer input and **never** evidence of model completion. | invariant 2.4 | **LOCKED** |
-| **D5** | `depth ≤ 1`. A verdict over a reply is depth 1; a summary of a summary is rejected at construction. | `Unit.wf` | **LOCKED** |
-| **D6** | `--hermetic` ⇔ session starts at genesis; `--resume <cid>` ⇔ starts at a node with a parent. Mutually exclusive, enforced at parse time. | operator ruling 2026-09-08 | **LOCKED** |
-| **D7** | Adjudicator unavailable ⇒ `AdjudicationFailure` surfaced to the operator and recorded as a node. **Never** a silent fallback to Jaccard. A re-read whose CID is absent fails closed — absence is a finding. | `AdjudicationFailure`, invariant §8 | **LOCKED** |
-| **D8** | The legal cut set is computed (tool-pair atomicity, unseen results never elided, last operator message pinned), not a caller responsibility. | invariants 5b.1, 2.3, 3.2 | **LOCKED** |
-| **D9** | Storage is newt's `SpillStore` now; `agent-store`'s opaque `Entry.payload` later. agent-frame v0 stays a library that mints elision. | `V0-DECISION.md` §3 | **LOCKED** |
-| **D10** | The narration adjudicator runs on the **auxiliary / CPU-local backend** (`BackendKind::Embedded`, or the summarizer's CPU-local default), with a `BackendRef` override, and the run manifest records which adjudicator judged the turn. It never contends with the primary model or the round budget. The reason `config/shell.rs:113` gives for keeping *intake* adjudication on the steering model — *"adjudication reads operator intent, which is the steering model's own job"* — does not transfer: narration classification is mechanical classification of model output, which is the summarizer's kind of work. | `config/shell.rs:113`, `BackendKind::Embedded` (#639), `BackendRef` | **LOCKED** 2026-09-08 |
-| **D11** | The main LLM **gets one `re_read(cid)` tool**. Retrieval is not harness-only: invariant 3.4's *re-read directive* is addressed to the model, so the model needs the affordance to act on it. Results are appended to the frame as nodes whose parent is the pointer that was followed, so a retrieval is itself provenanced and a later reader can see what the model chose to re-read. | invariant 3.4 | **LOCKED** 2026-09-08 |
-| **D12** | The adjudication side call **does not count against the round budget** — it is harness work, not model work, and charging it would penalise an arm for harness overhead and make round-cap comparisons across harnesses unfair. It **must** be declared in the run configuration and recorded in the contract record, or two runs are not comparable. This is #2227's "verify the instrument" applied to the classifier. | #2227 | **LOCKED** 2026-09-08 |
-| **D13** | The **`question` class ships** as a third verdict alongside answer / narration: a reply that asks the operator something is nudged to *ask*, not to *do*. This is #1020's original complaint (the model offered "Option A, B, or C?" and was nudged to act). It is also a class the Jaccard matcher structurally cannot carry — a third class crowds a margin that is already 0.03 — so it lands with the adjudicator, not before it. | #1020 | **LOCKED** 2026-09-08 |
+| **D1** | A frame primitive is `MerkleNode<Primitive>`; `Primitive` carries agent-frame's `Unit` fields (`op`, `depth`, `root`, `life`, `addressed`) plus the typed payload. No hand-rolled id, chain, or manifest. | `content-addressable::merkle`, `ContextOps.lean` | **SETTLED** (type) — storage unresolved, see C2 |
+| **D2** | Context is a projection of the frame — a selected node set rendered for one turn. Compaction is replaced by elision + re-read. The DAG is never pruned within a session. | invariants 3.1, 3.4 | **RESTATE** — see C1; retention already exists |
+| **D3** | The harness-llm is the only navigator. It is a bounded, tool-less side call in the `adjudicate.rs` shape. | `adjudicate.rs` (#1749), live | **SETTLED** (shape) — parser contract owed, C3 |
+| **D4** | Harness-origin nodes (nudges, adjudications, verdicts) are tagged in `life`/`root` and are **never** summarizer input and **never** evidence of model completion. | invariant 2.4 | **SETTLED** — but does not fix #2239 alone, C6 |
+| **D5** | `depth ≤ 1`. A verdict over a reply is depth 1; a summary of a summary is rejected at construction. | `Unit.wf` | **OPEN** — edge relation + decode check owed |
+| **D6** | `--hermetic` ⇔ session starts at genesis; `--resume <cid>` ⇔ starts at a node with a parent. Mutually exclusive, enforced at parse time. | operator ruling 2026-09-08 | **NARROW** — see C7; genesis ≠ hermetic |
+| **D7** | Adjudicator unavailable ⇒ `AdjudicationFailure` surfaced to the operator and recorded as a node. **Never** a silent fallback to Jaccard. A re-read whose CID is absent fails closed — absence is a finding. | `AdjudicationFailure`, invariant §8 | **SETTLED** — failure path owed for storage |
+| **D8** | The legal cut set is computed (tool-pair atomicity, unseen results never elided, last operator message pinned), not a caller responsibility. | invariants 5b.1, 2.3, 3.2 | **SETTLED** |
+| **D9** | Storage is newt's `SpillStore` now; `agent-store`'s opaque `Entry.payload` later. agent-frame v0 stays a library that mints elision. | `V0-DECISION.md` §3 | **OPEN** — SpillStore is ephemeral, C2 |
+| **D10** | The narration adjudicator runs on the **auxiliary / CPU-local backend** (`BackendKind::Embedded`, or the summarizer's CPU-local default), with a `BackendRef` override, and the run manifest records which adjudicator judged the turn. It never contends with the primary model or the round budget. The reason `config/shell.rs:113` gives for keeping *intake* adjudication on the steering model — *"adjudication reads operator intent, which is the steering model's own job"* — does not transfer: narration classification is mechanical classification of model output, which is the summarizer's kind of work. | `config/shell.rs:113`, `BackendKind::Embedded` (#639), `BackendRef` | **CHOSEN** — placement/fallback owed, C4 |
+| **D11** | The main LLM **gets one `re_read(cid)` tool**. Retrieval is not harness-only: invariant 3.4's *re-read directive* is addressed to the model, so the model needs the affordance to act on it. Results are appended to the frame as nodes whose parent is the pointer that was followed, so a retrieval is itself provenanced and a later reader can see what the model chose to re-read. | invariant 3.4 | **CHOSEN** — bounds owed (§6b) |
+| **D12** | The adjudication side call **does not count against the round budget** — it is harness work, not model work, and charging it would penalise an arm for harness overhead and make round-cap comparisons across harnesses unfair. It **must** be declared in the run configuration and recorded in the contract record, or two runs are not comparable. This is #2227's "verify the instrument" applied to the classifier. | #2227 | **CHOSEN** — separate enforced budget owed |
+| **D13** | The **`question` class ships** as a third verdict alongside answer / narration: a reply that asks the operator something is nudged to *ask*, not to *do*. This is #1020's original complaint (the model offered "Option A, B, or C?" and was nudged to act). The earlier rationale — that a Jaccard matcher "structurally cannot carry" a third class because its margin is 0.03 — is **withdrawn**: a winner/runner-up margin does not bound how many classes a classifier can represent (C5). Whether a model-backed classifier discriminates better is an empirical question, and it needs a comparison against the deterministic baseline rather than an impossibility claim. | #1020 | **CHOSEN** — C5 rationale withdrawn |
 
 ---
 
@@ -223,7 +328,8 @@ error rather than a policy.
   gate. This is the 0.9.0 stream. What it *does* change for 0.8.0: fix #979 so
   a turn cannot hang, fix #2239 so the harness stops reading its own script as
   evidence, and **spend nothing further on the compaction pipeline**.
-- **Not a rewrite.** Every LOCKED row names the thing it reuses.
+- **Not a rewrite.** Every settled row names the thing it reuses — and §6b
+  records where that reuse claim was wrong.
 
 ---
 
