@@ -13,12 +13,30 @@ use serde::de::DeserializeOwned;
 /// Default per-object bound, independent of a turn's retrieval byte budget.
 pub const DEFAULT_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 
+/// An execution lease, held until the session drops (including unwinding).
+/// Never unlink its sidecar: independent opens must lock the same inode.
+pub(crate) struct RunWriter {
+    _file: Option<std::fs::File>,
+    directory: Option<PathBuf>,
+    run: ContentId,
+    process: u32,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicationFailure {
+    BeforeReplace,
+    AfterReplace,
+}
+
 /// One storage interface with memory and durable backends.
 pub struct FrameStore {
     directory: Option<PathBuf>,
     nodes: BTreeMap<ContentId, Vec<u8>>,
     sources: BTreeMap<RawContentId, Vec<u8>>,
     max_record_bytes: usize,
+    #[cfg(test)]
+    pub(crate) publication_failure: Option<PublicationFailure>,
 }
 
 impl FrameStore {
@@ -28,6 +46,8 @@ impl FrameStore {
             nodes: BTreeMap::new(),
             sources: BTreeMap::new(),
             max_record_bytes: DEFAULT_MAX_RECORD_BYTES,
+            #[cfg(test)]
+            publication_failure: None,
         }
     }
 
@@ -54,6 +74,9 @@ impl FrameStore {
         let memory = Self::memory_with_max_bytes(max_record_bytes)?;
         let directory = directory.as_ref().to_path_buf();
         std::fs::create_dir_all(&directory).map_err(|e| crate::Error::Storage(e.to_string()))?;
+        let directory = directory
+            .canonicalize()
+            .map_err(|e| crate::Error::Storage(e.to_string()))?;
         Ok(Self {
             directory: Some(directory),
             ..memory
@@ -150,25 +173,119 @@ impl FrameStore {
         Ok(unit)
     }
 
-    /// A mutable locator names an immutable, verified journal checkpoint. It
-    /// grants no authority and is replaced only after referenced objects persist.
-    pub fn publish_head(&self, run: ContentId, head: ContentId) -> crate::Result<()> {
+    pub(crate) fn acquire_writer(
+        &self,
+        run: ContentId,
+        expected: Option<ContentId>,
+    ) -> crate::Result<RunWriter> {
+        let file = if let Some(dir) = &self.directory {
+            let locks = dir.join("locks");
+            std::fs::create_dir_all(&locks).map_err(|e| crate::Error::Storage(e.to_string()))?;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(locks.join(run.to_string()))
+                .map_err(|e| crate::Error::Storage(e.to_string()))?;
+            fs4::FileExt::try_lock(&file).map_err(|error| match error {
+                fs4::TryLockError::WouldBlock => crate::Error::Conflict(format!(
+                    "run {run} already has a writer; release its session before resuming"
+                )),
+                error => crate::Error::Storage(format!("cannot lock run {run}: {error}")),
+            })?;
+            Some(file)
+        } else {
+            None
+        };
+        let writer = RunWriter {
+            _file: file,
+            directory: self.directory.clone(),
+            run,
+            process: std::process::id(),
+        };
+        self.check_writer(&writer, expected)?;
+        Ok(writer)
+    }
+
+    pub(crate) fn check_writer(
+        &self,
+        writer: &RunWriter,
+        expected: Option<ContentId>,
+    ) -> crate::Result<()> {
+        if writer.process != std::process::id() || writer.directory != self.directory {
+            return Err(crate::Error::Conflict(
+                "session belongs to another process or store; open a fresh session".into(),
+            ));
+        }
+        let Some(dir) = &self.directory else {
+            return Ok(());
+        };
+        let path = dir.join("heads").join(writer.run.to_string());
+        let current = match read_bounded(&path, 256) {
+            Ok(bytes) => Some(
+                std::str::from_utf8(&bytes)
+                    .map_err(|e| crate::Error::Integrity(e.to_string()))?
+                    .trim()
+                    .parse::<ContentId>()
+                    .map_err(|e| crate::Error::Integrity(e.to_string()))?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(crate::Error::Storage(error.to_string())),
+        };
+        if current != expected {
+            return Err(crate::Error::Conflict(format!(
+                "run {} expected head {}, current head {}; resume the current locator or create a new run explicitly",
+                writer.run,
+                expected.map_or_else(|| "<absent>".into(), |id| id.to_string()),
+                current.map_or_else(|| "<absent>".into(), |id| id.to_string()),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Only the execution owner can select a new current checkpoint. The
+    /// predecessor check also rejects stale restoration after a writer exits.
+    pub(crate) fn publish_head(
+        &self,
+        writer: &RunWriter,
+        expected: Option<ContentId>,
+        head: ContentId,
+    ) -> crate::Result<()> {
+        self.check_writer(writer, expected)?;
         let Some(dir) = &self.directory else {
             return Ok(());
         };
         let publish = || -> std::io::Result<()> {
             let heads = dir.join("heads");
             std::fs::create_dir_all(&heads)?;
+            // Persist the heads directory's name on its first publication too.
+            #[cfg(unix)]
+            std::fs::File::open(dir)?.sync_all()?;
             let mut file = tempfile::NamedTempFile::new_in(&heads)?;
             writeln!(file, "{head}")?;
             file.as_file().sync_all()?;
-            file.persist(heads.join(run.to_string()))
+            #[cfg(test)]
+            self.fail_publication(PublicationFailure::BeforeReplace)?;
+            file.persist(heads.join(writer.run.to_string()))
                 .map_err(|e| e.error)?;
+            #[cfg(test)]
+            self.fail_publication(PublicationFailure::AfterReplace)?;
             #[cfg(unix)]
             std::fs::File::open(&heads)?.sync_all()?;
             Ok(())
         };
         publish().map_err(|e| crate::Error::Storage(e.to_string()))
+    }
+
+    #[cfg(test)]
+    fn fail_publication(&self, stage: PublicationFailure) -> std::io::Result<()> {
+        if self.publication_failure == Some(stage) {
+            return Err(std::io::Error::other(
+                "injected checkpoint publication failure",
+            ));
+        }
+        Ok(())
     }
 }
 

@@ -17,6 +17,7 @@ version = "0.8.0"
 dependencies = [
  "agent-frame",
  "content-addressable",
+ "fs4",
  "getrandom 0.2.17",
  "serde",
  "serde_json",
@@ -202,6 +203,16 @@ name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
+
+[[package]]
+name = "fs4"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
+dependencies = [
+ "rustix",
+ "windows-sys",
+]
 
 [[package]]
 name = "getrandom"

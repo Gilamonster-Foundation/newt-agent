@@ -49,8 +49,13 @@ fn restart_verifies_closure_and_keeps_unadjudicated_observation() {
     restored.record_verdict(reply, Verdict::Question).unwrap();
     assert!(restored.pending_replies().is_empty());
     assert_eq!(restored.replay(request.id).unwrap(), request.bytes);
+    let head = restored.head();
+    drop(restored);
     std::fs::remove_file(dir.path().join(format!("{}.cbor", request.projection))).unwrap();
-    assert!(Session::restore(dir.path(), head, "test-workspace").is_err());
+    let error = Session::restore(dir.path(), head, "test-workspace")
+        .err()
+        .unwrap();
+    assert!(matches!(error, agent_harness::Error::Storage(_)), "{error}");
 }
 
 #[test]
@@ -72,7 +77,9 @@ fn restored_transcript_includes_final_tool_observations_and_delivered_outcome() 
     session
         .record_outcome(reply, "deliver", "answer (checked)")
         .unwrap();
-    let restored = Session::restore(dir.path(), session.head(), "test-workspace").unwrap();
+    let head = session.head();
+    drop(session);
+    let restored = Session::restore(dir.path(), head, "test-workspace").unwrap();
     let messages = restored.restored_messages().unwrap();
     assert_eq!(messages.last().unwrap()["content"], "answer");
     assert_eq!(messages[2]["content"], "result");
@@ -189,6 +196,8 @@ fn elision_reread_is_recorded_bounded_and_restorable() {
     assert!(result["retrieval"].is_string());
     assert!(session.re_read(pointer, 0, 0).is_err());
     assert!(session.re_read(pointer, 0, usize::MAX).is_err());
-    let restored = Session::restore(dir.path(), session.head(), "test-workspace");
+    let head = session.head();
+    drop(session);
+    let restored = Session::restore(dir.path(), head, "test-workspace");
     assert!(restored.is_ok(), "{:?}", restored.err());
 }

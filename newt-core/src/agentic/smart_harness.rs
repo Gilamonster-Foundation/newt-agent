@@ -1264,9 +1264,10 @@ mod tests {
             {"role":"user","content":"current task"}
         ]);
         let cancel = AtomicBool::new(false);
-        let navigation =
-            super::super::cancellable(Some(&cancel), h.project(messages.as_array().unwrap(), 1200));
-        tokio::pin!(navigation);
+        let mut navigation = Box::pin(super::super::cancellable(
+            Some(&cancel),
+            h.project(messages.as_array().unwrap(), 1200),
+        ));
         tokio::select! {
             _ = started.notified() => {},
             _ = &mut navigation => panic!("navigation must wait for its auxiliary reply"),
@@ -1306,7 +1307,9 @@ mod tests {
         let payload: Value =
             serde_json::from_slice(&store.source(&payload.cid.parse().unwrap()).unwrap()).unwrap();
         assert!(payload["failure"].as_str().unwrap().contains("cancelled"));
-        Session::restore(dir.path(), h.head().unwrap(), "local-session").unwrap();
+        let head = h.head().unwrap();
+        drop(h);
+        Session::restore(dir.path(), head, "local-session").unwrap();
     }
 
     /// Grounds cancellation error propagation against a real failed checkpoint
@@ -1413,7 +1416,9 @@ mod tests {
             .split('.')
             .next()
             .unwrap();
-        let restored = Session::restore(dir.path(), h.head().unwrap(), "local-session").unwrap();
+        let head = h.head().unwrap();
+        drop(h);
+        let restored = Session::restore(dir.path(), head, "local-session").unwrap();
         let restored = SmartHarness::new(
             restored,
             Arc::new(|_| panic!("re-read never uses inference")),
@@ -1490,7 +1495,9 @@ mod tests {
         assert!(!rendered.contains("spill:"));
         let source = payload["sources"][0]["source_cid"].clone();
         assert_eq!(payload["sources"][0]["slice"]["complete"], false);
-        let restored = Session::restore(dir.path(), h.head().unwrap(), "local-session").unwrap();
+        let head = h.head().unwrap();
+        drop(h);
+        let restored = Session::restore(dir.path(), head, "local-session").unwrap();
         let restored = SmartHarness::new(
             restored,
             Arc::new(|_| panic!("no inference")),

@@ -66,6 +66,11 @@ impl PySession {
         self.inner.head().to_string()
     }
 
+    /// Verify this process still owns the current run before host side effects.
+    fn ensure_writer(&mut self) -> PyResult<()> {
+        self.inner.ensure_writer().map_err(invalid)
+    }
+
     /// Reset the host's per-turn navigation and elapsed-time budgets.
     fn start_turn(&mut self) {
         self.inner.start_turn();

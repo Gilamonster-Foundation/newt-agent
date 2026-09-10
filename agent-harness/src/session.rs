@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use crate::{
     projection::{Entry, Projection},
-    store::FrameStore,
+    store::{FrameStore, RunWriter},
     Error, Result, Verdict,
 };
 
@@ -215,6 +215,7 @@ pub struct PreparedRequest {
 
 pub struct Session {
     store: FrameStore,
+    writer: RunWriter,
     config: SessionConfig,
     head: ContentId,
     run: ContentId,
@@ -277,13 +278,21 @@ impl Session {
             config: config.clone(),
             root,
         }))?;
-        store.publish_head(head, head)?;
-        Ok(Self::empty(store, config, head, root))
+        let writer = store.acquire_writer(head, None)?;
+        store.publish_head(&writer, None, head)?;
+        Ok(Self::empty(store, writer, config, head, root))
     }
 
-    fn empty(store: FrameStore, config: SessionConfig, head: ContentId, root: ContentId) -> Self {
+    fn empty(
+        store: FrameStore,
+        writer: RunWriter,
+        config: SessionConfig,
+        head: ContentId,
+        root: ContentId,
+    ) -> Self {
         Self {
             store,
+            writer,
             config,
             head,
             run: head,
@@ -345,13 +354,29 @@ impl Session {
         self.attempted_selections.clear();
     }
 
-    fn append(&mut self, entry: JournalEntry) -> Result<()> {
+    /// Check execution ownership before host side effects. A failed check
+    /// permanently stops this session; dropping it releases its writer lease.
+    pub fn ensure_writer(&mut self) -> Result<()> {
+        self.ensure_active()?;
+        let result = self.store.check_writer(&self.writer, Some(self.head));
+        if result.is_err() {
+            self.aborted = true;
+        }
+        result
+    }
+
+    fn ensure_active(&self) -> Result<()> {
         if self.aborted {
             return Err(Error::Storage(
                 "session aborted after a failed journal append; restore a verified checkpoint"
                     .into(),
             ));
         }
+        Ok(())
+    }
+
+    fn append(&mut self, entry: JournalEntry) -> Result<()> {
+        self.ensure_writer()?;
         let result = self.append_inner(entry);
         if result.is_err() {
             self.aborted = true;
@@ -366,7 +391,8 @@ impl Session {
         let node = MerkleNode::new(entry, [self.head]);
         let head = self.store.put(&node)?;
         self.apply(node.payload())?;
-        self.store.publish_head(self.run, head)?;
+        self.store
+            .publish_head(&self.writer, Some(self.head), head)?;
         self.head = head;
         self.journal_len += 1;
         Ok(())
@@ -851,7 +877,8 @@ impl Session {
                 "run root does not commit its configuration and occurrence",
             ));
         }
-        let mut session = Self::empty(store, config, genesis, root);
+        let writer = store.acquire_writer(genesis, Some(head))?;
+        let mut session = Self::empty(store, writer, config, genesis, root);
         for (id, node) in chain.into_iter().rev() {
             session.apply(node.payload())?;
             session.head = id;
@@ -1015,6 +1042,7 @@ impl Session {
     }
 
     pub fn restored_messages(&self) -> Result<Vec<Value>> {
+        self.ensure_active()?;
         self.restored_transcript
             .iter()
             .map(|id| {

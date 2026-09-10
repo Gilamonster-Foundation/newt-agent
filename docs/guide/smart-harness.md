@@ -69,6 +69,19 @@ directory, current tool caveats, auxiliary configuration, and budgets to match.
 A record never grants authority. Provider protocol changes also require a
 fresh session.
 
+A writable session holds an exclusive OS lock on its run from creation or
+restoration until release. Resume accepts only the current `heads/<run CID>`
+checkpoint; an older checkpoint reports a conflict without selecting a divergent
+history. Stop the active writer and use the current locator to continue. To
+start independent work, create a fresh run explicitly. Read-only frame
+inspection does not acquire execution ownership. Never remove the persistent
+`locks/<run CID>` files to resolve a conflict: process exit releases the OS lock.
+A failed journal publication stops further writes from that session. Release
+it and restore the actual locator; a failure after replacement may have made a
+new checkpoint visible even though the append could not confirm durability.
+See the [reusable storage contract](../../agent-harness/README.md) for filesystem,
+process lifetime, and Unix/Windows crash-durability limits.
+
 Frames default to `frame/<workspace CID>` under Newt's user configuration
 directory (`~/.newt`, or `NEWT_CONFIG_DIR`). The workspace CID addresses the
 canonical workspace path. The resolved directory is included in the solve

@@ -17,6 +17,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
 getrandom.workspace = true
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 
 [lints]
 workspace = true

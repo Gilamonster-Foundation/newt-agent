@@ -1,6 +1,7 @@
 """Real CPython import grounds Rust's frame admission and byte-verification tests."""
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -9,11 +10,13 @@ from pathlib import Path
 from _smart_harness_consumer import frame, harness
 
 
-def refuses(action):
+def refuses(action, contains=None):
     try:
         action()
-    except ValueError:
-        return
+    except ValueError as error:
+        if contains is not None:
+            assert contains in str(error), str(error)
+        return str(error)
     raise AssertionError("invalid evidence crossed the Python admission boundary")
 
 
@@ -58,13 +61,18 @@ def harness_roundtrip():
         assert json.loads(session.replay(request["id"])) == body
         pending = session.record_reply(request["id"], b"Checking the source now.")
         head = session.head()
+        del session  # The current execution owner must release the run first.
         # A fresh interpreter verifies the stored run, then reconstructs the
         # original request and pending adjudication using no in-memory state.
-        subprocess.run(
+        child = subprocess.run(
             [sys.executable, __file__, "restore", directory, head, request["id"], pending],
-            check=True,
+            check=True, capture_output=True, text=True,
         )
-        refuses(lambda: harness.Session.restore(directory, head, "another-consumer"))
+        head = json.loads(child.stdout)["head"]
+        error = refuses(lambda: harness.Session.restore(directory, head, "another-consumer"))
+        assert "run writer conflict" not in error
+        session = harness.Session.restore(directory, head, "consumer-fixture")
+        head = session.head()
         # Addressed evidence is checked when read: a real byte substitution
         # cannot turn into a valid request just because its filename is a CID.
         for source in Path(directory).iterdir():
@@ -73,8 +81,64 @@ def harness_roundtrip():
                 break
         else:
             raise AssertionError("request evidence was not persisted")
-        refuses(lambda: session.replay(request["id"]))
-        refuses(lambda: harness.Session.restore(directory, head, "consumer-fixture"))
+        error = refuses(lambda: session.replay(request["id"]))
+        assert "run writer conflict" not in error
+        del session
+        error = refuses(lambda: harness.Session.restore(directory, head, "consumer-fixture"))
+        assert "run writer conflict" not in error
+
+
+def writer_ownership():
+    """Real lock/locator operations ground Rust's exclusive and current-head checks."""
+    with tempfile.TemporaryDirectory() as directory:
+        session = harness.Session('{"authority":"writer-fixture"}', directory)
+        stale = session.head()
+        checkpoint = Path(session.checkpoint_path())
+        session.record_request('{"messages":[{"role":"user","content":"task"}]}', "openai")
+        current = session.head()
+        expected = checkpoint.read_bytes()
+        refuses(lambda: harness.Session.restore(directory, current, "writer-fixture"), "run writer conflict")
+        assert checkpoint.read_bytes() == expected
+        del session
+        refuses(lambda: harness.Session.restore(directory, stale, "writer-fixture"), "run writer conflict")
+        assert checkpoint.read_bytes() == expected
+        restored = harness.Session.restore(directory, current, "writer-fixture")
+        restored.ensure_writer()
+        assert restored.head() != current
+        assert checkpoint.read_text().strip() == restored.head()
+
+
+def forked_writer_refuses():
+    """Ground the process-identity gate in an inherited Python/Rust session."""
+    if not hasattr(os, "fork"):
+        return
+    with tempfile.TemporaryDirectory() as directory:
+        session = harness.Session('{"authority":"fork-fixture"}', directory)
+        session.ensure_writer()
+        checkpoint = Path(session.checkpoint_path())
+        expected = checkpoint.read_bytes()
+        reader, writer = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.close(reader)
+            try:
+                refuses(session.ensure_writer, "run writer conflict")
+                refuses(lambda: session.record_request('{"messages":[]}', "openai"))
+                assert checkpoint.read_bytes() == expected
+                result = b"refused"
+            except BaseException as error:
+                result = repr(error).encode()
+            os.write(writer, result)
+            os._exit(0)
+        os.close(writer)
+        with os.fdopen(reader, "rb") as pipe:
+            result = pipe.read()
+        _, status = os.waitpid(child, 0)
+        assert status == 0 and result == b"refused", (status, result)
+        assert checkpoint.read_bytes() == expected
+        session.ensure_writer()
+        session.record_request('{"messages":[{"role":"user","content":"parent continues"}]}', "openai")
+        assert checkpoint.read_bytes() != expected
 
 
 def projection_and_retrieval():
@@ -154,8 +218,10 @@ def host_composition():
         session.record_adjudication_reply(adjudication, '"question"')
         session.record_verdict(reply, "question")
         session.record_outcome(reply, "await_operator", "HOST DECORATION: Which file next?")
-        restored = harness.Session.restore_with_config(directory, session.head(), session.config())
-        assert restored.run_id() == session.run_id()
+        run, head, config = session.run_id(), session.head(), session.config()
+        del session
+        restored = harness.Session.restore_with_config(directory, head, config)
+        assert restored.run_id() == run
         history = json.loads(restored.restored_messages())
         assert history[-1] == {"role":"assistant", "content":"Which file next?"}
         assert "HOST DECORATION" not in json.dumps(history)
@@ -165,9 +231,12 @@ def host_composition():
         assert json.loads(restored.restored_messages())[-1]["content"] == "Continue with the task."
         catalog = json.loads(restored.catalog(json.dumps(history), 4096))
         assert host_message not in [candidate["cid"] for candidate in catalog["candidates"]]
-        changed = json.loads(session.config())
+        changed = json.loads(config)
         changed["max_slice_bytes"] += 1
-        refuses(lambda: harness.Session.restore_with_config(directory, session.head(), json.dumps(changed)))
+        head = restored.head()
+        del restored
+        error = refuses(lambda: harness.Session.restore_with_config(directory, head, json.dumps(changed)))
+        assert "run writer conflict" not in error
 
 
 def provider_rendering():
@@ -204,9 +273,12 @@ if __name__ == "__main__":
         assert restored.head() != head
         assert restored.pending_replies() == [pending]
         assert json.loads(restored.replay(request))["messages"][0]["role"] == "user"
+        print(json.dumps({"head": restored.head()}))
     else:
         frame_roundtrip()
         event_admission()
+        writer_ownership()
+        forked_writer_refuses()
         harness_roundtrip()
         projection_and_retrieval()
         host_composition()

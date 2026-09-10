@@ -16,6 +16,8 @@ pub use session::{PreparedRequest, Session, SessionConfig};
 pub enum Error {
     #[error("frame storage: {0}")]
     Storage(String),
+    #[error("run writer conflict: {0}")]
+    Conflict(String),
     #[error("frame integrity: {0}")]
     Integrity(String),
     #[error("invalid proposal: {0}")]

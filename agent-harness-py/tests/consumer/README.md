@@ -18,7 +18,10 @@ VIRTUAL_ENV="$PWD/.venv" uv tool run maturin develop --locked
 The smoke checks unit and event admission, exact request replay, verdict
 accounting, complete tool-output retention, navigation selection, auxiliary
 observation recording, restoration in a fresh Python process, configuration
-drift, and refusal after stored bytes change.
+drift, and refusal after stored bytes change. It also checks competing and stale
+writers leave the checkpoint unchanged, releases sessions before restoration,
+and verifies inherited-session refusal through `os.fork()` where available.
+The successful parent append grounds continued ownership after the child exits.
 It uses no model, network endpoint, pytest, or terminal.
 
 The fixture calls `Session` from trusted Python code and uses temporary storage;

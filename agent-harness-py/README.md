@@ -37,6 +37,18 @@ per-call deadlines, tools, and orchestration.
 renderer; already-rendered native content blocks use `record_request`.
 Invalid records, proposals, and stored evidence raise `ValueError`.
 
+A durable session holds exclusive execution ownership of its run. Release all
+references to the current session before restoring it; in CPython, `del session`
+releases the owner when no other references remain. Restore requires the current
+checkpoint head and publishes a new head, which the host must retain for the next
+restore. A live competing writer or a stale head raises `ValueError` containing
+`run writer conflict` without replacing the checkpoint. Independent runs may share
+the same store. Verifying records does not transfer execution ownership.
+Call `ensure_writer()` before effects performed by the Python host. A failed check
+stops further recording on that session; release it and restore a verified current
+checkpoint. A session inherited through `fork()` cannot record or validate writer
+ownership in the child.
+
 The foreign host must protect durable frame storage from its model's tools.
 Before opening or restoring a session, require disjoint scopes for the store
 and every effective tool filesystem read/write grant. Resolve path aliases and

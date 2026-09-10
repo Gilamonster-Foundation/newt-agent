@@ -168,6 +168,44 @@ fn failed_checkpoint_publication_aborts_the_live_session() {
     assert!(session.record_messages(&messages).is_err());
 }
 
+/// Grounds the aborted-session contract in real atomic replacement, with faults
+/// at both sides of its visibility boundary. A failed flush can leave the new
+/// head visible, but the writer must never report it as a committed append.
+#[test]
+fn interrupted_publication_requires_drop_and_restore_of_the_actual_locator() {
+    use crate::store::PublicationFailure::{AfterReplace, BeforeReplace};
+
+    for stage in [BeforeReplace, AfterReplace] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::open(dir.path(), SessionConfig::default()).unwrap();
+        let before = session.head();
+        let locator = session.checkpoint_path().unwrap();
+        session.store.publication_failure = Some(stage);
+        // A single journal append, so the failure boundary is unambiguous.
+        let result = session.append(JournalEntry::Transcript { entries: vec![] });
+        assert!(matches!(result, Err(Error::Storage(_))));
+        assert_eq!(session.head(), before);
+        assert!(
+            session.restored_messages().is_err(),
+            "an aborted session must not expose an uncommitted transcript"
+        );
+        assert!(session.ensure_writer().is_err());
+        let current: ContentId = std::fs::read_to_string(&locator)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(current == before, stage == BeforeReplace);
+        assert!(matches!(
+            Session::restore(dir.path(), current, "local-session"),
+            Err(Error::Conflict(_))
+        ));
+        drop(session);
+        let restored = Session::restore(dir.path(), current, "local-session").unwrap();
+        assert!(restored.restored_messages().unwrap().is_empty());
+    }
+}
+
 #[test]
 fn packet_slots_preserve_occurrences_of_identical_units() {
     let mut session = Session::new(SessionConfig::default()).unwrap();
