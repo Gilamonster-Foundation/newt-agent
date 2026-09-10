@@ -273,6 +273,8 @@ fn context_features_local_backend_defaults_plan_semantic_ledger_on() {
 #[test]
 fn handle_context_command_dispatch() {
     use newt_core::{BackendKind, CompactionTriggerPolicy, ContextFeatures, ContextManager};
+    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
+    newt_core::process_env::remove_var("NEWT_COMPACTION_TRIGGER");
     let cfg = newt_core::Config::default();
     let none = ContextFeatures::default();
     // Cloud kind keeps the all-off base so these assertions isolate the
@@ -309,7 +311,6 @@ fn handle_context_command_dispatch() {
     );
     // The session pin is a process-global since #2009 PR7, so it is installed
     // rather than passed. Same precedence, same assertions.
-    let _guard = newt_core::test_guard::GlobalSettingsGuard::acquire();
     newt_core::process_env::set_var(
         "NEWT_COMPACTION_TRIGGER",
         CompactionTriggerPolicy::MessageCount.keyword(),
