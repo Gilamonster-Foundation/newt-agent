@@ -45,6 +45,15 @@ an independent instrument with no dependency on Newt. If the ruler shipped with
 the thing it measures, one commit could move both at once. The scoreboard above is
 the concise release view; the benchmark repository is the evidence.
 
+With smart-harness adjudication enabled, `newt solve` records questions as
+`status: awaiting_operator`; exhausted or final-round narration is
+`status: incomplete`. These retain their bench rows as
+`outcome: model_error`; an answer remains `completed`. Process exit status reports
+invocation errors, so read the structured status to distinguish an answer from
+an unfinished task. A completed response alone does not verify its claimed work.
+See the [smart-harness guide](docs/guide/smart-harness.md) for CPU auxiliary
+configuration, durable frames, and explicit resume or hermetic invocation.
+
 ## Use Newt
 
 ```bash

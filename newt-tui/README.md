@@ -42,6 +42,15 @@ not a deadline for an entire multi-chunk compaction. Embedded cancellation is
 cooperative: the caller returns while a synchronous load or forward may still be
 finishing, and another embedded generation is refused until that worker exits.
 
+The turn footer reports `awaiting operator` when smart-harness adjudication
+classifies a question, and `incomplete` when narration ends without an answer.
+The question or observed reply remains available; these status notices stay
+separate from model text.
+Enable `[smart_harness] enabled = true` to use durable frames and an independent
+CPU auxiliary. Smart mode selects from retained originals and disables legacy
+history and close-time summaries; each turn prints its frame head for inspection
+or resume. See [configuration and limits](../docs/guide/smart-harness.md).
+
 ## Tool output spills
 
 Every completed tool call is rendered through the same bounded spill block;

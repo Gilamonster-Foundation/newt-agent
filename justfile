@@ -174,6 +174,20 @@ lint:
 lock:
     cargo generate-lockfile
 
+# Real CPython consumer, mirrored by .github/workflows/harness-python.yml.
+# Separate from the Rust push gate because it needs uv and a Python interpreter.
+[unix]
+harness-python:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd agent-harness-py/tests/consumer
+    python3 check_dependencies.py
+    cargo fmt --manifest-path Cargo.toml -- --check
+    cargo clippy --manifest-path Cargo.toml --all-targets --locked -- -D warnings
+    uv venv --allow-existing --python "$(command -v python3)" .venv
+    VIRTUAL_ENV="$PWD/.venv" uv tool run --from 'maturin>=1.7,<2.0' maturin develop --locked
+    .venv/bin/python smoke.py
+
 # fmt-check, lint, and test — the local equivalent of CI.
 # PIPELINE PARITY: must match .github/workflows/ci.yml. Runs all three even if
 # an earlier one fails (a fmt failure must not mask a clippy failure), matching

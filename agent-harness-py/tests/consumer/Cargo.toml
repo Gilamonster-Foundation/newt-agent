@@ -1,0 +1,19 @@
+[package]
+name = "smart-harness-consumer"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+readme = "README.md"
+license = "Apache-2.0"
+
+[workspace]
+resolver = "2"
+
+[lib]
+name = "_smart_harness_consumer"
+crate-type = ["cdylib"]
+
+[dependencies]
+agent-harness-py = { path = "../.." }
+pyo3 = { version = "0.28", default-features = false, features = ["macros", "extension-module"] }

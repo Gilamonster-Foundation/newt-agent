@@ -71,6 +71,10 @@ pub struct SolveArgs {
     /// flag). Wins over `--unsafe-host-exec`.
     pub confined: bool,
     pub events: Option<PathBuf>,
+    pub smart_harness: bool,
+    pub frame_dir: Option<PathBuf>,
+    /// Distinguishes an explicit hermetic request from the legacy default.
+    pub hermetic_explicit: bool,
     /// The validated continuity mode this run launched under.
     ///
     /// Already proved legal by `LaunchConfig::from_flags` at the call site, so
@@ -92,6 +96,20 @@ pub struct SolveArgs {
     /// for). Local-weights derivation would only apply to the embedded
     /// backend, which `solve` cannot drive (it needs an HTTP endpoint).
     pub model_digest: Option<String>,
+}
+
+fn smart_launch(
+    launch: &newt_launch::LaunchConfig,
+    enabled: bool,
+    hermetic_explicit: bool,
+) -> newt_launch::LaunchConfig {
+    if enabled && !hermetic_explicit && !launch.continuity.is_resumable() {
+        newt_launch::LaunchConfig {
+            continuity: newt_launch::Continuity::Resume { from: None },
+        }
+    } else {
+        launch.clone()
+    }
 }
 
 /// Which headless lane `newt solve` runs.
@@ -431,9 +449,56 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // permission_gate stays `None` — an in-fence write auto-consents; an
     // out-of-fence tool write is denied. This is the only seam the confined lane
     // touches; the driver + tool layer are unchanged.
+    let smart_config = cfg.smart_harness.clone().unwrap_or_default();
+    let smart_enabled = args.smart_harness || smart_config.enabled;
     if lane == HeadlessLane::Confined {
         dc.caveats = confined_bench_caveats(&workspace);
+        if smart_enabled {
+            let scoped =
+                newt_core::confined_exec::build_tool_caveats(std::path::Path::new(&workspace));
+            dc.caveats.fs_read = scoped.fs_read;
+            dc.caveats.fs_write = scoped.fs_write;
+            newt_core::caveats::apply_cli_fs_grants(&mut dc.caveats, &workspace);
+        }
     }
+    let launch = smart_launch(&args.launch, smart_enabled, args.hermetic_explicit);
+    anyhow::ensure!(
+        smart_enabled || (args.frame_dir.is_none() && launch.continuity.parent_frame().is_none()),
+        "frame storage and --resume-from require --smart-harness or [smart_harness] enabled = true"
+    );
+    let mut smart_manifest = None;
+    let smart_harness = if smart_enabled {
+        newt_core::agentic::smart_harness::validate_isolation_runtime()?;
+        let harness_launch = newt_core::config::HarnessLaunch {
+            workspace: std::path::Path::new(&workspace),
+            caveats: &dc.caveats,
+            frame_dir: args.frame_dir.as_deref(),
+            resume_from: launch.continuity.parent_frame(),
+            hermetic: !launch.continuity.is_resumable(),
+        };
+        // Admit storage before loading or contacting the auxiliary. Explicit
+        // broad CLI grants stay visible and are rejected if they expose it.
+        smart_config.directory(&harness_launch)?;
+        let auxiliary = newt_inference::smart_harness::build(&smart_config, &url, kind)?;
+        let mut manifest = auxiliary.manifest;
+        manifest["primary_api"] = serde_json::json!(api.label());
+        let session = smart_config.open_session(&harness_launch, manifest.clone())?;
+        let session_config = serde_json::to_value(session.config())?;
+        smart_manifest = Some(serde_json::json!({
+            "invocation_mode": if launch.continuity.parent_frame().is_some() { "resume" } else { "fresh" },
+            "starting_cid": launch.continuity.parent_frame(),
+            "configuration": session_config,
+        }));
+        let harness = Arc::new(newt_core::agentic::smart_harness::SmartHarness::new(
+            session,
+            auxiliary.complete,
+            smart_config.adjudication.clone(),
+        )?);
+        dc.smart_harness = Some(harness.clone());
+        Some(harness)
+    } else {
+        None
+    };
     // Pin the model's served context window so the loop's pre-send guard +
     // compaction keep each request under the backend's `--ctx-size` (e.g. dgx1
     // llama.cpp serves qwen3-coder at 32768). `--context-window` is the FULL
@@ -534,6 +599,9 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     let reply_chars = o_opt.map(|o| o.reply.len()).unwrap_or(0);
     let usage = o_opt.and_then(|o| o.usage.as_ref().map(|u| u.total()));
     let halluc = o_opt.map(|o| o.hallucinations).unwrap_or(0);
+    if let (Some(manifest), Some(harness)) = (&mut smart_manifest, &smart_harness) {
+        manifest["head"] = serde_json::json!(harness.head()?.to_string());
+    }
     // The per-tool trajectory — the material for the failure taxonomy. The
     // single highest-signal field is `write_calls`: a failed task with 0 writes
     // never ACTED (the tenacity target); with writes it acted but wrong. Only
@@ -558,7 +626,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         }
         None => (0, 0, None, "None".to_string(), serde_json::Value::Null),
     };
-    let record = serde_json::json!({
+    let mut record = serde_json::json!({
         "kind": "solve_result",
         "task_file": instruction_file.to_string_lossy(),
         "cwd": workspace,
@@ -599,12 +667,15 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         // the record is parsed by gilamonster-bench with its own re-declared
         // structs, and adding a field there needs the unknown-field question
         // answered first (#2218). This line is newt's own.
-        "continuity": args.launch.continuity.as_str(),
-        "continuity_note": args.launch.describe(),
-        "resume_from": args.launch.continuity.parent_frame(),
+        "continuity": launch.continuity.as_str(),
+        "continuity_note": launch.describe(),
+        "resume_from": launch.continuity.parent_frame(),
         "trajectory": trajectory,
         "error": error,
     });
+    if let Some(manifest) = &smart_manifest {
+        record["smart_harness"] = manifest.clone();
+    }
     // 7. W0 (#1511): the per-round parse-signal trace events plus EXACTLY ONE
     //    contract record (the `contract_version` key marks it — the external
     //    evaluator rejects a trace with zero or several), appended alongside
@@ -654,6 +725,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
             gen_tokens: o_opt
                 .and_then(|o| o.usage.as_ref())
                 .map(|u| u64::from(u.output_tokens)),
+            smart_harness: smart_manifest.as_ref(),
         },
     ));
     if let Some(path) = &args.events {
@@ -816,6 +888,25 @@ fn confined_bench_caveats_with_grants(workspace: &str, extra_write_roots: &[Stri
 mod tests {
     use super::*;
     use newt_core::config::BackendConfig;
+
+    #[test]
+    fn smart_runs_are_resumable_unless_hermetic_was_explicit() {
+        let legacy = newt_launch::LaunchConfig::default();
+        assert!(!smart_launch(&legacy, false, false)
+            .continuity
+            .is_resumable());
+        assert!(smart_launch(&legacy, true, false).continuity.is_resumable());
+        assert!(!smart_launch(&legacy, true, true).continuity.is_resumable());
+        let resume = newt_launch::LaunchConfig {
+            continuity: newt_launch::Continuity::Resume {
+                from: Some("head".into()),
+            },
+        };
+        assert_eq!(
+            smart_launch(&resume, true, false).continuity.parent_frame(),
+            Some("head")
+        );
+    }
 
     fn backend(name: &str, endpoint: &str) -> BackendConfig {
         BackendConfig {

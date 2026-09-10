@@ -1746,15 +1746,19 @@ fn the_real_workspace_root_set_is_unchanged() {
     let roots = production_roots(&workspace_root());
     assert_eq!(
         roots.len(),
-        24,
-        "23 production members + newt-web; a change here rescopes every \
+        26,
+        "25 production members + newt-web; a change here rescopes every \
          law and every baseline. Moved 21 -> 22 by #1828 A2.0, which adds \
          the `newt-interaction` protocol crate; 22 -> 23 by the \
          `crates/newt-launch` launch-configuration crate; 23 -> 24 by \
          `agent-frame`, the derivation kernel incubated here through 0.1.0 \
-         (#2246) — the ratchet noticing a new member is this assertion \
-         working, not breaking"
+         (#2246); 24 -> 26 adds agent-harness and agent-harness-py for \
+         the smart-harness implementation of #2243. All production laws \
+         also scan these two new crates"
     );
+    for member in ["agent-harness", "agent-harness-py"] {
+        assert!(roots.contains(&workspace_root().join(member).join("src")));
+    }
     let names: Vec<String> = roots
         .iter()
         .map(|r| rel(&workspace_root(), r))

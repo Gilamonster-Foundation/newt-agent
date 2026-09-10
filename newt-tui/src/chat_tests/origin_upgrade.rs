@@ -128,6 +128,39 @@ fn round_cap_footer_is_deterministic_and_only_decorates_capped_replies() {
 }
 
 #[test]
+fn terminal_notices_preserve_questions_and_incomplete_observations() {
+    let question = "Which project should I update?";
+    let awaiting =
+        decorate_round_cap_reply(question, Some(newt_core::TurnEndReason::AwaitingOperator));
+    assert_eq!(
+        awaiting, question,
+        "host notices must not become model material"
+    );
+    let mut metrics = newt_core::TurnMetrics {
+        end_reason: Some(newt_core::TurnEndReason::AwaitingOperator),
+        ..Default::default()
+    };
+    assert!(metrics.display_line().contains("awaiting operator"));
+    for reason in [
+        newt_core::TurnEndReason::NarrationCapExhausted,
+        newt_core::TurnEndReason::NarrationFinalRound,
+    ] {
+        let reply = "I will inspect the test failure.";
+        let incomplete = decorate_round_cap_reply(reply, Some(reason));
+        assert_eq!(incomplete, reply);
+        metrics.end_reason = Some(reason);
+        assert!(metrics.display_line().contains("incomplete"));
+    }
+    assert_eq!(
+        decorate_round_cap_reply(
+            "The answer is 3.",
+            Some(newt_core::TurnEndReason::Completed)
+        ),
+        "The answer is 3."
+    );
+}
+
+#[test]
 fn capped_progress_is_persistable_without_duplicate_notices_and_resumes_its_objective() {
     let parent = ctx();
     let core_handoff = "Progress captured.\n\nPaused at the tool-round limit (40 rounds).";

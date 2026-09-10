@@ -9,6 +9,11 @@ model (`~/.newt/config.toml`), session and memory types, MCP server
 resolution, metrics, and capability caveat extensions used across the
 workspace.
 
+Turn metrics distinguish an answer from a question awaiting the operator and
+from incomplete narration. `TurnEndReason::AwaitingOperator` serializes as
+`awaiting_operator`; both narration exits report incomplete work. These are
+control outcomes, not evidence that a claimed external action succeeded.
+
 It also hosts the shared agentic tool executor used by the TUI and headless
 paths. Built-in file tools include `read_file`, `write_file`, `edit_file`,
 `delete_file`, `list_dir`, and `find`, all mediated by the same caveat and

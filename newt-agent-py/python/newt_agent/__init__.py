@@ -10,6 +10,8 @@ Submodules
 - ``newt_agent.inference``   ChatRequest/ChatReply + LocalOllamaBackend (async)
 - ``newt_agent.acp_worker``  TaskReply + Session data types
 - ``newt_agent.mcp``         McpServer dispatch shell + handler registry
+- ``newt_agent.frame``       Admitted units, canonical identities, byte verification
+- ``newt_agent.harness``     Durable sessions, projections, classification records
 
 Install: ``pip install newt-agent-py``
 
@@ -57,6 +59,8 @@ eval = _native.eval  # noqa: A001 — shadows builtin `eval`; deliberate parity
 inference = _native.inference
 acp_worker = _native.acp_worker
 mcp = _native.mcp
+frame = _native.frame
+harness = _native.harness
 
 _sys.modules["newt_agent.core"] = core
 _sys.modules["newt_agent.data"] = data
@@ -66,6 +70,8 @@ _sys.modules["newt_agent.eval"] = eval
 _sys.modules["newt_agent.inference"] = inference
 _sys.modules["newt_agent.acp_worker"] = acp_worker
 _sys.modules["newt_agent.mcp"] = mcp
+_sys.modules["newt_agent.frame"] = frame
+_sys.modules["newt_agent.harness"] = harness
 
 __all__ = [
     "core",
@@ -76,4 +82,6 @@ __all__ = [
     "inference",
     "acp_worker",
     "mcp",
+    "frame",
+    "harness",
 ]

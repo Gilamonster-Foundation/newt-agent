@@ -47,15 +47,17 @@
 //! A directory of content-addressed files (`~/.newt/frame` by default). Two
 //! profiles, matching the two id types:
 //!
-//! * `<content-id>.json` — a unit, root event or packet. Read back through
-//!   **decode → admit → recompute the id → compare to the filename**, which is
-//!   the `NodeStore::get` (verified) half. The stored bytes are never trusted:
-//!   the id is recomputed from the canonical form of the decoded value.
+//! * `<content-id>.cbor` — canonical records, read through the harness's
+//!   verified `FrameStore`. Unit reconstruction uses its shared admission seam.
+//! * `<content-id>.json` — earlier forensic fixtures, accepted only when the
+//!   canonical record is absent. This read-only migration boundary retains
+//!   decode, admission and identity checks; corruption never falls back to JSON.
 //! * `<raw-content-id>` — opaque source bytes. Returned **unverified**, because
 //!   hashing them is precisely what [`agent_frame::verify_unit`] does. That is
 //!   the `get_unverified` half, and keeping it unverified here is what makes
 //!   the mismatch case reachable and testable.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use agent_frame::{
@@ -66,6 +68,24 @@ use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use content_addressable::{ContentAddressable, ContentId, RawContentId};
 use serde::Serialize;
+
+/// Explicit read bounds for smart-frame inspection; no ancestry is traversed.
+#[derive(clap::Args, Debug, Clone, Copy)]
+pub struct InspectionArgs {
+    #[arg(long, default_value_t = agent_harness::forensics::InspectionLimits::default().max_bytes)]
+    max_bytes: usize,
+    #[arg(long, default_value_t = agent_harness::forensics::InspectionLimits::default().max_references)]
+    max_references: usize,
+}
+
+impl From<InspectionArgs> for agent_harness::forensics::InspectionLimits {
+    fn from(value: InspectionArgs) -> Self {
+        Self {
+            max_bytes: value.max_bytes,
+            max_references: value.max_references,
+        }
+    }
+}
 
 /// Forensics subcommands.
 #[derive(Subcommand, Debug)]
@@ -85,10 +105,9 @@ pub enum FrameCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Report which source a unit represents, which range of it, under which
-    /// operation, on whose authority, and at what depth.
+    /// Explain a unit, causal event, request, projection, or session journal entry.
     Explain {
-        /// The unit's content id.
+        /// The addressed record's content id, including a solve's reported head.
         cid: String,
         /// Frame store directory (default: `~/.newt/frame`).
         #[arg(long)]
@@ -96,21 +115,32 @@ pub enum FrameCmd {
         /// Emit the report as JSON.
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        limits: InspectionArgs,
     },
-    /// Report the IMMEDIATE parent link — one step, never a walk.
-    ///
-    /// Three outcomes, deliberately never conflated: `genesis` (no parents —
-    /// the chain ended, and the answer is complete), `parent` (the link is
-    /// named, follow it by calling again), or a loud failure to resolve the
-    /// subject. An absent parent meaning "origin" and an absent parent meaning
-    /// "I could not read it" are different facts and must not render alike.
+    /// Report immediate parents and references, without traversing ancestry.
+    /// Missing or substituted immediate references fail visibly.
     Parents {
-        /// A packet or unit content id.
+        /// A packet, unit, causal event, or journal entry content id.
         cid: String,
         /// Frame store directory (default: `~/.newt/frame`).
         #[arg(long)]
         frame: Option<PathBuf>,
         /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        limits: InspectionArgs,
+    },
+    /// Reconstruct a request and verify its recorded dispatch commitment.
+    /// Writes the exact request bytes to stdout, without an added newline.
+    Replay {
+        /// The recorded request's content id.
+        cid: String,
+        /// Frame store directory (default: `~/.newt/frame`).
+        #[arg(long)]
+        frame: Option<PathBuf>,
+        /// Emit a JSON receipt containing the verified request body.
         #[arg(long)]
         json: bool,
     },
@@ -150,9 +180,25 @@ impl FrameStore {
         std::fs::read(&path).with_context(|| format!("reading {}", path.display()))
     }
 
-    /// Read a structured node, **verifying** that it hashes to the id it was
-    /// filed under. The stored bytes are not trusted.
-    fn read_node<T, F>(&self, id: &ContentId, decode: F) -> Result<T>
+    fn canonical(&self) -> Result<agent_harness::store::FrameStore> {
+        // Forensics must not create a missing store as a side effect of a read.
+        if !self.dir.is_dir() {
+            bail!("frame store is not a directory: {}", self.dir.display());
+        }
+        Ok(agent_harness::store::FrameStore::open(&self.dir)?)
+    }
+
+    fn has_canonical(&self, id: &ContentId) -> Result<bool> {
+        match std::fs::symlink_metadata(self.dir.join(format!("{id}.cbor"))) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Read the earlier JSON format only when no canonical record exists.
+    /// All new writes use the harness store's canonical encoding.
+    fn read_legacy_node<T, F>(&self, id: &ContentId, decode: F) -> Result<T>
     where
         F: FnOnce(&[u8]) -> Result<T>,
         T: ContentAddressable,
@@ -172,7 +218,10 @@ impl FrameStore {
     /// Load and **admit** a unit. Both halves are required: bytes that decode
     /// are not yet a unit.
     fn unit(&self, id: &UnitId) -> Result<Unit> {
-        self.read_node(id.as_content_id(), |bytes| {
+        if self.has_canonical(id.as_content_id())? {
+            return Ok(self.canonical()?.unit(*id.as_content_id())?);
+        }
+        self.read_legacy_node(id.as_content_id(), |bytes| {
             let raw: RawUnit = serde_json::from_slice(bytes).context("decoding the stored unit")?;
             Unit::try_from(raw).map_err(|e| {
                 anyhow::anyhow!("the stored unit is not admissible under the v0 contract: {e}")
@@ -181,7 +230,10 @@ impl FrameStore {
     }
 
     fn root(&self, id: &ContentId) -> Result<RootEvent> {
-        self.read_node(id, |bytes| {
+        if self.has_canonical(id)? {
+            return Ok(self.canonical()?.get(id)?);
+        }
+        self.read_legacy_node(id, |bytes| {
             serde_json::from_slice(bytes).context("decoding the stored root event")
         })
     }
@@ -194,7 +246,12 @@ impl FrameStore {
     /// refuses it, so `parents` can no longer report a packet with two parents
     /// as an origin.
     fn packet(&self, id: &PacketId) -> Result<Packet> {
-        self.read_node(id.as_content_id(), |bytes| {
+        if self.has_canonical(id.as_content_id())? {
+            let raw: RawPacket = self.canonical()?.get(id.as_content_id())?;
+            return Packet::try_from(raw)
+                .context("the stored packet is not admissible under the v0 contract");
+        }
+        self.read_legacy_node(id.as_content_id(), |bytes| {
             let raw: RawPacket =
                 serde_json::from_slice(bytes).context("decoding the stored packet")?;
             // `context`, not `anyhow!("{e}")`: it keeps the typed
@@ -424,8 +481,19 @@ pub fn run(cmd: &FrameCmd) -> Result<i32> {
             source,
             json,
         } => run_verify(cid, frame.clone(), source.as_deref(), *json),
-        FrameCmd::Explain { cid, frame, json } => run_explain(cid, frame.clone(), *json),
-        FrameCmd::Parents { cid, frame, json } => run_parents(cid, frame.clone(), *json),
+        FrameCmd::Explain {
+            cid,
+            frame,
+            json,
+            limits,
+        } => run_explain(cid, frame.clone(), *json, (*limits).into()),
+        FrameCmd::Parents {
+            cid,
+            frame,
+            json,
+            limits,
+        } => run_parents(cid, frame.clone(), *json, (*limits).into()),
+        FrameCmd::Replay { cid, frame, json } => run_replay(cid, frame.clone(), *json),
     }
 }
 
@@ -441,6 +509,29 @@ fn emit<T: Serialize>(report: &T, json: bool, render: impl FnOnce(&T)) -> Result
 fn parse_unit(cid: &str) -> Result<UnitId> {
     cid.parse::<UnitId>()
         .map_err(|e| anyhow::anyhow!("`{cid}` is not a content id: {e}"))
+}
+
+fn run_replay(cid: &str, frame: Option<PathBuf>, json: bool) -> Result<i32> {
+    let store = FrameStore::open(frame)?;
+    let request = cid
+        .parse::<ContentId>()
+        .map_err(|e| anyhow::anyhow!("`{cid}` is not a content id: {e}"))?;
+    let bytes = agent_harness::replay_from_store(&store.canonical()?, request)?;
+    // Resolve and verify everything before stdout receives any bytes.
+    if json {
+        let report = serde_json::json!({
+            "command": "frame.replay",
+            "store": store.dir().display().to_string(),
+            "request": cid,
+            "verified": true,
+            "byte_count": bytes.len(),
+            "body": String::from_utf8(bytes)?,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        std::io::stdout().lock().write_all(&bytes)?;
+    }
+    Ok(0)
 }
 
 fn run_verify(cid: &str, frame: Option<PathBuf>, source: Option<&Path>, json: bool) -> Result<i32> {
@@ -498,8 +589,53 @@ fn run_verify(cid: &str, frame: Option<PathBuf>, source: Option<&Path>, json: bo
     Ok(i32::from(!report.verified))
 }
 
-fn run_explain(cid: &str, frame: Option<PathBuf>, json: bool) -> Result<i32> {
+fn emit_inspection(
+    store: &FrameStore,
+    cid: &str,
+    json: bool,
+    command: &str,
+    limits: agent_harness::forensics::InspectionLimits,
+) -> Result<bool> {
+    let id: ContentId = cid.parse().context("parsing frame content id")?;
+    if !store.has_canonical(&id)? {
+        return Ok(false);
+    }
+    let Some(inspection) =
+        agent_harness::forensics::inspect_from_store(&store.canonical()?, id, limits)?
+    else {
+        return Ok(false);
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "command": command, "store": store.dir().display().to_string(), "inspection": inspection,
+            }))?
+        );
+    } else {
+        println!("{command} — {} {}\n", inspection.kind, inspection.id);
+        println!("{}", serde_json::to_string_pretty(&inspection.record)?);
+        for reference in &inspection.references {
+            println!(
+                "  {}: {} [{}]",
+                reference.relation, reference.cid, reference.profile
+            );
+        }
+        println!("\n{}", inspection.validation);
+    }
+    Ok(true)
+}
+
+fn run_explain(
+    cid: &str,
+    frame: Option<PathBuf>,
+    json: bool,
+    limits: agent_harness::forensics::InspectionLimits,
+) -> Result<i32> {
     let store = FrameStore::open(frame)?;
+    if emit_inspection(&store, cid, json, "frame.explain", limits)? {
+        return Ok(0);
+    }
     let id = parse_unit(cid)?;
     let unit = store.unit(&id)?;
 
@@ -522,21 +658,19 @@ fn run_explain(cid: &str, frame: Option<PathBuf>, json: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// **One link. There is no walker here, and that is deliberate.**
-///
-/// `Unit.wf` says `depth <= 1`: nothing is more than one derivation from source
-/// material. So one-link verification *is* complete verification — there is no
-/// deeper chain to regress into, by construction rather than by policy. Genesis
-/// (a frame with no parents) is the defined bottom. The forensic obligation and
-/// the depth bound are the same constraint seen from two directions, which is
-/// also why refusing `concise` and `generate` in v0 is not merely caution: it
-/// is what keeps regress impossible.
-///
-/// A caller who wants the next link calls this command again on the id it
-/// reported. The recursion lives in the caller, by composition — we ship none
-/// of it, so there is no unbounded walk over data we do not control.
-fn run_parents(cid: &str, frame: Option<PathBuf>, json: bool) -> Result<i32> {
+/// Inspect one link at a time. Causal ancestry can be arbitrarily long even
+/// though generated material has derivation depth at most one. Immediate
+/// inspection does not establish full graph admission or execution authority.
+fn run_parents(
+    cid: &str,
+    frame: Option<PathBuf>,
+    json: bool,
+    limits: agent_harness::forensics::InspectionLimits,
+) -> Result<i32> {
     let store = FrameStore::open(frame)?;
+    if emit_inspection(&store, cid, json, "frame.parents", limits)? {
+        return Ok(0);
+    }
     let pid = cid
         .parse::<PacketId>()
         .map_err(|e| anyhow::anyhow!("`{cid}` is not a content id: {e}"))?;

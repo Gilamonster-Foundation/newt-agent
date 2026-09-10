@@ -13,6 +13,7 @@
 //! supported" error rather than mis-generating.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use newt_core::router::Tier;
@@ -25,8 +26,49 @@ use crate::palette::MiniModel;
 pub struct EmbeddedBackend {
     name: String,
     model: &'static MiniModel,
+    assets: ModelAssets,
+    device: Option<candle_core::Device>,
+}
+
+#[derive(Debug, Clone)]
+struct ModelAssets {
     gguf_path: PathBuf,
     tokenizer_path: PathBuf,
+    pinned: Option<Arc<PinnedAssets>>,
+}
+
+struct PinnedAssets {
+    weights: Vec<u8>,
+    tokenizer: Vec<u8>,
+}
+
+impl std::fmt::Debug for PinnedAssets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedAssets")
+            .field("weights_bytes", &self.weights.len())
+            .field("tokenizer_bytes", &self.tokenizer.len())
+            .finish()
+    }
+}
+
+trait ReadSeek: std::io::Read + std::io::Seek {}
+impl<T: std::io::Read + std::io::Seek> ReadSeek for T {}
+
+impl ModelAssets {
+    fn weights(&self) -> anyhow::Result<Box<dyn ReadSeek + '_>> {
+        match &self.pinned {
+            Some(pinned) => Ok(Box::new(std::io::Cursor::new(&pinned.weights))),
+            None => Ok(Box::new(std::fs::File::open(&self.gguf_path)?)),
+        }
+    }
+
+    fn tokenizer(&self) -> anyhow::Result<tokenizers::Tokenizer> {
+        match &self.pinned {
+            Some(pinned) => tokenizers::Tokenizer::from_bytes(&pinned.tokenizer),
+            None => tokenizers::Tokenizer::from_file(&self.tokenizer_path),
+        }
+        .map_err(|error| anyhow::anyhow!("load tokenizer: {error}"))
+    }
 }
 
 impl EmbeddedBackend {
@@ -76,8 +118,39 @@ impl EmbeddedBackend {
         Ok(Self {
             name: format!("embedded:{}", model.name),
             model,
-            gguf_path,
-            tokenizer_path,
+            assets: ModelAssets {
+                gguf_path,
+                tokenizer_path,
+                pinned: None,
+            },
+            device: None,
+        })
+    }
+
+    /// Build an auxiliary on CPU regardless of ambient accelerator settings.
+    pub fn new_cpu(model_name: &str, gguf_path: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let mut backend = Self::new(model_name, gguf_path)?;
+        backend.device = Some(candle_core::Device::Cpu);
+        backend.assets.pinned = Some(Arc::new(PinnedAssets {
+            weights: std::fs::read(&backend.assets.gguf_path)?,
+            tokenizer: std::fs::read(&backend.assets.tokenizer_path)?,
+        }));
+        Ok(backend)
+    }
+
+    /// Identities of the immutable bytes the CPU constructor retained for inference.
+    #[must_use]
+    pub fn pinned_asset_ids(
+        &self,
+    ) -> Option<(
+        content_addressable::RawContentId,
+        content_addressable::RawContentId,
+    )> {
+        self.assets.pinned.as_ref().map(|assets| {
+            (
+                content_addressable::RawContentId::from_content(&assets.weights),
+                content_addressable::RawContentId::from_content(&assets.tokenizer),
+            )
         })
     }
 
@@ -111,13 +184,14 @@ impl EmbeddedBackend {
     ) -> anyhow::Result<ChatReply> {
         let max_tokens = req.max_tokens.unwrap_or(512) as usize;
         let prompt = engine::format_chatml(&req.messages);
-        let gguf = self.gguf_path.clone();
-        let tok = self.tokenizer_path.clone();
+        let assets = self.assets.clone();
         let arch = self.model.arch;
         let model_id = self.model.name.to_string();
+        let device = self.device.clone();
         // candle is synchronous + CPU/GPU-bound; keep it off the async runtime.
         let content = run_generation(generation_admission(), deadline, move |checkpoint| {
-            engine::generate(&gguf, &tok, arch, &prompt, max_tokens, checkpoint)
+            let device = device.map(Ok).unwrap_or_else(engine::device)?;
+            engine::generate(&assets, arch, &prompt, max_tokens, &device, checkpoint)
         })
         .await?;
         Ok(ChatReply {
@@ -221,7 +295,6 @@ pub(crate) mod engine {
     use candle_core::{Device, Tensor};
     use candle_transformers::generation::LogitsProcessor;
     use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2;
-    use tokenizers::Tokenizer;
 
     use crate::backend::Message;
     use crate::palette::ModelArch;
@@ -297,11 +370,11 @@ pub(crate) mod engine {
 
     /// Load the model, run generation, decode. Qwen2 only for now.
     pub(super) fn generate(
-        gguf_path: &std::path::Path,
-        tokenizer_path: &std::path::Path,
+        assets: &super::ModelAssets,
         arch: ModelArch,
         prompt: &str,
         max_tokens: usize,
+        device: &Device,
         checkpoint: &dyn Fn() -> anyhow::Result<()>,
     ) -> anyhow::Result<String> {
         checkpoint()?;
@@ -311,18 +384,14 @@ pub(crate) mod engine {
                  (use a qwen2.5-* model); {arch:?} support is a follow-up"
             );
         }
-        let device = device()?;
         checkpoint()?;
-        let tokenizer = Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("load tokenizer {}: {e}", tokenizer_path.display()))?;
+        let tokenizer = assets.tokenizer()?;
         checkpoint()?;
-        let mut file = std::fs::File::open(gguf_path)
-            .with_context(|| format!("open {}", gguf_path.display()))?;
-        let content = gguf_file::Content::read(&mut file)
-            .with_context(|| format!("read GGUF {}", gguf_path.display()))?;
+        let mut file = assets.weights()?;
+        let content = gguf_file::Content::read(&mut file).context("read GGUF assets")?;
         checkpoint()?;
-        let mut model = Qwen2::from_gguf(content, &mut file, &device)
-            .context("load Qwen2 weights from GGUF")?;
+        let mut model =
+            Qwen2::from_gguf(content, &mut file, device).context("load Qwen2 weights from GGUF")?;
         checkpoint()?;
         let encoding = tokenizer
             .encode(prompt, true)
@@ -342,7 +411,7 @@ pub(crate) mod engine {
             max_tokens,
             checkpoint,
             |next, pos| {
-                let input = Tensor::new(next, &device)?.unsqueeze(0)?;
+                let input = Tensor::new(next, device)?.unsqueeze(0)?;
                 let logits = model.forward(&input, pos)?.squeeze(0)?;
                 Ok(if logits.rank() == 2 {
                     logits.get(logits.dim(0)? - 1)?
@@ -433,6 +502,50 @@ mod tests {
         assert!(err.to_string().contains("tokenizer not found"));
     }
 
+    /// Grounds the CPU-only auxiliary choice in the actual engine device value;
+    /// no environment mutation or accelerator availability is needed.
+    #[test]
+    fn new_cpu_pins_the_device_passed_to_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let gguf = dir.path().join("model.gguf");
+        std::fs::write(&gguf, b"placeholder").unwrap();
+        std::fs::write(dir.path().join("tokenizer.json"), b"{}").unwrap();
+        let backend = EmbeddedBackend::new_cpu("qwen2.5-0.5b", gguf).unwrap();
+        assert!(matches!(backend.device, Some(candle_core::Device::Cpu)));
+    }
+
+    /// Grounds manifest identity in the exact reader/tokenizer used by the
+    /// generation engine, even when the original filesystem paths change.
+    #[test]
+    fn cpu_assets_remain_bound_to_the_recorded_bytes_after_path_substitution() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let gguf = dir.path().join("model.gguf");
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&gguf, b"original weights").unwrap();
+        tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default())
+            .save(&tokenizer, false)
+            .unwrap();
+        let backend = EmbeddedBackend::new_cpu("qwen2.5-0.5b", &gguf).unwrap();
+        let ids = backend.pinned_asset_ids().unwrap();
+        std::fs::write(&gguf, b"replacement weights").unwrap();
+        std::fs::write(&tokenizer, b"invalid tokenizer").unwrap();
+        let mut bytes = Vec::new();
+        backend
+            .assets
+            .weights()
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"original weights");
+        assert_eq!(
+            ids.0,
+            content_addressable::RawContentId::from_content(&bytes)
+        );
+        assert_eq!(backend.pinned_asset_ids(), Some(ids));
+        assert!(backend.assets.tokenizer().is_ok());
+    }
+
     #[test]
     fn format_chatml_wraps_roles_and_opens_the_assistant_turn() {
         let msgs = vec![Message::system("be brief"), Message::user("summarize this")];
@@ -451,7 +564,7 @@ mod tests {
     async fn smoke_generate_on_cpu() {
         let gguf = std::env::var("NEWT_EMBEDDED_SMOKE_GGUF")
             .expect("set NEWT_EMBEDDED_SMOKE_GGUF to a qwen2.5 GGUF (tokenizer.json beside it)");
-        let be = EmbeddedBackend::new("qwen2.5-0.5b", &gguf).unwrap();
+        let be = EmbeddedBackend::new_cpu("qwen2.5-0.5b", &gguf).unwrap();
         let reply = be
             .complete(
                 ChatRequest::new()

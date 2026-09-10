@@ -28,7 +28,8 @@ use crate::agentic::tools::{execute_tool_inner, tool_presentation};
 ///
 /// `Default` is all-`None`: the bare dispatch a test or embedder starts from.
 #[derive(Default)]
-pub(crate) struct ToolCollaborators<'a> {
+pub(crate) struct ToolCollaborators<'a, 'gate> {
+    pub(crate) smart_harness: Option<&'a agentic::smart_harness::SmartHarness>,
     pub(crate) build_check_cmd: Option<&'a str>,
     /// #1947: the turn's tool ledger, distilled — what `render_report`'s
     /// capability claims are checked against.
@@ -44,7 +45,7 @@ pub(crate) struct ToolCollaborators<'a> {
     pub(crate) prompt_context: Option<PromptReadContext<'a>>,
     pub(crate) artifact_context: Option<ArtifactReadContext<'a>>,
     pub(crate) artifact_sink: Option<&'a dyn agentic::artifact_read::PromptArtifactSink>,
-    pub(crate) permission_gate: Option<&'a mut dyn PermissionGate>,
+    pub(crate) permission_gate: Option<&'gate mut dyn PermissionGate>,
     pub(crate) exec_floor: Option<&'a crate::caveats::Scope<String>>,
     pub(crate) git_tool: Option<&'a dyn GitTool>,
     pub(crate) crew_runner: Option<&'a dyn CrewRunner>,
@@ -275,7 +276,7 @@ pub(crate) async fn execute_tool_with_collaborators(
     tool_output_lines: usize,
     caveats: &crate::caveats::Caveats,
     mcp: &mut dyn McpTools,
-    collab: ToolCollaborators<'_>,
+    collab: ToolCollaborators<'_, '_>,
     tool_offload: bool,
     disposition: PromptDisposition,
     cancel: Option<&std::sync::atomic::AtomicBool>,
@@ -329,7 +330,7 @@ pub(super) async fn execute_tool_with_display_cancellable<W: std::io::Write + Se
     tool_output_lines: usize,
     caveats: &crate::caveats::Caveats,
     mcp: &mut dyn McpTools,
-    collab: ToolCollaborators<'_>,
+    collab: ToolCollaborators<'_, '_>,
     tool_offload: bool,
     disposition: PromptDisposition,
     cancel: Option<&std::sync::atomic::AtomicBool>,

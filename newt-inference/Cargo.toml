@@ -13,6 +13,7 @@ categories = ["api-bindings"]
 
 [dependencies]
 newt-core.workspace = true
+content-addressable.workspace = true
 newt-identity.workspace = true
 plugins-protocol.workspace = true
 anyhow.workspace = true
@@ -65,6 +66,7 @@ pyo3 = [
 ]
 
 [dev-dependencies]
+agent-harness.workspace = true
 tests-common = { path = "../tests/common" }
 wiremock.workspace = true
 tokio-test.workspace = true

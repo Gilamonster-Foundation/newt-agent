@@ -542,3 +542,171 @@ fn the_human_rendering_carries_the_same_facts_as_the_json() {
     }
     assert!(text.contains("OperatorPrompt") && text.contains("seq 7"));
 }
+
+/// Grounds the harness's canonical store in the actual forensic executable.
+#[test]
+fn canonical_harness_units_and_packets_use_the_existing_reports() {
+    let fixture = common::newt();
+    let dir = fixture.home().join("frame");
+    let mut store = agent_harness::store::FrameStore::open(&dir).unwrap();
+    store.put_source(SRC).unwrap();
+    store.put_source(b"summarise the log").unwrap();
+    let root = RootEvent::new(RootKind::OperatorPrompt, b"summarise the log", 7);
+    let root_id = store.put(&root).unwrap();
+    let unit = Unit::seal(Op::Elide, SRC, Span::new(4, 19), root_id).unwrap();
+    let uid = store.put(&unit).unwrap();
+    let packet = agent_frame::Packet::genesis(vec![uid.into()]);
+    let pid = store.put(&packet).unwrap();
+    for command in ["verify", "explain"] {
+        let mut process = common::newt();
+        let output = process
+            .args(["frame", command, &uid.to_string(), "--json", "--frame"])
+            .arg(&dir)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let report = json_of(&output);
+        assert_eq!(
+            report["source"],
+            content_addressable::RawContentId::from_content(SRC).to_string()
+        );
+        assert_eq!(report["root_kind"], "OperatorPrompt");
+        assert_eq!(report["depth"], 0);
+    }
+    let mut process = common::newt();
+    let output = process
+        .args(["frame", "parents", &pid.to_string(), "--json", "--frame"])
+        .arg(&dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(json_of(&output)["units"][0], uid.to_string());
+
+    // A legacy JSON twin cannot hide corruption of the authoritative format.
+    std::fs::write(
+        dir.join(format!("{uid}.json")),
+        serde_json::to_vec(&unit).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.join(format!("{uid}.cbor")), b"substituted").unwrap();
+    let mut process = common::newt();
+    process
+        .args(["frame", "verify", &uid.to_string(), "--frame"])
+        .arg(&dir)
+        .assert()
+        .failure();
+}
+
+/// Grounds byte-perfect replay in a cold process, then changes an addressed
+/// source on disk and checks the verifier refuses before emitting any request.
+#[test]
+fn replay_reconstructs_recorded_bytes_and_refuses_substitution() {
+    let fixture = common::newt();
+    let dir = fixture.home().join("frame");
+    let mut session = agent_harness::Session::open(&dir, Default::default()).unwrap();
+    let request = session
+        .record_request(
+            serde_json::json!({
+                "model":"fixture-model", "messages":[
+                    {"role":"system","content":"rules"}, {"role":"user","content":"task"}
+                ], "tools":[], "temperature":0.2
+            }),
+            "openai",
+        )
+        .unwrap();
+    drop(session);
+    let mut process = common::newt();
+    let output = process
+        .args(["frame", "replay", &request.id.to_string(), "--frame"])
+        .arg(&dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(output, request.bytes);
+    let mut process = common::newt();
+    let output = process
+        .args([
+            "frame",
+            "replay",
+            &request.id.to_string(),
+            "--json",
+            "--frame",
+        ])
+        .arg(&dir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let receipt = json_of(&output);
+    assert_eq!(receipt["verified"], true);
+    assert_eq!(receipt["byte_count"], request.bytes.len());
+    assert_eq!(receipt["body"].as_str().unwrap().as_bytes(), request.bytes);
+    let source = content_addressable::RawContentId::from_content(&request.bytes);
+    std::fs::write(dir.join(source.to_string()), b"substituted").unwrap();
+    let mut process = common::newt();
+    let assertion = process
+        .args(["frame", "replay", &request.id.to_string(), "--frame"])
+        .arg(&dir)
+        .assert()
+        .failure();
+    assert!(assertion.get_output().stdout.is_empty());
+}
+
+/// Grounds bounded session/event inspection in the actual CLI after restart.
+#[test]
+fn a_session_head_explains_its_verdict_and_exposes_immediate_links() {
+    let fixture = common::newt();
+    let dir = fixture.home().join("frame");
+    let mut session = agent_harness::Session::open(&dir, Default::default()).unwrap();
+    let request = session
+        .record_request(
+            serde_json::json!({"messages":[{"role":"user","content":"task"}]}),
+            "openai",
+        )
+        .unwrap();
+    let reply = session.record_reply(request.id, b"Which path?").unwrap();
+    session
+        .record_verdict(reply, agent_harness::Verdict::Question)
+        .unwrap();
+    let head = session.head().to_string();
+    drop(session);
+    for command in ["explain", "parents"] {
+        let mut process = common::newt();
+        let output = process
+            .args(["frame", command, &head, "--json", "--frame"])
+            .arg(&dir)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let report = json_of(&output);
+        assert_eq!(report["inspection"]["kind"], "journal");
+        assert_eq!(
+            report["inspection"]["record"]["verdict"]["reply"],
+            reply.to_string()
+        );
+        assert_eq!(report["inspection"]["graph_admitted"], false);
+    }
+    let mut process = common::newt();
+    process
+        .args(["frame", "explain", &head, "--max-bytes", "1", "--frame"])
+        .arg(&dir)
+        .assert()
+        .failure();
+    std::fs::remove_file(dir.join(format!("{reply}.cbor"))).unwrap();
+    let mut process = common::newt();
+    let assertion = process
+        .args(["frame", "parents", &head, "--frame"])
+        .arg(&dir)
+        .assert()
+        .failure();
+    assert!(assertion.get_output().stdout.is_empty());
+}

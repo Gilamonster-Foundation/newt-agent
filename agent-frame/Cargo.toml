@@ -18,6 +18,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Derivation kernel: what a derived thing may assert, what it owes its source, and how far it may travel from that source before it stops being accountable."
+readme = "README.md"
 publish = false
 
 [dependencies]

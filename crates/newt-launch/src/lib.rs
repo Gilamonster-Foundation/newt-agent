@@ -31,19 +31,18 @@
 //!
 //! # Continuity is a mode, not a spectrum
 //!
-//! Reproducibility and resumability trade against each other, so the mode is
-//! chosen at launch and stated:
+//! The host chooses whether prior session state is admitted at launch:
 //!
 //! | mode | what a run can inherit | a cap exit means |
 //! |---|---|---|
-//! | [`Continuity::Hermetic`] | nothing — every frame is genesis | failure, always |
+//! | [`Continuity::Hermetic`] | no inherited session; explicitly admitted inputs | failure, always |
 //! | [`Continuity::Resume`] | a parent frame, named by CID | paused, if a handoff was persisted |
 //!
-//! Hermeticity is not a separate mechanism. It is *"always start from genesis"*,
-//! and reproducibility follows from having no inherited state rather than from
-//! actively suppressing it. That is why [`Continuity::Hermetic`] cannot carry a
-//! `resume_from`: the illegal state is unrepresentable in the type, and
-//! [`LaunchConfig::validate`] exists for the combinations a type cannot express.
+//! Hermetic runs start without inherited session state and require the host to
+//! restrict ambient input sources. Records within the run still have causal
+//! parents. This does not guarantee deterministic inference or external tools.
+//! [`Continuity::Hermetic`] cannot carry a `resume_from`; [`LaunchConfig::validate`]
+//! checks the combinations a type cannot express.
 
 #![forbid(unsafe_code)]
 
@@ -55,8 +54,8 @@ use std::fmt;
 /// one or the other, so no code can hold "both" or "neither".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Continuity {
-    /// Inherit nothing. Every frame is a genesis frame with no parent, which is
-    /// what makes a run bit-for-bit reproducible.
+    /// Start without inherited session state and restrict inputs to sources
+    /// admitted by the host. Records within this invocation may have parents.
     ///
     /// The lane benchmarks run in. A run that exhausts its budget here has no
     /// continuation available *by construction*, so a cap exit is a failure
@@ -83,11 +82,9 @@ impl Continuity {
 
     /// The parent frame's content id, when continuing from one.
     ///
-    /// `None` under [`Self::Hermetic`], and also `None` for a genesis frame that
-    /// merely *starts* a resumable chain. **Absence of a parent is the
-    /// difference between a resumable frame and a replay from scratch** — so a
-    /// consumer wanting "can this be resumed?" should ask
-    /// [`Self::is_resumable`], not whether this returned `Some`.
+    /// `None` under [`Self::Hermetic`], and also `None` when starting a resumable
+    /// chain. Parent presence identifies an actual resume, not whether the run
+    /// permits later continuation. Use [`Self::is_resumable`] for that policy.
     #[must_use]
     pub fn parent_frame(&self) -> Option<&str> {
         match self {
@@ -109,9 +106,8 @@ impl Continuity {
 impl Default for Continuity {
     /// Hermetic.
     ///
-    /// The reproducible mode is the safe default: a run that inherits nothing
-    /// cannot silently carry state a caller did not ask for. Resumption is opted
-    /// into, never fallen into.
+    /// Existing callers start without inherited session state. Smart-harness
+    /// frontends may explicitly select a fresh resumable invocation instead.
     fn default() -> Self {
         Self::Hermetic
     }
@@ -235,7 +231,7 @@ impl LaunchConfig {
     pub fn describe(&self) -> String {
         match &self.continuity {
             Continuity::Hermetic => {
-                "hermetic: inherits nothing, every frame is genesis, a cap exit is a failure"
+                "hermetic: no inherited session, admitted inputs only, a cap exit is a failure"
                     .to_string()
             }
             Continuity::Resume { from: None } => {

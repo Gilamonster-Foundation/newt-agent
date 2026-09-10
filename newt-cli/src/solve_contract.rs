@@ -59,6 +59,8 @@ pub struct ContractInputs<'a> {
     pub wall_ms: u64,
     /// Generated (output) tokens, when the backend reported usage.
     pub gen_tokens: Option<u64>,
+    /// Accounted session, chosen auxiliary, and independent budgets when enabled.
+    pub smart_harness: Option<&'a serde_json::Value>,
 }
 
 /// How a turn ended, decided ONCE (#2212, corrected by #2218).
@@ -108,24 +110,11 @@ pub fn terminal(
             reason @ (TurnEndReason::RoundCap
             | TurnEndReason::Empty
             | TurnEndReason::Cancelled
-            // #2239: the rescue budget ran out and the loop accepted the
-            // narration as the answer. The reported transcript's whole reply
-            // was the rescue nudge's own "I'm finished" sentence, and it was
-            // recorded here as an ordinary success — indistinguishable from an
-            // answered question in `outcome`, in `status`, and to every
-            // consumer downstream. That is the #2212 falsehood in a second
-            // place: the loop stopped before finishing, so it stopped short.
-            | TurnEndReason::NarrationCapExhausted),
+            | TurnEndReason::AwaitingOperator
+            | TurnEndReason::NarrationCapExhausted
+            | TurnEndReason::NarrationFinalRound),
         ) => Terminal::StoppedShort(reason),
-        // `NarrationFinalRound` is deliberately NOT moved with it. It is a
-        // different exit — the round limit arrived while the model happened to
-        // be narrating — and no report stands behind reclassifying it. It is
-        // the same class and probably belongs beside `RoundCap`; that is a
-        // separate decision with its own bench-row consequences, not a
-        // wildcard to sweep along with this one.
-        Some(TurnEndReason::Completed | TurnEndReason::NarrationFinalRound) | None => {
-            Terminal::Completed
-        }
+        Some(TurnEndReason::Completed) | None => Terminal::Completed,
         // `Failed` implies an error, so `clean` is false and this is
         // unreachable. Classified anyway rather than left to a wildcard.
         Some(TurnEndReason::Failed) => Terminal::Failed(Some(ErrorClass::Harness)),
@@ -162,38 +151,19 @@ pub fn outcome_label(t: Terminal) -> &'static str {
         // run did not finish either, so it files the same way rather than
         // falling through to a wildcard.
         Terminal::StoppedShort(TurnEndReason::RoundCap | TurnEndReason::Cancelled) => "timeout",
-        // The model WAS reached and emitted unusable content, which is
-        // `CONTRACT.md`'s `model_error` verbatim: "reached but errored
-        // (refused, emitted invalid output)". `is_real_attempt()` includes it,
-        // correctly — the model ran. This is a change from pre-#2215 behaviour
-        // beyond the cap-exit case, made deliberately: `completed` for a
-        // placeholder reply is the same falsehood #2212 identified.
-        Terminal::StoppedShort(TurnEndReason::Empty) => "model_error",
-        // #2239. `model_error`, NOT `timeout`, and the distinction is the
-        // whole point of moving it.
-        //
-        // `CONTRACT.md`'s `model_error` is "reached but errored (refused,
-        // emitted invalid output)" — exactly this turn: the model ran for
-        // several rounds, was handed the rescue, and returned prose where an
-        // answer was required. That is unusable content from a model that WAS
-        // meaningfully exercised, which is the `Empty` argument above applied
-        // to a non-empty placeholder.
-        //
-        // It is not `timeout`, and the code says so: `NarrationCapExhausted`
-        // REQUIRES `round + 1 < current_tool_round_limit` at all three accept
-        // sites in `newt-core/src/agentic/mod.rs` — there were rounds left. No
-        // budget wall was hit; the harness ran out of patience with the model's
-        // narration, which is a model-behavior failure, not a resource one.
-        // Filing it `timeout` would also drop the row from the matrix
-        // (`is_real_attempt()` is `Completed | ModelError`) and quietly improve
-        // the average — the exact harm `bench_outcome_values_v1.txt` warns
-        // about. `model_error` keeps the row and scores it as the failure it is.
-        Terminal::StoppedShort(TurnEndReason::NarrationCapExhausted) => "model_error",
+        // The model was exercised but did not deliver an answer. A question is
+        // a valid interactive pause, yet a headless solve still needs an answer.
+        // Both narration exits remain scored attempts, including final-round
+        // narration: reclassifying it must not silently remove a bench row.
+        Terminal::StoppedShort(
+            TurnEndReason::Empty
+            | TurnEndReason::AwaitingOperator
+            | TurnEndReason::NarrationCapExhausted
+            | TurnEndReason::NarrationFinalRound,
+        ) => "model_error",
         // The remaining variants cannot construct `StoppedShort`; listed so a
         // new one fails to compile rather than inheriting a bucket.
-        Terminal::StoppedShort(
-            TurnEndReason::Completed | TurnEndReason::NarrationFinalRound | TurnEndReason::Failed,
-        ) => "harness_error",
+        Terminal::StoppedShort(TurnEndReason::Completed | TurnEndReason::Failed) => "harness_error",
         Terminal::Failed(Some(ErrorClass::Model)) => "model_error",
         Terminal::Failed(Some(ErrorClass::Transport)) => "transport_error",
         Terminal::Failed(Some(ErrorClass::Timeout)) => "timeout",
@@ -210,6 +180,7 @@ pub fn outcome_label(t: Terminal) -> &'static str {
 pub fn status_label(t: Terminal) -> &'static str {
     match t {
         Terminal::Completed => "completed",
+        Terminal::StoppedShort(TurnEndReason::AwaitingOperator) => "awaiting_operator",
         Terminal::StoppedShort(_) => "incomplete",
         Terminal::Failed(_) => "failed",
     }
@@ -273,6 +244,9 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
     });
     if let Some(cw) = i.context_window {
         effective_config["context_window"] = cw.into();
+    }
+    if let Some(harness) = i.smart_harness {
+        effective_config["smart_harness"] = harness.clone();
     }
     let mut record = serde_json::json!({
         "contract_version": CONTRACT_VERSION,
@@ -338,6 +312,7 @@ mod tests {
         TurnEndReason::Empty,
         TurnEndReason::Cancelled,
         TurnEndReason::Failed,
+        TurnEndReason::AwaitingOperator,
     ];
 
     fn tool_event(tool: &str, ok: bool) -> newt_core::ToolEvent {
@@ -395,6 +370,7 @@ mod tests {
             TurnEndReason::Empty => 4,
             TurnEndReason::Cancelled => 5,
             TurnEndReason::Failed => 6,
+            TurnEndReason::AwaitingOperator => 7,
         }
     }
 
@@ -525,18 +501,32 @@ mod tests {
              attempt that failed, not a budget wall and not a clean completion"
         );
 
-        // The over-correction guard, in both directions. A genuine completion
-        // is untouched, and `NarrationFinalRound` — deliberately left behind,
-        // see `terminal` — must not have been swept along.
+        // A genuine answer remains deliverable after a nudge.
         assert_eq!(
             terminal(true, None, Some(TurnEndReason::Completed)),
             Terminal::Completed
         );
-        assert_eq!(
-            terminal(true, None, Some(TurnEndReason::NarrationFinalRound)),
-            Terminal::Completed
-        );
         assert_eq!(outcome_label(Terminal::Completed), "completed");
+    }
+
+    #[test]
+    fn final_round_narration_is_incomplete_and_keeps_its_bench_row() {
+        let t = terminal(true, None, Some(TurnEndReason::NarrationFinalRound));
+        assert_eq!(
+            t,
+            Terminal::StoppedShort(TurnEndReason::NarrationFinalRound)
+        );
+        assert_eq!(status_label(t), "incomplete");
+        assert_eq!(outcome_label(t), "model_error");
+    }
+
+    #[test]
+    fn a_question_awaits_the_operator_instead_of_completing_the_task() {
+        let t = terminal(true, None, Some(TurnEndReason::AwaitingOperator));
+        assert_eq!(t, Terminal::StoppedShort(TurnEndReason::AwaitingOperator));
+        assert_eq!(status_label(t), "awaiting_operator");
+        assert_eq!(outcome_label(t), "model_error");
+        assert!(permitted_outcomes().contains(&outcome_label(t)));
     }
 
     /// The permitted set is a copy of a specific upstream shape, so it is
@@ -577,6 +567,7 @@ mod tests {
             max_rounds: 40,
             wall_ms: 10_000,
             gen_tokens: Some(500),
+            smart_harness: None,
         }
     }
 
@@ -774,6 +765,17 @@ mod tests {
             parsed["timing"],
             serde_json::json!({"wall_ms": 10_000, "gen_tokens": 500, "tok_s": 50.0})
         );
+    }
+
+    #[test]
+    fn smart_harness_configuration_is_declared_without_changing_the_outcome_vocabulary() {
+        let manifest = serde_json::json!({"head":"retained-head", "invocation_mode":"fresh", "configuration":{"auxiliary":{"placement":"cpu","max_calls":4}}});
+        let mut inputs = inputs();
+        inputs.smart_harness = Some(&manifest);
+        let record = contract_record(&inputs);
+        assert_eq!(record["effective_config"]["smart_harness"], manifest);
+        assert_eq!(record["contract_version"], "1");
+        assert!(permitted_outcomes().contains(&record["outcome"].as_str().unwrap()));
     }
 
     /// `model_digest` appears ONLY when operator-supplied — never fabricated.

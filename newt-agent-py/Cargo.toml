@@ -15,6 +15,7 @@ name = "_newt_agent"
 crate-type = ["cdylib"]
 
 [dependencies]
+agent-harness-py.workspace = true
 newt-core = { workspace = true, features = ["pyo3"] }
 newt-data = { workspace = true, features = ["pyo3"] }
 newt-inference = { workspace = true, features = ["pyo3"] }

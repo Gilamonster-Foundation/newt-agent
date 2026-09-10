@@ -24,6 +24,7 @@ keywords = ["newt", "agent", "router", "llm", "nemo"]
 categories = ["api-bindings", "text-processing"]
 
 [dependencies]
+agent-harness.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 # OCAP disclosure filter (ocap.rs): catch a known secret value in its common

@@ -653,9 +653,9 @@ fn object_bound_delete(
 /// the other arms, `find` contains to the workspace *independent of the fs_read
 /// scope* (even under `Scope::All`) — a recursive read is dangerous, so the
 /// search root must stay in-tree. On Linux this is an object-bound
-/// `openat2(RESOLVE_BENEATH)` resolve of the root beneath the workspace fd
-/// (TOCTOU-free — replaces the old canonicalize-then-`starts_with`); `find` never
-/// follows symlinks during descent, so a contained root bounds the whole walk.
+/// `openat2(RESOLVE_BENEATH)` check of the root beneath the workspace fd.
+/// The subsequent legacy walker reopens the path after this descriptor is
+/// discarded, so smart mode refuses this adapter and uses the confined shell.
 #[cfg(target_os = "linux")]
 fn find_root_contained(
     _scope: &crate::caveats::Scope<String>,
@@ -2299,7 +2299,73 @@ async fn execute_tool_inner(
     tool_output_lines: usize,
     caveats: &crate::caveats::Caveats,
     mcp: &mut dyn McpTools,
-    collab: ToolCollaborators<'_>,
+    mut collab: ToolCollaborators<'_, '_>,
+    tool_offload: bool,
+    disposition: PromptDisposition,
+) -> String {
+    let Some(harness) = collab.smart_harness else {
+        return execute_authorized_tool(
+            presentation,
+            name,
+            args,
+            workspace,
+            color,
+            tool_output_lines,
+            caveats,
+            mcp,
+            collab,
+            tool_offload,
+            disposition,
+        )
+        .await;
+    };
+    if let Err(error) = harness.validate_tool_authority(caveats, std::path::Path::new(workspace)) {
+        return format!("Error: frame isolation: {error}");
+    }
+    let mut gate =
+        collab
+            .permission_gate
+            .take()
+            .map(|inner| super::smart_harness::FramePermissionGate {
+                harness,
+                workspace: std::path::Path::new(workspace),
+                inner,
+                refusal: None,
+            });
+    let result = execute_authorized_tool(
+        presentation,
+        name,
+        args,
+        workspace,
+        color,
+        tool_output_lines,
+        caveats,
+        mcp,
+        ToolCollaborators {
+            permission_gate: gate.as_mut().map(|gate| gate as &mut dyn PermissionGate),
+            ..collab
+        },
+        tool_offload,
+        disposition,
+    )
+    .await;
+    match gate.and_then(|gate| gate.refusal) {
+        Some(error) => format!("Error: frame isolation: permission denied: {error}"),
+        None => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_authorized_tool(
+    presentation: &mut dyn ToolPresentation,
+    name: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+    color: bool,
+    tool_output_lines: usize,
+    caveats: &crate::caveats::Caveats,
+    mcp: &mut dyn McpTools,
+    collab: ToolCollaborators<'_, '_>,
     tool_offload: bool,
     // The prompt's validated disposition. This is deliberately a required
     // dispatcher input: catalog filtering is cosmetic, whereas this check is
@@ -2309,6 +2375,7 @@ async fn execute_tool_inner(
 ) -> String {
     // One unpack; the dispatch body below binds the same names it always has.
     let ToolCollaborators {
+        smart_harness,
         build_check_cmd,
         tool_evidence,
         note_sink,
@@ -2352,22 +2419,25 @@ async fn execute_tool_inner(
     // without advertising or granting shell execution. Do not discard cwd or
     // unknown argument semantics during this rewrite.
     let (raw_name, raw_args) = (name, args);
-    let routed_read =
-        if disposition != PromptDisposition::Act && name == "run_command" && !routing_disabled() {
-            match super::routing::RouteTable::builtin().classify_call(args) {
-                super::routing::RouteDecision::Route { tool: "git", args }
-                    if args
-                        .get("op")
-                        .and_then(|op| op.as_str())
-                        .is_some_and(super::git_tool::is_scoped_read_op) =>
-                {
-                    Some(args)
-                }
-                _ => None,
+    let routed_read = if smart_harness.is_none()
+        && disposition != PromptDisposition::Act
+        && name == "run_command"
+        && !routing_disabled()
+    {
+        match super::routing::RouteTable::builtin().classify_call(args) {
+            super::routing::RouteDecision::Route { tool: "git", args }
+                if args
+                    .get("op")
+                    .and_then(|op| op.as_str())
+                    .is_some_and(super::git_tool::is_scoped_read_op) =>
+            {
+                Some(args)
             }
-        } else {
-            None
-        };
+            _ => None,
+        }
+    } else {
+        None
+    };
     let (name, args) = routed_read
         .as_ref()
         .map_or((name, args), |args| ("git", args));
@@ -2532,6 +2602,13 @@ async fn execute_tool_inner(
         if name == "run_command" && !routing_disabled() {
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
             let decision = super::routing::RouteTable::builtin().classify_call(args);
+            let decision = match decision {
+                super::routing::RouteDecision::Route {
+                    tool: "git" | "find",
+                    ..
+                } if smart_harness.is_some() => super::routing::RouteDecision::Exec,
+                decision => decision,
+            };
             // §4.4: log every silent rewrite (the original command + the
             // governed built-in it routed to). `None` ⇒ nothing was rewritten.
             if let Some(line) = super::routing::audit_line(command, &decision) {
@@ -2599,6 +2676,10 @@ async fn execute_tool_inner(
         // verbatim body of one ADDRESSED item (`note:<id>` / `turn:<conv>#<seq>`)
         // via the caller's MemorySource — workspace-fenced by the underlying
         // NoteStore / ConversationStore. Same presence-gating as `recall`.
+        "re_read" => match smart_harness {
+            Some(harness) => harness.read(args).unwrap_or_else(|error| format!("Error: re_read refused: {error}")),
+            None => "Error: re_read is unavailable outside a smart harness session".to_string(),
+        },
         "memory_fetch" => match memory_source {
             Some(source) => execute_memory_fetch(args, source, color, tool_output_lines),
             // Without a source the tool was never advertised — same
@@ -2887,6 +2968,8 @@ async fn execute_tool_inner(
         // route through the injected CrewRunner, which runs spawned crews under
         // `meet`-attenuated caveats. Same presence-gating as `git` (the `/team`
         // toggle) — without an injected impl the tools were never advertised.
+        "crew" if smart_harness.is_some() =>
+            "Error: frame isolation: crew execution is unavailable until its file operations enforce the session filesystem boundary; use the confined local tools".into(),
         "compose_roster" | "crew" => match crew_runner {
             Some(runner) => {
                 let out = match runner.dispatch(name, args, caveats).await {
@@ -2929,7 +3012,9 @@ async fn execute_tool_inner(
             // #898: git NETWORK ops (push/fetch/pull/clone) are NOT bounced — the
             // embedded git tool can't do them, so they fall through to the shell
             // (net-gated), letting the model push a branch and open a PR.
-            if let Some(tool) = run_command_redirect(cmd) {
+            if let Some(tool) = run_command_redirect(cmd)
+                .filter(|tool| smart_harness.is_none() || !matches!(*tool, "git" | "find"))
+            {
                 return format!(
                     "error: '{tool}' is a tool, not a shell command. \
                      Call it as a separate tool invocation — \
@@ -3624,6 +3709,8 @@ async fn execute_tool_inner(
         // agent that needed `find` but the build's shell tool was unavailable;
         // this arm walks the workspace with the `ignore` crate (no subprocess),
         // gated by the same fs_read caveat as list_dir/read_file.
+        "find" if smart_harness.is_some() =>
+            "Error: frame isolation: native find is unavailable until its recursive walker retains the directory capability; use run_command for confined shell search".to_string(),
         "find" => {
             let path = args["path"].as_str().unwrap_or(".");
             let full = std::path::Path::new(workspace).join(path);
@@ -3657,8 +3744,8 @@ async fn execute_tool_inner(
             // step-52.6: object-bound root containment for a *recursive* read —
             // resolve the search root beneath the granted fs_read root
             // (openat2 RESOLVE_BENEATH on Linux; canonicalize fallback elsewhere),
-            // TOCTOU-free. `find` never follows symlinks during descent, so a
-            // contained root bounds the whole walk.
+            // The legacy walk below reopens this path, so smart sessions must
+            // use the confined shell instead of relying on this separate check.
             if !find_root_contained(&caveats.fs_read, workspace, &full, &full_str) {
                 return denied_fs_result("fs_read", path);
             }
@@ -3844,3 +3931,7 @@ mod exit_code_ok_tests;
 #[cfg(test)]
 #[path = "tools_tests/disable_ocap_tests.rs"]
 mod disable_ocap_tests;
+
+#[cfg(test)]
+#[path = "tools_tests/smart_frame_isolation.rs"]
+mod smart_frame_isolation_tests;

@@ -32,7 +32,7 @@ const MIN_HANDLE_LEN: usize = 40;
 
 /// Which session store a content handle must resolve in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MarkerKind {
+pub(super) enum MarkerKind {
     Spill,
     Compaction,
 }
@@ -453,7 +453,7 @@ fn scan_value_for_markers(v: &Value, out: &mut Vec<(MarkerKind, String)>) {
 /// Extract content-handle candidates: a `spill:`/`compaction:` prefix immediately
 /// followed by an alphanumeric run of at least [`MIN_HANDLE_LEN`] chars (the length
 /// floor keeps ordinary prose that merely contains the prefix from being a marker).
-fn extract_markers(s: &str, out: &mut Vec<(MarkerKind, String)>) {
+pub(super) fn extract_markers(s: &str, out: &mut Vec<(MarkerKind, String)>) {
     for (kind, prefix) in [
         (MarkerKind::Spill, "spill:"),
         (MarkerKind::Compaction, "compaction:"),

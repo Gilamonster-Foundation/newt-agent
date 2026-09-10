@@ -131,6 +131,7 @@ mod observation;
 mod operating_mode;
 mod permissions;
 mod plan_mode;
+pub mod smart_harness;
 // PR5: deterministic prompt-comprehension intake owns the turn disposition,
 // bounded clarification manifest, and content-free model projection.
 mod prompt_intake;
@@ -300,7 +301,7 @@ pub use warmup::warmup_if_cold;
 
 use crate::retry::{with_backoff_notify_error, RetryPolicy};
 use compress::{
-    compress, compression_trigger, CompressAction, CompressRequest, CompressTrigger,
+    compression_trigger, CompressAction, CompressRequest, CompressTrigger,
     CompressionTriggerLimits, RefusalReason,
 };
 use crossterm::{
@@ -396,6 +397,7 @@ mod first_request_budget_after_switch_tests;
 /// point (reuse discipline): a fix or a guard added here can never be missed at
 /// one call site.
 enum ResponsesCompaction {
+    HarnessFailure(String),
     /// Compression fired and the rebuilt (fenced) request fits the budget — the
     /// caller's `input` was rewritten to the compacted form.
     Compacted,
@@ -449,6 +451,7 @@ fn refusal_bail_message(reason: Option<RefusalReason>, current: usize, model: &s
 /// this reason IS the single diagnostic.
 #[derive(Debug, Clone)]
 enum CompactionRejection {
+    HarnessFailure(String),
     /// `input` could not be classified into typed provenance (a forbidden `system`
     /// item) — BHV-PROVENANCE-002.
     BridgeClassification,
@@ -468,6 +471,7 @@ enum CompactionRejection {
 impl std::fmt::Display for CompactionRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::HarnessFailure(error) => write!(f, "smart harness projection: {error}"),
             Self::BridgeClassification => write!(
                 f,
                 "proactive compaction could not classify the request (a forbidden system item)"
@@ -503,6 +507,7 @@ impl ResponsesCompaction {
     /// made no reduction) → `NoProgress`.
     fn rejection(self) -> Option<CompactionRejection> {
         match self {
+            Self::HarnessFailure(error) => Some(CompactionRejection::HarnessFailure(error)),
             Self::Compacted => None,
             Self::NotFired => Some(CompactionRejection::NoProgress),
             Self::Refused => Some(CompactionRejection::CompressorRefused),
@@ -558,7 +563,40 @@ async fn compact_responses_input(
     summarizer: Option<&SummarizeFn>,
     compress_state: &mut CompressState,
     color: bool,
+    smart_harness: Option<&smart_harness::SmartHarness>,
 ) -> ResponsesCompaction {
+    if let Some(harness) = smart_harness {
+        // Preserve native call IDs and reasoning items through host selection.
+        // The legacy summarizer bridge intentionally flattens them to prose.
+        let projected = match harness
+            .project(input, estimation.chars_for_tokens(compaction_budget))
+            .await
+        {
+            Ok(messages) => messages,
+            Err(error) => return ResponsesCompaction::HarnessFailure(error.to_string()),
+        };
+        let required = estimate_responses_request_real_tokens(
+            instructions,
+            &projected,
+            tools,
+            estimation,
+            cal,
+        );
+        if let Some(budget) = actionable_budget.filter(|budget| required > *budget) {
+            return ResponsesCompaction::OverBudgetAfterFence(
+                responses_compaction::PostBridgeBudgetExceeded {
+                    actionable_budget: budget,
+                    post_bridge_estimate: required,
+                    framing_overhead: 0,
+                },
+            );
+        }
+        if projected == *input {
+            return ResponsesCompaction::NotFired;
+        }
+        *input = projected;
+        return ResponsesCompaction::Compacted;
+    }
     // Classify the Responses `input` into TYPED provenance (fail-closed) and render
     // it to chat with `instructions` as a protected system head. A forbidden
     // `system` item in `input` fails closed here (BHV-PROVENANCE-002).
@@ -581,7 +619,7 @@ async fn compact_responses_input(
     // invents no retrieval handle (correction 1).
     let mut candidate_state = compress_state.clone();
     let stage_buffer: CompactionStageBuffer = std::sync::Mutex::new(Vec::new());
-    let outcome = compress(
+    let outcome = match smart_harness::compress(
         CompressRequest {
             messages: &chat,
             // Real-token cap minus real-token schema overhead → pipeline chars/4
@@ -601,8 +639,13 @@ async fn compact_responses_input(
         },
         summarizer,
         &mut candidate_state,
+        smart_harness,
     )
-    .await;
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => return ResponsesCompaction::HarnessFailure(error.to_string()),
+    };
     // The notice is NOT emitted yet — only a committed compaction surfaces one.
     if outcome.action == CompressAction::Refused {
         // Carry the CAUSE across, not just the fact: `CompressorRefused` names a
@@ -846,6 +889,8 @@ impl Drop for CompletedSpillDismissGuard<'_> {
 /// resolves config + capability cache + caveats per turn and threads them in
 /// here, so the loop itself never re-reads config from disk).
 pub struct ChatCtx<'a> {
+    /// Optional accounted projection and auxiliary completion adjudication.
+    pub smart_harness: Option<&'a smart_harness::SmartHarness>,
     pub url: &'a str,
     pub model: &'a str,
     /// Wire protocol of the active backend (Ollama vs OpenAI-compatible).
@@ -1089,8 +1134,8 @@ pub struct ChatCtx<'a> {
     /// Out-param: why the loop ended the turn ([`crate::TurnEndReason`]) —
     /// narration-acceptance forensics, round cap, empty reply. Lent fresh per
     /// turn like `tool_events`; the TUI folds it into `TurnMetrics` (footer +
-    /// usage.jsonl). `None` (eval / headless) ⇒ nothing reported. The
-    /// Responses-API loop does not report it.
+    /// usage.jsonl). `None` (eval / headless) ⇒ nothing reported. All smart
+    /// providers report terminal control outcomes, including Responses.
     pub end_reason: Option<&'a mut Option<crate::TurnEndReason>>,
     /// Out-param: per-turn observability for the solve contract (W0 #1511) —
     /// the backend-reported served `model` plus per-round tool-call parse
@@ -1251,17 +1296,20 @@ fn append_clean_build_warning(
     messages: &mut Vec<serde_json::Value>,
     clean_build: &mut crate::loop_watch::CleanBuildWatch,
     args: &serde_json::Value,
-) {
+    harness: Option<&smart_harness::SmartHarness>,
+) -> anyhow::Result<()> {
     if let Some(warning) = clean_build.observe(
         args.get("command")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default(),
     ) {
-        messages.push(serde_json::json!({
-            "role": "user",
-            "content": format!("{} {warning}", compress::LOOP_GUIDANCE_PREFIX),
-        }));
+        let text = format!("{} {warning}", compress::LOOP_GUIDANCE_PREFIX);
+        if let Some(harness) = harness {
+            harness.host_message(&text)?;
+        }
+        messages.push(serde_json::json!({"role":"user", "content":text}));
     }
+    Ok(())
 }
 
 /// Record a completed call only when the event sink is present. Keep elapsed
@@ -1784,6 +1832,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // by the destructure (the destructures ignore it via `markdown: _`).
     let markdown = ctx.markdown;
     let ChatCtx {
+        smart_harness,
         url,
         model,
         kind: _,
@@ -1870,6 +1919,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // Explain / Research / Ask turns may still use bounded read-only tools, but
     // must never inherit the harness's execution-pressure repairs.
     let action_nudges = action_nudges && prompt_disposition == PromptDisposition::Act;
+    if let Some(harness) = smart_harness {
+        harness.start_turn()?;
+    }
+    // Smart mode retains full tool output before the existing shell cap runs.
+    let spill_store = smart_harness.map(|h| h.spill_store()).or(spill_store);
+    let tool_offload = tool_offload || smart_harness.is_some();
+    let smart_verify = action_nudges && prompt_disposition == PromptDisposition::Act;
+    let action_nudges = action_nudges && smart_harness.is_none();
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     // Headless callers may pass no session state — compression still works,
     // with per-turn anti-thrash accounting.
@@ -1933,6 +1990,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         .iter()
         .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
         .collect();
+    if let Some(harness) = smart_harness {
+        messages = harness.initial_messages(messages)?;
+    }
     let ephemeral_prompt = prompt_read::headless_prompt_fallback(turn_prompt_context, task);
     let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
     let prompt_context =
@@ -1948,7 +2008,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // save_note tool isn't even advertised.
     if note_sink.is_some() {
         if let Some(line) = note_nudge.as_deref_mut().and_then(NoteNudge::begin_turn) {
-            append_nudge_line(&mut messages, &line);
+            if let Some(harness) = smart_harness {
+                harness.host_message(&line)?;
+                messages.push(serde_json::json!({"role":"user", "content":line}));
+            } else {
+                append_nudge_line(&mut messages, &line);
+            }
         }
     }
 
@@ -2007,7 +2072,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // `tools:` allow-list (no-op when `persona_tools` is `None`). The executor
     // enforces the same set, so what the model sees and what it may run agree.
     let tools = filter_advertised_tools(tools, persona_tools);
-    let tools = filter_tools_for_disposition(tools, prompt_disposition);
+    let tools = filter_tools_for_disposition(
+        smart_harness::advertise(tools, smart_harness),
+        prompt_disposition,
+    );
     // #TEC Pass 1: the exposure stage. Clip the AUTHORIZED catalog to what the
     // model's LIVE usable budget can afford (probed `safe_context` → send
     // budget), never by model name. `ExposureProfile::Full` (the default) is
@@ -2155,7 +2223,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // round on the model or a tool. The reply is empty — the caller sees
         // `cancel` set and treats the turn as abandoned regardless.
         if is_cancelled(cancel) {
-            return Ok((String::new(), false, accumulated_usage, hallucination_count));
+            return Ok((
+                smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                false,
+                accumulated_usage,
+                hallucination_count,
+            ));
         }
         // #952/#1669: operator steering, delivered BEFORE this round's model
         // call and AFTER any tool that was already running finished above.
@@ -2298,7 +2371,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     color,
                     cancellable(
                         cancel,
-                        compress(
+                        smart_harness::compress(
                             CompressRequest {
                                 messages: &messages,
                                 budget: pipeline_budget,
@@ -2316,14 +2389,20 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             },
                             summarizer,
                             compress_state,
+                            smart_harness,
                         ),
                     ),
                 )
                 .await
                 {
-                    Some(o) => o,
+                    Some(o) => o?,
                     None => {
-                        return Ok((String::new(), false, accumulated_usage, hallucination_count))
+                        return Ok((
+                            smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                            false,
+                            accumulated_usage,
+                            hallucination_count,
+                        ))
                     }
                 };
                 if let Some(notice) = outcome.notice {
@@ -2433,6 +2512,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // Final text round: stream:true so the user sees tokens arrive.
             // We don't know which round is last, so we probe with stream:false first
             // and switch to streaming only when the model returns no tool calls.
+            if let Some(harness) = smart_harness {
+                harness.record_messages(&messages)?;
+            }
             let mut body_no_stream = if let Some(ctx_size) = num_ctx {
                 serde_json::json!({
                     "model": model,
@@ -2477,28 +2559,21 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             // W0 (#1511): classify while the error is TYPED — the
                             // DispatchError keeps the historical message text and
                             // carries the structural class to the driver boundary.
-                            let resp = client
-                                .post(&chat_url)
-                                .json(&body_no_stream)
-                                .send()
-                                .await
-                                .map_err(|e| {
-                                    anyhow::Error::new(observability::DispatchError::from_reqwest(
-                                        "request failed",
-                                        e,
-                                    ))
-                                })?;
-                            if !resp.status().is_success() {
-                                let status = resp.status();
-                                let text = resp.text().await.unwrap_or_default();
-                                return Err(observability::DispatchError::http_status(format!(
-                                    "Ollama {status}: {text}"
+                            let resp = smart_harness::request(
+                                client.post(&chat_url),
+                                &body_no_stream,
+                                smart_harness,
+                                "ollama",
+                            )?
+                            .send()
+                            .await
+                            .map_err(|e| {
+                                anyhow::Error::new(observability::DispatchError::from_reqwest(
+                                    "request failed",
+                                    e,
                                 ))
-                                .into());
-                            }
-                            resp.json::<serde_json::Value>()
-                                .await
-                                .map_err(anyhow::Error::from)
+                            })?;
+                            smart_harness::response(resp, smart_harness, "Ollama").await
                         },
                         |attempt, delay, error| {
                             print_retry_indicator(attempt, retry.max_retries, delay, error, color);
@@ -2510,7 +2585,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             {
                 Some(d) => d,
                 // Interrupted mid-probe: abandon the turn.
-                None => return Ok((String::new(), false, accumulated_usage, hallucination_count)),
+                None => {
+                    return Ok((
+                        smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                        false,
+                        accumulated_usage,
+                        hallucination_count,
+                    ))
+                }
             };
             match dispatch {
                 Ok(j) => break (j, round_est_raw),
@@ -2545,10 +2627,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             color,
                             false,
                         );
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": ollama_tool_xml_retry_nudge()
-                        }));
+                        let nudge = ollama_tool_xml_retry_nudge();
+                        if let Some(harness) = smart_harness {
+                            harness.host_message(nudge)?;
+                        }
+                        messages.push(serde_json::json!({"role":"user", "content":nudge}));
                         // Retry the SAME logical round (inner dispatch loop): the
                         // corrective nudge must reach a tool-CAPABLE round, else at
                         // max_tool_rounds == 1 it is only ever sent to the
@@ -2603,7 +2686,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             // The endpoint's parsed hard limit is authoritative —
                             // a refuse on it is correct from here on (Step 20.3).
                             send_budget_authoritative = true;
-                            let compression = compress(
+                            let compression = smart_harness::compress(
                                 CompressRequest {
                                     // Real-token budget minus real-token schema
                                     // overhead, converted into the pipeline's
@@ -2627,15 +2710,17 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 },
                                 summarizer,
                                 compress_state,
+                                smart_harness,
                             );
                             let Some(outcome) = cancellable(cancel, compression).await else {
                                 return Ok((
-                                    String::new(),
+                                    smart_harness::cancelled(smart_harness, &mut end_reason)?,
                                     false,
                                     accumulated_usage,
                                     hallucination_count,
                                 ));
                             };
+                            let outcome = outcome?;
                             if let Some(notice) = outcome.notice {
                                 print_harness_notice(&notice, color);
                             }
@@ -2801,6 +2886,44 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         }
 
         if !has_tools {
+            if let Some(harness) = smart_harness {
+                let more = round + 1 < current_tool_round_limit;
+                let control = harness
+                    .classify(&probe_content, narration_nudge_cap, more, cancel)
+                    .await?;
+                let control = harness.verify_answer(
+                    control,
+                    &messages,
+                    workspace,
+                    task,
+                    more && smart_verify,
+                )?;
+                let (text, reason) = match control {
+                    smart_harness::Control::Continue(nudge) => {
+                        messages
+                            .push(serde_json::json!({"role":"assistant", "content":probe_content}));
+                        messages.push(serde_json::json!({"role":"user", "content":nudge}));
+                        continue 'round_loop;
+                    }
+                    smart_harness::Control::Answer => {
+                        (probe_content.clone(), crate::TurnEndReason::Completed)
+                    }
+                    smart_harness::Control::Finish { text, reason } => (text, reason),
+                };
+                if let Some(slot) = &mut end_reason {
+                    **slot = Some(reason);
+                }
+                let text = finalize_final_text(
+                    text,
+                    workspace,
+                    &caveats.fs_read,
+                    turn_start_head.as_deref(),
+                    disclosure,
+                );
+                harness.outcome(reason, &text)?;
+                return Ok((text, false, accumulated_usage, hallucination_count));
+            }
+
             // Format-hallucination tracker: the content looked like a tool-call
             // attempt but could not be recovered into one — count it so cap-exit
             // and metrics see a tooling failure, not a clean final answer.
@@ -3124,7 +3247,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             .await
             {
                 Some(r) => r?,
-                None => return Ok((String::new(), false, accumulated_usage, hallucination_count)),
+                None => {
+                    return Ok((
+                        smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                        false,
+                        accumulated_usage,
+                        hallucination_count,
+                    ))
+                }
             };
 
             if !sresp.status().is_success() {
@@ -3322,7 +3452,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 .saturating_sub(tool_tokens_real),
                             cal,
                         );
-                        let compression = compress(
+                        let compression = smart_harness::compress(
                             CompressRequest {
                                 messages: &messages,
                                 budget: target,
@@ -3342,15 +3472,17 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             },
                             summarizer,
                             compress_state,
+                            smart_harness,
                         );
                         let Some(outcome) = cancellable(cancel, compression).await else {
                             return Ok((
-                                String::new(),
+                                smart_harness::cancelled(smart_harness, &mut end_reason)?,
                                 false,
                                 accumulated_usage,
                                 hallucination_count,
                             ));
                         };
+                        let outcome = outcome?;
                         if let Some(notice) = outcome.notice {
                             print_harness_notice(&notice, color);
                         }
@@ -3619,6 +3751,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // can only ever be `ContentInvalid`; `reason()` reads either class.
             Err(rejection) => {
                 let reason = rejection.reason().to_string();
+                if let Some(harness) = smart_harness {
+                    harness.reject_tools(&reason, true)?;
+                }
                 for _tc in tcs {
                     print_synthetic_tool_result(
                         "(rejected tool-call batch)",
@@ -3636,10 +3771,16 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             Some(0),
                         ));
                     }
-                    messages.push(serde_json::json!({
-                        "role": "tool",
-                        "content": format!("tool-call batch rejected before execution: {reason}"),
-                    }));
+                    smart_harness::push_tool_message(
+                        &mut messages,
+                        serde_json::json!({
+                            "role": "tool",
+                            "content": format!("tool-call batch rejected before execution: {reason}"),
+                        }),
+                        smart_harness,
+                        true,
+                        "(rejected tool-call batch)",
+                    )?;
                 }
                 None
             }
@@ -3649,7 +3790,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // the first tool side effect below. A content-invalid batch leaves
         // `validated == None`; it is NOT provider-accept evidence and must not
         // ratchet the learned budget (RR1 fail-closed).
-        if validated.is_some() {
+        if let Some(calls) = validated.as_ref() {
+            if let Some(harness) = smart_harness {
+                harness.tool_dispatch(calls)?;
+            }
             emit_accepted(
                 &mut on_round_usage,
                 round_usage,
@@ -3685,7 +3829,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
-                messages.push(serde_json::json!({ "role": "tool", "content": steer }));
+                smart_harness::push_tool_message(
+                    &mut messages,
+                    serde_json::json!({ "role": "tool", "content": steer }),
+                    smart_harness,
+                    true,
+                    name,
+                )?;
                 continue;
             }
             if !is_read_only_call(name, &args) {
@@ -3746,6 +3896,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        smart_harness,
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
                         // Reborrow + re-coerce: shortens the trait-object
@@ -3786,7 +3937,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 )
                 .await
                 else {
-                    return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                    return Ok((
+                        smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                        false,
+                        accumulated_usage,
+                        hallucination_count,
+                    ));
                 };
                 result
             };
@@ -3805,7 +3961,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 round_progress = true;
             }
             repeat_calls.record(name, &args, ok, &result);
-            append_clean_build_warning(&mut messages, &mut clean_build, &args);
+            append_clean_build_warning(&mut messages, &mut clean_build, &args, smart_harness)?;
             if workflow_runtime.record_tool_result(&result) {
                 round_progress = true;
             }
@@ -3821,17 +3977,26 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // #867 Part A: ledger the verified paths this result surfaced
             // BEFORE the offload may spill the text out of the transcript.
             observed_paths.record(&result, &mut observed_resolver);
-            messages.push(serde_json::json!({
-                "role": "tool",
-                // Step 26.3 (#584): offload an oversized result (redact → spill →
-                // teaser+handle) when tool_offload is on; unchanged otherwise.
-                "content": maybe_offload_tool_result(name, result, tool_offload, spill_store, disclosure)
-            }));
+            smart_harness::push_tool_message(
+                &mut messages,
+                serde_json::json!({
+                    "role": "tool",
+                    // Step 26.3 (#584): offload an oversized result (redact → spill →
+                    // teaser+handle) when tool_offload is on; unchanged otherwise.
+                    "content": smart_harness::tool_result(name, result, tool_offload, spill_store, disclosure, smart_harness)?
+                }),
+                smart_harness,
+                tools::is_context_remaining_call(name),
+                name,
+            )?;
         }
         if round_wrote {
             read_only_rounds = 0;
         } else {
             read_only_rounds = read_only_rounds.saturating_add(1);
+        }
+        if let Some(harness) = smart_harness {
+            harness.record_messages(&messages)?;
         }
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
     }
@@ -3849,6 +4014,28 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // Step 27.5: salvage the plan/state ledger + the failed-call count so the
     // summary reflects progress and the fallback advice is honest.
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    if let Some(harness) = smart_harness {
+        harness.record_messages(&messages)?;
+        let text = cap_exit_fallback(
+            max_tool_rounds,
+            accumulated_usage,
+            repeat_calls.total_failures(),
+            progress.as_deref(),
+        );
+        let text = finalize_final_text(
+            text,
+            workspace,
+            &caveats.fs_read,
+            turn_start_head.as_deref(),
+            disclosure,
+        );
+        harness.outcome(crate::TurnEndReason::RoundCap, &text)?;
+        if let Some(slot) = &mut end_reason {
+            **slot = Some(crate::TurnEndReason::RoundCap);
+        }
+        return Ok((text, false, accumulated_usage, hallucination_count));
+    }
+
     let (text, streamed, usage) = final_summary_ollama(
         &client,
         &chat_url,
@@ -5520,7 +5707,7 @@ impl CapExit {
         extract: impl FnOnce(serde_json::Value) -> (String, Option<crate::TokenUsage>),
     ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
         let retry = tui_retry_policy(endpoint);
-        let result = dispatch_json(&retry, request, http_error_prefix, |_, _, _| {}).await;
+        let result = dispatch_json(&retry, request, http_error_prefix, |_, _, _| {}, None).await;
         if let Ok(json) = result {
             let (content, usage) = extract(json);
             let total = merge_round_usage(self.accumulated, usage);
@@ -5742,6 +5929,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        smart_harness,
         url,
         model,
         kind: _,
@@ -5843,6 +6031,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // See the Ollama path: a non-Act turn is allowed bounded reads but never
     // execution-pressure nudges.
     let action_nudges = action_nudges && prompt_disposition == PromptDisposition::Act;
+    if let Some(harness) = smart_harness {
+        harness.start_turn()?;
+    }
+    // Smart mode retains full tool output before the existing shell cap runs.
+    let spill_store = smart_harness.map(|h| h.spill_store()).or(spill_store);
+    let tool_offload = tool_offload || smart_harness.is_some();
+    let smart_verify = action_nudges && prompt_disposition == PromptDisposition::Act;
+    let action_nudges = action_nudges && smart_harness.is_none();
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     let generation_policy = generation_policy::GenerationPolicy::resolve(
         cognition,
@@ -5908,6 +6104,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             serde_json::json!({"role": m.role.as_str(), "content": content})
         })
         .collect();
+    if let Some(harness) = smart_harness {
+        messages = harness.initial_messages(messages)?;
+    }
     let ephemeral_prompt = prompt_read::headless_prompt_fallback(turn_prompt_context, task);
     let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
     let prompt_context =
@@ -5920,7 +6119,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // In-band memory nudge (Step 19.3) — mirrors the Ollama path.
     if note_sink.is_some() {
         if let Some(line) = note_nudge.as_deref_mut().and_then(NoteNudge::begin_turn) {
-            append_nudge_line(&mut messages, &line);
+            if let Some(harness) = smart_harness {
+                harness.host_message(&line)?;
+                messages.push(serde_json::json!({"role":"user", "content":line}));
+            } else {
+                append_nudge_line(&mut messages, &line);
+            }
         }
     }
 
@@ -5975,7 +6179,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // `tools:` allow-list (no-op when `persona_tools` is `None`). The executor
     // enforces the same set, so what the model sees and what it may run agree.
     let tools = filter_advertised_tools(tools, persona_tools);
-    let tools = filter_tools_for_disposition(tools, prompt_disposition);
+    let tools = filter_tools_for_disposition(
+        smart_harness::advertise(tools, smart_harness),
+        prompt_disposition,
+    );
     // #TEC Pass 1: exposure stage — clip the authorized catalog to the live
     // usable budget (identity under `ExposureProfile::Full`). See the Ollama
     // path for the full rationale.
@@ -6096,7 +6303,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // bail at the round boundary with an empty reply; tool dispatches below
         // are also raced so an interrupt can stop a hung command mid-round.
         if is_cancelled(cancel) {
-            return Ok((String::new(), false, accumulated_usage, hallucination_count));
+            return Ok((
+                smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                false,
+                accumulated_usage,
+                hallucination_count,
+            ));
         }
         // #952/#1669: operator steering, delivered BEFORE this round's model
         // call and AFTER any tool that was already running finished above.
@@ -6149,6 +6361,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // Phase 20 §2.3: calibrated `current` (real-token space) —
             // mirrors the Ollama path.
             let advertised_tools = tools_supported.then_some(&tools);
+            if let Some(harness) = smart_harness {
+                harness.record_messages(&messages)?;
+            }
             let wire_messages = openai_chat_wire_messages(&messages)?;
             let current = full_message_request_pressure_tokens(
                 prompt_tracker.current(&messages, advertised_tools, cal, estimation),
@@ -6195,7 +6410,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 // send budget rests on a believed ceiling (mirrors the Ollama
                 // loop). A lone-HWM guard is non-authoritative → fails open.
                 let token_fired = mid_loop_trim_tokens.is_some_and(|t| t > 0 && current > t);
-                let compression = compress(
+                let compression = smart_harness::compress(
                     CompressRequest {
                         messages: &messages,
                         budget: pipeline_budget,
@@ -6221,10 +6436,17 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     },
                     summarizer,
                     compress_state,
+                    smart_harness,
                 );
                 let Some(outcome) = cancellable(cancel, compression).await else {
-                    return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                    return Ok((
+                        smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                        false,
+                        accumulated_usage,
+                        hallucination_count,
+                    ));
                 };
+                let outcome = outcome?;
                 if let Some(notice) = outcome.notice {
                     print_harness_notice(&notice, color);
                 }
@@ -6299,6 +6521,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // inside the retry loop below, where the spinner is still alive.
         let mut thought_for;
         let (json, round_est_raw): (serde_json::Value, usize) = loop {
+            if let Some(harness) = smart_harness {
+                harness.record_messages(&messages)?;
+            }
             let wire_messages = openai_chat_wire_messages(&messages)?;
 
             // Mirror the Ollama full-request gate. A known authoritative ceiling
@@ -6370,7 +6595,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         ));
                     }
                     async {
-                        let mut req = client.post(&chat_url).json(&body);
+                        let mut req = smart_harness::request(
+                            client.post(&chat_url),
+                            &body,
+                            smart_harness,
+                            "openai",
+                        )?;
                         if let Some(key) = api_key {
                             req = req.bearer_auth(key);
                         }
@@ -6383,17 +6613,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 e,
                             ))
                         })?;
-                        if !resp.status().is_success() {
-                            let status = resp.status();
-                            let text = resp.text().await.unwrap_or_default();
-                            return Err(observability::DispatchError::http_status(format!(
-                                "inference endpoint {status}: {text}"
-                            ))
-                            .into());
-                        }
-                        resp.json::<serde_json::Value>()
-                            .await
-                            .map_err(anyhow::Error::from)
+                        smart_harness::response(resp, smart_harness, "inference endpoint").await
                     }
                 },
                 |attempt, delay, error| {
@@ -6484,7 +6704,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                             // The endpoint's parsed hard limit is authoritative
                             // from here on (Step 20.3; mirrors the Ollama path).
                             send_budget_authoritative = true;
-                            let compression = compress(
+                            let compression = smart_harness::compress(
                                 CompressRequest {
                                     // Real-token cap minus real-token schema
                                     // overhead → pipeline chars/4 currency
@@ -6512,15 +6732,17 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 },
                                 summarizer,
                                 compress_state,
+                                smart_harness,
                             );
                             let Some(outcome) = cancellable(cancel, compression).await else {
                                 return Ok((
-                                    String::new(),
+                                    smart_harness::cancelled(smart_harness, &mut end_reason)?,
                                     false,
                                     accumulated_usage,
                                     hallucination_count,
                                 ));
                             };
+                            let outcome = outcome?;
                             if let Some(notice) = outcome.notice {
                                 print_harness_notice(&notice, color);
                             }
@@ -6788,6 +7010,44 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         }
 
         if !has_tools {
+            if let Some(harness) = smart_harness {
+                let more = round + 1 < current_tool_round_limit;
+                let control = harness
+                    .classify(&oa_content, narration_nudge_cap, more, cancel)
+                    .await?;
+                let control = harness.verify_answer(
+                    control,
+                    &messages,
+                    workspace,
+                    task,
+                    more && smart_verify,
+                )?;
+                let (text, reason) = match control {
+                    smart_harness::Control::Continue(nudge) => {
+                        messages
+                            .push(serde_json::json!({"role":"assistant", "content":oa_content}));
+                        messages.push(serde_json::json!({"role":"user", "content":nudge}));
+                        continue 'round_loop;
+                    }
+                    smart_harness::Control::Answer => {
+                        (oa_content.clone(), crate::TurnEndReason::Completed)
+                    }
+                    smart_harness::Control::Finish { text, reason } => (text, reason),
+                };
+                if let Some(slot) = &mut end_reason {
+                    **slot = Some(reason);
+                }
+                let text = finalize_final_text(
+                    text,
+                    workspace,
+                    &caveats.fs_read,
+                    turn_start_head.as_deref(),
+                    disclosure,
+                );
+                harness.outcome(reason, &text)?;
+                return Ok((text, false, accumulated_usage, hallucination_count));
+            }
+
             // Format-hallucination tracker (mirror of the Ollama loop): content
             // that looked like a tool call but couldn't be recovered is counted.
             if recovered.tool_shaped {
@@ -7142,7 +7402,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 // would be a lie about the turn's cost.
                 StreamOutcome::Cancelled(stream_usage) => {
                     accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
-                    return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                    return Ok((
+                        smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                        false,
+                        accumulated_usage,
+                        hallucination_count,
+                    ));
                 }
             };
             // #1964: this normal (non-cap) finish gets the same claim check
@@ -7203,11 +7468,17 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         let validated = match tools::validate_tool_call_batch(&extracted, true) {
             Ok(v) => Some(v),
             Err(tools::BatchRejection::CorrelationImpossible(reason)) => {
+                if let Some(harness) = smart_harness {
+                    harness.reject_tools(&reason, false)?;
+                }
                 // A missing/blank/duplicate `tool_call_id`: a tool result cannot
                 // be correlated. Abort the turn — do not fabricate an id.
                 return Err(anyhow::anyhow!("malformed provider output: {reason}"));
             }
             Err(tools::BatchRejection::ContentInvalid(reason)) => {
+                if let Some(harness) = smart_harness {
+                    harness.reject_tools(&reason, true)?;
+                }
                 // ids are valid + unique → echo a correctly keyed rejection per
                 // call and re-dispatch so the model can retry.
                 for tc in tcs {
@@ -7228,11 +7499,17 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                             Some(0),
                         ));
                     }
-                    messages.push(serde_json::json!({
-                        "role": "tool",
-                        "tool_call_id": id,
-                        "content": format!("tool-call batch rejected before execution: {reason}"),
-                    }));
+                    smart_harness::push_tool_message(
+                        &mut messages,
+                        serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": id,
+                            "content": format!("tool-call batch rejected before execution: {reason}"),
+                        }),
+                        smart_harness,
+                        true,
+                        "(rejected tool-call batch)",
+                    )?;
                 }
                 None
             }
@@ -7243,7 +7520,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // above (early `Err`, RR2) and a content-invalid batch leaves
         // `validated == None` (RR1); neither is provider-accept evidence, so
         // neither ratchets the learned budget.
-        if validated.is_some() {
+        if let Some(calls) = validated.as_ref() {
+            if let Some(harness) = smart_harness {
+                harness.tool_dispatch(calls)?;
+            }
             emit_accepted(
                 &mut on_round_usage,
                 round_usage,
@@ -7304,11 +7584,17 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
-                messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": steer,
-                }));
+                smart_harness::push_tool_message(
+                    &mut messages,
+                    serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": steer,
+                    }),
+                    smart_harness,
+                    true,
+                    name,
+                )?;
                 continue;
             }
             record_organic_note_use(name, &note_sink, &mut note_nudge);
@@ -7354,6 +7640,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        smart_harness,
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
                         // Reborrow + re-coerce: shortens the trait-object
@@ -7394,7 +7681,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 )
                 .await
                 else {
-                    return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                    return Ok((
+                        smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                        false,
+                        accumulated_usage,
+                        hallucination_count,
+                    ));
                 };
                 result
             };
@@ -7421,7 +7713,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 round_progress = true;
             }
             repeat_calls.record(name, &args, ok, &result);
-            append_clean_build_warning(&mut messages, &mut clean_build, &args);
+            append_clean_build_warning(&mut messages, &mut clean_build, &args, smart_harness)?;
             if workflow_runtime.record_tool_result(&result) {
                 round_progress = true;
             }
@@ -7436,12 +7728,21 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             );
             // #867 Part A: ledger verified paths (see the Ollama path).
             observed_paths.record(&result, &mut observed_resolver);
-            messages.push(serde_json::json!({
-                "role": "tool",
-                "tool_call_id": id,
-                // Step 26.3 (#584): see the Ollama path.
-                "content": maybe_offload_tool_result(name, result, tool_offload, spill_store, disclosure),
-            }));
+            smart_harness::push_tool_message(
+                &mut messages,
+                serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    // Step 26.3 (#584): see the Ollama path.
+                    "content": smart_harness::tool_result(name, result, tool_offload, spill_store, disclosure, smart_harness)?,
+                }),
+                smart_harness,
+                tools::is_context_remaining_call(name),
+                name,
+            )?;
+        }
+        if let Some(harness) = smart_harness {
+            harness.record_messages(&messages)?;
         }
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
     }
@@ -7457,6 +7758,28 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let trimmed = trim_for_summary(&messages, protected_head, 6.max(replay_protected_tail_len));
     // Step 27.5: salvage progress + failed-call count (matches the Ollama path).
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    if let Some(harness) = smart_harness {
+        harness.record_messages(&messages)?;
+        let text = cap_exit_fallback(
+            max_tool_rounds,
+            accumulated_usage,
+            repeat_calls.total_failures(),
+            progress.as_deref(),
+        );
+        let text = finalize_final_text(
+            text,
+            workspace,
+            &caveats.fs_read,
+            turn_start_head.as_deref(),
+            disclosure,
+        );
+        harness.outcome(crate::TurnEndReason::RoundCap, &text)?;
+        if let Some(slot) = &mut end_reason {
+            **slot = Some(crate::TurnEndReason::RoundCap);
+        }
+        return Ok((text, false, accumulated_usage, hallucination_count));
+    }
+
     let (text, streamed, usage) = final_summary_openai(
         &client,
         &chat_url,
@@ -7521,6 +7844,7 @@ fn anthropic_headers(
 /// Per-turn dispatch context for the Anthropic loop, bundled so
 /// [`anthropic_dispatch_round`] keeps a reviewable signature.
 struct AnthropicDispatch<'a> {
+    smart_harness: Option<&'a smart_harness::SmartHarness>,
     /// Whole-request-timeout client for `stream:false` bodies (a total bound
     /// is correct for a single-shot response — mirrors the OpenAI path).
     client: &'a reqwest::Client,
@@ -7560,6 +7884,7 @@ struct AnthropicDispatch<'a> {
 async fn anthropic_dispatch_round(
     d: &AnthropicDispatch<'_>,
     body: &serde_json::Value,
+    messages: &[serde_json::Value],
     stream: bool,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<Option<(anthropic_wire::AnthropicRound, bool)>> {
@@ -7569,8 +7894,13 @@ async fn anthropic_dispatch_round(
             with_backoff_notify_error(
                 d.retry,
                 || async {
-                    let req =
-                        anthropic_headers(d.client.post(d.messages_url), d.api_key).json(body);
+                    let req = anthropic_headers(d.client.post(d.messages_url), d.api_key);
+                    let req = match d.smart_harness {
+                        Some(harness) => req
+                            .header(reqwest::header::CONTENT_TYPE, "application/json")
+                            .body(harness.prepare_with_messages(body, "anthropic", messages)?),
+                        None => req.json(body),
+                    };
                     // W0 (#1511): classify while the error is TYPED — mirrors
                     // the OpenAI path's dispatch site.
                     let resp = req.send().await.map_err(|e| {
@@ -7579,17 +7909,7 @@ async fn anthropic_dispatch_round(
                             e,
                         ))
                     })?;
-                    if !resp.status().is_success() {
-                        let status = resp.status();
-                        let text = resp.text().await.unwrap_or_default();
-                        return Err(observability::DispatchError::http_status(format!(
-                            "inference endpoint {status}: {text}"
-                        ))
-                        .into());
-                    }
-                    resp.json::<serde_json::Value>()
-                        .await
-                        .map_err(anyhow::Error::from)
+                    smart_harness::response(resp, d.smart_harness, "inference endpoint").await
                 },
                 |attempt, delay, error| {
                     print_retry_indicator(attempt, d.retry.max_retries, delay, error, d.color);
@@ -7823,6 +8143,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        smart_harness,
         url,
         model,
         kind: _,
@@ -7916,6 +8237,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // See the Ollama path: a non-Act turn is allowed bounded reads but never
     // execution-pressure nudges. (Mirrors the OpenAI path.)
     let action_nudges = action_nudges && prompt_disposition == PromptDisposition::Act;
+    if let Some(harness) = smart_harness {
+        harness.start_turn()?;
+    }
+    // Smart mode retains full tool output before the existing shell cap runs.
+    let spill_store = smart_harness.map(|h| h.spill_store()).or(spill_store);
+    let tool_offload = tool_offload || smart_harness.is_some();
+    let smart_verify = action_nudges && prompt_disposition == PromptDisposition::Act;
+    let action_nudges = action_nudges && smart_harness.is_none();
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     let generation_policy = generation_policy::GenerationPolicy::resolve(
         cognition,
@@ -7945,8 +8274,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         .unwrap_or_else(anthropic_wire::default_max_tokens);
     // Streaming valve: default ON; `NEWT_ANTHROPIC_STREAM=off` disables SSE.
     // Read once per loop invocation so a mid-turn flip cannot tear a round.
-    let streaming_enabled =
-        !std::env::var("NEWT_ANTHROPIC_STREAM").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"));
+    let streaming_enabled = smart_harness.is_none()
+        && !std::env::var("NEWT_ANTHROPIC_STREAM")
+            .is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"));
     // Headless callers may pass no session state (mirrors the OpenAI path).
     let mut local_compress_state = CompressState::new();
     let compress_state = match compress_state {
@@ -7967,6 +8297,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let messages_url = anthropic_wire::messages_url(url);
     let retry = tui_retry_policy(url);
     let dispatcher = AnthropicDispatch {
+        smart_harness,
         client: &client,
         stream_client: &stream_client,
         messages_url: &messages_url,
@@ -8004,6 +8335,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             serde_json::json!({"role": m.role.as_str(), "content": content})
         })
         .collect();
+    if let Some(harness) = smart_harness {
+        messages = harness.initial_messages(messages)?;
+    }
     let ephemeral_prompt = prompt_read::headless_prompt_fallback(turn_prompt_context, task);
     let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
     let prompt_context =
@@ -8016,7 +8350,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // In-band memory nudge (Step 19.3) — mirrors the OpenAI path.
     if note_sink.is_some() {
         if let Some(line) = note_nudge.as_deref_mut().and_then(NoteNudge::begin_turn) {
-            append_nudge_line(&mut messages, &line);
+            if let Some(harness) = smart_harness {
+                harness.host_message(&line)?;
+                messages.push(serde_json::json!({"role":"user", "content":line}));
+            } else {
+                append_nudge_line(&mut messages, &line);
+            }
         }
     }
 
@@ -8067,7 +8406,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         advertise_plan_mode_active,
     );
     let tools = filter_advertised_tools(tools, persona_tools);
-    let tools = filter_tools_for_disposition(tools, prompt_disposition);
+    let tools = filter_tools_for_disposition(
+        smart_harness::advertise(tools, smart_harness),
+        prompt_disposition,
+    );
     // #TEC Pass 1: exposure stage — mirrors the OpenAI path.
     let tools = crate::agentic::tools::select_exposed(
         tools,
@@ -8178,7 +8520,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         }
         // Interrupt checkpoint (Esc / Ctrl-C) — mirrors the OpenAI path.
         if is_cancelled(cancel) {
-            return Ok((String::new(), false, accumulated_usage, hallucination_count));
+            return Ok((
+                smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                false,
+                accumulated_usage,
+                hallucination_count,
+            ));
         }
         // #952/#1669: operator steering, delivered BEFORE this round's model
         // call and AFTER any tool that was already running finished above.
@@ -8264,7 +8611,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     trigger.budget
                 };
                 let token_fired = mid_loop_trim_tokens.is_some_and(|t| t > 0 && current > t);
-                let compression = compress(
+                let compression = smart_harness::compress(
                     CompressRequest {
                         messages: &messages,
                         budget: pipeline_budget,
@@ -8286,10 +8633,17 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     },
                     summarizer,
                     compress_state,
+                    smart_harness,
                 );
                 let Some(outcome) = cancellable(cancel, compression).await else {
-                    return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                    return Ok((
+                        smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                        false,
+                        accumulated_usage,
+                        hallucination_count,
+                    ));
                 };
+                let outcome = outcome?;
                 if let Some(notice) = outcome.notice {
                     print_harness_notice(&notice, color);
                 }
@@ -8362,6 +8716,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // dispatch only: leading system run → top-level `system`,
             // assistant `tool_calls` → `tool_use` blocks, `role:"tool"` runs
             // → ONE user message of `tool_result` blocks.
+            if let Some(harness) = smart_harness {
+                harness.record_messages(&messages)?;
+            }
             let (system, wire_messages) = anthropic_wire::anthropic_wire_messages(&messages)?;
 
             // Mirror the OpenAI full-request gate.
@@ -8396,12 +8753,18 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 streaming_enabled,
             );
             let dispatch =
-                anthropic_dispatch_round(&dispatcher, &body, streaming_enabled, cancel).await;
+                anthropic_dispatch_round(&dispatcher, &body, &messages, streaming_enabled, cancel)
+                    .await;
             match dispatch {
                 // Interrupted mid-dispatch: same contract as the round-
                 // boundary checkpoint (mirrors the Ollama raced probe).
                 Ok(None) => {
-                    return Ok((String::new(), false, accumulated_usage, hallucination_count))
+                    return Ok((
+                        smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                        false,
+                        accumulated_usage,
+                        hallucination_count,
+                    ))
                 }
                 Ok(Some((reply, printed))) => {
                     // `pause_turn`: the server paused a long turn; re-dispatch
@@ -8473,7 +8836,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                             send_budget = Some(new_budget);
                             effective_input_ceiling = Some(new_budget);
                             send_budget_authoritative = true;
-                            let compression = compress(
+                            let compression = smart_harness::compress(
                                 CompressRequest {
                                     messages: &messages,
                                     budget: calibrate_down(
@@ -8498,15 +8861,17 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                 },
                                 summarizer,
                                 compress_state,
+                                smart_harness,
                             );
                             let Some(outcome) = cancellable(cancel, compression).await else {
                                 return Ok((
-                                    String::new(),
+                                    smart_harness::cancelled(smart_harness, &mut end_reason)?,
                                     false,
                                     accumulated_usage,
                                     hallucination_count,
                                 ));
                             };
+                            let outcome = outcome?;
                             if let Some(notice) = outcome.notice {
                                 print_harness_notice(&notice, color);
                             }
@@ -8780,6 +9145,44 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         }
 
         if !has_tools {
+            if let Some(harness) = smart_harness {
+                let more = round + 1 < current_tool_round_limit;
+                let control = harness
+                    .classify(&oa_content, narration_nudge_cap, more, cancel)
+                    .await?;
+                let control = harness.verify_answer(
+                    control,
+                    &messages,
+                    workspace,
+                    task,
+                    more && smart_verify,
+                )?;
+                let (text, reason) = match control {
+                    smart_harness::Control::Continue(nudge) => {
+                        messages
+                            .push(serde_json::json!({"role":"assistant", "content":oa_content}));
+                        messages.push(serde_json::json!({"role":"user", "content":nudge}));
+                        continue 'round_loop;
+                    }
+                    smart_harness::Control::Answer => {
+                        (oa_content.clone(), crate::TurnEndReason::Completed)
+                    }
+                    smart_harness::Control::Finish { text, reason } => (text, reason),
+                };
+                if let Some(slot) = &mut end_reason {
+                    **slot = Some(reason);
+                }
+                let text = finalize_final_text(
+                    text,
+                    workspace,
+                    &caveats.fs_read,
+                    turn_start_head.as_deref(),
+                    disclosure,
+                );
+                harness.outcome(reason, &text)?;
+                return Ok((text, false, accumulated_usage, hallucination_count));
+            }
+
             // Format-hallucination tracker (mirrors the OpenAI path).
             if recovered.tool_shaped {
                 hallucination_count += 1;
@@ -9090,11 +9493,17 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         let validated = match tools::validate_tool_call_batch(&extracted, true) {
             Ok(v) => Some(v),
             Err(tools::BatchRejection::CorrelationImpossible(reason)) => {
+                if let Some(harness) = smart_harness {
+                    harness.reject_tools(&reason, false)?;
+                }
                 // A missing/blank/duplicate id: a tool result cannot be
                 // correlated. Abort the turn — do not fabricate an id.
                 return Err(anyhow::anyhow!("malformed provider output: {reason}"));
             }
             Err(tools::BatchRejection::ContentInvalid(reason)) => {
+                if let Some(harness) = smart_harness {
+                    harness.reject_tools(&reason, true)?;
+                }
                 // ids are valid + unique → echo a correctly keyed rejection
                 // per call and re-dispatch so the model can retry.
                 for tc in tcs {
@@ -9115,11 +9524,17 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                             Some(0),
                         ));
                     }
-                    messages.push(serde_json::json!({
-                        "role": "tool",
-                        "tool_call_id": id,
-                        "content": format!("tool-call batch rejected before execution: {reason}"),
-                    }));
+                    smart_harness::push_tool_message(
+                        &mut messages,
+                        serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": id,
+                            "content": format!("tool-call batch rejected before execution: {reason}"),
+                        }),
+                        smart_harness,
+                        true,
+                        "(rejected tool-call batch)",
+                    )?;
                 }
                 None
             }
@@ -9127,7 +9542,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // #1528 B4 — mirrors the OpenAI path: a FULLY-VALIDATED batch is
         // usable output; emit the accepted-prompt observation before the
         // first tool side effect.
-        if validated.is_some() {
+        if let Some(calls) = validated.as_ref() {
+            if let Some(harness) = smart_harness {
+                harness.tool_dispatch(calls)?;
+            }
             emit_accepted(
                 &mut on_round_usage,
                 round_usage,
@@ -9187,11 +9605,17 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
-                messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": steer,
-                }));
+                smart_harness::push_tool_message(
+                    &mut messages,
+                    serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": steer,
+                    }),
+                    smart_harness,
+                    true,
+                    name,
+                )?;
                 continue;
             }
             record_organic_note_use(name, &note_sink, &mut note_nudge);
@@ -9235,6 +9659,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        smart_harness,
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
                         // Reborrow + re-coerce — see the OpenAI path.
@@ -9271,7 +9696,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 )
                 .await
                 else {
-                    return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                    return Ok((
+                        smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                        false,
+                        accumulated_usage,
+                        hallucination_count,
+                    ));
                 };
                 result
             };
@@ -9295,7 +9725,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 round_progress = true;
             }
             repeat_calls.record(name, &args, ok, &result);
-            append_clean_build_warning(&mut messages, &mut clean_build, &args);
+            append_clean_build_warning(&mut messages, &mut clean_build, &args, smart_harness)?;
             if workflow_runtime.record_tool_result(&result) {
                 round_progress = true;
             }
@@ -9314,11 +9744,20 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // `anthropic_wire_messages` folds each consecutive run into ONE
             // user message of tool_result blocks (`tool_use_id` = this id)
             // on the next dispatch.
-            messages.push(serde_json::json!({
-                "role": "tool",
-                "tool_call_id": id,
-                "content": maybe_offload_tool_result(name, result, tool_offload, spill_store, disclosure),
-            }));
+            smart_harness::push_tool_message(
+                &mut messages,
+                serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": smart_harness::tool_result(name, result, tool_offload, spill_store, disclosure, smart_harness)?,
+                }),
+                smart_harness,
+                tools::is_context_remaining_call(name),
+                name,
+            )?;
+        }
+        if let Some(harness) = smart_harness {
+            harness.record_messages(&messages)?;
         }
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
     }
@@ -9334,6 +9773,28 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let trimmed = trim_for_summary(&messages, protected_head, 6.max(replay_protected_tail_len));
     // Step 27.5: salvage progress + failed-call count (mirrors the OpenAI path).
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    if let Some(harness) = smart_harness {
+        harness.record_messages(&messages)?;
+        let text = cap_exit_fallback(
+            max_tool_rounds,
+            accumulated_usage,
+            repeat_calls.total_failures(),
+            progress.as_deref(),
+        );
+        let text = finalize_final_text(
+            text,
+            workspace,
+            &caveats.fs_read,
+            turn_start_head.as_deref(),
+            disclosure,
+        );
+        harness.outcome(crate::TurnEndReason::RoundCap, &text)?;
+        if let Some(slot) = &mut end_reason {
+            **slot = Some(crate::TurnEndReason::RoundCap);
+        }
+        return Ok((text, false, accumulated_usage, hallucination_count));
+    }
+
     let (text, streamed, usage) = final_summary_anthropic(
         &client,
         &messages_url,
@@ -9524,12 +9985,22 @@ async fn dispatch_responses_json(
     validated: &responses_wire_validation::ValidatedResponsesRequest,
     retry: &RetryPolicy,
     color: bool,
+    smart_harness: Option<&smart_harness::SmartHarness>,
 ) -> anyhow::Result<serde_json::Value> {
     let body = validated.body();
-    dispatch_json(
+    let body_bytes = smart_harness
+        .map(|h| h.request(body, "responses"))
+        .transpose()?;
+    let result = dispatch_json(
         retry,
         || {
-            let mut req = client.post(url).json(body);
+            let mut req = match &body_bytes {
+                Some(bytes) => client
+                    .post(url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(bytes.clone()),
+                None => client.post(url).json(body),
+            };
             if let Some(key) = api_key {
                 req = req.bearer_auth(key);
             }
@@ -9539,8 +10010,10 @@ async fn dispatch_responses_json(
         |attempt, delay, error| {
             print_retry_indicator(attempt, retry.max_retries, delay, error, color);
         },
+        smart_harness,
     )
-    .await
+    .await?;
+    Ok(result)
 }
 
 /// Shared transport from the Responses dispatcher; build a fresh request per attempt.
@@ -9550,6 +10023,7 @@ async fn dispatch_json(
     request: impl Fn() -> reqwest::RequestBuilder,
     http_error_prefix: &str,
     on_retry: impl FnMut(u32, std::time::Duration, &anyhow::Error),
+    smart_harness: Option<&smart_harness::SmartHarness>,
 ) -> anyhow::Result<serde_json::Value> {
     with_backoff_notify_error(
         retry,
@@ -9561,17 +10035,7 @@ async fn dispatch_json(
                     e,
                 ))
             })?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(observability::DispatchError::http_status(format!(
-                    "{http_error_prefix} {status}: {text}"
-                ))
-                .into());
-            }
-            resp.json::<serde_json::Value>()
-                .await
-                .map_err(anyhow::Error::from)
+            smart_harness::response(resp, smart_harness, http_error_prefix).await
         },
         on_retry,
     )
@@ -9587,6 +10051,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
     let ChatCtx {
+        smart_harness,
         url,
         model,
         kind: _,
@@ -9615,7 +10080,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         reasoning_replay_scope: _,
         max_tool_rounds,
         workflow_grace_rounds: _,
-        narration_nudge_cap: _,
+        narration_nudge_cap,
         action_nudges,
         prompt_disposition,
         prompt_intake,
@@ -9680,6 +10145,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // discards it — without terminal writes — so a stale rewind can never
     // replay over a later turn's prompt.
     let _completed_spill_guard = CompletedSpillDismissGuard(&completed_spill_renderer);
+    if let Some(harness) = smart_harness {
+        harness.start_turn()?;
+    }
+    // Smart mode retains full tool output before the existing shell cap runs.
+    let spill_store = smart_harness.map(|h| h.spill_store()).or(spill_store);
+    let tool_offload = tool_offload || smart_harness.is_some();
+    let smart_verify = action_nudges && prompt_disposition == PromptDisposition::Act;
+    let action_nudges = action_nudges && smart_harness.is_none();
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     // #1528: headless callers may pass no session state — fall back to a local
     // one so the cw-400 recovery's `compress::compress` always has anti-thrash
@@ -9718,6 +10191,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         .iter()
         .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
         .collect();
+    if let Some(harness) = smart_harness {
+        msgs_json = harness.initial_messages(msgs_json)?;
+    }
     let ephemeral_prompt = prompt_read::headless_prompt_fallback(turn_prompt_context, task);
     let turn_prompt_context = turn_prompt_context.or(ephemeral_prompt.as_ref());
     let prompt_context =
@@ -9745,7 +10221,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // FR-1 part 2 (#997): scope the advertised catalog to the active persona
     // (Responses wire). No-op when `persona_tools` is `None`.
     let tools_chat = filter_advertised_tools(tools_chat, persona_tools);
-    let tools_chat = filter_tools_for_disposition(tools_chat, prompt_disposition);
+    let tools_chat = filter_tools_for_disposition(
+        smart_harness::advertise(tools_chat, smart_harness),
+        prompt_disposition,
+    );
     // #TEC Pass 1: exposure stage on the chat-shaped catalog before it is
     // projected to Responses tools, so the estimate and the wire agree.
     // Identity under `ExposureProfile::Full`. The send budget is computed just
@@ -9883,7 +10362,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // output can land a canonical line under the frame.
         dismiss_completed_spill(&completed_spill_renderer);
         if is_cancelled(cancel) {
-            return Ok((String::new(), false, accumulated_usage, hallucination_count));
+            return Ok((
+                smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                false,
+                accumulated_usage,
+                hallucination_count,
+            ));
         }
         // #952/#1669: operator steering, delivered BEFORE this round's model
         // call and AFTER any tool that was already running finished above.
@@ -9941,9 +10425,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         summarizer,
                         compress_state,
                         color,
+                        smart_harness,
                     );
                     let Some(outcome) = cancellable(cancel, compression).await else {
-                        return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                        return Ok((
+                            smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                            false,
+                            accumulated_usage,
+                            hallucination_count,
+                        ));
                     };
                     proactive_rejection = outcome.rejection();
                 }
@@ -9956,6 +10446,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             // NOTHING and does not advance the round; if compaction could not fit the
             // request, the local reason is attached so the headless error chain
             // explains WHY. Only a `ValidatedResponsesRequest` reaches the dispatcher.
+            if let Some(harness) = smart_harness {
+                harness.record_responses_messages(instructions.as_deref(), &input)?;
+            }
             let body = build_body(&input, tools_supported);
             let policy = responses_wire_validation::ResponsesWirePolicy {
                 store: crate::responses_wire::STORE_RESPONSE_SERVER_SIDE,
@@ -9979,6 +10472,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &validated,
                 &retry,
                 color,
+                smart_harness,
             )
             .await;
 
@@ -10057,10 +10551,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                 summarizer,
                                 compress_state,
                                 color,
+                                smart_harness,
                             );
                             let Some(outcome) = cancellable(cancel, compression).await else {
                                 return Ok((
-                                    String::new(),
+                                    smart_harness::cancelled(smart_harness, &mut end_reason)?,
                                     false,
                                     accumulated_usage,
                                     hallucination_count,
@@ -10093,6 +10588,17 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // surfaced — never mistaken for a benign empty reply.
         let decoded = match crate::responses_wire::decode_response(&json) {
             Ok(d) => d,
+            Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage })
+                if smart_harness.is_some() =>
+            {
+                crate::responses_wire::DecodedResponse {
+                    text: message,
+                    tool_calls: Vec::new(),
+                    echo: Vec::new(),
+                    model: None,
+                    usage,
+                }
+            }
             Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage }) => {
                 accumulated_usage = merge_round_usage(accumulated_usage, usage);
                 // #1964: this normal (non-cap) finish gets the same claim
@@ -10106,7 +10612,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 );
                 return Ok((out, false, accumulated_usage, hallucination_count));
             }
-            Err(e) => return Err(anyhow::anyhow!("Responses turn not usable: {e}")),
+            Err(e) => {
+                if let Some(harness) = smart_harness {
+                    harness.provider_failure(&e.to_string())?;
+                }
+                return Err(anyhow::anyhow!("Responses turn not usable: {e}"));
+            }
         };
         accumulated_usage = merge_round_usage(accumulated_usage, decoded.usage);
         let (text, calls, echo) = (decoded.text, decoded.tool_calls, decoded.echo);
@@ -10123,6 +10634,42 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         }
 
         if calls.is_empty() {
+            if let Some(harness) = smart_harness {
+                let more = round + 1 < max_tool_rounds;
+                let control = harness
+                    .classify(&text, narration_nudge_cap, more, cancel)
+                    .await?;
+                let control = harness.verify_answer(
+                    control,
+                    &input,
+                    workspace,
+                    task,
+                    more && smart_verify,
+                )?;
+                let (text, reason) = match control {
+                    smart_harness::Control::Continue(nudge) => {
+                        input.extend(echo.clone());
+                        input.push(serde_json::json!({"role":"assistant", "content":text}));
+                        input.push(serde_json::json!({"role":"user", "content":nudge}));
+                        continue;
+                    }
+                    smart_harness::Control::Answer => (text, crate::TurnEndReason::Completed),
+                    smart_harness::Control::Finish { text, reason } => (text, reason),
+                };
+                if let Some(slot) = &mut end_reason {
+                    **slot = Some(reason);
+                }
+                let text = finalize_final_text(
+                    text,
+                    workspace,
+                    &caveats.fs_read,
+                    turn_start_head.as_deref(),
+                    disclosure,
+                );
+                harness.outcome(reason, &text)?;
+                return Ok((text, false, accumulated_usage, hallucination_count));
+            }
+
             if !is_cancelled(cancel)
                 && readonly_completion_pending(prompt_disposition, &nudge_classifier, &text)
             {
@@ -10207,6 +10754,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         let validated = match tools::validate_tool_call_batch(&extracted, true) {
             Ok(v) => v,
             Err(tools::BatchRejection::CorrelationImpossible(reason)) => {
+                if let Some(harness) = smart_harness {
+                    harness.reject_tools(&reason, false)?;
+                }
                 // A missing/blank/duplicate call id: a `function_call_output`
                 // cannot be correlated. Abort the turn — fabricating an id only
                 // produces a provider 400 or a silent mispairing. Nothing was
@@ -10214,6 +10764,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 return Err(anyhow::anyhow!("malformed provider output: {reason}"));
             }
             Err(tools::BatchRejection::ContentInvalid(reason)) => {
+                if let Some(harness) = smart_harness {
+                    harness.reject_tools(&reason, true)?;
+                }
                 // ids are valid + unique → echo the calls and a correctly keyed
                 // rejection per call, then re-dispatch so the model can retry.
                 for item in &echo {
@@ -10240,15 +10793,24 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                             Some(0),
                         ));
                     }
-                    input.push(serde_json::json!({
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": format!("tool-call batch rejected before execution: {reason}"),
-                    }));
+                    smart_harness::push_tool_message(
+                        &mut input,
+                        serde_json::json!({
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": format!("tool-call batch rejected before execution: {reason}"),
+                        }),
+                        smart_harness,
+                        true,
+                        "(rejected tool-call batch)",
+                    )?;
                 }
                 continue;
             }
         };
+        if let Some(harness) = smart_harness {
+            harness.tool_dispatch(&validated)?;
+        }
         // Every call is valid: echo the reasoning + function_call items (in output
         // order, so each call keeps its required reasoning item), then execute.
         for item in &echo {
@@ -10291,11 +10853,17 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
-                input.push(serde_json::json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": steer,
-                }));
+                smart_harness::push_tool_message(
+                    &mut input,
+                    serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": steer,
+                    }),
+                    smart_harness,
+                    true,
+                    name,
+                )?;
                 continue;
             }
             record_organic_note_use(name, &note_sink, &mut note_nudge);
@@ -10353,6 +10921,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
+                        smart_harness,
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
                         // Reborrow + re-coerce: shortens the trait-object
@@ -10393,7 +10962,12 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 )
                 .await
                 else {
-                    return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                    return Ok((
+                        smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                        false,
+                        accumulated_usage,
+                        hallucination_count,
+                    ));
                 };
                 result
             };
@@ -10412,7 +10986,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             repeat_calls.record(name, &args, ok, &result);
-            append_clean_build_warning(&mut input, &mut clean_build, &args);
+            append_clean_build_warning(&mut input, &mut clean_build, &args, smart_harness)?;
             record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
             record_phantom_reach(
                 &mut phantom_reaches,
@@ -10423,12 +10997,21 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 advertise_team,
             );
             observed_paths.record(&result, &mut observed_resolver);
-            input.push(serde_json::json!({
-                "type": "function_call_output",
-                "call_id": call_id,
-                // Step 26.3 (#584): see the Ollama path (Responses output shape).
-                "output": maybe_offload_tool_result(name, result, tool_offload, spill_store, disclosure),
-            }));
+            smart_harness::push_tool_message(
+                &mut input,
+                serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    // Step 26.3 (#584): see the Ollama path (Responses output shape).
+                    "output": smart_harness::tool_result(name, result, tool_offload, spill_store, disclosure, smart_harness)?,
+                }),
+                smart_harness,
+                tools::is_context_remaining_call(name),
+                name,
+            )?;
+        }
+        if let Some(harness) = smart_harness {
+            harness.record_responses_messages(instructions.as_deref(), &input)?;
         }
     }
 
@@ -10438,6 +11021,28 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // count does not include this extra tools-disabled completion.
     let cap_accumulated = accumulated_usage;
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    if let Some(harness) = smart_harness {
+        harness.record_responses_messages(instructions.as_deref(), &input)?;
+        let text = cap_exit_fallback(
+            max_tool_rounds,
+            accumulated_usage,
+            repeat_calls.total_failures(),
+            progress.as_deref(),
+        );
+        let text = finalize_final_text(
+            text,
+            workspace,
+            &caveats.fs_read,
+            turn_start_head.as_deref(),
+            disclosure,
+        );
+        harness.outcome(crate::TurnEndReason::RoundCap, &text)?;
+        if let Some(slot) = &mut end_reason {
+            **slot = Some(crate::TurnEndReason::RoundCap);
+        }
+        return Ok((text, false, accumulated_usage, hallucination_count));
+    }
+
     let observed = observed_paths.into_vec();
     input.push(serde_json::json!({
         "role": "user",
@@ -10476,9 +11081,15 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 summarizer,
                 compress_state,
                 color,
+                smart_harness,
             );
             let Some(outcome) = cancellable(cancel, compression).await else {
-                return Ok((String::new(), false, accumulated_usage, hallucination_count));
+                return Ok((
+                    smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                    false,
+                    accumulated_usage,
+                    hallucination_count,
+                ));
             };
             summary_rejection = outcome.rejection();
         }
@@ -10536,34 +11147,41 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // transient transport failures exactly like every round, so a 500 / timeout /
     // reset on the LAST request no longer discards the turn after all tool rounds
     // were spent.
-    let json =
-        match dispatch_responses_json(&client, &responses_url, api_key, &validated, &retry, color)
-            .await
-        {
-            Ok(json) => json,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "Responses cap-exit summary dispatch failed; returning captured progress"
-                );
-                let text = finalize_final_text(
-                    cap_exit_fallback(
-                        max_tool_rounds,
-                        cap_accumulated,
-                        repeat_calls.total_failures(),
-                        progress.as_deref(),
-                    ),
-                    workspace,
-                    &caveats.fs_read,
-                    turn_start_head.as_deref(),
-                    disclosure,
-                );
-                if let Some(slot) = &mut end_reason {
-                    **slot = Some(crate::TurnEndReason::RoundCap);
-                }
-                return Ok((text, false, accumulated_usage, hallucination_count));
+    let json = match dispatch_responses_json(
+        &client,
+        &responses_url,
+        api_key,
+        &validated,
+        &retry,
+        color,
+        smart_harness,
+    )
+    .await
+    {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "Responses cap-exit summary dispatch failed; returning captured progress"
+            );
+            let text = finalize_final_text(
+                cap_exit_fallback(
+                    max_tool_rounds,
+                    cap_accumulated,
+                    repeat_calls.total_failures(),
+                    progress.as_deref(),
+                ),
+                workspace,
+                &caveats.fs_read,
+                turn_start_head.as_deref(),
+                disclosure,
+            );
+            if let Some(slot) = &mut end_reason {
+                **slot = Some(crate::TurnEndReason::RoundCap);
             }
-        };
+            return Ok((text, false, accumulated_usage, hallucination_count));
+        }
+    };
     // Fail closed on provider output: unusable text never becomes the model's
     // answer. At this already-reached cap, however, the deterministic progress
     // handoff is still a successful paused turn so the interactive caller can

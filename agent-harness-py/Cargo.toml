@@ -1,0 +1,21 @@
+[package]
+name = "agent-harness-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Composable Python bindings for the agent-frame kernel and smart harness"
+readme = "README.md"
+publish = false
+
+[dependencies]
+agent-frame = { path = "../agent-frame" }
+agent-harness = { workspace = true }
+content-addressable = { workspace = true }
+pyo3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

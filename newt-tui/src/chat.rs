@@ -2,6 +2,7 @@ use super::*;
 use newt_core::agentic::chat_complete_with_prompt_and_artifacts;
 
 mod navigation_execution;
+mod smart_sessions;
 use navigation_execution::handle_nav_command;
 mod background_warmup;
 use background_warmup::{
@@ -1377,6 +1378,21 @@ fn session_body(
     let key_path = newt_identity::default_key_path().ok();
     let mut cap =
         SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace, None);
+    let smart_startup_caveats = cap.caveats().clone();
+    let smart_config = cfg.smart_harness.clone().filter(|config| config.enabled);
+    if let Some(config) = smart_config.as_ref() {
+        newt_core::agentic::smart_harness::validate_isolation_runtime()?;
+        // Local MCP processes inherit this capability when the pool starts.
+        // Validate it before spawning them, as well as each turn's narrower
+        // authority when its session opens and tools dispatch.
+        config.directory(&newt_core::config::HarnessLaunch {
+            workspace: std::path::Path::new(workspace),
+            caveats: cap.caveats(),
+            frame_dir: None,
+            resume_from: None,
+            hermetic: false,
+        })?;
+    }
     // Session working style. This never grants authority; plan/diagnose only
     // narrow the existing prompt-disposition and caveat boundaries.
     let mut active_operating_mode = OperatingMode::Chat;
@@ -1757,6 +1773,7 @@ fn session_body(
             cap_cache.get(&cap_id),
         )
     };
+    let mut smart_sessions = smart_sessions::Sessions::new(smart_startup_caveats);
     let mut memory = {
         let mut mgr = newt_core::MemoryManager::new();
         // Soul provider first — sets the frozen identity block.
@@ -1812,19 +1829,22 @@ fn session_body(
             // no-op on a non-project dir; drift-cached so a re-launch is cheap.
             mgr.add_provider(newt_core::ProjectMapProvider::new());
         }
-        // History provider based on config.
-        match mem_cfg.provider {
-            newt_core::MemoryProviderKind::TokenBudget => {
-                mgr.add_provider(newt_core::TokenBudget::new(mem_budget, 0.80));
-            }
-            newt_core::MemoryProviderKind::Summarizing => {
-                // Step 18.5 (#247): the provider delegates to the shared 18.4
-                // compression pipeline, so it takes the SAME async summarizer
-                // the loop uses — one HTTP wiring, one redaction + marker
-                // path. (The old sync closure here blocked inside `sync_turn`
-                // — the contract violation this step deletes.) Captured at
-                // session start; model switches apply on next session.
-                let s =
+        // Smart mode selects from retained originals at the frame boundary.
+        if smart_config.is_some() {
+            mgr.add_provider(newt_core::RollingWindow::new(usize::MAX));
+        } else {
+            match mem_cfg.provider {
+                newt_core::MemoryProviderKind::TokenBudget => {
+                    mgr.add_provider(newt_core::TokenBudget::new(mem_budget, 0.80));
+                }
+                newt_core::MemoryProviderKind::Summarizing => {
+                    // Step 18.5 (#247): the provider delegates to the shared 18.4
+                    // compression pipeline, so it takes the SAME async summarizer
+                    // the loop uses — one HTTP wiring, one redaction + marker
+                    // path. (The old sync closure here blocked inside `sync_turn`
+                    // — the contract violation this step deletes.) Captured at
+                    // session start; model switches apply on next session.
+                    let s =
                     // The same capability-derived context figure the provider
                     // budget uses — the summary request must not be silently
                     // truncated at Ollama's default window (F5).
@@ -1838,10 +1858,11 @@ fn session_body(
                         Some(mem_budget),
                         color,
                     ));
-                mgr.add_provider(s);
-            }
-            _ => {
-                mgr.add_provider(newt_core::RollingWindow::new(mem_cfg.window));
+                    mgr.add_provider(s);
+                }
+                _ => {
+                    mgr.add_provider(newt_core::RollingWindow::new(mem_cfg.window));
+                }
             }
         }
         // NoteStore is always active — manages system-prompt injection only.
@@ -3331,6 +3352,14 @@ fn session_body(
                         || slash_word == "compact"
                         || slash_word.starts_with("compact ")
                     {
+                        if smart_config.is_some() {
+                            print_newt(
+                                "Smart harness selects context before each request; originals remain in the durable frame.",
+                                color,
+                                verbose,
+                            );
+                            continue;
+                        }
                         // Manual compression (Step 18.6, #247): the SAME
                         // prune → boundary → redacted summary → marker
                         // pipeline the loop's triggers call, run because the
@@ -4271,7 +4300,7 @@ fn session_body(
                         // /restart) extract as before; 19.4: extraction runs BEFORE
                         // the reset below wipes the history it reads, and failure
                         // never blocks the reset.
-                        if reason != "start" {
+                        if reason != "start" && smart_config.is_none() {
                             let close_complete = build_session_summarizer(
                                 &sum_cfg,
                                 &cfg,
@@ -7117,16 +7146,18 @@ fn session_body(
                     // The same effective context cap the main loop sends — the
                     // summary request must not be silently truncated at Ollama's
                     // default window (F5).
-                    let loop_summarizer = build_session_summarizer(
-                        &sum_cfg,
-                        &cfg,
-                        &inf_url,
-                        &inf_model,
-                        inf_kind,
-                        &inf_key,
-                        eff_num_ctx,
-                        color,
-                    );
+                    let loop_summarizer = smart_config.is_none().then(|| {
+                        build_session_summarizer(
+                            &sum_cfg,
+                            &cfg,
+                            &inf_url,
+                            &inf_model,
+                            inf_kind,
+                            &inf_key,
+                            eff_num_ctx,
+                            color,
+                        )
+                    });
                     // Per-turn tool-event recorder (Step 17.6, #246): the
                     // loop pushes one event per tool call; the save site
                     // persists them into the turn's `events` column.
@@ -7430,6 +7461,31 @@ fn session_body(
                     // the life of the process.
                     let _turn_binding =
                         crate::session_worker::bind_turn(tabs.active().session_id());
+                    let turn_smart_harness = if let Some(config) = &smart_config {
+                        let launch = newt_core::config::HarnessLaunch {
+                            workspace: std::path::Path::new(workspace),
+                            caveats: &turn_caveats,
+                            frame_dir: None,
+                            resume_from: None,
+                            hermetic: false,
+                        };
+                        match smart_sessions.get(
+                            (&active_conversation_id, messages.len() > 2),
+                            config,
+                            &launch,
+                            &inf_url,
+                            inf_kind,
+                            choice.api,
+                        ) {
+                            Ok(harness) => Some(harness),
+                            Err(error) => {
+                                print_newt(&format!("smart harness: {error}"), color, verbose);
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let response = with_live_spill_watch(
                         interruptible,
                         &turn_cancel,
@@ -7439,6 +7495,7 @@ fn session_body(
                             tokio::task::block_in_place(|| {
                                 rt.block_on(chat_complete_with_prompt_and_artifacts(
                                     ChatCtx {
+                                        smart_harness: turn_smart_harness.as_deref(),
                                         rewrites_history: turn_rewrites_history,
                                         url: &inf_url,
                                         model: &inf_model,
@@ -7556,7 +7613,7 @@ fn session_body(
                                         // available in both memory disclosure modes.
                                         memory_source: Some(&memory_source),
                                         // Summarize-don't-discard (Step 18.4, #247).
-                                        summarizer: Some(&*loop_summarizer),
+                                        summarizer: loop_summarizer.as_deref(),
                                         compress_state: Some(&mut compress_state),
                                         tool_events: Some(&mut turn_tool_events),
                                         phantom_reaches: Some(&mut turn_phantom_reaches),
@@ -8123,6 +8180,16 @@ fn session_body(
                                     }
                                 }
                                 print_metrics(&metrics, color);
+                                if let Some(harness) = &turn_smart_harness {
+                                    match harness.head() {
+                                        Ok(head) => {
+                                            print_newt(&format!("frame: {head}"), color, verbose);
+                                        }
+                                        Err(error) => {
+                                            print_newt(&format!("frame: {error}"), color, verbose);
+                                        }
+                                    }
+                                }
                                 // Append to usage log and enforce rotation policy.
                                 if let Some(log) = newt_core::Config::user_config_path()
                                     .map(|p| p.with_file_name("usage.jsonl"))
@@ -8256,7 +8323,7 @@ fn session_body(
     // 19.4: close-time extraction on a clean exit only — the EMFILE/panic
     // crash breaks above leave `clean_exit` false (a degraded terminal does
     // not need one more network round-trip). Failure never blocks exit.
-    if clean_exit {
+    if clean_exit && smart_config.is_none() {
         let close_complete = build_session_summarizer(
             &sum_cfg,
             &cfg,

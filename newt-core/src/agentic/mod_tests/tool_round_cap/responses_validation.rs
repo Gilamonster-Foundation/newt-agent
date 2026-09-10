@@ -138,6 +138,7 @@ async fn assert_validation_blocks_dispatch(
             &validated,
             &tui_retry_policy(&url),
             false,
+            None,
         )
         .await;
     }
@@ -268,6 +269,7 @@ async fn responses_valid_request_dispatches_exactly_once() {
         &validated,
         &tui_retry_policy(&url),
         false,
+        None,
     )
     .await
     .expect("the validated request dispatches");

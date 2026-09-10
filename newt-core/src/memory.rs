@@ -548,7 +548,7 @@ impl MemoryProvider for RollingWindow {
         self.history.push((user.to_string(), assistant.to_string()));
         // Keep only the last max_turns entries in storage too, so memory
         // doesn't grow unboundedly over very long sessions.
-        if self.history.len() > self.max_turns * 2 {
+        if self.history.len() > self.max_turns.saturating_mul(2) {
             let drain_to = self.history.len() - self.max_turns;
             self.history.drain(..drain_to);
         }

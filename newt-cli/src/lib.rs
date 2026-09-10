@@ -792,8 +792,8 @@ pub enum Command {
     /// Solve one task HEADLESS and emit a trace (Terminal-Bench / #1419). Drives
     /// the same agentic loop the TUI runs, non-interactively, and exits. Reads
     /// the task from `--instruction-file`, runs in `--cwd`, and appends a JSONL
-    /// trace to `--events`. `--non-interactive` (the default here) runs OCAP-off
-    /// + full-access with no prompts — the benchmark bootstrap lane.
+    /// trace to `--events`. Execution is confined by default; non-interactive
+    /// operation does not grant host access.
     Solve {
         /// Workspace directory the agent runs against (default: current dir).
         #[arg(long, value_name = "DIR")]
@@ -822,6 +822,12 @@ pub enum Command {
         /// Append a JSONL trace record here.
         #[arg(long, value_name = "FILE")]
         events: Option<PathBuf>,
+        /// Enable accounted context navigation and an independent CPU adjudicator.
+        #[arg(long)]
+        smart_harness: bool,
+        /// Private frame directory (default: user config/frame/<workspace CID>).
+        #[arg(long, value_name = "DIR")]
+        frame_dir: Option<PathBuf>,
         /// Override the max tool-call rounds for this solve.
         #[arg(long, value_name = "N")]
         max_rounds: Option<usize>,
@@ -837,10 +843,10 @@ pub enum Command {
         /// when absent — never fabricated.
         #[arg(long, value_name = "SHA256")]
         model_digest: Option<String>,
-        /// Inherit nothing: every frame is genesis, and the run is bit-for-bit
-        /// reproducible. The default, and the lane benchmarks run in — a run
-        /// that exhausts its round budget here has no continuation available by
-        /// construction, so a cap exit is a failure rather than a pause.
+        /// Start without inherited frame or ambient memory inputs. Smart mode
+        /// otherwise starts a resumable frame; legacy solve keeps its default.
+        /// This bounds admitted inputs, not model nondeterminism or provider-side
+        /// transformations, and does not claim bit-for-bit inference replay.
         ///
         /// Mutually exclusive with `--resume` / `--resume-from`. Unlike the
         /// `--confined` / `--unsafe-host-exec` pair — where confinement wins
@@ -1732,6 +1738,8 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             unsafe_host_exec,
             confined,
             events,
+            smart_harness,
+            frame_dir,
             max_rounds,
             context_window,
             model_digest,
@@ -1754,6 +1762,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 unsafe_host_exec,
                 confined,
                 events,
+                smart_harness,
+                frame_dir,
+                hermetic_explicit: hermetic,
                 max_rounds,
                 context_window,
                 model_digest,
@@ -2414,6 +2425,39 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn smart_harness_flags_preserve_hermetic_resume_exclusion() {
+        let cli = Cli::try_parse_from([
+            "newt",
+            "solve",
+            "--instruction-file",
+            "task.md",
+            "--smart-harness",
+            "--frame-dir",
+            "frame",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Solve {
+                smart_harness: true,
+                frame_dir: Some(_),
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from([
+            "newt",
+            "solve",
+            "--instruction-file",
+            "task.md",
+            "--smart-harness",
+            "--hermetic",
+            "--resume-from",
+            "bafy"
+        ])
+        .is_err());
     }
 
     #[test]

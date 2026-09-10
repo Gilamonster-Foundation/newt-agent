@@ -26,6 +26,8 @@ members = [
     # must never acquire newt-core's closure, and tests/no_service_edge.rs
     # asserts it has no HTTP or inference dependency edge.
     "agent-frame",
+    "agent-harness",
+    "agent-harness-py",
     "plugins-protocol",
     "providers/openai",
     "tests/common",
@@ -97,6 +99,9 @@ homepage = "https://github.com/hartsock/newt-agent"
 authors = ["Shawn Hartsock <hartsock@users.noreply.github.com>"]
 
 [workspace.dependencies]
+agent-frame = { path = "agent-frame", version = "=0.8.0" }
+agent-harness = { path = "agent-harness", version = "=0.8.0" }
+agent-harness-py = { path = "agent-harness-py", version = "=0.8.0" }
 # Core utilities
 anyhow = "1.0"
 thiserror = "2.0"
@@ -133,7 +138,7 @@ age = { version = "0.11", features = ["armor"] }
 # what lets a deleted or reordered row be detected at all. CLAUDE.md names the
 # type for exactly this use, so this is uptake of the existing abstraction
 # rather than a hand-rolled chain beside it.
-content-addressable = { version = "0.1.2", features = ["unstable-merkle"] }
+content-addressable = { version = "0.1.2", features = ["unstable-merkle", "unstable-store"] }
 # The key-precedence ladder (#2005, docs/decisions/key_ladder_crate.md §1): who
 # owns a trigger right now, as a pure predicate over a TOML table. Extracted to
 # its own repo rather than a newt module because a foreign TUI must be able to

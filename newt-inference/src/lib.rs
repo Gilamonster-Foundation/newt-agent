@@ -21,6 +21,8 @@ pub mod palette;
 pub mod provider_plugin;
 pub mod registry;
 pub mod responses;
+/// Independent bounded auxiliary inference for the smart harness.
+pub mod smart_harness;
 
 // Step 9.7: the shared retry/backoff module moved to `newt-core` so the
 // relocated agentic loop (`newt_core::agentic`) can use it without a

@@ -31,6 +31,7 @@ const NO_CHECKS_WORKSPACE: &str = "newt-core-test-workspace-that-does-not-exist"
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        smart_harness: None,
         rewrites_history: true,
         url: server_uri,
         model: "test-model",
@@ -272,3 +273,7 @@ mod verification;
 #[cfg(test)]
 #[path = "http_spill_retrieval.rs"]
 mod spill_retrieval;
+
+#[cfg(test)]
+#[path = "http_smart_harness.rs"]
+mod smart_harness;

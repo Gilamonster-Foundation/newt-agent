@@ -1,5 +1,8 @@
 # Smart harness — design record
 
+Implementation contracts and verification evidence are recorded in
+[smart-harness-implementation.md](smart-harness-implementation.md).
+
 > **Canonical copy.** Mirrored on the knowledge board as
 > `board/newt-agent/2026-09-08_smart-harness-DESIGN-RECORD.md`; on drift, this
 > file wins because it is versioned with the code it describes. Prior decisions
