@@ -34,6 +34,14 @@
 //! [`TryFrom`] impl, which enforces the v0 contract. Deriving `Deserialize`
 //! made the constructor one path of two, and the decoder was the unchecked one.
 //!
+//! [`Packet`] is closed the same way and for the same reason. It is a
+//! [`MerkleNode`], which carries a parent *set*; v0 mints a **chain**, whose
+//! Lean referent has no multi-parent constructor. Decoding therefore lands in
+//! [`RawPacket`] and admission refuses two or more parents — the state that
+//! satisfied `is_genesis() == false` and `prior() == None` at once.
+//!
+//! [`MerkleNode`]: content_addressable::MerkleNode
+//!
 //! # The machine-checked referent
 //!
 //! Every table in [`op`] and every rule in [`unit`] mirrors
@@ -79,7 +87,7 @@ pub mod verify;
 
 pub use derivation::{Derivation, Span};
 pub use op::{Check, Op};
-pub use packet::{Packet, PacketBody, PacketId, UnitId};
+pub use packet::{Packet, PacketAdmitError, PacketBody, PacketId, RawPacket, UnitId};
 pub use root::{RootEvent, RootKind};
 pub use unit::{AdmitError, Life, RawUnit, SealError, Unit};
 pub use verify::{verify_unit, verify_unit_with, Mismatch, SourceResolver, Verified, VerifyError};

@@ -59,7 +59,8 @@
 use std::path::{Path, PathBuf};
 
 use agent_frame::{
-    verify_unit, Packet, PacketId, RawUnit, RootEvent, SourceResolver, Unit, UnitId, VerifyError,
+    verify_unit, Packet, PacketAdmitError, PacketId, RawPacket, RawUnit, RootEvent, SourceResolver,
+    Unit, UnitId, VerifyError,
 };
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
@@ -185,9 +186,23 @@ impl FrameStore {
         })
     }
 
+    /// Load and **admit** a packet — the same two halves as [`Self::unit`].
+    ///
+    /// A stored node can be perfectly well addressed and still not be a v0
+    /// packet: `MerkleNode` carries a parent set, and a two-parent node hashes
+    /// to a real id, files under it, and passes the id check. Admission is what
+    /// refuses it, so `parents` can no longer report a packet with two parents
+    /// as an origin.
     fn packet(&self, id: &PacketId) -> Result<Packet> {
         self.read_node(id.as_content_id(), |bytes| {
-            serde_json::from_slice(bytes).context("decoding the stored packet")
+            let raw: RawPacket =
+                serde_json::from_slice(bytes).context("decoding the stored packet")?;
+            // `context`, not `anyhow!("{e}")`: it keeps the typed
+            // `PacketAdmitError` in the chain, which is how `parents` tells
+            // "these bytes are not a packet at all" apart from "they are a
+            // packet and I refused it".
+            Packet::try_from(raw)
+                .context("the stored packet is not admissible under the v0 contract")
         })
     }
 }
@@ -530,6 +545,11 @@ fn run_parents(cid: &str, frame: Option<PathBuf>, json: bool) -> Result<i32> {
     // and fall back to reading a unit — the id carries no type tag, so there is
     // nothing to branch on but the read.
     let report = match store.packet(&pid) {
+        // The subject decoded as a packet and was REFUSED. That is a verdict
+        // about the packet, not evidence it might be a unit — falling through
+        // here would report an "unknown field payload" decode error for a node
+        // whose real defect is that it forks the chain.
+        Err(e) if e.downcast_ref::<PacketAdmitError>().is_some() => return Err(e),
         Ok(p) => {
             let units: Vec<String> = p.units().iter().map(ToString::to_string).collect();
             match p.prior() {

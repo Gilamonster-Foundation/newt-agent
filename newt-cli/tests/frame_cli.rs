@@ -312,6 +312,138 @@ fn an_unreadable_subject_is_an_error_not_a_genesis() {
     assert_eq!(v["parent"], gid);
 }
 
+/// **An unresolvable root is reported, not omitted.** The store is the layer
+/// that owns root resolution — `agent-frame`'s admission proves only that the
+/// id is well formed, and `verify_unit` never touches it.
+///
+/// So the distinction has to be visible here or nowhere: a unit whose root
+/// event is absent still VERIFIES (its source, span and elided claims are all
+/// true) while `root_unresolved` says the provenance could not be followed.
+/// Reporting a verified unit with silently missing `root_kind` would let a
+/// reader take a green verdict for a provenance statement it never made.
+#[test]
+fn a_root_that_does_not_resolve_is_reported_not_silently_dropped() {
+    let mut n = common::newt();
+    let dir = n.home().join("frame");
+    let (uid, _, _) = seed(&dir);
+
+    // Anti-vacuous: with the root event present, it resolves and is named.
+    let v = json_of(
+        &n.args(["frame", "verify", &uid, "--json", "--frame"])
+            .arg(&dir)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    );
+    assert_eq!(v["root_kind"], "OperatorPrompt");
+    assert!(v["root_unresolved"].is_null());
+
+    // Remove only the root event. Nothing about the unit's own claims changes.
+    let root_id = v["root"].as_str().unwrap().to_string();
+    std::fs::remove_file(dir.join(format!("{root_id}.json"))).unwrap();
+
+    let mut n2 = common::newt();
+    let v = json_of(
+        &n2.args(["frame", "verify", &uid, "--json", "--frame"])
+            .arg(&dir)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    );
+    assert_eq!(
+        v["verified"], true,
+        "the unit's own claims still re-derive: the root is not one of them"
+    );
+    assert_eq!(v["root"], root_id, "the id is still reported");
+    assert!(
+        v["root_kind"].is_null(),
+        "nothing may be claimed about an event that was not read: {v}"
+    );
+    assert!(
+        v["root_unresolved"].is_string(),
+        "the failure to resolve must be SAID, not left as an absent field: {v}"
+    );
+}
+
+/// **A two-parent node is not an origin, and must not render as one.**
+///
+/// The regression this holds: while `Packet` derived `Deserialize`, a Merkle
+/// node with two parents decoded straight into a trusted `Packet`. `prior()`
+/// returned `None` — it names a link only when there is exactly one — so this
+/// command reported `outcome: "genesis"`, *"no parents: this frame is an
+/// origin, and the chain ends here"*, of a packet with two.
+///
+/// That is the third outcome this file exists to keep apart, in its worst form:
+/// not "I could not resolve it" rendered as an origin, but "I dropped the links
+/// I did resolve" rendered as an origin. The node here is legitimately
+/// addressed and filed under its true id, so the store's own id check passes
+/// and only admission can object.
+#[test]
+fn a_two_parent_node_is_refused_not_reported_as_genesis() {
+    let mut n = common::newt();
+    let dir = n.home().join("frame");
+    let (_, head, gid) = seed(&dir);
+
+    // A real DAG node over the two packets the seed laid down.
+    let forked = agent_frame::RawPacket::new(
+        agent_frame::PacketBody { units: vec![] },
+        [
+            head.parse::<agent_frame::PacketId>()
+                .unwrap()
+                .into_content_id(),
+            gid.parse::<agent_frame::PacketId>()
+                .unwrap()
+                .into_content_id(),
+        ],
+    );
+    assert_eq!(forked.parents().len(), 2, "the fixture must really fork");
+    let fid = content_addressable::ContentAddressable::content_id(&forked).unwrap();
+    std::fs::write(
+        dir.join(format!("{fid}.json")),
+        serde_json::to_vec(&forked).unwrap(),
+    )
+    .unwrap();
+
+    // Anti-vacuous: the one-parent sibling in the same store still answers.
+    let v = json_of(
+        &n.args(["frame", "parents", &head, "--json", "--frame"])
+            .arg(&dir)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    );
+    assert_eq!(
+        v["outcome"], "parent",
+        "the honest chain link still reports"
+    );
+
+    // The forked node: a loud failure, never `genesis`.
+    let mut n2 = common::newt();
+    let out = n2
+        .args(["frame", "parents", &fid.to_string(), "--json", "--frame"])
+        .arg(&dir)
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("genesis"),
+        "a two-parent node must not render as an origin: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("CHAIN"),
+        "the refusal must say what was wrong with it: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A unit is a leaf. `parents` names what its derivation addresses and follows
 /// neither.
 #[test]

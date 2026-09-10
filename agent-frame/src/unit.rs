@@ -24,6 +24,34 @@
 //! needs the bytes — so it is checked by [`crate::verify`], and the negative
 //! case is tested there.
 //!
+//! # What admission does NOT prove about `root`
+//!
+//! Stated because the omission is easy to read as an oversight, and because a
+//! boundary whose limits are undocumented gets trusted for more than it checks.
+//!
+//! Admission establishes that `root` is **present and is a syntactically valid
+//! dag-cbor-profile [`ContentId`]**. It establishes nothing else. In
+//! particular it does not establish that the id resolves to a stored
+//! [`crate::RootEvent`], and a `RawUnit` naming an id nothing ever minted
+//! admits — and verifies — exactly like one that names a real event.
+//!
+//! That is not a gap to be closed here. Resolving an id needs a store, and this
+//! crate has none; giving it one to answer a structural question is v0 growing
+//! the storage service its scope refuses. It is the same shape as the span
+//! rule one paragraph up: the check exists, and it lives where the data does.
+//!
+//! **The layer that owns it is the store.** `newt frame`'s `FrameStore`
+//! resolves the root and reports `root_kind` / `root_seq` / `root_content`
+//! when it can and `root_unresolved` when it cannot — never a silent absence,
+//! which is the same discipline `parents` applies to a missing link.
+//!
+//! Read together with the Lean referent this is a **weakening paired with a
+//! strengthening**. `fabricated u := u.root.isNone` is unrepresentable in Rust,
+//! because `root` is mandatory rather than an `Option`. What replaces the
+//! orphan is a root that *dangles*, which the Lean model has no way to express
+//! — its `Root` is an inhabitant, not a reference. `agent-frame` is stricter
+//! about presence and cannot be strict about resolution.
+//!
 //! # Identity is the derivation, not the lifecycle
 //!
 //! [`Unit::id`] is the id of the [`Derivation`]. `life` is deliberately outside

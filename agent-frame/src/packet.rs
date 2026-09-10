@@ -14,6 +14,27 @@
 //! crate that owns id-minting. Genesis is the empty parent set — the same fact
 //! the old `prior: None` encoded, expressed in the vocabulary the rest of the
 //! line already speaks.
+//!
+//! # Borrowing a DAG node does not make v0 a DAG
+//!
+//! [`MerkleNode`] carries a parent *set*, because a Merkle DAG node does. v0
+//! mints a **chain**: the referent is `formal/ContextOps/Basic.lean`, whose
+//! `Chain` has exactly two constructors — `genesis (units)` and
+//! `sealed (prior : Chain) (units)`. There is no multi-parent constructor to
+//! correspond to.
+//!
+//! So [`Packet`] does **not** implement [`serde::Deserialize`], for the same
+//! reason [`crate::Unit`] does not. Foreign bytes decode to [`RawPacket`] — an
+//! ordinary untrusted DAG node — and cross into a `Packet` only through the
+//! fallible [`TryFrom`] below, which admits zero parents or exactly one.
+//!
+//! The state that closes is a real one, not a hypothetical: a decoded
+//! two-parent node satisfied `is_genesis() == false` *and* `prior() == None`
+//! simultaneously. Neither constructor can mint that, and `newt frame parents`
+//! rendered it as `outcome: "genesis"` — "no parents: this frame is an origin,
+//! and the chain ends here" — of a packet with two. A forensic surface that
+//! reports the absence of a link it silently dropped is worse than one that
+//! refuses to answer.
 
 use std::collections::BTreeSet;
 
@@ -92,9 +113,41 @@ pub struct PacketBody {
 ///
 /// Identity is over the whole node — payload and parent links together — so a
 /// packet cannot be re-parented without changing its id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct Packet(MerkleNode<PacketBody>);
+
+/// The transparent decode target: **an untrusted DAG node**.
+///
+/// Deliberately the [`MerkleNode`] itself rather than a fresh DTO. A `RawUnit`
+/// had to be minted because a `Unit` is not structurally a plain record of its
+/// own fields; a raw packet *is* exactly a Merkle node with a `PacketBody`
+/// payload, and standing a second type up beside one that already has the right
+/// shape and the right wire form is the sprawl this crate is written against.
+///
+/// It asserts nothing: the parent set may hold any number of links, which is
+/// what gives `TryFrom<RawPacket> for Packet` something to refuse.
+pub type RawPacket = MerkleNode<PacketBody>;
+
+/// Why a decoded packet was refused admission.
+///
+/// Named apart from [`crate::AdmitError`] rather than folded into it: a reader
+/// of a log needs to know whether the thing that failed the v0 contract was a
+/// unit or a packet, and a shared enum answers that only by which variant fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PacketAdmitError {
+    /// The node has more than one parent. v0 mints a chain, not a DAG.
+    #[error(
+        "decoded packet has {parents} parents: v0 mints a CHAIN, so a packet has zero \
+         parents (genesis) or exactly one. A node with several has no single `prior`, \
+         so it is neither genesis nor following — a third state no constructor can mint \
+         and no forensic reader can name."
+    )]
+    NotAChain {
+        /// How many parent links the decoded node carried.
+        parents: usize,
+    },
+}
 
 impl Packet {
     /// A packet with no predecessor.
@@ -149,6 +202,28 @@ impl Packet {
     /// Propagates an encoding failure from the canonical form.
     pub fn id(&self) -> Result<PacketId, ContentError> {
         self.0.id().map(PacketId::from)
+    }
+}
+
+impl TryFrom<RawPacket> for Packet {
+    type Error = PacketAdmitError;
+
+    /// **The only way in from foreign bytes.**
+    ///
+    /// One rule, because the chain has one shape: at most one parent. Nothing
+    /// else about a decoded packet is a claim this layer can check — whether the
+    /// units it names exist, or admit, needs a store, and inventing one here
+    /// would be v0 growing a storage service to answer a structural question.
+    ///
+    /// # Errors
+    ///
+    /// [`PacketAdmitError::NotAChain`] when the node carries two or more parents.
+    fn try_from(raw: RawPacket) -> Result<Self, Self::Error> {
+        let parents = raw.parents().len();
+        if parents > 1 {
+            return Err(PacketAdmitError::NotAChain { parents });
+        }
+        Ok(Self(raw))
     }
 }
 

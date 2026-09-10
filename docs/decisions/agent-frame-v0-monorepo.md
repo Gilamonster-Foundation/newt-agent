@@ -136,6 +136,58 @@ vocabulary the rest of the line speaks.
 one type and a packet id fitted a unit slot with nothing to say about it. They
 are newtypes now.
 
+**C5 — C2 was fixed on `Unit` and left open on `Packet`.** Closing the unit's
+decoder while `Packet` still derived `Deserialize` fixed one instance of a
+defect class rather than the class. `Packet` is a `MerkleNode`, which carries a
+parent **set**; v0 mints a **chain**, and the referent's `Chain` is
+`genesis (units)` or `sealed (prior : Chain) (units)` with no multi-parent
+constructor. Foreign bytes could hand a packet two parents, and the result
+satisfied both halves of a contradiction at once:
+
+```
+parents      = 2
+is_genesis() = false        <- it has parents
+prior()      = None         <- ...but not exactly one, so no link is named
+```
+
+Neither `genesis` nor `following` can mint that. The decoder could, and the
+consequence reached the forensic surface: `newt frame parents` reported
+`outcome: "genesis"` — *"no parents: this frame is an origin, and the chain ends
+here"* — of a packet with two. That is the **three outcomes, never conflated**
+table in *Forensics is a first-class surface* below, violated in its worst
+form. An absent parent meaning "origin" and one meaning "I could not resolve it"
+are the two this record set out to keep apart; this was a third, worse than
+either: *"I dropped the links I did resolve."*
+
+The repair is the one `Unit` already had. `Packet` no longer derives
+`Deserialize`; bytes decode to `RawPacket` — deliberately the `MerkleNode`
+itself, not a fresh DTO, since a raw packet **is** an untrusted DAG node — and
+`TryFrom<RawPacket> for Packet` admits zero parents or exactly one, refusing
+anything more with `PacketAdmitError::NotAChain`. `agent-frame/tests/admission.rs`
+drives it across the real `serde_json` boundary, and
+`newt-cli/tests/frame_cli.rs` proves the store now refuses a two-parent node
+that is legitimately addressed and filed under its true id — so the store's own
+id check passes and only admission can object.
+
+**What admission proves about `root`, and what it does not.** Admission
+establishes that `root` is present and is a well-formed dag-cbor `ContentId`.
+It does not establish that the id resolves to a `RootEvent`, and neither does
+`verify_unit` — a unit naming an id nothing ever minted admits and verifies
+exactly like one naming a real event, which
+`neither_admission_nor_verification_resolves_the_root` makes executable.
+Resolving an id needs a store, and giving the kernel one to answer a structural
+question is v0 growing the storage service its scope refuses. **The store owns
+it**: `newt frame` reports `root_kind` / `root_seq` / `root_content` when it
+resolves and `root_unresolved` when it cannot — never a silent absence, the
+same discipline `parents` applies to a missing link, and now covered by
+`a_root_that_does_not_resolve_is_reported_not_silently_dropped`.
+
+Read against the referent this is a **weakening paired with a strengthening**:
+`fabricated u := u.root.isNone` is unrepresentable in Rust because `root` is
+mandatory, and what replaces the orphan is a root that may *dangle* — which the
+Lean model cannot express, its `Root` being an inhabitant rather than a
+reference.
+
 ## Forensics is a first-class surface
 
 The operator requirement is that a consumer must be **able** to establish which
@@ -270,6 +322,22 @@ the build, and nothing in CI would have caught it.
 `agent-frame/tests/kernel_laws.rs` asserts the Rust obeys the same ones, naming
 the Lean theorem per test. Either half alone is a claim. The `formal` CI job
 makes the Lean half real — a `formal/` folder nobody builds is decoration.
+
+**Where the Rust deliberately differs from the referent.** Matching theorem and
+test names are not correspondence; these are the places the predicates actually
+diverge. Most are strengthenings; the three that are not are marked, and each is
+either unreachable in v0 or owned by a named layer above the kernel.
+
+| Lean | Rust | direction |
+|---|---|---|
+| `sealUnit` accepts every `Op` | `Unit::seal` and admission accept `Elide` only | stronger — `no_generation_all_checkable` is a mode in Lean, the only mode here |
+| `Unit.addressed : Bool`, set by the constructor | no such field; `{source, span, elided}` is a *resolvable* address | stronger — `seal_is_addressed` becomes "the address resolves", checked by `verify_unit` |
+| `root : Option Root`; `fabricated u := u.root.isNone` | `root : ContentId`, mandatory | stronger on presence — `orphan_is_fabricated` has no Rust twin because the orphan is unrepresentable |
+| `Root` is an inhabitant | `root` is a *reference* that may dangle | **weaker** — resolution is the store's, not the kernel's; see C5 above |
+| `Chain.wf` is a hypothesis carried on the chain theorems | every `Unit` that exists has `depth <= 1`, on both construction paths | stronger — `chain_depth_le_one` holds unconditionally rather than under a premise |
+| `Chain` = `genesis \| sealed (prior)` | `Packet` = `MerkleNode` admitted at 0 or 1 parents | equal, **as of C5**; it was weaker before |
+| `depthAfter` over `Nat` | `depth_after` over `u32`, saturating | weaker only at `u32::MAX`, unreachable in v0 — `the_depth_arithmetic_saturates_rather_than_wrapping` pins it |
+| `render`, and its four theorems | no counterpart | not implemented — v0 has no selection API, so the Lean proves more than the Rust claims |
 
 **It breaks the stack's shape, deliberately and temporarily.** `agent-bridle`,
 `agent-mesh` and `agent-store` are separate public repos on crates.io.

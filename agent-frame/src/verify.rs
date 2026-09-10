@@ -38,6 +38,15 @@
 //! directions — which is also why refusing `concise` and `generate` in v0 is
 //! not merely caution: it is what keeps regress impossible.
 //!
+//! **And it does not resolve the root.** `verify_unit` recomputes the three
+//! claims that the source bytes can settle — source, span, elided — and no
+//! others. A unit naming a root id nothing ever minted verifies exactly like
+//! one naming a real event, because the bytes in hand cannot tell them apart.
+//! [`Verified`] therefore carries no root field: reporting one would imply this
+//! function had established something about it. Root resolution belongs to
+//! whoever holds the store, and `newt frame` reports it as a separate,
+//! separately-failable fact.
+//!
 //! There is deliberately no walker here. [`Verified`] reports the source id
 //! that was checked, so a caller who wants the next link calls again with it.
 //! The recursion lives in the caller; nothing in this design forbids depth, it

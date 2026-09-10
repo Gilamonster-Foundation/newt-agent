@@ -12,7 +12,7 @@
 //! would let a pass on one read as a pass on the other.
 
 use agent_frame::{
-    Check, Life, Op, Packet, RawUnit, RootEvent, RootKind, SealError, Span, Unit, UnitId,
+    Check, Life, Op, Packet, RawPacket, RawUnit, RootEvent, RootKind, SealError, Span, Unit, UnitId,
 };
 use content_addressable::{ContentAddressable, ContentId};
 
@@ -46,6 +46,41 @@ fn generation_is_the_only_riser() {
             "generation is the only riser"
         );
     }
+}
+
+/// **The one place the Rust is not the Lean: `Nat` is unbounded and `u32` is
+/// not.** Recorded as a test rather than a comment, because an undocumented
+/// divergence from the referent is how a correspondence quietly stops being one.
+///
+/// Lean's `depthAfter .generate d = d + 1` holds for every `d`. Rust saturates,
+/// so at `u32::MAX` generation does not raise. Three things make that the right
+/// total-function choice rather than a hole:
+///
+/// * it is **unreachable in v0** — `depth_after` is only ever called as
+///   `op.depth_after(0)`, by `seal` and by admission, and both refuse
+///   `Generate` outright before reaching it;
+/// * the alternative is worse — a wrapping add would take `u32::MAX` to `0`,
+///   which *silently satisfies* `depth <= 1` by overflowing past it. Saturation
+///   fails toward the bound, wrapping fails through it;
+/// * a saturated value still refuses admission, since `depth == depth_after(0)`
+///   is the rule and no operation implies `u32::MAX`.
+#[test]
+fn the_depth_arithmetic_saturates_rather_than_wrapping() {
+    assert_eq!(
+        Op::Generate.depth_after(u32::MAX),
+        u32::MAX,
+        "saturating, NOT wrapping: a wrap to 0 would satisfy `depth <= 1` by overflow"
+    );
+    assert_eq!(Op::Elide.depth_after(u32::MAX), u32::MAX);
+
+    // Unreachable through either construction path: admission is the gate, and
+    // it compares against `depth_after(0)`.
+    let mut raw = sealed().to_raw();
+    raw.depth = u32::MAX;
+    assert!(
+        Unit::try_from(raw).is_err(),
+        "a saturated depth is still not the depth elision implies"
+    );
 }
 
 /// Lean: `elide_asserts_nothing`.
@@ -246,10 +281,13 @@ fn canonical_bytes_round_trip_and_the_id_is_stable() {
     assert_eq!(back, u);
     assert_eq!(back.id().unwrap(), id);
 
-    // Packets round-trip too, parent links included.
+    // Packets round-trip too, parent links included — and through the SAME
+    // admission boundary, since `Packet` no longer derives `Deserialize`.
+    // `admission.rs` drives what that boundary turns away.
     let p = Packet::following(Packet::genesis(vec![id]).id().unwrap(), vec![id]);
     let pw = serde_json::to_vec(&p).unwrap();
-    let pb: Packet = serde_json::from_slice(&pw).unwrap();
+    let praw: RawPacket = serde_json::from_slice(&pw).unwrap();
+    let pb = Packet::try_from(praw).expect("its own bytes admit");
     assert_eq!(pb, p);
     assert_eq!(pb.id().unwrap(), p.id().unwrap());
 }
