@@ -154,6 +154,13 @@ session. Full restoration checks the caller's current configured history cap.
 The authority-only foreign restore convenience API uses the default traversal
 cap; callers with a larger contract must use `restore_with_config`.
 
+Semantic-gather manifests count extension-matching candidates that pass the
+workspace-bound open and metadata checks. Entries denied or unreadable at those
+checks are omitted from `candidate_count`, `candidate_hash`, and `cuts`; caps
+describe that admitted set. A later content-read failure can also leave a planned
+kept entry without returned source text. Accounting for every discovered or
+unreadable entry is outside this repair.
+
 Startup can fail before an invocation is admitted, for example when its CPU
 model is absent. The operator receives that error; there is no raw reply or
 successful session to claim. An in-turn auxiliary failure retains the observed
@@ -168,8 +175,8 @@ control behavior only. They do not establish model classification quality.
 No superiority claim follows from a third class or from a clean test suite.
 
 The new accept path applies when smart mode is enabled. With smart mode
-disabled, the legacy rescue and classifier remain in use. The final-round
-narration status correction applies to both paths; this change does not claim
-to close every legacy accept-site behavior in #2239.
+disabled, the legacy rescue, classifier, and #2218 final-round narration outcome
+remain in use. Smart final-round narration is incomplete; this change does not
+claim to close every legacy accept-site behavior in #2239.
 
 License: Apache-2.0, consistent with the workspace.

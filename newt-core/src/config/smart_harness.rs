@@ -434,6 +434,10 @@ fn authority_id(context: &Value) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    fn assert_same_directory(left: &Path, right: &Path) {
+        assert_eq!(left.canonicalize().unwrap(), right.canonicalize().unwrap());
+    }
+
     #[test]
     fn configuration_is_opt_in_and_roundtrips_explicit_budgets() {
         let config: SmartHarnessConfig =
@@ -635,10 +639,7 @@ mod tests {
         std::fs::create_dir_all(workspace.join("mutable")).unwrap();
         std::fs::create_dir(paths.path().join("outside")).unwrap();
         let anchor = workspace.join("mutable/../../outside");
-        assert_eq!(
-            anchor.canonicalize().unwrap(),
-            paths.path().join("outside").canonicalize().unwrap()
-        );
+        assert_same_directory(&anchor, &paths.path().join("outside"));
         let mut caveats = crate::confined_exec::build_tool_caveats(&workspace);
         let Scope::Only(reads) = &mut caveats.fs_read else {
             panic!("fixture authority must be scoped");
@@ -663,7 +664,7 @@ mod tests {
         std::os::unix::fs::symlink(safe.path(), &mutable).unwrap();
         let anchor = private.path().join("anchor");
         std::os::unix::fs::symlink(&mutable, &anchor).unwrap();
-        assert_eq!(anchor.canonicalize().unwrap(), safe.path());
+        assert_same_directory(&anchor, safe.path());
         let mut caveats = crate::confined_exec::build_tool_caveats(workspace.path());
         let Scope::Only(reads) = &mut caveats.fs_read else {
             panic!("fixture authority must be scoped");
@@ -748,7 +749,8 @@ mod tests {
         assert_ne!(launch.authority().unwrap(), changed.authority().unwrap());
     }
 
-    #[cfg(unix)]
+    // APFS rejects invalid UTF-8 names before the authority check can run.
+    #[cfg(target_os = "linux")]
     #[test]
     fn authority_refuses_lossy_workspace_names() {
         use std::os::unix::ffi::OsStrExt;

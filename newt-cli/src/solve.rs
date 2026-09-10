@@ -589,6 +589,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
             Err(_) => None,
         },
         o_opt.and_then(|o| o.end_reason),
+        smart_harness.is_some(),
     );
     let outcome_label = solve_contract::outcome_label(terminal);
     let status = solve_contract::status_label(terminal);
