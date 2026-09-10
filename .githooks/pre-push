@@ -36,6 +36,14 @@
 #   - `just msrv` matches the "MSRV (Rust 1.88)" job (cargo +1.88 check
 #     --all-targets, so dev-deps count too — #2161; local best-effort, needs
 #     rustup + the 1.88 toolchain — CI is the hard gate)
+# PARITY EXCEPTION (#1098), deliberate and one-directional: on a push whose
+# every path is documentation, this hook runs `just docs-check` ALONE and skips
+# the cargo gates. CI still runs everything on every push, so the authoritative
+# gate is unchanged and the hook can only be MORE permissive, never less. This
+# is the direction #1098 asks for -- hook = fast pre-flight on changed code,
+# pipeline = authoritative gate -- not a hole in parity. The classification
+# fails closed; see the gate itself.
+#
 # When editing this hook, update the workflow to match.
 # When editing the workflow, update this hook to match.
 #
@@ -89,6 +97,7 @@ NET_LEAK_RE='(\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b)|(\b192\.168\.[0-9]{1,3
 # notes-scanner's RFC-1918 locality fixture). These reveal no home topology.
 NET_LEAK_ALLOW='192\.0\.2\.|198\.51\.100\.|203\.0\.113\.|127\.0\.0\.1|0\.0\.0\.0|\b10\.0\.0\.1\b|\b192\.168\.0\.1\b'
 _leaks=""
+_changed=""
 while read -r _lref _lsha _rref _rsha; do
     [ -z "$_lsha" ] && continue
     case "$_lsha" in *[!0]*) ;; *) continue ;; esac   # all-zero local = branch delete
@@ -96,6 +105,10 @@ while read -r _lref _lsha _rref _rsha; do
         *[!0]*) _range="$_rsha..$_lsha" ;;            # update: only the new commits
         *)      _range="origin/main...$_lsha" ;;      # new branch: changes since it forked main
     esac
+    # Same range the leak guard scans, reused to decide whether this push can
+    # touch a Rust build at all (see the documentation-only gate below).
+    _changed="$_changed
+$(git diff --name-only "$_range" 2>/dev/null || true)"
     # Exclude .githooks/ — these scripts legitimately contain the IP/DNS regex.
     _hits="$(git diff "$_range" -- . ':(exclude).githooks/*' 2>/dev/null \
              | grep -E '^\+' | grep -vE '^\+\+\+' \
@@ -118,6 +131,22 @@ fi
 # Ensure ~/.cargo/bin is on PATH so cargo sub-commands are found even when
 # the hook is invoked from an editor or GUI that doesn't source ~/.zshrc.
 export PATH="$HOME/.cargo/bin:$PATH"
+
+# sccache: the S3 endpoint lives in ~/.config/sccache/config, and the SCCACHE_*
+# environment variables OVERRIDE that file. Any long-lived parent — a terminal
+# multiplexer's server process, a shell started before the endpoint moved —
+# hands every child it spawns a stale endpoint, and a child that never sources
+# a login profile has no chance to repair it.
+#
+# sccache does not degrade to plain rustc when its cache is unreachable: it
+# FAILS THE BUILD. rustc exits 2 with NO diagnostics, which reads exactly like
+# a compile error and gets misfiled as "the gate failed" against whatever
+# change happened to be in flight. Observed 2026-09-09 against a dead
+# 127.0.0.1:9000 inherited from a process older than the endpoint move.
+#
+# Drop the overrides so the config file is the single source of truth.
+# Credentials (AWS_*) and RUSTC_WRAPPER are deliberately untouched.
+unset SCCACHE_ENDPOINT SCCACHE_S3_USE_SSL SCCACHE_BUCKET SCCACHE_REGION
 
 if ! command -v just >/dev/null 2>&1; then
     echo "pre-push: 'just' not found in PATH"
@@ -155,6 +184,41 @@ fi
 
 # Guard: never push a build patched onto the real brush shell (agent-bridle
 # `main`) — it reintroduces the brush git dep and breaks crates.io publish.
+
+# ── Documentation-only fast path (#1098) ──────────────────────────────────────
+# A push that cannot change a single byte of compiled output has no business
+# spending ten minutes proving the workspace still builds. Classify the pushed
+# range; if nothing in it can reach a Rust build, run the documentation gate
+# (which is the part that CAN fail on a .md change) and stop.
+#
+# FAILS CLOSED, deliberately. The fast path is taken only when the range was
+# read AND every path in it is inert. An empty list means "I could not
+# determine what changed" -- not "nothing changed" -- and falls through to the
+# full gate. An absence-check that cannot tell those apart is how this class of
+# guard dies; see the anti-vacuous note in .github/workflows/formal.yml.
+#
+# The allowlist is closed: anything unrecognised (a justfile, a workflow, a
+# .toml, a hook) is treated as build-affecting and runs everything.
+_needs_build=0
+_docs_changed=""
+while IFS= read -r _f; do
+    [ -z "$_f" ] && continue
+    case "$_f" in
+        *.md|docs/*|LICENSE|LICENSE-*|*.txt) _docs_changed="$_docs_changed $_f" ;;
+        *) _needs_build=1 ;;
+    esac
+done <<EOF
+$_changed
+EOF
+
+if [ "$_needs_build" -eq 0 ] && [ -n "$_docs_changed" ]; then
+    echo "[pre-push] documentation-only push — the cargo gates cannot observe this change."
+    for _f in $_docs_changed; do echo "             $_f"; done
+    echo "[pre-push] running just docs-check..."
+    just docs-check
+    echo "[pre-push] OK (documentation-only; fmt/clippy/test/audit/msrv/coverage skipped)"
+    exit 0
+fi
 
 echo "[pre-push] running just check..."
 just check
