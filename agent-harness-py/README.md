@@ -26,7 +26,7 @@ depth and source relationships; it does not grant host authority or verify the
 truth of a generated claim.
 
 `harness.Session` accepts JSON configuration and supplies synchronous request,
-reply, verdict, intervention, outcome, and normalized tool-dispatch recording.
+reply, verdict, intervention, outcome, and tool-lifecycle recording.
 It retains complete tool output, records navigation/adjudication requests and
 raw replies or failures, builds bounded catalogs and validated selections,
 and supports retrieval, exact replay, and restoration. `config`, `run_id`,
@@ -35,7 +35,59 @@ and supports retrieval, exact replay, and restoration. `config`, `run_id`,
 per-call deadlines, tools, and orchestration.
 `record_rendered_request` accepts canonical messages for the shared Anthropic
 renderer; already-rendered native content blocks use `record_request`.
+Send the returned receipt's `bytes` string encoded as UTF-8 unchanged. Its
+committed serialization can differ from the caller's input JSON text; do not
+serialize the input again for transmission.
 Invalid records, proposals, and stored evidence raise `ValueError`.
+
+Tool batches use the same durable contract as native Rust consumers:
+
+```python
+# messages includes the original assistant tool-call envelope.
+invocations = session.begin_tool_batch(reply, calls_json, messages_json)
+session.start_tool_call(invocations[0])  # before the host starts the effect
+result = execute_tool()                # the host owns execution and disclosure
+session.record_tool_return(invocations[0], result)  # exact observed bytes
+session.record_tool_delivery(invocations[0], provider_message_json)
+```
+
+`calls_json` contains normalized `{id, function: {name, arguments}}` records
+with object-valued arguments; keep the original provider envelopes in
+`messages_json`. Commit each return before scheduling the next sequential tool.
+Independently started calls may return in any order; deliver their provider
+envelopes in the original call order. `kind="failed"` records a typed error actually received
+from the tool; an ordinary string beginning with `Error:` remains an observed
+return. `kind="host"` identifies a host-authored result and `kind="retrieval"`
+requires this session's admitted `re_read` result. `retained_sources_json`
+links already-retained complete tool outputs to an observed return or failure.
+When output includes a transient spill pointer, first commit the raw return,
+then retain its external sources and attach them with `record_tool_sources`
+before delivery. A missing or invalid spill must not erase the observed return.
+`resolve_tool_call` closes a queued call with an explicitly host-authored
+substitute. `tool_call` returns the invocation's state and evidence CIDs.
+
+On cancellation, `interrupt_tool_batch(reason)` commits synthetic harness
+messages for unfinished protocol slots and returns the full recovery history.
+Cold restoration performs the same repair: observed returns and failures
+remain reachable, a started call without a return becomes `uncertain`, and a
+queued call becomes `not_started`. Recovery never reruns them. A return retained
+before its presentation remains reachable through the synthetic message's
+evidence pointer. A cancelled await does not prove external work stopped; a
+process can die between an effect and the commit of its return. This contract
+does not provide exactly-once external effects.
+
+Stop scheduling tools after a persistence error. Preserve the execution result
+alongside the exception in host error reporting, release the failed session,
+and recover from the actual current locator. The session refuses further
+recording after a failed publication.
+
+New runs use journal schema 2. The former `record_tool_dispatch` API is replaced
+by the lifecycle methods above. Writable restore refuses schema-1 runs because
+their checkpoints cannot establish whether unrecorded calls started; inspect
+their immutable evidence and explicitly create a new run instead. Existing
+read-only inspection and exact request replay remain available through the Rust
+forensic API and `newt frame` CLI. The Python `Session` restore methods open
+writable sessions and therefore refuse schema 1.
 
 A durable session holds exclusive execution ownership of its run. Release all
 references to the current session before restoring it; in CPython, `del session`
@@ -48,6 +100,9 @@ Call `ensure_writer()` before effects performed by the Python host. A failed che
 stops further recording on that session; release it and restore a verified current
 checkpoint. A session inherited through `fork()` cannot record or validate writer
 ownership in the child.
+After `fork`, the child must release its inherited session before opening one
+of its own. An inherited open descriptor can keep the parent's Unix lock held
+until that copy is closed, even after the parent exits.
 
 The foreign host must protect durable frame storage from its model's tools.
 Before opening or restoring a session, require disjoint scopes for the store

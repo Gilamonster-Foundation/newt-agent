@@ -75,10 +75,35 @@ checkpoint; an older checkpoint reports a conflict without selecting a divergent
 history. Stop the active writer and use the current locator to continue. To
 start independent work, create a fresh run explicitly. Read-only frame
 inspection does not acquire execution ownership. Never remove the persistent
-`locks/<run CID>` files to resolve a conflict: process exit releases the OS lock.
+`locks/<run CID>` files to resolve a conflict. The OS releases the lock when its
+last handle closes; a forked child must drop any inherited session handle too.
 A failed journal publication stops further writes from that session. Release
 it and restore the actual locator; a failure after replacement may have made a
 new checkpoint visible even though the append could not confirm durability.
+
+Tool batches are recorded before execution, with a separate occurrence identity
+for each call. The host records a start before dispatch and retains the exact
+disclosed return before display, bounded projection, or another tool. The later
+model-facing envelope has its own recorded provenance. The raw result
+is recorded before resolving any spill hints; verified external sources
+are attached afterward. A malformed or unavailable hint stops the current batch
+while preserving the raw return as observed. An ordinary returned
+string, including `Error: ...`, does not prove success or failure. Rust and
+Python hosts with an actual typed tool error can explicitly record `Failed`;
+frame persistence errors remain session errors.
+
+After an interruption, completed returns remain available. A call with a start
+but no observed return is `Uncertain`: it may have had side effects. An admitted
+call that never started is `NotStarted`. Resume fills missing provider result
+slots with explicit harness notices before a new operator message; a retained
+return without its finished presentation gets a source pointer. Recovery never
+reruns a tool and does not promise exactly-once external effects. The current
+native provider loops execute calls sequentially.
+
+Sessions now write schema 2. This unmerged experimental interface explicitly
+refuses writable restoration of schema 1 because its missing per-call records
+cannot establish what executed. Start a new run; read-only frame inspection and
+the existing exact request-replay format remain available for older records.
 See the [reusable storage contract](../../agent-harness/README.md) for filesystem,
 process lifetime, and Unix/Windows crash-durability limits.
 

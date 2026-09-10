@@ -19,16 +19,18 @@ fn harness(directory: &Path) -> (SmartHarness, content_addressable::ContentId) {
     )
 }
 
-async fn dispatch<'a>(
-    harness: &'a SmartHarness,
+async fn dispatch(
+    harness: &SmartHarness,
     workspace: &Path,
     caveats: &Caveats,
     name: &str,
     args: serde_json::Value,
-    permission_gate: Option<&'a mut dyn PermissionGate>,
+    permission_gate: Option<&mut dyn PermissionGate>,
 ) -> String {
+    let batch = harness.fixture_tool_batch(name, args.clone());
+    let invocation = batch.start(0, None).unwrap();
     let mut display = super::super::display::ToolDisplay::new(Vec::new(), false, 80, 20, false);
-    execute_tool_inner(
+    execute_tool_with_display_cancellable(
         &mut display,
         name,
         &args,
@@ -38,14 +40,17 @@ async fn dispatch<'a>(
         caveats,
         &mut NoMcp,
         ToolCollaborators {
-            smart_harness: Some(harness),
+            invocation: Some(&invocation),
             permission_gate,
             ..Default::default()
         },
         false,
         PromptDisposition::Act,
+        None,
     )
     .await
+    .unwrap()
+    .unwrap()
 }
 
 /// Grounds the smart-session authority gate in actual file operations: a
@@ -425,8 +430,10 @@ async fn smart_delegates_cannot_read_private_payloads() {
         ("git", serde_json::json!({"op":"add","paths":[marker]})),
         ("crew", serde_json::json!({"task":"read private frame"})),
     ] {
+        let batch = harness.fixture_tool_batch(name, args.clone());
+        let invocation = batch.start(0, None).unwrap();
         let mut display = super::super::display::ToolDisplay::new(Vec::new(), false, 80, 20, false);
-        let output = execute_tool_inner(
+        let output = execute_tool_with_display_cancellable(
             &mut display,
             name,
             &args,
@@ -436,15 +443,18 @@ async fn smart_delegates_cannot_read_private_payloads() {
             &caveats,
             &mut NoMcp,
             ToolCollaborators {
-                smart_harness: Some(&harness),
+                invocation: Some(&invocation),
                 git_tool: Some(&delegate),
                 crew_runner: Some(&delegate),
                 ..Default::default()
             },
             false,
             PromptDisposition::Act,
+            None,
         )
-        .await;
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             !output.contains("private generated material"),
             "{name}: {output}"

@@ -29,7 +29,7 @@ use crate::agentic::tools::{execute_tool_inner, tool_presentation};
 /// `Default` is all-`None`: the bare dispatch a test or embedder starts from.
 #[derive(Default)]
 pub(crate) struct ToolCollaborators<'a, 'gate> {
-    pub(crate) smart_harness: Option<&'a agentic::smart_harness::SmartHarness>,
+    pub(crate) invocation: Option<&'a agentic::smart_harness::ToolInvocation<'a>>,
     pub(crate) build_check_cmd: Option<&'a str>,
     /// #1947: the turn's tool ledger, distilled — what `render_report`'s
     /// capability claims are checked against.
@@ -124,6 +124,7 @@ pub async fn execute_tool(
         None,
     )
     .await
+    .expect("legacy dispatch has no durable completion writer")
     .expect("tool execution without a cancellation flag cannot be interrupted")
 }
 
@@ -188,6 +189,7 @@ pub async fn execute_tool_with_offload(
         None,
     )
     .await
+    .expect("legacy dispatch has no durable completion writer")
     .expect("tool execution without a cancellation flag cannot be interrupted")
 }
 
@@ -260,6 +262,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
         None,
     )
     .await
+    .expect("legacy dispatch has no durable completion writer")
     .expect("tool execution without a cancellation flag cannot be interrupted")
 }
 
@@ -280,7 +283,7 @@ pub(crate) async fn execute_tool_with_collaborators(
     tool_offload: bool,
     disposition: PromptDisposition,
     cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> Option<String> {
+) -> anyhow::Result<Option<String>> {
     let mut display = ToolDisplay::new(
         std::io::stdout(),
         color,
@@ -334,10 +337,12 @@ pub(super) async fn execute_tool_with_display_cancellable<W: std::io::Write + Se
     tool_offload: bool,
     disposition: PromptDisposition,
     cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> Option<String> {
+) -> anyhow::Result<Option<String>> {
     let (presentation_name, presentation_detail) =
         tool_presentation(name, args, std::path::Path::new(workspace));
     display.call(&presentation_name, &presentation_detail);
+    let invocation = collab.invocation;
+    let spill = collab.spill_store;
     let result = {
         // #1727: the row under the header is never silent while the tool is
         // in flight. The spinner is scoped to this block, so it is erased
@@ -371,8 +376,15 @@ pub(super) async fn execute_tool_with_display_cancellable<W: std::io::Write + Se
     };
     match result {
         Some(result) => {
+            if let Some(invocation) = invocation {
+                if let Err(error) = invocation.observe(&result, spill) {
+                    display.result(&result);
+                    display.result(&format!("error: tool completion failed: {error:#}"));
+                    return Err(error);
+                }
+            }
             display.result(&result);
-            Some(result)
+            Ok(Some(result))
         }
         None => {
             // The turn is being torn down — an interactive viewport painted
@@ -382,7 +394,7 @@ pub(super) async fn execute_tool_with_display_cancellable<W: std::io::Write + Se
             display.drop_completed_spill_renderer();
             let result = format!("error: {name} interrupted — tool cancelled before completion");
             display.result(&result);
-            None
+            Ok(None)
         }
     }
 }

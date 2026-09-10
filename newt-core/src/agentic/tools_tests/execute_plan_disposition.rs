@@ -25,6 +25,7 @@ async fn run_scheduled_tool(
         None,
     )
     .await
+    .expect("legacy fixture has no durable writer")
     .expect("test dispatch is not cancellable")
 }
 
@@ -93,6 +94,7 @@ async fn enter_and_exit_plan_mode_are_session_local_and_immediate() {
         None,
     )
     .await
+    .expect("legacy fixture has no durable writer")
     .expect("test dispatch is not cancellable");
     assert!(
         control_only.contains("scheduled planning"),
@@ -119,6 +121,7 @@ async fn enter_and_exit_plan_mode_are_session_local_and_immediate() {
         None,
     )
     .await
+    .expect("legacy fixture has no durable writer")
     .expect("test dispatch is not cancellable");
     assert!(
         control_only_exit.contains("exited the model-entered PLAN PHASE"),
@@ -363,6 +366,7 @@ async fn auto_mode_selector_dispatches_through_session_control_without_current_w
         None,
     )
     .await
+    .expect("legacy fixture has no durable writer")
     .unwrap();
     assert!(result.contains("current turn unchanged"), "{result}");
     assert_eq!(*control.0.lock().unwrap(), vec!["dev"]);
@@ -381,6 +385,7 @@ async fn auto_mode_selector_dispatches_through_session_control_without_current_w
         None,
     )
     .await
+    .expect("legacy fixture has no durable writer")
     .unwrap();
     assert!(unavailable.contains("/mode auto"), "{unavailable}");
 }

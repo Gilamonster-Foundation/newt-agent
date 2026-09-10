@@ -228,7 +228,8 @@ async fn pre_set_cancellation_closes_the_block_without_polling_a_mutation() {
         PromptDisposition::Act,
         Some(&cancel),
     )
-    .await;
+    .await
+    .expect("legacy fixture has no durable writer");
 
     assert!(out.is_none());
     assert!(!ws.path().join("must-not-exist.txt").exists());
@@ -394,6 +395,7 @@ async fn run_tool_captured_with_context_and_live(
         None,
     )
     .await
+    .expect("legacy fixture has no durable writer")
     .expect("uncancelled test dispatch should complete");
     let rendered = String::from_utf8(display.into_inner()).unwrap();
     (out, rendered)

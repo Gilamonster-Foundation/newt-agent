@@ -2,6 +2,10 @@
 use super::*;
 use crate::agentic::smart_harness::{AdjudicationSettings, SmartHarness};
 
+#[cfg(target_os = "linux")]
+#[path = "http_smart_completion.rs"]
+mod completion;
+
 async fn run(
     wire: &str,
     texts: &[&str],

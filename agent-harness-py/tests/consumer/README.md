@@ -22,6 +22,12 @@ drift, and refusal after stored bytes change. It also checks competing and stale
 writers leave the checkpoint unchanged, releases sessions before restoration,
 and verifies inherited-session refusal through `os.fork()` where available.
 The successful parent append grounds continued ownership after the child exits.
+The lifecycle smoke commits a real fixture effect and short return, records an
+explicit typed failure, then restores with another call started and a final call
+still queued. It checks the four distinct states, synthetic protocol repair,
+stable provider IDs, refusal to replay closed calls, and serialization/replay of
+the recorded continuation bytes. It also checks that error-shaped text alone
+does not become a typed failure.
 It uses no model, network endpoint, pytest, or terminal.
 
 The fixture calls `Session` from trusted Python code and uses temporary storage;

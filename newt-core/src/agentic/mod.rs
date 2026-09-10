@@ -3790,10 +3790,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // the first tool side effect below. A content-invalid batch leaves
         // `validated == None`; it is NOT provider-accept evidence and must not
         // ratchet the learned budget (RR1 fail-closed).
-        if let Some(calls) = validated.as_ref() {
-            if let Some(harness) = smart_harness {
-                harness.tool_dispatch(calls)?;
-            }
+        let batch = smart_harness
+            .zip(validated.as_ref())
+            .map(|(harness, calls)| harness.tool_batch(calls, &messages))
+            .transpose()?;
+        let mut tool_warnings = Vec::new();
+        if validated.is_some() {
             emit_accepted(
                 &mut on_round_usage,
                 round_usage,
@@ -3803,7 +3805,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         }
         // Phase 2: every call in the batch is valid — execute in order. `flatten`
         // yields nothing (so this runs zero tools) when the batch was rejected.
-        for (_tc, vc) in tcs.iter().zip(validated.iter().flatten()) {
+        for (call_index, (_tc, vc)) in tcs.iter().zip(validated.iter().flatten()).enumerate() {
             let name = vc.name.as_str();
             let args = vc.args.clone();
             announce_tool_activity(name);
@@ -3829,15 +3831,18 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
-                smart_harness::push_tool_message(
+                smart_harness::push_tool_resolution(
                     &mut messages,
                     serde_json::json!({ "role": "tool", "content": steer }),
-                    smart_harness,
-                    true,
-                    name,
+                    batch.as_ref(),
+                    call_index,
                 )?;
                 continue;
             }
+            let invocation = batch
+                .as_ref()
+                .map(|batch| batch.start(call_index, disclosure))
+                .transpose()?;
             if !is_read_only_call(name, &args) {
                 round_wrote = true;
             }
@@ -3861,6 +3866,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     input_ceiling_pct,
                     low_budget_pct,
                 );
+                if let Some(invocation) = &invocation {
+                    invocation.host();
+                    invocation.observe(&report, spill_store)?;
+                }
                 print_synthetic_tool_result(
                     name,
                     &args,
@@ -3874,10 +3883,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 // #297 follow-up: race the tool dispatch against the turn's
                 // cancel flag. A mid-tool interrupt (Esc / Ctrl-C) now drops the
                 // in-flight future here instead of waiting for the tool to
-                // return — and for exec that dropped future triggers
-                // `kill_on_drop` on the child *tree*, so a hung `run_command`
-                // dies the instant the user asks for it rather than at the
-                // host-exec timeout ceiling. `is_cancelled` between rounds still
+                // return. Exec retains `kill_on_drop`, but dropping a future
+                // is not proof the child tree stopped or side effects ceased.
+                // A started call without an observed return remains uncertain.
+                // `is_cancelled` between rounds still
                 // catches the abandoned turn; this closes the *during-a-tool*
                 // window that a foreground child on the tty used to wedge.
                 // #1947: distil the ledger BEFORE the call. What a
@@ -3896,7 +3905,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
-                        smart_harness,
+                        invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
                         // Reborrow + re-coerce: shortens the trait-object
@@ -3935,7 +3944,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     prompt_disposition,
                     cancel,
                 )
-                .await
+                .await?
                 else {
                     return Ok((
                         smart_harness::cancelled(smart_harness, &mut end_reason)?,
@@ -3961,7 +3970,16 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 round_progress = true;
             }
             repeat_calls.record(name, &args, ok, &result);
-            append_clean_build_warning(&mut messages, &mut clean_build, &args, smart_harness)?;
+            append_clean_build_warning(
+                if batch.is_some() {
+                    &mut tool_warnings
+                } else {
+                    &mut messages
+                },
+                &mut clean_build,
+                &args,
+                None,
+            )?;
             if workflow_runtime.record_tool_result(&result) {
                 round_progress = true;
             }
@@ -3977,17 +3995,24 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // #867 Part A: ledger the verified paths this result surfaced
             // BEFORE the offload may spill the text out of the transcript.
             observed_paths.record(&result, &mut observed_resolver);
-            smart_harness::push_tool_message(
+            smart_harness::push_tool_return(
                 &mut messages,
                 serde_json::json!({
                     "role": "tool",
                     // Step 26.3 (#584): offload an oversized result (redact → spill →
                     // teaser+handle) when tool_offload is on; unchanged otherwise.
-                    "content": smart_harness::tool_result(name, result, tool_offload, spill_store, disclosure, smart_harness)?
+                    "content": smart_harness::tool_result(name, result, tool_offload, spill_store, disclosure, invocation.as_ref())?
                 }),
+                invocation.as_ref(),
+            )?;
+        }
+        for message in tool_warnings {
+            smart_harness::push_tool_message(
+                &mut messages,
+                message,
                 smart_harness,
-                tools::is_context_remaining_call(name),
-                name,
+                true,
+                "build guidance",
             )?;
         }
         if round_wrote {
@@ -7520,10 +7545,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // above (early `Err`, RR2) and a content-invalid batch leaves
         // `validated == None` (RR1); neither is provider-accept evidence, so
         // neither ratchets the learned budget.
-        if let Some(calls) = validated.as_ref() {
-            if let Some(harness) = smart_harness {
-                harness.tool_dispatch(calls)?;
-            }
+        let batch = smart_harness
+            .zip(validated.as_ref())
+            .map(|(harness, calls)| harness.tool_batch(calls, &messages))
+            .transpose()?;
+        let mut tool_warnings = Vec::new();
+        if validated.is_some() {
             emit_accepted(
                 &mut on_round_usage,
                 round_usage,
@@ -7532,7 +7559,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             );
         }
         // Phase 2: every call is valid — execute in order (empty when rejected).
-        for (tc, vc) in tcs.iter().zip(validated.iter().flatten()) {
+        for (call_index, (tc, vc)) in tcs.iter().zip(validated.iter().flatten()).enumerate() {
             let id = vc.call_id.as_str();
             let name = vc.name.as_str();
             let args = vc.args.clone();
@@ -7584,19 +7611,22 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
-                smart_harness::push_tool_message(
+                smart_harness::push_tool_resolution(
                     &mut messages,
                     serde_json::json!({
                         "role": "tool",
                         "tool_call_id": id,
                         "content": steer,
                     }),
-                    smart_harness,
-                    true,
-                    name,
+                    batch.as_ref(),
+                    call_index,
                 )?;
                 continue;
             }
+            let invocation = batch
+                .as_ref()
+                .map(|batch| batch.start(call_index, disclosure))
+                .transpose()?;
             record_organic_note_use(name, &note_sink, &mut note_nudge);
             // retry technique: snapshot the file's pre-write bytes before the
             // write tool runs, so the post-turn gate can revert exactly newt's writes.
@@ -7614,6 +7644,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     input_ceiling_pct,
                     low_budget_pct,
                 );
+                if let Some(invocation) = &invocation {
+                    invocation.host();
+                    invocation.observe(&report, spill_store)?;
+                }
                 print_synthetic_tool_result(
                     name,
                     &args,
@@ -7640,7 +7674,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
-                        smart_harness,
+                        invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
                         // Reborrow + re-coerce: shortens the trait-object
@@ -7679,7 +7713,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     prompt_disposition,
                     cancel,
                 )
-                .await
+                .await?
                 else {
                     return Ok((
                         smart_harness::cancelled(smart_harness, &mut end_reason)?,
@@ -7713,7 +7747,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 round_progress = true;
             }
             repeat_calls.record(name, &args, ok, &result);
-            append_clean_build_warning(&mut messages, &mut clean_build, &args, smart_harness)?;
+            append_clean_build_warning(
+                if batch.is_some() {
+                    &mut tool_warnings
+                } else {
+                    &mut messages
+                },
+                &mut clean_build,
+                &args,
+                None,
+            )?;
             if workflow_runtime.record_tool_result(&result) {
                 round_progress = true;
             }
@@ -7728,17 +7771,24 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             );
             // #867 Part A: ledger verified paths (see the Ollama path).
             observed_paths.record(&result, &mut observed_resolver);
-            smart_harness::push_tool_message(
+            smart_harness::push_tool_return(
                 &mut messages,
                 serde_json::json!({
                     "role": "tool",
                     "tool_call_id": id,
                     // Step 26.3 (#584): see the Ollama path.
-                    "content": smart_harness::tool_result(name, result, tool_offload, spill_store, disclosure, smart_harness)?,
+                    "content": smart_harness::tool_result(name, result, tool_offload, spill_store, disclosure, invocation.as_ref())?,
                 }),
+                invocation.as_ref(),
+            )?;
+        }
+        for message in tool_warnings {
+            smart_harness::push_tool_message(
+                &mut messages,
+                message,
                 smart_harness,
-                tools::is_context_remaining_call(name),
-                name,
+                true,
+                "build guidance",
             )?;
         }
         if let Some(harness) = smart_harness {
@@ -9542,10 +9592,12 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // #1528 B4 — mirrors the OpenAI path: a FULLY-VALIDATED batch is
         // usable output; emit the accepted-prompt observation before the
         // first tool side effect.
-        if let Some(calls) = validated.as_ref() {
-            if let Some(harness) = smart_harness {
-                harness.tool_dispatch(calls)?;
-            }
+        let batch = smart_harness
+            .zip(validated.as_ref())
+            .map(|(harness, calls)| harness.tool_batch(calls, &messages))
+            .transpose()?;
+        let mut tool_warnings = Vec::new();
+        if validated.is_some() {
             emit_accepted(
                 &mut on_round_usage,
                 round_usage,
@@ -9554,7 +9606,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             );
         }
         // Phase 2: every call is valid — execute in order (empty when rejected).
-        for (tc, vc) in tcs.iter().zip(validated.iter().flatten()) {
+        for (call_index, (tc, vc)) in tcs.iter().zip(validated.iter().flatten()).enumerate() {
             let id = vc.call_id.as_str();
             let name = vc.name.as_str();
             let args = vc.args.clone();
@@ -9605,19 +9657,22 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
-                smart_harness::push_tool_message(
+                smart_harness::push_tool_resolution(
                     &mut messages,
                     serde_json::json!({
                         "role": "tool",
                         "tool_call_id": id,
                         "content": steer,
                     }),
-                    smart_harness,
-                    true,
-                    name,
+                    batch.as_ref(),
+                    call_index,
                 )?;
                 continue;
             }
+            let invocation = batch
+                .as_ref()
+                .map(|batch| batch.start(call_index, disclosure))
+                .transpose()?;
             record_organic_note_use(name, &note_sink, &mut note_nudge);
             // retry technique: snapshot the file's pre-write bytes before the
             // write tool runs (mirrors the OpenAI path).
@@ -9633,6 +9688,10 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     input_ceiling_pct,
                     low_budget_pct,
                 );
+                if let Some(invocation) = &invocation {
+                    invocation.host();
+                    invocation.observe(&report, spill_store)?;
+                }
                 print_synthetic_tool_result(
                     name,
                     &args,
@@ -9659,7 +9718,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
-                        smart_harness,
+                        invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
                         // Reborrow + re-coerce — see the OpenAI path.
@@ -9694,7 +9753,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     prompt_disposition,
                     cancel,
                 )
-                .await
+                .await?
                 else {
                     return Ok((
                         smart_harness::cancelled(smart_harness, &mut end_reason)?,
@@ -9725,7 +9784,16 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 round_progress = true;
             }
             repeat_calls.record(name, &args, ok, &result);
-            append_clean_build_warning(&mut messages, &mut clean_build, &args, smart_harness)?;
+            append_clean_build_warning(
+                if batch.is_some() {
+                    &mut tool_warnings
+                } else {
+                    &mut messages
+                },
+                &mut clean_build,
+                &args,
+                None,
+            )?;
             if workflow_runtime.record_tool_result(&result) {
                 round_progress = true;
             }
@@ -9744,16 +9812,23 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             // `anthropic_wire_messages` folds each consecutive run into ONE
             // user message of tool_result blocks (`tool_use_id` = this id)
             // on the next dispatch.
-            smart_harness::push_tool_message(
+            smart_harness::push_tool_return(
                 &mut messages,
                 serde_json::json!({
                     "role": "tool",
                     "tool_call_id": id,
-                    "content": smart_harness::tool_result(name, result, tool_offload, spill_store, disclosure, smart_harness)?,
+                    "content": smart_harness::tool_result(name, result, tool_offload, spill_store, disclosure, invocation.as_ref())?,
                 }),
+                invocation.as_ref(),
+            )?;
+        }
+        for message in tool_warnings {
+            smart_harness::push_tool_message(
+                &mut messages,
+                message,
                 smart_harness,
-                tools::is_context_remaining_call(name),
-                name,
+                true,
+                "build guidance",
             )?;
         }
         if let Some(harness) = smart_harness {
@@ -10808,16 +10883,24 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 continue;
             }
         };
-        if let Some(harness) = smart_harness {
-            harness.tool_dispatch(&validated)?;
-        }
         // Every call is valid: echo the reasoning + function_call items (in output
         // order, so each call keeps its required reasoning item), then execute.
         for item in &echo {
             input.push(item.clone());
         }
+        let batch = smart_harness
+            .map(|harness| {
+                let mut messages = Vec::with_capacity(input.len() + 1);
+                if let Some(text) = &instructions {
+                    messages.push(serde_json::json!({"role":"system","content":text}));
+                }
+                messages.extend_from_slice(&input);
+                harness.tool_batch(&validated, &messages)
+            })
+            .transpose()?;
+        let mut tool_warnings = Vec::new();
         // Phase 2: execute in order.
-        for (call, vc) in calls.iter().zip(validated.iter()) {
+        for (call_index, (call, vc)) in calls.iter().zip(validated.iter()).enumerate() {
             let call_id = vc.call_id.as_str();
             let name = vc.name.as_str();
             let args = vc.args.clone();
@@ -10853,19 +10936,22 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
-                smart_harness::push_tool_message(
+                smart_harness::push_tool_resolution(
                     &mut input,
                     serde_json::json!({
                         "type": "function_call_output",
                         "call_id": call_id,
                         "output": steer,
                     }),
-                    smart_harness,
-                    true,
-                    name,
+                    batch.as_ref(),
+                    call_index,
                 )?;
                 continue;
             }
+            let invocation = batch
+                .as_ref()
+                .map(|batch| batch.start(call_index, disclosure))
+                .transpose()?;
             record_organic_note_use(name, &note_sink, &mut note_nudge);
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
@@ -10895,6 +10981,10 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     estimation,
                     low_budget_pct,
                 );
+                if let Some(invocation) = &invocation {
+                    invocation.host();
+                    invocation.observe(&report, spill_store)?;
+                }
                 print_synthetic_tool_result(
                     name,
                     &args,
@@ -10921,7 +11011,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     caveats,
                     mcp,
                     tools::ToolCollaborators {
-                        smart_harness,
+                        invocation: invocation.as_ref(),
                         build_check_cmd: build_check_cmd.as_deref(),
                         tool_evidence: tool_evidence.as_ref(),
                         // Reborrow + re-coerce: shortens the trait-object
@@ -10960,7 +11050,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     prompt_disposition,
                     cancel,
                 )
-                .await
+                .await?
                 else {
                     return Ok((
                         smart_harness::cancelled(smart_harness, &mut end_reason)?,
@@ -10986,7 +11076,16 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             ledger_consume_at_commit_epoch(attribution, name, &args, ok, &result);
             run_command_denial_observed |= run_command_result_is_denial(name, ok, &result);
             repeat_calls.record(name, &args, ok, &result);
-            append_clean_build_warning(&mut input, &mut clean_build, &args, smart_harness)?;
+            append_clean_build_warning(
+                if batch.is_some() {
+                    &mut tool_warnings
+                } else {
+                    &mut input
+                },
+                &mut clean_build,
+                &args,
+                None,
+            )?;
             record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
             record_phantom_reach(
                 &mut phantom_reaches,
@@ -10997,17 +11096,24 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 advertise_team,
             );
             observed_paths.record(&result, &mut observed_resolver);
-            smart_harness::push_tool_message(
+            smart_harness::push_tool_return(
                 &mut input,
                 serde_json::json!({
                     "type": "function_call_output",
                     "call_id": call_id,
                     // Step 26.3 (#584): see the Ollama path (Responses output shape).
-                    "output": smart_harness::tool_result(name, result, tool_offload, spill_store, disclosure, smart_harness)?,
+                    "output": smart_harness::tool_result(name, result, tool_offload, spill_store, disclosure, invocation.as_ref())?,
                 }),
+                invocation.as_ref(),
+            )?;
+        }
+        for message in tool_warnings {
+            smart_harness::push_tool_message(
+                &mut input,
+                message,
                 smart_harness,
-                tools::is_context_remaining_call(name),
-                name,
+                true,
+                "build guidance",
             )?;
         }
         if let Some(harness) = smart_harness {

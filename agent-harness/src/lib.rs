@@ -9,7 +9,9 @@ pub mod session;
 pub mod store;
 pub use agent_frame::ReplyVerdict as Verdict;
 pub use forensics::replay_from_store;
-pub use session::{PreparedRequest, Session, SessionConfig};
+pub use session::{
+    PreparedRequest, Session, SessionConfig, ToolCallState, ToolCallStatus, ToolReturn,
+};
 
 /// A refused host operation. Errors are surfaced; none imply model completion.
 #[derive(Debug, thiserror::Error)]

@@ -2,7 +2,7 @@
 use crate::{projection::Projection, session::RequestRecord, store::FrameStore, Error, Result};
 use content_addressable::{ContentId, RawContentId};
 
-use crate::session::{JournalEntry, RetrievalBody, SessionConfig};
+use crate::session::{JournalEntry, RetrievalBody, SessionConfig, ToolChange};
 use agent_frame::{RawEvent, RootEvent};
 use content_addressable::{canonical, MerkleNode, NodeStore};
 use serde::Serialize;
@@ -73,6 +73,37 @@ pub fn inspect_from_store(
             Run { root, .. } => references.push(("root", Address::Node(*root))),
             Observation { event } | Intervention { event } | ToolOutput { event, .. } => {
                 references.push(("event", Address::Node(*event)));
+            }
+            ToolBatch {
+                reply,
+                invocations,
+                entries,
+            } => {
+                references.push(("reply", Address::Node(*reply)));
+                references.extend(
+                    invocations
+                        .iter()
+                        .map(|id| ("invocation", Address::Node(*id))),
+                );
+                references.extend(entries.iter().map(|id| ("message", Address::Node(*id))));
+            }
+            ToolCall { invocation, change } => {
+                references.push(("invocation", Address::Node(*invocation)));
+                match change {
+                    ToolChange::Started => {}
+                    ToolChange::Returned { event, sources, .. } => {
+                        references.push(("return", Address::Node(*event)));
+                        references.extend(sources.iter().map(|id| ("source", Address::Node(*id))));
+                    }
+                    ToolChange::Sources { sources } => {
+                        references.extend(sources.iter().map(|id| ("source", Address::Node(*id))));
+                    }
+                    ToolChange::Delivered { event }
+                    | ToolChange::Resolved { event }
+                    | ToolChange::Closed { event, .. } => {
+                        references.push(("delivery", Address::Node(*event)));
+                    }
+                }
             }
             Reply { event, request } => references.extend([
                 ("event", Address::Node(*event)),

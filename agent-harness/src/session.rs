@@ -11,6 +11,10 @@ use content_addressable::{ContentAddressable, ContentError, ContentId, MerkleNod
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+mod tools;
+pub(crate) use tools::ToolChange;
+pub use tools::{ToolCallState, ToolCallStatus, ToolReturn};
+
 use crate::{
     projection::{Entry, Projection},
     store::{FrameStore, RunWriter},
@@ -105,6 +109,15 @@ pub(crate) enum JournalEntry {
     ToolOutput {
         event: ContentId,
         name: String,
+    },
+    ToolBatch {
+        reply: ContentId,
+        invocations: Vec<ContentId>,
+        entries: Vec<ContentId>,
+    },
+    ToolCall {
+        invocation: ContentId,
+        change: ToolChange,
     },
     Reply {
         event: ContentId,
@@ -228,6 +241,8 @@ pub struct Session {
     packets: BTreeMap<ContentId, Packet>,
     packet_events: BTreeMap<ContentId, Vec<ContentId>>,
     reread_outputs: BTreeMap<String, Vec<ContentId>>,
+    tool_calls: BTreeMap<ContentId, ToolCallStatus>,
+    tool_order: Vec<ContentId>,
     pending: BTreeSet<ContentId>,
     replies: BTreeSet<ContentId>,
     model_messages: BTreeSet<ContentId>,
@@ -274,7 +289,7 @@ impl Session {
         store.put_source(&bytes)?;
         let root = store.put(&RootEvent::new(RootKind::HarnessEvent, &bytes, 0))?;
         let head = store.put(&MerkleNode::genesis(JournalEntry::Run {
-            schema: 1,
+            schema: 2,
             config: config.clone(),
             root,
         }))?;
@@ -305,6 +320,8 @@ impl Session {
             packets: BTreeMap::new(),
             packet_events: BTreeMap::new(),
             reread_outputs: BTreeMap::new(),
+            tool_calls: BTreeMap::new(),
+            tool_order: Vec::new(),
             pending: BTreeSet::new(),
             replies: BTreeSet::new(),
             model_messages: BTreeSet::new(),
@@ -451,6 +468,14 @@ impl Session {
     fn apply(&mut self, entry: &JournalEntry) -> Result<()> {
         match entry {
             JournalEntry::Run { .. } => return Err(integrity("nested run record")),
+            JournalEntry::ToolBatch {
+                reply,
+                invocations,
+                entries,
+            } => self.apply_tool_batch(*reply, invocations, entries)?,
+            JournalEntry::ToolCall { invocation, change } => {
+                self.apply_tool_change(*invocation, change)?;
+            }
             JournalEntry::Observation { event } | JournalEntry::Intervention { event } => {
                 let value = self.checked_event(*event)?;
                 if !matches!(
@@ -465,6 +490,7 @@ impl Session {
                 if value.body().origin == EventOrigin::Operator
                     && value.body().kind == EventKind::Observation
                 {
+                    self.ensure_tools_closed()?;
                     self.root = value.body().root;
                 }
                 if value.body().kind == EventKind::Retrieval {
@@ -532,6 +558,7 @@ impl Session {
                 self.verdicts.insert(*reply, *verdict);
             }
             JournalEntry::ModelMessage { event, reply } => {
+                self.ensure_tools_closed()?;
                 let value = self.checked_event(*event)?;
                 let message: Value =
                     serde_json::from_slice(&self.store.source(&value.body().payload)?)
@@ -605,6 +632,7 @@ impl Session {
                 self.projections.insert(*projection);
             }
             JournalEntry::Request { request } => {
+                self.ensure_tools_closed()?;
                 let record: RequestRecord = self.store.get(request)?;
                 if self
                     .format
@@ -634,6 +662,7 @@ impl Session {
                 }
             }
             JournalEntry::Transcript { entries } => {
+                self.ensure_tools_closed()?;
                 for id in entries {
                     let event = self
                         .events
@@ -701,17 +730,7 @@ impl Session {
                         return Err(integrity("awaiting operator requires a question verdict"))
                     }
                     ControlOutcome::ToolDispatch => {
-                        if !self.pending.contains(reply) {
-                            return Err(integrity("dispatch requires an unadjudicated reply"));
-                        }
-                        let payload: Value =
-                            serde_json::from_slice(&self.store.source(&value.body().payload)?)
-                                .map_err(integrity)?;
-                        let calls = payload
-                            .get("tool_calls")
-                            .and_then(Value::as_array)
-                            .ok_or_else(|| integrity("dispatch has no admitted calls"))?;
-                        validate_calls(calls)?;
+                        return Err(integrity("tool dispatch requires a lifecycle batch"));
                     }
                     _ => {}
                 }
@@ -826,7 +845,10 @@ impl Session {
             } = node.payload()
             {
                 config.validate()?;
-                if *schema != 1
+                if *schema == 1 {
+                    return Err(Error::Access("pre-lifecycle schema 1 sessions cannot prove per-call completion; inspect/replay the retained frame or start a new schema 2 run".into()));
+                }
+                if *schema != 2
                     || !node.parents().is_empty()
                     || config.authority != authority
                     || config.hermetic
@@ -888,6 +910,7 @@ impl Session {
             starting: head,
             authority: authority.into(),
         })?;
+        session.interrupt_tool_batch("resumed after the previous writer stopped")?;
         Ok(session)
     }
 
@@ -936,6 +959,7 @@ impl Session {
     }
 
     fn ingest(&mut self, messages: &[Value]) -> Result<Vec<Entry>> {
+        self.ensure_tools_closed()?;
         let mut entries = Vec::with_capacity(messages.len());
         let mut available: BTreeMap<RawContentId, std::collections::VecDeque<ContentId>> =
             BTreeMap::new();
@@ -1368,28 +1392,6 @@ impl Session {
         })
     }
 
-    pub fn record_tool_dispatch(&mut self, reply: ContentId, calls: &[Value]) -> Result<()> {
-        validate_calls(calls)?;
-        if !self.pending.contains(&reply) {
-            return Err(integrity("dispatch requires an unadjudicated tool reply"));
-        }
-        let bytes = serde_json::to_vec(&json!({"role":"assistant","tool_calls":calls}))
-            .map_err(integrity)?;
-        let event = self.event(
-            EventOrigin::Harness,
-            EventKind::Intervention,
-            &bytes,
-            BTreeSet::from([reply]),
-            BTreeSet::from([reply]),
-            1,
-        )?;
-        self.append(JournalEntry::Outcome {
-            event,
-            reply,
-            control: ControlOutcome::ToolDispatch,
-        })
-    }
-
     fn render_selection(
         &mut self,
         messages: &[Value],
@@ -1510,8 +1512,14 @@ impl Session {
             id,
             offset,
             max_bytes,
-            self.config.max_fetched_bytes - self.fetched,
-            self.config.max_dereferences - self.dereferences,
+            self.config
+                .max_fetched_bytes
+                .checked_sub(self.fetched)
+                .ok_or_else(|| Error::Budget("retrieval bytes".into()))?,
+            self.config
+                .max_dereferences
+                .checked_sub(self.dereferences)
+                .ok_or_else(|| Error::Budget("retrieval dereferences".into()))?,
         )?;
         self.fetched += retrieved.read_bytes;
         self.dereferences += retrieved.parts.len().max(1);
@@ -1841,6 +1849,7 @@ impl Session {
         message: &Value,
         parent: ContentId,
     ) -> Result<ContentId> {
+        self.ensure_tools_closed()?;
         if !matches!(crate::projection::role(message), "user" | "tool") {
             return Err(integrity("host envelope must be a user or tool message"));
         }
@@ -1869,22 +1878,6 @@ fn append_overlap(target: &mut Vec<u8>, bytes: &[u8], position: usize, start: us
     if from < to {
         target.extend_from_slice(&bytes[from - position..to - position]);
     }
-}
-
-fn validate_calls(calls: &[Value]) -> Result<()> {
-    if calls.is_empty()
-        || calls.iter().any(|call| {
-            call.pointer("/function/name")
-                .or_else(|| call.get("name"))
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-        })
-    {
-        return Err(integrity(
-            "normalized tool calls require nonempty function names",
-        ));
-    }
-    Ok(())
 }
 
 fn tool_contents(message: &Value) -> Vec<&str> {

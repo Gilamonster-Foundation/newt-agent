@@ -10,6 +10,12 @@ use serde_json::Value;
 
 use super::compress::SummarizeFn;
 
+#[path = "smart_tool_completion.rs"]
+mod tool_completion;
+pub(crate) use tool_completion::{
+    push_tool_resolution, push_tool_return, ToolBatch, ToolInvocation,
+};
+
 /// Operator-overridable auxiliary protocol and per-turn bounds.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -237,6 +243,8 @@ impl SmartHarness {
     /// Start one primary turn without discarding its retained session graph.
     pub fn start_turn(&self) -> anyhow::Result<()> {
         let mut s = self.state()?;
+        s.session
+            .interrupt_tool_batch("previous turn ended before tool completion")?;
         s.session.start_turn();
         if s.initial.is_none() {
             let history = s.session.restored_messages()?;
@@ -264,9 +272,8 @@ impl SmartHarness {
         &self.spill
     }
 
-    fn retained_tool_slice(&self, name: &str, bytes: &[u8]) -> anyhow::Result<Value> {
+    fn tool_slice(&self, cid: ContentId) -> anyhow::Result<Value> {
         let mut s = self.state()?;
-        let cid = s.session.retain_tool_output(name, bytes)?;
         let max_bytes = self
             .settings
             .initial_tool_bytes
@@ -408,10 +415,11 @@ impl SmartHarness {
         Ok(self.state()?.session.record_messages(messages)?)
     }
 
-    pub(crate) fn tool_dispatch(
+    pub(crate) fn tool_batch(
         &self,
         calls: &[super::tools::ValidatedCall],
-    ) -> anyhow::Result<()> {
+        messages: &[Value],
+    ) -> anyhow::Result<ToolBatch<'_>> {
         let mut s = self.state()?;
         let reply = s
             .reply
@@ -424,7 +432,8 @@ impl SmartHarness {
                 })
             })
             .collect::<Vec<_>>();
-        Ok(s.session.record_tool_dispatch(reply, &calls)?)
+        let ids = s.session.begin_tool_batch(reply, &calls, messages)?;
+        Ok(ToolBatch::new(self, ids))
     }
 
     pub(crate) fn reject_tools(&self, reason: &str, recoverable: bool) -> anyhow::Result<()> {
@@ -465,6 +474,7 @@ impl SmartHarness {
             _ => "incomplete",
         };
         let mut s = self.state()?;
+        s.session.interrupt_tool_batch(control)?;
         if let Some(reply) = s.reply {
             s.session.record_outcome(reply, control, text)?;
             s.reply = None;
@@ -885,18 +895,10 @@ pub(super) fn push_tool_message(
     message: Value,
     harness: Option<&SmartHarness>,
     host_supplied: bool,
-    name: &str,
+    _name: &str,
 ) -> anyhow::Result<()> {
-    let retrieval_error = message
-        .get("content")
-        .or_else(|| message.get("output"))
-        .and_then(Value::as_str)
-        .is_some_and(|text| {
-            (name == "re_read" && text.starts_with("Error: re_read refused:"))
-                || text.starts_with("Error: frame isolation:")
-        });
     if let Some(harness) = harness {
-        if host_supplied || retrieval_error {
+        if host_supplied {
             harness.host_envelope(&message)?;
         }
     }
@@ -910,51 +912,14 @@ pub(crate) fn tool_result(
     offload: bool,
     spill: Option<&dyn super::content_spill::SpillStore>,
     disclosure: Option<&crate::ocap::DisclosureFilter>,
-    harness: Option<&SmartHarness>,
+    invocation: Option<&ToolInvocation<'_>>,
 ) -> anyhow::Result<String> {
-    let Some(harness) = harness else {
-        return Ok(super::maybe_offload_tool_result(
+    match invocation {
+        Some(invocation) => invocation.model_text(),
+        None => Ok(super::maybe_offload_tool_result(
             name, result, offload, spill, disclosure,
-        ));
-    };
-    let mut display = super::redact_model_facing(disclosure, result);
-    // re_read returns a registered receipt. Wrapping it as a fresh tool source
-    // would erase the retrieved artifact's original provenance and depth.
-    if name == "re_read" {
-        return Ok(display);
+        )),
     }
-    display = super::compress::redact_secrets(&display);
-    let mut markers = Vec::new();
-    super::responses_wire_validation::extract_markers(&display, &mut markers);
-    let mut sources = Vec::new();
-    for (kind, handle) in markers {
-        if kind != super::responses_wire_validation::MarkerKind::Spill {
-            continue;
-        }
-        let old_hint = super::content_spill::tool_output_retrieval_hint(&handle);
-        if !display.contains(&old_hint) {
-            continue;
-        }
-        let cid = super::content_spill::SpillCid::parse(&handle)?;
-        let record = spill.and_then(|store| store.fetch(&cid)).ok_or_else(|| {
-            anyhow::anyhow!("retained tool output is absent from its authorized spill store")
-        })?;
-        let full = super::redact_model_facing(disclosure, record.redacted_text);
-        let source = harness.retained_tool_slice(name, full.as_bytes())?;
-        let new_hint = format!("Call re_read with JSON arguments {} for bounded retained output; use next_offset to continue.", serde_json::json!({"cid":source["source_cid"]}));
-        display = display.replace(&old_hint, &new_hint);
-        sources.push(source);
-    }
-    if sources.is_empty() {
-        if display.len() <= harness.settings.initial_tool_bytes {
-            return Ok(display);
-        }
-        sources.push(harness.retained_tool_slice(name, display.as_bytes())?);
-        display = format!("{name} returned {} bytes. The initial slice follows; use re_read with source_cid and next_offset for more.", display.len());
-    }
-    Ok(serde_json::to_string(
-        &serde_json::json!({"display":display,"sources":sources}),
-    )?)
 }
 
 /// Parse the strict tool-less classifier protocol; prose and aliases are failures.
@@ -1056,13 +1021,7 @@ mod tests {
     #[test]
     fn admitted_tool_batches_settle_the_original_observation_without_a_verdict() {
         let h = harness(&[], Default::default());
-        observation(&h, "<tool_call>re_read</tool_call>");
-        h.tool_dispatch(&[super::super::tools::ValidatedCall {
-            call_id: "recovered-1".into(),
-            name: "re_read".into(),
-            args: serde_json::json!({"cid":"source"}),
-        }])
-        .unwrap();
+        let _batch = h.fixture_tool_batch("re_read", serde_json::json!({"cid":"source"}));
         assert!(h.state().unwrap().session.pending_replies().is_empty());
     }
 
@@ -1476,7 +1435,8 @@ mod tests {
             Default::default(),
         )
         .unwrap();
-        observation(&h, "tool call");
+        let batch = h.fixture_tool_batch("run_command", serde_json::json!({"command":"fixture"}));
+        let invocation = batch.start(0, None).unwrap();
         let store = super::super::content_spill::SessionSpillStore::new([1; 16]);
         let full = "retained full command output\n".repeat(1000);
         let (handle, _) = super::super::content_spill::store_redacted_full(
@@ -1488,8 +1448,24 @@ mod tests {
             "head ... tail\n{}\nerror: command exited 7",
             super::super::content_spill::tool_output_retrieval_hint(&handle.unwrap())
         );
-        let rendered =
-            tool_result("run_command", display, false, Some(&store), None, Some(&h)).unwrap();
+        invocation.observe(&display, Some(&store)).unwrap();
+        let rendered = tool_result(
+            "run_command",
+            display,
+            false,
+            Some(&store),
+            None,
+            Some(&invocation),
+        )
+        .unwrap();
+        push_tool_return(
+            &mut Vec::new(),
+            serde_json::json!({"role":"tool","tool_call_id":"fixture_call","content":rendered}),
+            Some(&invocation),
+        )
+        .unwrap();
+        drop(invocation);
+        drop(batch);
         let payload: Value = serde_json::from_str(&rendered).expect("durable first-slice envelope");
         assert!(payload["display"].as_str().unwrap().contains("exited 7"));
         assert!(!rendered.contains("spill:"));

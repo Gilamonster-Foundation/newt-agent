@@ -186,6 +186,15 @@ def event_admission():
     refuses(lambda: frame.Event(json.dumps(body), [verdict]))
 
 
+def begin_tools(session, reply, calls, messages):
+    """The host decodes transport calls into the leaf's normalized call shape."""
+    normalized = [{"id":call["id"], "function":{
+        "name":call["function"]["name"],
+        "arguments":json.loads(call["function"]["arguments"]),
+    }} for call in calls]
+    return session.begin_tool_batch(reply, json.dumps(normalized), json.dumps(messages))
+
+
 def host_composition():
     """Compose tool dispatch, exact retention, and independent auxiliary recording."""
     with tempfile.TemporaryDirectory() as directory:
@@ -197,12 +206,17 @@ def host_composition():
         request = json.loads(session.record_request(json.dumps({"messages":messages}), "openai"))
         reply = session.record_reply(request["id"], b"tool call")
         calls = [{"id":"call_1", "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]
-        session.record_tool_dispatch(reply, json.dumps(calls))
+        messages.append({"role":"assistant", "tool_calls":calls})
+        invocation, = begin_tools(session, reply, calls, messages)
+        session.start_tool_call(invocation)
+        session.record_tool_return(invocation, b"unabridged file contents")
         retained = session.retain_tool_output("read_file", b"unabridged file contents")
+        session.record_tool_sources(invocation, json.dumps([retained]))
+        assert json.loads(session.tool_call(invocation))["retained_sources"] == [retained]
         assert json.loads(session.re_read(retained, 0, 100))["text"] == "unabridged file contents"
-        messages += [{"role":"assistant", "tool_calls":calls},
-                     {"role":"tool", "tool_call_id":"call_1", "content":"unabridged file contents"}]
-        session.record_messages(json.dumps(messages))
+        delivered = {"role":"tool", "tool_call_id":"call_1", "content":"unabridged file contents"}
+        session.record_tool_delivery(invocation, json.dumps(delivered))
+        messages.append(delivered)
         assert json.loads(session.restored_messages()) == messages
         session.start_turn()
         catalog = json.loads(session.catalog(json.dumps(messages), 4096))
@@ -237,6 +251,64 @@ def host_composition():
         del restored
         error = refuses(lambda: harness.Session.restore_with_config(directory, head, json.dumps(changed)))
         assert "run writer conflict" not in error
+
+
+def tool_recovery():
+    """Ground lifecycle admission and cold recovery in the compiled foreign API."""
+    with tempfile.TemporaryDirectory() as directory:
+        session = harness.Session(directory=directory)
+        messages = [{"role":"user", "content":"apply changes"}]
+        request = json.loads(session.record_request(json.dumps({"messages":messages}), "openai"))
+        reply = session.record_reply(request["id"], b"tool batch")
+        calls = [{"id":f"call_{n}", "type":"function", "function":{"name":"fixture", "arguments":"{}"}} for n in range(4)]
+        messages.append({"role":"assistant", "tool_calls":calls})
+        ids = begin_tools(session, reply, calls, messages)
+        session.start_tool_call(ids[0])
+        # This real write grounds the host's observe-then-commit boundary. The
+        # fixture host has no background executor and does not claim exactly once.
+        fixture = Path(directory).parent / (Path(directory).name + "-effect")
+        try:
+            fixture.write_text("A completed")
+            session.record_tool_return(ids[0], b"Error: same observed bytes")
+            session.record_tool_delivery(ids[0], json.dumps({"role":"tool", "tool_call_id":"call_0", "content":"Error: same observed bytes"}))
+            session.start_tool_call(ids[1])
+            refuses(lambda: session.record_tool_return(ids[1], b"bad kind", kind="success"))
+            refuses(lambda: session.record_tool_return(ids[1], b"\xff", kind="host"))
+            refuses(lambda: session.record_tool_return(ids[1], b"host notice", kind="host", retained_sources_json=json.dumps([session.run_id()])))
+            session.record_tool_return(ids[1], b"Error: same observed bytes", kind="failed")
+            session.start_tool_call(ids[2])
+            # B's typed failure has no presentation yet; C has no observed
+            # return and D has never started. Release the writer, then recover.
+            head, config = session.head(), session.config()
+            del session
+            restored = harness.Session.restore_with_config(directory, head, config)
+            assert fixture.read_text() == "A completed"
+            states = [json.loads(restored.tool_call(invocation)) for invocation in ids]
+            assert [state["state"] for state in states] == ["returned", "failed", "uncertain", "not_started"]
+            assert all(state["delivery"] for state in states)
+            assert all(state["returned"] for state in states[:2])
+            assert all(state["returned"] is None for state in states[2:])
+            history = json.loads(restored.restored_messages())
+            results = [message for message in history if message.get("role") == "tool"]
+            assert [result["tool_call_id"] for result in results] == [call["id"] for call in calls]
+            assert results[0]["content"] == "Error: same observed bytes"
+            assert all("harness" in result["content"].lower() for result in results[1:])
+            assert json.loads(restored.interrupt_tool_batch("already closed")) == history
+            next_request = json.loads(restored.record_request(json.dumps({"messages":history}), "openai"))
+            assert json.loads(next_request["bytes"])["messages"] == history
+            assert restored.replay(next_request["id"]) == next_request["bytes"].encode()
+            for invocation in ids:
+                refuses(lambda invocation=invocation: restored.start_tool_call(invocation))
+            reply = restored.record_reply(next_request["id"], b"another admitted call")
+            calls = [{"id":"host_refusal", "type":"function", "function":{"name":"fixture", "arguments":"{}"}}]
+            history.append({"role":"assistant", "tool_calls":calls})
+            invocation, = begin_tools(restored, reply, calls, history)
+            restored.resolve_tool_call(invocation, json.dumps({"role":"tool", "tool_call_id":"host_refusal", "content":"Harness refused execution under current authority."}))
+            status = json.loads(restored.tool_call(invocation))
+            assert status["state"] == "host_resolved" and status["returned"] is None
+            assert status["delivery"] is not None
+        finally:
+            fixture.unlink(missing_ok=True)
 
 
 def provider_rendering():
@@ -282,4 +354,5 @@ if __name__ == "__main__":
         harness_roundtrip()
         projection_and_retrieval()
         host_composition()
+        tool_recovery()
         provider_rendering()

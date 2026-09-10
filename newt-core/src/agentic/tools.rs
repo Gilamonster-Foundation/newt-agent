@@ -2303,7 +2303,7 @@ async fn execute_tool_inner(
     tool_offload: bool,
     disposition: PromptDisposition,
 ) -> String {
-    let Some(harness) = collab.smart_harness else {
+    let Some(invocation) = collab.invocation else {
         return execute_authorized_tool(
             presentation,
             name,
@@ -2319,7 +2319,9 @@ async fn execute_tool_inner(
         )
         .await;
     };
+    let harness = invocation.harness();
     if let Err(error) = harness.validate_tool_authority(caveats, std::path::Path::new(workspace)) {
+        invocation.host();
         return format!("Error: frame isolation: {error}");
     }
     let mut gate =
@@ -2350,7 +2352,10 @@ async fn execute_tool_inner(
     )
     .await;
     match gate.and_then(|gate| gate.refusal) {
-        Some(error) => format!("Error: frame isolation: permission denied: {error}"),
+        Some(error) => {
+            invocation.host();
+            format!("Error: frame isolation: permission denied: {error}")
+        }
         None => result,
     }
 }
@@ -2375,7 +2380,7 @@ async fn execute_authorized_tool(
 ) -> String {
     // One unpack; the dispatch body below binds the same names it always has.
     let ToolCollaborators {
-        smart_harness,
+        invocation,
         build_check_cmd,
         tool_evidence,
         note_sink,
@@ -2401,6 +2406,13 @@ async fn execute_authorized_tool(
         live_tool_output,
         completed_spill_renderer: _,
     } = collab;
+    let smart_harness = invocation.map(|call| call.harness());
+    let host_return = |text: String| {
+        if let Some(invocation) = invocation {
+            invocation.host();
+        }
+        text
+    };
 
     // A model-entered Plan phase takes effect immediately for every later
     // tool call in the same inference round. The outer TUI also resolves it
@@ -2454,8 +2466,7 @@ async fn execute_authorized_tool(
                 .and_then(|op| op.as_str())
                 .is_some_and(super::git_tool::is_scoped_read_op))
     {
-        let msg = disposition_tool_denied_message(disposition, name);
-        return msg;
+        return host_return(disposition_tool_denied_message(disposition, name));
     }
 
     // A read/recovery tool can itself hit a caveat denial (for example
@@ -2478,7 +2489,7 @@ async fn execute_authorized_tool(
     // past — and only the exec TARGET is matched, so the same words quoted in a
     // coach's question or a runbook note are untouched.
     if let Some(denied) = super::deny::deny_check(raw_name, raw_args) {
-        return denied.reason;
+        return host_return(denied.reason);
     }
 
     // FR-1 part 2 (#997): persona tool allow-list — refuse a BUILT-IN tool the
@@ -2498,8 +2509,7 @@ async fn execute_authorized_tool(
             _ => name,
         };
         if !persona_tool_allowed(canonical, allow) && !mcp.handles(name) {
-            let msg = persona_tool_denied_message(canonical);
-            return msg;
+            return host_return(persona_tool_denied_message(canonical));
         }
     }
 
@@ -2569,7 +2579,7 @@ async fn execute_authorized_tool(
         // the only way to dispatch — an un-leashed call does not type-check.
         return match leash_mcp_call(name, args, grant) {
             Ok(leased) => mcp.call(&leased).await,
-            Err(_) => persona_tool_denied_message(name),
+            Err(_) => host_return(persona_tool_denied_message(name)),
         };
     }
 
@@ -2580,7 +2590,7 @@ async fn execute_authorized_tool(
     // names, handled above) fall through unchanged.
     let name = match resolve_tool_alias(name) {
         Some(AliasOutcome::Rewrite(canonical)) => canonical,
-        Some(AliasOutcome::Correct(msg)) => return msg,
+        Some(AliasOutcome::Correct(msg)) => return host_return(msg),
         None => name,
     };
 
@@ -2677,7 +2687,10 @@ async fn execute_authorized_tool(
         // via the caller's MemorySource — workspace-fenced by the underlying
         // NoteStore / ConversationStore. Same presence-gating as `recall`.
         "re_read" => match smart_harness {
-            Some(harness) => harness.read(args).unwrap_or_else(|error| format!("Error: re_read refused: {error}")),
+            Some(harness) => match harness.read(args) {
+                Ok(text) => { invocation.expect("smart dispatch has a witness").retrieval(); text }
+                Err(error) => { invocation.expect("smart dispatch has a witness").host(); format!("Error: re_read refused: {error}") }
+            },
             None => "Error: re_read is unavailable outside a smart harness session".to_string(),
         },
         "memory_fetch" => match memory_source {
@@ -2909,7 +2922,7 @@ async fn execute_authorized_tool(
                 // This engine-read boundary is independent of disposition and
                 // Git write grants. Refuse before any confirmation or retry.
                 if let Err(error) = super::git_tool::check_git_read_scope(op, &caveats.fs_read) {
-                    return format!("error: {error}");
+                    return host_return(format!("error: {error}"));
                 }
                 let gc = crate::git_caveats::GitCaveats::from_session(caveats);
                 // #1191: data-loss ops (stash-drop / branch-delete) are gated
@@ -2929,7 +2942,7 @@ async fn execute_authorized_tool(
                              dropping; do NOT delete a branch that holds unmerged work. \
                              The operator must confirm any data-loss git op."
                         );
-                        return refusal;
+                        return host_return(refusal);
                     }
                 }
                 let mut out = match tool.dispatch(op, args, &gc, caveats) {
@@ -2969,7 +2982,7 @@ async fn execute_authorized_tool(
         // `meet`-attenuated caveats. Same presence-gating as `git` (the `/team`
         // toggle) — without an injected impl the tools were never advertised.
         "crew" if smart_harness.is_some() =>
-            "Error: frame isolation: crew execution is unavailable until its file operations enforce the session filesystem boundary; use the confined local tools".into(),
+            { invocation.expect("smart dispatch has a witness").host(); "Error: frame isolation: crew execution is unavailable until its file operations enforce the session filesystem boundary; use the confined local tools".into() },
         "compose_roster" | "crew" => match crew_runner {
             Some(runner) => {
                 let out = match runner.dispatch(name, args, caveats).await {
@@ -2999,12 +3012,12 @@ async fn execute_authorized_tool(
             // works instead of failing on an un-exec'able builtin.
             if cd_path.is_some() && cmd.trim().is_empty() {
                 let path = cd_path.as_deref().unwrap_or("");
-                return format!(
+                return host_return(format!(
                     "note: a bare `cd` has no effect — each command runs \
                      independently, so there is no persistent shell to change. \
                      Prefix the command instead (`cd {path} && <command>`, which \
                      newt runs in `{path}`) or pass `cwd`."
-                );
+                ));
             }
 
             // Corrective guard: the model tried to call a tool as a shell binary.
@@ -3015,11 +3028,11 @@ async fn execute_authorized_tool(
             if let Some(tool) = run_command_redirect(cmd)
                 .filter(|tool| smart_harness.is_none() || !matches!(*tool, "git" | "find"))
             {
-                return format!(
+                return host_return(format!(
                     "error: '{tool}' is a tool, not a shell command. \
                      Call it as a separate tool invocation — \
                      do not pass '{tool}' as a command argument to run_command."
-                );
+                ));
             }
 
             // Attribution invariant (#1709 family): a COMPOSED shell command that
@@ -3036,7 +3049,7 @@ async fn execute_authorized_tool(
             // Read-only git (status/log/diff) and network ops (push/fetch/…)
             // are unaffected; this never reaches the confined shell.
             if run_command_creates_shell_git_commit(cmd) {
-                return "error: refusing to create a git commit via the shell — that \
+                return host_return("error: refusing to create a git commit via the shell — that \
                      bypasses harness-managed commit attribution (the `git` tool \
                      stamps the Co-authored-by trailer + provenance itself; a \
                      shell `git commit`/`merge`/`cherry-pick`/`revert`/`rebase` \
@@ -3047,7 +3060,7 @@ async fn execute_authorized_tool(
                      directly, not via run_command. \
                      Read-only git (status/log/diff) and `git push`/`fetch` are \
                      unaffected; abort forms (`--abort`/`--quit`) pass through."
-                    .to_string();
+                    .to_string());
             }
 
             // Route the WHOLE command through agent-bridle's confined shell
@@ -3710,7 +3723,7 @@ async fn execute_authorized_tool(
         // this arm walks the workspace with the `ignore` crate (no subprocess),
         // gated by the same fs_read caveat as list_dir/read_file.
         "find" if smart_harness.is_some() =>
-            "Error: frame isolation: native find is unavailable until its recursive walker retains the directory capability; use run_command for confined shell search".to_string(),
+            { invocation.expect("smart dispatch has a witness").host(); "Error: frame isolation: native find is unavailable until its recursive walker retains the directory capability; use run_command for confined shell search".to_string() },
         "find" => {
             let path = args["path"].as_str().unwrap_or(".");
             let full = std::path::Path::new(workspace).join(path);
@@ -3935,3 +3948,7 @@ mod disable_ocap_tests;
 #[cfg(test)]
 #[path = "tools_tests/smart_frame_isolation.rs"]
 mod smart_frame_isolation_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "tools_tests/smart_tool_completion.rs"]
+mod smart_tool_completion_tests;

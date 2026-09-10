@@ -1,6 +1,7 @@
 //! Python owns orchestration; the Rust session owns policy, recording, and replay.
 
-use agent_harness::Session;
+use agent_harness::{Session, ToolReturn};
+use content_addressable::ContentId;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
@@ -180,13 +181,114 @@ impl PySession {
             .to_string())
     }
 
-    fn record_tool_dispatch(&mut self, reply: &str, calls_json: &str) -> PyResult<()> {
-        self.inner
-            .record_tool_dispatch(
+    /// Commit the assistant envelope and queued occurrences before execution.
+    fn begin_tool_batch(
+        &mut self,
+        reply: &str,
+        calls_json: &str,
+        messages_json: &str,
+    ) -> PyResult<Vec<String>> {
+        Ok(self
+            .inner
+            .begin_tool_batch(
                 reply.parse().map_err(invalid)?,
                 &decode::<Vec<serde_json::Value>>(calls_json)?,
+                &decode::<Vec<serde_json::Value>>(messages_json)?,
+            )
+            .map_err(invalid)?
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect())
+    }
+
+    /// Verify writer authority and record execution intent before host effects.
+    fn start_tool_call(&mut self, invocation: &str) -> PyResult<()> {
+        self.inner
+            .start_tool_call(invocation.parse().map_err(invalid)?)
+            .map_err(invalid)
+    }
+
+    /// Commit observed bytes immediately. Only an explicitly typed tool error
+    /// uses `failed`; string contents never determine the recorded outcome.
+    #[pyo3(signature = (invocation, bytes, kind="observed", retained_sources_json="[]"))]
+    fn record_tool_return(
+        &mut self,
+        invocation: &str,
+        bytes: &[u8],
+        kind: &str,
+        retained_sources_json: &str,
+    ) -> PyResult<String> {
+        let retained_sources = decode::<Vec<ContentId>>(retained_sources_json)?;
+        let returned = match kind {
+            "observed" => ToolReturn::Observed {
+                bytes,
+                retained_sources: &retained_sources,
+            },
+            "failed" => ToolReturn::Failed {
+                bytes,
+                retained_sources: &retained_sources,
+            },
+            "retrieval" | "host" => {
+                if !retained_sources.is_empty() {
+                    return Err(invalid(
+                        "retained sources apply only to observed or failed returns",
+                    ));
+                }
+                let text = std::str::from_utf8(bytes).map_err(invalid)?;
+                if kind == "retrieval" {
+                    ToolReturn::Retrieval(text)
+                } else {
+                    ToolReturn::Host(text)
+                }
+            }
+            _ => {
+                return Err(invalid(
+                    "tool return kind must be observed, failed, retrieval, or host",
+                ))
+            }
+        };
+        Ok(self
+            .inner
+            .record_tool_return(invocation.parse().map_err(invalid)?, returned)
+            .map_err(invalid)?
+            .to_string())
+    }
+
+    /// Record the provider envelope after committing the observed return.
+    fn record_tool_delivery(&mut self, invocation: &str, message_json: &str) -> PyResult<()> {
+        self.inner
+            .record_tool_delivery(invocation.parse().map_err(invalid)?, &decode(message_json)?)
+            .map_err(invalid)
+    }
+
+    /// Attach retained external sources after the raw return is committed.
+    fn record_tool_sources(&mut self, invocation: &str, sources_json: &str) -> PyResult<()> {
+        self.inner
+            .record_tool_sources(
+                invocation.parse().map_err(invalid)?,
+                &decode::<Vec<ContentId>>(sources_json)?,
             )
             .map_err(invalid)
+    }
+
+    /// Close a queued call using an explicitly host-authored substitute.
+    fn resolve_tool_call(&mut self, invocation: &str, message_json: &str) -> PyResult<()> {
+        self.inner
+            .resolve_tool_call(invocation.parse().map_err(invalid)?, &decode(message_json)?)
+            .map_err(invalid)
+    }
+
+    /// Close remaining protocol slots without replaying external work.
+    fn interrupt_tool_batch(&mut self, reason: &str) -> PyResult<String> {
+        json(&self.inner.interrupt_tool_batch(reason).map_err(invalid)?)
+    }
+
+    fn tool_call(&self, invocation: &str) -> PyResult<String> {
+        json(
+            self.inner
+                .tool_call(invocation.parse().map_err(invalid)?)
+                .map_err(invalid)?,
+        )
     }
 
     fn record_outcome(&mut self, reply: &str, outcome: &str, delivered: &str) -> PyResult<()> {

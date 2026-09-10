@@ -124,7 +124,7 @@ fn restored_run_root_must_commit_its_actual_configuration() {
         .unwrap();
     let head = store
         .put(&MerkleNode::genesis(JournalEntry::Run {
-            schema: 1,
+            schema: 2,
             config: SessionConfig::default(),
             root,
         }))
@@ -151,6 +151,107 @@ fn decoded_journal_cannot_relabel_a_verdict_or_replay_an_occurrence() {
             request: *session.requests.iter().next().unwrap()
         })
         .is_err());
+}
+
+#[test]
+fn retrieval_refuses_overdrawn_local_accounting_without_underflow() {
+    let (mut session, reply) = observed_session();
+    session.fetched = session.config.max_fetched_bytes + 1;
+    assert!(matches!(
+        session.re_read(&reply.to_string(), 0, 1),
+        Err(Error::Budget(_))
+    ));
+}
+
+/// Grounds the schema refusal at a real legacy run root while keeping offline
+/// request replay usable. Older journals cannot prove per-call execution facts.
+#[test]
+fn pre_lifecycle_runs_refuse_writable_restore_but_keep_read_only_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::open(dir.path(), SessionConfig::default()).unwrap();
+    let request = session
+        .record_request(
+            json!({"messages":[{"role":"user","content":"task"}]}),
+            "openai",
+        )
+        .unwrap();
+    let old = session
+        .store
+        .put(&MerkleNode::genesis(JournalEntry::Run {
+            schema: 1,
+            config: session.config.clone(),
+            root: session.root,
+        }))
+        .unwrap();
+    drop(session);
+    let error = Session::restore(dir.path(), old, "local-session")
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("pre-lifecycle schema 1"),
+        "{error}"
+    );
+    assert_eq!(
+        crate::replay_from_store(&FrameStore::open(dir.path()).unwrap(), request.id).unwrap(),
+        request.bytes
+    );
+}
+
+/// Grounds transition admission in a correctly addressed but semantically
+/// forged journal entry. Hash checks alone must not accept an unstarted return.
+#[test]
+fn cold_restore_refuses_a_hashed_return_without_a_start_fact() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::open(dir.path(), SessionConfig::default()).unwrap();
+    let request = session
+        .record_request(
+            json!({"messages":[{"role":"user","content":"task"}]}),
+            "openai",
+        )
+        .unwrap();
+    let reply = session.record_reply(request.id, b"call").unwrap();
+    let calls = [json!({"id":"a","function":{"name":"test","arguments":{}}})];
+    let messages = [
+        json!({"role":"user","content":"task"}),
+        json!({"role":"assistant","tool_calls":calls}),
+    ];
+    let call = session.begin_tool_batch(reply, &calls, &messages).unwrap()[0];
+    let event = session
+        .event(
+            EventOrigin::Tool,
+            EventKind::Observation,
+            b"forged returned bytes",
+            BTreeSet::from([call]),
+            BTreeSet::new(),
+            0,
+        )
+        .unwrap();
+    let forged = session
+        .store
+        .put(&MerkleNode::new(
+            JournalEntry::ToolCall {
+                invocation: call,
+                change: ToolChange::Returned {
+                    event,
+                    sources: vec![],
+                    kind: tools::ReturnKind::Observed,
+                },
+            },
+            [session.head],
+        ))
+        .unwrap();
+    session
+        .store
+        .publish_head(&session.writer, Some(session.head), forged)
+        .unwrap();
+    drop(session);
+    let error = Session::restore(dir.path(), forged, "local-session")
+        .err()
+        .unwrap();
+    assert!(
+        error.to_string().contains("only started calls can return"),
+        "{error}"
+    );
 }
 
 /// Grounds append failure behavior in a real failed atomic head publication.

@@ -37,10 +37,10 @@ legacy mode and in the comparison evaluator; smart mode never falls back to it.
 | D3: host ownership | Tool-less relevance calls propose a strict JSON CID array. The host checks the entire selection, authority, required inputs, tool groups, and budgets before dispatch. Rejected proposals and auxiliary errors remain recorded. | `agent-harness/tests/navigation.rs`; `http_smart_harness.rs` |
 | D4: harness origin | Host messages are explicitly registered at insertion. Auxiliary payloads and control text cannot impersonate operator input or become source relevance evidence. Parsed model text and decorated delivery records remain distinct. | Operator collision and model-answer evidence regressions in `session/tests.rs` |
 | D5: depth | Admission recomputes generation depth from derivation sources, not all causal parents. Generation from depth one is rejected. Elision and retrieval preserve source origin and depth. Native provider tool envelopes retain retrieval provenance. | Kernel construction, JSON/CBOR admission, and native-provider receipt tests |
-| D6: lifecycle | Each fresh invocation has an addressed root containing its configuration and occurrence nonce. Resume records its starting checkpoint and current authority. Hermetic input constraints are explicit and prohibit resume. | Shared configuration tests; real restart tests; CLI flag tests |
+| D6: lifecycle | Each fresh invocation has an addressed root containing its configuration and occurrence nonce. A writable session holds exclusive run ownership and checks its expected head against the current locator. Resume admits only that current checkpoint with matching authority; hermetic input constraints prohibit resume. | [Writer ownership](../../agent-harness/tests/writer_ownership.rs), [process lifetime](../../agent-harness/tests/writer_process.rs), configuration, and CLI flag tests |
 | D7: failures | Raw replies persist before auxiliary work. Failure records settle failed adjudication without inventing a verdict. Unavailable startup configuration is a visible admission error before any model reply. Missing or corrupt storage fails closed. | Timeout, cancellation, malformed reply, missing source, and failed checkpoint tests |
 | D8: legal cuts | The last actual operator message, system constraints, and unseen tool results are protected. Call/result groups remain whole. Harness pins are fixed protocol constraints, outside relevance evidence. | Navigation and provider integration tests |
-| D9: durability | Sources and addressed nodes persist before the journal publishes its checkpoint. Resume verifies the complete admitted closure and current configuration. Tool output leaves ephemeral spill storage before durable slices are returned. | Real filesystem, cold process, TUI locator, and shell spill restart tests |
+| D9: durability | Sources and addressed nodes persist before checkpoint publication. Schema 2 records each batch, distinct call occurrence, start, observed return, and model-facing delivery. Resume admits the complete closure and current configuration, preserves observed returns, and explicitly closes uncertain or unstarted slots without rerunning tools. | [Tool lifecycle](../../agent-harness/tests/tool_lifecycle.rs), [four-provider completion and recovery](../../newt-core/src/agentic/mod_tests/http_smart_completion.rs), and writer process tests |
 | D10: CPU auxiliary | Embedded smart inference explicitly selects CPU and captures the exact model/tokenizer bytes named by the manifest. An external override requires a separate endpoint and declared CPU placement. No primary fallback exists. | Inference configuration and pinned asset tests; real CPU smoke |
 | D11: mediated retrieval | `re_read` admits only session events or packets, checks byte intervals and budgets, and records a receipt parented on the followed pointer and retrieved artifacts. A partial slice states its continuation. | Receipt, tamper, access, and restart tests |
 | D12: separate budget | Auxiliary calls, input/output sizes, generation tokens, and elapsed time have their own configuration and accounting. Navigation adds independent catalog, fetch, dereference, retry, and elapsed-work limits. | Runtime budget tests; emitted solve contract |
@@ -63,7 +63,9 @@ legacy mode and in the comparison evaluator; smart mode never falls back to it.
    harness material is excluded from relevance evidence and generation inputs.
 5. The host persists the projection and exact rendered request before network
    dispatch. It records the full provider reply before parsing or adjudicating
-   it. Validated tool batches receive a separate dispatch record before effects.
+   it. Before effects, schema 2 commits the validated batch and a distinct start
+   for each dispatched call. Each observed return persists before display or
+   another tool; its later model-facing delivery is recorded separately.
 6. A tool-less reply is parsed into original model text, then classified through
    a bounded auxiliary call. Its raw auxiliary prompt, output or failure,
    normalized verdict, and host control outcome are distinct records.
@@ -111,6 +113,13 @@ Structured objects are canonical DAG-CBOR files named by their `ContentId`.
 Opaque material uses `RawContentId`. An atomically replaced `heads/<run CID>`
 locator points to immutable journal state. The TUI keeps an immutable
 conversation-to-run binding and verifies the checkpoint when reopening it.
+A writable session owns an exclusive run lock until release and refuses a
+changed expected head. Writable restoration accepts only the current locator
+and schema 2; schema 1 lacks the per-call evidence needed for safe continuation.
+Interrupted calls with no observed return remain explicitly uncertain, while
+admitted calls that never started remain unstarted. Restored provider slots are
+closed with recorded host notices or retained-return pointers, without replaying
+external tool effects.
 Old conversations without that binding require a new conversation, or an
 existing frame can be resumed through `newt solve`. Inherited text is not
 treated as restored history.
