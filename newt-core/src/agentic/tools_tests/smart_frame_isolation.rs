@@ -1,6 +1,6 @@
 use super::*;
 use crate::agentic::{mcp::NoMcp, smart_harness::SmartHarness};
-use crate::caveats::{Caveats, Scope};
+use crate::caveats::Caveats;
 use std::{path::Path, sync::Arc};
 
 fn harness(directory: &Path) -> (SmartHarness, content_addressable::ContentId) {
@@ -219,6 +219,8 @@ async fn private_frame_denies_raw_tools_and_preserves_mediated_reads() {
 #[tokio::test]
 #[serial_test::serial]
 async fn real_shell_cannot_read_or_mutate_private_frame() {
+    use crate::caveats::Scope;
+
     let _env = super::disable_ocap_tests::env_lock().await;
     let _yolo = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
     let _full = super::disable_ocap_tests::EnvVar::set("NEWT_FULL_ACCESS", "0");

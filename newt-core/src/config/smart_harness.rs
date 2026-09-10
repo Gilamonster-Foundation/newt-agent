@@ -300,13 +300,20 @@ fn isolated_directory(dir: &Path, caveats: &Caveats, workspace: &Path) -> anyhow
         roots.extend(paths.into_iter().map(PathBuf::from));
     }
     if let Scope::Only(commands) = &caveats.exec {
+        let path_bearing = |name: &str| {
+            let path = Path::new(name);
+            path.has_root()
+                || path
+                    .parent()
+                    .is_some_and(|parent| !parent.as_os_str().is_empty())
+        };
         roots.extend(
             commands
                 .iter()
-                .filter(|name| name.contains('/'))
+                .filter(|name| path_bearing(name))
                 .map(PathBuf::from),
         );
-        if commands.iter().any(|name| !name.contains('/')) {
+        if commands.iter().any(|name| !path_bearing(name)) {
             // ponytail: exclude whole PATH directories; narrow to executable
             // files when bridle exposes its currently private resolver.
             if let Some(path) = std::env::var_os("PATH") {
@@ -628,7 +635,10 @@ mod tests {
         std::fs::create_dir_all(workspace.join("mutable")).unwrap();
         std::fs::create_dir(paths.path().join("outside")).unwrap();
         let anchor = workspace.join("mutable/../../outside");
-        assert_eq!(anchor.canonicalize().unwrap(), paths.path().join("outside"));
+        assert_eq!(
+            anchor.canonicalize().unwrap(),
+            paths.path().join("outside").canonicalize().unwrap()
+        );
         let mut caveats = crate::confined_exec::build_tool_caveats(&workspace);
         let Scope::Only(reads) = &mut caveats.fs_read else {
             panic!("fixture authority must be scoped");
@@ -777,7 +787,10 @@ mod tests {
         let auxiliary = serde_json::json!({"placement":"cpu", "model":"fixture"});
         let session = config.open_session(&launch, auxiliary.clone()).unwrap();
         let context = session.config().authority_context.as_ref().unwrap();
-        assert_eq!(context["workspace"], workspace.path().to_str().unwrap());
+        assert_eq!(
+            context["workspace"],
+            workspace.path().canonicalize().unwrap().to_str().unwrap()
+        );
         assert_eq!(context["caveats"], serde_json::to_value(&caveats).unwrap());
         let head = session.head().to_string();
         drop(session);
