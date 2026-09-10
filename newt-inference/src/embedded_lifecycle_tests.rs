@@ -5,7 +5,19 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-const WATCHDOG: Duration = Duration::from_secs(5);
+// A HANG-GUARD, never a latency bound. Every use below waits on a
+// `spawn_blocking` worker that holds the admission permit; the successor path
+// uses `try_acquire_owned`, so none of these waits is structurally slow and an
+// Elapsed here means the blocking thread was starved, not that the code is
+// wrong. Five seconds of wall clock was too tight under `cargo llvm-cov`: the
+// instrumented job runs ~2x the plain test job (18m56s vs 10m25s on
+// 2026-09-08), and the pair at lines 72 and 128 failed there while passing on
+// the same commit in the uninstrumented job. Widening a hang-guard weakens no
+// assertion in this file -- the one real latency bound is the separate
+// `Duration::from_secs(1)` below, which is unchanged. The sibling comment at
+// "not required to beat a short timer on a contended test machine" records the
+// same lesson for a wait that was fixed by pausing the clock instead.
+const WATCHDOG: Duration = Duration::from_secs(60);
 
 #[tokio::test]
 async fn expired_generation_does_not_start_the_loader() {

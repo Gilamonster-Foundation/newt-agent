@@ -781,6 +781,40 @@ kind = "openai"
         "the early-write half of the shape must have happened — without it this \
          is a generic capped run, not the write-complete-then-grind case: {result}"
     );
+    // `write_calls` counts by NAME and ignores `ok` (solve.rs), so it would
+    // still read 3 if every write had been DENIED — and then the ok-gated field
+    // below would be `null`, failing for a permission reason unrelated to this
+    // fix. Pin the writes as SUCCEEDING so the two cannot drift apart silently.
+    let writes_ok = result["trajectory"]
+        .as_array()
+        .expect("trajectory is an array")
+        .iter()
+        .filter(|e| e["tool"] == "write_file" && e["ok"] == true)
+        .count();
+    assert_eq!(
+        writes_ok, EARLY_WRITES,
+        "the early writes must have SUCCEEDED, not merely been attempted: {result}"
+    );
+
+    // ── the typed grind measurement (#2214) ───────────────────────────────
+    // RED against e3f42a36: the record has no such key, so this reads `null`.
+    //
+    // How many calls the run spent AFTER its last successful workspace write —
+    // the thing that distinguishes write-complete-then-grind from thrash and
+    // from a genuinely-too-small cap, all three of which say `RoundCap` today.
+    //
+    // The expected value is in CALLS, not rounds. It equals
+    // `CAP_ROUNDS - EARLY_WRITES` only because this scripted model issues
+    // exactly one call per round; a fixture that ever batches two calls into a
+    // round must recompute it from the trajectory rather than from the round
+    // counts. 5 is neither 0 nor `tool_calls` (8), so neither a constant-zero
+    // implementation nor an off-by-the-whole-length one passes.
+    assert_eq!(
+        result["calls_after_last_write"],
+        (CAP_ROUNDS - EARLY_WRITES) as u64,
+        "the run spent its whole tail after the work was done; that must be a \
+         value a gate can assert, not prose in the reply: {result}"
+    );
 
     // ── the precondition ──────────────────────────────────────────────────
     // If the run did not actually end at the cap, the fixture failed to

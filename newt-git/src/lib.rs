@@ -1446,7 +1446,7 @@ fn render_branch_list(git_dir: &Path, args: &serde_json::Value) -> Result<String
         ));
     }
     let scope = match args.get("scope") {
-        None => "all",
+        None | Some(serde_json::Value::Null) => "all",
         Some(serde_json::Value::String(scope))
             if matches!(scope.as_str(), "local" | "remote" | "all") =>
         {

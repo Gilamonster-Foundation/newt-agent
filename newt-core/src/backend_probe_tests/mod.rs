@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::{BackendKind, OpenAiApi as OpenAiApiSurface};
 use std::time::Duration;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn openai_backend(model: Option<&str>, serving: Option<Serving>) -> BackendConfig {
