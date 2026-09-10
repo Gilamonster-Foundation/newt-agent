@@ -1,0 +1,16 @@
+[package]
+name = "diffprobe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Concept probe: wrap watchdiff-tui to let an agent show and explore a diff it made."
+
+# Detach from the newt workspace that envelopes this worktree, so the probe is
+# its own build unit and never touches the newt coverage/build gate.
+[workspace]
+
+[dependencies]
+watchdiff-tui = "0.2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
