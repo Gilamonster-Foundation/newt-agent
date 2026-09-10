@@ -96,16 +96,40 @@ sequenceDiagram
     C->>M: prompt
     M-->>C: reply (or tool call)
     C-->>H: reply + antecedent node ids
-    H->>H: adjudicate — answer / narration / question (bounded, tool-less)
     H->>F: append node { reply, parents: antecedents }
-    H->>F: append node { verdict, parents: [reply], op: generate, depth: 1 }
+    F-->>H: reply CID — the observation is now recorded
+    H->>H: adjudicate(reply CID, antecedents) — answer / narration / question (bounded, tool-less)
+    H->>F: append node { verdict, parents: [reply CID], op: generate, depth: 1 }
     Note over H,F: harness-origin nodes are tagged and never enter summarizer input (2.4)
 ```
 
-Two things the diagram fixes that prose leaves loose: **the cut set is computed
-by the harness, not chosen by a caller** (5b.1), and **the verdict is a node with
-the reply as its parent** — which is what lets a later reader ask "why was this
-turn recorded as done?" and get a CID, not a `⚠` glyph.
+Three things the diagram fixes that prose leaves loose.
+
+**The cut set is computed by the harness, not chosen by a caller** (5b.1).
+
+**The verdict is a node with the reply as its parent** — which is what lets a
+later reader ask "why was this turn recorded as done?" and get a CID, not a
+`⚠` glyph.
+
+**Record before adjudicate.** The reply is an *observation*. It is appended
+before the adjudicator is called, and the adjudicator is handed the recorded
+CID plus the antecedents it needs — it is not the operation that decides
+whether the reply deserves to exist in the frame. Order the other way round and
+an adjudicator that fails, times out, is cancelled, or returns unparseable
+output takes the observation with it: the reply existed, influenced nothing
+durable, and is absent from the accounted history. That is a provenance hole,
+and it is the one an implementation agent would dig by following a diagram
+literally. The failure behaviour that follows from the ordering:
+
+| what fails | consequence |
+|---|---|
+| appending the reply node | a **storage/integrity** failure. The turn does not proceed, and it is reported as storage failure — never as an adjudication outcome |
+| adjudicator unavailable, timeout, cancellation, unparseable output | the reply node **stands**. The failure is itself surfaced and recorded per **D7** (`AdjudicationFailure`), never a silent fallback |
+| — | there is no path that yields a verdict about an unrecorded observation: every verdict is parented by an already-recorded reply CID |
+
+This is the designed lifecycle, not a description of live code; the residual
+implementation obligations (interruption mid-turn, and the limits of replay over
+redacted content) are in §6b.
 
 ---
 
@@ -139,18 +163,22 @@ without inflation:
 
 - **one typed node shape for every derived thing**, instead of one bespoke
   record for compaction spans and nothing for the rest;
-- **a derivation constraint** (`op`, `depth`, parent set) checked at
-  construction and at decode, so an elision cannot silently become a
-  generation;
+- **a derivation constraint** (`op`, `depth`, parent set) that is *to be*
+  checked at construction and at decode, so an elision cannot silently become a
+  generation. The law is machine-checked in Lean (`Unit.wf`); the Rust
+  construction and decode validation is owed, not present — D5 is **OPEN**;
 - **an auditable projection**: the cut is a named set of CIDs a cold reader can
   re-derive, rather than a prompt string nobody can reconstruct.
 
-A genesis node has no parents, so `--hermetic` and `--resume <cid>` are
+A genesis node has no parents, so a **fresh** graph and a **resumed** graph are
 distinguishable at the data structure: one starts at a node with no parents, the
-other at a node with one. That is a statement about **graph origin only**.
-Hermeticity is a stronger property — which inputs are admitted, and what ambient
-state the run may read — and parentage does not establish it (C7). D6 must
-specify admitted inputs and ambient-state assumptions separately.
+other at a node with one. That is a statement about **graph origin only**, and it
+is the whole of what parentage tells you. Hermeticity is a different and stronger
+property — which inputs are admitted, and what ambient state the run may read —
+and no arrangement of parents establishes it (C7). So `--hermetic` is not a claim
+about where the graph starts; it is an execution policy that a run at genesis may
+or may not be honouring. D6 states the two separately, and the admitted-input
+contract it needs is still unwritten.
 
 ---
 
@@ -258,10 +286,18 @@ flowchart LR
 ```
 
 `Unit.wf: depth ≤ 1`. A harness verdict over a reply is depth 1. A summary of a
-summary is depth 2 and is **illegal by construction** — which is the
+summary is depth 2 and is **illegal by the design law** — which is the
 derivation-depth bound this line has already concluded is the only novel claim
-in the context-management literature it surveyed. The frame makes it a type
-error rather than a policy.
+in the context-management literature it surveyed.
+
+Keep two things apart here, because collapsing them is how a design law gets
+mistaken for a shipped guarantee. The **law** is machine-checked: `Unit.wf` is a
+Lean invariant, and it holds. **Runtime enforcement does not exist yet** — Rust
+owes validation at construction *and* at decode, and specifically across
+retrieval edges, where observing that a retrieval happened must not reset the
+retrieved artifact's origin or depth (§6b, "depth laundering"). The intent is
+that the frame makes depth 2 a type error rather than a policy; today it is a
+proved law with the enforcement outstanding (D5, **OPEN**).
 
 ---
 
@@ -303,10 +339,15 @@ implied-solved:
   must not reset the retrieved artifact's origin or depth. The depth-one rule
   needs a stated edge relation and validation at **both** construction and
   decode.
-- **Record before adjudicate.** The turn lifecycle must commit the observation
-  before any advisory adjudication can influence its fate, with defined
-  behaviour for interruption, malformed output, timeout and storage failure —
-  and no claim of byte-perfect replay over redacted content.
+- **Record-before-adjudicate: ordering settled, edges owed.** The *ordering* is
+  now stated normatively in §2 — the observation is appended first, the
+  adjudicator is handed the recorded CID, and adjudicator failure cannot erase
+  the reply. What an implementation still owes: behaviour when the turn is
+  **interrupted or cancelled between the append and the verdict** (the reply
+  node stands with no verdict — a reader must be able to tell that state from
+  "adjudicated as an answer"), and the limits of replay: **no claim of
+  byte-perfect replay over redacted content** survives, because the span the
+  handle points at is redacted (C1).
 
 ## 6c. The real defect behind #2239, and its separately shippable fix
 
@@ -375,23 +416,26 @@ emitted outcome string must update that permitted set in the same PR.
 Statuses below were revised after the review in §6b. **CHOSEN** means the
 operator picked the option and it stands; it does not mean the semantics,
 failure behaviour and verification obligations are all specified. **SETTLED**
-means those are specified. **OPEN** and **RESTATE** mean work is owed before
-implementation.
+means those are specified. **RESTATED** means the decision stands but its
+*claim* was rewritten because the original was not supported. **NARROW** means
+an over-broad claim was withdrawn and the decision now says less than it did.
+**OPEN** means work is owed before implementation. A corrected wording never by
+itself moves a decision to a stronger status.
 
 
 | # | decision | grounded in | status |
 |---|---|---|---|
 | **D1** | A frame primitive is `MerkleNode<Primitive>`; `Primitive` carries agent-frame's `Unit` fields (`op`, `depth`, `root`, `life`, `addressed`) plus the typed payload. No hand-rolled id, chain, or manifest. | `content-addressable::merkle`, `ContextOps.lean` | **SETTLED** (type) — storage unresolved, see C2 |
 | **D2** | Context is a projection of the frame — a selected node set rendered for one turn, auditable as a named CID set. Compaction is replaced by elision + re-read. The DAG is never pruned within a session. **The contribution is typed provenance, a construction-and-decode derivation constraint, and an auditable projection — not retention**, which already exists (§4). | invariants 3.1, 3.4 | **RESTATED** in §3/§4 per C1 — durability still owed, see D9 |
-| **D3** | The harness-llm is the only navigator. It is a bounded, tool-less side call in the `adjudicate.rs` shape. | `adjudicate.rs` (#1749), live | **SETTLED** (shape) — parser contract owed, C3 |
+| **D3** | The harness-llm is the only navigator: it is the only party that traverses the frame. It is a bounded, tool-less side call in the `adjudicate.rs` shape. This is not contradicted by D11 — the main LLM's `re_read` is a *mediated request*, not traversal authority (see D11). | `adjudicate.rs` (#1749), live | **SETTLED** (shape) — parser contract owed, C3 |
 | **D4** | Harness-origin nodes (nudges, adjudications, verdicts) are tagged in `life`/`root` and are **never** summarizer input and **never** evidence of model completion. | invariant 2.4 | **SETTLED** — but does not fix #2239 alone, C6 |
 | **D5** | `depth ≤ 1`. A verdict over a reply is depth 1; a summary of a summary is rejected at construction. | `Unit.wf` | **OPEN** — edge relation + decode check owed |
-| **D6** | `--hermetic` ⇔ session starts at genesis; `--resume <cid>` ⇔ starts at a node with a parent. Mutually exclusive, enforced at parse time. | operator ruling 2026-09-08 | **NARROW** — see C7; genesis ≠ hermetic |
+| **D6** | **Graph origin and execution policy are two different things.** A fresh execution begins at genesis (a node with no parents); `--resume <cid>` begins from an existing frame node — the root of the restored reachable state. `--hermetic` is an **execution policy orthogonal to graph origin**: it constrains which inputs are admitted and what ambient state the run may read. A hermetic run may begin at genesis, but **genesis alone does not prove hermeticity** and parentage cannot be used to decide it. That `--hermetic` and `--resume` are mutually exclusive, enforced at parse time, stands as a **product constraint for the first implementation** (operator ruling 2026-09-08) — it is not derived from Merkle parentage, and a later implementation could relax it without touching the data structure. **The hermetic-input contract itself is unresolved**: the set of admitted inputs and the ambient-state assumptions are not specified anywhere in this document. | operator ruling 2026-09-08 (mutual exclusion); C7 (the correction) | **NARROW** — the false equivalence is withdrawn; the hermetic-input contract is still owed and remains **OPEN** |
 | **D7** | Adjudicator unavailable ⇒ `AdjudicationFailure` surfaced to the operator and recorded as a node. **Never** a silent fallback to Jaccard. A re-read whose CID is absent fails closed — absence is a finding. | `AdjudicationFailure`, invariant §8 | **SETTLED** — failure path owed for storage |
 | **D8** | The legal cut set is computed (tool-pair atomicity, unseen results never elided, last operator message pinned), not a caller responsibility. | invariants 5b.1, 2.3, 3.2 | **SETTLED** |
 | **D9** | Storage is newt's `SpillStore` now; `agent-store`'s opaque `Entry.payload` later. agent-frame v0 stays a library that mints elision. | `V0-DECISION.md` §3 | **OPEN** — SpillStore is ephemeral, C2 |
 | **D10** | The narration adjudicator runs on the **auxiliary / CPU-local backend** (`BackendKind::Embedded`, or the summarizer's CPU-local default), with a `BackendRef` override, and the run manifest records which adjudicator judged the turn. It never contends with the primary model or the round budget. The reason `config/shell.rs:113` gives for keeping *intake* adjudication on the steering model — *"adjudication reads operator intent, which is the steering model's own job"* — does not transfer: narration classification is mechanical classification of model output, which is the summarizer's kind of work. | `config/shell.rs:113`, `BackendKind::Embedded` (#639), `BackendRef` | **CHOSEN** — placement/fallback owed, C4 |
-| **D11** | The main LLM **gets one `re_read(cid)` tool**. Retrieval is not harness-only: invariant 3.4's *re-read directive* is addressed to the model, so the model needs the affordance to act on it. Results are appended to the frame as nodes whose parent is the pointer that was followed, so a retrieval is itself provenanced and a later reader can see what the model chose to re-read. | invariant 3.4 | **CHOSEN** — bounds owed (§6b) |
+| **D11** | The main LLM **gets one `re_read(cid)` tool**. Retrieval is not harness-only: invariant 3.4's *re-read directive* is addressed to the model, so the model needs the affordance to act on it. **It is a mediated capability, not frame-traversal authority**: the model *requests* a CID, the harness validates and bounds the request, the access happens through harness-owned machinery, and the result is recorded and projected back. The model never gets to walk the graph, and an absent CID fails closed (D7). Results are appended to the frame as nodes whose parent is the pointer that was followed, so a retrieval is itself provenanced and a later reader can see what the model chose to re-read. | invariant 3.4 | **CHOSEN** — bounds owed (§6b) |
 | **D12** | The adjudication side call **does not count against the round budget** — it is harness work, not model work, and charging it would penalise an arm for harness overhead and make round-cap comparisons across harnesses unfair. It **must** be declared in the run configuration and recorded in the contract record, or two runs are not comparable. This is #2227's "verify the instrument" applied to the classifier. | #2227 | **CHOSEN** — separate enforced budget owed |
 | **D13** | The **`question` class ships** as a third verdict alongside answer / narration: a reply that asks the operator something is nudged to *ask*, not to *do*. This is #1020's original complaint (the model offered "Option A, B, or C?" and was nudged to act). The earlier rationale — that a Jaccard matcher "structurally cannot carry" a third class because its margin is 0.03 — is **withdrawn**: a winner/runner-up margin does not bound how many classes a classifier can represent (C5). Whether a model-backed classifier discriminates better is an empirical question, and it needs a comparison against the deterministic baseline rather than an impossibility claim. | #1020 | **CHOSEN** — C5 rationale withdrawn |
 
