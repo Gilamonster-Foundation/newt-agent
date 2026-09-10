@@ -247,6 +247,9 @@ async fn host_bypass_publishes_output_before_command_completion() {
 #[cfg(not(windows))]
 #[tokio::test]
 async fn bridled_shell_forwards_live_bytes_without_changing_the_envelope() {
+    // Restricted-exec proofs must not inherit another test's temporary engine.
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     let sink = std::sync::Arc::new(RecordingLiveOutput::default());
     let caveats = crate::caveats::Caveats {
         exec: crate::caveats::Scope::only(["echo".to_string()]),
