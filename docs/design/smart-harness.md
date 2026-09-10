@@ -6,8 +6,9 @@
 > this builds on: `docs/decisions/1528b3-cid-spill-identity.md`,
 > `docs/decisions/1528b3-proactive-compaction.md`.
 
-**Status:** DESIGN UNDER REVISION. Revised 2026-09-08, made self-consistent
-2026-09-09. Nothing implemented.
+**Status:** DESIGN UNDER REVISION. Revised against `main` at `ddbf870f`
+(2026-09-09). The elision kernel and its forensic CLI landed in **#2246**;
+the smart-harness integration described here is not implemented.
 
 An earlier revision of this file marked all thirteen decisions **LOCKED** and
 said implementation could begin. **That status was not supported by the
@@ -29,8 +30,10 @@ D10–D13 remain the operator's decisions and stand as *choices*. What does not
 stand is my characterisation of what the code already does, and several
 "grounded in existing law" claims that the law does not actually support.
 
-**Implementation of the frame does not begin from this document in its current
-state.** The separately-shippable half of the #2239 fix (§6c) never depended on
+**Implementation of the smart-harness integration does not begin from this
+document in its current state.** The existing kernel is inventoried below;
+D1–D3 still owe integration contracts. The separately-shippable half of the
+#2239 fix (§6c) never depended on
 it and has already shipped: **#2251 merged 2026-09-09 (`44ff61c8`)**, so an
 exhausted narration rescue is no longer reported as a completion. **#2239 itself
 remains OPEN** — the accept site, the `NarrationFinalRound` decision and TUI
@@ -45,43 +48,54 @@ thesis and its recovery). This document is the accounting.
 ## 0. Inventory — what is reused, not designed
 
 Per the provenance-audit rule: enumerate what exists before designing the gap.
+The current-main baseline is [#2246's merged tree](https://github.com/Gilamonster-Foundation/newt-agent/tree/ddbf870facbba1b895dfd66793b157c973b0c0fd).
+The [monorepo decision](https://github.com/Gilamonster-Foundation/newt-agent/blob/ddbf870facbba1b895dfd66793b157c973b0c0fd/docs/decisions/agent-frame-v0-monorepo.md)
+supersedes the separate-repository release plan.
 
 | already exists | where | role here |
 |---|---|---|
-| `MerkleNode<T>` (payload + ordered parent set, id over both), `ContentId`, `NodeStore`, canonical dag-cbor | `content-addressable` 0.1.2, already a workspace dependency | **the node, the id, the store trait.** Hand-rolling any of these is a defect |
-| `Op = concise \| elide \| generate`; `depthAfter: generate ⇒ d+1`; `Unit { op, depth, root, life, addressed }`; `Unit.wf: depth ≤ 1` | `agent-frame/formal/ContextOps.lean` — machine-checked | **the derivation laws** |
-| invariants §1–§8; ledger newt 29 ✓ / 6 partial / 5 open / 1 rejected | `agent-frame/docs/INVARIANTS.md`, `V0-DECISION.md` | **the obligations** |
-| `SpillStore` + `SpillProvenance::CompactionSpan` — content-addressed, redact-on-store, fail-closed on collision | `newt-core/src/agentic/content_spill.rs` | **storage, for a live session only.** `SessionSpillStore` is a `Mutex<HashMap<String, SpillRecordV1>>`; its own module doc (`:29`) says it is "session-scoped, and discarded at `/new`; it was NEVER persisted, so an old handle could not survive a process/session restart". agent-frame v0 defers the session store *"specifically because it already exists in newt"* — but a durable frame needs a durable path this does not provide (C2) |
-| `adjudicate.rs` — one bounded, tool-less side call; `AdjudicationFailure` returned so the harness *tells* the operator | `newt-core/src/agentic/adjudicate.rs`, live at `newt-tui/src/chat.rs:6680` | **the harness-llm call shape.** The *call shape* is what is reused. The parse is **not** strict: `parse_adjudication_reply` strips a fence, then takes `find('[')`..`rfind(']')`, so prose on either side of the array is accepted. The "does NOT hunt for a decision inside prose" assurance is a doc comment the code does not implement (C3) — an explicit parser contract is owed |
+| `MerkleNode<T>`, `ContentId`, `RawContentId`, `NodeStore`, canonical dag-cbor | `content-addressable` 0.1.2, already a workspace dependency | **the node, identities, and store trait.** Parents are a `BTreeSet`: canonical CID order, not presentation or insertion order. Structured values use `ContentId`; opaque bytes use `RawContentId` |
+| `Op = concise \| elide \| generate`; `depthAfter: generate ⇒ d+1`; `Unit.wf: depth ≤ 1` | `formal/ContextOps/Basic.lean` | **the derivation laws.** Lean's abstract `addressed` field is not the Rust representation |
+| `Unit`, `Derivation`, `RootEvent`, `UnitId`, `Packet`, `PacketId`; `verify_unit` | `agent-frame/src/{unit,derivation,root,packet,verify}.rs`, landed in #2246 | **the elision kernel.** `Unit` addresses `{ op, source, span, elided, root }`; `life` is outside that identity. `RootEvent` identifies a particular event. `Packet` already wraps `MerkleNode<PacketBody>` and admits a chain, not multiple parents. Construction and decode admission enforce elision-only/depth-zero rules; byte verification is separate (§6) |
+| invariants §1–§8; `INVARIANTS.md` and `V0-DECISION.md` | historical records in the archived separate agent-frame repository, not paths in this checkout | **background obligations.** Numbered invariant references below refer to those records, not a fresh conformance count; the local code and monorepo decision define what shipped |
+| `SpillStore` + `SpillProvenance::CompactionSpan` — content-addressed, redact-on-store, fail-closed on collision | `newt-core/src/agentic/content_spill.rs:296-298` | **storage for a live session.** `SessionSpillStore` keeps records in an in-memory `Mutex<HashMap<...>>`. It supplies no cross-process restoration path; D9 remains open |
+| `FrameStore`, `SourceResolver`; `newt frame verify/explain/parents` | `newt-cli/src/frame_cmd.rs`, landed in #2246 | **verified reading of on-disk records.** Reuses kernel admission and verification, and reports unresolved roots. It does not write session history or restore a session's graph closure and authorization context |
+| `adjudicate.rs` — one bounded, tool-less side call; `AdjudicationFailure` returned so the harness *tells* the operator | `newt-core/src/agentic/adjudicate.rs`, live at `newt-tui/src/chat.rs:6436` | **the auxiliary call shape.** The parse is **not** strict: `parse_adjudication_reply` strips a fence, then takes `find('[')`..`rfind(']')`, so prose on either side of the array is accepted. The "does NOT hunt for a decision inside prose" assurance is a doc comment the code does not implement (C3) — an explicit parser contract is owed |
 | `BackendKind::Embedded` (#639), `BackendRef` | `newt-core/src/config.rs`; device selector at `newt-inference/src/embedded.rs:9` | **a separately addressable backend** and its override. Not automatically a *non-contending* one: it is CPU **by default**, not CPU-only — `NEWT_EMBEDDED_DEVICE = cpu\|metal\|cuda\|auto`, plus `embedded-metal` / `embedded-cuda` features — so "never contends with the primary" is a constraint D10 must specify and enforce, not a property inherited from the enum (C4) |
 
-**What is new:** one node payload type, one navigation loop, one classifier
-adoption, and the rule that harness output is never evidence. That is the whole
-gap.
+**What remains:** integrate observations, interventions and verdicts with the
+existing kernel; record ordered projections; implement host-controlled
+navigation and a bounded classifier; and provide the session lifecycle. These
+are integration obligations, not permission to rebuild identities, elision,
+packet admission or verification beside the implementations above.
 
 ---
 
 ## 1. The four layers
 
 ```
-agent-frame  <->  harness-llm  <->  context  <->  LLM
+agent-frame  <->  host harness (assisted by a small LLM)  <->  context  <->  LLM
 ```
 
 ```mermaid
 flowchart LR
     F[("agent-frame<br/>Merkle DAG of primitives<br/><i>what do I know, and how</i>")]
-    H["harness-llm<br/>small model<br/><i>navigate · assemble · adjudicate</i>"]
+    H["host harness<br/><i>validate · navigate · record · render</i>"]
+    K["auxiliary LLM<br/><i>propose relevance · classify replies</i>"]
     C["context<br/>this turn's projection<br/><i>a view, never the frame</i>"]
     M["LLM<br/>the harnessed model<br/><i>do the work</i>"]
     F <-->|"catalog + fetch / append nodes"| H
+    H <-->|"bounded input / untrusted proposal"| K
     H <-->|"assemble / read back"| C
     C <-->|"prompt / reply"| M
 ```
 
-**The main model never touches the frame.** It sees a projection. The
-harness-llm is the only navigator, and everything the main model produces goes
-back into the frame *through* the harness-llm, which is where it gets
-classified and recorded.
+**The host harness alone traverses and writes the frame.** Both models see
+bounded inputs and return untrusted outputs. The auxiliary model proposes
+relevant material and classifies replies through tool-less calls; it cannot
+fetch, append, grant access or declare a cut legal. Host code computes legality,
+validates proposals, records observations and renders the projection. The main
+model's `re_read` request crosses the same host-owned boundary (D11).
 
 ---
 
@@ -90,26 +104,43 @@ classified and recorded.
 ```mermaid
 sequenceDiagram
     participant F as agent-frame
-    participant H as harness-llm
+    participant H as host harness
+    participant K as auxiliary LLM
     participant C as context
     participant M as LLM
     H->>F: read catalog (node ids + one-line cards)
-    H->>H: compute legal cut set (5b.1)
+    H->>H: compute legal cuts and bounded candidate catalog (5b.1)
+    H->>K: bounded candidates + task, no tools
+    K-->>H: proposed relevant selection
+    H->>H: validate access, bounds, pairs, unseen results, pinned message
     H->>F: fetch nodes the projection needs
-    H->>C: assemble projection
+    H->>F: record ordered projection + rendering inputs (3a)
+    H->>C: render the recorded projection
+    C-->>H: exact request prepared for dispatch
+    H->>F: record request commitment bound to projection
     C->>M: prompt
     M-->>C: reply (or tool call)
-    C-->>H: reply + antecedent node ids
+    C-->>H: reply + projection record CID + antecedent node ids
     H->>F: append node { reply, parents: antecedents }
     F-->>H: reply CID — the observation is now recorded
-    H->>H: adjudicate(reply CID, antecedents) — answer / narration / question (bounded, tool-less)
+    H->>K: recorded reply + antecedents — bounded, tool-less adjudication
+    K-->>H: proposed answer / narration / question verdict
+    H->>H: validate verdict schema and referenced reply
     H->>F: append node { verdict, parents: [reply CID], op: generate, depth: 1 }
     Note over H,F: harness-origin nodes are tagged and never enter summarizer input (2.4)
 ```
 
-Three things the diagram fixes that prose leaves loose.
+The diagram assigns ownership as well as ordering.
 
-**The cut set is computed by the harness, not chosen by a caller** (5b.1).
+**Legality is computed and enforced by host code** (5b.1). The model chooses
+relevance only within those constraints. Before any projection is sent, the
+host checks the complete proposed selection: tool pairs stay atomic, unseen
+results stay visible, the last operator message stays pinned, and access and
+size limits hold. An invalid proposal is rejected before rendering; the host
+does not repair it by silently dropping protected material or consult the model
+to waive a rule. Rejection is surfaced and recorded. Any retry consumes the
+separate navigation budget; its limits and termination policy remain owed in
+§6b. Model output cannot authorize frame reads or writes.
 
 **The verdict is a node with the reply as its parent** — which is what lets a
 later reader ask "why was this turn recorded as done?" and get a CID, not a
@@ -127,6 +158,7 @@ literally. The failure behaviour that follows from the ordering:
 
 | what fails | consequence |
 |---|---|
+| recording the projection or request commitment | a **storage/integrity** failure before dispatch. Do not send an unrecorded projection |
 | appending the reply node | a **storage/integrity** failure. The turn does not proceed, and it is reported as storage failure — never as an adjudication outcome |
 | adjudicator unavailable, timeout, cancellation, unparseable output | the reply node **stands**. The failure is itself surfaced and recorded per **D7** (`AdjudicationFailure`), never a silent fallback |
 | — | there is no path that yields a verdict about an unrecorded observation: every verdict is parented by an already-recorded reply CID |
@@ -138,6 +170,10 @@ redacted content) are in §6b.
 ---
 
 ## 3. The frame is a DAG; context is a projection
+
+This is the proposed full integration graph. The shipped v0 `Packet` is a
+single-predecessor chain; this diagram does not widen its admission rules. D1
+must specify how these causal relationships reuse and extend the kernel.
 
 ```mermaid
 flowchart TB
@@ -155,7 +191,9 @@ flowchart TB
     class G,U1,E1,A1,U2 proj
 ```
 
-Highlighted nodes are **this turn's projection**: `{G, U1, E1, A1, U2}`. The
+Highlighted nodes are **this turn's selected material**: `{G, U1, E1, A1, U2}`.
+The intended presentation order is `[G, U1, E1, A1, U2]`, which must be recorded
+separately (§3a). The
 elided pair `{T1, R1}` is still in the DAG; the projection carries `E1`, a
 pointer to them with a re-read directive. Nothing was deleted — which satisfies
 invariant 3.4's *name what was compacted with a re-read directive*.
@@ -165,24 +203,52 @@ retains the span and already advertises a resolvable content-addressed handle
 (§4, C1). What this picture adds over that is narrower, and it is worth stating
 without inflation:
 
-- **one typed node shape for every derived thing**, instead of one bespoke
-  record for compaction spans and nothing for the rest;
+- **typed provenance across observations and derivations**, reusing the landed
+  kernel; additional payloads and their relationship to its types remain D1;
 - **a derivation constraint** (`op`, `depth`, parent set) that is *to be*
   checked at construction and at decode, so an elision cannot silently become a
-  generation. The law is machine-checked in Lean (`Unit.wf`); the Rust
-  construction and decode validation is owed, not present — D5 is **OPEN**;
-- **an auditable projection**: the cut is a named set of CIDs a cold reader can
-  re-derive, rather than a prompt string nobody can reconstruct.
+  generation. The elision kernel already checks construction and admission;
+  extending this across generated verdicts and retrieval edges remains owed —
+  D5 is **OPEN**;
+- **an auditable projection**: selected CIDs are necessary but insufficient.
+  Ordered entries and rendering inputs must also be recorded (§3a).
 
-A genesis node has no parents, so a **fresh** graph and a **resumed** graph are
-distinguishable at the data structure: one starts at a node with no parents, the
-other at a node with one. That is a statement about **graph origin only**, and it
-is the whole of what parentage tells you. Hermeticity is a different and stronger
+A genesis node has no parents. That identifies graph topology, not whether an
+invocation is fresh or resumed: an existing genesis node can itself be a resume
+target. The run record must state the invocation mode and selected starting CID;
+parentage cannot recover that choice. Hermeticity is a different and stronger
 property — which inputs are admitted, and what ambient state the run may read —
 and no arrangement of parents establishes it (C7). So `--hermetic` is not a claim
 about where the graph starts; it is an execution policy that a run at genesis may
 or may not be honouring. D6 states the two separately, and the admitted-input
 contract it needs is still unwritten.
+
+### 3a. What an auditable projection must record
+
+A CID set cannot reconstruct a prompt. Merkle parents discard insertion order,
+and the graph above does not order `E1` relative to `A1` or `U2`. The same selected
+nodes can therefore produce different prompts without changing their IDs.
+
+Before dispatch, host code must record the ordered entries actually rendered,
+including message roles, referenced CIDs and any selected byte spans; the
+renderer/template version and all rendering options; and the task, system and
+tool-definition inputs that affect the request. It must bind this record to the
+request dispatched to the backend and to the resulting reply. Canonical
+structured records reuse `ContentId`; a commitment to exact serialized request
+bytes uses `RawContentId`. Neither needs a new hash or canonical encoding.
+
+The verification obligation is a cold replay: resolve the retained inputs,
+render in recorded order with the recorded configuration, and compare with the
+recorded request commitment. Reordering entries or changing a role, selected
+span or template must be detectable. A commitment alone does not retain inputs,
+and redacted or unavailable inputs must produce an explicit replay limitation,
+not a claim of byte-perfect reconstruction. The protocol records what the host
+sent; it cannot establish hidden provider-side prompt transformations.
+
+This states the missing contract, not a new implemented record type. Its schema,
+admission rules, storage and replay tests remain **OPEN** under D2 and must reuse
+the inventory before choosing an encoding. Recording an ordered projection
+does not make the existing `Packet` multi-parent or change `Unit` identity.
 
 ---
 
@@ -219,16 +285,16 @@ already made once (#1786). What actually changes across the two panels:
 | | today | design |
 |---|---|---|
 | span survives | yes, redacted, in `SpillStore` | yes, in the DAG |
-| handle | content-addressed, one bespoke provenance variant | `MerkleNode` id, uniform across every derived thing |
-| derivation recorded | implicit — the summary does not name its `op` or depth | explicit `op`/`depth`/parent set, checked at construction **and** decode |
+| handle | content-addressed, one bespoke provenance variant | existing `UnitId` / `PacketId` where applicable; additional payload identities and causal links remain open under D1 |
+| derivation recorded | implicit — the summary does not name its `op` or depth | elision already checked; general `op`/depth/edge validation at construction and decode remains D5 |
 | durability | session-scoped; discarded at `/new`, gone at restart (C2) | owed — D9 is **OPEN** for exactly this reason |
-| projection auditable | no — the prompt string is not reconstructible | yes — a named CID set a cold reader re-derives |
+| projection auditable | no complete projection/replay record here | owed — ordered entries, rendering inputs and a request commitment, with explicit replay limits (§3a) |
 
 The honest incremental contribution is those four rows, not the first one.
 
 ---
 
-## 5. What the frame contributes to #2239 (necessary, not sufficient)
+## 5. What the frame contributes to #2239
 
 ```mermaid
 sequenceDiagram
@@ -236,7 +302,7 @@ sequenceDiagram
     participant M as LLM
     participant K as classifier
     rect rgba(181,85,27,0.10)
-    Note over H,K: TODAY, post-#2251 (merged 2026-09-09, 44ff61c8)
+    Note over H,K: TODAY, after PR 2251 (merged 2026-09-09, 44ff61c8)
     H->>M: "…if genuinely finished, say so in one sentence"
     M-->>K: "I'm finished — the answer above is complete."
     K->>K: Jaccard(reply, prototypes) ≥ 0.28, margin 0.03
@@ -251,16 +317,17 @@ sequenceDiagram
     M-->>K: same reply — recorded as node R, parents: [N]
     K->>K: adjudicate(R, parents) — sees N is a scripted request
     K-->>H: compliance with a harness script is not a deliverable → verdict node, loud
-    Note over H,K: still needs §6c: the compliant one-sentence reply is stamped Completed at the accept site, so it never reaches the variant #2251 fixed
+    Note over H,K: still needs §6c: the compliant one-sentence reply is stamped Completed at the accept site, so it never reaches the variant PR 2251 fixed
     end
 ```
 
-The classifier does not get smarter prototypes. It gets **the antecedent**: the
-reply's parent is the nudge node, tagged harness-origin. A reply whose only
-parent is a harness script is not evidence of completion, by rule. This is
-invariant 2.4 — *harness process-corrections must not enter the summarizer
-input; a small model echoes loop guidance back* — enforced by the DAG instead
-of hoped for.
+The classifier gets **the antecedent**: the nudge is recorded as harness-origin
+material. A scripted self-report such as "I'm finished" must not substitute for
+a substantive deliverable or verified task evidence. The host uses recorded
+origin to exclude its interventions from summarizer input (invariant 2.4).
+Parentage makes the intervention inspectable; it does not establish whether the
+reply is substantive. That still requires classification and the separate
+completion policy below. A genuine answer after the same nudge stays deliverable.
 
 **This does not, on its own, fix #2239 (C6) — and #2239 is still OPEN.** The
 reasoning has to be restated, because the half the frame was contrasted against
@@ -282,7 +349,7 @@ happens. So the split is no longer "evidence half vs outcome half"; it is:
 | half | state |
 |---|---|
 | **reporting** — an exhausted rescue is not filed as a completion | **landed**, #2251 |
-| **accept site** — the harness stops scoring text it dictated as the answer | **open**, and the frame is what makes it decidable (§6c) |
+| **accept site** — the harness stops scoring text it dictated as the answer | **open**; the proposed frame records evidence for that decision (§6c), but the fix can proceed independently |
 
 The frame improves the **evidence** available at the accept site. It does not,
 and never did, fix the reporting; that was independent and shipped first.
@@ -311,14 +378,21 @@ summary is depth 2 and is **illegal by the design law** — which is the
 derivation-depth bound this line has already concluded is the only novel claim
 in the context-management literature it surveyed.
 
-Keep two things apart here, because collapsing them is how a design law gets
-mistaken for a shipped guarantee. The **law** is machine-checked: `Unit.wf` is a
-Lean invariant, and it holds. **Runtime enforcement does not exist yet** — Rust
-owes validation at construction *and* at decode, and specifically across
-retrieval edges, where observing that a retrieval happened must not reset the
-retrieved artifact's origin or depth (§6b, "depth laundering"). The intent is
-that the frame makes depth 2 a type error rather than a policy; today it is a
-proved law with the enforcement outstanding (D5, **OPEN**).
+The **law** is machine-checked in `formal/ContextOps/Basic.lean`. **Runtime
+enforcement exists for the narrower elision kernel:** `Unit::seal` refuses
+`Concise` and `Generate`, computes depth zero and checks the source span;
+`TryFrom<RawUnit>` enforces elision, matching depth and a nonempty span. A unit
+cannot bypass admission through ordinary `Deserialize`. `verify_unit` separately
+checks the source hash, actual byte bounds and elided-content hash. Admission
+alone does not verify those bytes, and neither operation resolves the root or
+establishes whether source bytes were themselves generated.
+
+**The general bound remains unimplemented.** A reply/verdict pipeline cannot
+use `Generate` through the current v0 admission boundary. Its edge semantics and
+checks must be specified at construction and decode before widening that
+boundary. Across retrieval, observing an access must not reset the retrieved
+artifact's origin or depth (§6b, "depth laundering"). D5 stays **OPEN** for
+those extensions, not for a missing elision check that has already shipped.
 
 ---
 
@@ -353,9 +427,13 @@ explicitly. No other row's evidence has changed.
 | C6 | Fixing the classifier (or adding causal parentage) fixes #2239 | **Evidence as observed, pre-#2251 (`origin/main` at `e3f42a36`, 2026-09-09):** `solve_contract.rs:106-115` mapped `NarrationCapExhausted` into `Terminal::Completed` — the same bucket as a genuine completion, so a correct classifier still yielded a scored success. **That mapping is HISTORICAL:** `44ff61c8` (#2251, merged 2026-09-09T14:26:41Z) moved it to `Terminal::StoppedShort` / `model_error`. **The claim in column 2 is still false**, and was withdrawn because it was *wrong*, not because it was *fixed* — the classifier was never the whole defect, and the accept site is still open (§6c residual 1) | §5 (restated for the post-#2251 code), §6c | Reporting half **landed** in #2251. Still owed: the accept site (§6c residual 1), the `NarrationFinalRound` decision (residual 2), TUI behaviour (residual 3). #2239 remains **OPEN** |
 | C7 | `--hermetic` "reduces to always genesis" | A genesis node establishes a graph **origin**. It says nothing about admitted inputs or ambient state | §3 (genesis ≠ hermetic) | Narrow the claim: specify admitted inputs and ambient-state assumptions separately from parentage |
 
-**Not yet addressed at all** — named here so they are visible rather than
-implied-solved:
+**Integration obligations still open:**
 
+- **Ordered projection and host/model protocols.** §3a states what must be
+  replayable, but the record schema and admission/replay tests remain owed.
+  §2 assigns legality to host code; navigation proposal grammar and rejection,
+  cancellation and termination tests remain owed. Neither is settled by
+  correcting the diagram (D2/D3).
 - **Bounded navigation as a workflow** (not just a bounded call): per-request
   catalog size, fetched bytes, dereference count, auxiliary calls, retries,
   total time, and a deterministic no-progress condition. A catalog that emits
@@ -431,7 +509,7 @@ and none is closed by this design document either.
    `newt-core/src/agentic/mod.rs` (3048, 4816, 7051, 9025 on `origin/main`).
    #2251 changed how that outcome is **reported**, not whether it happens. This
    is issue ask #4, a separate change in `newt-core`, and it is the half this
-   frame exists to make decidable.
+   frame would make auditable; fixing it does not require waiting for the frame.
 2. **`NarrationFinalRound` was deliberately not moved with it.** It still maps to
    `Terminal::Completed` (`solve_contract.rs:126-127`). The comment at `:120-125`
    states why: it is "a different exit — the round limit arrived while the model
@@ -492,7 +570,8 @@ emitted outcome string must update that permitted set in the same PR.
 Statuses below were revised after the review in §6b. **CHOSEN** means the
 operator picked the option and it stands; it does not mean the semantics,
 failure behaviour and verification obligations are all specified. **SETTLED**
-means those are specified. **RESTATED** means the decision stands but its
+means those are specified for the stated rule; it does not mean its integration
+is implemented. **RESTATED** means the decision stands but its
 *claim* was rewritten because the original was not supported. **NARROW** means
 an over-broad claim was withdrawn and the decision now says less than it did.
 **OPEN** means work is owed before implementation. A corrected wording never by
@@ -501,15 +580,15 @@ itself moves a decision to a stronger status.
 
 | # | decision | grounded in | status |
 |---|---|---|---|
-| **D1** | A frame primitive is `MerkleNode<Primitive>`; `Primitive` carries agent-frame's `Unit` fields (`op`, `depth`, `root`, `life`, `addressed`) plus the typed payload. No hand-rolled id, chain, or manifest. | `content-addressable::merkle`, `ContextOps.lean` | **SETTLED** (type) — storage unresolved, see C2 |
-| **D2** | Context is a projection of the frame — a selected node set rendered for one turn, auditable as a named CID set. Compaction is replaced by elision + re-read. The DAG is never pruned within a session. **The contribution is typed provenance, a construction-and-decode derivation constraint, and an auditable projection — not retention**, which already exists (§4). | invariants 3.1, 3.4 | **RESTATED** in §3/§4 per C1 — durability still owed, see D9 |
-| **D3** | The harness-llm is the only navigator: it is the only party that traverses the frame. It is a bounded, tool-less side call in the `adjudicate.rs` shape. This is not contradicted by D11 — the main LLM's `re_read` is a *mediated request*, not traversal authority (see D11). | `adjudicate.rs` (#1749), live | **SETTLED** (shape) — parser contract owed, C3 |
-| **D4** | Harness-origin nodes (nudges, adjudications, verdicts) are tagged in `life`/`root` and are **never** summarizer input and **never** evidence of model completion. | invariant 2.4 | **SETTLED** — but does not fix #2239 alone, C6 |
-| **D5** | `depth ≤ 1`. A verdict over a reply is depth 1; a summary of a summary is rejected at construction. | `Unit.wf` | **OPEN** — edge relation + decode check owed |
-| **D6** | **Graph origin and execution policy are two different things.** A fresh execution begins at genesis (a node with no parents); `--resume <cid>` begins from an existing frame node — the root of the restored reachable state. `--hermetic` is an **execution policy orthogonal to graph origin**: it constrains which inputs are admitted and what ambient state the run may read. A hermetic run may begin at genesis, but **genesis alone does not prove hermeticity** and parentage cannot be used to decide it. That `--hermetic` and `--resume` are mutually exclusive, enforced at parse time, stands as a **product constraint for the first implementation** (operator ruling 2026-09-08) — it is not derived from Merkle parentage, and a later implementation could relax it without touching the data structure. **The hermetic-input contract itself is unresolved**: the set of admitted inputs and the ambient-state assumptions are not specified anywhere in this document. | operator ruling 2026-09-08 (mutual exclusion); C7 (the correction) | **NARROW** — the false equivalence is withdrawn; the hermetic-input contract is still owed and remains **OPEN** |
+| **D1** | Reuse `agent_frame::Unit` / `Derivation`, `RootEvent` and `Packet` identity and admission boundaries. A unit addresses source material and a span; `life` does not change its derivation identity. Additional payloads and causal links must extend these abstractions using `content-addressable`, with an explicit relationship to v0's single-predecessor packet chain. A separate `MerkleNode<Primitive>` representation is not settled by the Lean fields alone. | `agent-frame/src/{derivation,unit,root,packet}.rs`; #2246 | **RESTATED** — reuse boundary established; full payload and edge contract **OPEN** |
+| **D2** | Context is an ordered projection of the frame. The host must record ordered entries, roles, selected spans, rendering inputs and a request commitment (§3a); a CID set alone cannot establish reconstruction. The intended DAG is retained within a session. The contribution is uniform provenance and auditable projection over existing retention and elision. | invariants 3.1, 3.4; `MerkleNode` parent-set semantics; §3a | **RESTATED** — schema, admission and replay tests **OPEN**; durability D9 |
+| **D3** | Deterministic host code owns traversal, access, cut legality, storage admission and rendering. The auxiliary LLM supplies untrusted relevance proposals and verdicts through bounded tool-less calls. Host validation rejects invalid proposals before dispatch (§2); neither model can waive constraints. | `adjudicate.rs` (#1749) call shape; §2 | **RESTATED** — ownership specified; proposal/parser and bounded navigation contracts **OPEN** (C3, §6b) |
+| **D4** | Host-recorded interventions (nudges, adjudications, verdicts) carry explicit harness origin and are **never** summarizer input or evidence of model completion. Reuse `RootEvent` to name the triggering event; `life` remains lifecycle, not an origin tag. D1 must specify the payload representation. | invariant 2.4; `agent-frame/src/{root,unit}.rs` | **SETTLED** as an exclusion rule — does not fix #2239 alone, C6 |
+| **D5** | `depth ≤ 1` is the intended full-frame law. V0 already enforces elision at depth zero at construction and decode admission, and `verify_unit` checks the addressed material. It does not establish the source's own provenance or preserve generation depth across retrieval. Generation, its edge relation and construction/decode checks remain owed. | `formal/ContextOps/Basic.lean`; `agent-frame/src/{unit,verify}.rs` | **OPEN** for the full frame — v0 elision enforcement landed in #2246 |
+| **D6** | **Graph origin, invocation mode and execution policy are separate.** A fresh execution begins at genesis; `--resume <cid>` selects an existing node, which may itself be genesis. The run record names the mode and starting CID instead of inferring them from parents. `--hermetic` constrains admitted inputs and ambient state; genesis alone proves neither. Mutual exclusion of `--hermetic` and `--resume` at parse time remains a **product constraint for the first implementation** (operator ruling 2026-09-08), not a consequence of parentage. The admitted-input and ambient-state contract is still unspecified. | operator ruling 2026-09-08 (mutual exclusion); C7; §3 | **NARROW** — hermetic-input contract **OPEN** |
 | **D7** | Adjudicator unavailable ⇒ `AdjudicationFailure` surfaced to the operator and recorded as a node. **Never** a silent fallback to Jaccard. A re-read whose CID is absent fails closed — absence is a finding. | `AdjudicationFailure`, invariant §8 | **SETTLED** — failure path owed for storage |
-| **D8** | The legal cut set is computed (tool-pair atomicity, unseen results never elided, last operator message pinned), not a caller responsibility. | invariants 5b.1, 2.3, 3.2 | **SETTLED** |
-| **D9** | Storage is newt's `SpillStore` now; `agent-store`'s opaque `Entry.payload` later. agent-frame v0 stays a library that mints elision. | `V0-DECISION.md` §3 | **OPEN** — SpillStore is ephemeral, C2 |
+| **D8** | Host code computes legal cuts and validates the complete proposed selection: tool-pair atomicity, unseen results never elided, last operator message pinned. A model proposal cannot override these checks (§2). | invariants 5b.1, 2.3, 3.2 | **SETTLED** as host-enforced constraints; implementation remains owed |
+| **D9** | Reuse the live-session `SpillStore` and disk-reading/verification boundaries in `newt frame`. The kernel remains a storage-free library. Durable session recording and resume still need a writer and restoration of graph closure, schema and authorization context; existing disk inspection does not supply them. | `content_spill.rs`; `frame_cmd.rs`; #2246 monorepo decision | **OPEN** — session durability and restoration owed |
 | **D10** | The narration adjudicator runs on the **auxiliary / CPU-local backend** (`BackendKind::Embedded`, or the summarizer's CPU-local default), with a `BackendRef` override, and the run manifest records which adjudicator judged the turn. It never contends with the primary model or the round budget. The reason `config/shell.rs:113` gives for keeping *intake* adjudication on the steering model — *"adjudication reads operator intent, which is the steering model's own job"* — does not transfer: narration classification is mechanical classification of model output, which is the summarizer's kind of work. | `config/shell.rs:113`, `BackendKind::Embedded` (#639), `BackendRef` | **CHOSEN** — placement/fallback owed, C4 |
 | **D11** | The main LLM **gets one `re_read(cid)` tool**. Retrieval is not harness-only: invariant 3.4's *re-read directive* is addressed to the model, so the model needs the affordance to act on it. **It is a mediated capability, not frame-traversal authority**: the model *requests* a CID, the harness validates and bounds the request, the access happens through harness-owned machinery, and the result is recorded and projected back. The model never gets to walk the graph, and an absent CID fails closed (D7). Results are appended to the frame as nodes whose parent is the pointer that was followed, so a retrieval is itself provenanced and a later reader can see what the model chose to re-read. | invariant 3.4 | **CHOSEN** — bounds owed (§6b) |
 | **D12** | The adjudication side call **does not count against the round budget** — it is harness work, not model work, and charging it would penalise an arm for harness overhead and make round-cap comparisons across harnesses unfair. It **must** be declared in the run configuration and recorded in the contract record, or two runs are not comparable. This is #2227's "verify the instrument" applied to the classifier. | #2227 | **CHOSEN** — separate enforced budget owed |
@@ -519,14 +598,15 @@ itself moves a decision to a stronger status.
 
 ## 8. What this is NOT
 
-- **Not a new node type or id scheme.** `MerkleNode` and `ContentId` exist and
-  hand-rolling either is a defect. A **durable** store, on the other hand, is
-  genuinely absent: `SessionSpillStore` is an in-memory map discarded at `/new`
-  (C2), so D9 is open and "not a new store" must not be read as "storage is
-  solved".
+- **Reuse the existing kernel and identities.** `Unit`, `Packet`, `MerkleNode`
+  and the CID profiles already exist. D1 owes their integration with the new
+  payloads, not a parallel implementation. Disk inspection also exists, while a
+  durable session writer and restoration lifecycle remain open (D9).
 - **Not a smarter summarizer.** The summarizer is demoted, not improved.
-- **Not a 0.8.0 item.** agent-frame is pre-implementation and its 0.0.1 is the
-  gate. This is the 0.9.0 stream. What it *does* change for 0.8.0: fix #979 so
+- **The smart-harness integration remains in the 0.9.0 stream.** The elision
+  kernel and forensic CLI have already landed in #2246. The monorepo decision
+  sets **0.1.0** as the kernel's graduation to a separate public crate; the old
+  separate-repository 0.0.1 gate no longer applies. The earlier priorities stand: fix #979 so
   a turn cannot hang, fix #2239 so the harness stops reading its own script as
   evidence, and **spend nothing further on the compaction pipeline**.
 - **Not a rewrite.** Every settled row names the thing it reuses — and §6b
@@ -536,10 +616,11 @@ itself moves a decision to a stronger status.
 
 ## 9. What "properly accounted" means here
 
-Every node has a CID. Every derived thing names its source and its depth. Every
-harness intervention is a node, so the question *"why did the harness do that?"*
-has an address. The bench record (#2227) names which adjudicator judged which
-turn. A cold reader with the DAG can re-derive every `elide` and check every
-`generate` against its root. **That is the property: nothing the harness does
-is undocumented, because the documentation is the data structure.**
-
+The intended integration records every observation and intervention with a CID,
+and names each derivation's source and depth. The bench record (#2227) names
+which adjudicator judged which turn. A cold reader can re-derive an elision from
+retained source bytes today; full projection replay requires the ordered record
+and inputs in §3a. Generated verdicts still need the verification contract in D5.
+An address makes a claim inspectable; it does not prove that claim true, retain
+missing inputs or establish that a task succeeded. Those limits are part of
+being properly accounted.
