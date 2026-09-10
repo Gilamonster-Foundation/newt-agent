@@ -1,0 +1,29 @@
+# agent-frame — the derivation kernel.
+#
+# v0 IS A LIBRARY. No daemon, no socket, no async, no wire format, no storage
+# (docs/decisions/agent-frame-v0-monorepo.md §"v0 scope"). Two consequences are
+# load-bearing and enforced by `tests/no_service_edge.rs` rather than by this
+# comment:
+#
+#   * NO HTTP and NO inference dependency, ever. That is invariant 7.4's static
+#     half, landed day one so the crate stays daemon-able for free.
+#   * NO tokio. A kernel of pure functions has nothing to await.
+#
+# Adding a dependency here is a decision about the whole line, not a convenience.
+[package]
+name = "agent-frame"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Derivation kernel: what a derived thing may assert, what it owes its source, and how far it may travel from that source before it stops being accountable."
+publish = false
+
+[dependencies]
+content-addressable = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
