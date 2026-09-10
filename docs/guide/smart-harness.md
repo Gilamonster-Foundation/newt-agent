@@ -153,6 +153,14 @@ restart its stored run locator follows the latest verified checkpoint. An older
 conversation without an accounted frame is refused visibly; start a new
 conversation or resume an explicit frame CID through `newt solve`.
 
+Each live TUI conversation retains its embedded auxiliary and the exact model
+and tokenizer bytes pinned when it opened. Later turns reuse those assets after
+checking current authority, configuration, and primary protocol. Replacing or
+removing the original files does not change that live conversation; a new
+conversation pins the selected files afresh. Changing model selection or
+authority requires a new conversation. External auxiliary credentials are
+checked for availability on each turn.
+
 An `Answer` remains subject to task-evidence checks, disclosure filtering, and
 finalization; a missing required check can continue the turn. A `Question` keeps
 the original question and reports `awaiting_operator`. Exhausted narration

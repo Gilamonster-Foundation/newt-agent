@@ -7473,9 +7473,8 @@ fn session_body(
                             (&active_conversation_id, messages.len() > 2),
                             config,
                             &launch,
-                            &inf_url,
-                            inf_kind,
-                            choice.api,
+                            (&inf_url, inf_kind, choice.api),
+                            || newt_inference::smart_harness::build(config, &inf_url, inf_kind),
                         ) {
                             Ok(harness) => Some(harness),
                             Err(error) => {

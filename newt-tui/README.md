@@ -51,6 +51,14 @@ CPU auxiliary. Smart mode selects from retained originals and disables legacy
 history and close-time summaries; each turn prints its frame head for inspection
 or resume. See [configuration and limits](../docs/guide/smart-harness.md).
 
+Each conversation retains its embedded auxiliary and the exact model/tokenizer
+bytes pinned when that conversation opens. Later turns reuse those assets after
+checking the current authority, configuration, and primary protocol. Replacing
+or removing the original files does not change a live conversation; a new
+conversation loads and pins the currently selected files. Changing the selection
+or authority requires a new conversation. External auxiliaries continue to
+revalidate configured credential availability on every turn.
+
 ## Tool output spills
 
 Every completed tool call is rendered through the same bounded spill block;
