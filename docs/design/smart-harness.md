@@ -30,8 +30,12 @@ stand is my characterisation of what the code already does, and several
 "grounded in existing law" claims that the law does not actually support.
 
 **Implementation of the frame does not begin from this document in its current
-state.** The separately-shippable #2239 fix (§"the real defect", below) does not
-depend on it and should proceed independently.
+state.** The separately-shippable half of the #2239 fix (§6c) never depended on
+it and has already shipped: **#2251 merged 2026-09-09 (`44ff61c8`)**, so an
+exhausted narration rescue is no longer reported as a completion. **#2239 itself
+remains OPEN** — the accept site, the `NarrationFinalRound` decision and TUI
+behaviour are all outside what #2251 did (§6c residuals 1-3), and they continue
+independently of this document too.
 
 Companion: knowledge board `2026-09-08_harness-as-a-tiny-llm-DESIGN.md` (the
 thesis and its recovery). This document is the accounting.
@@ -232,13 +236,14 @@ sequenceDiagram
     participant M as LLM
     participant K as classifier
     rect rgba(181,85,27,0.10)
-    Note over H,K: TODAY
+    Note over H,K: TODAY, post-#2251 (merged 2026-09-09, 44ff61c8)
     H->>M: "…if genuinely finished, say so in one sentence"
     M-->>K: "I'm finished — the answer above is complete."
     K->>K: Jaccard(reply, prototypes) ≥ 0.28, margin 0.03
-    K-->>H: EITHER final_answer → TurnEndReason::Completed
-    K-->>H: OR narration → TurnEndReason::NarrationCapExhausted
-    Note over H,K: both map to Terminal::Completed — committed as success either way
+    K-->>H: EITHER final_answer → Completed → Terminal::Completed
+    K-->>H: OR narration → NarrationCapExhausted → Terminal::StoppedShort
+    Note over H,K: StoppedShort scores outcome "model_error" (solve_contract.rs:119, :191)
+    Note over H,K: REPORTING is honest now — but the loop still ACCEPTED the narration as the answer
     end
     rect rgba(15,124,138,0.10)
     Note over H,K: DESIGN
@@ -246,7 +251,7 @@ sequenceDiagram
     M-->>K: same reply — recorded as node R, parents: [N]
     K->>K: adjudicate(R, parents) — sees N is a scripted request
     K-->>H: compliance with a harness script is not a deliverable → verdict node, loud
-    Note over H,K: still needs §6c: a loud verdict that maps to Terminal::Completed is still a scored success
+    Note over H,K: still needs §6c: the compliant one-sentence reply is stamped Completed at the accept site, so it never reaches the variant #2251 fixed
     end
 ```
 
@@ -257,14 +262,30 @@ invariant 2.4 — *harness process-corrections must not enter the summarizer
 input; a small model echoes loop guidance back* — enforced by the DAG instead
 of hoped for.
 
-**This does not, on its own, fix #2239 (C6).** The bug is not only that the
-harness misreads the reply; it is that *every* narration exit is filed as an
-ordinary completion downstream. Get the classification perfectly right and the
-turn is still recorded as a success, because `terminal()` puts
-`NarrationCapExhausted` in the same bucket as `Completed`. The frame improves
-the **evidence**; §6c fixes the **outcome**. Both are needed, they are
-independent, and the outcome half ships first because it depends on nothing
-here.
+**This does not, on its own, fix #2239 (C6) — and #2239 is still OPEN.** The
+reasoning has to be restated, because the half the frame was contrasted against
+has since landed. When this section was first written, `terminal()` put
+`NarrationCapExhausted` in the same bucket as `Completed`, so a perfect
+classifier still yielded a scored success. **That is no longer the code.** PR
+**#2251** merged 2026-09-09 (`44ff61c8`) and moved `NarrationCapExhausted` in
+with `RoundCap` / `Empty` / `Cancelled` → `Terminal::StoppedShort`
+(`solve_contract.rs:119`), scored as `model_error` (`:191`). Reporting is honest
+now.
+
+What #2251 did **not** do is the reason #2239 remains open, and it is the part
+the frame speaks to: **the loop still accepts the rescue nudge's narration as
+the turn's answer.** `NarrationCapExhausted` is still produced at four accept
+sites in `newt-core/src/agentic/mod.rs` (3048, 4816, 7051, 9025 on
+`origin/main`) — #2251 changed how that outcome is *reported*, not whether it
+happens. So the split is no longer "evidence half vs outcome half"; it is:
+
+| half | state |
+|---|---|
+| **reporting** — an exhausted rescue is not filed as a completion | **landed**, #2251 |
+| **accept site** — the harness stops scoring text it dictated as the answer | **open**, and the frame is what makes it decidable (§6c) |
+
+The frame improves the **evidence** available at the accept site. It does not,
+and never did, fix the reporting; that was independent and shipped first.
 
 One constraint the frame must respect, stated here because it is easy to get
 backwards: **ancestry is evidence about causality, not a completion oracle.** A
@@ -310,9 +331,17 @@ does not do, and as the standing list of what an implementation still owes.
 
 Each row was checked against `origin/main` by opening the file, and re-verified
 on 2026-09-09 during the consistency pass. "Obligation" is what an
-implementation still owes; none of it is done. The "corrected in" column names
-where the live text now says the right thing, so a reader can check that the
-retraction actually took.
+implementation still owes. The "corrected in" column names where the live text
+now says the right thing, so a reader can check that the retraction actually
+took.
+
+**One row's evidence has since been superseded by a merge, not by a rewrite.**
+C6's cited mapping was accurate when observed and is now historical — #2251
+landed later the same day. It is dated in place rather than deleted, because the
+distinction matters to a reader: a claim withdrawn *because the code was fixed*
+is not the same as a claim withdrawn *because it was never true*. C6 is the
+second kind, with evidence of the first kind attached; the row says so
+explicitly. No other row's evidence has changed.
 
 | # | The claim the failed revision made | What source says | Corrected in | Obligation |
 |---|---|---|---|---|
@@ -321,7 +350,7 @@ retraction actually took.
 | C3 | The adjudication side call has a **strict** parse | `adjudicate.rs:58` does `find('[')` / `rfind(']')`, so prose on either side is accepted. The "does NOT hunt inside prose" assurance is a *comment*, not the code | §0 inventory (`adjudicate.rs` row) | State the parser's actual accepted language and choose an explicit contract. Any production parser change is a **separate** PR with its own tests |
 | C4 | Route the adjudicator to an "auxiliary / CPU-local" backend so it never contends with the primary | `newt-inference/src/embedded.rs:9` is **CPU by default, not CPU-only** — `NEWT_EMBEDDED_DEVICE = cpu\|metal\|cuda\|auto`, with `embedded-metal` / `embedded-cuda` features | §0 inventory (`BackendKind::Embedded` row) | D10 must specify placement constraints, timeout ownership, cancellation propagation, unavailable-at-startup behaviour, and an explicit fallback. An override must not silently violate placement |
 | C5 | A third class "cannot be carried" by the Jaccard matcher because the margin is 0.03 | A winner/runner-up margin does not bound how many classes a classifier can represent. The reasoning is invalid | not present in live text; D13 rationale withdrawn | Remove the impossibility claim. Justify model-backed classification as an **empirical hypothesis** about discrimination and context-sensitivity, with a comparison plan against the deterministic baseline |
-| C6 | Fixing the classifier (or adding causal parentage) fixes #2239 | `solve_contract.rs:106-115` maps `NarrationCapExhausted` into `Terminal::Completed` — the same bucket as a genuine completion. A correct classifier still yields a scored success | §5 (retitled, closing paragraphs), §6c | See §"the real defect". The fix is in **completion semantics**, is separately shippable, and depends on neither the frame nor a new model |
+| C6 | Fixing the classifier (or adding causal parentage) fixes #2239 | **Evidence as observed, pre-#2251 (`origin/main` at `e3f42a36`, 2026-09-09):** `solve_contract.rs:106-115` mapped `NarrationCapExhausted` into `Terminal::Completed` — the same bucket as a genuine completion, so a correct classifier still yielded a scored success. **That mapping is HISTORICAL:** `44ff61c8` (#2251, merged 2026-09-09T14:26:41Z) moved it to `Terminal::StoppedShort` / `model_error`. **The claim in column 2 is still false**, and was withdrawn because it was *wrong*, not because it was *fixed* — the classifier was never the whole defect, and the accept site is still open (§6c residual 1) | §5 (restated for the post-#2251 code), §6c | Reporting half **landed** in #2251. Still owed: the accept site (§6c residual 1), the `NarrationFinalRound` decision (residual 2), TUI behaviour (residual 3). #2239 remains **OPEN** |
 | C7 | `--hermetic` "reduces to always genesis" | A genesis node establishes a graph **origin**. It says nothing about admitted inputs or ambient state | §3 (genesis ≠ hermetic) | Narrow the claim: specify admitted inputs and ambient-state assumptions separately from parentage |
 
 **Not yet addressed at all** — named here so they are visible rather than
@@ -349,14 +378,36 @@ implied-solved:
   byte-perfect replay over redacted content** survives, because the span the
   handle points at is redacted (C1).
 
-## 6c. The real defect behind #2239, and its separately shippable fix
+## 6c. The real defect behind #2239 — the reporting half has landed, the accept site has not
 
-**Confirmed on `origin/main` as of 2026-09-09** (`e3f42a36`), where the code
-below is still live. A fix is proposed in **PR #2251, open and unmerged** — so
-this section describes the current state, not a landed one. When #2251 lands,
-replace the snippet with the landed mapping and mark this paragraph resolved.
+**The reporting half is fixed.** PR **#2251** merged **2026-09-09T14:26:41Z** as
+`44ff61c8`, verified present on `origin/main`. **Issue #2239 is still OPEN**, and
+this section is the accounting of why.
 
-`newt-cli/src/solve_contract.rs:106-115`:
+What the code does **now**, `newt-cli/src/solve_contract.rs:106-119`:
+
+```rust
+match end_reason {
+    Some(
+        reason @ (TurnEndReason::RoundCap
+        | TurnEndReason::Empty
+        | TurnEndReason::Cancelled
+        | TurnEndReason::NarrationCapExhausted),
+    ) => Terminal::StoppedShort(reason),
+```
+
+and at `:191`:
+
+```rust
+Terminal::StoppedShort(TurnEndReason::NarrationCapExhausted) => "model_error",
+```
+
+So an exhausted narration rescue is **`Terminal::StoppedShort`, scored
+`model_error`** — no longer in the same bucket as a genuine completion, and
+`status_label` puts every `StoppedShort` in `"incomplete"` (`:213`).
+
+**What it used to do, and when.** Before `44ff61c8` — that is, on `origin/main`
+up to and including `e3f42a36`, observed 2026-09-09 — the same site read:
 
 ```rust
 Some(
@@ -367,12 +418,33 @@ Some(
 | None => Terminal::Completed,
 ```
 
-Exhausted narration is classified as an ordinary successful completion. **That
-is the defect** — not the classifier being fooled. A rescue that ran out of
-budget without satisfying the task contract reports the same terminal state as a
-turn that genuinely finished.
+Exhausted narration was classified as an ordinary successful completion. That is
+kept here dated rather than deleted, because it is the observation the correction
+was built on and a later reader needs to be able to tell a claim withdrawn
+*because it was fixed* from one withdrawn *because it was wrong*.
 
-The fix is in completion semantics and needs three concepts kept apart:
+**Three things #2251 explicitly did not do.** Each is a reason #2239 stays open,
+and none is closed by this design document either.
+
+1. **The accept site.** The loop still accepts the rescue nudge's narration as
+   the turn's answer. `NarrationCapExhausted` is still produced at four sites in
+   `newt-core/src/agentic/mod.rs` (3048, 4816, 7051, 9025 on `origin/main`).
+   #2251 changed how that outcome is **reported**, not whether it happens. This
+   is issue ask #4, a separate change in `newt-core`, and it is the half this
+   frame exists to make decidable.
+2. **`NarrationFinalRound` was deliberately not moved with it.** It still maps to
+   `Terminal::Completed` (`solve_contract.rs:126-127`). The comment at `:120-125`
+   states why: it is "a different exit — the round limit arrived while the model
+   happened to be narrating — and no report stands behind reclassifying it… a
+   separate decision with its own bench-row consequences, not a wildcard to sweep
+   along with this one." Do not treat that arm as an oversight; it is an open
+   decision with a bench-row cost.
+3. **TUI behaviour is outside #2251's scope.** The fix is in `newt-cli`'s
+   contract mapping. What the interactive surface shows for an exhausted rescue
+   was not touched and is not settled here.
+
+The remaining fix is in completion semantics and needs three concepts kept
+apart:
 **response classification** (is this text an answer, narration, or a question),
 **control outcome** (continue, await operator, deliver, terminate incomplete,
 cancel, fail), and **task-success evidence** (did the claimed external actions
@@ -386,14 +458,16 @@ Two constraints on that fix:
 - Exhausted rescue must **preserve prior observations** and surface the actual
   incomplete outcome, rather than discarding content or asserting completion.
 
-**A second, independent hole, found while verifying the above.** Probing the
-OpenAI loop on `origin/main` with a scripted reply to the rescue nudge, the
-recorded `end_reason` is:
+**Why residual 1 is the larger half — measured, and reported in #2251 itself.**
+Probing the OpenAI loop with a scripted reply to the rescue nudge, the recorded
+`end_reason` is:
 
 ```
 Completed              <- "Yes, I am finished."
 Completed              <- "I am genuinely finished."
+Completed              <- "I'm finished."
 Completed              <- "Done."
+Completed              <- "Yes — finished. The answer is three."
 NarrationCapExhausted  <- "I'm finished — the answer above is the complete
                            deliverable; there is nothing to edit or run."
 ```
@@ -401,11 +475,13 @@ NarrationCapExhausted  <- "I'm finished — the answer above is the complete
 The nudge asks the model to "say so explicitly in one sentence"; the compliant
 one-sentence replies never reach `NarrationCapExhausted` at all — they are
 stamped `Completed` at the core accept site. #2239's transcript was the *verbose*
-phrasing, which is the only one that trips the bag-of-words matcher into the
-warning. So the terminal-mapping fix above makes the reported failure honest but
-reaches a minority of affected turns; the accept-site half is issue ask #4 and is
-a separate change in `newt-core`. Both are downstream of the same mistake:
-**scoring text the harness itself dictated.**
+phrasing, the only one that trips the bag-of-words matcher into the warning.
+
+The consequence, stated in #2251's own body: the landed mapping **"makes the
+reported failure honest, but reaches a minority of the affected turns."** The
+majority of exhausted-rescue turns are still stamped `Completed` before the
+mapping ever sees them, which is exactly residual 1. Both halves are downstream
+of one mistake: **scoring text the harness itself dictated.**
 
 Note the lockstep hazard: PR #2242 (merged 2026-09-08) pins emitted outcome
 values against `newt-cli/contract/bench_outcome_values_v1.txt`. A change to an
