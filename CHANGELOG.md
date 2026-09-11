@@ -9,6 +9,41 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Added — smart harness: durable frames, host-validated adjudication, `newt frame` forensics (#2246, #2251, #2260, #2263)
+
+- **`agent-frame` incubates here as a workspace leaf (#2246).** A unit's
+  address is self-validating: its id is the id of its derivation, and
+  `verify_unit` recomputes every claim from the source bytes. `Unit` and
+  `Packet` admit foreign bytes only through `RawUnit`/`RawPacket` `TryFrom`.
+  `newt frame explain|parents|verify|replay` inspects a frame directory and
+  adds no capability the library lacks. ADR:
+  [`docs/decisions/agent-frame-v0-monorepo.md`](docs/decisions/agent-frame-v0-monorepo.md).
+- **`agent-harness` and `agent-harness-py` (#2260).** Host-controlled context
+  projection, bounded navigation, exclusive run ownership (run-scoped OS locks,
+  expected-head checks) and restoration over `agent-frame`, with no inference,
+  HTTP, async, or terminal dependency; the PyO3 crate exposes the same
+  admission boundaries to Python. Contract:
+  [`docs/design/smart-harness-implementation.md`](docs/design/smart-harness-implementation.md)
+  (D1–D13, each mapped to code and a named test).
+- **`newt solve` classifies the final reply before it exits.** An answer is
+  `status: completed`; a question is `awaiting_operator`. An exhausted
+  narration rescue is `incomplete` in every mode (#2251); with
+  `--smart-harness`, a narration-only final round is too (#2260). Both keep
+  their bench row as `outcome: model_error`. The exit code reports invocation
+  errors only. A completed status still does not verify the claimed work: the
+  judge sees the reply, not its effects.
+- **The auxiliary may share the primary model's origin (#2263).** D10's
+  origin-independence assertion is reversed; the manifest records
+  `shares_primary_origin` so runs stay comparable. Placement (`cpu`, `cuda`,
+  …) is a declared label recorded verbatim with
+  `placement_evidence: "operator-declared"`, never verified. The embedded
+  auxiliary stays CPU-only and refuses any other declaration before loading
+  assets.
+- **Harbor runner grows a plain/smart A/B path (#2260).** `NEWT_BENCH_SMART`
+  in `scripts/eval/harbor/newt_agent.py`, `smart-ab.sh`, and `cross-tab.py`
+  grade both arms by the external verifier and tabulate false completions.
+  Guide: [`docs/guide/smart-harness.md`](docs/guide/smart-harness.md).
+
 ### Changed — the denial journal is a chain, and `newt ocap denials` verifies it (#2085)
 
 - **Denial records are content-addressed and linked.** `~/.newt/denial-journal.jsonl`
