@@ -224,7 +224,12 @@ def load_roster(path: str) -> list[dict]:
 
 
 def render_table(
-    records: list[dict], roster: list[dict] | None = None, *, queued: bool = True
+    records: list[dict],
+    roster: list[dict] | None = None,
+    *,
+    queued: bool = True,
+    complete: bool = False,
+    top: int | None = None,
 ) -> str:
     """The parity scoreboard: one row per model with its OCAP-off and OCAP-on
     champions side by side and the parity delta (on − off) between them. Each
@@ -236,7 +241,11 @@ def render_table(
     either lane, because an unrun model is a to-do list rather than a result.
     It never suppresses a ``_pending_`` cell — a half-measured model keeps its
     row, since a blank cell would read as a zero where a label reads as a gap.
-    The full roster-tracking table is published by gilamonster-bench."""
+    The full roster-tracking table is published by gilamonster-bench.
+
+    ``complete=True`` keeps only models measured on BOTH lanes, and ``top``
+    caps the table at the N best rows: the README profile is a handful of
+    finished comparisons, never a to-do list of pending cells."""
     champs = champions(records)
     # Every model that appears in the data — plus, unless trimmed for the README,
     # every model the roster still owes a run.
@@ -255,8 +264,17 @@ def render_table(
         )
         return (-best, m)
 
+    if complete:
+        families = {
+            m: f
+            for m, f in families.items()
+            if (m, "off") in champs and (m, "on") in champs
+        }
     scope = (
-        "Measured models only; the roster's unrun models are in the full table."
+        "Models measured on both lanes only; half-measured and unrun models "
+        "are in the full table."
+        if complete
+        else "Measured models only; the roster's unrun models are in the full table."
         if not queued
         else "0.7.6 establishes the honesty-classified, digest-pinned confined "
         "(OCAP-on) baseline; OCAP-on within reach of OCAP-off (parity) is pursued "
@@ -272,7 +290,7 @@ def render_table(
     if not families:
         return header + "| _(no runs recorded yet)_ | | |\n"
     body = ""
-    for m in sorted(families, key=sort_key):
+    for m in sorted(families, key=sort_key)[:top]:
         off, on = champs.get((m, "off")), champs.get((m, "on"))
         # Prefer the OCAP-on run's metadata for the row (the 0.7.6 focus); fall
         # back to OCAP-off, then to nothing.
@@ -376,7 +394,9 @@ def _cmd_parity(a: argparse.Namespace) -> int:
 
 def _cmd_render(a: argparse.Namespace) -> int:
     records = load_manifest(a.manifest)
-    table = render_table(records, load_roster(a.roster), queued=a.queued)
+    table = render_table(
+        records, load_roster(a.roster), queued=a.queued, complete=a.complete, top=a.top
+    )
     text = open(a.readme).read()
     new = inject(text, table)
     if new != text:
@@ -451,6 +471,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_false",
         help="drop never-run roster rows (the README profile); the full "
         "roster-tracking table is published by gilamonster-bench",
+    )
+    pr.add_argument(
+        "--complete-only",
+        dest="complete",
+        action="store_true",
+        help="keep only models measured on both OCAP lanes",
+    )
+    pr.add_argument(
+        "--top", type=int, default=None, help="cap the table at the N best rows"
     )
     pr.set_defaults(fn=_cmd_render, queued=True)
 
@@ -587,6 +616,16 @@ def _self_test() -> int:
     assert "`solo`<br>" in ht and "_pending_" in ht, ht
     assert "`unrun`<br>" not in ht, ht
     # dropping every row still yields the honest placeholder, never a bare header.
+    # complete=True drops the half-measured model; top caps the row count.
+    both = recs + [{"date": "d", "version": "v", "model": "solo", "family": "f",
+                    "ocap": "off", "passed": 9, "total": 30, "mean_reward": 0.3}]
+    ct = render_table(both, queued=False, complete=True)
+    assert "`solo`<br>" not in ct and "_pending_" not in ct, ct
+    assert ct.count("<br><sub>") == len(
+        {m for (m, _l) in champions(both) if (m, "on") in champions(both)
+         and (m, "off") in champions(both)}
+    ), ct
+    assert render_table(both, queued=False, top=1).count("<br><sub>") == 1
     empty = render_table([], [{"model": "unrun", "family": "f"}], queued=False)
     assert "no runs recorded" in empty, empty
 
