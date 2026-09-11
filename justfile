@@ -309,7 +309,9 @@ bench-gate MODEL SCORE:
 # the bragging right, not the to-do list. The full roster-tracking table, with
 # queued models and per-run provenance, is published by gilamonster-bench.
 bench-publish:
-    python3 scripts/eval/bench_scoreboard.py render --readme README.md --no-queued
+    # README profile: a handful of finished both-lane comparisons; the full
+    # roster table (pending cells, queued models) is published by gilamonster-bench.
+    python3 scripts/eval/bench_scoreboard.py render --readme README.md --no-queued --complete-only --top 5
 
 bench-selftest:
     python3 scripts/eval/bench_scoreboard.py --self-test
