@@ -20,8 +20,12 @@ ported from the [scrybe](https://github.com/hartsock/scrybe) reference shim
   shim. Add a binary = one `package.json` (+ a copy of `bin/`, `lib/`, `platforms.json`).
 - **No `postinstall`.** The binary arrives as a normal optional dependency —
   hermetic, offline-cacheable.
-- **`platforms.json`** is the single source of truth (`darwin-arm64`, `darwin-x64`,
-  `linux-x64`, `win32-x64`); `sync-versions.mjs` stamps exact pins at release.
+- **`platforms.json`** lists the supported release targets: `darwin-arm64`,
+  `linux-x64` (glibc), and `win32-x64`. `sync-versions.mjs` stamps exact pins at
+  release, after checking the version against `Cargo.toml`.
+- **Process forwarding.** The shim passes arguments and standard streams to
+  the binary and preserves its exit status. On Unix it forwards `SIGINT`,
+  `SIGTERM`, and `SIGHUP`; Windows uses Node's native process semantics.
 
 ## Scope (this PR)
 
@@ -29,14 +33,35 @@ Ships **`newt` + `newt-mcp-server`** — the two binaries `release.yml`'s
 `build-binaries` actually produces (`-p newt-agent -p newt-mcp-server`). The
 `@gilamonster/newt-mcp-data` and `@gilamonster/newt-provider-openai` names are
 reserved but not shipped here — wire them in once those binaries are added to the
-release build.
+release build. Intel macOS, Linux ARM64, and musl builds are outside this matrix.
+The package-manager abstraction and `newt upgrade` from #1221 are separate work.
 
 ## Develop
 
 ```bash
-cd npm && npm test          # node --test: manifest integrity + resolver + happy-path exec
+just npm-test              # Node 22; no npm install or Rust build required
 ```
 
-Publishing uses npm **OIDC trusted publishing** (see `.github/workflows/release.yml`
-`build-npm` + `publish-npm-meta`). Each package has a trusted publisher configured
-on npmjs pointing at `Gilamonster-Foundation/newt-agent` → `release.yml`.
+The same suite runs through `just check` and CI on Linux, macOS, and Windows.
+It checks resolution, process execution, version refusal, and real `npm pack`
+contents for both binaries on every declared platform. Unix signal tests are
+explicitly skipped on Windows. Tests use temporary fixtures and no registry calls.
+
+## Release
+
+The [release workflow](../.github/workflows/release.yml) validates npm inputs
+before `build-binaries`, then wraps its accepted artifacts without rebuilding.
+Platform packages publish first; only after all six succeed do the two scoped
+shims and `newt-agent` umbrella publish. Existing published versions are skipped;
+other publication errors fail the job. Stable versions use `latest`, prereleases
+use `next`. A `v` tag must match the Cargo workspace version exactly; versions
+with `+build` metadata are refused because npm normalizes that metadata away.
+Checked-in `0.0.0` package versions are placeholders replaced during release.
+
+Publishing requires [npm trusted publishers](https://docs.npmjs.com/trusted-publishers/)
+on all nine packages, configured for `Gilamonster-Foundation/newt-agent` and
+`release.yml`, with direct publishing enabled. Stage-only authorization cannot
+run this workflow's `npm publish`. Registry setup is an operator prerequisite;
+the test suite does not verify it. The jobs use GitHub-hosted runners, Node 22
+(at least 22.14), npm 11 (at least 11.5.1), and `id-token: write`. They publish
+only on version tags and do not use a stored npm token.

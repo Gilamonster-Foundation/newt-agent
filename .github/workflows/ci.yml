@@ -4,6 +4,7 @@ name: CI
 # by .githooks/pre-push (via `just shell-check` + `just check` + `just cov-ci` +
 # `just audit` + `just msrv`).
 # When editing those, update the push hook to match.
+# npm tests also run in `just check`; macOS/Windows executions require CI hosts.
 # EXCEPTION: the `windows` job is CI-only — it cannot be mirrored locally (no
 # Windows dev box), so it is deliberately outside hook parity.
 # See docs/ROADMAP.md "Acceptance contract" for the gate definition.
@@ -26,6 +27,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  test-npm:
+    name: npm installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # HOOK PARITY: identical test command in `just npm-test` / `just check`.
+      - run: npm --prefix npm test
+
   lint:
     name: Rust lint (fmt + clippy)
     runs-on: ${{ vars.GMF_LINUX_RUNNER || 'ubuntu-latest' }}

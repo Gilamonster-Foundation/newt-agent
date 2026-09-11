@@ -9,6 +9,9 @@
 # Install: `just install-hooks` (or `git config core.hooksPath .githooks`)
 #
 # PIPELINE PARITY: This hook mirrors .github/workflows/ci.yml.
+#   - `just check` runs `npm --prefix npm test` (Node 22), matching test-npm;
+#     other OS executions are CI-only. release.yml reuses this suite before
+#     tag-only artifact assembly/publication, which this hook does not perform.
 #   - .github/workflows/harness-python.yml is a declared real-resource lane (uv + CPython), deliberately outside hook parity; `just harness-python` mirrors it.
 #   - The feature list passed to clippy and to cargo test must MATCH:
 #     `--features newt-data/kernel,newt-interaction/schema`. Linting without

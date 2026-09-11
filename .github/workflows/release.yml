@@ -1,5 +1,8 @@
 name: Release
 
+# HOOK PARITY: .githooks/pre-push mirrors npm tests through `just check`.
+# npm artifact assembly and registry publication are tag-only lanes.
+
 # Patterned on agent-mesh's release.yml: a single PyO3 cdylib wheel
 # (`newt-agent-py`) for two OSes (Linux + macOS — Windows fails on
 # the iroh/quinn-style native deps in our transitive graph). Plus
@@ -35,6 +38,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  npm-preflight:
+    name: Check npm release inputs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm --prefix npm test
+      - name: Require the tag to match the workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node npm/scripts/sync-versions.mjs --version "${GITHUB_REF_NAME#v}" --check
+
   # Release publication is impossible until setup's cross-platform,
   # real-process acceptance contract passes. The same reusable workflow also
   # runs weekly and on demand without publishing anything.
@@ -57,7 +73,7 @@ jobs:
 
   build-binaries:
     name: Build (${{ matrix.label }})
-    needs: [mcp-import-acceptance]
+    needs: [mcp-import-acceptance, npm-preflight]
     strategy:
       fail-fast: false
       matrix:
@@ -656,16 +672,15 @@ jobs:
   # Ships only what build-binaries produces (-p newt-agent -p newt-mcp-server);
   # newt-mcp-data / newt-provider-openai names are reserved but not built yet.
   #
-  # Auth: npm OIDC trusted publishing (NO stored token) — each of the 21 packages
-  # has a trusted publisher configured on npmjs pointing at
-  # Gilamonster-Foundation/newt-agent -> release.yml, and id-token: write + npm
-  # >= 11.5.1 mints a short-lived token. NOTE: this diverges from the PyPI/crates
-  # jobs above, which deliberately use account-scoped tokens; the maintainer
-  # chose OIDC for npm. Tag-only (an npm version can't be republished).
+  # Auth: npm OIDC trusted publishing. Each of the nine shipped packages must
+  # authorize this repository's release.yml for direct publishing (see npm/).
+  # GitHub-hosted runners, Node >= 22.14 and npm >= 11.5.1 are required.
+  # Reuse build-binaries, preserving its setup and MCP acceptance prerequisites.
 
   build-npm:
     name: npm binary (${{ matrix.key }})
     if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-binaries]
     permissions:
       contents: read
       id-token: write        # npm provenance + OIDC trusted publishing
@@ -673,10 +688,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { key: darwin-arm64, os: macos-latest,   target: aarch64-apple-darwin }
-          - { key: linux-x64,    os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
-          - { key: win32-x64,    os: windows-latest, target: x86_64-pc-windows-msvc }
-    runs-on: ${{ matrix.os }}
+          - { key: darwin-arm64, label: macos-arm64, archive_ext: tar.gz, binary_ext: "" }
+          - { key: linux-x64, label: linux-x86_64, archive_ext: tar.gz, binary_ext: "" }
+          - { key: win32-x64, label: windows-x86_64, archive_ext: zip, binary_ext: .exe }
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -684,38 +699,48 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
       - name: Upgrade npm for OIDC trusted publishing (>= 11.5.1)
-        run: npm install -g npm@latest
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: npm-${{ matrix.key }}
+        run: npm install -g npm@11
 
       - name: Derive version from tag
         shell: bash
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
-      - name: Build binaries
-        run: cargo build --release --locked --target ${{ matrix.target }} -p newt-agent -p newt-mcp-server
+      - name: Download the accepted release binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: newt-agent-${{ matrix.label }}
+          path: incoming/
+
+      - name: Extract release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="incoming/newt-agent-${GITHUB_REF_NAME}-${{ matrix.label }}.${{ matrix.archive_ext }}"
+          if [[ "${{ matrix.archive_ext }}" == zip ]]; then
+            unzip -q "$archive" -d incoming/
+          else
+            tar -xzf "$archive" -C incoming/
+          fi
 
       - name: Wrap + publish platform packages
         shell: bash
         run: |
-          ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
+          set -euo pipefail
+          channel=latest
+          case "$VERSION" in *-*) channel=next ;; esac
           for shim in "@gilamonster/newt" "@gilamonster/newt-mcp-server"; do
             bin="${shim##*/}"
             out="dist-npm/${bin}-${{ matrix.key }}"
             node npm/scripts/build-platform-package.mjs \
               --name "$shim" \
-              --binary "target/${{ matrix.target }}/release/${bin}${ext}" \
+              --binary "incoming/newt-agent-${GITHUB_REF_NAME}-${{ matrix.label }}/${bin}${{ matrix.binary_ext }}" \
               --key "${{ matrix.key }}" --version "$VERSION" --out "$out"
             ( cd "$out"
               PKG=$(node -p "require('./package.json').name")
               if npm view "$PKG@$VERSION" version >/dev/null 2>&1; then
                 echo "$PKG@$VERSION already published — skipping"
               else
-                npm publish --provenance --access public
+                npm publish --provenance --access public --tag "$channel"
               fi )
           done
 
@@ -734,7 +759,7 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
       - name: Upgrade npm for OIDC trusted publishing (>= 11.5.1)
-        run: npm install -g npm@latest
+        run: npm install -g npm@11
 
       - name: Derive version from tag
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
@@ -746,13 +771,16 @@ jobs:
         shell: bash
         # Order matters: the newt-agent umbrella depends on @gilamonster/newt.
         run: |
+          set -euo pipefail
+          channel=latest
+          case "$VERSION" in *-*) channel=next ;; esac
           for dir in npm/newt npm/newt-mcp-server npm/newt-agent; do
             ( cd "$dir"
               PKG=$(node -p "require('./package.json').name")
               if npm view "$PKG@$VERSION" version >/dev/null 2>&1; then
                 echo "$PKG@$VERSION already published — skipping"
               else
-                npm publish --provenance --access public
+                npm publish --provenance --access public --tag "$channel"
               fi )
           done
 # Model: GPT-5 | Harness: Codex | Operator: Shawn Hartsock | Time: 17:39 EDT | Date: 2026-08-12
