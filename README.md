@@ -4,20 +4,15 @@
   <img src="docs/logos/newt-agent-logo_source.png" alt="Newt-Agent logo" width="256" />
 </p>
 
-> **Experimental agentic coder.**
-
-Written in Rust. The default build ships no cloud provider — remote models are
-opt-in subprocess plugins. The scoreboard below is the claim: measured on
-Terminal-Bench, with security enabled and disabled.
+> **Experimental agentic coder**, written in Rust. Local-first: the default
+> build ships no cloud provider. The scoreboard below is the claim.
 
 ## Terminal-Bench
 
 Measured on [Terminal-Bench](https://github.com/harbor-framework/terminal-bench)
-via `newt solve` (headless) plus the Harbor adapter. The release gate is a
-**per-model monotonic ratchet** — a model's score never goes down across
-releases; establish a starting number, then keep beating it. Both lanes are
-published, because confined (**OCAP on**) versus unconfined (**OCAP off**) is
-the claim worth making: security you can afford to leave switched on.
+via `newt solve` and the Harbor adapter, confined (**OCAP on**) and unconfined
+(**OCAP off**). Each lane is a per-model monotonic ratchet: a score never goes
+down across releases.
 
 <!-- BENCH-SCOREBOARD:START -->
 _Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotonic ratchet (a score never goes down). 0.7.6 establishes the honesty-classified, digest-pinned confined (OCAP-on) baseline; OCAP-on within reach of OCAP-off (parity) is pursued forward via pre-granted permissions, not gated here. Auto-generated; do not edit by hand._
@@ -35,25 +30,16 @@ _Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotoni
 | `nemotron-3-nano_30b`<br><sub>nemotron · tb-30 · ctx 65536 · v0.7.5 · 2026-07-29</sub> | 6.7% (2/30) | _pending_ |
 | `glm-4.7-flash`<br><sub>glm · tb-30 · ctx 65536 · v0.7.6 · 2026-07-31</sub> | _pending_ | 3.3% (1/30) |
 | `gpt-4.1-mini`<br><sub>openai · tb-30 · ctx 65536 · v0.8.0 · 2026-08-05</sub> | 0.0% (0/30) | 3.3% (1/30) |
+| `kimi-k2.7-code`<br><sub>kimi · queued</sub> | _queued_ | _queued_ |
+| `nemotron-3-ultra`<br><sub>nemotron · queued</sub> | _queued_ | _queued_ |
+| `ornith-1.0-397b-iq1_m`<br><sub>ornith · queued</sub> | _queued_ | _queued_ |
 
 <!-- BENCH-SCOREBOARD:END -->
 
-**[Full results, provenance, and methodology](https://github.com/Gilamonster-Foundation/gilamonster-bench/tree/main/scoreboard)** —
-including per-run records, rejected runs, queued work, and the scoring rules — live
-in [`gilamonster-bench`](https://github.com/Gilamonster-Foundation/gilamonster-bench),
-an independent instrument with no dependency on Newt. If the ruler shipped with
-the thing it measures, one commit could move both at once. The scoreboard above is
-the concise release view; the benchmark repository is the evidence.
-
-With smart-harness adjudication enabled, `newt solve` classifies the model's
-final reply before it exits: an answer is `status: completed`, a question is
-`awaiting_operator`, and exhausted or narration-only rounds are `incomplete`.
-Read that structured status; the process exit code only reports invocation
-errors. A completed status still does not verify the claimed work. The
-auxiliary judge is either the embedded CPU model or any external backend,
-including the primary model's own endpoint; its placement is declared and
-recorded, never verified. The [smart-harness guide](docs/guide/smart-harness.md)
-covers configuration, durable frames, resume, and `newt frame` forensics.
+Evidence, provenance, rejected runs, and the scoring rules live in
+[`gilamonster-bench`](https://github.com/Gilamonster-Foundation/gilamonster-bench/tree/main/scoreboard),
+an instrument with no dependency on Newt. If the ruler shipped with the thing
+it measures, one commit could move both at once.
 
 ## Use Newt
 
@@ -64,126 +50,45 @@ just install   # → ~/bin/newt, ~/bin/newt-mcp-server
 newt           # first run opens the setup wizard, then the TUI coder
 ```
 
-A fresh box needs no setup step: the first launch at a terminal opens the
-wizard — local Ollama, another machine (auto-probed for Ollama / llama.cpp /
-vLLM, adopting whatever model is already loaded), OpenAI, Anthropic, or Ollama
-Cloud. Already know the endpoint? `newt setup inference.example.net` probes it
-directly, and `newt code` names the default TUI-coder command explicitly.
-
-Prefer a browser? The HTMX web cockpit is a separately built binary
-([`newt-web/`](./newt-web/), deliberately outside the workspace graph):
-
-```bash
-just install-web   # → ~/bin/newt-web
-newt web           # launches it (127.0.0.1:8880 by default)
-```
-
-Hosted providers (OpenAI, Anthropic, OpenRouter, NVIDIA NIM, …) live in an
-extensible preset roster that also reads **Hermes Agent** configs — copy a
-`~/.hermes/config.yaml` into `~/.newt/providers/` or run `newt providers
-import-hermes` ([provider presets](./docs/provider-presets.md)).
-Authenticated endpoints, discovery ports, and where (encrypted) credentials and
-backends are stored: [the setup guide](./docs/guide/setup.md). Inside the TUI, `/mode` picks a working
-style and `/posture` is the separate authority control — a posture floor can only
-ever narrow authority
-([decision record](./docs/decisions/operating_modes_and_permission_postures.md)).
-Tool output renders through a bounded, tail-biased spill that `/spill` tunes
-([newt-tui](./newt-tui/README.md)). Run `newt --help` for every mode (worker, MCP
-server, doctor, config, …) — the binary is the authority on its own surface, this
-file is not. Python bindings live in [`newt-agent-py/`](./newt-agent-py/).
-
-## Explore the TUI
-
-Start with the [settings walkthroughs](./demos/README.md), organized by what
-you want to control:
-
-| Control | Walkthrough |
-|---|---|
-| Session and presentation | [Settings, apply/cancel, and receipts](./demos/README.md#session-settings-and-presentation) |
-| Inference | [Backends and models](./demos/README.md#backends-and-models) |
-| Working style | [Psyche and named personas](./demos/README.md#psyche-and-personas) |
-| Authority | [Permissions and posture](./demos/README.md#permissions-and-posture) |
-| Context | [Context controls](./demos/README.md#context-controls) |
-
-The reusable widgets have their own [newtui demo gallery](https://github.com/Gilamonster-Foundation/newtui/tree/main/demos).
-Its [settings recording](https://github.com/Gilamonster-Foundation/newtui/blob/main/demos/settings.gif)
-demonstrates the standalone component; the walkthroughs above describe Newt's
-application workflows.
+`newt --help` is the authority on the binary's surface; this file is not.
+The HTMX web cockpit is a separately built binary: `just install-web`, then
+`newt web` ([`newt-web/`](./newt-web/README.md)).
 
 ## Why Newt
 
-An agent *harness* helps the model do work; a **bridle** lets the operator
-*steer* — and prove, after the fact, exactly where the horse went. Newt is an
-experiment in making Object Capability (OCAP) security — long considered
-theoretically correct but practically unimplementable — pragmatic inside an agent
-loop, as a reusable concept
-([`agent-bridle`](https://github.com/Gilamonster-Foundation/agent-bridle))
-intended to be pluggable into other harnesses, not just this one.
-
-Because OCAP is an algebraic construction, some questions are answered
-*structurally* rather than by audit-log archaeology: who acted on what and when,
-who granted the authority for it, and whether **only** what was permitted
-actually happened. For anyone whose work lives on provenance, authority,
-integrity, and data sovereignty — lawyers, clinicians, data scientists — those
-answers have to be properties of the system, not promises in a policy document.
-The long form is [`docs/vision.md`](./docs/vision.md).
-
-If it doesn't find its day in the sun, it was fun anyway.
+A *harness* helps the model work; a **bridle** lets the operator steer, and
+prove afterwards exactly where the horse went. Newt is an experiment in making
+Object Capability (OCAP) security pragmatic inside an agent loop, as a reusable
+component ([`agent-bridle`](https://github.com/Gilamonster-Foundation/agent-bridle))
+other harnesses can adopt. Who acted, on what, under whose grant, and whether
+*only* what was permitted happened then become properties of the system, not
+promises in a policy document. Long form: [`docs/vision.md`](./docs/vision.md).
 
 ## Design laws
 
-The invariants. Each links to the decision record that argues it.
-
-- **Local-first inference.** The default binary speaks only to local
-  backends. Cloud providers are opt-in subprocess plugins speaking the
-  JSON-RPC schema in [`plugins-protocol/`](./plugins-protocol/) — the opt-in
-  is enforced at the **build** level, not a runtime flag.
-- **Fail-closed OCAP.** Authority is a caveat lattice, not a denylist; a
-  fixed safety floor no mode or grant can unlock. See
-  [`docs/decisions/agentic_object_capability_security.md`](./docs/decisions/agentic_object_capability_security.md)
-  and [`docs/decisions/ocap_confinement_model.md`](./docs/decisions/ocap_confinement_model.md).
-- **Small crates, zero warnings, coverage-gated.** `just check` mirrors CI;
-  the pre-push hook runs it. One operator's leverage *is* this discipline.
-- **Patch, not prose.** Delegated work is verified by the harness (real
-  diffs, real test runs — [`newt-eval/`](./newt-eval/)), never by trusting a
-  model's summary of itself. The bench ratchet above is the same law at
-  release scale: verify by artifact, never by self-report.
-- **Skills are on-demand context.** The prompt carries an index; bodies load
-  when used. See [`docs/decisions/agent-skills.md`](./docs/decisions/agent-skills.md)
-  and the bundled skills in [`.newt/bundled-skills/`](./.newt/bundled-skills/).
-- **Issues are ground truth.** [`ROADMAP.md`](./ROADMAP.md) sequences
-  delivery, but GitHub issue state is authoritative — the document is only
-  the map.
-- **Causal ordering, not wall-clock.** Timestamps are display *claims*; the
-  conversation store orders on signed per-writer ticks + content hashes. See
-  [`docs/decisions/conversation_context_architecture.md`](./docs/decisions/conversation_context_architecture.md).
-
-## Field notes and studies
-
-The durable output of this experiment is what building it teaches about how LLMs
-behave inside a harness.
-
-- **[Summarization-induced hallucination](./docs/notes/2026-06-13-summarization-induced-hallucination.md)** — a confident summary is worse than a labelled absence: absence routes the model to re-read, a summary suppresses recovery.
-- **[Truncation honesty](./docs/testing/results/context-baseline-f0f4f6e.md)** — silent context truncation yields *silently wrong* answers; every fix moves the failure, it doesn't always remove it.
-- **[Coder-driving sweet spots](./docs/notes/2026-05-31-newt-coder-driving-sweet-spots.md)** — where small local models are and aren't reliable at agentic coding.
-- **[Hermes learnings](./docs/design/context-memory-hermes-learnings.md)** — take the algorithms, refuse the architecture.
+Seven invariants, each argued in a decision record:
+[`docs/design-laws.md`](./docs/design-laws.md). Local-first inference;
+fail-closed OCAP; small crates, zero warnings, coverage-gated; patch, not
+prose; skills are on-demand context; issues are ground truth; causal
+ordering, not wall-clock.
 
 ## Where things live
 
 | What | Where |
 |---|---|
-| Setup beyond the quick start | [`docs/guide/setup.md`](./docs/guide/setup.md) |
-| Benchmark results & methodology | [Terminal-Bench scoreboard](#terminal-bench) and [gilamonster-bench records](https://github.com/Gilamonster-Foundation/gilamonster-bench/tree/main/scoreboard) |
-| Forward plan | [`ROADMAP.md`](./ROADMAP.md) (issue numbers are the live state) |
-| Release history | [`CHANGELOG.md`](./CHANGELOG.md) |
-| Design docs & studies | [`docs/design/`](./docs/design/) |
-| Decision records | [`docs/decisions/`](./docs/decisions/) |
-| Field notes | [`docs/notes/`](./docs/notes/) |
-| Terminal UI | [`newt-tui/README.md`](./newt-tui/README.md) |
-| Evaluation harness | [`newt-eval/README.md`](./newt-eval/README.md) |
+| Setup, discovery, credentials | [`docs/guide/setup.md`](./docs/guide/setup.md) |
+| Hosted providers and Hermes import | [`docs/provider-presets.md`](./docs/provider-presets.md) |
+| Terminal UI and its walkthroughs | [`newt-tui/README.md`](./newt-tui/README.md), [`demos/README.md`](./demos/README.md) |
+| Python bindings | [`newt-agent-py/README.md`](./newt-agent-py/README.md) |
+| Cloud-provider plugin protocol | [`plugins-protocol/`](./plugins-protocol/README.md) |
 | Smart harness (adjudication, frames, forensics) | [`docs/guide/smart-harness.md`](./docs/guide/smart-harness.md) |
-| Derivation kernel and recorded sessions | [`agent-frame/`](./agent-frame/README.md), [`agent-harness/`](./agent-harness/README.md), Python: [`agent-harness-py/`](./agent-harness-py/README.md) |
-| Terminal-Bench runner (Harbor adapter, A/B script) | [`scripts/eval/harbor/README.md`](./scripts/eval/harbor/README.md) |
+| Derivation kernel and recorded sessions | [`agent-frame/`](./agent-frame/README.md), [`agent-harness/`](./agent-harness/README.md), [`agent-harness-py/`](./agent-harness-py/README.md) |
+| Evaluation harness | [`newt-eval/README.md`](./newt-eval/README.md) |
+| Terminal-Bench runner | [`scripts/eval/harbor/README.md`](./scripts/eval/harbor/README.md) |
+| Benchmark evidence | [`gilamonster-bench`](https://github.com/Gilamonster-Foundation/gilamonster-bench/tree/main/scoreboard) |
+| What changed | [`CHANGELOG.md`](./CHANGELOG.md) |
+| Forward plan | [`ROADMAP.md`](./ROADMAP.md) (issue state is authoritative) |
+| Design docs, decisions, field notes | [`docs/design/`](./docs/design/), [`docs/decisions/`](./docs/decisions/), [`docs/notes/`](./docs/notes/README.md) |
 | Local gate | `just check` (see [`justfile`](./justfile)) |
 
 ## License
