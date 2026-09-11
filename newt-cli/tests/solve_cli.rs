@@ -7,7 +7,81 @@ use assert_cmd::Command;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+mod common;
+
 const NEMOTRON_MODEL: &str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16";
+
+/// Grounds frame-directory admission with the real solve entrypoint. The
+/// deliberately invalid auxiliary placement proves isolation is checked first,
+/// while an isolated store proceeds to the independent auxiliary validation.
+#[test]
+fn smart_solve_admits_private_storage_before_loading_the_auxiliary() {
+    for (exposed, extra_grant, unsafe_exec) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (false, false, false),
+    ] {
+        let mut command = common::newt();
+        let home = command.home().to_path_buf();
+        common::isolate_loopback_chat(&mut *command, &home);
+        let workspace = home.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let frame = if exposed {
+            workspace.join("frame")
+        } else {
+            home.join("private-frame")
+        };
+        let config = home.join("config.toml");
+        std::fs::write(
+            &config,
+            r#"default_backend = "fixture"
+[[backends]]
+name = "fixture"
+endpoint = "http://127.0.0.1:1"
+model = "fixture"
+kind = "openai"
+[smart_harness]
+device = "cuda"
+"#,
+        )
+        .unwrap();
+        let instruction = workspace.join("task.md");
+        std::fs::write(&instruction, "Read the workspace.").unwrap();
+        command
+            .arg("--config")
+            .arg(&config)
+            .args(["solve", "--smart-harness", "--cwd"])
+            .arg(&workspace)
+            .arg("--instruction-file")
+            .arg(&instruction)
+            .arg("--frame-dir")
+            .arg(&frame);
+        if extra_grant {
+            command.env("NEWT_READ_PATHS", &home);
+        }
+        if unsafe_exec {
+            command.arg("--unsafe-host-exec");
+        }
+        let expected = if unsafe_exec {
+            "requires confined launch authority"
+        } else if !cfg!(target_os = "linux") || !newt_core::ocap_l3_backend().1 {
+            "requires object-bound Linux filesystem tools and Landlock"
+        } else if exposed || extra_grant {
+            "frame storage overlaps model filesystem authority"
+        } else {
+            // The all-clear case reaches the auxiliary stage: `device = "cuda"`
+            // with no external backend is refused there (embedded is cpu-only),
+            // which proves storage admission ran first without loading a model.
+            "requires an external backend"
+        };
+        command
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(expected));
+        assert!(!frame.exists(), "rejected launch must not create a frame");
+    }
+}
 
 fn has_one_round_action_nudge(body: &serde_json::Value) -> bool {
     body["messages"].as_array().is_some_and(|messages| {

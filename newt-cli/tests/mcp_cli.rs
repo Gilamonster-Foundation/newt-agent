@@ -412,6 +412,7 @@ mod composed_private_mcp_uat {
 
         let (reply, _, _, hallucinations) = newt_core::chat_complete(
             ChatCtx {
+                smart_harness: None,
                 rewrites_history: true,
                 url: &model.uri(),
                 model: "composed-private-review-model",

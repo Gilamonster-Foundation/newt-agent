@@ -1,7 +1,7 @@
 //! Umbrella Python extension module for newt-agent.
 //!
-//! One cdylib, eight submodules (core, data, tools, coder, eval, inference,
-//! acp_worker, mcp). Each underlying crate exposes a
+//! One cdylib with composable submodules, including the frame and host harness.
+//! Each underlying crate exposes a
 //! `pyo3_module::register` function that adds its types to the parent
 //! module — this crate just stitches them together.
 
@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 
 #[pymodule]
 fn _newt_agent(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    agent_harness_py::pyo3_module::register(py, m)?;
     newt_core::pyo3_module::register(py, m)?;
     newt_data::pyo3_module::register(py, m)?;
     newt_tools::pyo3_module::register(py, m)?;

@@ -74,6 +74,8 @@
 
 /// Derivations: the addressed fact a unit's identity is computed over.
 pub mod derivation;
+/// Causal events: observations, interventions, and checked derivation ancestry.
+pub mod event;
 /// The operation algebra: what was done, what it asserts, how it is checked.
 pub mod op;
 /// Packets: the chain, and identity over the whole body.
@@ -86,6 +88,7 @@ pub mod unit;
 pub mod verify;
 
 pub use derivation::{Derivation, Span};
+pub use event::{Event, EventBody, EventError, EventKind, EventOrigin, RawEvent, ReplyVerdict};
 pub use op::{Check, Op};
 pub use packet::{Packet, PacketAdmitError, PacketBody, PacketId, RawPacket, UnitId};
 pub use root::{RootEvent, RootKind};

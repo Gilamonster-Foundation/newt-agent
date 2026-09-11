@@ -7,13 +7,13 @@ fn clean_build_guidance_appends_one_exact_user_message_on_the_third_call() {
     let mut watch = crate::loop_watch::CleanBuildWatch::default();
     let command = serde_json::json!({"command": "cargo clean && cargo check"});
     for args in [serde_json::json!({}), serde_json::json!({"command": 42})] {
-        append_clean_build_warning(&mut messages, &mut watch, &args);
+        append_clean_build_warning(&mut messages, &mut watch, &args, None).unwrap();
     }
     for _ in 0..2 {
-        append_clean_build_warning(&mut messages, &mut watch, &command);
+        append_clean_build_warning(&mut messages, &mut watch, &command, None).unwrap();
         assert_eq!(messages, vec![original.clone()]);
     }
-    append_clean_build_warning(&mut messages, &mut watch, &command);
+    append_clean_build_warning(&mut messages, &mut watch, &command, None).unwrap();
     let expected = vec![
         original,
         serde_json::json!({
@@ -25,7 +25,7 @@ fn clean_build_guidance_appends_one_exact_user_message_on_the_third_call() {
         }),
     ];
     assert_eq!(messages, expected);
-    append_clean_build_warning(&mut messages, &mut watch, &command);
+    append_clean_build_warning(&mut messages, &mut watch, &command, None).unwrap();
     assert_eq!(messages, expected, "guidance is capped at once per turn");
 }
 

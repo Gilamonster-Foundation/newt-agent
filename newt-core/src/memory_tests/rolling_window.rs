@@ -1,6 +1,16 @@
 use super::*;
 
 #[tokio::test]
+async fn rolling_window_can_retain_originals_without_an_integer_overflow() {
+    let mut rw = RollingWindow::new(usize::MAX);
+    rw.sync_turn("question", "answer", &dummy_metrics()).await;
+    let messages = rw.build_messages("system", "next");
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[1].content, "question");
+    assert_eq!(messages[2].content, "answer");
+}
+
+#[tokio::test]
 async fn rolling_window_empty_produces_two_messages() {
     let rw = RollingWindow::new(5);
     let msgs = rw.build_messages("sys", "hello");

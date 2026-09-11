@@ -42,6 +42,7 @@ async fn scoped_act_git_discovery_does_not_advertise_legacy_operations() {
             None,
         )
         .await
+        .expect("legacy fixture has no durable writer")
         .unwrap();
         assert_eq!(out.contains("git — List and count"), scoped, "{out}");
         assert_eq!(out.contains("git — Run a git operation"), !scoped, "{out}");
@@ -142,5 +143,6 @@ async fn run_git_gated_scope(op: &str, caveats: &Caveats, gate: &mut MockGate) -
         None,
     )
     .await
+    .expect("legacy fixture has no durable writer")
     .unwrap()
 }

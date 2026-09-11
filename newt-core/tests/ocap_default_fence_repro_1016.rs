@@ -98,9 +98,12 @@ async fn confined_commit(ws: &Path, home: &Path, read_grants: &[String]) -> serd
             // `venv_env_map`'s default passthrough. The child SEES $HOME; the
             // fence then denies reading anything in it.
             "HOME": home.to_string_lossy(),
-            // Bare-name resolution for the granted `git`. A real session
-            // inherits this from the operator's PATH.
-            "PATH": "/usr/bin:/bin",
+            // Match the parent's executable search path: bridle anchors the
+            // granted `git` inode before applying this child environment.
+            // Git hooks prepend their exec directory; a fixed child PATH can
+            // then choose a different git inode and fail at exec, before the
+            // HOME read axis this fixture is meant to vary.
+            "PATH": agent_bridle::default_exec_path(),
             // Isolate the ONE axis these tests vary: `$HOME`.
             //
             // Git reads the SYSTEM config (`/etc/gitconfig`) before the user's,

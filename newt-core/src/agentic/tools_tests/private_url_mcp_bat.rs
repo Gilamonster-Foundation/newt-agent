@@ -166,6 +166,7 @@ async fn private_review_fetch_recovers_through_tool_search_and_mcp() {
 
     let (reply, _, _, hallucinations) = chat_complete(
         ChatCtx {
+            smart_harness: None,
             rewrites_history: true,
             url: &model.uri(),
             model: "adaptive-private-review-model",

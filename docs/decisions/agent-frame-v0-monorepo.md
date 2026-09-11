@@ -199,7 +199,20 @@ exactly one function, `agent_frame::verify_unit`, and `newt frame` calls it:
 newt frame verify  <cid> [--source FILE] [--frame DIR] [--json]
 newt frame explain <cid> [--frame DIR] [--json]
 newt frame parents <cid> [--frame DIR] [--json]
+newt frame replay  <request-cid> [--frame DIR] [--json]
 ```
+
+The smart harness stores canonical `<cid>.cbor` records and raw source files.
+Forensic reads compose with `agent_harness::store::FrameStore`, including its
+unit admission and verified content-addressed reads. Earlier `<cid>.json`
+fixtures remain readable only when the canonical record is absent; a damaged
+canonical record cannot fall back to a JSON twin. New writes use canonical CBOR.
+
+`replay` reconstructs a request from its projection and verified source closure,
+then checks the recorded dispatch commitment and exact stored request bytes.
+It writes the exact request bytes without a newline, or a receipt containing
+the same body with `--json`. A missing or substituted input fails before stdout
+receives request bytes. Replay reads evidence without granting session authority.
 
 `verify` **exits non-zero on mismatch**, so a script can gate on it.
 `newt-cli/tests/frame_cli.rs` asserts the CLI reaches the same verdict as the

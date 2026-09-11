@@ -98,6 +98,8 @@ impl std::fmt::Debug for HeadlessCodeSearch {
 /// compress state) are intentionally absent — a driven cowork turn is headless.
 #[derive(Debug, Clone)]
 pub struct TurnDriverConfig {
+    /// Shared accounted session and independent narration adjudicator.
+    pub smart_harness: Option<Arc<super::smart_harness::SmartHarness>>,
     /// Inference endpoint base URL.
     pub url: String,
     /// Model name.
@@ -185,6 +187,7 @@ impl TurnDriverConfig {
         workspace: impl Into<String>,
     ) -> Self {
         Self {
+            smart_harness: None,
             url: url.into(),
             model: model.into(),
             kind,
@@ -553,6 +556,7 @@ async fn run_one_turn(
     // explicit `disclosure` param) value-filter against the same secret.
     let _disclosure_guard = crate::ocap::scoped_session_disclosure(session_disclosure.clone());
     let ctx = ChatCtx {
+        smart_harness: config.smart_harness.as_deref(),
         rewrites_history: config.context_manager.rewrites_history(),
         url: &config.url,
         model: &config.model,
@@ -806,6 +810,41 @@ mod tests {
             }
         }
         panic!("turn did not complete within the 30s pump budget");
+    }
+
+    #[tokio::test]
+    async fn driver_accounts_for_a_question_without_delivering_a_completion() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(PlainOllama {
+                served: Arc::new(AtomicUsize::new(0)),
+                reply: "Which repository?".into(),
+            })
+            .mount(&server)
+            .await;
+        let harness = Arc::new(
+            super::super::smart_harness::SmartHarness::new(
+                agent_harness::Session::new(Default::default()).unwrap(),
+                Arc::new(|_| Box::pin(async { Ok("\"question\"".to_string()) })),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let before = harness.head().unwrap();
+        let mut config = cfg(&server.uri());
+        config.smart_harness = Some(harness.clone());
+        let mut driver = TurnDriver::new(config);
+        driver.submit("Update the repository").unwrap();
+        let TurnStatus::Completed(outcome) = pump_to_done(&mut driver).await else {
+            panic!("the turn must finish by awaiting the operator");
+        };
+        assert_eq!(
+            outcome.end_reason,
+            Some(crate::TurnEndReason::AwaitingOperator)
+        );
+        assert_eq!(outcome.reply, "Which repository?");
+        assert_ne!(before, harness.head().unwrap());
     }
 
     /// THE acceptance test: a consumer drives one turn through the driver and

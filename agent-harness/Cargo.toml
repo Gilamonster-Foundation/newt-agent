@@ -1,0 +1,23 @@
+[package]
+name = "agent-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Host-controlled context projection and accounted agent sessions"
+readme = "README.md"
+publish = false
+
+[dependencies]
+agent-frame.workspace = true
+content-addressable.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+getrandom.workspace = true
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
+
+[lints]
+workspace = true

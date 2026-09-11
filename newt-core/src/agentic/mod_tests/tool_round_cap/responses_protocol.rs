@@ -380,6 +380,7 @@ async fn responses_durable_prompt_context_reaches_v1_responses_wire() {
     let uri = server.uri();
     let (reply, streamed, usage, _hallu) = openai_responses_complete_with_prompt(
         ChatCtx {
+            smart_harness: None,
             url: &uri,
             model: "gpt-5-codex",
             kind: BackendKind::Openai,

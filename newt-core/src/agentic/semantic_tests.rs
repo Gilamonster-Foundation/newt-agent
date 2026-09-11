@@ -8,6 +8,42 @@ fn cand(paths: &[(&str, u64)]) -> Vec<(String, u64)> {
     paths.iter().map(|(p, s)| (p.to_string(), *s)).collect()
 }
 
+/// Grounds gather admission in real files and both contained and escaping links.
+#[cfg(target_os = "linux")]
+#[test]
+fn gather_rejects_source_symlinks_outside_the_workspace() {
+    let workspace = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    let source = "fn workspace_source() {}";
+    std::fs::write(workspace.path().join("ordinary.rs"), source).unwrap();
+    std::os::unix::fs::symlink("ordinary.rs", workspace.path().join("inside.rs")).unwrap();
+    let payload = private.path().join("payload");
+    std::fs::write(&payload, "fn private_frame_payload() {}").unwrap();
+    std::os::unix::fs::symlink(&payload, workspace.path().join("escape.rs")).unwrap();
+
+    let (files, manifest) = gather_with_manifest(
+        workspace.path().to_str().unwrap(),
+        &["rs".into()],
+        GatherCaps::default(),
+    );
+    assert_eq!(
+        files,
+        vec![
+            ("inside.rs".into(), source.into()),
+            ("ordinary.rs".into(), source.into()),
+        ]
+    );
+    let expected = plan_gather(
+        &cand(&[
+            ("inside.rs", source.len() as u64),
+            ("ordinary.rs", source.len() as u64),
+        ]),
+        GatherCaps::default(),
+    )
+    .1;
+    assert_eq!(manifest, expected);
+}
+
 #[test]
 fn plan_gather_sorts_before_capping() {
     // #1281 / WF-4: the fix. Unstable walk order in, deterministic kept out —

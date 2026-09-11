@@ -917,9 +917,10 @@ pub fn plan_gather(
 }
 
 /// Gather source files whose extension is in `extensions`, honestly (#1281):
-/// walk → collect matching candidates with sizes → [`plan_gather`] (sort + cap)
+/// walk → collect readable candidates with sizes → [`plan_gather`] (sort + cap)
 /// → read the kept files, returning `(files, manifest)`. The manifest records
-/// the full-walk hash + what the caps dropped.
+/// admitted candidate paths and what the caps dropped. On Linux, metadata and
+/// content reads resolve beneath one opened workspace capability.
 ///
 /// The extension allow-list is a **parameter**, not a hardcoded `rs`/`py`
 /// literal (#956): the API-surface caller derives it from the *resolved language
@@ -931,7 +932,24 @@ pub fn gather_with_manifest(
     extensions: &[String],
     caps: GatherCaps,
 ) -> (Vec<(String, String)>, GatherManifest) {
+    use std::io::Read;
+
     let root = std::path::Path::new(workspace);
+    #[cfg(target_os = "linux")]
+    let directory = match crate::fs_cap::WorkspaceDir::open_root(root) {
+        Ok(directory) => directory,
+        Err(_) => return (Vec::new(), plan_gather(&[], caps).1),
+    };
+    let open = |relative: &std::path::Path| {
+        #[cfg(target_os = "linux")]
+        {
+            directory.open(relative)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::fs::File::open(root.join(relative))
+        }
+    };
     let mut candidates: Vec<(String, u64)> = Vec::new();
     for entry in ignore::WalkBuilder::new(workspace).build().flatten() {
         let path = entry.path();
@@ -939,18 +957,22 @@ pub fn gather_with_manifest(
         if !ext.is_some_and(|e| extensions.iter().any(|x| x == e)) {
             continue;
         }
-        let size = path.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
-        candidates.push((rel, size));
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let Ok(metadata) = open(relative).and_then(|file| file.metadata()) else {
+            continue;
+        };
+        candidates.push((relative.to_string_lossy().into_owned(), metadata.len()));
     }
     let (kept, manifest) = plan_gather(&candidates, caps);
     let mut files = Vec::with_capacity(kept.len());
     for rel in &kept {
-        if let Ok(src) = std::fs::read_to_string(root.join(rel)) {
+        if let Ok(src) = open(std::path::Path::new(rel)).and_then(|mut file| {
+            let mut source = String::new();
+            file.read_to_string(&mut source)?;
+            Ok(source)
+        }) {
             files.push((rel.clone(), src));
         }
     }

@@ -51,6 +51,7 @@ pub use profile::{
 };
 pub use semantic::{OnEmbedFailure, SemanticConfig};
 pub use skills::SkillsConfig;
+pub use smart_harness::{HarnessLaunch, SmartHarnessConfig};
 pub use summarizer::SummarizerConfig;
 pub use tool_exposure::{ExposureProfile, ToolExposureConfig};
 pub use tools::ToolsConfig;
@@ -70,6 +71,7 @@ mod redact;
 mod semantic;
 mod shell;
 mod skills;
+mod smart_harness;
 mod summarizer;
 mod tool_exposure;
 mod tools;
@@ -195,6 +197,10 @@ pub struct Config {
     /// the built-in [`crate::agentic::DispositionLexicon`] defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intake: Option<IntakeConfig>,
+
+    /// `[smart_harness]` — opt-in recorded projections and narration adjudication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smart_harness: Option<SmartHarnessConfig>,
 
     /// `[context]` — context-management strategy selection (Step 24.8, #559).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1326,6 +1332,7 @@ impl Default for Config {
             tui: None,
             shell: None,
             intake: None,
+            smart_harness: None,
             context: None,
             tools: None,
             tenacity: None,

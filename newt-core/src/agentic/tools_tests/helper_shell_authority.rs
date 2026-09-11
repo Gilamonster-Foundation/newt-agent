@@ -12,6 +12,9 @@ use super::*;
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn run_command_child_under_net_none_cannot_open_a_socket_b1() {
+    // Restricted-exec proofs must not inherit another test's temporary engine.
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     if !crate::confined_exec::kernel_fs_fence_available()
         || !std::path::Path::new("/usr/bin/python3").exists()
     {
@@ -56,6 +59,9 @@ async fn run_command_child_under_net_none_cannot_open_a_socket_b1() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn run_command_child_can_reach_an_af_unix_abstract_deputy() {
+    // Restricted-exec proofs must not inherit another test's temporary engine.
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "safe-subset");
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::{SocketAddr, UnixListener};
     if !crate::confined_exec::kernel_fs_fence_available()

@@ -22,6 +22,7 @@ fn ctx<'a>(
     workspace: &'a str,
 ) -> ChatCtx<'a> {
     ChatCtx {
+        smart_harness: None,
         url: server_uri,
         model: "test-model",
         kind: BackendKind::Ollama,

@@ -387,12 +387,13 @@ pub(crate) fn merged_tool_definitions(
 /// controls, not task authority; hiding an exit could strand the session in a
 /// read-only style, while exposing them still cannot widen human authority.
 fn is_persona_unfenceable_tool(name: &str) -> bool {
-    EXTENDED_TOOL_REGISTRY.iter().any(|spec| {
-        matches!(
-            spec.gate,
-            Gate::Always | Gate::OperatingMode | Gate::PlanMode | Gate::ScheduledPlanMode
-        ) && spec.name == name
-    })
+    name == "re_read"
+        || EXTENDED_TOOL_REGISTRY.iter().any(|spec| {
+            matches!(
+                spec.gate,
+                Gate::Always | Gate::OperatingMode | Gate::PlanMode | Gate::ScheduledPlanMode
+            ) && spec.name == name
+        })
 }
 
 /// FR-1 part 2 (#997): is `name` callable under a persona whose `tools:`
@@ -491,6 +492,7 @@ fn common_read_only_tool_allowed(name: &str) -> bool {
                 | "prompt_read"
                 | "artifact_read"
                 | "resume_context"
+                | "re_read"
                 // Read-only evidence and memory retrieval. `web_fetch` remains
                 // subject to the existing net caveat; dispatch removes the
                 // permission gate in non-Act modes so it cannot mint a grant.
@@ -1082,7 +1084,7 @@ pub(super) static ALL_TOOL_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(||
 /// intentionally excluded; callers that need MCP should check their live MCP
 /// registry separately.
 pub(crate) fn known_builtin_tool_name(tool_name: &str) -> bool {
-    ALL_TOOL_NAMES.contains(&tool_name)
+    tool_name == "re_read" || ALL_TOOL_NAMES.contains(&tool_name)
 }
 
 /// Whether a [`Gate`] is satisfied given this session's injected capabilities.

@@ -46,11 +46,11 @@ impl TokenUsage {
 pub enum TurnEndReason {
     /// A genuine final answer (no pending-action cue in the closing reply).
     Completed,
-    /// Pending-action narration accepted because the rescue budget
-    /// (`[tui] narration_nudge_cap`) was already spent this turn.
+    /// The reply asks a question; the task awaits the operator's answer.
+    AwaitingOperator,
+    /// Pending-action narration stopped after the rescue budget was spent.
     NarrationCapExhausted,
-    /// Pending-action narration accepted on the final allowed round, where
-    /// every rescue nudge is skipped (`round + 1 < limit` guard).
+    /// Pending-action narration stopped on the final allowed round.
     NarrationFinalRound,
     /// The tool-round cap ended the turn via the tools-disabled summary.
     RoundCap,
@@ -157,11 +157,12 @@ impl TurnMetrics {
         // cap) says so instead of silently looking finished.
         match self.end_reason {
             Some(TurnEndReason::NarrationCapExhausted) => {
-                format!("{base} · ⚠ ended on narration (rescue budget spent)")
+                format!("{base} · ⚠ incomplete: ended on narration (rescue budget spent)")
             }
             Some(TurnEndReason::NarrationFinalRound) => {
-                format!("{base} · ⚠ ended on narration (final round)")
+                format!("{base} · ⚠ incomplete: ended on narration (final round)")
             }
+            Some(TurnEndReason::AwaitingOperator) => format!("{base} · awaiting operator"),
             Some(TurnEndReason::RoundCap) => format!("{base} · round cap"),
             Some(TurnEndReason::Empty) => format!("{base} · ⚠ empty response"),
             Some(TurnEndReason::Cancelled) => format!("{base} · ⊘ interrupted"),
@@ -356,6 +357,30 @@ mod tests {
             j.contains("\"end_reason\":\"narration_cap_exhausted\""),
             "{j}"
         );
+    }
+
+    #[test]
+    fn a_question_reports_awaiting_operator_without_claiming_completion() {
+        let mut m = metrics(100, 10, 5, None);
+        m.end_reason = Some(TurnEndReason::AwaitingOperator);
+        assert!(m.display_line().contains("awaiting operator"));
+        assert!(!m.display_line().contains("completed"));
+        assert_eq!(
+            serde_json::to_value(&m).unwrap()["end_reason"],
+            "awaiting_operator"
+        );
+    }
+
+    #[test]
+    fn unrescued_narration_is_visibly_incomplete() {
+        let mut m = metrics(100, 10, 5, None);
+        for reason in [
+            TurnEndReason::NarrationCapExhausted,
+            TurnEndReason::NarrationFinalRound,
+        ] {
+            m.end_reason = Some(reason);
+            assert!(m.display_line().contains("incomplete"));
+        }
     }
 
     #[test]
