@@ -5,7 +5,11 @@ on real, containerized Terminal-Bench tasks — the entry to the release-champio
 ceremony's reproducible lane.
 
 It **injects** the locally-built `newt` binary + a pinned backend profile into
-each task container (newt has no public package yet), then runs `newt solve`
+each task container (newt has no public package yet), then runs `newt solve`.
+**The injected binary must target the oldest glibc among the task images** —
+a host-built binary on Ubuntu 24.04 needs `GLIBC_2.39`, and Debian-bookworm
+based tasks ship 2.36 and refuse it at exec, silently scoring 0. Build it in
+`rust:<msrv>-bookworm` (see `smart-ab.sh`, which refuses a too-new binary)
 headless in `/app`, writing the trace to `/logs/agent/newt-events.jsonl`.
 Inference reaches the pinned endpoint from *inside* the container.
 
