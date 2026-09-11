@@ -6,10 +6,12 @@
 // Exact pins so an umbrella always pulls the matching platform build.
 //
 //   node scripts/sync-versions.mjs --version 0.6.0
+// Add --check to validate the Cargo release version without changing manifests.
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { checkReleaseVersion } from './release-version.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
@@ -22,6 +24,11 @@ if (i === -1 || !process.argv[i + 1]) {
   process.exit(2);
 }
 const version = process.argv[i + 1];
+checkReleaseVersion(version);
+if (process.argv.includes('--check')) {
+  console.log(`release version ${version} matches Cargo workspace`);
+  process.exit(0);
+}
 
 function patch(rel, fn) {
   const p = join(root, rel);

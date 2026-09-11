@@ -9,9 +9,10 @@
 // Generic over the binary — `--name` is the shim package, the binary file name is
 // its last path segment. Reads npm/platforms.json (single source of truth).
 
-import { readFileSync, writeFileSync, mkdirSync, copyFileSync, chmodSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, copyFileSync, chmodSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { checkReleaseVersion } from './release-version.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PLATFORMS = JSON.parse(readFileSync(join(here, '..', 'platforms.json'), 'utf8'));
@@ -30,6 +31,7 @@ const binary = arg('binary');
 const key = arg('key');
 const version = arg('version');
 const out = resolve(arg('out'));
+checkReleaseVersion(version);
 
 const entry = PLATFORMS.find((p) => p.key === key);
 if (!entry) {
@@ -39,6 +41,13 @@ if (!entry) {
 
 const binName = shim.split('/').pop();
 const fileName = entry.os === 'win32' ? `${binName}.exe` : binName;
+
+const source = statSync(binary);
+if (!source.isFile() || source.size === 0) {
+  console.error('build-platform-package: --binary must name a nonempty regular file');
+  process.exit(2);
+}
+const license = readFileSync(join(here, '..', '..', 'LICENSE'));
 
 mkdirSync(out, { recursive: true });
 
@@ -52,12 +61,13 @@ const pkg = {
   os: [entry.os],
   cpu: [entry.cpu],
   ...(entry.libc ? { libc: [entry.libc] } : {}),
-  files: [fileName, 'README.md'],
+  files: [fileName, 'README.md', 'LICENSE'],
   publishConfig: { access: 'public' },
 };
 
 writeFileSync(join(out, 'package.json'), JSON.stringify(pkg, null, 2) + '\n');
 copyFileSync(binary, join(out, fileName));
+writeFileSync(join(out, 'LICENSE'), license);
 if (entry.os !== 'win32') chmodSync(join(out, fileName), 0o755);
 writeFileSync(
   join(out, 'README.md'),
