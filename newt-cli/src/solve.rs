@@ -479,7 +479,16 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         };
         // Admit storage before loading or contacting the auxiliary. Explicit
         // broad CLI grants stay visible and are rejected if they expose it.
-        smart_config.directory(&harness_launch)?;
+        smart_config.directory(&harness_launch).with_context(|| {
+            format!(
+                "smart-harness: resolving the frame directory (workspace {}, frame dir {})",
+                harness_launch.workspace.display(),
+                harness_launch
+                    .frame_dir
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|| "<default>".into())
+            )
+        })?;
         let auxiliary = newt_inference::smart_harness::build(&smart_config, &url, kind)
             .with_context(|| format!("smart-harness: building the auxiliary against {url}"))?;
         let mut manifest = auxiliary.manifest;
