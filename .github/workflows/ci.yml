@@ -61,6 +61,11 @@ jobs:
       - name: fmt check
         if: always()
         run: cargo fmt --all -- --check
+      # HOOK PARITY: mirrored by `just check`; Git and the hook are real,
+      # expensive gate commands are stubbed inside temporary fixture repos.
+      - name: push-hook privacy and rebase regression
+        if: always()
+        run: python3 scripts/test_pre_push.py
       - name: clippy
         # `if: always()` so a fmt failure can't mask a clippy failure: the two
         # steps fail independently, surfacing both in one run instead of forcing
