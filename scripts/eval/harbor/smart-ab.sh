@@ -13,7 +13,10 @@ for arm in off on; do
   if [ "$arm" = on ]; then profile=~/.newt/bench/qwen-smart.toml; smart=1; else profile=~/.newt/bench/qwen-plain.toml; smart=""; fi
   echo "=== arm: smart=$arm  profile=$(basename "$profile") ==="
   NEWT_BENCH_PROFILE="$profile" NEWT_BENCH_SMART="$smart" \
-    harbor run --config "$JOB" --no-rebuild --no-cleanup --job-name "smart-${arm}-${LABEL}" 2>&1 | tail -3
+    # harbor 0.20: --no-delete keeps each task environment after completion (the
+  # cross-tab reads newt-events.jsonl + the frame from it); not forcing a build is
+  # already the default, so warm image layers are reused across arms.
+  harbor run --config "$JOB" --no-delete --job-name "smart-${arm}-${LABEL}" 2>&1 | tail -3
 done
 echo "=== cross-tab ==="
 python3 "$HERE/cross-tab.py" /var/tmp/tbench-harbor/smart-off-"$LABEL"* /var/tmp/tbench-harbor/smart-on-"$LABEL"*
