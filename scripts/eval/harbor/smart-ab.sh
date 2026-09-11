@@ -8,6 +8,10 @@ set -euo pipefail
 JOB="${1:?job json}"; LABEL="${2:?run label}"
 : "${NEWT_BENCH_BIN:?path to the branch-built newt binary}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Harbor imports the adapter by bare module name (newt_agent:NewtAgent); the
+# README's own invocation sets this. Without it the run dies in five seconds
+# with "Failed to import module 'newt_agent'" before any inference.
+export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 "$NEWT_BENCH_BIN" --version
 for arm in off on; do
   if [ "$arm" = on ]; then profile=~/.newt/bench/qwen-smart.toml; smart=1; else profile=~/.newt/bench/qwen-plain.toml; smart=""; fi
