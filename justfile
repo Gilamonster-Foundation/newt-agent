@@ -312,6 +312,7 @@ bench-publish:
     # README profile: a handful of finished both-lane comparisons; the full
     # roster table (pending cells, queued models) is published by gilamonster-bench.
     python3 scripts/eval/bench_scoreboard.py render --readme README.md --no-queued --complete-only --top 5
+    python3 scripts/eval/bench_scoreboard.py render --readme docs/scoreboard.md
 
 bench-selftest:
     python3 scripts/eval/bench_scoreboard.py --self-test
