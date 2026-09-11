@@ -37,8 +37,15 @@ for arm in off on; do
   # P1 (review 5175154929): the env prefix MUST stay on the same logical line as
   # `harbor run`. A comment between a trailing backslash and the command turns the
   # assignments into a standalone statement and Harbor sees neither variable.
+  # A single llama.cpp server serves one generation at a time; four concurrent
+  # trials queue behind each other and every one of them times out at Harbor's
+  # 900 s agent cap having completed zero rounds (observed 2026-09-11, 7/8
+  # trials at 0 rounds). Serialize by default, and scale the agent timeout to
+  # the tasks' own budget (task.toml timeout_sec is 2400 for the heavy ones).
   NEWT_BENCH_PROFILE="$profile" NEWT_BENCH_SMART="$smart" \
-    harbor run --config "$JOB" --no-delete --job-name "smart-${arm}-${LABEL}" 2>&1 | tail -3
+    harbor run --config "$JOB" --no-delete --job-name "smart-${arm}-${LABEL}" \
+      --n-concurrent "${NEWT_BENCH_CONCURRENCY:-1}" \
+      --agent-timeout-multiplier "${NEWT_BENCH_TIMEOUT_MULT:-3}" 2>&1 | tail -3
 done
 echo "=== cross-tab ==="
 python3 "$HERE/cross-tab.py" "$JOBS_DIR"/smart-off-"$LABEL"* "$JOBS_DIR"/smart-on-"$LABEL"*
