@@ -45,6 +45,13 @@ function binaryPath() {
     );
   }
 
+  if (entry.libc === 'glibc' && !process.report?.getReport?.()?.header?.glibcVersionRuntime) {
+    throw new Error(
+      `${BINARY}: this Linux binary requires glibc; this Node runtime did not report glibc.\n` +
+        `Install from source instead:  ${REPO}`
+    );
+  }
+
   const pkg = `${SHIM}-${entry.key}`;
   try {
     const pkgJsonPath = require.resolve(`${pkg}/package.json`);
@@ -53,7 +60,7 @@ function binaryPath() {
     throw new Error(
       `${BINARY}: the platform package "${pkg}" is not installed.\n` +
         `This usually means optionalDependencies were skipped during install.\n` +
-        `Try:   npm install -g newt-agent --include=optional\n` +
+        `Try:   npm install -g ${SHIM} --include=optional\n` +
         `Or install from source:  ${REPO}`
     );
   }

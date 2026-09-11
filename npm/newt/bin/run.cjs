@@ -2,10 +2,10 @@
 'use strict';
 
 // Generic launcher shared by every @gilamonster/<bin> shim: resolve the platform
-// binary and exec it, passing through argv, stdio, exit code, and signals.
+// binary and exec it, passing through argv, stdio, exit code, and Unix signals.
 
 const os = require('os');
-const { spawnSync } = require('child_process');
+const { spawn } = require('child_process');
 const { binaryPath, BINARY } = require('../lib/binary.cjs');
 
 let bin;
@@ -16,16 +16,17 @@ try {
   process.exit(1);
 }
 
-const result = spawnSync(bin, process.argv.slice(2), { stdio: 'inherit' });
-
-if (result.error) {
-  process.stderr.write(`${BINARY}: failed to launch ${bin}: ${result.error.message}\n`);
+const child = spawn(bin, process.argv.slice(2), { stdio: 'inherit' });
+if (process.platform !== 'win32') {
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(signal, () => child.kill(signal));
+  }
+}
+child.on('error', (err) => {
+  process.stderr.write(`${BINARY}: failed to launch ${bin}: ${err.message}\n`);
   process.exit(1);
-}
-
-if (result.signal) {
-  const num = os.constants.signals[result.signal];
-  process.exit(num ? 128 + num : 1);
-}
-
-process.exit(result.status === null ? 1 : result.status);
+});
+child.on('exit', (status, signal) => {
+  const num = signal && os.constants.signals[signal];
+  process.exit(signal ? (num ? 128 + num : 1) : (status === null ? 1 : status));
+});

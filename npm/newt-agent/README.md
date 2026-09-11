@@ -14,6 +14,6 @@ the prebuilt `newt` Rust binary for your platform via per-platform
 
 The MCP server is a separate install: `npm i -g @gilamonster/newt-mcp-server`.
 
-Other channels: `cargo install newt-agent` · `pip install newt-agent`.
+Install the CLI from source with `cargo install newt-agent`.
 
 License: Apache-2.0
