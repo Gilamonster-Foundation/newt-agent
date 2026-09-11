@@ -1,7 +1,22 @@
-# Smart harness — design record
+# Smart harness design record
 
-Implementation contracts and verification evidence are recorded in
-[smart-harness-implementation.md](smart-harness-implementation.md).
+**Status: historical proposal and review.** The implementation is developed on
+`feat/smart-harness` in
+[PR #2260](https://github.com/Gilamonster-Foundation/newt-agent/pull/2260).
+Current contracts and named regression tests are in
+[smart-harness-implementation.md](smart-harness-implementation.md); configuration
+and recovery instructions are in [the operator guide](../guide/smart-harness.md).
+
+The original D10 placement requirement was superseded by
+[PR #2263](https://github.com/Gilamonster-Foundation/newt-agent/pull/2263).
+The default embedded auxiliary remains CPU-only. An explicit external auxiliary
+may use other placement and share the primary origin, with both choices recorded.
+Separate auxiliary budgets and host validation remain required; hardware
+independence is no longer an admission requirement.
+
+The sections below retain the proposal's September 2026 baseline and review
+statuses. They explain how the design evolved and are not the current
+implementation checklist.
 
 > **Canonical copy.** Mirrored on the knowledge board as
 > `board/newt-agent/2026-09-08_smart-harness-DESIGN-RECORD.md`; on drift, this
@@ -9,9 +24,11 @@ Implementation contracts and verification evidence are recorded in
 > this builds on: `docs/decisions/1528b3-cid-spill-identity.md`,
 > `docs/decisions/1528b3-proactive-compaction.md`.
 
-**Status:** DESIGN UNDER REVISION. Revised against `main` at `ddbf870f`
+## Historical review context
+
+**Proposal status at review:** DESIGN UNDER REVISION. Revised against `main` at `ddbf870f`
 (2026-09-09). The elision kernel and its forensic CLI landed in **#2246**;
-the smart-harness integration described here is not implemented.
+the smart-harness integration described here was not implemented at that baseline.
 
 An earlier revision of this file marked all thirteen decisions **LOCKED** and
 said implementation could begin. **That status was not supported by the
@@ -579,6 +596,8 @@ is implemented. **RESTATED** means the decision stands but its
 an over-broad claim was withdrawn and the decision now says less than it did.
 **OPEN** means work is owed before implementation. A corrected wording never by
 itself moves a decision to a stronger status.
+**SUPERSEDED** identifies an original decision replaced by the linked current
+implementation contract.
 
 
 | # | decision | grounded in | status |
@@ -592,7 +611,7 @@ itself moves a decision to a stronger status.
 | **D7** | Adjudicator unavailable ⇒ `AdjudicationFailure` surfaced to the operator and recorded as a node. **Never** a silent fallback to Jaccard. A re-read whose CID is absent fails closed — absence is a finding. | `AdjudicationFailure`, invariant §8 | **SETTLED** — failure path owed for storage |
 | **D8** | Host code computes legal cuts and validates the complete proposed selection: tool-pair atomicity, unseen results never elided, last operator message pinned. A model proposal cannot override these checks (§2). | invariants 5b.1, 2.3, 3.2 | **SETTLED** as host-enforced constraints; implementation remains owed |
 | **D9** | Reuse the live-session `SpillStore` and disk-reading/verification boundaries in `newt frame`. The kernel remains a storage-free library. Durable session recording and resume still need a writer and restoration of graph closure, schema and authorization context; existing disk inspection does not supply them. | `content_spill.rs`; `frame_cmd.rs`; #2246 monorepo decision | **OPEN** — session durability and restoration owed |
-| **D10** | The narration adjudicator runs on the **auxiliary / CPU-local backend** (`BackendKind::Embedded`, or the summarizer's CPU-local default), with a `BackendRef` override, and the run manifest records which adjudicator judged the turn. It never contends with the primary model or the round budget. The reason `config/shell.rs:113` gives for keeping *intake* adjudication on the steering model — *"adjudication reads operator intent, which is the steering model's own job"* — does not transfer: narration classification is mechanical classification of model output, which is the summarizer's kind of work. | `config/shell.rs:113`, `BackendKind::Embedded` (#639), `BackendRef` | **CHOSEN** — placement/fallback owed, C4 |
+| **D10** | The narration adjudicator runs on the **auxiliary / CPU-local backend** (`BackendKind::Embedded`, or the summarizer's CPU-local default), with a `BackendRef` override, and the run manifest records which adjudicator judged the turn. It never contends with the primary model or the round budget. The reason `config/shell.rs:113` gives for keeping *intake* adjudication on the steering model — *"adjudication reads operator intent, which is the steering model's own job"* — does not transfer: narration classification is mechanical classification of model output, which is the summarizer's kind of work. | `config/shell.rs:113`, `BackendKind::Embedded` (#639), `BackendRef` | **SUPERSEDED** by [the implemented D10 contract](smart-harness-implementation.md#decisions-and-verification) and #2263; retained here as the original choice |
 | **D11** | The main LLM **gets one `re_read(cid)` tool**. Retrieval is not harness-only: invariant 3.4's *re-read directive* is addressed to the model, so the model needs the affordance to act on it. **It is a mediated capability, not frame-traversal authority**: the model *requests* a CID, the harness validates and bounds the request, the access happens through harness-owned machinery, and the result is recorded and projected back. The model never gets to walk the graph, and an absent CID fails closed (D7). Results are appended to the frame as nodes whose parent is the pointer that was followed, so a retrieval is itself provenanced and a later reader can see what the model chose to re-read. | invariant 3.4 | **CHOSEN** — bounds owed (§6b) |
 | **D12** | The adjudication side call **does not count against the round budget** — it is harness work, not model work, and charging it would penalise an arm for harness overhead and make round-cap comparisons across harnesses unfair. It **must** be declared in the run configuration and recorded in the contract record, or two runs are not comparable. This is #2227's "verify the instrument" applied to the classifier. | #2227 | **CHOSEN** — separate enforced budget owed |
 | **D13** | The **`question` class ships** as a third verdict alongside answer / narration: a reply that asks the operator something is nudged to *ask*, not to *do*. This is #1020's original complaint (the model offered "Option A, B, or C?" and was nudged to act). The earlier rationale — that a Jaccard matcher "structurally cannot carry" a third class because its margin is 0.03 — is **withdrawn**: a winner/runner-up margin does not bound how many classes a classifier can represent (C5). Whether a model-backed classifier discriminates better is an empirical question, and it needs a comparison against the deterministic baseline rather than an impossibility claim. | #1020 | **CHOSEN** — C5 rationale withdrawn |

@@ -1,7 +1,7 @@
 # Smart harness
 
-Smart mode records a content-addressed session and uses an independent auxiliary
-model to select retained context and classify tool-less replies. Enable it with
+Smart mode records a content-addressed session and uses auxiliary model calls
+to select retained context and classify tool-less replies. Enable it with
 `newt solve --smart-harness --instruction-file task.md` or workspace configuration:
 
 ```toml
@@ -22,27 +22,33 @@ max_output_bytes = 32768
 max_output_tokens = 4096
 ```
 
-The default auxiliary runs on CPU through the embedded backend. It must already
-be installed; startup errors are visible and never fall back to the primary
-model. Its call, byte, token, and elapsed-time limits are independent of primary
-tool rounds. Both narration classification and context selection share these
-auxiliary limits. Protocol instructions and the continuation nudge are also
-overridable under `smart_harness.adjudication`.
+The default auxiliary runs an installed embedded model on CPU and pins immutable
+model and tokenizer bytes for the backend's lifetime. Choose an external backend
+for non-CPU smart inference. Startup errors are visible; there is no silent
+fallback. Its call, byte, token, and elapsed-time limits are
+accounted separately from primary tool rounds. Both narration classification
+and context selection share these auxiliary limits. Protocol instructions and
+the continuation nudge are also overridable under
+`smart_harness.adjudication`.
 
 The [recorded CPU comparison](../../newt-inference/tests/fixtures/README.md)
 found no valid verdicts from the installed 0.5B model with the initial bundled
 protocol, even with a longer deadline. These measurements do not establish a
-useful default classifier. Check the recorded protocol and model results when
-choosing an auxiliary; malformed replies produce an explicit failure.
+useful default classifier. The external model's 8/8 result reported in
+[PR #2263](https://github.com/Gilamonster-Foundation/newt-agent/pull/2263) covers
+eight curated fixtures; it does not establish general classification quality or
+superiority. Smart classification remains experimental; malformed replies
+produce an explicit failure.
 
-An external auxiliary requires its own endpoint, protocol, model, and an explicit
-placement declaration (`cpu`, `cuda`, ...). The host rejects an incomplete
-override. It does **not** reject reusing the primary model's own endpoint: that
-is a legitimate choice — a capable primary model classified all eight bundled
-fixtures correctly where the embedded 0.5B classified none — and the run
-manifest records `shares_primary_origin` so two runs remain comparable. The
-declaration is operator-supplied evidence; the client cannot inspect that
-server's hardware.
+An external auxiliary requires an explicit endpoint, protocol, model, and a
+nonempty `device` placement label (`cpu`, `cuda`, ...). The host rejects an
+incomplete override. Placement is recorded as `operator-declared`; the client
+does not verify the server's hardware. The auxiliary may use the primary's
+endpoint and model. The manifest records `shares_primary_origin` to identify
+whether their URL origins match. Shared servers or hardware can contend for
+resources; neither the placement label nor separate budgets guarantees physical
+independence. An unavailable auxiliary produces an error without silently
+selecting another backend.
 
 ```toml
 [smart_harness]

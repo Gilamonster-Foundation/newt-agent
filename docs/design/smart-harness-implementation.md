@@ -1,11 +1,15 @@
 # Smart harness implementation
 
-This is the implementation contract for the design proposed in
-[PR #2243](https://github.com/Gilamonster-Foundation/newt-agent/pull/2243).
-The reviewed baseline was `ddbf870f`; that proposal remains the historical
-record of the corrections to its earlier claims. The contracts below replace
-its open implementation questions. Configuration and invocation examples are
-in [the operator guide](../guide/smart-harness.md).
+This is the current contract for the experimental `feat/smart-harness` branch
+in [PR #2260](https://github.com/Gilamonster-Foundation/newt-agent/pull/2260).
+It implements the proposal in
+[PR #2243](https://github.com/Gilamonster-Foundation/newt-agent/pull/2243),
+including the external auxiliary placement amendment in
+[PR #2263](https://github.com/Gilamonster-Foundation/newt-agent/pull/2263).
+The [design record](smart-harness.md) preserves the proposal's historical
+assumptions and review. The contracts below describe implemented behavior;
+configuration and invocation examples are in
+[the operator guide](../guide/smart-harness.md).
 
 ## Reused boundaries
 
@@ -41,7 +45,7 @@ legacy mode and in the comparison evaluator; smart mode never falls back to it.
 | D7: failures | Raw replies persist before auxiliary work. Failure records settle failed adjudication without inventing a verdict. Unavailable startup configuration is a visible admission error before any model reply. Missing or corrupt storage fails closed. | [Observation and restart tests](../../agent-harness/tests/session.rs): `observation_precedes_verdict_and_request_replays`, `restart_verifies_closure_and_keeps_unadjudicated_observation`; [Failure tests](../../newt-core/src/agentic/smart_harness.rs): `auxiliary_timeout_and_cancellation_are_bounded_and_recorded`, `cancelled_initial_navigation_retains_a_request_linked_failure`; [Failure-recording method (not a test)](../../agent-harness/src/session.rs): `record_adjudication_failure`; [Checkpoint test](../../agent-harness/src/session/tests.rs): `failed_checkpoint_publication_aborts_the_live_session`; [Startup test](../../newt-cli/tests/solve_cli.rs): `smart_solve_admits_private_storage_before_loading_the_auxiliary`. |
 | D8: legal cuts | The last actual operator message, system constraints, and unseen tool results are protected. Call/result groups remain whole. Harness pins are fixed protocol constraints, outside relevance evidence. | [Legal-cut test](../../agent-harness/tests/navigation.rs): `proposal_cannot_drop_pins_unseen_results_or_half_a_tool_pair`; [Operator-pin test](../../agent-harness/tests/session.rs): `actual_operator_stays_pinned_after_harness_nudge`; [Provider-adapter test](../../newt-core/src/agentic/smart_harness.rs): `accepted_navigation_keeps_pins_and_retains_retrievable_source_after_restart`. |
 | D9: durability | Sources and addressed nodes persist before checkpoint publication. Schema 2 records each batch, distinct call occurrence, start, observed return, and model-facing delivery. Resume admits the complete closure and current configuration, preserves observed returns, and explicitly closes uncertain or unstarted slots without rerunning tools. | [Lifecycle tests](../../agent-harness/tests/tool_lifecycle.rs): `cold_restore_closes_each_wire_without_losing_a_completed_return`, `returned_without_delivery_stays_returned_and_retains_its_source_closure`; [Four-provider recovery](../../newt-core/src/agentic/mod_tests/http_smart_completion.rs): `all_four_abrupt_future_drops_preserve_completed_calls`; [Schema and publication tests](../../agent-harness/src/session/tests.rs): `pre_lifecycle_runs_refuse_writable_restore_but_keep_read_only_replay`, `interrupted_publication_requires_drop_and_restore_of_the_actual_locator`. |
-| D10: CPU auxiliary | Embedded smart inference explicitly selects CPU and captures the exact model/tokenizer bytes named by the manifest. An external override requires a pinned endpoint, protocol, model, and a declared placement; it MAY share the primary's origin, and the manifest records `shares_primary_origin` (reversed 2026-09-11: independence was a contention preference, not an authority boundary, and a capable primary model classified 8/8 fixtures where the embedded 0.5B classified 0/8). No *silent* primary fallback exists. | [Embedded tests](../../newt-inference/src/embedded.rs): `new_cpu_pins_the_device_passed_to_generation`, `cpu_assets_remain_bound_to_the_recorded_bytes_after_path_substitution`; [Placement test](../../newt-inference/src/smart_harness.rs): `unsafe_or_incomplete_placement_never_falls_back_to_primary`, `a_same_origin_auxiliary_is_accepted_and_its_manifest_says_so`; [Opt-in real-model smoke (ignored by default)](../../newt-inference/src/embedded.rs): `smoke_generate_on_cpu`. |
+| D10: auxiliary placement | The default embedded auxiliary runs on CPU and captures the exact model/tokenizer bytes named by the manifest. An external override pins its endpoint, protocol, and model and declares placement, which the client records without verifying remote hardware. It may share the primary origin; the manifest records `shares_primary_origin`. Non-CPU placement requires an external backend. No silent primary fallback exists. | [Embedded tests](../../newt-inference/src/embedded.rs): `new_cpu_pins_the_device_passed_to_generation`, `cpu_assets_remain_bound_to_the_recorded_bytes_after_path_substitution`; [Placement tests](../../newt-inference/src/smart_harness.rs): `unsafe_or_incomplete_placement_never_falls_back_to_primary`, `a_same_origin_auxiliary_is_accepted_and_its_manifest_says_so`, `embedded_auxiliary_refuses_a_non_cpu_declaration_before_loading_assets`; [Opt-in real-model smoke (ignored by default)](../../newt-inference/src/embedded.rs): `smoke_generate_on_cpu`. |
 | D11: mediated retrieval | `re_read` admits only session events or packets, checks byte intervals and budgets, and records a receipt parented on the followed pointer and retrieved artifacts. A partial slice states its continuation. | [Bounded receipt and restart test](../../agent-harness/tests/session.rs): `elision_reread_is_recorded_bounded_and_restorable`; [Receipt provenance test](../../agent-harness/src/session/tests.rs): `native_provider_tool_receipts_never_become_operator_or_source_evidence`; [Tamper test](../../agent-harness/tests/storage.rs): `disk_restart_retains_sources_and_refuses_tampering`. |
 | D12: separate budget | Auxiliary calls, input/output sizes, generation tokens, and elapsed time have their own configuration and accounting. Navigation adds independent catalog, fetch, dereference, retry, and elapsed-work limits. | [Auxiliary budget tests](../../newt-core/src/agentic/smart_harness.rs): `auxiliary_system_instruction_shares_the_input_byte_budget`, `oversized_auxiliary_replies_are_retained_before_budget_rejection`, `auxiliary_timeout_and_cancellation_are_bounded_and_recorded`; [Navigation-work budget test](../../agent-harness/src/session/tests.rs): `idle_time_does_not_exhaust_navigation_work_budget`; [Selection budget test](../../agent-harness/tests/navigation.rs): `proposal_cannot_drop_pins_unseen_results_or_half_a_tool_pair`; [Emitted contract test](../../newt-cli/src/solve_contract.rs): `smart_harness_configuration_is_declared_without_changing_the_outcome_vocabulary`. |
 | D13: question | Strict verdicts are `answer`, `narration`, or `question`. A question is delivered with `awaiting_operator`. Narration gets a bounded continuation or an incomplete result. | [Strict verdict test](../../newt-core/src/agentic/smart_harness.rs): `verdict_protocol_accepts_only_an_exact_class`; [Four-provider control tests](../../newt-core/src/agentic/mod_tests/http_smart_harness.rs): `all_four_wires_deliver_a_real_answer_after_a_nudge_without_regeneration`, `all_four_wires_preserve_questions_and_honestly_stop_exhausted_narration`; [Terminal accounting test](../../newt-cli/src/solve_contract.rs): `final_round_narration_preserves_legacy_outcomes_and_accounts_for_smart_runs`. |
@@ -150,7 +154,12 @@ Navigation elapsed time measures navigation work, including its auxiliary
 calls. Waiting for the primary model or the operator does not consume it.
 Auxiliary classification and navigation share the separate auxiliary call and
 time budget. Limits are recorded with the run; changing them requires a fresh
-session. Full restoration checks the caller's current configured history cap.
+session. Sharing an external inference server may cause resource contention;
+separate accounting does not reserve hardware capacity. Embedded sessions keep
+their immutable asset bytes until released. Newt's CLI/TUI restores compare the
+current resolved configuration, including auxiliary manifest fields, with the
+recorded configuration; incompatible earlier manifests require a fresh run.
+Full restoration checks the caller's current configured history cap.
 The authority-only foreign restore convenience API uses the default traversal
 cap; callers with a larger contract must use `restore_with_config`.
 
@@ -161,8 +170,9 @@ describe that admitted set. A later content-read failure can also leave a planne
 kept entry without returned source text. Accounting for every discovered or
 unreadable entry is outside this repair.
 
-Startup can fail before an invocation is admitted, for example when its CPU
-model is absent. The operator receives that error; there is no raw reply or
+Startup can fail before an invocation is admitted, for example when an embedded
+model is absent or an external override is incomplete. The operator receives
+that error; there is no raw reply or
 successful session to claim. An in-turn auxiliary failure retains the observed
 reply and records failure. If storage itself is unavailable, durable failure
 recording cannot be promised; the operation stops and reports the storage error.
@@ -173,6 +183,15 @@ records baseline decisions and actual auxiliary outputs/errors, and identifies
 its fixtures, assets, placement, and timing. Scripted provider tests establish
 control behavior only. They do not establish model classification quality.
 No superiority claim follows from a third class or from a clean test suite.
+
+The [Harbor adapter](../../scripts/eval/harbor/README.md) supplies a separate
+task-level experiment: the same branch binary runs with smart mode off and on,
+and its recorded outcome is compared with the task verifier. The runner checks
+the binary's glibc requirement against a configured floor and reads results
+from the configured job directory.
+The documented eight-task subset excludes four tasks whose reference solutions
+failed the local verifier. These apparatus checks and curated fixtures do not
+establish that smart mode improves task completion or reduces false completions.
 
 The new accept path applies when smart mode is enabled. With smart mode
 disabled, the legacy rescue, classifier, and #2218 final-round narration outcome
