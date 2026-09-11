@@ -137,6 +137,13 @@ pub fn build(
             )
         }
         None => {
+            // The embedded auxiliary is constructed with `new_cpu` and cannot run
+            // anywhere else, so a non-cpu declaration without an external backend
+            // is a contradiction, not a choice. Refuse it before touching assets.
+            anyhow::ensure!(
+                config.device.as_deref().is_none_or(|d| d.trim() == "cpu"),
+                "embedded auxiliary always runs on cpu; a non-cpu placement declaration requires an external backend"
+            );
             let (backend, mut manifest) = embedded(config)?;
             manifest["placement"] = Value::String("cpu".into());
             manifest["shares_primary_origin"] = Value::Bool(false);
@@ -335,6 +342,24 @@ mod tests {
         // And a distinct origin is recorded as such, so the two runs are distinguishable.
         let distinct = build(&config, "http://primary.invalid:8000", BackendKind::Openai).unwrap();
         assert_eq!(distinct.manifest["shares_primary_origin"], false);
+    }
+
+    /// A non-cpu declaration is only meaningful with an external backend; the
+    /// embedded path is cpu by construction and must say so before loading assets.
+    #[test]
+    fn embedded_auxiliary_refuses_a_non_cpu_declaration_before_loading_assets() {
+        let config = SmartHarnessConfig {
+            enabled: true,
+            device: Some("cuda".into()),
+            ..Default::default()
+        };
+        let err = build(&config, "http://primary.invalid:8000", BackendKind::Openai)
+            .err()
+            .expect("cuda without an external backend must be refused");
+        assert!(
+            err.to_string().contains("requires an external backend"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

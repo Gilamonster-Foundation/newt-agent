@@ -70,7 +70,10 @@ device = "cuda"
         } else if exposed || extra_grant {
             "frame storage overlaps model filesystem authority"
         } else {
-            "auxiliary placement must be cpu"
+            // The all-clear case reaches the auxiliary stage: `device = "cuda"`
+            // with no external backend is refused there (embedded is cpu-only),
+            // which proves storage admission ran first without loading a model.
+            "requires an external backend"
         };
         command
             .assert()

@@ -26,7 +26,8 @@ pub struct SmartHarnessConfig {
     /// A fully pinned external auxiliary. It may name the primary backend's own origin;
     /// the run manifest records `shares_primary_origin` so runs stay comparable (D10).
     pub backend: Option<BackendRef>,
-    /// External placement declaration (`cpu`, `cuda`, ...). Required for an external
+    /// Placement declaration (`cpu`, `cuda`, ...). The embedded auxiliary is cpu-only,
+    /// so a non-cpu value requires `backend`. Required for an external
     /// auxiliary, recorded in the manifest verbatim, and NOT verified — the client cannot
     /// inspect a remote server's hardware.
     pub device: Option<String>,
