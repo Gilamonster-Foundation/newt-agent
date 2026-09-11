@@ -29,7 +29,13 @@ if [ -n "$NEED" ] && [ "$(printf '%s\n%s\n' "$FLOOR" "$NEED" | sort -V | tail -1
   exit 2
 fi
 for arm in off on; do
-  if [ "$arm" = on ]; then profile=~/.newt/bench/qwen-smart.toml; smart=1; else profile=~/.newt/bench/qwen-plain.toml; smart=""; fi
+  # Arm profiles are a parameter: NEWT_BENCH_PROFILES=<prefix> selects
+  # ~/.newt/bench/<prefix>-plain.toml and <prefix>-smart.toml. Both arms must
+  # name the SAME model on a single-slot server -- a different judge model would
+  # force a swap on every adjudication.
+  pfx="${NEWT_BENCH_PROFILES:-qwen}"
+  if [ "$arm" = on ]; then profile=~/.newt/bench/$pfx-smart.toml; smart=1; else profile=~/.newt/bench/$pfx-plain.toml; smart=""; fi
+  [ -f "$profile" ] || { echo "missing arm profile: $profile" >&2; exit 2; }
   echo "=== arm: smart=$arm  profile=$(basename "$profile") ==="
   # harbor 0.20: --no-delete keeps each task environment after completion (the
   # cross-tab reads newt-events.jsonl + the frame from it); not forcing a build is
