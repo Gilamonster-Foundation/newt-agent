@@ -1,0 +1,24 @@
+{
+  "jobs_dir": "/var/tmp/tbench-harbor",
+  "datasets": [
+    {
+      "path": "/var/tmp/tbench-tasks/terminal-bench",
+      "task_names": [
+        "circuit-fibsqrt",
+        "compile-compcert",
+        "fix-code-vulnerability",
+        "git-leak-recovery",
+        "overfull-hbox",
+        "prove-plus-comm",
+        "pypi-server",
+        "torch-tensor-parallelism"
+      ]
+    }
+  ],
+  "agents": [
+    {
+      "import_path": "newt_agent:NewtAgent",
+      "model_name": "newt/qwen3.8-flash-next"
+    }
+  ]
+}
