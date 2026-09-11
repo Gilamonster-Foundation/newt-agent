@@ -45,14 +45,15 @@ an independent instrument with no dependency on Newt. If the ruler shipped with
 the thing it measures, one commit could move both at once. The scoreboard above is
 the concise release view; the benchmark repository is the evidence.
 
-With smart-harness adjudication enabled, `newt solve` records questions as
-`status: awaiting_operator`; exhausted or final-round narration is
-`status: incomplete`. These retain their bench rows as
-`outcome: model_error`; an answer remains `completed`. Process exit status reports
-invocation errors, so read the structured status to distinguish an answer from
-an unfinished task. A completed response alone does not verify its claimed work.
-See the [smart-harness guide](docs/guide/smart-harness.md) for CPU auxiliary
-configuration, durable frames, and explicit resume or hermetic invocation.
+With smart-harness adjudication enabled, `newt solve` classifies the model's
+final reply before it exits: an answer is `status: completed`, a question is
+`awaiting_operator`, and exhausted or narration-only rounds are `incomplete`.
+Read that structured status; the process exit code only reports invocation
+errors. A completed status still does not verify the claimed work. The
+auxiliary judge is either the embedded CPU model or any external backend,
+including the primary model's own endpoint; its placement is declared and
+recorded, never verified. The [smart-harness guide](docs/guide/smart-harness.md)
+covers configuration, durable frames, resume, and `newt frame` forensics.
 
 ## Use Newt
 
@@ -180,6 +181,9 @@ behave inside a harness.
 | Field notes | [`docs/notes/`](./docs/notes/) |
 | Terminal UI | [`newt-tui/README.md`](./newt-tui/README.md) |
 | Evaluation harness | [`newt-eval/README.md`](./newt-eval/README.md) |
+| Smart harness (adjudication, frames, forensics) | [`docs/guide/smart-harness.md`](./docs/guide/smart-harness.md) |
+| Derivation kernel and recorded sessions | [`agent-frame/`](./agent-frame/README.md), [`agent-harness/`](./agent-harness/README.md), Python: [`agent-harness-py/`](./agent-harness-py/README.md) |
+| Terminal-Bench runner (Harbor adapter, A/B script) | [`scripts/eval/harbor/README.md`](./scripts/eval/harbor/README.md) |
 | Local gate | `just check` (see [`justfile`](./justfile)) |
 
 ## License
