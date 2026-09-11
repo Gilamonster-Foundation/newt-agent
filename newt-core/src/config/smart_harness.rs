@@ -23,9 +23,12 @@ pub struct SmartHarnessConfig {
     /// Host-private durable directory, outside every model file grant.
     /// Relative overrides are resolved against the workspace and must pass isolation.
     pub frame_dir: Option<PathBuf>,
-    /// A fully pinned external auxiliary, never an override of the primary model.
+    /// A fully pinned external auxiliary. It may name the primary backend's own origin;
+    /// the run manifest records `shares_primary_origin` so runs stay comparable (D10).
     pub backend: Option<BackendRef>,
-    /// External placement declaration. An override requires the explicit value `cpu`.
+    /// External placement declaration (`cpu`, `cuda`, ...). Required for an external
+    /// auxiliary, recorded in the manifest verbatim, and NOT verified — the client cannot
+    /// inspect a remote server's hardware.
     pub device: Option<String>,
     /// Embedded palette alias; absence uses the installed default palette model.
     pub model: Option<String>,
