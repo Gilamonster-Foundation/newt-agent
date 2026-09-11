@@ -16,14 +16,19 @@ def verdict(d,td):
         if re.search(r'reward',k,re.I) and isinstance(v,(int,float)): return v>0
     return None
 def newt(d,td):
-    last=None
+    """P4 (review 5175154929): `end_reason` lives on the solve_result record and
+    `outcome` on the trailing contract record; merge both rather than keeping
+    whichever record came last."""
+    outcome=None; reason=None; seen=False
     for ev in glob.glob(f"{d}/{td}/**/newt-events.jsonl",recursive=True):
         for line in open(ev,errors="replace"):
             try: o=json.loads(line)
             except Exception: continue
-            if "end_reason" in o or "outcome" in o: last=o
-    if not last: return ("no-record","")
-    return (str(last.get("outcome") or last.get("status")), str(last.get("end_reason")).replace("Some(","").rstrip(")"))
+            if "end_reason" in o: reason=o["end_reason"]; seen=True
+            if "outcome" in o: outcome=o["outcome"]; seen=True
+            elif "status" in o and outcome is None and o.get("kind")=="solve_result": outcome=o["status"]; seen=True
+    if not seen: return ("no-record","")
+    return (str(outcome), str(reason).replace("Some(","").rstrip(")"))
 for d in sys.argv[1:]:
     tds=sorted(p for p in os.listdir(d) if os.path.isdir(f"{d}/{p}"))
     tab=collections.Counter((newt(d,td),verdict(d,td)) for td in tds)

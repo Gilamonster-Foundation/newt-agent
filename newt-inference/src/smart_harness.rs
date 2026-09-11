@@ -183,7 +183,7 @@ fn embedded(config: &SmartHarnessConfig) -> anyhow::Result<(Arc<dyn InferenceBac
         .as_deref()
         .unwrap_or(crate::palette::default_model().name);
     let path = config.model_path.clone().or_else(|| crate::palette::resolve_local(model))
-        .ok_or_else(|| anyhow::anyhow!("embedded auxiliary model is unavailable; provision it with `newt models pull {model}` or configure an independent CPU backend"))?;
+        .ok_or_else(|| anyhow::anyhow!("embedded auxiliary model is unavailable; provision it with `newt models pull {model}` or configure an external backend"))?;
     let backend = crate::embedded::EmbeddedBackend::new_cpu(model, &path)?;
     anyhow::ensure!(
         backend.model().arch == crate::palette::ModelArch::Qwen2,
@@ -200,7 +200,7 @@ fn embedded(config: &SmartHarnessConfig) -> anyhow::Result<(Arc<dyn InferenceBac
 
 #[cfg(not(feature = "embedded"))]
 fn embedded(_: &SmartHarnessConfig) -> anyhow::Result<(Arc<dyn InferenceBackend>, Value)> {
-    anyhow::bail!("embedded auxiliary support is not compiled; enable the embedded feature or configure an independent CPU backend")
+    anyhow::bail!("embedded auxiliary support is not compiled; enable the embedded feature or configure an external backend")
 }
 
 #[cfg(test)]

@@ -29,7 +29,7 @@ model and pins its generation device through `EmbeddedBackend::new_cpu`.
 That constructor captures immutable weights and tokenizer bytes; the manifest
 records their raw CIDs and generation reads those same bytes even if the original
 paths change. The immutable model bytes remain resident while the backend lives.
-An external override must declare CPU placement and pin its own endpoint,
+An external override must declare its placement (`cpu`, `cuda`, ...) and pin its own endpoint,
 model, and protocol. It cannot reuse the primary endpoint. Calls use the
 configured timeout and output-token limit, with transport retries disabled.
 An unavailable auxiliary returns an error; it never falls back to the primary.

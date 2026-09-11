@@ -6,6 +6,8 @@
 # Usage: NEWT_BENCH_BIN=<branch release newt> smart-ab.sh <job.json> <run-label>
 set -euo pipefail
 JOB="${1:?job json}"; LABEL="${2:?run label}"
+# P3 (review 5175154929): report from the SAME jobs_dir the job was executed with.
+JOBS_DIR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["jobs_dir"])' "$JOB")"
 : "${NEWT_BENCH_BIN:?path to the branch-built newt binary}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Harbor imports the adapter by bare module name (newt_agent:NewtAgent); the
@@ -16,11 +18,14 @@ export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 for arm in off on; do
   if [ "$arm" = on ]; then profile=~/.newt/bench/qwen-smart.toml; smart=1; else profile=~/.newt/bench/qwen-plain.toml; smart=""; fi
   echo "=== arm: smart=$arm  profile=$(basename "$profile") ==="
-  NEWT_BENCH_PROFILE="$profile" NEWT_BENCH_SMART="$smart" \
-    # harbor 0.20: --no-delete keeps each task environment after completion (the
+  # harbor 0.20: --no-delete keeps each task environment after completion (the
   # cross-tab reads newt-events.jsonl + the frame from it); not forcing a build is
   # already the default, so warm image layers are reused across arms.
-  harbor run --config "$JOB" --no-delete --job-name "smart-${arm}-${LABEL}" 2>&1 | tail -3
+  # P1 (review 5175154929): the env prefix MUST stay on the same logical line as
+  # `harbor run`. A comment between a trailing backslash and the command turns the
+  # assignments into a standalone statement and Harbor sees neither variable.
+  NEWT_BENCH_PROFILE="$profile" NEWT_BENCH_SMART="$smart" \
+    harbor run --config "$JOB" --no-delete --job-name "smart-${arm}-${LABEL}" 2>&1 | tail -3
 done
 echo "=== cross-tab ==="
-python3 "$HERE/cross-tab.py" /var/tmp/tbench-harbor/smart-off-"$LABEL"* /var/tmp/tbench-harbor/smart-on-"$LABEL"*
+python3 "$HERE/cross-tab.py" "$JOBS_DIR"/smart-off-"$LABEL"* "$JOBS_DIR"/smart-on-"$LABEL"*
