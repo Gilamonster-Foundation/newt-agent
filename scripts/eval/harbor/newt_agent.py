@@ -85,6 +85,11 @@ _HTTP_RETRIES = os.environ.get("NEWT_BENCH_HTTP_RETRIES", "10")
 # workspace's own checks before declaring done. Opt-in per run — set
 # NEWT_BENCH_SELF_VERIFY=1 to inject NEWT_SELF_VERIFY=1 into the container.
 _SELF_VERIFY = os.environ.get("NEWT_BENCH_SELF_VERIFY", "")
+# Smart-harness arm (#2260/#2263): set NEWT_BENCH_SMART=1 to run `newt solve
+# --smart-harness`. The frame lives under /logs/agent so it is outside every
+# workspace tool grant AND survives the container for the cross-tab. The
+# profile must carry a `[smart_harness]` block; the adapter only adds the flag.
+_SMART = os.environ.get("NEWT_BENCH_SMART", "")
 
 
 def _container_env_prefix() -> str:
@@ -161,6 +166,11 @@ class NewtAgent(BaseInstalledAgent):
         # default --yolo full-access lane. The flag flips OCAP on AND seeds the
         # workspace-fenced caveat inside `newt solve`.
         confined = " --confined" if _OCAP.strip().lower() == "on" else ""
+        smart = (
+            " --smart-harness --frame-dir /logs/agent/frame"
+            if _SMART.strip() in ("1", "on", "true")
+            else ""
+        )
         # --non-interactive defaults true in `newt solve`, so it's omitted here
         # (passing it bare requires a value under the current arg definition).
         command = (
@@ -169,6 +179,6 @@ class NewtAgent(BaseInstalledAgent):
             "--instruction-file /tmp/newt-task.md "
             "--config /etc/newt/bench.toml "
             "--events /logs/agent/newt-events.jsonl "
-            f"--max-rounds {shlex.quote(_MAX_ROUNDS)}{tenacity}{ctx}{confined}"
+            f"--max-rounds {shlex.quote(_MAX_ROUNDS)}{tenacity}{ctx}{confined}{smart}"
         )
         await self.exec_as_agent(environment, command=command)
