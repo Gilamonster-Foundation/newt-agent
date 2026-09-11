@@ -17,7 +17,9 @@ pub struct Auxiliary {
     pub manifest: Value,
 }
 
-/// Resolve an independent auxiliary. An unavailable choice never reuses primary inference.
+/// Resolve the auxiliary. An unavailable or incomplete choice never silently falls back to
+/// primary inference; an external auxiliary MAY deliberately name the primary's origin, and
+/// the run manifest records that it did so the two runs stay comparable (D10, D12).
 pub fn build(
     config: &SmartHarnessConfig,
     primary_endpoint: &str,
@@ -33,17 +35,23 @@ pub fn build(
         config
             .device
             .as_deref()
-            .is_none_or(|device| device == "cpu"),
-        "smart-harness auxiliary placement must be cpu"
+            .is_none_or(|device| !device.trim().is_empty()),
+        "smart-harness auxiliary placement declaration must not be empty"
     );
     let timeout = Duration::from_millis(config.adjudication.timeout_ms);
     let mut disclosure = newt_core::ocap::DisclosureFilter::new();
     let (backend, mut manifest) = match &config.backend {
         Some(reference) => {
-            anyhow::ensure!(
-                config.device.as_deref() == Some("cpu"),
-                "an external auxiliary requires an explicit cpu placement declaration"
-            );
+            let placement = config
+                .device
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "an external auxiliary requires an explicit placement declaration (e.g. \"cpu\" or \"cuda\"); it is recorded, not verified"
+                    )
+                })?;
             anyhow::ensure!(
                 config.model.is_none() && config.model_path.is_none(),
                 "external and embedded auxiliary configuration cannot be combined"
@@ -76,17 +84,15 @@ pub fn build(
                     && url.fragment().is_none(),
                 "auxiliary endpoint must be an HTTP URL without credentials, query, or fragment"
             );
-            if primary_kind != BackendKind::Embedded {
-                let primary = reqwest::Url::parse(primary_endpoint).map_err(|_| {
-                    anyhow::anyhow!(
-                        "cannot establish auxiliary independence from an invalid primary endpoint"
-                    )
-                })?;
-                anyhow::ensure!(
-                    url.origin() != primary.origin(),
-                    "auxiliary endpoint must be independent of primary inference"
-                );
-            }
+            // D10 reversal (2026-09-11): sharing the primary's origin is a legitimate,
+            // recorded choice, not a refusal. The independence rule existed for GPU
+            // contention, not authority — proposal legality is validated by the harness
+            // regardless of who proposed. What must survive is comparability: the
+            // manifest says whether this judge shared the primary's origin.
+            let shares_primary_origin = primary_kind != BackendKind::Embedded
+                && reqwest::Url::parse(primary_endpoint)
+                    .map(|primary| primary.origin() == url.origin())
+                    .unwrap_or(false);
             let (_, _, _, key) = reference.resolve("", "", kind, &None);
             anyhow::ensure!(
                 key.is_some()
@@ -125,12 +131,25 @@ pub fn build(
             (
                 backend,
                 serde_json::json!({"backend":kind.label(), "model":model,
-                "endpoint":url.as_str(), "placement_evidence":"operator-declared"}),
+                "endpoint":url.as_str(), "placement":placement,
+                "placement_evidence":"operator-declared",
+                "shares_primary_origin":shares_primary_origin}),
             )
         }
-        None => embedded(config)?,
+        None => {
+            // The embedded auxiliary is constructed with `new_cpu` and cannot run
+            // anywhere else, so a non-cpu declaration without an external backend
+            // is a contradiction, not a choice. Refuse it before touching assets.
+            anyhow::ensure!(
+                config.device.as_deref().is_none_or(|d| d.trim() == "cpu"),
+                "embedded auxiliary always runs on cpu; a non-cpu placement declaration requires an external backend"
+            );
+            let (backend, mut manifest) = embedded(config)?;
+            manifest["placement"] = Value::String("cpu".into());
+            manifest["shares_primary_origin"] = Value::Bool(false);
+            (backend, manifest)
+        }
     };
-    manifest["placement"] = Value::String("cpu".into());
     manifest["primary_protocol"] = Value::String(primary_kind.label().into());
     manifest["adjudication"] = serde_json::to_value(&config.adjudication)?;
     let max_output_tokens = config.adjudication.max_output_tokens;
@@ -164,7 +183,7 @@ fn embedded(config: &SmartHarnessConfig) -> anyhow::Result<(Arc<dyn InferenceBac
         .as_deref()
         .unwrap_or(crate::palette::default_model().name);
     let path = config.model_path.clone().or_else(|| crate::palette::resolve_local(model))
-        .ok_or_else(|| anyhow::anyhow!("embedded auxiliary model is unavailable; provision it with `newt models pull {model}` or configure an independent CPU backend"))?;
+        .ok_or_else(|| anyhow::anyhow!("embedded auxiliary model is unavailable; provision it with `newt models pull {model}` or configure an external backend"))?;
     let backend = crate::embedded::EmbeddedBackend::new_cpu(model, &path)?;
     anyhow::ensure!(
         backend.model().arch == crate::palette::ModelArch::Qwen2,
@@ -181,7 +200,7 @@ fn embedded(config: &SmartHarnessConfig) -> anyhow::Result<(Arc<dyn InferenceBac
 
 #[cfg(not(feature = "embedded"))]
 fn embedded(_: &SmartHarnessConfig) -> anyhow::Result<(Arc<dyn InferenceBackend>, Value)> {
-    anyhow::bail!("embedded auxiliary support is not compiled; enable the embedded feature or configure an independent CPU backend")
+    anyhow::bail!("embedded auxiliary support is not compiled; enable the embedded feature or configure an external backend")
 }
 
 #[cfg(test)]
@@ -269,7 +288,7 @@ mod tests {
     fn unsafe_or_incomplete_placement_never_falls_back_to_primary() {
         for mutate in [
             |c: &mut SmartHarnessConfig| c.device = None,
-            |c: &mut SmartHarnessConfig| c.device = Some("cuda".into()),
+            |c: &mut SmartHarnessConfig| c.device = Some("   ".into()),
             |c: &mut SmartHarnessConfig| c.backend.as_mut().unwrap().model = None,
             |c: &mut SmartHarnessConfig| c.backend.as_mut().unwrap().kind = None,
             |c: &mut SmartHarnessConfig| c.backend.as_mut().unwrap().endpoint = None,
@@ -280,7 +299,6 @@ mod tests {
             assert!(build(&config, "http://primary.invalid:8000", BackendKind::Openai).is_err());
         }
         for endpoint in [
-            "http://primary.invalid:8000/v1",
             "http://user:secret@auxiliary.invalid",
             "http://auxiliary.invalid?key=secret",
         ] {
@@ -291,6 +309,57 @@ mod tests {
             )
             .is_err());
         }
+    }
+
+    /// D10 reversal: an auxiliary may name the primary's own origin. The manifest must say so,
+    /// the declared placement must be recorded verbatim, and the request must actually reach
+    /// that origin — grounded in a real HTTP exchange, not a config read.
+    #[tokio::test]
+    async fn a_same_origin_auxiliary_is_accepted_and_its_manifest_says_so() {
+        let server = MockServer::start().await;
+        let mut config = external(&server.uri());
+        config.device = Some("cuda".into());
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message":{"role":"assistant","content":"\"narration\""}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Same origin as the primary — exactly what the old assertion refused.
+        let auxiliary = build(&config, &server.uri(), BackendKind::Openai).unwrap();
+        assert_eq!(auxiliary.manifest["shares_primary_origin"], true);
+        assert_eq!(auxiliary.manifest["placement"], "cuda");
+        assert_eq!(
+            auxiliary.manifest["placement_evidence"],
+            "operator-declared"
+        );
+        assert_eq!(
+            (auxiliary.complete)("classify this".into()).await.unwrap(),
+            "\"narration\""
+        );
+        // And a distinct origin is recorded as such, so the two runs are distinguishable.
+        let distinct = build(&config, "http://primary.invalid:8000", BackendKind::Openai).unwrap();
+        assert_eq!(distinct.manifest["shares_primary_origin"], false);
+    }
+
+    /// A non-cpu declaration is only meaningful with an external backend; the
+    /// embedded path is cpu by construction and must say so before loading assets.
+    #[test]
+    fn embedded_auxiliary_refuses_a_non_cpu_declaration_before_loading_assets() {
+        let config = SmartHarnessConfig {
+            enabled: true,
+            device: Some("cuda".into()),
+            ..Default::default()
+        };
+        let err = build(&config, "http://primary.invalid:8000", BackendKind::Openai)
+            .err()
+            .expect("cuda without an external backend must be refused");
+        assert!(
+            err.to_string().contains("requires an external backend"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

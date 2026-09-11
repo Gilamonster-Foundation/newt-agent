@@ -36,9 +36,13 @@ useful default classifier. Check the recorded protocol and model results when
 choosing an auxiliary; malformed replies produce an explicit failure.
 
 An external auxiliary requires its own endpoint, protocol, model, and an explicit
-CPU placement declaration. The host rejects a primary endpoint reuse, GPU
-placement, or an incomplete override. A CPU declaration for an external server
-is operator-supplied evidence; the client cannot inspect that server's hardware.
+placement declaration (`cpu`, `cuda`, ...). The host rejects an incomplete
+override. It does **not** reject reusing the primary model's own endpoint: that
+is a legitimate choice — a capable primary model classified all eight bundled
+fixtures correctly where the embedded 0.5B classified none — and the run
+manifest records `shares_primary_origin` so two runs remain comparable. The
+declaration is operator-supplied evidence; the client cannot inspect that
+server's hardware.
 
 ```toml
 [smart_harness]
@@ -49,6 +53,20 @@ device = "cpu"
 endpoint = "http://127.0.0.1:11435"
 kind = "ollama"
 model = "installed-auxiliary-model"
+```
+
+To judge with the same model that does the work, point the auxiliary at the
+primary's own server (placeholder host shown):
+
+```toml
+[smart_harness]
+enabled = true
+device = "cuda"
+
+[smart_harness.backend]
+endpoint = "http://inference.example:8080"
+kind = "openai"
+model = "the-primary-model"
 # api_key_env = "AUXILIARY_API_KEY"  # only if that server requires it
 ```
 
