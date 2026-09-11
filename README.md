@@ -27,7 +27,9 @@ _Per-model Terminal-Bench champions, **OCAP off vs on**. Each lane is a monotoni
 
 <!-- BENCH-SCOREBOARD:END -->
 
-Evidence, provenance, rejected runs, and the scoring rules live in
+The full table, with half-measured and queued models, is
+[`docs/scoreboard.md`](./docs/scoreboard.md). Evidence, provenance, rejected
+runs, and the scoring rules live in
 [`gilamonster-bench`](https://github.com/Gilamonster-Foundation/gilamonster-bench/tree/main/scoreboard),
 an instrument with no dependency on Newt. If the ruler shipped with the thing
 it measures, one commit could move both at once.
@@ -76,6 +78,7 @@ ordering, not wall-clock.
 | Derivation kernel and recorded sessions | [`agent-frame/`](./agent-frame/README.md), [`agent-harness/`](./agent-harness/README.md), [`agent-harness-py/`](./agent-harness-py/README.md) |
 | Evaluation harness | [`newt-eval/README.md`](./newt-eval/README.md) |
 | Terminal-Bench runner | [`scripts/eval/harbor/README.md`](./scripts/eval/harbor/README.md) |
+| Full scoreboard | [`docs/scoreboard.md`](./docs/scoreboard.md) |
 | Benchmark evidence | [`gilamonster-bench`](https://github.com/Gilamonster-Foundation/gilamonster-bench/tree/main/scoreboard) |
 | What changed | [`CHANGELOG.md`](./CHANGELOG.md) |
 | Forward plan | [`ROADMAP.md`](./ROADMAP.md) (issue state is authoritative) |
