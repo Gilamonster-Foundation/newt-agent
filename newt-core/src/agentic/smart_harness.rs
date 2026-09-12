@@ -900,6 +900,21 @@ pub(crate) async fn response(
     }
 }
 
+/// Per-message rounding can hide required elision when converting tokens to bytes.
+/// Force projection without changing the separate token admission budget.
+pub(super) fn projection_byte_budget(
+    messages: &[Value],
+    token_budget: usize,
+    est: crate::tokens::TokenEstimation,
+) -> anyhow::Result<usize> {
+    let max_bytes = est.chars_for_tokens(token_budget);
+    if super::estimate_tokens(messages, est) > token_budget {
+        Ok(max_bytes.min(serde_json::to_vec(messages)?.len().saturating_sub(1)))
+    } else {
+        Ok(max_bytes)
+    }
+}
+
 /// Reuse the existing pressure trigger and wire bridges; smart mode elides
 /// through the verified frame instead of running the legacy summarizer.
 pub(super) async fn compress(
@@ -912,7 +927,10 @@ pub(super) async fn compress(
         return Ok(super::compress::compress(req, summarizer, state).await);
     };
     let messages = harness
-        .project(req.messages, req.est.chars_for_tokens(req.budget))
+        .project(
+            req.messages,
+            projection_byte_budget(req.messages, req.budget, req.est)?,
+        )
         .await?;
     let tokens_before = super::estimate_tokens(req.messages, req.est);
     let tokens_after = super::estimate_tokens(&messages, req.est);

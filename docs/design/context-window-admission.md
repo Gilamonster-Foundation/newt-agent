@@ -40,6 +40,9 @@ Regression evidence lives in the
 [calibration tests](../../newt-core/src/agentic/compress_tests/calibration.rs),
 [classification tests](../../newt-core/tests/context_overflow_classification.rs),
 and [durable recovery tests](../../newt-core/src/agentic/smart_harness_tests/context_exceeded.rs).
+The [projection boundary tests](../../newt-core/src/agentic/context_recovery_tests.rs)
+cover protected-history limits and token/byte rounding in both shared and
+Responses smart compaction.
 
 Calibration is a conservative heuristic, not exact tokenization. Per-request
 admission cannot guarantee that other clients leave room in a shared KV pool.

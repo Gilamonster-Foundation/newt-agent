@@ -568,10 +568,12 @@ async fn compact_responses_input(
     if let Some(harness) = smart_harness {
         // Preserve native call IDs and reasoning items through host selection.
         // The legacy summarizer bridge intentionally flattens them to prose.
-        let projected = match harness
-            .project(input, estimation.chars_for_tokens(compaction_budget))
-            .await
-        {
+        let max_bytes =
+            match smart_harness::projection_byte_budget(input, compaction_budget, estimation) {
+                Ok(max_bytes) => max_bytes,
+                Err(error) => return ResponsesCompaction::HarnessFailure(error.to_string()),
+            };
+        let projected = match harness.project(input, max_bytes).await {
             Ok(messages) => messages,
             Err(error) => return ResponsesCompaction::HarnessFailure(error.to_string()),
         };

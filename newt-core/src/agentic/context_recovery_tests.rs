@@ -110,3 +110,130 @@ async fn overflow_respects_append_only_and_endpoint_replay_protection() {
     assert!(replay.tokens_after > 1_000);
     assert!(replay.messages.ends_with(&messages[3..]));
 }
+
+#[tokio::test]
+async fn overflow_smart_projection_cannot_skip_elision_due_to_per_message_rounding() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let mut messages = fixture("newest result must remain");
+    for message in &mut messages {
+        let padding = (5 - message.to_string().len() % 4) % 4;
+        let content = message["content"].as_str().unwrap().to_string();
+        message["content"] = json!(format!("{content}{}", "x".repeat(padding)));
+        assert_eq!(message.to_string().len() % 4, 1);
+    }
+    let est = crate::tokens::TokenEstimation::default();
+    let before = trim::estimate_tokens(&messages, est);
+    let bytes = serde_json::to_vec(&messages).unwrap().len();
+    assert!(
+        bytes <= est.chars_for_tokens(before - 1),
+        "fixture must expose the token/byte rounding mismatch"
+    );
+
+    let navigation_calls = Arc::new(AtomicUsize::new(0));
+    let counted_calls = navigation_calls.clone();
+    let harness = smart_harness::SmartHarness::new(
+        agent_harness::Session::new(Default::default()).unwrap(),
+        Arc::new(move |prompt| {
+            counted_calls.fetch_add(1, Ordering::SeqCst);
+            let catalog: Value = serde_json::from_str(prompt.lines().last().unwrap()).unwrap();
+            let selected = catalog["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|candidate| {
+                    candidate["required"] == true
+                        || candidate["pairs"]
+                            .as_array()
+                            .is_some_and(|pairs| !pairs.is_empty())
+                })
+                .map(|candidate| candidate["cid"].clone())
+                .collect::<Vec<_>>();
+            Box::pin(async move { Ok(serde_json::to_string(&selected).unwrap()) })
+        }),
+        Default::default(),
+    )
+    .unwrap();
+    let mut input = request(&messages);
+    input.budget = target(&messages, before + 1_000, est);
+    let result = compress(
+        input,
+        None,
+        &mut super::super::CompressState::new(),
+        Some(&harness),
+    )
+    .await
+    .expect("a removable source must be projected despite token/byte rounding differences");
+    assert_eq!(navigation_calls.load(Ordering::SeqCst), 1);
+    assert!(result.fired);
+    assert!(result.tokens_after < before);
+    // Smart elision inserts its retained-frame pointer before the first user
+    // message. The exact protected inputs retain their relative order.
+    assert!(result.messages.starts_with(&messages[..2]));
+    assert!(result.messages.contains(&messages[2]));
+    assert!(result.messages.ends_with(&messages[4..]));
+    assert!(!result.messages.contains(&messages[3]));
+}
+
+#[tokio::test]
+async fn overflow_smart_responses_projection_cannot_skip_elision_due_to_rounding() {
+    let task = "keep the exact operator prompt";
+    let mut input = vec![
+        json!({"role":"user","content":task}),
+        json!({"role":"assistant","content":"obsolete reasoning ".repeat(500)}),
+        json!({"role":"assistant","content":"old evidence ".repeat(100)}),
+        json!({"role":"assistant","content":"earlier notes ".repeat(100)}),
+    ];
+    for message in &mut input {
+        let padding = (5 - message.to_string().len() % 4) % 4;
+        let content = message["content"].as_str().unwrap().to_string();
+        message["content"] = json!(format!("{content}{}", "x".repeat(padding)));
+    }
+    let original = input.clone();
+    let est = crate::tokens::TokenEstimation::default();
+    let before = trim::estimate_tokens(&input, est);
+    assert!(serde_json::to_vec(&input).unwrap().len() <= est.chars_for_tokens(before - 1));
+    let harness = smart_harness::SmartHarness::new(
+        agent_harness::Session::new(Default::default()).unwrap(),
+        std::sync::Arc::new(|prompt| {
+            let catalog: Value = serde_json::from_str(prompt.lines().last().unwrap()).unwrap();
+            let selected = catalog["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|candidate| candidate["required"] == true)
+                .map(|candidate| candidate["cid"].clone())
+                .collect::<Vec<_>>();
+            Box::pin(async move { Ok(serde_json::to_string(&selected).unwrap()) })
+        }),
+        Default::default(),
+    )
+    .unwrap();
+    let outcome = super::super::compact_responses_input(
+        &mut input,
+        Some("policy"),
+        None,
+        Some(before + 1_000),
+        before - 1,
+        1.0,
+        est,
+        task,
+        8_192,
+        true,
+        None,
+        None,
+        &mut super::super::CompressState::new(),
+        false,
+        Some(&harness),
+        true,
+    )
+    .await;
+    assert!(
+        matches!(outcome, super::super::ResponsesCompaction::Compacted),
+        "Responses must project a smaller candidate despite token/byte rounding differences"
+    );
+    assert!(trim::estimate_tokens(&input, est) < before);
+    assert!(input.contains(&original[0]));
+    assert!(!input.contains(&original[1]));
+}
