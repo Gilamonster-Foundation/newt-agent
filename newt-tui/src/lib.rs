@@ -830,7 +830,7 @@ fn render_inline_header(workspace: &str, color: bool) -> String {
 
     // Text lines aligned to the middle-right of the logo.
     let mid = n / 2;
-    let header = format!("{}  ·  {}", brand_name(), brand_tagline());
+    let header = brand_tagline();
     let plugins = brand_plugins();
     let version = format!("v{VERSION}");
     let text: &[(&str, bool)] = &[

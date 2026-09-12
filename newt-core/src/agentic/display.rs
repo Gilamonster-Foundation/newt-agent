@@ -1346,13 +1346,19 @@ impl<W: Write> ToolDisplay<W> {
                 .unwrap_or_else(|| spill_view_lines(output, self.spill_lines, self.cols).join("\n"))
         };
         if self.color {
-            execute!(
-                &mut self.writer,
-                SetForegroundColor(CtColor::DarkGrey),
-                Print(format!("{rendered}\n")),
-                ResetColor,
-            )
-            .ok();
+            // Each logical row is independently styled: the cockpit resets
+            // attributes between committed rows, including spill fold markers.
+            for line in rendered.lines() {
+                execute!(
+                    &mut self.writer,
+                    SetForegroundColor(
+                        crate::tty::theme::active().color(crate::tty::theme::Role::Dim)
+                    ),
+                    Print(format!("{line}\n")),
+                    ResetColor,
+                )
+                .ok();
+            }
         } else {
             writeln!(&mut self.writer, "{rendered}").ok();
         }
@@ -1405,13 +1411,19 @@ impl<W: Write + Send> ToolPresentation for ToolDisplay<W> {
             return;
         }
         if self.color {
-            execute!(
-                &mut self.writer,
-                SetForegroundColor(CtColor::DarkGrey),
-                Print(format!("{rendered}\n")),
-                ResetColor,
-            )
-            .ok();
+            // Each logical row is independently styled: the cockpit resets
+            // attributes between committed rows, including spill fold markers.
+            for line in rendered.lines() {
+                execute!(
+                    &mut self.writer,
+                    SetForegroundColor(
+                        crate::tty::theme::active().color(crate::tty::theme::Role::Dim)
+                    ),
+                    Print(format!("{line}\n")),
+                    ResetColor,
+                )
+                .ok();
+            }
         } else {
             writeln!(&mut self.writer, "{rendered}").ok();
         }
