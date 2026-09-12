@@ -421,8 +421,19 @@ async fn exact_count_smart_admission_keeps_raw_response_evidence_and_request_rep
     mount_counter(&server, &trace, Some(measured_tokens)).await;
     mount_generation(&server, &trace, true, false).await;
     let directory = tempfile::tempdir().unwrap();
-    let harness =
-        smart(agent_harness::Session::open(directory.path(), Default::default()).unwrap());
+    // This real-filesystem test durably elides roughly 100 messages. Match
+    // the disk-elision fixture's I/O allowance on slower runners; dedicated
+    // navigation budget tests retain the small elapsed-time limits.
+    let harness = smart(
+        agent_harness::Session::open(
+            directory.path(),
+            agent_harness::SessionConfig {
+                max_elapsed_ms: 300_000,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
     let messages = history();
     let caveats = Caveats::top();
     let uri = server.uri();
