@@ -1,5 +1,43 @@
 use super::*;
 
+#[tokio::test]
+async fn router_load_and_unload_use_explicit_routes_and_require_success() {
+    use wiremock::matchers::{body_json, header};
+    let server = MockServer::start().await;
+    for action in ["load", "unload"] {
+        Mock::given(method("POST"))
+            .and(path(format!("/models/{action}")))
+            .and(header("authorization", "Bearer test-key"))
+            .and(body_json(serde_json::json!({"model": "chosen"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let client = reqwest::Client::new();
+    for loaded in [true, false] {
+        set_llamacpp_model_loaded(&client, &server.uri(), Some("test-key"), "chosen", loaded)
+            .await
+            .unwrap();
+    }
+    Mock::given(method("POST"))
+        .and(path("/models/load"))
+        .and(body_json(serde_json::json!({"model": "refused"})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": false})),
+        )
+        .mount(&server)
+        .await;
+    assert!(
+        set_llamacpp_model_loaded(&client, &server.uri(), None, "refused", true)
+            .await
+            .is_err()
+    );
+    server.verify().await;
+}
+
 // --- warm models ---
 
 #[test]
@@ -108,4 +146,26 @@ async fn vllm_warm_models_is_the_served_list() {
         .await;
     assert_eq!(warm, Some(vec!["resident-model".to_string()]));
     server.verify().await;
+}
+#[test]
+fn router_states_keep_loaded_and_unloaded_distinct_from_unknown() {
+    let states = parse_llamacpp_model_states(&serde_json::json!({"data": [
+        {"id": "resident", "status": {"value": "loaded"}},
+        {"id": "cold", "status": {"value": "unloaded"}},
+        {"id": "starting", "status": {"value": "loading"}},
+        {"id": "broken", "status": {"value": "unloaded", "failed": true}},
+        {"id": "unknown"}
+    ]}))
+    .unwrap();
+    assert_eq!(
+        states,
+        vec![
+            ("resident".into(), "loaded".into()),
+            ("cold".into(), "unloaded".into()),
+            ("starting".into(), "loading".into()),
+            ("broken".into(), "failed".into()),
+            ("unknown".into(), "unknown".into()),
+        ]
+    );
+    assert!(parse_llamacpp_model_states(&serde_json::json!({"data": [{"id":"hosted"}]})).is_none());
 }

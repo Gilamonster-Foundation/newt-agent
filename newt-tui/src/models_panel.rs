@@ -24,10 +24,10 @@
 //! arithmetic is `list_cursor`, which exists so the five panels behind it do
 //! not each grow their own.
 //!
-//! This module is therefore only what is TRUE OF MODELS: which row is active,
-//! that choosing the active one is a no-op, and what the rows say.
+//! Residency comes from the backend probe. Router actions run between panel
+//! visits, outside the draw/key loop, and the next visit re-reads server state.
 
-use crate::config_panel::{hint_line, render_panel, ModelChoice, RowView};
+use crate::config_panel::{render_panel_with_styles, status_line, ModelChoice, RowView};
 use crate::list_cursor::ListCursor;
 use crate::panel::{Flow, Key, Screen};
 
@@ -38,6 +38,15 @@ pub(crate) enum Outcome {
     Chose(String),
     /// Esc, or Enter on the model already active.
     Cancelled,
+    Manage(Action, String),
+    Refresh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Action {
+    Load,
+    Unload,
+    LoadOnly,
 }
 
 pub(crate) struct ModelsPanel {
@@ -45,6 +54,11 @@ pub(crate) struct ModelsPanel {
     active: String,
     cursor: ListCursor,
     chose: Option<String>,
+    management: bool,
+    action: Option<Action>,
+    confirm: Option<Action>,
+    refresh: bool,
+    status: String,
 }
 
 /// Body rows the picker shows at once.
@@ -54,6 +68,11 @@ pub(crate) struct ModelsPanel {
 /// view to answer a question about it. Nine is enough to see a neighbourhood
 /// and short enough to leave the transcript legible behind it.
 const VISIBLE: usize = 9;
+
+/// Bare model commands share the picker; arguments retain text dispatch.
+pub(crate) fn requested(tokens: &[&str]) -> bool {
+    matches!(tokens, ["model"] | ["models"])
+}
 
 /// Two border rows, the header, and the hint line, on top of the body.
 pub(crate) fn panel_height() -> u16 {
@@ -73,6 +92,11 @@ impl ModelsPanel {
             models,
             active,
             chose: None,
+            management: false,
+            action: None,
+            confirm: None,
+            refresh: false,
+            status: String::new(),
         }
     }
 
@@ -86,22 +110,35 @@ impl ModelsPanel {
             .map(|(i, model)| RowView {
                 label: "",
                 value: model.name.clone(),
-                // The active marker goes in the provenance column, which is
-                // already the dim "where this came from" register.
-                // The active marker rides the provenance column, which is
-                // already the dim "where this came from" register. `tag` is
-                // the cached conformance marker, shown but never acted on: an
-                // untested model stays selectable, because refusing to dial
-                // one would make the picker a gate rather than a chooser.
-                provenance: if model.name == self.active {
-                    format!("{}  ◂ active", model.tag)
+                // Session selection and server residency are independent:
+                // an active session may refer to an unloaded model.
+                provenance: if model.tag == "[loaded]" {
+                    " [loaded]".to_string()
                 } else {
-                    model.tag.clone()
+                    String::new()
                 },
                 selected: i == self.cursor.at(),
                 editable: false,
             })
             .collect()
+    }
+
+    fn row_style(&self, row: &RowView) -> (ratatui::style::Style, ratatui::style::Style) {
+        use crate::theme::{color, Role};
+        use ratatui::style::{Modifier, Style};
+        let value = if row.value == self.active {
+            Style::default()
+                .fg(color(Role::ActiveModel))
+                .remove_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+        };
+        (
+            value,
+            Style::default()
+                .fg(color(Role::LoadedModel))
+                .remove_modifier(Modifier::DIM),
+        )
     }
 
     fn title(&self) -> String {
@@ -117,6 +154,12 @@ impl ModelsPanel {
     }
 
     pub(crate) fn outcome(self) -> Outcome {
+        if self.refresh {
+            return Outcome::Refresh;
+        }
+        if let (Some(action), Some(name)) = (self.action, self.chose.as_ref()) {
+            return Outcome::Manage(action, name.clone());
+        }
         match self.chose {
             // Enter on the model already running is a no-op, not a switch. It
             // would otherwise tear down and redial the session to arrive
@@ -129,19 +172,73 @@ impl ModelsPanel {
 
 impl Screen for ModelsPanel {
     fn draw(&self, frame: &mut ratatui::Frame) {
-        render_panel(
+        let hint = if let Some(action) = self.confirm {
+            match action {
+                Action::LoadOnly => {
+                    "Unload all others; load highlighted model? Enter confirms · Esc back"
+                        .to_string()
+                }
+                _ => "Unload highlighted model from memory? Enter confirms · Esc back".to_string(),
+            }
+        } else if !self.status.is_empty() {
+            format!(
+                "{} · ↑↓ move · Enter use · r refresh · Esc close",
+                self.status
+            )
+        } else if self.management {
+            "↑↓ choose · Enter use · l load · u unload · x load only this · r refresh · Esc close"
+                .to_string()
+        } else {
+            "↑↓ choose · Enter use · ^u/^d page · g/G ends · r refresh · Esc close".to_string()
+        };
+        render_panel_with_styles(
             frame,
             &self.title(),
             &self.window(),
-            hint_line("↑↓/jk move · ^u/^d page · g/G ends · Enter choose · Esc cancel"),
+            status_line(&hint),
             0,
-            46,
+            0,
+            |row| self.row_style(row),
         );
     }
 
     fn key(&mut self, key: Key) -> Flow {
+        if let Some(action) = self.confirm {
+            return match key {
+                Key::Esc => {
+                    self.confirm = None;
+                    Flow::Stay
+                }
+                Key::Enter => {
+                    self.chose = Some(self.models[self.cursor.at()].name.clone());
+                    self.action = Some(action);
+                    Flow::Close(true)
+                }
+                _ => Flow::Stay,
+            };
+        }
+        self.status.clear();
         let page = self.cursor.page() as isize;
         match key {
+            Key::Char('r') => {
+                self.refresh = true;
+                Flow::Close(true)
+            }
+            Key::Char('l' | 'u' | 'x') if self.management && !self.models.is_empty() => {
+                let action = match key {
+                    Key::Char('u') => Action::Unload,
+                    Key::Char('x') => Action::LoadOnly,
+                    _ => Action::Load,
+                };
+                if action == Action::Load {
+                    self.chose = Some(self.models[self.cursor.at()].name.clone());
+                    self.action = Some(action);
+                    Flow::Close(true)
+                } else {
+                    self.confirm = Some(action);
+                    Flow::Stay
+                }
+            }
             Key::Esc => Flow::Close(false),
             Key::Enter => {
                 if let Some(model) = self.models.get(self.cursor.at()) {
@@ -192,24 +289,308 @@ impl Screen for ModelsPanel {
 ///
 /// The terminal could not be taken, built, polled, read or repainted.
 pub(crate) fn choose(
-    models: Vec<ModelChoice>,
-    active: String,
+    choice: &crate::BackendChoice,
     window: Option<crate::session_worker::PanelWindow>,
-) -> std::io::Result<Outcome> {
-    let mut panel = ModelsPanel::new(models, active);
-    let applied = crate::panel::drive(&mut panel, panel_height(), window.as_ref())?;
-    // A cancelled visit is silent — browse-and-leave costs nothing, the same
-    // #1665 discipline the other panels keep.
-    Ok(if applied {
-        panel.outcome()
-    } else {
-        Outcome::Cancelled
+) -> anyhow::Result<Option<String>> {
+    let active = choice.active_model.clone().unwrap_or_default();
+    let mut focused = active.clone();
+    let mut status = String::new();
+    loop {
+        let (models, management) = snapshot(choice)?;
+        let mut panel = ModelsPanel::new(models, focused.clone());
+        panel.active = active.clone();
+        panel.management = management;
+        panel.status = std::mem::take(&mut status);
+        let applied = crate::panel::drive(&mut panel, panel_height(), window.as_ref())?;
+        focused = panel
+            .models
+            .get(panel.cursor.at())
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
+        if !applied {
+            return Ok(None);
+        }
+        match panel.outcome() {
+            Outcome::Chose(name) => return Ok(Some(name)),
+            Outcome::Cancelled => return Ok(None),
+            Outcome::Refresh => {}
+            Outcome::Manage(action, name) => {
+                // The panel releases raw mode before network I/O. Refresh from
+                // the server afterward; an HTTP success never invents residency.
+                status = match manage(choice, action, &name) {
+                    Ok(()) => "Request accepted".to_string(),
+                    Err(e) => format!("Model action failed: {e}"),
+                };
+            }
+        }
+    }
+}
+
+pub(crate) fn snapshot(choice: &crate::BackendChoice) -> anyhow::Result<(Vec<ModelChoice>, bool)> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            use newt_core::backend_probe::{
+                api_for_engine, detect_engine, fetch_llamacpp_model_states,
+            };
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()?;
+            let engine =
+                detect_engine(&client, &choice.url, choice.kind, choice.api_key.as_deref()).await;
+            if engine == Some(newt_core::config::Engine::LlamaCpp) {
+                if let Ok(Some(states)) =
+                    fetch_llamacpp_model_states(&client, &choice.url, choice.api_key.as_deref())
+                        .await
+                {
+                    let models = states
+                        .into_iter()
+                        .map(|(name, state)| ModelChoice {
+                            name,
+                            tag: format!("[{state}]"),
+                        })
+                        .collect();
+                    return Ok((models, true));
+                }
+            }
+            let api = api_for_engine(choice.kind, engine);
+            let names = api
+                .list_models(&client, &choice.url, choice.api_key.as_deref())
+                .await?;
+            let warm = api
+                .warm_models(&client, &choice.url, choice.api_key.as_deref())
+                .await;
+            let models = names
+                .into_iter()
+                .map(|name| {
+                    let state = match &warm {
+                        Some(loaded) if loaded.contains(&name) => "loaded",
+                        Some(_) => "unloaded",
+                        None => "state unknown",
+                    };
+                    ModelChoice {
+                        name,
+                        tag: format!("[{state}]"),
+                    }
+                })
+                .collect();
+            Ok((models, false))
+        })
+    })
+}
+
+fn manage(choice: &crate::BackendChoice, action: Action, name: &str) -> anyhow::Result<()> {
+    let operation = match action {
+        Action::Load => "Load",
+        Action::Unload => "Unload",
+        Action::LoadOnly => "Unload other resident models and load",
+    };
+    eprintln!("{operation} {name} — waiting for the server…");
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            use newt_core::backend_probe::{
+                fetch_llamacpp_model_states, set_llamacpp_model_loaded,
+            };
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()?;
+            if action == Action::LoadOnly {
+                // Re-read just before eviction; do not act on stale picker rows.
+                let states =
+                    fetch_llamacpp_model_states(&client, &choice.url, choice.api_key.as_deref())
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("server no longer reports model residency")
+                        })?;
+                anyhow::ensure!(
+                    states.iter().any(|(model, _)| model == name),
+                    "selected model is no longer available"
+                );
+                for (other, state) in states {
+                    if other != name && matches!(state.as_str(), "loaded" | "loading" | "sleeping")
+                    {
+                        set_llamacpp_model_loaded(
+                            &client,
+                            &choice.url,
+                            choice.api_key.as_deref(),
+                            &other,
+                            false,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            set_llamacpp_model_loaded(
+                &client,
+                &choice.url,
+                choice.api_key.as_deref(),
+                name,
+                action != Action::Unload,
+            )
+            .await
+        })
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_only_evicts_other_residents_before_loading_and_stops_on_failure() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for unload_status in [200, 503] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"data": [
+                        {"id":"old", "status":{"value":"loaded"}},
+                        {"id":"cold", "status":{"value":"unloaded"}},
+                        {"id":"chosen", "status":{"value":"unloaded"}}
+                    ]}),
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/models/unload"))
+                .and(body_json(serde_json::json!({"model":"old"})))
+                .respond_with(
+                    ResponseTemplate::new(unload_status)
+                        .set_body_json(serde_json::json!({"success":true})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/models/load"))
+                .and(body_json(serde_json::json!({"model":"chosen"})))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"success":true})),
+                )
+                .expect(if unload_status == 200 { 1 } else { 0 })
+                .mount(&server)
+                .await;
+            let choice = crate::BackendChoice::synthesized(
+                "fixture",
+                server.uri(),
+                newt_core::BackendKind::Openai,
+                Some("old".into()),
+            );
+            let result = manage(&choice, Action::LoadOnly, "chosen");
+            assert_eq!(result.is_ok(), unload_status == 200);
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests[1].url.path(), "/models/unload");
+            if unload_status == 200 {
+                assert_eq!(requests[2].url.path(), "/models/load");
+            }
+            server.verify().await;
+        }
+    }
+
+    #[test]
+    fn eviction_requires_confirmation_and_escape_does_not_evict() {
+        let mut p = panel(3, "model-00");
+        p.management = true;
+        p.key(Key::Down);
+        assert_eq!(p.key(Key::Char('x')), Flow::Stay);
+        assert_eq!(p.key(Key::Esc), Flow::Stay);
+        assert_eq!(p.outcome(), Outcome::Cancelled);
+
+        let mut p = panel(3, "model-00");
+        p.management = true;
+        p.key(Key::Down);
+        p.key(Key::Char('x'));
+        assert_eq!(p.key(Key::Enter), Flow::Close(true));
+        assert_eq!(
+            p.outcome(),
+            Outcome::Manage(Action::LoadOnly, "model-01".into())
+        );
+    }
+
+    #[test]
+    fn load_state_is_visible_beside_the_name_and_controls_need_management() {
+        let mut p = ModelsPanel::new(
+            vec![ModelChoice {
+                name: "resident".into(),
+                tag: "[loaded]".into(),
+            }],
+            "resident".into(),
+        );
+        assert_eq!(p.window()[0].value, "resident");
+        assert_eq!(p.window()[0].provenance, " [loaded]");
+        assert_eq!(p.key(Key::Char('l')), Flow::Stay);
+        assert_eq!(p.outcome(), Outcome::Cancelled);
+    }
+
+    #[test]
+    fn unloaded_and_failed_rows_have_no_badges() {
+        let p = ModelsPanel::new(
+            vec![
+                ModelChoice {
+                    name: "cold".into(),
+                    tag: "[unloaded]".into(),
+                },
+                ModelChoice {
+                    name: "failed".into(),
+                    tag: "[failed]".into(),
+                },
+            ],
+            "cold".into(),
+        );
+        assert!(p.window().iter().all(|r| r.provenance.is_empty()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optional_router_state_failure_keeps_the_model_list_usable() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/props"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_generation_settings":{}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data":[{"id":"fixture"}]})),
+            )
+            .mount(&server)
+            .await;
+        let choice = crate::BackendChoice::synthesized(
+            "fixture",
+            server.uri(),
+            newt_core::BackendKind::Openai,
+            None,
+        );
+        let (models, management) = snapshot(&choice).unwrap();
+        assert_eq!(models[0].name, "fixture");
+        assert!(!management);
+    }
+
+    #[test]
+    fn both_bare_model_commands_open_the_picker() {
+        assert!(requested(&["model"]));
+        assert!(requested(&["models"]));
+        for tokens in [
+            vec![],
+            vec!["model", "other"],
+            vec!["models", "capabilities"],
+            vec!["backends"],
+        ] {
+            assert!(!requested(&tokens));
+        }
+    }
 
     fn models(n: usize) -> Vec<ModelChoice> {
         (0..n)
@@ -338,14 +719,16 @@ mod tests {
         assert_eq!(p.window().len(), 3);
     }
 
-    /// The active marker rides the provenance column and marks exactly one row.
+    /// Active styling remains distinct from the moving keyboard cursor.
     #[test]
     fn exactly_one_row_is_marked_active() {
         let p = panel(52, "model-07");
         let marked: Vec<_> = p
             .window()
             .into_iter()
-            .filter(|r| r.provenance.contains("active"))
+            .filter(|r| {
+                p.row_style(r).0.fg == Some(crate::theme::color(crate::theme::Role::ActiveModel))
+            })
             .collect();
         assert_eq!(marked.len(), 1);
         assert_eq!(marked[0].value, "model-07");

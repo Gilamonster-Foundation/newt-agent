@@ -162,7 +162,47 @@ pub(crate) fn choose(
             })
             .map_err(|e| format!("{e:#}"))
     };
-    backend_panel::run(seed(cfg), persist, remove, window)
+    backend_panel::run(seed(cfg), persist, remove, window, discover_models)
+}
+
+/// Resolve the form's endpoint and credentials, including unsaved edits.
+fn discover_models(edit: &BackendEdit) -> Result<Vec<crate::config_panel::ModelChoice>, String> {
+    let config = newt_core::config::BackendConfig {
+        name: edit.name.clone(),
+        endpoint: edit.endpoint.clone(),
+        kind: edit.kind,
+        model: edit.model.clone(),
+        api_key_env: edit.api_key_env.clone(),
+        api_key_file: edit.api_key_file.clone(),
+        ..Default::default()
+    };
+    let key = config
+        .resolve_api_key_detailed()
+        .map_err(|e| e.to_string())?;
+    let kind = match edit.kind {
+        Some(kind) => kind,
+        None => tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()?;
+                newt_core::backend_probe::detect_endpoint(&client, &edit.endpoint, key.as_deref())
+                    .await
+                    .map(|p| p.kind)
+            })
+        })
+        .map_err(|e| format!("{e:#}"))?,
+    };
+    let mut choice = crate::BackendChoice::synthesized(
+        &edit.name,
+        edit.endpoint.clone(),
+        kind,
+        edit.model.clone(),
+    );
+    choice.api_key = key;
+    crate::models_panel::snapshot(&choice)
+        .map(|(models, _)| models)
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[cfg(test)]
