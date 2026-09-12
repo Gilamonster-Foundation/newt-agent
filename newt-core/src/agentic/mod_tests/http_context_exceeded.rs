@@ -184,3 +184,162 @@ async fn smart_context_exceeded_reprojects_the_recorded_request_before_retry() {
     assert_eq!(events.len(), 1);
     assert!(events[0]["projected_tokens"].as_u64().is_some());
 }
+
+/// An optional display request may fail after the answer has been accepted.
+/// Keep that answer, but retain the observed rejection and its session learning.
+#[tokio::test]
+async fn display_context_exceeded_keeps_the_answer_and_records_the_rejection() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |request: &Request| {
+            let mut requests = captured.lock().unwrap();
+            requests.push(body_json(request));
+            if requests.len() == 1 {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices":[{"finish_reason":"stop","message":{
+                        "role":"assistant","content":"preserved accepted answer"
+                    }}]
+                }))
+            } else {
+                ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                    "error":{"message":"Context size has been exceeded."}
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut observation = observability::SolveObservation::default();
+    let mut state = CompressState::new();
+    let mut reason = None;
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.kind = BackendKind::Openai;
+    context.action_nudges = false;
+    context.solve_obs = Some(&mut observation);
+    context.compress_state = Some(&mut state);
+    context.end_reason = Some(&mut reason);
+    let (reply, streamed, _, _) = chat_complete(context, &mut NoMcp).await.unwrap();
+    assert_eq!(reply, "preserved accepted answer");
+    assert!(!streamed);
+    assert_eq!(reason, Some(crate::TurnEndReason::Completed));
+    assert_eq!(requests.lock().unwrap().len(), 2, "no unchanged replay");
+    let rejections = observation
+        .behavior_signals
+        .iter()
+        .filter(|signal| {
+            matches!(
+                signal,
+                observability::BehaviorSignal::ContextExceeded { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rejections.len(),
+        1,
+        "a failed display request must not disappear from the events"
+    );
+    assert!(matches!(
+        rejections[0],
+        observability::BehaviorSignal::ContextExceeded {
+            projected_tokens: None,
+            ..
+        }
+    ));
+    assert!(state.calibration.ratio(None) >= 1.5);
+}
+
+/// The tool-round cap remains authoritative even if its optional summary
+/// overflows. Preserve the observed tool result and report every rejection.
+#[tokio::test]
+async fn cap_summary_context_exceeded_keeps_round_cap_and_records_the_rejection() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |request: &Request| {
+            let mut requests = captured.lock().unwrap();
+            requests.push(body_json(request));
+            if requests.len() == 1 {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices":[{"finish_reason":"tool_calls","message":{
+                        "role":"assistant","content":null,"tool_calls":[{
+                            "id":"completed_call","type":"function","function":{
+                                "name":"get_context_remaining","arguments":"{}"
+                            }
+                        }]
+                    }}]
+                }))
+            } else {
+                ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                    "error":{"message":"Context size has been exceeded."}
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut observation = observability::SolveObservation::default();
+    let mut state = CompressState::new();
+    let mut reason = None;
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.kind = BackendKind::Openai;
+    context.max_tool_rounds = 1;
+    context.action_nudges = false;
+    context.solve_obs = Some(&mut observation);
+    context.compress_state = Some(&mut state);
+    context.end_reason = Some(&mut reason);
+    let (reply, _, _, _) = chat_complete(context, &mut NoMcp).await.unwrap();
+    assert!(reply.contains("tool-round limit (1"), "{reply}");
+    assert_eq!(reason, Some(crate::TurnEndReason::RoundCap));
+    let requests = requests.lock().unwrap();
+    let summaries = &requests[1..];
+    assert!(!summaries.is_empty());
+    assert!(summaries.len() <= 3, "at most two smaller summary attempts");
+    for summary in summaries {
+        assert!(
+            summary["tools"].is_null(),
+            "the tool cap cannot be bypassed"
+        );
+        let messages = summary["messages"].as_array().unwrap();
+        assert!(messages.iter().any(|message| {
+            message["role"] == "tool" && message["tool_call_id"] == "completed_call"
+        }));
+    }
+    assert!(
+        summaries.windows(2).all(|pair| {
+            pair[1]["messages"].to_string().len() < pair[0]["messages"].to_string().len()
+        }),
+        "a rejected summary must never be re-sent unchanged"
+    );
+    let rejections = observation
+        .behavior_signals
+        .iter()
+        .filter(|signal| {
+            matches!(
+                signal,
+                observability::BehaviorSignal::ContextExceeded { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rejections.len(),
+        summaries.len(),
+        "a rejected cap summary must not disappear into the fallback"
+    );
+    assert!(matches!(
+        rejections.last().unwrap(),
+        observability::BehaviorSignal::ContextExceeded {
+            projected_tokens: None,
+            ..
+        }
+    ));
+    assert!(state.calibration.ratio(None) >= 1.5);
+}

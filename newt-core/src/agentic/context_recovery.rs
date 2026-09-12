@@ -75,6 +75,38 @@ pub(super) fn record(
     Ok(())
 }
 
+/// Estimated request size accompanying a rejected optional completion.
+/// The original typed provider error remains its anyhow source.
+#[derive(Debug)]
+pub(super) struct OptionalRejection {
+    pub estimated_tokens: usize,
+}
+
+impl std::fmt::Display for OptionalRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "optional completion rejected (~{} input tokens)",
+            self.estimated_tokens
+        )
+    }
+}
+
+/// These phases already have an accepted answer or have exhausted their tool
+/// quota. Preserve that result without another generation, but retain what the
+/// rejected optional request taught the session. Smart mode skips these calls.
+pub(super) fn terminal_optional(
+    observations: &mut Option<&mut observability::SolveObservation>,
+    state: &mut super::CompressState,
+    applied_ratio: f32,
+    round: usize,
+    attempt: u32,
+    estimated_tokens: usize,
+) -> anyhow::Result<()> {
+    state.calibration.overflow(applied_ratio);
+    record(observations, None, round, attempt, estimated_tokens, None)
+}
+
 #[cfg(test)]
 #[path = "context_recovery_tests.rs"]
 mod tests;

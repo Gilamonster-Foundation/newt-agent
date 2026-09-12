@@ -4160,28 +4160,29 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         return Ok((text, false, accumulated_usage, hallucination_count));
     }
 
-    let (text, streamed, usage) = final_summary_ollama(
-        &client,
-        &chat_url,
-        model,
-        trimmed,
-        CapExit {
-            max_tool_rounds,
-            accumulated: accumulated_usage,
-            wasted_calls: repeat_calls.total_failures(),
-            progress,
-            observed: observed_paths.into_vec(),
-            request_budget: authoritative_request_budget(
-                send_budget,
-                send_budget_authoritative,
-                mid_loop_trim_tokens,
-            ),
-            calibration: cal,
-            estimation,
-            ollama_num_ctx: num_ctx,
-        },
-    )
-    .await?;
+    let cap = CapExit {
+        max_tool_rounds,
+        accumulated: accumulated_usage,
+        wasted_calls: repeat_calls.total_failures(),
+        progress,
+        observed: observed_paths.into_vec(),
+        request_budget: authoritative_request_budget(
+            send_budget,
+            send_budget_authoritative,
+            mid_loop_trim_tokens,
+        ),
+        calibration: cal,
+        estimation,
+        ollama_num_ctx: num_ctx,
+    };
+    let result = final_summary_ollama(&client, &chat_url, model, trimmed, &cap).await;
+    let (text, streamed, usage) = cap.recover_rejection(
+        result,
+        &mut solve_obs,
+        compress_state,
+        max_tool_rounds,
+        cw_retries + 1,
+    )?;
     let text = finalize_final_text(
         text,
         workspace,
@@ -5823,15 +5824,49 @@ impl CapExit {
         )
     }
 
+    fn recover_rejection(
+        &self,
+        result: anyhow::Result<(String, bool, Option<crate::TokenUsage>)>,
+        observations: &mut Option<&mut observability::SolveObservation>,
+        state: &mut CompressState,
+        round: usize,
+        attempt: u32,
+    ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
+        if let Err(error) = &result {
+            if let Some(rejection) = error.downcast_ref::<context_recovery::OptionalRejection>() {
+                context_recovery::terminal_optional(
+                    observations,
+                    state,
+                    self.calibration,
+                    round,
+                    attempt,
+                    rejection.estimated_tokens,
+                )?;
+                return Ok(self.fallback());
+            }
+        }
+        result
+    }
+
     async fn finish(
         &self,
         endpoint: &str,
         request: impl Fn() -> reqwest::RequestBuilder,
         http_error_prefix: &str,
+        estimated_tokens: usize,
         extract: impl FnOnce(serde_json::Value) -> (String, Option<crate::TokenUsage>),
     ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
         let retry = tui_retry_policy(endpoint);
         let result = dispatch_json(&retry, request, http_error_prefix, |_, _, _| {}, None).await;
+        let result = match result {
+            Err(error)
+                if crate::retry::classify(&error)
+                    == crate::retry::Retryability::ContextExceeded =>
+            {
+                return Err(error.context(context_recovery::OptionalRejection { estimated_tokens }));
+            }
+            other => other,
+        };
         if let Ok(json) = result {
             let (content, usage) = extract(json);
             let total = merge_round_usage(self.accumulated, usage);
@@ -5863,7 +5898,7 @@ async fn final_summary_ollama(
     chat_url: &str,
     model: &str,
     mut messages: Vec<serde_json::Value>,
-    cap: CapExit,
+    cap: &CapExit,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     if !cap.fits(&messages, model) {
@@ -5882,6 +5917,7 @@ async fn final_summary_ollama(
         chat_url,
         || client.post(chat_url).json(&body),
         "Ollama",
+        estimate_tokens(&messages, cap.estimation),
         |json| {
             // #385: strip inline reasoning; all-reasoning content takes the fallback.
             let (content, _reasoning) = crate::reasoning::split_reasoning(
@@ -5974,7 +6010,7 @@ async fn final_summary_openai(
     api_key: Option<&str>,
     mut messages: Vec<serde_json::Value>,
     generation_policy: generation_policy::GenerationPolicy,
-    cap: CapExit,
+    cap: &CapExit,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     let messages = openai_chat_wire_messages(&messages)?;
@@ -5998,6 +6034,7 @@ async fn final_summary_openai(
             req
         },
         "inference endpoint",
+        estimate_tokens(&messages, cap.estimation),
         |json| {
             // #385: strip inline <think>…</think> reasoning from the content.
             let (content, _reasoning) = crate::reasoning::split_reasoning(
@@ -7561,6 +7598,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // policy) and is likely to reproduce the same answer from the
             // same prefix.
             let stream_wire_messages = openai_chat_wire_messages(&messages)?;
+            let stream_estimate = estimate_request_tokens(
+                &stream_wire_messages,
+                tools_supported.then_some(&tools),
+                estimation,
+            );
             let mut stream_body = serde_json::json!({
                 "model": model,
                 "messages": stream_wire_messages,
@@ -7612,6 +7654,18 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 // return silence, or a truncation, because the second call
                 // failed. Its tokens were still spent, so they still merge.
                 StreamOutcome::UseProbe(stream_usage) => {
+                    accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
+                    (content, false)
+                }
+                StreamOutcome::ContextExceeded(stream_usage) => {
+                    context_recovery::terminal_optional(
+                        &mut solve_obs,
+                        compress_state,
+                        cal,
+                        round,
+                        cw_retries + 1,
+                        stream_estimate,
+                    )?;
                     accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
                     (content, false)
                 }
@@ -8027,30 +8081,38 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         return Ok((text, false, accumulated_usage, hallucination_count));
     }
 
-    let (text, streamed, usage) = final_summary_openai(
+    let cap = CapExit {
+        max_tool_rounds,
+        accumulated: accumulated_usage,
+        wasted_calls: repeat_calls.total_failures(),
+        progress,
+        observed: observed_paths.into_vec(),
+        request_budget: authoritative_request_budget(
+            send_budget,
+            send_budget_authoritative,
+            mid_loop_trim_tokens,
+        ),
+        calibration: cal,
+        estimation,
+        ollama_num_ctx: None,
+    };
+    let result = final_summary_openai(
         &client,
         &chat_url,
         model,
         api_key,
         trimmed,
         generation_policy,
-        CapExit {
-            max_tool_rounds,
-            accumulated: accumulated_usage,
-            wasted_calls: repeat_calls.total_failures(),
-            progress,
-            observed: observed_paths.into_vec(),
-            request_budget: authoritative_request_budget(
-                send_budget,
-                send_budget_authoritative,
-                mid_loop_trim_tokens,
-            ),
-            calibration: cal,
-            estimation,
-            ollama_num_ctx: None,
-        },
+        &cap,
     )
-    .await?;
+    .await;
+    let (text, streamed, usage) = cap.recover_rejection(
+        result,
+        &mut solve_obs,
+        compress_state,
+        max_tool_rounds,
+        cw_retries + 1,
+    )?;
     let text = finalize_final_text(
         text,
         workspace,
@@ -8364,7 +8426,7 @@ async fn final_summary_anthropic(
     api_key: Option<&str>,
     mut messages: Vec<serde_json::Value>,
     generation_policy: generation_policy::GenerationPolicy,
-    cap: CapExit,
+    cap: &CapExit,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     let (system, wire_messages) = anthropic_wire::anthropic_wire_messages(&messages)?;
@@ -8387,6 +8449,7 @@ async fn final_summary_anthropic(
         messages_url,
         || anthropic_headers(client.post(messages_url), api_key).json(&body),
         "inference endpoint",
+        estimate_value_tokens(&body, cap.estimation),
         |json| {
             // This wire separates thinking natively; text needs no split_reasoning.
             let reply = anthropic_wire::parse_messages_reply(&json);
@@ -10177,30 +10240,38 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         return Ok((text, false, accumulated_usage, hallucination_count));
     }
 
-    let (text, streamed, usage) = final_summary_anthropic(
+    let cap = CapExit {
+        max_tool_rounds,
+        accumulated: accumulated_usage,
+        wasted_calls: repeat_calls.total_failures(),
+        progress,
+        observed: observed_paths.into_vec(),
+        request_budget: authoritative_request_budget(
+            send_budget,
+            send_budget_authoritative,
+            mid_loop_trim_tokens,
+        ),
+        calibration: cal,
+        estimation,
+        ollama_num_ctx: None,
+    };
+    let result = final_summary_anthropic(
         &client,
         &messages_url,
         model,
         api_key,
         trimmed,
         generation_policy,
-        CapExit {
-            max_tool_rounds,
-            accumulated: accumulated_usage,
-            wasted_calls: repeat_calls.total_failures(),
-            progress,
-            observed: observed_paths.into_vec(),
-            request_budget: authoritative_request_budget(
-                send_budget,
-                send_budget_authoritative,
-                mid_loop_trim_tokens,
-            ),
-            calibration: cal,
-            estimation,
-            ollama_num_ctx: None,
-        },
+        &cap,
     )
-    .await?;
+    .await;
+    let (text, streamed, usage) = cap.recover_rejection(
+        result,
+        &mut solve_obs,
+        compress_state,
+        max_tool_rounds,
+        cw_retries + 1,
+    )?;
     let text = finalize_final_text(
         text,
         workspace,
@@ -11654,6 +11725,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // transient transport failures exactly like every round, so a 500 / timeout /
     // reset on the LAST request no longer discards the turn after all tool rounds
     // were spent.
+    let summary_estimate =
+        estimate_responses_request_tokens(instructions.as_deref(), &input, None, estimation);
     let json = match dispatch_responses_json(
         &client,
         &responses_url,
@@ -11667,6 +11740,16 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     {
         Ok(json) => json,
         Err(error) => {
+            if crate::retry::classify(&error) == crate::retry::Retryability::ContextExceeded {
+                context_recovery::terminal_optional(
+                    &mut solve_obs,
+                    compress_state,
+                    cal,
+                    max_tool_rounds,
+                    cw_retries + 1,
+                    summary_estimate,
+                )?;
+            }
             tracing::warn!(
                 error = %error,
                 "Responses cap-exit summary dispatch failed; returning captured progress"
@@ -12056,9 +12139,8 @@ fn decode_chunk(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
 }
 
 /// What the streaming re-issue produced, and so what the caller owes the
-/// operator. Three arms because the caller has three different jobs — an
-/// `Option` collapsed the last two, and the collapse is what let an operator's
-/// own interrupt be reported as a broken wire.
+/// operator. Keep an observed capacity rejection distinct from an ordinary
+/// display failure, and an operator interrupt distinct from a broken wire.
 #[derive(Debug)]
 enum StreamOutcome {
     /// Text reached the terminal: return it with `was_streamed = true` so the
@@ -12072,6 +12154,8 @@ enum StreamOutcome {
     /// usage the second call did report — those tokens were spent whether or
     /// not the answer arrived.
     UseProbe(Option<crate::TokenUsage>),
+    /// Preserve the accepted answer, but learn and record the rejected display.
+    ContextExceeded(Option<crate::TokenUsage>),
     /// The operator interrupted with nothing on screen. End the turn with an
     /// empty reply, the same contract as the loop's round-boundary interrupt
     /// checkpoint — an interrupt is not a wire failure to recover from.
@@ -12131,13 +12215,30 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     };
     let resp = match sent {
         Ok(r) if r.status().is_success() => r,
-        outcome => {
+        Ok(response) => {
+            let status = response.status();
+            let Some((bytes, _read_error)) =
+                cancellable(cancel, crate::retry::read_response_bytes(response)).await
+            else {
+                return StreamOutcome::Cancelled(None);
+            };
+            if cw_overflow::is_context_overflow(&String::from_utf8_lossy(&bytes)) {
+                return StreamOutcome::ContextExceeded(None);
+            }
             if debug {
-                let why = match outcome {
-                    Ok(r) => format!("stream request {}", r.status()),
-                    Err(e) => format!("stream request failed: {e}"),
-                };
-                print_debug(&format!("{why} — using probe content"), color);
+                print_debug(
+                    &format!("stream request {status} — using probe content"),
+                    color,
+                );
+            }
+            return StreamOutcome::UseProbe(None);
+        }
+        Err(error) => {
+            if debug {
+                print_debug(
+                    &format!("stream request failed: {error} — using probe content"),
+                    color,
+                );
             }
             return StreamOutcome::UseProbe(None);
         }

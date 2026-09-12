@@ -257,6 +257,9 @@ mod reasoning_overflow;
 #[path = "http_context_exceeded.rs"]
 mod context_exceeded;
 
+#[path = "http_context_exceeded_optional.rs"]
+mod optional_context_exceeded;
+
 #[cfg(test)]
 #[path = "http_mcp_routing.rs"]
 mod mcp_routing;

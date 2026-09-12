@@ -816,12 +816,13 @@ async fn final_summary_provider_contracts() {
             let url = server.uri();
             let policy = generation_policy::GenerationPolicy::default();
             let result = match provider {
-                "ollama" => final_summary_ollama(&client, &url, "test", Vec::new(), cap).await,
+                "ollama" => final_summary_ollama(&client, &url, "test", Vec::new(), &cap).await,
                 "openai" => {
-                    final_summary_openai(&client, &url, "test", None, Vec::new(), policy, cap).await
+                    final_summary_openai(&client, &url, "test", None, Vec::new(), policy, &cap)
+                        .await
                 }
                 _ => {
-                    final_summary_anthropic(&client, &url, "test", None, Vec::new(), policy, cap)
+                    final_summary_anthropic(&client, &url, "test", None, Vec::new(), policy, &cap)
                         .await
                 }
             };

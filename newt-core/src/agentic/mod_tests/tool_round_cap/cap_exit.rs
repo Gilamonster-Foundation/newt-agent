@@ -408,7 +408,7 @@ async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
         &chat_url,
         "test-model",
         Vec::new(),
-        CapExit {
+        &CapExit {
             max_tool_rounds: 25,
             accumulated: None,
             wasted_calls: 0,
@@ -475,7 +475,7 @@ async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
         None,
         Vec::new(),
         generation_policy::GenerationPolicy::default(),
-        CapExit {
+        &CapExit {
             max_tool_rounds: 40,
             accumulated: Some(crate::TokenUsage {
                 input_tokens: 100,
@@ -552,7 +552,7 @@ async fn ollama_cap_exit_refuses_giant_fresh_result_before_dispatch() {
         &format!("{}/api/chat", server.uri()),
         "tiny-model",
         messages,
-        CapExit {
+        &CapExit {
             max_tool_rounds: 1,
             accumulated: None,
             wasted_calls: 0,
@@ -610,7 +610,7 @@ async fn openai_cap_exit_refuses_giant_fresh_result_before_dispatch() {
         None,
         messages,
         generation_policy::GenerationPolicy::default(),
-        CapExit {
+        &CapExit {
             max_tool_rounds: 1,
             accumulated: None,
             wasted_calls: 0,

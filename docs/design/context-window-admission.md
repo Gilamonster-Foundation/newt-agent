@@ -35,11 +35,18 @@ and its exact recorded request. It does not fabricate a tool result or model
 reply. Failed publication prevents another dispatch. Partial server error bytes
 remain observations when a subsequent disconnect interrupts the response body.
 
+After the loop accepts an answer or reaches its tool-round limit, an optional
+display or summary request can still be rejected. That rejection is recorded
+with `projected_tokens: null` and updates session calibration. The accepted
+answer or round-cap handoff remains the turn result; the optional request does
+not reopen the tool loop. Smart mode does not issue these extra requests.
+
 Regression evidence lives in the
 [provider-loop tests](../../newt-core/src/agentic/mod_tests/http_context_exceeded.rs),
 [calibration tests](../../newt-core/src/agentic/compress_tests/calibration.rs),
 [classification tests](../../newt-core/tests/context_overflow_classification.rs),
-and [durable recovery tests](../../newt-core/src/agentic/smart_harness_tests/context_exceeded.rs).
+[durable recovery tests](../../newt-core/src/agentic/smart_harness_tests/context_exceeded.rs),
+and [optional-request adapter tests](../../newt-core/src/agentic/mod_tests/http_context_exceeded_optional.rs).
 The [projection boundary tests](../../newt-core/src/agentic/context_recovery_tests.rs)
 cover protected-history limits and token/byte rounding in both shared and
 Responses smart compaction.
