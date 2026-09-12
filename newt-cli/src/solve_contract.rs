@@ -564,6 +564,8 @@ mod tests {
     /// pinned exactly rather than merely non-empty. A silent edit — adding a
     /// value to make a failing case pass — is the failure mode the file exists
     /// to prevent, and changing this list is how a reviewer is made to look.
+    /// #2268 authorizes `context_exceeded` explicitly; the file documents the
+    /// still-required matching consumer update rather than claiming it ran.
     #[test]
     fn the_checked_in_permitted_set_matches_contract_version_one() {
         assert_eq!(
@@ -573,12 +575,13 @@ mod tests {
                 "model_error",
                 "transport_error",
                 "timeout",
-                "harness_error"
+                "harness_error",
+                "context_exceeded"
             ],
-            "the checked-in copy of gilamonster-bench's `Outcome` changed. That \
-             is a deliberate act tracking an upstream contract change, not a \
-             way to make a test pass — re-read `gilamonster-bench/src/\
-             contract.rs` and confirm `contract_version` before editing this."
+            "the declared gilamonster-bench `Outcome` set changed. That requires \
+             an explicit contract decision and a coordinated consumer update, \
+             not a way to make a test pass — re-read gilamonster-bench/src/\
+             contract.rs and confirm contract_version before editing this."
         );
     }
 
