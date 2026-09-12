@@ -683,6 +683,8 @@ pub fn render_help(topic: Option<&str>, color: bool, verbose: bool) -> String {
 
 pub(crate) fn help_lines() -> &'static [&'static str] {
     &[
+        "  /models                  - list the models the active backend serves, marking the active one",
+        "  /models capabilities     - the same list as a matrix: tool use, thinking, context window, tuning",
         "  /model <name>            - switch model on the active backend (sticks across runs)",
         "  /backends [name]         - backend panel on a rich TTY (choose · edit · add · remove); text: list, or switch by name",
         "  /backend                 - alias of /backends",
