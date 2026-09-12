@@ -162,7 +162,45 @@ false-completion rate we already measure on terminal-bench. That convergence is
 useful — the instrument that tests whether the harness is honest is the one
 already built.
 
-## 8. Open questions
+## 8. Naming
+
+"Illusion" states the intention and is kept above for that reason. It is a poor
+name for the *mechanism*, because it invites building the one thing §2 forbids.
+Candidates, ranked by whether the borrowed structure actually does work:
+
+**Atlas and chart (recommended).** A manifold is covered by charts, each locally
+simple, glued by transition maps. You never hold the manifold; you hold a chart
+and can move to an adjacent one. That is bounded residency and unbounded reach,
+exactly. Crucially a chart has never claimed to be the manifold, so the word
+carries no deception — which is the whole defect in "illusion". §4's relative
+genesis restates cleanly: *a new chart whose transition map to the previous
+atlas is known, over a region not locally resolvable.*
+
+**Sheaf (the formal version, if we go deeper).** A sheaf assigns data to open
+sets with restriction maps, and local sections that agree on overlaps glue to a
+global section. The gluing condition is the formal statement of §4.2's problem:
+when are two candidate histories consistent where they overlap? Cohomology
+measures the **obstruction** to gluing — i.e. precisely where local views cannot
+be reconciled. That is real work, not decoration, and it is the one place the
+mathematics would earn its keep.
+
+**Protocol complex / combinatorial topology (the distributed-systems bridge).**
+Herlihy–Kozlov–Rajsbaum model the set of global states consistent with a given
+set of local views as a simplicial complex, and derive impossibility results
+about when local views *cannot* be glued into agreement. That is our branching
+question with the names already assigned.
+
+**Projection — avoid.** Already taken in this codebase (`agent-harness` has
+context projection and ordered request projection) and it means the narrower
+act of selecting what enters the window. The mathematical sense is also wrong:
+a projection is idempotent and *loses* the complement permanently, which is the
+destructive half we are trying to escape.
+
+Per the convention in [`context-scheduler.md`](context-scheduler.md), prose
+here stays with dry role names; a topological handle belongs in conversation
+and in code comments, not as a replacement for plain description.
+
+## 9. Open questions
 
 1. What exactly is the resident-set eviction policy, and is it the operator's
    knob, the manager's, or derived from the fault record?
