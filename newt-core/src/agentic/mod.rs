@@ -4174,6 +4174,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         calibration: cal,
         estimation,
         ollama_num_ctx: num_ctx,
+        prompt_measurement: Default::default(),
     };
     let result = final_summary_ollama(&client, &chat_url, model, trimmed, &cap).await;
     let (text, streamed, usage) = cap.recover_rejection(
@@ -5789,6 +5790,9 @@ struct CapExit {
     /// Ollama must repeat the configured context window on every request,
     /// including the tools-disabled cap exit. Ignored by OpenAI chat.
     ollama_num_ctx: Option<u32>,
+    /// Learning evidence from fresh counts of this immutable summary request.
+    /// Admission still probes anew on every attempt; this is never a count cache.
+    prompt_measurement: std::sync::Mutex<Option<context_recovery::PromptMeasurement>>,
 }
 
 impl CapExit {
@@ -5824,6 +5828,25 @@ impl CapExit {
         )
     }
 
+    fn record_measurement(
+        &self,
+        measurement: context_recovery::PromptMeasurement,
+    ) -> anyhow::Result<()> {
+        let mut observed = self
+            .prompt_measurement
+            .lock()
+            .map_err(|_| anyhow::anyhow!("optional prompt measurement lock poisoned"))?;
+        // The final request body is immutable across transport retries. Retain
+        // its strongest count for learning, independent of each fresh admission.
+        if observed
+            .as_ref()
+            .is_none_or(|previous| measurement.tokens > previous.tokens)
+        {
+            *observed = Some(measurement);
+        }
+        Ok(())
+    }
+
     fn recover_rejection(
         &self,
         result: anyhow::Result<(String, bool, Option<crate::TokenUsage>)>,
@@ -5832,6 +5855,13 @@ impl CapExit {
         round: usize,
         attempt: u32,
     ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
+        if let Some(measurement) = *self
+            .prompt_measurement
+            .lock()
+            .map_err(|_| anyhow::anyhow!("optional prompt measurement lock poisoned"))?
+        {
+            measurement.learn(state);
+        }
         if let Err(error) = &result {
             if let Some(rejection) = error.downcast_ref::<context_recovery::OptionalRejection>() {
                 context_recovery::terminal_optional(
@@ -5848,14 +5878,17 @@ impl CapExit {
         result
     }
 
-    async fn finish(
+    async fn finish<Fut>(
         &self,
         endpoint: &str,
-        request: impl Fn() -> reqwest::RequestBuilder,
+        request: impl Fn() -> Fut,
         http_error_prefix: &str,
         estimated_tokens: usize,
         extract: impl FnOnce(serde_json::Value) -> (String, Option<crate::TokenUsage>),
-    ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
+    ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)>
+    where
+        Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
+    {
         let retry = tui_retry_policy(endpoint);
         let result = dispatch_json(&retry, request, http_error_prefix, |_, _, _| {}, None).await;
         let result = match result {
@@ -5915,7 +5948,7 @@ async fn final_summary_ollama(
     }
     cap.finish(
         chat_url,
-        || client.post(chat_url).json(&body),
+        || async { Ok(client.post(chat_url).json(&body)) },
         "Ollama",
         estimate_tokens(&messages, cap.estimation),
         |json| {
@@ -5999,6 +6032,50 @@ fn prepare_openai_assistant_replay(
     assistant
 }
 
+/// Count the assembled Chat Completions body only when admission has a bound.
+/// Every caller invokes this anew immediately before its generation attempt.
+async fn count_openai_request(
+    client: &reqwest::Client,
+    chat_url: &str,
+    api_key: Option<&str>,
+    body: &serde_json::Value,
+    budget: Option<usize>,
+) -> anyhow::Result<Option<crate::backend_probe::TokenCount>> {
+    if budget.is_none() {
+        return Ok(None);
+    }
+    let endpoint = chat_url
+        .strip_suffix("/v1/chat/completions")
+        .ok_or_else(|| anyhow::anyhow!("invalid Chat Completions endpoint for token admission"))?;
+    let model = body["model"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("token admission requires the assembled request model"))?;
+    crate::backend_probe::count_chat_tokens(client, endpoint, model, api_key, body).await
+}
+
+fn enforce_counted_budget(
+    count: Option<&crate::backend_probe::TokenCount>,
+    budget: Option<usize>,
+    estimated_tokens: usize,
+) -> anyhow::Result<()> {
+    if let (Some(count), Some(budget)) = (count, budget) {
+        if count.tokens > budget {
+            let error = observability::DispatchError::context_exceeded(format!(
+                "pre-dispatch: Context size has been exceeded: measured {} input tokens \
+                 exceed the {budget}-token input budget",
+                count.tokens,
+            ));
+            return Err(
+                anyhow::Error::new(error).context(context_recovery::PromptMeasurement {
+                    tokens: count.tokens,
+                    estimated_tokens,
+                }),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Final tools-disabled completion for the OpenAI (`/v1/chat/completions`) path.
 ///
 /// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
@@ -6026,12 +6103,22 @@ async fn final_summary_openai(
     generation_policy.apply_to_chat_completions_body(&mut body);
     cap.finish(
         chat_url,
-        || {
+        || async {
+            let count =
+                count_openai_request(client, chat_url, api_key, &body, cap.request_budget).await?;
+            let estimated_tokens = estimate_tokens(&messages, cap.estimation);
+            if let Some(count) = &count {
+                cap.record_measurement(context_recovery::PromptMeasurement {
+                    tokens: count.tokens,
+                    estimated_tokens,
+                })?;
+            }
+            enforce_counted_budget(count.as_ref(), cap.request_budget, estimated_tokens)?;
             let mut req = client.post(chat_url).json(&body);
             if let Some(key) = api_key {
                 req = req.bearer_auth(key);
             }
-            req
+            Ok(req)
         },
         "inference endpoint",
         estimate_tokens(&messages, cap.estimation),
@@ -6733,6 +6820,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // but the operator-declared local window still bounds Newt's pre-send
             // budget. These endpoints reject oversize requests rather than silently
             // truncating them, so no wire field is needed to enforce the local cap.
+            let request_budget = authoritative_request_budget(
+                send_budget,
+                send_budget_authoritative,
+                mid_loop_trim_tokens,
+            );
+            let measured_prompt_tokens = std::sync::atomic::AtomicUsize::new(0);
+            let admission_commit_failure = std::sync::OnceLock::new();
             let max_attempts = retry.max_retries.saturating_add(1);
             let attempts_started = std::cell::Cell::new(0u32);
             let spinner_label =
@@ -6765,6 +6859,33 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         if let Some(key) = api_key {
                             req = req.bearer_auth(key);
                         }
+                        let counted = count_openai_request(
+                            &client,
+                            &chat_url,
+                            api_key,
+                            &body,
+                            request_budget,
+                        )
+                        .await;
+                        if let (Some(harness), Some(budget)) = (smart_harness, request_budget) {
+                            let committed = match counted.as_ref() {
+                                Ok(Some(count)) => harness.record_token_count(Ok(count), budget),
+                                Err(error) => harness.record_token_count(Err(error), budget),
+                                Ok(None) => Ok(()),
+                            };
+                            if let Err(error) = committed {
+                                admission_commit_failure.get_or_init(|| error);
+                                // The preserved diagnostic may itself contain a transient
+                                // or context error. Storage failure must bypass both retries.
+                                anyhow::bail!("token-count evidence could not be committed");
+                            }
+                        }
+                        let counted = counted?;
+                        if let Some(count) = &counted {
+                            measured_prompt_tokens
+                                .fetch_max(count.tokens, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        enforce_counted_budget(counted.as_ref(), request_budget, round_est_raw)?;
                         // W0 (#1511): classify while the error is TYPED — the
                         // DispatchError keeps the historical message text and carries
                         // the structural class to the driver boundary.
@@ -6793,6 +6914,17 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 .as_ref()
                 .map_or(std::time::Duration::ZERO, crate::tty::Spinner::elapsed);
             drop(spinner);
+            if let Some(error) = admission_commit_failure.into_inner() {
+                return Err(error);
+            }
+            let measured = measured_prompt_tokens.load(std::sync::atomic::Ordering::Relaxed);
+            if measured > 0 {
+                compress_state
+                    .calibration
+                    .observe_count(measured, round_est_raw);
+                cal = compress_state.calibration.ratio(estimate_ratio);
+                tool_tokens_real = calibrate_up(tool_tokens, cal);
+            }
             match dispatch {
                 Ok(j) => break (j, round_est_raw),
                 Err(e) => {
@@ -6824,7 +6956,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     // headless drivers; this fallback is only for numberless errors.
                     // It remains capped by the operator-declared local window even
                     // though no `num_ctx` field rides on this wire.
-                    let overflow = cw_overflow::is_context_overflow(&e.to_string());
+                    let overflow =
+                        crate::retry::classify(&e) == crate::retry::Retryability::ContextExceeded;
                     if overflow {
                         cal = compress_state.calibration.overflow(cal);
                         tool_tokens_real = calibrate_up(tool_tokens, cal);
@@ -6840,6 +6973,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     effective_input_ceiling,
                                 )
                             })
+                            // Exact admission rejected this candidate, not the
+                            // configured server window. Keep its known bound.
+                            .or_else(|| request_budget.filter(|budget| measured > *budget))
                             .or_else(|| {
                                 cw_overflow::core_recover_overflow(
                                     &e.to_string(),
@@ -7624,16 +7760,53 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if let Some(key) = api_key {
                 stream_req = stream_req.bearer_auth(key);
             }
-            let (out, was_streamed) = match openai_stream_final_answer(
-                stream_req,
-                io::stdout(),
-                color,
-                markdown,
-                debug,
-                cancel,
-            )
-            .await
-            {
+            let stream_budget = authoritative_request_budget(
+                send_budget,
+                send_budget_authoritative,
+                mid_loop_trim_tokens,
+            );
+            let admitted = cancellable(cancel, async {
+                let count =
+                    count_openai_request(&client, &chat_url, api_key, &stream_body, stream_budget)
+                        .await?;
+                enforce_counted_budget(count.as_ref(), stream_budget, stream_estimate)?;
+                Ok::<_, anyhow::Error>(count.map(|count| context_recovery::PromptMeasurement {
+                    tokens: count.tokens,
+                    estimated_tokens: stream_estimate,
+                }))
+            })
+            .await;
+            let streamed = match admitted {
+                Some(Ok(measurement)) => {
+                    if let Some(measurement) = measurement {
+                        measurement.learn(compress_state);
+                    }
+                    openai_stream_final_answer(
+                        stream_req,
+                        io::stdout(),
+                        color,
+                        markdown,
+                        debug,
+                        cancel,
+                    )
+                    .await
+                }
+                Some(Err(error)) => {
+                    if let Some(measurement) =
+                        error.downcast_ref::<context_recovery::PromptMeasurement>()
+                    {
+                        measurement.learn(compress_state);
+                    }
+                    if crate::retry::classify(&error) == crate::retry::Retryability::ContextExceeded
+                    {
+                        StreamOutcome::ContextExceeded(None)
+                    } else {
+                        StreamOutcome::UseProbe(None)
+                    }
+                }
+                None => StreamOutcome::Cancelled(None),
+            };
+            let (out, was_streamed) = match streamed {
                 // A second call, so a second usage record. Merged, not
                 // replaced — and when the server sent none, `merge_round_usage`
                 // keeps what the probe already reported rather than zeroing it.
@@ -8095,6 +8268,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         calibration: cal,
         estimation,
         ollama_num_ctx: None,
+        prompt_measurement: Default::default(),
     };
     let result = final_summary_openai(
         &client,
@@ -8441,7 +8615,7 @@ async fn final_summary_anthropic(
     );
     cap.finish(
         messages_url,
-        || anthropic_headers(client.post(messages_url), api_key).json(&body),
+        || async { Ok(anthropic_headers(client.post(messages_url), api_key).json(&body)) },
         "inference endpoint",
         estimate_value_tokens(&body, cap.estimation),
         |json| {
@@ -10248,6 +10422,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         calibration: cal,
         estimation,
         ollama_num_ctx: None,
+        prompt_measurement: Default::default(),
     };
     let result = final_summary_anthropic(
         &client,
@@ -10440,7 +10615,7 @@ async fn dispatch_responses_json(
         .transpose()?;
     let result = dispatch_json(
         retry,
-        || {
+        || async {
             let mut req = match &body_bytes {
                 Some(bytes) => client
                     .post(url)
@@ -10451,7 +10626,7 @@ async fn dispatch_responses_json(
             if let Some(key) = api_key {
                 req = req.bearer_auth(key);
             }
-            req
+            Ok(req)
         },
         "inference endpoint",
         |attempt, delay, error| {
@@ -10465,18 +10640,21 @@ async fn dispatch_responses_json(
 
 /// Shared transport from the Responses dispatcher; build a fresh request per attempt.
 /// Keep the status prefix exact: retry classification reads the resulting message.
-async fn dispatch_json(
+async fn dispatch_json<Fut>(
     retry: &RetryPolicy,
-    request: impl Fn() -> reqwest::RequestBuilder,
+    request: impl Fn() -> Fut,
     http_error_prefix: &str,
     on_retry: impl FnMut(u32, std::time::Duration, &anyhow::Error),
     smart_harness: Option<&smart_harness::SmartHarness>,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<serde_json::Value>
+where
+    Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
+{
     with_backoff_notify_error(
         retry,
         || async {
             // Typed classification at the source (W0 #1511).
-            let resp = request().send().await.map_err(|e| {
+            let resp = request().await?.send().await.map_err(|e| {
                 anyhow::Error::new(observability::DispatchError::from_reqwest(
                     "request failed",
                     e,

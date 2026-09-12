@@ -20,7 +20,12 @@ impl PromptCalibration {
     /// samples leave the prior untouched; smaller samples cannot erase a known
     /// under-count (some backends report only uncached prompt suffixes).
     pub(crate) fn observe(&mut self, prompt_tokens: Option<u32>, raw_estimate: usize) {
-        if let Some(prompt_tokens) = prompt_tokens.filter(|n| *n > 0 && raw_estimate > 0) {
+        self.observe_count(prompt_tokens.unwrap_or(0) as usize, raw_estimate);
+    }
+
+    /// Tokenizer endpoints may return a count wider than the usage wire's u32.
+    pub(crate) fn observe_count(&mut self, prompt_tokens: usize, raw_estimate: usize) {
+        if prompt_tokens > 0 && raw_estimate > 0 {
             self.has_usage = true;
             self.learned_ratio = Some(
                 self.ratio(None)

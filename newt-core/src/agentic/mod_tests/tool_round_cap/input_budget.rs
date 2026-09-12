@@ -459,6 +459,7 @@ async fn openai_chat_giant_prompt_read_result_refuses_before_second_dispatch() {
         .received_requests()
         .await
         .expect("wiremock request journal");
+    let requests = super::chat_recovery::openai_generation_requests(requests);
     assert_eq!(requests.len(), 1, "no over-budget second dispatch");
 }
 

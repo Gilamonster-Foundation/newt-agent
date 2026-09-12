@@ -226,6 +226,14 @@ impl DispatchError {
         }
     }
 
+    /// Refuse a measured over-budget candidate before generation dispatch.
+    pub fn context_exceeded(message: impl Into<String>) -> Self {
+        Self {
+            class: ErrorClass::ContextExceeded,
+            msg: message.into(),
+        }
+    }
+
     /// Wrap a non-success HTTP status: recognized context rejection is
     /// `context_exceeded`; other backend rejections are `model_error`. `msg` is
     /// the caller's fully-formatted historical string (`"Ollama {status}:

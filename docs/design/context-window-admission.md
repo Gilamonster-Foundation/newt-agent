@@ -56,3 +56,79 @@ Responses smart compaction.
 
 Calibration is a conservative heuristic, not exact tokenization. Per-request
 admission cannot guarantee that other clients leave room in a shared KV pool.
+
+## Server token counting
+
+For a configured context bound, each OpenAI-compatible generation request is
+probed for a server count after its messages, tools, model, and template options
+are assembled. A measured primary request that exceeds the input allowance
+enters the bounded context-recovery path before generation is dispatched. The
+output allowance remains reserved separately. Optional display and summary
+requests retain the terminal-rejection behavior described above.
+
+Measured counts update the conservative session calibration against the
+original estimate of that same request, including accepted and refused optional
+requests. Admission still probes afresh on each attempt; a prior measurement
+does not authorize another request. Smart mode retains the exact counter
+response and counting method as request-linked evidence; tokenizer responses
+are not model replies.
+
+Exact counting is capability-based:
+
+| Server capability | Measurement | Unsupported behavior |
+| --- | --- | --- |
+| llama.cpp `/v1/chat/completions/input_tokens` | Submit the complete chat request and use its positive `input_tokens`. | Try the remaining capabilities when the endpoint is absent. |
+| vLLM `/v1/chat/completions/render` | Submit the complete chat request and count its rendered `token_ids`. | Nontext inputs retain the calibrated estimate. |
+| Older llama.cpp `/apply-template` and `/tokenize` | Require fresh model metadata proving completion-only preprocessing, render the complete chat request, then tokenize that prompt with `add_special: true` and `parse_special: true`. | Missing, ambiguous, multimodal, or unknown capability metadata retains the calibrated estimate. |
+| Legacy vLLM chat `/tokenize` without the full renderer | Retain the calibrated estimate. | This endpoint's chat preprocessing is not guaranteed to match generation; its count is not presented as an exact bound. |
+
+Capability discovery and counting repeat for every assembled candidate,
+including a candidate rebuilt after context recovery. Counts and capabilities
+are not cached across turns. All probes carry the configured bearer credential.
+This can require multiple read-only round trips: one for direct llama counting,
+two for the vLLM renderer, and six for the guarded older llama path. Endpoint
+absence (HTTP 404, 405, or 501) permits fallback; other HTTP failures and malformed
+measurements stop dispatch instead of silently weakening enforcement.
+
+These measurements describe the server-rendered input at probe time. They do
+not reserve shared KV capacity or make server model/template replacement
+between counting and generation atomic. Servers without a supported
+exact-counting capability use the session's usage-anchored heuristic and
+bounded shrink/recovery behavior. Multimodal and embedding-position accounting
+is outside this counter's supported exact subset.
+
+The llama paths share the
+[generation renderer and tokenizer](https://github.com/ggml-org/llama.cpp/blob/82d6bb284d1ff1c6ef37f29a4c3b63d1a8b11806/tools/server/server-context.cpp#L4257).
+The legacy capability check follows its
+[model metadata](https://github.com/ggml-org/llama.cpp/blob/82d6bb284d1ff1c6ef37f29a4c3b63d1a8b11806/tools/server/server-context.cpp#L4566).
+vLLM's
+[full chat renderer](https://github.com/vllm-project/vllm/blob/46d2b23ac5047a813ebb082122166e4ae09b5f39/vllm/entrypoints/scale_out/render/serving.py#L78)
+preserves generation preprocessing; its
+[legacy tokenizer](https://github.com/vllm-project/vllm/blob/46d2b23ac5047a813ebb082122166e4ae09b5f39/vllm/entrypoints/serve/tokenize/serving.py)
+does not provide that guarantee.
+
+The [counter protocol tests](../../newt-core/src/backend_probe_tests/token_count.rs)
+cover capability selection, authenticated probes, malformed counts, and error
+classification. The
+[provider admission tests](../../newt-core/src/agentic/mod_tests/http_token_count.rs)
+cover re-projection, fresh counts before dispatch, protected history, and
+calibration from optional requests.
+
+### Durable count records
+
+Smart-harness journal schema remains 2. `RequestIntervention` is an additive
+journal variant; existing request, projection, and event encodings are
+unchanged. New readers can restore existing schema-2 journals. The existing
+refusal of writable schema-1 restoration remains unchanged.
+
+Older readers strictly deserialize the closed `JournalEntry` enum and reject a
+journal containing `request_intervention`; upgrade the reader before resuming
+such a journal. An unknown-variant decoding error is a reader compatibility
+limitation and does not by itself establish that stored bytes were corrupted.
+No journal entries are silently skipped or downgraded.
+
+The [smart count tests](../../newt-core/src/agentic/smart_harness_tests/token_count.rs)
+cover committed evidence, recovery admission, and persistence failure. The
+[reusable request-intervention tests](../../agent-harness/tests/request_intervention.rs)
+cover request ownership, fresh restoration, and binding counts to the complete
+request template.
