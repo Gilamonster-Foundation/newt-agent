@@ -813,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn smart_harness_configuration_is_declared_without_changing_the_outcome_vocabulary() {
+    fn smart_harness_configuration_is_declared_with_a_permitted_v1_outcome() {
         let manifest = serde_json::json!({"head":"retained-head", "invocation_mode":"fresh", "configuration":{"auxiliary":{"placement":"cpu","max_calls":4}}});
         let mut inputs = inputs();
         inputs.smart_harness = Some(&manifest);

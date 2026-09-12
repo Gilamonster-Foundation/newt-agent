@@ -14,9 +14,12 @@ of silent prompt truncation is not a calibration sample.
 
 `Context size has been exceeded` and the supported numbered context errors
 classify as `ContextExceeded`. Ordinary transport backoff never resends those
-requests. Recovery uses the strongest observed correction, or increases the
-applied correction by at least 1.5 when no usage sample exists, then runs the
-existing compression pipeline with a smaller target.
+requests. Recovery uses the strongest observed correction, or multiplies the
+applied correction by 1.5 when no usage sample exists, up to the existing 3.0
+heuristic ceiling. Only overflow guesses are capped: measured ratios above 3.0
+remain authoritative. Repeated capacity rejections without token evidence must
+not compound the guess until even a later small prompt cannot be dispatched.
+Recovery still runs the existing compression pipeline with a smaller target.
 There are at most two smaller replacement requests per user turn. Each must
 reduce the request estimate; the exact active prompt and newest tool result
 remain protected. Failure to produce a smaller fitting projection ends recovery.

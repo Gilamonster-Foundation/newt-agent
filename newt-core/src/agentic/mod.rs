@@ -8255,17 +8255,11 @@ async fn anthropic_dispatch_round(
                         let status = resp.status();
                         let (bytes, read_error) = crate::retry::read_response_bytes(resp).await;
                         let text = String::from_utf8_lossy(&bytes);
-                        if !cw_overflow::is_context_overflow(&text) {
-                            if let Some(error) = read_error {
-                                return Err(observability::DispatchError::from_reqwest(
-                                    "stream request failed",
-                                    error,
-                                )
-                                .into());
-                            }
-                        }
+                        let read_diagnostic = read_error
+                            .map(|error| format!("; response body read failed: {error}"))
+                            .unwrap_or_default();
                         return Err(observability::DispatchError::http_status(format!(
-                            "inference endpoint {status}: {text}"
+                            "inference endpoint {status}: {text}{read_diagnostic}"
                         ))
                         .into());
                     }

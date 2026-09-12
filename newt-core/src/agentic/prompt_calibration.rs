@@ -30,9 +30,10 @@ impl PromptCalibration {
     }
 
     /// Prefer observed usage over guessing another multiplier. Without usable
-    /// usage, infer at least a 1.5 under-count and retain that correction. The
-    /// caller independently tightens the projection budget on every overflow,
-    /// caps shrink attempts at two, and refuses an unchanged request.
+    /// usage, multiply the guess by 1.5 up to sanitize_estimate_ratio's 3.0
+    /// heuristic ceiling. Measured ratios above that ceiling remain usable.
+    /// The caller independently tightens the projection budget on every
+    /// overflow, caps shrink attempts at two, and refuses an unchanged request.
     pub(crate) fn overflow(&mut self, applied_ratio: f32) -> f32 {
         let applied = if applied_ratio.is_finite() {
             applied_ratio.max(1.0)
@@ -43,7 +44,7 @@ impl PromptCalibration {
         let ratio = if self.has_usage {
             current
         } else {
-            (current * 1.5).min(f32::MAX)
+            (current * 1.5).min(3.0)
         };
         self.learned_ratio = Some(ratio);
         ratio

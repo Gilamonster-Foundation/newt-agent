@@ -69,6 +69,55 @@ fn calibration_uses_measured_usage_before_guessing_an_overflow_ratio() {
     assert_eq!(state.calibration.ratio(None), 1.5);
 }
 
+#[test]
+fn repeated_usage_free_overflows_cannot_exceed_the_heuristic_ceiling() {
+    let mut state = CompressState::new();
+    // Six turns, each with an initial rejection and two failed shrinks.
+    for _ in 0..18 {
+        state.calibration.overflow(state.calibration.ratio(None));
+    }
+    let ratio = state.calibration.ratio(None);
+    assert!(
+        ratio <= 3.0,
+        "usage-free overflow guesses must stay at or below 3.0, got {ratio}"
+    );
+    assert_eq!(
+        ratio, 3.0,
+        "repeated rejection must still tighten the prior"
+    );
+    assert_eq!(calibrate_down(9_000, ratio), 3_000);
+}
+
+#[test]
+fn overflow_keeps_authoritative_measurements_above_the_guess_ceiling() {
+    let mut state = CompressState::new();
+    state.calibration.observe(Some(30_000), 4_000);
+    for _ in 0..18 {
+        assert_eq!(state.calibration.overflow(7.5), 7.5);
+    }
+    assert_eq!(calibrate_down(30_000, state.calibration.ratio(None)), 4_000);
+}
+
+#[test]
+fn discarded_cache_hit_usage_retains_the_observed_sample_policy_on_overflow() {
+    for inferred in [false, true] {
+        let mut state = CompressState::new();
+        if inferred {
+            state.calibration.overflow(1.0);
+            state.calibration.overflow(1.5);
+        }
+        let retained = state.calibration.ratio(None);
+        // A reported suffix count is an observation, but cannot loosen the
+        // retained prior. It still selects usage over an invented multiplier.
+        for tokens in [1, 100, 500] {
+            state.calibration.observe(Some(tokens), 4_000);
+        }
+        for _ in 0..18 {
+            assert_eq!(state.calibration.overflow(retained), retained);
+        }
+    }
+}
+
 #[tokio::test]
 async fn calibration_survives_compaction_anchor_invalidation_and_turn_reuse() {
     let messages = tool_heavy("preserve the operator task", 12, 2_000);

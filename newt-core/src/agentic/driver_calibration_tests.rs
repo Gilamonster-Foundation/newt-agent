@@ -156,3 +156,73 @@ async fn consecutive_driver_turns_without_usage_preserve_the_cold_budget() {
         .skip(1)
         .eq(requests[0]["messages"].as_array().unwrap().iter().skip(1)));
 }
+
+/// Grounds bounded overflow guesses in the real headless dispatch path: a
+/// session that received no usable usage must still admit a later small prompt.
+#[tokio::test]
+async fn inferred_overflows_cannot_permanently_refuse_the_next_small_driver_prompt() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured = requests.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |request: &Request| {
+            captured
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&request.body).unwrap());
+            // A complete JSON response is also valid when the primary requests
+            // SSE. No stream flag shortcut may hide a missing primary dispatch.
+            ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"finish_reason":"stop","message":{
+                    "role":"assistant","content":"Hello."
+                }}]
+            }))
+        })
+        .mount(&server)
+        .await;
+    let mut config = TurnDriverConfig::new(
+        server.uri(),
+        "calibration-fixture",
+        BackendKind::Openai,
+        "driver-calibration-test-no-workspace",
+    );
+    config.num_ctx = Some(65_536);
+    config.max_tool_rounds = 2;
+    config.workflow_grace_rounds = 0;
+    config.mid_loop_trim_threshold = usize::MAX;
+    let task = "Hello";
+    let driver = TurnDriver::with_transcript(config, vec![MemMessage::user(task)]);
+    {
+        let mut state = driver.runtime.compress_state.lock().await;
+        // Six turns with an initial rejection and two failed shrinks each.
+        // Reuse the actual session state; no measured sample corrects it here.
+        for _ in 0..18 {
+            let applied = state.calibration.ratio(None);
+            state.calibration.overflow(applied);
+        }
+    }
+    let result = run_one_turn(
+        &driver.config,
+        &driver.runtime.clone(),
+        driver.transcript(),
+        task,
+    )
+    .await
+    .unwrap();
+    assert!(
+        result.error.is_none(),
+        "unmeasured overflow guesses must not permanently block a small prompt: {:?}",
+        result.error
+    );
+    assert_eq!(result.reply, "Hello.");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "one primary and its optional display");
+    for request in requests.iter() {
+        assert!(request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "user" && message["content"] == task));
+    }
+}
