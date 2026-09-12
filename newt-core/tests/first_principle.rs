@@ -38,6 +38,7 @@
 //! cannot quietly delete the marker for one instead of fixing it. Un-ignoring a
 //! law is how a fix is proved: the test must go red first with the old code.
 
+use newt_core::agentic::SUMMARY_PREFIX;
 use newt_core::{ConversationStore, PhantomReach, PhantomResolution};
 
 mod common;
@@ -52,12 +53,16 @@ use common::{cfg_is_test_only, for_each_production_line, production_roots};
 /// the suite landed at 3 (issue #1785's original acceptance text predates the
 /// third law and said "lower to 1" — superseded by this note). #1785 took
 /// 3 → 2. #1786 Phase A (the v2 encoding) hashed `phantom_reaches` and
-/// landed `sources`, taking 2 → 1; Phase C (the producer plumbing) retires
+/// landed `sources`, taking 2 → 1; Phase C (the producer plumbing) retired
 /// the last law — `derived_records_name_their_sources`, strengthened per the
 /// spec's §10.1 to drive the REAL compaction producer, never the Debug-grep
 /// this file originally carried — taking 1 → 0. #1787 is downstream
 /// diagnostics built on those fixes, not a law in this file.
-const KNOWN_VIOLATIONS: usize = 1;
+///
+/// ZERO is not "done": it means every law this file states is currently
+/// upheld. The ratchet's job from here is to stay there — a new violation
+/// must be filed, named in its marker, and raised deliberately.
+const KNOWN_VIOLATIONS: usize = 0;
 
 fn store(root: &std::path::Path, workspace: &std::path::Path) -> ConversationStore {
     ConversationStore::new(root, workspace, 100).unwrap()
@@ -794,12 +799,22 @@ fn restore_read_refuses_a_witness_with_no_writer() {
 /// cannot audit it, you cannot re-derive it, and you cannot tell a faithful
 /// summary from a fabricated one, because both look the same on the wire.
 ///
-/// VIOLATION: `ConversationTurn` has no field naming a source. A compaction
-/// summary is written into the same `user`/`assistant` strings as a real turn,
-/// with nothing distinguishing it and nothing pointing back. Once written, its
-/// origin is gone.
+/// This drives the REAL producer — `persist_compaction_summary`, the one
+/// production site that appends a compaction summary to the conversation
+/// record — and asserts what it actually wrote. It deliberately does NOT grep
+/// a `Debug` rendering for the word "source": that flips green the moment a
+/// field exists, whatever the producer puts in it, and a law that passes on an
+/// empty field is a law about spelling.
+///
+/// Expected ids are re-derived here from the raw stored bytes, the way an
+/// independent implementation would — never through the crate's own id
+/// function, so encoding drift between the two is a failure rather than a
+/// silent agreement.
+///
+/// Residue (§3.2): scoped to v2 rows. Pre-bump v1 rows carry `sources = '[]'`
+/// as unhashed bytes that are never interpreted, and no producer can
+/// retroactively attribute them.
 #[test]
-#[ignore = "FIRST-PRINCIPLE VIOLATION — ConversationTurn cannot express provenance; summaries name no source turns"]
 fn derived_records_name_their_sources() {
     let root = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
@@ -808,29 +823,107 @@ fn derived_records_name_their_sources() {
     store.append_turn(&id, "user one", "assistant one").unwrap();
     store.append_turn(&id, "user two", "assistant two").unwrap();
 
-    // A summary of the two turns above is appended the only way the store
-    // allows: as another turn, indistinguishable from a witnessed one.
-    store
-        .append_turn(
-            &id,
-            "",
-            "[CONTEXT COMPACTION — REFERENCE ONLY] the user asked twice",
-        )
-        .unwrap();
+    // Snapshot the ids BEFORE the producer runs: what the summary replaces is
+    // what existed when it was minted.
+    let mut witnessed = stored_content_ids(root.path(), &id);
+    assert_eq!(
+        witnessed.len(),
+        2,
+        "two witnessed turns precede the summary"
+    );
+    witnessed.sort(); // the stored citation is canonical: sorted, deduped
+
+    // The real producer mints the summary row. Two witnessed turns exist, so
+    // both are citable and both must be cited.
+    let first_summary = format!("{SUMMARY_PREFIX} the user asked twice");
+    newt_core::persist_compaction_summary(&store, &id, &first_summary).unwrap();
 
     let rec = store.load(&id).unwrap();
     let summary = rec.turns.last().unwrap();
-
-    // The law: this derived record must name the turns it derives from. There
-    // is currently no field in which to say so, which is the violation.
-    let names_sources = format!("{summary:?}").contains("source");
-    assert!(
-        names_sources,
-        "a compacted summary was recorded with no reference to the turns it \
-         replaced — it is an unattributable assertion.\n\
-         Fix: give the turn record a source-reference field so a derived entry \
-         names its inputs, making it re-derivable and auditable."
+    assert_eq!(
+        summary.sources, witnessed,
+        "a compacted summary was recorded without naming the turns it replaced \
+         — it is an unattributable assertion.\n\
+         Fix: the producer must cite the content ids of the turns the summary \
+         stands in for, read back from the store."
     );
+    store
+        .verify_chain(&id)
+        .expect("a summary citing real turns must verify");
+
+    // The cut. A SECOND compaction stands in for the previous summary plus the
+    // turns after it — not for the turns that summary already replaced, whose
+    // provenance edge is recorded transitively by the summary itself. A
+    // producer that simply cited every row in the conversation would over-claim
+    // here, and this is the assertion that catches it.
+    store
+        .append_turn(&id, "user three", "assistant three")
+        .unwrap();
+
+    // [turn one, turn two, summary one, turn three] at the moment of minting.
+    let all = stored_content_ids(root.path(), &id);
+    assert_eq!(all.len(), 4, "four rows precede the second compaction");
+    let expected_second: Vec<String> = {
+        let mut ids = vec![all[2].clone(), all[3].clone()];
+        ids.sort();
+        ids
+    };
+
+    let second_summary = format!("{SUMMARY_PREFIX} and then a third time");
+    newt_core::persist_compaction_summary(&store, &id, &second_summary).unwrap();
+
+    let rec = store.load(&id).unwrap();
+    let second = rec.turns.last().unwrap();
+    assert_eq!(
+        second.sources, expected_second,
+        "the second summary must cite the previous summary and the turn after \
+         it — the working set it actually replaced — and must NOT re-cite the \
+         turns the first summary already covered."
+    );
+    assert!(
+        !second.sources.contains(&all[0]) && !second.sources.contains(&all[1]),
+        "the second summary over-claimed: it cited turns already covered by \
+         the first summary, whose edge to them is already recorded."
+    );
+    store
+        .verify_chain(&id)
+        .expect("a chained summary citing real rows must verify");
+}
+
+/// Content ids of a conversation's turns in `load` order, derived from the raw
+/// stored bytes exactly as an independent implementation would: the pinned
+/// `newt-turn-content:v1` domain prefix over the five length-prefixed content
+/// fields. Deliberately not the crate's own `content_id`.
+fn stored_content_ids(root: &std::path::Path, conversation: &str) -> Vec<String> {
+    let conn = rusqlite::Connection::open(root.join("conversations.db")).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT user, assistant, events, phantom_reaches, sources FROM turns
+              WHERE conversation_id = ?1
+              ORDER BY seq ASC, writer_fingerprint ASC",
+        )
+        .unwrap();
+    let ids = stmt
+        .query_map([conversation], |row| {
+            let fields: [String; 5] = [
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ];
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"newt-turn-content:v1");
+            for f in &fields {
+                buf.extend_from_slice(&(f.len() as u64).to_le_bytes());
+                buf.extend_from_slice(f.as_bytes());
+            }
+            Ok(blake3::hash(&buf).to_hex().to_string())
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    ids
 }
 
 // =========================================================================
