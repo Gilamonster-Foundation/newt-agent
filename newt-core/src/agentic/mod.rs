@@ -4079,7 +4079,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 &args,
                 None,
             )?;
-            if workflow_runtime.record_tool_result(&result) {
+            if workflow_runtime.record_tool_result(&result, ok) {
                 round_progress = true;
             }
             record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
@@ -4407,6 +4407,10 @@ impl RepeatCallGuard {
 struct WorkflowErrorEvidence {
     fingerprint: String,
     observations: usize,
+    /// Set when the failing probe that minted this evidence names a blocker no
+    /// workspace edit can repair (#2273). Carries the reason for the guidance
+    /// text. `None` is the ordinary repairable error the nudges were built for.
+    unreachable: Option<&'static str>,
 }
 
 #[derive(Debug, Default)]
@@ -4448,10 +4452,11 @@ impl WorkflowRuntimeState {
             .unwrap_or(WORKFLOW_RECENT_PROGRESS_ROUNDS)
     }
 
-    fn record_tool_result(&mut self, result: &str) -> bool {
+    fn record_tool_result(&mut self, result: &str, ok: bool) -> bool {
         let Some(fingerprint) = workflow_error_fingerprint(result) else {
             return false;
         };
+        let unreachable = unreachable_by_edit(ok, result);
         match self.error_evidence.as_mut() {
             Some(evidence) if evidence.fingerprint == fingerprint => {
                 evidence.observations = evidence.observations.saturating_add(1);
@@ -4461,6 +4466,7 @@ impl WorkflowRuntimeState {
                 self.error_evidence = Some(WorkflowErrorEvidence {
                     fingerprint,
                     observations: 1,
+                    unreachable,
                 });
                 self.read_only_rounds_after_evidence = 0;
                 self.writes_after_evidence = 0;
@@ -4510,6 +4516,13 @@ impl WorkflowRuntimeState {
             return None;
         }
         self.step_lock_nudges += 1;
+        if let Some(reason) = evidence.unreachable {
+            return Some(workflow_blocked_nudge(
+                &evidence.fingerprint,
+                reason,
+                active_step_description(step_ledger).as_deref(),
+            ));
+        }
         Some(workflow_step_lock_nudge(
             &evidence.fingerprint,
             evidence.observations,
@@ -4562,6 +4575,13 @@ impl WorkflowRuntimeState {
             return None;
         }
         self.rediscovery_nudges += 1;
+        if let Some(reason) = evidence.unreachable {
+            return Some(workflow_blocked_nudge(
+                &evidence.fingerprint,
+                reason,
+                active_step_description(step_ledger).as_deref(),
+            ));
+        }
         Some(workflow_rediscovery_nudge(
             &evidence.fingerprint,
             active_step_description(step_ledger).as_deref(),
@@ -4582,6 +4602,15 @@ impl WorkflowRuntimeState {
             .rounds_since_progress
             .is_some_and(|rounds| rounds <= self.progress_horizon());
         if let Some(evidence) = self.error_evidence.as_ref() {
+            // A grace window exists to let an edit land. When no edit can
+            // reach the blocker, extra rounds buy nothing but more pressure.
+            if let Some(reason) = evidence.unreachable {
+                return Some(workflow_blocked_nudge(
+                    &evidence.fingerprint,
+                    reason,
+                    active_step.as_deref(),
+                ));
+            }
             if self.writes_after_evidence > 0 {
                 return Some(workflow_post_write_grace_nudge(
                     &evidence.fingerprint,
@@ -4700,6 +4729,28 @@ fn active_step_description(step_ledger: Option<&dyn scheduled::StepLedger>) -> O
                 .find(|step| step.status != StepStatus::Done)
         })
         .map(|step| step.description.clone())
+}
+
+/// The guidance for a blocker no workspace edit can repair (#2273).
+///
+/// The repair nudges this stands in for are absolute — "make the smallest
+/// edit", "call the concrete edit tool now", and a `disallowed_actions` line
+/// that forbids restating findings without editing. Against a missing binary
+/// or a refused capability those instructions cannot be followed honestly, so
+/// the model either argues with the harness or invents a fix. This says the
+/// opposite thing with the same force: name the probe, and stop.
+///
+/// It deliberately still forbids reporting the task COMPLETE. Ending on a
+/// stated blocker is an honest terminal answer; ending by claiming the work is
+/// done is the false completion this release has been measuring. The exit this
+/// opens must not become a second route to that.
+fn workflow_blocked_nudge(fingerprint: &str, reason: &str, active_step: Option<&str>) -> String {
+    let active = active_step
+        .map(|step| format!(" Active step: '{step}'."))
+        .unwrap_or_default();
+    format!(
+        "<workflow_state>\nactive_step = \"report a blocker no edit can clear\"\nlast_error_fingerprint = \"{fingerprint}\"\nblocker = \"{reason}\"\nnext_allowed_actions = \"state the blocker, quote the exact failing probe (the command and the error it returned), then end the turn\"\ndisallowed_actions = \"editing a file to satisfy this guidance, inventing a fix for an environmental blocker, or reporting the task complete\"\n</workflow_state>\n{active} The recorded failure is not something a workspace edit can repair: {reason}. Do not make a cosmetic or placeholder edit to satisfy this guidance. State what is blocked, quote the failing probe, and end the turn. Reporting a blocker with its evidence is a correct and complete answer here; claiming the task itself is finished is not."
+    )
 }
 
 fn workflow_step_lock_nudge(
@@ -5004,21 +5055,80 @@ fn run_command_is_advertised(tools: &serde_json::Value) -> bool {
     })
 }
 
+/// Result text that marks a REFUSED CAPABILITY. Shared by the exec-denial
+/// ground-truth check and by [`unreachable_by_edit`], so the two cannot drift
+/// into disagreeing about what a denial looks like.
+const CAPABILITY_DENIAL_NEEDLES: [&str; 6] = [
+    "permission denied",
+    "permission-denied",
+    "not within the granted authority",
+    "does not permit",
+    "capability denied",
+    "exec not granted",
+];
+
+/// Result text that marks a MISSING EXECUTABLE — the tool the model needs is
+/// not present in this environment at all (#2273).
+const MISSING_EXECUTABLE_NEEDLES: [&str; 4] = [
+    "command not found",
+    "no such command",
+    "executable file not found",
+    "is not recognized as an internal or external command",
+];
+
 fn run_command_result_is_denial(tool_name: &str, ok: bool, result: &str) -> bool {
     if tool_name != "run_command" || ok {
         return false;
     }
     let lower = result.to_ascii_lowercase();
-    [
-        "permission denied",
-        "permission-denied",
-        "not within the granted authority",
-        "does not permit",
-        "capability denied",
-        "exec not granted",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    CAPABILITY_DENIAL_NEEDLES
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+/// Is this FAILED tool result a blocker that no workspace edit can repair?
+///
+/// The workflow repair nudges exist for one theory of a no-edit round: the
+/// model declared completion without doing the work. That theory is wrong when
+/// the tool the model needs is absent or refused — `cargo: command not found`
+/// fingerprints exactly like a compiler error, and the nudge then demands an
+/// edit that cannot exist. A model handed "you must produce an edit" against an
+/// unfixable blocker either resists (and says so, as in #2273's transcript) or
+/// fabricates a cosmetic fix. The harness must not ask (#2273).
+///
+/// EVIDENCE, NEVER ASSERTION. This reads the TOOL'S OWN returned result and the
+/// classified failure flag; the model's prose never reaches it. That is the
+/// same rule [`run_command_result_is_denial`] already enforces for exec-denial
+/// claims, and the same rule `context_exceeded` follows in #2268 — minted from
+/// the server's answer, not the agent's opinion. A blocked path reachable by
+/// saying "I am blocked" would become the universal excuse for stopping early,
+/// which is worse than the nudge it replaces.
+///
+/// Requiring the failure flag is what keeps a bare `echo` from minting it: a
+/// successful command that merely PRINTS "command not found" is not a blocker.
+/// Residue, stated rather than hidden: [`tools::tool_result_ok`] is a textual
+/// classification, not a real exit status, so a model that deliberately runs a
+/// command crafted to both fail and emit this text can still reach the state.
+/// That is a visible fabrication in the transcript, not talking its way in, and
+/// it is exactly the strength the neighbouring denial check already has.
+fn unreachable_by_edit(ok: bool, result: &str) -> Option<&'static str> {
+    if ok {
+        return None;
+    }
+    let lower = result.to_ascii_lowercase();
+    if MISSING_EXECUTABLE_NEEDLES
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return Some("a required executable is not present in this environment");
+    }
+    if CAPABILITY_DENIAL_NEEDLES
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return Some("a required capability was refused by the confinement");
+    }
+    None
 }
 
 fn run_command_ground_truth_nudge() -> &'static str {
@@ -8181,7 +8291,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 &args,
                 None,
             )?;
-            if workflow_runtime.record_tool_result(&result) {
+            if workflow_runtime.record_tool_result(&result, ok) {
                 round_progress = true;
             }
             record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
@@ -10332,7 +10442,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 &args,
                 None,
             )?;
-            if workflow_runtime.record_tool_result(&result) {
+            if workflow_runtime.record_tool_result(&result, ok) {
                 round_progress = true;
             }
             record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
