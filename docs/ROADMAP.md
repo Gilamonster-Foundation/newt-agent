@@ -786,11 +786,36 @@ a wiremocked OpenAI endpoint.
 
 ---
 
-# Phase 13 — TUI (deferred to a follow-up roadmap)
+# Phase 13 — Reuse NewtUI in the rich terminal surface
 
-TUI work is hard to unit-test to 80% coverage with mocks alone — it needs
-snapshot testing (`insta`) and a terminal simulator. We'll plan that phase
-once Phases 0–12 are landed and `newt worker` is dogfooded end-to-end.
+The rich panels now have pure key-dispatch tests and terminal acceptance
+coverage. Adopt [NewtUI](https://github.com/Gilamonster-Foundation/newtui)
+incrementally, retaining Newt's terminal ownership, settings vocabulary and
+mutation paths. Each step replaces one shared seam before moving a component.
+
+## Step 13.1 — Shared panel key and close vocabulary
+
+**Status:** in progress.
+
+**What:** `newt-tui::panel` re-exports `newtui::{Key, Flow}` and deletes its
+local enums. Crossterm decoding, `Screen`, raw-mode guards and the
+`SurfaceRequest::Panel` window stay in Newt. Unmapped keys still reach panels
+as `Key::Other`, including the backend confirmation's decline-on-any-other-key
+behavior. The dependency is enabled only by `rich-tui`, without NewtUI's
+renderer feature.
+
+**Dependency:** NewtUI 0.1.0 is not on crates.io yet. An immutable Git revision
+plus a version requirement follows the existing `precedence-ladder` approach.
+Publishing `newt-tui` waits for NewtUI's registry release; replace the Git pin
+with that release in the uptake PR. No sibling checkout is required to build.
+
+**Tests:** direct NewtUI type-identity and crossterm mapping regressions, existing
+panel dispatch and confirmation tests, rich/lean feature checks, and the
+workspace acceptance contract. Existing panel terminal-ownership and raw-mode
+acceptance tests remain the proof for the unchanged driver.
+
+**Out of scope:** settings state-machine adoption, renderer or layout changes,
+new bindings, and tool-edit diff presentation. Those are subsequent slices.
 
 ---
 
