@@ -262,9 +262,9 @@ pub use kit::{Axis, MountKind, RegistryEntry, COMPONENT_REGISTRY};
 pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
 pub use memory::{
-    MemMessage, MemoryIndex, MemoryManager, MemoryProvider, NoteStore, NotesUnsupported, Role,
-    RollingWindow, SessionContext, SoulProvider, SoulSource, Summarizing, TokenBudget, COACH_SOUL,
-    DEFAULT_CONTEXT_TOKENS, DEFAULT_SOUL, MEMORY_INDEX_BUDGET,
+    persist_compaction_summary, MemMessage, MemoryIndex, MemoryManager, MemoryProvider, NoteStore,
+    NotesUnsupported, Role, RollingWindow, SessionContext, SoulProvider, SoulSource, Summarizing,
+    TokenBudget, COACH_SOUL, DEFAULT_CONTEXT_TOKENS, DEFAULT_SOUL, MEMORY_INDEX_BUDGET,
 };
 pub use metrics::{TokenUsage, TurnEndReason, TurnMetrics};
 pub use model_id::ModelId;

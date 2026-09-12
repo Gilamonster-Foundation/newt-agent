@@ -482,6 +482,44 @@ impl ConversationStore {
     /// is absence of evidence and skips only the tip comparison). A tampered
     /// row (content OR claims — claims are inside the canonical encoding, so
     /// they are tamper-evident too) breaks the chain.
+    /// `(user, assistant, content_id)` for every turn of a conversation, in
+    /// the SAME order [`Self::load`] returns them (§6 causal order: `seq`
+    /// then writer).
+    ///
+    /// The read-back seam a producer of DERIVED rows needs (#1786 §8). Ids
+    /// come from the stored column bytes through [`TurnRow::content_id`] —
+    /// never recomputed from a materialized [`crate::ConversationTurn`],
+    /// which would drift the moment a column stopped round-tripping and
+    /// would mint an id for a row that does not exist. The write-time
+    /// validator cannot catch that, because drifted hex is still well-formed
+    /// hex; only reading the bytes that were actually hashed can.
+    ///
+    /// The cut fields ride along so a caller decides which turns a new
+    /// derived row replaces from ONE read: a second query could interleave
+    /// with a concurrent append and pair ids against the wrong turns.
+    pub(crate) fn turn_refs(&self, id: &str) -> anyhow::Result<Vec<(String, String, String)>> {
+        let id = self.resolve_id(id)?;
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT conversation_id, writer_fingerprint, seq, prev_hash, user, assistant,
+                    events, tokens_in, tokens_out, ts_claim, encoding_version,
+                    phantom_reaches, sources
+               FROM turns
+              WHERE conversation_id = ?1
+              ORDER BY seq ASC, writer_fingerprint ASC",
+        )?;
+        let rows = stmt
+            .query_map([&id], turn_row_from_sql)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let content_id = r.content_id();
+                (r.user, r.assistant, content_id)
+            })
+            .collect())
+    }
+
     pub fn verify_chain(&self, id: &str) -> anyhow::Result<()> {
         let id = self.resolve_id(id)?;
         let conn = self.lock_conn();

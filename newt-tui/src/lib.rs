@@ -5780,9 +5780,11 @@ where
     // rebuilds `[summary] + [turns from the trigger on]` — the same working
     // set the live session kept.
     if let Some(summary) = compaction {
-        // Sources stay empty until the producer plumbing lands (#1786 spec
-        // §8, Phase C): ids flow from the store post-save, one cycle late.
-        store.append_turn_full(conversation_id, &summary, "", &[], &[], &[], None, None)?;
+        // #1786 Phase C: the summary is a DERIVED row and cites the turns it
+        // replaced. The producer lives in newt-core beside `restore_turns`,
+        // whose cut defines the working set being replaced — the two must
+        // agree, so they are not written twice.
+        newt_core::persist_compaction_summary(store, conversation_id, &summary)?;
     }
     // 17.6: persist the turn's tool events and the backend-reported token
     // actuals. `usage` is what `chat_complete` returned — input = largest

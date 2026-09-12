@@ -149,6 +149,22 @@ pub struct ConversationTurn {
     /// when the backend reported nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_out: Option<u32>,
+    /// Content ids of the turns this row was DERIVED from (#1786 §3).
+    ///
+    /// Empty for a witnessed turn — a real exchange is a direct recording and
+    /// derives from nothing. Non-empty for a harness-minted row, today only a
+    /// compaction summary, which replaces the turns it cites with generated
+    /// prose whose sole justification is those turns.
+    ///
+    /// A LOWER BOUND, never a completeness claim (§3): it lists the citable
+    /// inputs, so window entries with no persisted row are omitted rather than
+    /// guessed. And derivation is not faithfulness — a summary citing the
+    /// right turns can still misrepresent them (§3.1).
+    ///
+    /// Additive like `events` and `phantom_reaches`: pre-v2 rows carry the
+    /// column default and parse empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
 }
 
 impl ConversationTurn {
@@ -160,6 +176,7 @@ impl ConversationTurn {
             phantom_reaches: Vec::new(),
             tokens_in: None,
             tokens_out: None,
+            sources: Vec::new(),
         }
     }
 }
