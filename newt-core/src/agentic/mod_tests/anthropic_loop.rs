@@ -15,6 +15,10 @@ use std::sync::{Arc, Mutex};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+#[cfg(test)]
+#[path = "anthropic_context_errors.rs"]
+mod context_errors;
+
 /// Set/unset an env var for the test's duration, restoring prior state on
 /// drop (env vars are process-global — hence the serial lane above).
 struct EnvGuard {
@@ -1271,7 +1275,11 @@ async fn context_window_400_compacts_and_retries() {
         .mount(&server)
         .await;
 
-    let messages = msgs();
+    // #2268: an overflow may retry only after shrinking. Preserve the
+    // original success/count assertion with removable history.
+    let mut messages = msgs();
+    messages.insert(1, MemMessage::user("historical context ".repeat(500)));
+    messages.insert(2, MemMessage::assistant("earlier reasoning ".repeat(500)));
     let caveats = Caveats::top();
     let uri = server.uri();
     let mut c = ctx(&uri, &messages, &caveats);
@@ -1288,6 +1296,14 @@ async fn context_window_400_compacts_and_retries() {
         2,
         "overflow → compact → exactly one retried dispatch"
     );
+    let requests = server.received_requests().await.unwrap();
+    let rejected = body_json(&requests[0]);
+    let recovered = body_json(&requests[1]);
+    assert!(
+        recovered["messages"].to_string().len() < rejected["messages"].to_string().len(),
+        "recovery must not resend the rejected request unchanged"
+    );
+    assert!(recovered["messages"].to_string().contains("do the thing"));
 }
 
 // -----------------------------------------------------------------------

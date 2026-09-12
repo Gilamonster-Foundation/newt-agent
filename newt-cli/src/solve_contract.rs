@@ -125,8 +125,10 @@ pub fn terminal(
     }
 }
 
-/// The contract record's `outcome` — **exactly the five values `CONTRACT.md`
-/// defines**, and no others. The bench's `Outcome` is a CLOSED serde enum with
+/// The contract record's `outcome` — the closed set pinned in
+/// `contract/bench_outcome_values_v1.txt`. #2268 adds `context_exceeded` as an
+/// explicit extension that requires a matching bench consumer update.
+/// The bench's `Outcome` is a CLOSED serde enum with
 /// no `serde(other)` (`gilamonster-bench/src/contract.rs:20`), so an unknown
 /// value does not deserialize: the run does not score badly, it DROPS OUT of
 /// the matrix. #2215 emitted `round_cap` here and silently deleted rows.
@@ -169,6 +171,7 @@ pub fn outcome_label(t: Terminal) -> &'static str {
         // new one fails to compile rather than inheriting a bucket.
         Terminal::StoppedShort(TurnEndReason::Completed | TurnEndReason::Failed) => "harness_error",
         Terminal::Failed(Some(ErrorClass::Model)) => "model_error",
+        Terminal::Failed(Some(ErrorClass::ContextExceeded)) => "context_exceeded",
         Terminal::Failed(Some(ErrorClass::Transport)) => "transport_error",
         Terminal::Failed(Some(ErrorClass::Timeout)) => "timeout",
         Terminal::Failed(Some(ErrorClass::Harness) | None) => "harness_error",
@@ -384,6 +387,7 @@ mod tests {
         ErrorClass::Transport,
         ErrorClass::Timeout,
         ErrorClass::Harness,
+        ErrorClass::ContextExceeded,
     ];
 
     fn error_class_index(c: ErrorClass) -> usize {
@@ -392,6 +396,7 @@ mod tests {
             ErrorClass::Transport => 1,
             ErrorClass::Timeout => 2,
             ErrorClass::Harness => 3,
+            ErrorClass::ContextExceeded => 4,
         }
     }
 
@@ -843,3 +848,7 @@ mod tests {
         assert!(contract_record(&i)["timing"].get("tok_s").is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "solve_contract_context_tests.rs"]
+mod context_tests;

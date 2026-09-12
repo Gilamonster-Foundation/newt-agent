@@ -350,6 +350,7 @@ pub(crate) fn retry_indicator_text(
         Some(ErrorClass::Timeout) => "request timed out",
         Some(ErrorClass::Transport) => "connection lost",
         Some(ErrorClass::Model) => "backend returned a retryable error",
+        Some(ErrorClass::ContextExceeded) => "backend rejected the context size",
         Some(ErrorClass::Harness) => "request failed in the harness",
         None => "connection lost",
     };
