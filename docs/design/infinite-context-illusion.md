@@ -1,12 +1,25 @@
-# The illusion of infinite context
+# Distributed graph-based context
+
+> **Bounded residency, unbounded reach, and every unit provably derived.**
 
 **Status:** Intention, stated by the maintainer 2026-09-12. No implementation.
-This records the goal, the mechanism, and the three rules that keep the
-mechanism honest, so that whoever builds it does not have to re-derive them.
+This records the goal, the mechanism, and the rules that keep the mechanism
+honest, so that whoever builds it does not have to re-derive them.
 
 **The intention, in the maintainer's words:** *to create the ILLUSION of
 infinite context.* We do not need a million-token window. We need its
 **effect**, and we may be able to produce that effect by clever illusion.
+
+The architecture name is the maintainer's. The thesis line under it exists
+because the name says what the thing *is* and not what it *claims*; §1-§2 are
+the claim, and the claim is the part that has to survive contact with evidence.
+
+**Distribution is earned, not chosen.** Content addressing makes the graph
+trivially distributable — a unit's name is a function of its bytes, so moving
+it costs nothing and proves itself on arrival. Multi-host operation (§4, §6) is
+therefore a *consequence* of the structure rather than a separate design
+decision, and the single-session case remains the common one. Nothing here
+should be read as requiring a mesh to be useful.
 
 **Related:** [`smart-harness.md`](smart-harness.md) and
 [`smart-harness-implementation.md`](smart-harness-implementation.md) (the frame
@@ -168,7 +181,18 @@ already built.
 name for the *mechanism*, because it invites building the one thing §2 forbids.
 Candidates, ranked by whether the borrowed structure actually does work:
 
-**Atlas and chart (recommended).** A manifold is covered by charts, each locally
+**Paged context (the mechanism half).** Paging is the honest word for bounded
+residency: a *page fault* is already understood as visible and handled rather
+than as a failure or a lie, which is exactly the property §2 demands and the
+property "illusion" endangered. Its limit is that virtual memory's backing
+store is dumb — a page is bytes at an address and proves nothing about its
+origin. Ours is a derivation graph, so **a fault can be served by re-derivation,
+not only by retrieval**, and the rebuild can be checked because identity is
+content-derived. No borrowed term covers that; the nearest cousins are gradient
+checkpointing (recompute rather than store) and a materialized view rebuilt
+from base tables, and neither verifies the rebuild.
+
+**Atlas and chart (the geometric picture).** A manifold is covered by charts, each locally
 simple, glued by transition maps. You never hold the manifold; you hold a chart
 and can move to an adjacent one. That is bounded residency and unbounded reach,
 exactly. Crucially a chart has never claimed to be the manifold, so the word
