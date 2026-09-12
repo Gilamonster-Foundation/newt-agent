@@ -379,6 +379,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unfinished_summary_and_tool_promises_are_pending_actions() {
+        let classifier = NudgeClassifier::builtin();
+        for text in [
+            "This remains a large file. Let me summarize the current state and what could be improved:",
+            "Let me check the current working directory and available git operations:",
+        ] {
+            assert!(classifier.is_pending_action(text), "{text}: {:?}", classifier.classify(text));
+        }
+        assert!(!classifier.is_pending_action("The files were examined; everything checks out."));
+    }
+
+    #[test]
     fn nudge_classifier_builtin_matches_known_phrases() {
         let classifier = NudgeClassifier::builtin();
         assert!(classifier.is_pending_action(
