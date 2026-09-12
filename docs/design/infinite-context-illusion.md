@@ -1,4 +1,4 @@
-# Distributed graph-based context
+# Paged context over a distributed derivation graph
 
 > **Bounded residency, unbounded reach, and every unit provably derived.**
 
@@ -10,7 +10,11 @@ honest, so that whoever builds it does not have to re-derive them.
 infinite context.* We do not need a million-token window. We need its
 **effect**, and we may be able to produce that effect by clever illusion.
 
-The architecture name is the maintainer's. The thesis line under it exists
+The name is the maintainer's and it carries the whole design: **paged** is the
+residency mechanism (§3), **derivation graph** is the structure that makes a
+page provable rather than merely present (§4), and **over** is the layering —
+the mechanism sits on the structure, which is why a fault can be served by
+re-derivation and not only by retrieval. The thesis line under it exists
 because the name says what the thing *is* and not what it *claims*; §1-§2 are
 the claim, and the claim is the part that has to survive contact with evidence.
 
