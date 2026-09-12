@@ -18,10 +18,38 @@
 //! The discriminator is STRUCTURED (exit code + the `denials` array), never a
 //! stderr grep — the same rule [`super::super::shell::envelope_denied`] follows.
 
-/// A program certain to exist on any Linux host running these tests.
-const PRESENT: &str = "sh";
-/// A program certain NOT to exist — no grant could ever supply it.
+/// A program certain NOT to exist — no grant could ever supply it. Contains no
+/// path separator, so it is resolved through `PATH` on every platform and
+/// found nowhere.
 const ABSENT: &str = "newt-absent-binary-xyzzy-2274";
+
+/// A file certain to be PRESENT on the host, on every platform the suite runs
+/// on: this test binary.
+///
+/// The obvious choice is a well-known command name, and the obvious choice is
+/// wrong. `sh` is a Unix assumption; so is every other hardcoded binary name,
+/// which only moves the assumption rather than removing it. A Windows runner
+/// has no `sh`, the host probe correctly reports "not on this host", and the
+/// not-carried case silently becomes the absent case — the test stops
+/// exercising the branch it was written for.
+///
+/// `current_exe()` is definitionally present wherever the test runs, and it is
+/// ALREADY ABSOLUTE, which is what this case needs: `host_path_lookup` takes
+/// its explicit-path branch on a separator and stats the file directly, so no
+/// `PATH` resolution is involved on any platform. It is also the right shape
+/// for the `exec:<abs path>` grant assertion (#2274 grants are absolute paths).
+///
+/// The reaching-outside-the-carried-userland instinct is exactly what carrying
+/// brush exists to prevent; the fixture had the same bug the production code
+/// does not.
+fn present_host_binary() -> String {
+    let exe = std::env::current_exe().expect("the running test binary exists");
+    assert!(
+        exe.is_absolute(),
+        "current_exe() must be absolute for the exec:<abs path> assertion: {exe:?}"
+    );
+    exe.display().to_string()
+}
 
 /// brush's shape for "I could not resolve this program at all": exit 127,
 /// and — critically — NO `denied` flag and NO `denials` array, because the
@@ -59,9 +87,10 @@ fn empty_exec() -> crate::caveats::Scope<String> {
 /// basename (#2274 grant shape).
 #[test]
 fn not_carried_but_present_on_host_names_the_grant_to_ask_for() {
+    let present = present_host_binary();
     let msg = super::super::shell::absent_binary_refusal(
-        &format!("{PRESENT} -c true"),
-        &not_found_envelope(PRESENT),
+        &present,
+        &not_found_envelope(&present),
         &empty_exec(),
     )
     .expect("a 127 with no denials must produce a named refusal");
@@ -70,9 +99,12 @@ fn not_carried_but_present_on_host_names_the_grant_to_ask_for() {
         msg.contains("carried userland"),
         "must name the state, got: {msg}"
     );
+    // The EXACT grant string, not a `/` prefix: on Windows an absolute path is
+    // `C:\...`, so asserting "exec:/" would be the same platform assumption in
+    // a different place.
     assert!(
-        msg.contains("exec:/"),
-        "must name an ABSOLUTE-PATH grant to ask for, got: {msg}"
+        msg.contains(&format!("exec:{present}")),
+        "must name the absolute-path grant to ask for ({present}), got: {msg}"
     );
     assert!(
         !msg.contains("not installed on this host"),
@@ -110,8 +142,8 @@ fn absent_from_host_says_so_and_does_not_coach_a_useless_grant() {
 fn denied_by_grant_is_not_an_absence() {
     assert!(
         super::super::shell::absent_binary_refusal(
-            &format!("{PRESENT} -c true"),
-            &denied_envelope(PRESENT),
+            &present_host_binary(),
+            &denied_envelope(&present_host_binary()),
             &empty_exec(),
         )
         .is_none(),
@@ -124,9 +156,10 @@ fn denied_by_grant_is_not_an_absence() {
 /// misdiagnosis — the twin is that no two of them read the same.
 #[test]
 fn all_three_states_produce_different_messages() {
+    let present = present_host_binary();
     let not_carried = super::super::shell::absent_binary_refusal(
-        &format!("{PRESENT} -c true"),
-        &not_found_envelope(PRESENT),
+        &present,
+        &not_found_envelope(&present),
         &empty_exec(),
     )
     .expect("not-carried must be named");
@@ -138,7 +171,7 @@ fn all_three_states_produce_different_messages() {
     )
     .expect("absent-from-host must be named");
 
-    let denied = super::super::shell::denied_run_command_result(&denied_envelope(PRESENT), false);
+    let denied = super::super::shell::denied_run_command_result(&denied_envelope(&present), false);
 
     assert_ne!(not_carried, absent, "not-carried must differ from absent");
     assert_ne!(not_carried, denied, "not-carried must differ from denied");
