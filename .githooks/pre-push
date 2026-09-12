@@ -9,6 +9,11 @@
 # Install: `just install-hooks` (or `git config core.hooksPath .githooks`)
 #
 # PIPELINE PARITY: This hook mirrors .github/workflows/ci.yml.
+#   - `just check` exercises this hook's privacy/range handling through
+#     scripts/test_pre_push.py, matching the CI lint job's regression step.
+#   - `just check` runs `npm --prefix npm test` (Node 22), matching test-npm;
+#     other OS executions are CI-only. release.yml reuses this suite before
+#     tag-only artifact assembly/publication, which this hook does not perform.
 #   - .github/workflows/harness-python.yml is a declared real-resource lane (uv + CPython), deliberately outside hook parity; `just harness-python` mirrors it.
 #   - The feature list passed to clippy and to cargo test must MATCH:
 #     `--features newt-data/kernel,newt-interaction/schema`. Linting without
@@ -106,12 +111,23 @@ while read -r _lref _lsha _rref _rsha; do
         *[!0]*) _range="$_rsha..$_lsha" ;;            # update: only the new commits
         *)      _range="origin/main...$_lsha" ;;      # new branch: changes since it forked main
     esac
-    # Same range the leak guard scans, reused to decide whether this push can
-    # touch a Rust build at all (see the documentation-only gate below).
+    # Keep the complete update for gate selection, including upstream changes
+    # brought in by a rebase (see the documentation-only gate below).
     _changed="$_changed
 $(git diff --name-only "$_range" 2>/dev/null || true)"
+    _leak_range="$_range"
+    # A rebased branch reintroduces upstream lines in old-head..new-head even
+    # though they are already public on main. Scan the feature additions only
+    # when BOTH ancestry checks prove this case; errors are not divergence.
+    # Gate selection above stays conservative, and the privacy patterns stay
+    # unchanged. New private lines on the rebased branch still fail below.
+    _ancestor_status=0
+    git merge-base --is-ancestor "$_rsha" "$_lsha" 2>/dev/null || _ancestor_status=$?
+    if [ "$_ancestor_status" -eq 1 ] && git merge-base --is-ancestor origin/main "$_lsha" 2>/dev/null; then
+        _leak_range="origin/main..$_lsha"
+    fi
     # Exclude .githooks/ — these scripts legitimately contain the IP/DNS regex.
-    _hits="$(git diff "$_range" -- . ':(exclude).githooks/*' 2>/dev/null \
+    _hits="$(git diff "$_leak_range" -- . ':(exclude).githooks/*' 2>/dev/null \
              | grep -E '^\+' | grep -vE '^\+\+\+' \
              | grep -nEi "$NET_LEAK_RE" | grep -vEi "$NET_LEAK_ALLOW" || true)"
     [ -n "$_hits" ] && _leaks="$_leaks
