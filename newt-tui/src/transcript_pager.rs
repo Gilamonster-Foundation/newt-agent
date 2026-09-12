@@ -577,6 +577,7 @@ mod tests {
                 })
                 .collect(),
             phantom_reaches: Vec::new(),
+            sources: Vec::new(),
             tokens_in: None,
             tokens_out: None,
         }

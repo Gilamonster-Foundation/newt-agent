@@ -885,7 +885,8 @@ impl ConversationStore {
 
         // §6: turn order is the causal tick, never ts_claim.
         let mut stmt = conn.prepare(
-            "SELECT user, assistant, events, tokens_in, tokens_out, phantom_reaches FROM turns
+            "SELECT user, assistant, events, tokens_in, tokens_out, phantom_reaches, sources
+               FROM turns
               WHERE conversation_id = ?1
               ORDER BY seq ASC, writer_fingerprint ASC",
         )?;
@@ -897,10 +898,19 @@ impl ConversationStore {
                 row.get::<_, Option<i64>>(3)?,
                 row.get::<_, Option<i64>>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
             ))
         })?;
         for turn in turns {
-            let (user, assistant, events_json, tokens_in, tokens_out, phantom_reaches_json) = turn?;
+            let (
+                user,
+                assistant,
+                events_json,
+                tokens_in,
+                tokens_out,
+                phantom_reaches_json,
+                sources_json,
+            ) = turn?;
             // 17.6: events deserialize strictly — a row whose blob is not
             // ToolEvent-shaped errors clearly (the encoding_version
             // philosophy: never quietly hand back garbage). Pre-17.6 rows
@@ -921,6 +931,18 @@ impl ConversationStore {
                          phantom-reach JSON ({e}); refusing to load garbage"
                     )
                 })?;
+            // #1786 §3: the provenance edge decodes as strictly as the two
+            // columns above, and additionally re-checks CANONICAL FORM. The
+            // bytes are hashed, so a row whose sources are merely parseable
+            // but not canonical is already a chain violation — handing such a
+            // row back as if it were ordinary would let a caller read a
+            // citation the record cannot actually carry.
+            let sources = parse_canonical_sources(&sources_json).map_err(|e| {
+                anyhow::anyhow!(
+                    "conversation `{id}`: turn sources column is not canonical \
+                     provenance JSON ({e}); refusing to load garbage"
+                )
+            })?;
             record.turns.push(ConversationTurn {
                 user,
                 assistant,
@@ -928,6 +950,7 @@ impl ConversationStore {
                 phantom_reaches,
                 tokens_in: tokens_from_sql(tokens_in)?,
                 tokens_out: tokens_from_sql(tokens_out)?,
+                sources,
             });
         }
         Ok(record)
@@ -956,7 +979,8 @@ impl ConversationStore {
         let conn = self.lock_conn();
         let row = conn
             .query_row(
-                "SELECT t.user, t.assistant, t.events, t.tokens_in, t.tokens_out, t.phantom_reaches
+                "SELECT t.user, t.assistant, t.events, t.tokens_in, t.tokens_out,
+                        t.phantom_reaches, t.sources
                    FROM turns t
                    JOIN conversations c
                      ON c.id = t.conversation_id AND c.workspace_key = ?3
@@ -970,11 +994,20 @@ impl ConversationStore {
                         row.get::<_, Option<i64>>(3)?,
                         row.get::<_, Option<i64>>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((user, assistant, events_json, tokens_in, tokens_out, phantom_reaches_json)) = row
+        let Some((
+            user,
+            assistant,
+            events_json,
+            tokens_in,
+            tokens_out,
+            phantom_reaches_json,
+            sources_json,
+        )) = row
         else {
             return Ok(None);
         };
@@ -993,6 +1026,15 @@ impl ConversationStore {
                      phantom-reach JSON ({e}); refusing to load garbage"
                 )
             })?;
+        // #1786 §3: same canonical-form check as `load` — one turn read
+        // by address must not report a citation the whole-record read would
+        // refuse.
+        let sources = parse_canonical_sources(&sources_json).map_err(|e| {
+            anyhow::anyhow!(
+                "conversation `{id}`: turn sources column is not canonical \
+                 provenance JSON ({e}); refusing to load garbage"
+            )
+        })?;
         Ok(Some(ConversationTurn {
             user,
             assistant,
@@ -1000,6 +1042,7 @@ impl ConversationStore {
             phantom_reaches,
             tokens_in: tokens_from_sql(tokens_in)?,
             tokens_out: tokens_from_sql(tokens_out)?,
+            sources,
         }))
     }
 
