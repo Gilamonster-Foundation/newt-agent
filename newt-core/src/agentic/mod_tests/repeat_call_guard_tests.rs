@@ -752,3 +752,54 @@ fn a_blocker_asserted_without_a_failing_probe_is_not_honoured() {
         "a blocker the model only asserted must not buy an exit: {nudge}"
     );
 }
+
+#[test]
+fn workflow_blocker_classification_refreshes_for_the_same_fingerprint() {
+    let repairable = "error: command exited 1\na test failed";
+    let blocked = "error: command exited 1\nPermission denied";
+    for (first, second, expect_blocked) in
+        [(repairable, blocked, true), (blocked, repairable, false)]
+    {
+        let mut state = WorkflowRuntimeState::default();
+        state.record_tool_result(first, false);
+        state.record_round_outcome(false, false);
+        for _ in 0..WorkflowRuntimeState::STEP_LOCK_NUDGE_CAP {
+            assert!(state.round_start_nudge(None).is_some());
+        }
+        assert!(state.record_tool_result(second, false));
+        state.record_round_outcome(false, false);
+        let nudge = state
+            .round_start_nudge(None)
+            .expect("changed classification renews guidance");
+        assert_eq!(nudge.contains("end the turn"), expect_blocked, "{nudge}");
+        assert_eq!(
+            nudge.contains("Make the smallest edit"),
+            !expect_blocked,
+            "{nudge}"
+        );
+        assert!(
+            !state.record_tool_result(second, false),
+            "identical evidence is not new progress"
+        );
+    }
+}
+
+#[test]
+fn workflow_blocker_records_filesystem_capability_denial() {
+    // The prefix emitted by tools::denied_fs_result is not a compiler error.
+    let result = "capability denied: fs_read does not permit '/outside'.";
+    assert!(!tools::tool_result_ok(result));
+    let mut state = WorkflowRuntimeState::default();
+    assert!(state.record_tool_result(result, tools::tool_result_ok(result)));
+    state.record_round_outcome(false, false);
+    let nudge = state
+        .round_start_nudge(None)
+        .expect("filesystem denial steers the turn");
+    assert!(nudge.contains("end the turn"), "{nudge}");
+    assert!(nudge.contains("required capability was refused"), "{nudge}");
+    assert!(!nudge.contains("Make the smallest edit"), "{nudge}");
+
+    let mut successful = WorkflowRuntimeState::default();
+    assert!(!successful.record_tool_result(result, true));
+    assert!(successful.error_evidence.is_none());
+}
