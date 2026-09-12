@@ -394,7 +394,7 @@ error[E0425]: cannot find value `SECTION_PROMPT_TOKENS` in this scope
 "#;
     let mut state = WorkflowRuntimeState::default();
 
-    state.record_tool_result(output);
+    state.record_tool_result(output, false);
     state.record_round_outcome(false, false);
 
     let nudge = state
@@ -434,7 +434,7 @@ fn workflow_runtime_tracks_failed_edit_as_unresolved_evidence() {
     let output = "error: old_string not found in newt-tui/src/help_sections.rs";
     let mut state = WorkflowRuntimeState::default();
 
-    state.record_tool_result(output);
+    state.record_tool_result(output, false);
     state.record_round_outcome(false, false);
 
     let nudge = state
@@ -618,5 +618,137 @@ fn a_passing_build_stays_repeatable() {
     assert!(
         g.repeat_steer("run_command", &args).is_none(),
         "a passing build was memoized; re-running a build is legitimate"
+    );
+}
+
+// =========================================================================
+// #2273 — the nudge must not demand an edit no edit can make
+// =========================================================================
+
+/// The reported defect: a missing executable fingerprints exactly like a
+/// compiler error, so the repair nudge demanded an edit that cannot exist and
+/// pressured the model into a cosmetic fix. With a real failing probe the
+/// guidance must stop asking for an edit and let the turn end.
+#[test]
+fn environmental_blocker_guidance_does_not_demand_an_edit() {
+    // The transcript's own shape: run_command returns a failed result naming a
+    // binary the sandbox does not have.
+    let probe = "error: command not found: cargo";
+    let mut state = WorkflowRuntimeState::default();
+
+    state.record_tool_result(probe, false);
+    state.record_round_outcome(false, false);
+
+    let nudge = state
+        .round_start_nudge(None)
+        .expect("a recorded blocker must still steer the turn, not go silent");
+
+    assert!(
+        !nudge.contains("Make the smallest edit"),
+        "the guidance must not demand an edit for a blocker no edit reaches: {nudge}"
+    );
+    assert!(
+        nudge.contains("not something a workspace edit can repair"),
+        "the guidance must name why no edit applies: {nudge}"
+    );
+    assert!(
+        nudge.contains("end the turn"),
+        "the guidance must let the turn end: {nudge}"
+    );
+    assert!(
+        nudge.contains("executable is not present"),
+        "the guidance must name the blocker class: {nudge}"
+    );
+    // It must not become a false-completion path either.
+    assert!(
+        nudge.contains("reporting the task complete"),
+        "ending on a blocker is not the same as completing the task: {nudge}"
+    );
+
+    // The rediscovery and grace paths must agree — all of them fired the
+    // edit demand before, so all of them have to stop.
+    let classification = crate::NudgeClassification {
+        class: crate::NudgeClass::PlanUpdate,
+        score: 1.0,
+    };
+    let rediscovery = state
+        .rediscovery_nudge(Some(&classification), "Summary of Findings", None)
+        .expect("rediscovery on a blocker must still answer");
+    assert!(
+        !rediscovery.contains("Call the concrete edit tool"),
+        "rediscovery must not demand an edit for a blocker: {rediscovery}"
+    );
+    let grace = state
+        .cap_grace_nudge(None, 12, 2)
+        .expect("the grace window must still answer on a blocker");
+    assert!(
+        !grace.contains("call the concrete edit tool now"),
+        "the grace window must not demand an edit for a blocker: {grace}"
+    );
+}
+
+/// The twin, and the reason this change is not a weakening: a model that
+/// declared completion without doing the work has no failing probe, so it must
+/// STILL be pushed to edit. If this passes with the change reverted it proves
+/// nothing — it is here to prove the blocked path did not swallow the case the
+/// nudge was built for.
+#[test]
+fn a_declared_completion_with_no_probe_is_still_nudged_to_act() {
+    let compiler_error = r#"
+error[E0425]: cannot find value `SECTION_PROMPT_TOKENS` in this scope
+   --> newt-tui/src/help_sections.rs:523:22
+"#;
+    let mut state = WorkflowRuntimeState::default();
+
+    state.record_tool_result(compiler_error, false);
+    state.record_round_outcome(false, false);
+
+    let nudge = state
+        .round_start_nudge(None)
+        .expect("an ordinary repairable error must still lock the active repair");
+    assert!(
+        nudge.contains("Make the smallest edit"),
+        "a repairable error must still demand the edit: {nudge}"
+    );
+    assert!(
+        !nudge.contains("end the turn"),
+        "a repairable error must NOT be offered the blocked exit: {nudge}"
+    );
+
+    // And the tenacity path — narration with no evidence at all — is untouched.
+    let mut narrating = WorkflowRuntimeState::default();
+    for _ in 0..3 {
+        narrating.record_round_outcome(false, false);
+    }
+    let action = narrating
+        .action_forcing_nudge(5, None, None)
+        .expect("pure narration must still be pushed to act");
+    assert!(action.contains("edit_file or write_file"), "{action}");
+}
+
+/// "Blocked" by assertion is not blocked. The state is minted from the tool's
+/// own failed result; a SUCCESSFUL command that merely prints the words — an
+/// `echo`, or a model quoting the error back — must not reach it, or the
+/// blocked path becomes the universal excuse for stopping early.
+#[test]
+fn a_blocker_asserted_without_a_failing_probe_is_not_honoured() {
+    // Fingerprints (starts with `error:`) and contains the blocker words, but
+    // the call SUCCEEDED — this is output, not a failing probe.
+    let echoed = "error: build failed\ncargo: command not found";
+    let mut state = WorkflowRuntimeState::default();
+
+    state.record_tool_result(echoed, true);
+    state.record_round_outcome(false, false);
+
+    let nudge = state
+        .round_start_nudge(None)
+        .expect("the evidence still stands; only its classification changes");
+    assert!(
+        nudge.contains("Make the smallest edit"),
+        "an unproven blocker must fall back to the ordinary repair demand: {nudge}"
+    );
+    assert!(
+        !nudge.contains("end the turn"),
+        "a blocker the model only asserted must not buy an exit: {nudge}"
     );
 }
