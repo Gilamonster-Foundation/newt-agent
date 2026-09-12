@@ -365,13 +365,20 @@ pub(crate) const COMMANDS: &[SlashCommand] = &[
         Disposition::Absorb,
         Receipt::Missing,
     ),
-    cmd_on(
+    // NOT retired. #2009 PR3 retired this row to `/status models`, but that
+    // destination is `status_topics`' rewrite BACK to `/models`, which is the
+    // live implementation and always has been (`lib.rs`'s dispatch match names
+    // `"models"` explicitly, so the row never reached `fallthrough_message`).
+    // The retirement therefore pointed a command at itself, and — because the
+    // help corpus was pruned to match — took the only listing verb out of
+    // `/help` and the palette. An operator could switch models but not see
+    // them. Reads print (`status_topics`' own rule); this one is not retired.
+    cmd(
         "models",
         &[],
         Family::Model,
         Disposition::Keep,
         Receipt::None_,
-        Surface::Retired("/status models"),
     ),
     cmd(
         "probe",

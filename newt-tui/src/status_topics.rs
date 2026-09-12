@@ -262,6 +262,13 @@ mod tests {
 
     /// Anti-vacuous twin: the loop above proves nothing if no row retires to
     /// `/status`.
+    ///
+    /// **7 → 6: `/models` was never a real retirement.** Its row pointed at
+    /// `/status models`, which is this module's rewrite BACK to `/models` —
+    /// the live implementation. Un-retiring it (the `/models` discoverability
+    /// fix) drops the count by one without weakening this guard: what it
+    /// exists to prove is that rows DO retire into `/status`, and six still
+    /// do. The `models` TOPIC stays; both doors still reach one handler.
     #[test]
     fn something_actually_retired_into_status() {
         let count = crate::slash_registry::COMMANDS
@@ -272,7 +279,7 @@ mod tests {
             })
             .count();
         assert!(
-            count >= 7,
+            count >= 6,
             "only {count} rows retired into /status; the fold is eight topics"
         );
     }

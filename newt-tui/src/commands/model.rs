@@ -309,7 +309,7 @@ pub(crate) fn dispatch(
                 };
                 print_newt(
                     &format!(
-                        "active model: {}  (use /model <name> to switch)",
+                        "active model: {}  (/models to see the choices, /model <name> to switch)",
                         choice.display_model()
                     ),
                     color,
