@@ -75,6 +75,32 @@ pub(super) fn record(
     Ok(())
 }
 
+/// The backend's count paired with the uncalibrated estimate of that same
+/// assembled request. Carries evidence through optional-request fallbacks.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PromptMeasurement {
+    pub tokens: usize,
+    pub estimated_tokens: usize,
+}
+
+impl PromptMeasurement {
+    pub(super) fn learn(&self, state: &mut super::CompressState) {
+        state
+            .calibration
+            .observe_count(self.tokens, self.estimated_tokens);
+    }
+}
+
+impl std::fmt::Display for PromptMeasurement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "measured {} prompt tokens from a {}-token prior",
+            self.tokens, self.estimated_tokens
+        )
+    }
+}
+
 /// Estimated request size accompanying a rejected optional completion.
 /// The original typed provider error remains its anyhow source.
 #[derive(Debug)]

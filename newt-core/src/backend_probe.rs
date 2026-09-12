@@ -22,6 +22,10 @@ use crate::config::{
     BackendConfig, BackendKind, Engine, ManagedMode, OpenAiApi as OpenAiApiSurface, Serving,
 };
 
+#[path = "backend_probe_token_count.rs"]
+mod token_count;
+pub use token_count::{count_chat_tokens, TokenCount};
+
 /// HTTP status returned by a model-list probe. Keeping the status typed lets
 /// endpoint detection distinguish authentication and unsupported APIs from a
 /// host that could not be reached, while preserving the existing `HTTP ...`

@@ -418,6 +418,7 @@ async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
             ollama_num_ctx: Some(4_096),
+            prompt_measurement: Default::default(),
         },
     )
     .await
@@ -488,6 +489,7 @@ async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
             ollama_num_ctx: None,
+            prompt_measurement: Default::default(),
         },
     )
     .await
@@ -562,6 +564,7 @@ async fn ollama_cap_exit_refuses_giant_fresh_result_before_dispatch() {
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
             ollama_num_ctx: Some(2_500),
+            prompt_measurement: Default::default(),
         },
     )
     .await
@@ -620,6 +623,7 @@ async fn openai_cap_exit_refuses_giant_fresh_result_before_dispatch() {
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
             ollama_num_ctx: None,
+            prompt_measurement: Default::default(),
         },
     )
     .await

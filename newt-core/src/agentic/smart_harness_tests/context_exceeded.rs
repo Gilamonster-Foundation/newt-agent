@@ -160,3 +160,6 @@ fn context_exceeded_checkpoint_failure_is_returned_and_prevents_another_request(
         )
         .is_err());
 }
+
+#[path = "token_count.rs"]
+mod token_count;

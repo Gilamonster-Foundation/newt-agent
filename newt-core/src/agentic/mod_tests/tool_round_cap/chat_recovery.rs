@@ -1,5 +1,23 @@
 use super::*;
 
+/// Count generation separately from the unsupported token-count probes these
+/// fixtures receive. Unexpected requests must still fail the fixture.
+pub(super) fn openai_generation_requests(requests: Vec<Request>) -> Vec<Request> {
+    requests
+        .into_iter()
+        .filter(|request| {
+            assert_eq!(request.method.as_str(), "POST");
+            match request.url.path() {
+                "/v1/chat/completions" => true,
+                "/v1/chat/completions/input_tokens"
+                | "/v1/chat/completions/render"
+                | "/tokenize" => false,
+                path => panic!("unexpected request path: {path}"),
+            }
+        })
+        .collect()
+}
+
 /// A `recover_cw_400` hook for the chat-path cw-400 recovery tests. It
 /// parses nothing — it unconditionally reports a recovered input cap. The
 /// removable fixture history forces a strictly smaller request before the
@@ -74,6 +92,7 @@ async fn openai_chat_cw_400_recovery_retries_the_same_logical_round_with_tools()
     assert_eq!(reply, "done");
 
     let reqs = server.received_requests().await.expect("requests recorded");
+    let reqs = openai_generation_requests(reqs);
     assert_eq!(
         reqs.len(),
         3,
@@ -129,6 +148,7 @@ async fn openai_chat_cw_400_recovery_is_bounded() {
         .await
         .expect_err("a persistent chat cw-400 surfaces after the bounded retries");
     let reqs = server.received_requests().await.expect("requests recorded");
+    let reqs = openai_generation_requests(reqs);
     assert_eq!(reqs.len(), 3, "initial request plus two shrink attempts");
     assert!(reqs.windows(2).all(|pair| {
         let previous: serde_json::Value = serde_json::from_slice(&pair[0].body).unwrap();

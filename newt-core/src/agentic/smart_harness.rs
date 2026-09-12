@@ -109,6 +109,7 @@ struct State {
     session: Session,
     request: Option<ContentId>,
     reply: Option<ContentId>,
+    admission_rejection: Option<ContentId>,
     antecedent: Option<String>,
     operator_task: Option<String>,
     calls: usize,
@@ -196,6 +197,7 @@ impl SmartHarness {
                 session,
                 request: None,
                 reply: None,
+                admission_rejection: None,
                 antecedent: None,
                 operator_task: None,
                 calls: 0,
@@ -257,6 +259,7 @@ impl SmartHarness {
         s.antecedent = None;
         s.request = None;
         s.reply = None;
+        s.admission_rejection = None;
         Ok(())
     }
 
@@ -328,6 +331,7 @@ impl SmartHarness {
         let request = s.session.record_request(body.clone(), format)?;
         s.request = Some(request.id);
         s.reply = None;
+        s.admission_rejection = None;
         Ok(request.bytes)
     }
 
@@ -343,7 +347,62 @@ impl SmartHarness {
             .record_rendered_request(body.clone(), format, messages)?;
         s.request = Some(request.id);
         s.reply = None;
+        s.admission_rejection = None;
         Ok(request.bytes)
+    }
+
+    /// Admit the exact counter response as harness metadata for the prepared
+    /// generation request. Counting never creates a primary-model observation.
+    pub(crate) fn record_token_count(
+        &self,
+        result: Result<&crate::backend_probe::TokenCount, &anyhow::Error>,
+        budget: usize,
+    ) -> anyhow::Result<()> {
+        let diagnostic = match result {
+            Ok(count) => format!(
+                "{} tokens, budget {budget}, method {}",
+                count.tokens, count.method
+            ),
+            Err(error) => format!("{error:#}"),
+        };
+        let committed = (|| -> anyhow::Result<()> {
+            let mut s = self.state()?;
+            // A failed new observation must not reuse an earlier admission.
+            s.admission_rejection = None;
+            let request = s
+                .request
+                .ok_or_else(|| anyhow::anyhow!("token count has no recorded request"))?;
+            let (payload, rejected) = match result {
+                Ok(count) => (
+                    serde_json::json!({
+                        "kind": "token_count",
+                        "tokens": count.tokens,
+                        "budget": budget,
+                        "method": count.method,
+                        "response_body": std::str::from_utf8(&count.response_bytes)?,
+                    }),
+                    count.tokens > budget,
+                ),
+                Err(error) => (
+                    serde_json::json!({
+                        "kind": "token_count_error",
+                        "budget": budget,
+                        "error": format!("{error:#}"),
+                    }),
+                    crate::retry::classify(error) == crate::retry::Retryability::ContextExceeded,
+                ),
+            };
+            let event = s
+                .session
+                .record_request_intervention(request, &serde_json::to_vec(&payload)?)?;
+            s.admission_rejection = rejected.then_some(event);
+            Ok(())
+        })();
+        committed.map_err(|error| {
+            let message =
+                format!("token-count evidence could not be committed ({diagnostic}): {error}");
+            error.context(message)
+        })
     }
 
     /// Even malformed, refused, or interrupted responses remain observations.
@@ -353,6 +412,7 @@ impl SmartHarness {
             .request
             .ok_or_else(|| anyhow::anyhow!("reply has no recorded request"))?;
         s.reply = Some(s.session.record_reply(request, bytes)?);
+        s.admission_rejection = None;
         Ok(())
     }
 
@@ -504,8 +564,9 @@ impl SmartHarness {
         let request = s
             .request
             .ok_or_else(|| anyhow::anyhow!("context overflow has no recorded request"))?;
-        let reply = s
+        let rejection = s
             .reply
+            .or(s.admission_rejection)
             .ok_or_else(|| anyhow::anyhow!("context overflow has no observed rejection"))?;
         let payload = serde_json::to_string(&serde_json::json!({
             "request_cid": request,
@@ -513,10 +574,13 @@ impl SmartHarness {
         }))?;
         // This outcome belongs to the rejected request, not the whole turn.
         // The next request may proceed only after all recovery evidence commits.
-        s.session.record_failure(reply, "context_exceeded")?;
-        s.session.record_outcome(reply, "failed", "")?;
-        s.session.record_intervention(&payload, reply)?;
+        if let Some(reply) = s.reply {
+            s.session.record_failure(reply, "context_exceeded")?;
+            s.session.record_outcome(reply, "failed", "")?;
+        }
+        s.session.record_intervention(&payload, rejection)?;
         s.reply = None;
+        s.admission_rejection = None;
         Ok(())
     }
 

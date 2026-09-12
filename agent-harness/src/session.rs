@@ -139,6 +139,10 @@ pub(crate) enum JournalEntry {
     Intervention {
         event: ContentId,
     },
+    RequestIntervention {
+        request: ContentId,
+        event: ContentId,
+    },
     Unit {
         unit: ContentId,
     },
@@ -495,6 +499,20 @@ impl Session {
                 }
                 if value.body().kind == EventKind::Retrieval {
                     return Err(integrity("retrieval requires a verified range receipt"));
+                }
+                self.events.insert(*event, value);
+            }
+            JournalEntry::RequestIntervention { request, event } => {
+                let parents = self.request_intervention_parents(*request)?;
+                let value = self.checked_event(*event)?;
+                if value.body().origin != EventOrigin::Harness
+                    || value.body().kind != EventKind::Intervention
+                    || !value.body().sources.is_empty()
+                    || value.parents() != &parents
+                {
+                    return Err(integrity(
+                        "request intervention has invalid provenance or antecedents",
+                    ));
                 }
                 self.events.insert(*event, value);
             }
@@ -1830,6 +1848,40 @@ impl Session {
             1,
         )?;
         self.append(JournalEntry::Failure { event, reply })
+    }
+
+    /// Record harness metadata about an exact prepared request, including
+    /// candidates rejected before dispatch. This does not record a model reply.
+    pub fn record_request_intervention(
+        &mut self,
+        request: ContentId,
+        payload: &[u8],
+    ) -> Result<ContentId> {
+        self.ensure_writer()?;
+        let parents = self.request_intervention_parents(request)?;
+        let event = self.event(
+            EventOrigin::Harness,
+            EventKind::Intervention,
+            payload,
+            parents,
+            BTreeSet::new(),
+            1,
+        )?;
+        self.append(JournalEntry::RequestIntervention { request, event })?;
+        Ok(event)
+    }
+
+    fn request_intervention_parents(&self, request: ContentId) -> Result<BTreeSet<ContentId>> {
+        if !self.requests.contains(&request) {
+            return Err(Error::Access("intervention has no admitted request".into()));
+        }
+        let record: RequestRecord = self.store.get(&request)?;
+        if !self.projections.contains(&record.projection) {
+            return Err(integrity("request intervention has no admitted projection"));
+        }
+        self.verify_request(&record)?;
+        let projection: Projection = self.store.get(&record.projection)?;
+        Ok(projection.entries.iter().map(|entry| entry.event).collect())
     }
 
     pub fn record_intervention(&mut self, text: &str, parent: ContentId) -> Result<ContentId> {

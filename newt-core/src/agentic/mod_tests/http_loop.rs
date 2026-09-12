@@ -257,6 +257,9 @@ mod reasoning_overflow;
 #[path = "http_context_exceeded.rs"]
 mod context_exceeded;
 
+#[path = "http_token_count.rs"]
+mod token_count;
+
 #[path = "http_context_exceeded_optional.rs"]
 mod optional_context_exceeded;
 
