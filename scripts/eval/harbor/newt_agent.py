@@ -8,9 +8,11 @@ task container, then drives ``newt solve`` headless in the task's working
 directory (Harbor's ``task_env_config.workdir``, else the container's ``pwd``) and writes the
 trace to ``/logs/agent``. Two lanes, chosen by ``NEWT_BENCH_OCAP``:
 
-- unset / off — the default ``--non-interactive`` (``--yolo --full-access``)
-  lane: OCAP off, host shell, no prompts. The lane the published floor was set
-  on (deliberate variable isolation).
+- unset / off — the ``--unsafe-host-exec`` lane: OCAP off, ambient host
+  shell, no prompts. The lane the published floor was set on (deliberate
+  variable isolation). Since #1582 a plain ``newt solve`` is confined, so the
+  adapter must pass the opt-in explicitly; before that fix every "off" run
+  silently measured the confined lane.
 - ``on`` — the ``--confined`` lane: OCAP stays ON, writes fenced to the
   workspace + the container's mutable roots, reads/exec/net open. The 0.7.6
   parity gate runs the SAME suite once per lane and requires the scores match.
@@ -25,7 +27,7 @@ Run it:
     NEWT_BENCH_BIN=~/bin/newt \\
     NEWT_BENCH_PROFILE=/path/to/bench.toml \\
     NEWT_BENCH_TENACITY=insistent \\
-    NEWT_BENCH_OCAP=on \\        # omit / off for the --yolo lane
+    NEWT_BENCH_OCAP=on \\        # omit / off for the --unsafe-host-exec lane
     NEWT_BENCH_SELF_VERIFY=1 \\  # run the workspace's own checks before RTB (#1 lever)
     PYTHONPATH=scripts/eval/harbor \\
     harbor run -a newt_agent:NewtAgent -m newt/qwen3-coder_30b <task-or-dataset...>
@@ -70,11 +72,20 @@ _MAX_ROUNDS = os.environ.get("NEWT_BENCH_MAX_ROUNDS", "40")
 # the endpoint actually serves. Overrideable; empty disables the pin.
 _CONTEXT_WINDOW = os.environ.get("NEWT_BENCH_CONTEXT_WINDOW", "65536")
 # OCAP lane: ``on`` runs the confined lane (OCAP enabled, writes fenced to the
-# workspace + the container's mutable roots, reads/exec/net open) instead of the
-# default ``--yolo`` full-access lane. This is the variable the 0.7.6 parity gate
+# workspace + the container's mutable roots, reads/exec/net open); anything else
+# runs the ``--unsafe-host-exec`` full-access lane. This is the variable the parity gate
 # flips: the SAME suite is run once per model with NEWT_BENCH_OCAP unset (off)
 # and once with ``on``, and the two scores must match before 0.7.6 tags.
 _OCAP = os.environ.get("NEWT_BENCH_OCAP", "")
+
+
+def _lane_flag(ocap: str) -> str:
+    """The `newt solve` flag that selects the lane. `newt solve` is confined by
+    default (#1582), so BOTH lanes are explicit: ``--confined`` flips OCAP on and
+    seeds the workspace-fenced caveat; ``--unsafe-host-exec`` is the opt-in to
+    the OCAP-off ambient-host lane. Returning "" for the off lane ran the
+    confined lane under the off label — the bug this function makes testable."""
+    return " --confined" if ocap.strip().lower() == "on" else " --unsafe-host-exec"
 # Inference-robustness knob. The local llama.cpp router drops connections under
 # memory pressure (co-hosted vLLM near the 121G ceiling), and a task that
 # exhausts newt's retry window scores 0 on a pure infra fault — not the agent.
@@ -163,9 +174,6 @@ class NewtAgent(BaseInstalledAgent):
 
         tenacity = f" --tenacity {shlex.quote(_TENACITY)}" if _TENACITY else ""
         ctx = f" --context-window {shlex.quote(_CONTEXT_WINDOW)}" if _CONTEXT_WINDOW else ""
-        # OCAP-on lane: append --confined. Off (empty/anything else) keeps the
-        # default --yolo full-access lane. The flag flips OCAP on AND seeds the
-        # workspace-fenced caveat inside `newt solve`.
         # The task's working directory is NOT always /app: terminal-bench's
         # prove-plus-comm declares WORKDIR /workspace and copies its partial proof
         # there, and its verifier checks paths relative to that. Hardcoding /app
@@ -176,7 +184,7 @@ class NewtAgent(BaseInstalledAgent):
         if not workdir:
             probe = await self.exec_as_agent(environment, command="pwd")
             workdir = ((getattr(probe, "stdout", None) or "").strip().splitlines() or ["/app"])[0] or "/app"
-        confined = " --confined" if _OCAP.strip().lower() == "on" else ""
+        confined = _lane_flag(_OCAP)
         smart = (
             " --smart-harness --frame-dir /logs/agent/frame"
             if _SMART.strip() in ("1", "on", "true")
