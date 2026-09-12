@@ -17,7 +17,11 @@ async fn run(
     let calls = Arc::new(AtomicUsize::new(0));
     let wire_owned = wire.to_string();
     Mock::given(method("POST")).respond_with(move |request: &Request| {
-        assert_eq!(body_json(request)["stream"], false, "smart mode renders the adjudicated observation without generating another answer");
+        let body = body_json(request);
+        assert_eq!(body["stream"], wire_owned == "openai", "OpenAI streams the primary response; smart mode still avoids an extra display generation");
+        if wire_owned == "openai" {
+            assert_eq!(body["stream_options"]["include_usage"], true);
+        }
         let i = calls.fetch_add(1, Ordering::SeqCst);
         let text = &texts[i.min(texts.len()-1)];
         let value = if text == "<tool>" {

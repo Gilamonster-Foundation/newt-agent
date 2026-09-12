@@ -19,7 +19,7 @@ const RELEASED_TASK: &str = "Create posture-canary.txt containing RELEASED_ATTEM
 
 fn final_response(streaming: bool) -> ResponseTemplate {
     if streaming {
-        let frame = json!({"choices": [{"delta": {"content": "The tool result is recorded."}}]});
+        let frame = json!({"choices": [{"delta": {"content": "The tool result is recorded."}, "finish_reason": "stop"}]});
         ResponseTemplate::new(200).set_body_raw(
             format!("data: {frame}\n\ndata: [DONE]\n\n"),
             "text/event-stream",
@@ -69,7 +69,8 @@ async fn settings_posture_reaches_accepted_turn_and_off_releases_the_clamp() {
     // than infer an earlier denial from the final file (the second turn writes
     // the same path). Ignore startup probes; assertions below require both
     // operator tasks and their exact tool-call results to have reached the wire.
-    let observed = Arc::new(Mutex::new(Vec::<(bool, Value, bool, bool)>::new()));
+    let observed = Arc::new(Mutex::new(Vec::<(bool, Value, bool, bool, bool)>::new()));
+    let pending_replay = Mutex::new(None::<Vec<u8>>);
     let capture = Arc::clone(&observed);
     let inspected_canary = canary.clone();
     let inspected_outside = outside_canary.clone();
@@ -78,6 +79,13 @@ async fn settings_posture_reaches_accepted_turn_and_off_releases_the_clamp() {
         .respond_with(move |request: &Request| {
             let body: Value = serde_json::from_slice(&request.body).expect("chat request JSON");
             let streaming = body["stream"].as_bool().unwrap_or(false);
+            // Only a matching terminal answer arms one optional display copy.
+            // A different request consumes that eligibility as a new round.
+            let replaying = pending_replay
+                .lock()
+                .expect("replay lock")
+                .take()
+                .is_some_and(|prior| streaming && prior == request.body);
             let messages = body["messages"].as_array().expect("chat messages");
             let active_task = messages.iter().rposition(|message| {
                 message["role"] == "user"
@@ -105,9 +113,15 @@ async fn settings_posture_reaches_accepted_turn_and_off_releases_the_clamp() {
                 body.clone(),
                 inspected_canary.exists(),
                 inspected_outside.exists(),
+                replaying,
             ));
-            if has_result || streaming {
-                return final_response(streaming);
+            if has_result {
+                if !replaying {
+                    *pending_replay.lock().expect("replay lock") = Some(request.body.clone());
+                }
+                // Preserve the primary's original JSON usage and the optional
+                // display's SSE content; both requests now use stream:true.
+                return final_response(replaying && streaming);
             }
             let mut calls = vec![json!({
                 "id": call_id, "type": "function",
@@ -242,14 +256,14 @@ scheduled = false
     for released in [false, true] {
         let requests: Vec<_> = captured
             .iter()
-            .filter(|(phase, body, _, _)| *phase == released && body["stream"] != true)
+            .filter(|(phase, _, _, _, replay)| *phase == released && !*replay)
             .collect();
         assert_eq!(
             requests.len(),
             2,
             "one tool-call round and one result round per turn"
         );
-        let (_, first, existed_before_call, _) = requests[0];
+        let (_, first, existed_before_call, _, _) = requests[0];
         assert!(
             !existed_before_call,
             "canary must remain absent through the locked turn and before release"
@@ -300,7 +314,7 @@ scheduled = false
             );
         }
     }
-    assert!(captured.iter().all(|(_, _, _, exists)| !exists));
+    assert!(captured.iter().all(|(_, _, _, exists, _)| !exists));
     assert!(
         !outside_canary.exists(),
         "off must preserve the base write fence"

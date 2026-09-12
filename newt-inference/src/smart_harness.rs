@@ -210,6 +210,16 @@ mod tests {
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn ollama_reply(content: &str) -> ResponseTemplate {
+        let body = serde_json::json!({
+            "message": { "role": "assistant", "content": content },
+            "done": true
+        })
+        .to_string()
+            + "\n";
+        ResponseTemplate::new(200).set_body_raw(body, "application/x-ndjson")
+    }
+
     fn external(endpoint: &str) -> SmartHarnessConfig {
         let mut config = SmartHarnessConfig {
             enabled: true,
@@ -238,9 +248,7 @@ mod tests {
                 {"role":"system", "content":"Return the requested JSON value."},
                 {"role":"user", "content":"classify this evidence"}
             ]})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "message":{"role":"assistant","content":"\"answer\""}
-            })))
+            .respond_with(ollama_reply("\"answer\""))
             .expect(1)
             .mount(&server)
             .await;
@@ -265,7 +273,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .and(body_partial_json(serde_json::json!({
-                "model":"auxiliary-fixture", "stream":false,
+                "model":"auxiliary-fixture", "stream":true,
                 "options":{"num_predict":64},
                 "messages":[{"role":"user","content":"classify this"}]
             })))
@@ -321,9 +329,7 @@ mod tests {
         config.device = Some("cuda".into());
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "message":{"role":"assistant","content":"\"narration\""}
-            })))
+            .respond_with(ollama_reply("\"narration\""))
             .expect(1)
             .mount(&server)
             .await;

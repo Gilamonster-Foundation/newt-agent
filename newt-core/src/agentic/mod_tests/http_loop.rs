@@ -124,9 +124,29 @@ fn is_stream(req: &Request) -> bool {
 /// question the loop already had answered, so counting it would turn a
 /// `rounds` assertion into a request count.
 fn sse_replay(text: &str) -> ResponseTemplate {
-    let frame = serde_json::json!({"choices": [{"delta": {"content": text}}]});
+    let frame =
+        serde_json::json!({"choices": [{"delta": {"content": text}, "finish_reason":"stop"}]});
     let body = format!("data: {frame}\n\ndata: [DONE]\n\n");
     ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream")
+}
+
+/// One terminal response authorizes one matching display reissue. A changed
+/// request invalidates the pending replay; every later logical turn advances.
+#[derive(Default)]
+pub(super) struct DisplayReplay(Mutex<Option<Vec<u8>>>);
+
+impl DisplayReplay {
+    pub(super) fn arm(&self, request: &Request) {
+        *self.0.lock().unwrap() = Some(request.body.clone());
+    }
+
+    pub(super) fn take(&self, request: &Request) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .take()
+            .is_some_and(|body| is_stream(request) && body == request.body)
+    }
 }
 
 fn ndjson(lines: &[serde_json::Value]) -> ResponseTemplate {
@@ -156,30 +176,25 @@ impl Respond for CaptureOpenAiRequestResponder {
 
 // -- Narrate-then-stop rescue: bounded no-tool-call auto-continue ---------
 
-/// OpenAI responder that serves a scripted `choices[0].message` per request
-/// (by order); out-of-range requests repeat the last scripted entry.
+/// OpenAI responder that serves one scripted message per logical round.
+/// Primary calls stream too, so only an identical request immediately after a
+/// no-tool response can consume its one pending display replay. A changed
+/// request advances the script; out-of-range rounds repeat its last entry.
 struct ScriptedOpenAi {
     round: Arc<AtomicUsize>,
     script: Vec<serde_json::Value>,
-    /// What the last scripted round answered with, replayed over SSE for the
-    /// #123 streaming re-issue.
-    last_content: Arc<Mutex<String>>,
+    /// Exact request bytes and message eligible for one display reissue.
+    pending_replay: Mutex<Option<(Vec<u8>, serde_json::Value)>>,
 }
 impl Respond for ScriptedOpenAi {
     fn respond(&self, req: &Request) -> ResponseTemplate {
-        // #123: the streaming re-issue of an ALREADY-ACCEPTED round is not a
-        // new round — it re-serves the same answer over SSE. Advancing the
-        // script here would silently turn every `rounds` assertion in this
-        // file into a request count, which is not what any of them mean; and
-        // serving the next scripted message would answer a question the loop
-        // never asked. Replaying the accepted content is what a real backend
-        // approximately does, and it puts the whole OpenAI corpus through the
-        // streaming path for free.
-        if body_json(req)["stream"].as_bool().unwrap_or(false) {
-            let text = self.last_content.lock().unwrap().clone();
-            let frame = serde_json::json!({"choices": [{"delta": {"content": text}}]});
-            let body = format!("data: {frame}\n\ndata: [DONE]\n\n");
-            return ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream");
+        // Consume or invalidate the pending replay before deciding the round.
+        // Keeping it after replay would swallow a later identical turn.
+        let mut pending = self.pending_replay.lock().unwrap();
+        if let Some((body, message)) = pending.take() {
+            if is_stream(req) && body == req.body {
+                return scripted_openai_response(req, message);
+            }
         }
         let i = self.round.fetch_add(1, Ordering::SeqCst);
         let msg = self
@@ -188,12 +203,38 @@ impl Respond for ScriptedOpenAi {
             .or_else(|| self.script.last())
             .cloned()
             .unwrap_or_else(|| serde_json::json!({ "content": "final." }));
-        if let Some(content) = msg["content"].as_str() {
-            *self.last_content.lock().unwrap() = content.to_string();
+        if !msg["tool_calls"]
+            .as_array()
+            .is_some_and(|calls| !calls.is_empty())
+        {
+            *pending = Some((req.body.clone(), msg.clone()));
         }
-        ResponseTemplate::new(200)
-            .set_body_json(serde_json::json!({ "choices": [{ "message": msg }] }))
+        scripted_openai_response(req, msg)
     }
+}
+
+/// Change only the wire envelope: retain script text, tool identities and
+/// arguments verbatim, adding the positional index required by SSE deltas.
+fn scripted_openai_response(req: &Request, mut message: serde_json::Value) -> ResponseTemplate {
+    if !is_stream(req) {
+        return ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({"choices":[{"message":message}]}));
+    }
+    let finish = if let Some(calls) = message["tool_calls"]
+        .as_array_mut()
+        .filter(|c| !c.is_empty())
+    {
+        for (index, call) in calls.iter_mut().enumerate() {
+            call["index"] = serde_json::json!(index);
+        }
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    let chunk = serde_json::json!({"choices":[{"index":0,"delta":message}]});
+    let done = serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":finish}]});
+    let body = format!("data: {chunk}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+    ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream")
 }
 
 /// Drive the OpenAI loop over a per-round script; return `(reply, requests)`.
@@ -208,7 +249,7 @@ async fn run_openai_script_with_ledger(
         .respond_with(ScriptedOpenAi {
             round: round.clone(),
             script,
-            last_content: Default::default(),
+            pending_replay: Default::default(),
         })
         .mount(&server)
         .await;
@@ -224,6 +265,53 @@ async fn run_openai_script_with_ledger(
 
 async fn run_openai_script(script: Vec<serde_json::Value>) -> (String, usize) {
     run_openai_script_with_ledger(script, None).await
+}
+
+/// Grounds scripted round accounting in real HTTP requests: each accepted
+/// answer is displayed once, and a later identical turn still advances.
+#[tokio::test]
+async fn scripted_openai_identical_next_turn_consumes_the_next_answer() {
+    let server = MockServer::start().await;
+    let round = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ScriptedOpenAi {
+            round: round.clone(),
+            script: vec![
+                serde_json::json!({"content":"First answer."}),
+                serde_json::json!({"content":"Second answer."}),
+            ],
+            pending_replay: Default::default(),
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    // Reuse one immutable prompt receipt so this fixture sends byte-identical
+    // turns; the convenience entry point would mint a fresh address each time.
+    let turn = crate::TurnPromptContext::ephemeral_operator(
+        "scripted-replay",
+        "do the thing",
+        "do the thing",
+    );
+    for expected in ["First answer.", "Second answer."] {
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.prompt_disposition = PromptDisposition::Explain;
+        let (reply, streamed, _, _) = chat_complete_with_prompt(c, Some(&turn), None, &mut NoMcp)
+            .await
+            .expect("scripted streamed primary must produce a complete answer");
+        assert_eq!(reply, expected);
+        assert!(streamed, "the display reissue must carry real SSE text");
+    }
+    assert_eq!(round.load(Ordering::SeqCst), 2, "two logical rounds");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 4, "primary and display for each turn");
+    assert!(requests.iter().all(is_stream), "all generations stream");
+    assert_eq!(requests[0].body, requests[1].body, "first display replay");
+    assert_eq!(requests[2].body, requests[3].body, "second display replay");
+    assert_eq!(requests[0].body, requests[2].body, "identical next turn");
 }
 
 #[cfg(test)]

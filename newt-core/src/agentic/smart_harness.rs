@@ -408,12 +408,33 @@ impl SmartHarness {
     /// Even malformed, refused, or interrupted responses remain observations.
     pub(crate) fn observe(&self, bytes: &[u8]) -> anyhow::Result<()> {
         let mut s = self.state()?;
+        Self::record_observation(&mut s, bytes)
+    }
+
+    fn record_observation(s: &mut State, bytes: &[u8]) -> anyhow::Result<()> {
         let request = s
             .request
             .ok_or_else(|| anyhow::anyhow!("reply has no recorded request"))?;
         s.reply = Some(s.session.record_reply(request, bytes)?);
         s.admission_rejection = None;
         Ok(())
+    }
+
+    /// A dropped transport future cannot return a persistence error directly.
+    /// Retain it so the cancellation path fails closed instead of reporting a
+    /// clean interruption without its already observed response bytes.
+    fn observe_on_drop(&self, bytes: &[u8]) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.deferred_failure.is_some() {
+            return;
+        }
+        if let Err(error) = Self::record_observation(&mut state, bytes) {
+            state.deferred_failure = Some(format!(
+                "interrupted response observation could not be recorded: {error}"
+            ));
+        }
     }
 
     pub(crate) async fn project(
@@ -918,26 +939,95 @@ pub(crate) async fn response(
     harness: Option<&SmartHarness>,
     prefix: &str,
 ) -> anyhow::Result<Value> {
-    let status = response.status();
-    let (bytes, read_error) = crate::retry::read_response_bytes(response).await;
-    if let Some(h) = harness {
-        h.observe(&bytes)?;
+    response_with_decoder(response, harness, prefix, |bytes| {
+        Ok(serde_json::from_slice(bytes)?)
+    })
+    .await
+}
+
+/// OpenAI interpretation errors are model/wire evidence, with their original
+/// error chain retained. JSON-only consumers retain their existing decoder.
+pub(crate) fn decode_openai_response(bytes: &[u8]) -> anyhow::Result<Value> {
+    super::openai_sse::decode_response(bytes).map_err(|error| {
+        let classified = super::observability::DispatchError::http_status(format!("{error:#}"));
+        error.context(classified)
+    })
+}
+
+/// Own response bytes across suspension points. Dropping the reader is the
+/// cancellation boundary, so its `Drop` records bytes already received before
+/// the outer cancellation path commits the terminal outcome.
+struct ResponseObservation<'a> {
+    harness: Option<&'a SmartHarness>,
+    bytes: Vec<u8>,
+    pending: bool,
+}
+
+impl<'a> ResponseObservation<'a> {
+    fn new(harness: Option<&'a SmartHarness>) -> Self {
+        Self {
+            harness,
+            bytes: Vec::new(),
+            pending: true,
+        }
     }
-    // A disconnect after an observed overflow body must not replace that
-    // diagnosis with a retryable transport error. Retain partial bytes too.
-    let overflow = !status.is_success()
-        && super::cw_overflow::is_context_overflow(&String::from_utf8_lossy(&bytes));
+
+    fn finish(mut self) -> anyhow::Result<Vec<u8>> {
+        self.pending = false;
+        if let Some(harness) = self.harness {
+            harness.observe(&self.bytes)?;
+        }
+        Ok(std::mem::take(&mut self.bytes))
+    }
+}
+
+impl Drop for ResponseObservation<'_> {
+    fn drop(&mut self) {
+        if self.pending {
+            if let Some(harness) = self.harness {
+                harness.observe_on_drop(&self.bytes);
+            }
+        }
+    }
+}
+
+/// Observe exact response bytes once, then choose the provider's decoder.
+pub(crate) async fn response_with_decoder(
+    response: reqwest::Response,
+    harness: Option<&SmartHarness>,
+    prefix: &str,
+    decode: fn(&[u8]) -> anyhow::Result<Value>,
+) -> anyhow::Result<Value> {
+    let status = response.status();
+    let mut observation = ResponseObservation::new(harness);
+    let read_error = crate::retry::read_response_bytes_into(response, &mut observation.bytes).await;
+    let bytes = observation.finish()?;
+    // A parsed SSE error envelope may arrive under HTTP 200 before the socket
+    // closes. Inspect that evidence before preferring the body-read failure.
+    // Successful content quoting the same text must remain ordinary content.
+    let decoded = status.is_success().then(|| decode(&bytes));
+    let provider_rejection = decoded.as_ref().is_some_and(|result| {
+        result
+            .as_ref()
+            .is_err_and(super::openai_sse::is_provider_error)
+    });
+    let overflow = if let Some(Err(error)) = &decoded {
+        crate::retry::classify(error) == crate::retry::Retryability::ContextExceeded
+    } else {
+        !status.is_success()
+            && super::cw_overflow::is_context_overflow(&String::from_utf8_lossy(&bytes))
+    };
     let read_diagnostic = read_error
         .as_ref()
         .map(|error| format!("; response body read failed: {error}"))
         .unwrap_or_default();
     if let Some(error) = read_error {
-        if !overflow {
+        if status.is_success() && !overflow && !provider_rejection {
             if let Some(harness) = harness {
                 harness.provider_failure(&error.to_string())?;
             }
-            return Err(super::observability::DispatchError::from_reqwest(
-                "response read failed",
+            return Err(super::observability::DispatchError::response_read(
+                "request failed reading response",
                 error,
             )
             .into());
@@ -953,13 +1043,18 @@ pub(crate) async fn response(
         ))
         .into());
     }
-    match serde_json::from_slice(&bytes) {
+    match decoded.expect("successful status selects a decoder") {
         Ok(value) => Ok(value),
         Err(error) => {
-            if let Some(harness) = harness {
+            if let Some(harness) = harness.filter(|_| !overflow) {
                 harness.provider_failure(&error.to_string())?;
             }
-            Err(error.into())
+            if read_diagnostic.is_empty() {
+                Err(error)
+            } else {
+                let diagnostic = format!("{error:#}{read_diagnostic}");
+                Err(error.context(diagnostic))
+            }
         }
     }
 }
@@ -1172,6 +1267,119 @@ mod tests {
             .restored_messages()
             .unwrap()
             .is_empty());
+    }
+
+    /// Grounds the response reader's future-drop path with a real socket. The
+    /// write barrier proves the reader consumed the SSE prefix before
+    /// cancellation; the recorded source must retain that exact wire prefix.
+    #[tokio::test]
+    async fn cancelled_response_reader_retains_exact_partial_wire_observation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let config = agent_harness::SessionConfig {
+            max_fetched_bytes: 32 * 1024 * 1024,
+            ..Default::default()
+        };
+        let h = SmartHarness::new(
+            Session::new(config).unwrap(),
+            Arc::new(|_| Box::pin(async { unreachable!("no auxiliary call") })),
+            Default::default(),
+        )
+        .unwrap();
+        h.request(
+            &serde_json::json!({"messages":[{"role":"user","content":"cancel"}]}),
+            "openai",
+        )
+        .unwrap();
+
+        let fragment =
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let (delivered_tx, delivered_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut chunk = [0_u8; 1024];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending request headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                )
+                .await
+                .unwrap();
+            let padding = format!(":{}\n", "x".repeat(64 * 1024 - 2));
+            for _ in 0..256 {
+                socket.write_all(padding.as_bytes()).await.unwrap();
+            }
+            delivered_tx.send(()).unwrap();
+            match socket.read(&mut [0_u8; 1]).await {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                other => panic!("cancelled response socket remained active: {other:?}"),
+            }
+        });
+        let response = reqwest::Client::new().get(uri).send().await.unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut completion = Box::pin(super::super::cancellable(
+            Some(&cancel),
+            response_with_decoder(
+                response,
+                Some(&h),
+                "inference endpoint",
+                decode_openai_response,
+            ),
+        ));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                _ = delivered_rx => {},
+                result = &mut completion => panic!("unfinished response resolved: {result:?}"),
+            }
+        })
+        .await
+        .expect("the partial response must reach the reader");
+        cancel.store(true, Ordering::Relaxed);
+        assert!(completion.await.is_none());
+        tokio::time::timeout(Duration::from_secs(30), server)
+            .await
+            .expect("the server must observe cancellation")
+            .unwrap();
+
+        {
+            let mut state = h.state().unwrap();
+            let reply = state
+                .reply
+                .expect("cancellation must retain an observed reply");
+            let slice = state
+                .session
+                .re_read(&reply.to_string(), 0, fragment.len())
+                .unwrap();
+            assert_eq!(slice["text"], std::str::from_utf8(fragment).unwrap());
+            assert_eq!(slice["offset"], 0);
+            assert_eq!(slice["end"], fragment.len());
+            assert_eq!(slice["complete"], false);
+        }
+        assert_eq!(
+            h.state().unwrap().session.pending_replies().len(),
+            1,
+            "the interrupted wire response must remain pending until cancellation settles it"
+        );
+        let mut reason = None;
+        assert_eq!(cancelled(Some(&h), &mut Some(&mut reason)).unwrap(), "");
+        assert_eq!(reason, Some(crate::TurnEndReason::Cancelled));
+        assert!(
+            h.state().unwrap().session.pending_replies().is_empty(),
+            "the interrupted observation must be settled as cancelled"
+        );
     }
 
     #[tokio::test]

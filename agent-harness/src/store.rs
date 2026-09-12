@@ -22,6 +22,22 @@ pub(crate) struct RunWriter {
     process: u32,
 }
 
+impl Drop for RunWriter {
+    fn drop(&mut self) {
+        // Unix fork duplicates the locked open file description. Closing only
+        // our descriptor can leave its inherited copy holding the lock until
+        // exec/exit. Only the owning process may release the shared lock: a
+        // child's drop must never unlock a still-live parent session.
+        if self.process == std::process::id() {
+            if let Some(file) = &self._file {
+                // Drop cannot report errors; closing the handle still follows.
+                // A failed unlock stays fail-closed until every copy closes.
+                let _ = fs4::FileExt::unlock(file);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PublicationFailure {

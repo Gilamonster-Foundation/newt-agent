@@ -132,3 +132,53 @@ cover committed evidence, recovery admission, and persistence failure. The
 [reusable request-intervention tests](../../agent-harness/tests/request_intervention.rs)
 cover request ownership, fresh restoration, and binding counts to the complete
 request template.
+
+## Streaming and request lifetime
+
+The core OpenAI-compatible tool loop and `LocalVllmBackend` request SSE with
+usage included. `LocalOllamaBackend` requests Ollama's streamed NDJSON and
+requires one JSON object per record and a terminal `done: true` frame. Both
+local decoders retain final usage. An observed provider-error record remains
+authoritative when a later disconnect or idle timeout interrupts the body.
+Separate reasoning deltas stay out of answer text, and the existing inline
+reasoning filter remains in place. The shared SSE decoder assembles tool-call
+fragments with their observed IDs, then sends names and arguments through the
+same validation gate used by complete JSON responses. Empty arguments therefore
+mean `{}` in either transport, while malformed or non-object arguments cannot
+authorize tool execution. The decoder also requires `[DONE]` and a finish reason.
+A server that returns complete JSON instead is decoded once through the existing
+response shape. That fallback does not itself trigger a retry; the existing
+legacy display reissue still applies. Smart mode records the exact received SSE
+bytes before decoding them; the reconstructed message is an interpretation, not
+replacement wire evidence. If cancellation drops an unfinished response reader,
+its already received byte prefix is committed before the synthetic cancellation
+outcome settles that observation.
+
+Core OpenAI-compatible generation uses an idle read timeout configured by
+`inference_timeout_secs` in `[tui]` (default 120 seconds); successful reads reset
+the bound. Counting probes keep their whole-request bound because they return a
+single response. The standalone local backends use `with_timeout(Duration)` for
+both the send/header deadline and maximum idle gap between response chunks.
+Their owned clients use the same read timeout. An injected client retains its
+settings, connection pool, and any stricter deadline. Retry backoff can make the
+whole turn longer than one attempt's bounds.
+
+Cancellation and timeout drop the in-flight request. The
+[socket regressions](../../newt-inference/tests/local_stream_tests.rs) check that
+dropping the future closes an unfinished HTTP/1 connection. A server-side
+generation-slot fixture holds its slot until a streamed write observes that
+close; the `stream: false` control retains the slot until generation is explicitly
+finished. This grounds the disconnect mechanism without claiming that every
+remote service releases its scheduler slot or KV allocation on the same schedule.
+
+Legacy mode retains the optional final-display request after accepting an
+answer. Its existing idle read deadline allows a progressing stream to continue.
+An actual SSE error envelope, including one received before a disconnect or
+without `[DONE]`, preserves the accepted answer; a capacity rejection also records
+`context_exceeded` and updates calibration. Quoting those words in answer text
+is ordinary content. Smart mode continues to omit the extra display request.
+
+The [decoder tests](../../newt-core/src/agentic/openai_sse_strict_tests.rs),
+[primary-loop tests](../../newt-core/src/agentic/mod_tests/openai_primary_stream.rs),
+and [display-loop tests](../../newt-core/src/agentic/mod_tests/http_display_context_exceeded.rs)
+cover these protocol and recovery boundaries without live models.

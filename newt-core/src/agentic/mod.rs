@@ -34,7 +34,7 @@ pub(crate) mod cw_overflow;
 mod display;
 mod generation_policy;
 mod git_tool;
-mod openai_sse;
+pub mod openai_sse;
 pub(crate) mod self_verify;
 // Step 26.4 (#583): scratchpad structured-state — the `scratchpad` context feature.
 pub(crate) mod scratchpad;
@@ -335,7 +335,7 @@ use trim::{
 ///
 /// Local inference keeps the patient seven-attempt policy needed while a DGX
 /// loads or sheds pressure. Hosted requests get one retry: each failed attempt
-/// may already have consumed the full inference deadline and may be billable.
+/// may already have consumed the full configured inference bound and may be billable.
 /// All thresholds remain overridable through the standard `NEWT_HTTP_*` vars.
 fn inference_endpoint_is_owned(endpoint: &str) -> bool {
     let Some(host) = reqwest::Url::parse(endpoint)
@@ -360,9 +360,11 @@ fn inference_progress_label(
     model: &str,
     attempt: u32,
     attempts: u32,
-    deadline_secs: u64,
+    idle_timeout_secs: u64,
 ) -> String {
-    format!("waiting for {model} · attempt {attempt}/{attempts} · {deadline_secs}s deadline…")
+    format!(
+        "waiting for {model} · attempt {attempt}/{attempts} · {idle_timeout_secs}s idle timeout…"
+    )
 }
 
 /// `Authorization: Bearer <key>` as client default headers for the Ollama
@@ -1044,8 +1046,8 @@ pub struct ChatCtx<'a> {
     /// TCP connect timeout. Short (5 s default) so a down endpoint fails fast
     /// rather than blocking the full `inference_timeout_secs`.
     pub connect_timeout_secs: u64,
-    /// Total inference timeout. Must be long enough for the model to generate
-    /// a complete response (120 s default).
+    /// Inference timeout (120 s default): a total bound for single-response
+    /// requests and a maximum idle gap for streamed generation.
     pub inference_timeout_secs: u64,
     /// Message list size at which the agent trims the middle of the in-flight
     /// conversation to prevent context overflow mid-turn.
@@ -1214,8 +1216,8 @@ pub struct ChatCtx<'a> {
     /// caller) ⇒ nothing is recorded — bit-for-bit today's behavior there.
     pub attribution: Option<&'a std::cell::RefCell<crate::attribution::AttributionLedger>>,
     /// User-interrupt flag (Esc / Ctrl-C during a turn). When set mid-turn the
-    /// loop abandons at its next checkpoint — the round-loop top, and the two
-    /// model awaits (the non-streaming probe and the token stream) — and
+    /// loop abandons at its next checkpoint — the round-loop top and provider
+    /// response awaits — and
     /// returns early. `None` (every headless / eval caller) ⇒ no interrupt
     /// path, bit-for-bit today's behavior. The caller owns the `AtomicBool`,
     /// trips it from a keyboard watcher, and inspects it after the call to tell
@@ -5847,6 +5849,17 @@ impl CapExit {
         Ok(())
     }
 
+    fn learn_measurement(&self, state: &mut CompressState) -> anyhow::Result<()> {
+        if let Some(measurement) = *self
+            .prompt_measurement
+            .lock()
+            .map_err(|_| anyhow::anyhow!("optional prompt measurement lock poisoned"))?
+        {
+            measurement.learn(state);
+        }
+        Ok(())
+    }
+
     fn recover_rejection(
         &self,
         result: anyhow::Result<(String, bool, Option<crate::TokenUsage>)>,
@@ -5855,13 +5868,7 @@ impl CapExit {
         round: usize,
         attempt: u32,
     ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
-        if let Some(measurement) = *self
-            .prompt_measurement
-            .lock()
-            .map_err(|_| anyhow::anyhow!("optional prompt measurement lock poisoned"))?
-        {
-            measurement.learn(state);
-        }
+        self.learn_measurement(state)?;
         if let Err(error) = &result {
             if let Some(rejection) = error.downcast_ref::<context_recovery::OptionalRejection>() {
                 context_recovery::terminal_optional(
@@ -5889,8 +5896,39 @@ impl CapExit {
     where
         Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
     {
+        self.finish_with_decoder(
+            endpoint,
+            request,
+            http_error_prefix,
+            estimated_tokens,
+            |bytes| Ok(serde_json::from_slice(bytes)?),
+            extract,
+        )
+        .await
+    }
+
+    async fn finish_with_decoder<Fut>(
+        &self,
+        endpoint: &str,
+        request: impl Fn() -> Fut,
+        http_error_prefix: &str,
+        estimated_tokens: usize,
+        decode: fn(&[u8]) -> anyhow::Result<serde_json::Value>,
+        extract: impl FnOnce(serde_json::Value) -> (String, Option<crate::TokenUsage>),
+    ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)>
+    where
+        Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
+    {
         let retry = tui_retry_policy(endpoint);
-        let result = dispatch_json(&retry, request, http_error_prefix, |_, _, _| {}, None).await;
+        let result = dispatch_with_decoder(
+            &retry,
+            request,
+            http_error_prefix,
+            |_, _, _| {},
+            None,
+            decode,
+        )
+        .await;
         let result = match result {
             Err(error)
                 if crate::retry::classify(&error)
@@ -6081,7 +6119,7 @@ fn enforce_counted_budget(
 /// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
 /// `accumulated` carries usage from the preceding tool-call rounds.
 async fn final_summary_openai(
-    client: &reqwest::Client,
+    clients: (&reqwest::Client, &reqwest::Client),
     chat_url: &str,
     model: &str,
     api_key: Option<&str>,
@@ -6089,6 +6127,7 @@ async fn final_summary_openai(
     generation_policy: generation_policy::GenerationPolicy,
     cap: &CapExit,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
+    let (count_client, stream_client) = clients;
     cap.push_nudge(&mut messages);
     let messages = openai_chat_wire_messages(&messages)?;
     if !cap.fits(&messages, model) {
@@ -6098,14 +6137,16 @@ async fn final_summary_openai(
     let mut body = serde_json::json!({
         "model": model,
         "messages": &messages,
-        "stream": false,
+        "stream": true,
+        "stream_options": {"include_usage": true},
     });
     generation_policy.apply_to_chat_completions_body(&mut body);
-    cap.finish(
+    cap.finish_with_decoder(
         chat_url,
         || async {
             let count =
-                count_openai_request(client, chat_url, api_key, &body, cap.request_budget).await?;
+                count_openai_request(count_client, chat_url, api_key, &body, cap.request_budget)
+                    .await?;
             let estimated_tokens = estimate_tokens(&messages, cap.estimation);
             if let Some(count) = &count {
                 cap.record_measurement(context_recovery::PromptMeasurement {
@@ -6114,7 +6155,7 @@ async fn final_summary_openai(
                 })?;
             }
             enforce_counted_budget(count.as_ref(), cap.request_budget, estimated_tokens)?;
-            let mut req = client.post(chat_url).json(&body);
+            let mut req = stream_client.post(chat_url).json(&body);
             if let Some(key) = api_key {
                 req = req.bearer_auth(key);
             }
@@ -6122,6 +6163,7 @@ async fn final_summary_openai(
         },
         "inference endpoint",
         estimate_tokens(&messages, cap.estimation),
+        smart_harness::decode_openai_response,
         |json| {
             // #385: strip inline <think>…</think> reasoning from the content.
             let (content, _reasoning) = crate::reasoning::split_reasoning(
@@ -6139,9 +6181,8 @@ async fn final_summary_openai(
 /// loop, but over `POST {endpoint}/v1/chat/completions` with bearer auth and
 /// the OpenAI `tool_calls` / `tool_call_id` / `usage` shapes.
 ///
-/// Non-streaming for now — the final answer is returned (and printed by the
-/// caller) rather than streamed token-by-token. Token-by-token SSE streaming
-/// is a follow-up; functionally the loop is complete, including tools.
+/// Primary requests stream on the transport and are validated before tools
+/// execute. Accepted final answers retain the existing display reissue.
 pub async fn openai_chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
@@ -6310,8 +6351,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // crosses the deadline (the DGX retry-storm wedge the Ollama path already
     // learned). An IDLE `read_timeout` caps the gap BETWEEN chunks and resets
     // on every token, so a stream runs as long as it keeps producing while a
-    // genuinely stalled connection still bails. The one-shot `stream:false`
-    // probe keeps `client` — a total bound is right for a single response.
+    // genuinely stalled connection still bails. Counting probes keep `client`;
+    // every streamed generation uses `stream_client`.
     let stream_client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
         .read_timeout(std::time::Duration::from_secs(inference_timeout_secs))
@@ -6805,7 +6846,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 "messages": wire_messages,
                 "tools": tools.clone(),
                 "tool_choice": "auto",
-                "stream": false,
+                "stream": true,
+                "stream_options": {"include_usage": true},
             });
             generation_policy.apply_to_chat_completions_body(&mut body);
             // Drop tools (and the now-meaningless tool_choice) for a model that
@@ -6851,7 +6893,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     }
                     async {
                         let mut req = smart_harness::request(
-                            client.post(&chat_url),
+                            stream_client.post(&chat_url),
                             &body,
                             smart_harness,
                             "openai",
@@ -6895,7 +6937,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 e,
                             ))
                         })?;
-                        smart_harness::response(resp, smart_harness, "inference endpoint").await
+                        smart_harness::response_with_decoder(
+                            resp,
+                            smart_harness,
+                            "inference endpoint",
+                            smart_harness::decode_openai_response,
+                        )
+                        .await
                     }
                 },
                 |attempt, delay, error| {
@@ -6908,8 +6956,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     }
                     print_retry_indicator(attempt, retry.max_retries, delay, error, color);
                 },
-            )
-            .await;
+            );
+            let dispatch = cancellable(cancel, dispatch).await;
             thought_for = spinner
                 .as_ref()
                 .map_or(std::time::Duration::ZERO, crate::tty::Spinner::elapsed);
@@ -6925,6 +6973,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 cal = compress_state.calibration.ratio(estimate_ratio);
                 tool_tokens_real = calibrate_up(tool_tokens, cal);
             }
+            let Some(dispatch) = dispatch else {
+                return Ok((
+                    smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                    false,
+                    accumulated_usage,
+                    hallucination_count,
+                ));
+            };
             match dispatch {
                 Ok(j) => break (j, round_est_raw),
                 Err(e) => {
@@ -7238,10 +7294,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 color,
             );
         }
-        // …and now SHOW it. This wire is non-streaming (`"stream": false`
-        // above), so until this the operator's only evidence a thinking model
-        // had reasoned at all was a `--debug` line counting the characters it
-        // threw away. On a reasoning model that is most of what the turn did.
+        // Show reasoning after the primary SSE response has been validated.
+        // Transport streaming keeps cancellation effective; this fold retains
+        // the existing presentation after a complete tool/answer decision.
         //
         // Same fold as the streaming path and as a tool result: the first
         // `spill_lines` rows commit, the rest are retained behind
@@ -7729,10 +7784,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // gates above, every one of which can `continue 'round_loop`: a
             // re-issue placed before them would pay for a streamed answer the
             // harness then throws away, double-billing every nudged round.
-            // The body is the probe's body with the stream flag flipped, so
-            // the second call sees the identical prompt (same tools, same
-            // policy) and is likely to reproduce the same answer from the
-            // same prefix.
+            // The reissue retains the primary request's prompt, tools and
+            // generation policy, with the existing idle timeout for display.
             let stream_wire_messages = openai_chat_wire_messages(&messages)?;
             let stream_estimate = estimate_request_tokens(
                 &stream_wire_messages,
@@ -8270,16 +8323,24 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         ollama_num_ctx: None,
         prompt_measurement: Default::default(),
     };
-    let result = final_summary_openai(
-        &client,
+    let summary = final_summary_openai(
+        (&client, &stream_client),
         &chat_url,
         model,
         api_key,
         trimmed,
         generation_policy,
         &cap,
-    )
-    .await;
+    );
+    let Some(result) = cancellable(cancel, summary).await else {
+        cap.learn_measurement(compress_state)?;
+        return Ok((
+            smart_harness::cancelled(smart_harness, &mut end_reason)?,
+            false,
+            accumulated_usage,
+            hallucination_count,
+        ));
+    };
     let (text, streamed, usage) = cap.recover_rejection(
         result,
         &mut solve_obs,
@@ -8645,7 +8706,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         task,
         workspace,
         color,
-        // Unlike the non-streaming OpenAI path, this loop streams natively —
+        // Like the OpenAI-compatible path, this loop streams natively —
         // the caller-resolved markdown decision drives the live writer.
         markdown,
         tool_offload,
@@ -10650,6 +10711,28 @@ async fn dispatch_json<Fut>(
 where
     Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
 {
+    dispatch_with_decoder(
+        retry,
+        request,
+        http_error_prefix,
+        on_retry,
+        smart_harness,
+        |bytes| Ok(serde_json::from_slice(bytes)?),
+    )
+    .await
+}
+
+async fn dispatch_with_decoder<Fut>(
+    retry: &RetryPolicy,
+    request: impl Fn() -> Fut,
+    http_error_prefix: &str,
+    on_retry: impl FnMut(u32, std::time::Duration, &anyhow::Error),
+    smart_harness: Option<&smart_harness::SmartHarness>,
+    decode: fn(&[u8]) -> anyhow::Result<serde_json::Value>,
+) -> anyhow::Result<serde_json::Value>
+where
+    Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
+{
     with_backoff_notify_error(
         retry,
         || async {
@@ -10660,7 +10743,8 @@ where
                     e,
                 ))
             })?;
-            smart_harness::response(resp, smart_harness, http_error_prefix).await
+            smart_harness::response_with_decoder(resp, smart_harness, http_error_prefix, decode)
+                .await
         },
         on_retry,
     )
@@ -12424,7 +12508,7 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     );
     let cols = display::term_cols();
     let mut sink = AnswerSink::Raw(out);
-    let mut acc = openai_sse::SseAccumulator::new();
+    let mut acc = openai_sse::SseAccumulator::new_with_provider_errors();
     // #385, on this wire: the non-streaming arm of this same loop runs every
     // reply through `split_reasoning`, so an inline `<think>` block never
     // reaches the answer. The streamed arm has to hold the identical line, or
@@ -12439,7 +12523,7 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     // The bytes of a character that has only half arrived. See `decode_chunk`.
     let mut carry: Vec<u8> = Vec::new();
     let mut resp = resp;
-    while !acc.is_done() {
+    while !acc.is_done() && !acc.has_provider_error() {
         match cancellable(cancel, resp.chunk()).await {
             // Interrupted: stop reading and keep what already streamed. Record
             // WHOSE stop this was — a cut socket and a keypress both end the
@@ -12491,7 +12575,24 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     }
     drop(spinner.take());
     let mut out = sink.end(started);
-    let round = acc.finish();
+    let (round, provider_error) = acc.finish_with_error();
+    if !interrupted {
+        if let Some(error) = provider_error {
+            if started {
+                display::write_harness_notice(
+                    &mut out,
+                    "stream rejected the request — the complete answer follows",
+                    color,
+                );
+            }
+            return if crate::retry::classify(&error) == crate::retry::Retryability::ContextExceeded
+            {
+                StreamOutcome::ContextExceeded(round.usage)
+            } else {
+                StreamOutcome::UseProbe(round.usage)
+            };
+        }
+    }
     if text.is_empty() {
         // Nothing reached the terminal, so an interrupt here ends the turn
         // rather than printing the probe answer the operator just stopped.

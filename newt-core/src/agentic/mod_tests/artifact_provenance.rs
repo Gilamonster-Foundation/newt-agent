@@ -1,4 +1,5 @@
 use super::*;
+use crate::agentic::http_loop_tests::DisplayReplay;
 use crate::caveats::{Caveats, CountBound, Scope};
 use crate::{BackendKind, MemMessage};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -101,16 +102,9 @@ fn ctx<'a>(
     }
 }
 
-/// #123: the streaming re-issue of an ALREADY-ACCEPTED OpenAI round. It is
-/// not a new round — it re-serves the same answer over SSE — so a responder
-/// answers it WITHOUT advancing its round counter, and a `requests` assertion
-/// keeps counting model rounds rather than HTTP requests.
-fn is_stream(req: &Request) -> bool {
-    body_json(req)["stream"].as_bool().unwrap_or(false)
-}
-
 fn sse_replay(text: &str) -> ResponseTemplate {
-    let frame = serde_json::json!({"choices": [{"delta": {"content": text}}]});
+    let frame =
+        serde_json::json!({"choices": [{"delta": {"content": text}, "finish_reason": "stop"}]});
     let body = format!("data: {frame}\n\ndata: [DONE]\n\n");
     ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream")
 }
@@ -250,11 +244,12 @@ async fn ollama_advertises_artifact_read_and_records_plan_provenance() {
 struct OpenAiPlanResponder {
     requests: Arc<AtomicUsize>,
     artifact_read_seen: Arc<AtomicBool>,
+    replay: DisplayReplay,
 }
 
 impl Respond for OpenAiPlanResponder {
     fn respond(&self, req: &Request) -> ResponseTemplate {
-        if is_stream(req) {
+        if self.replay.take(req) {
             return sse_replay("retry plan provenance captured");
         }
         let body = body_json(req);
@@ -275,6 +270,7 @@ impl Respond for OpenAiPlanResponder {
                 "usage": {"prompt_tokens": 20, "completion_tokens": 3}
             }))
         } else {
+            self.replay.arm(req);
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{"message": {
                     "role": "assistant",
@@ -296,6 +292,7 @@ async fn openai_chat_records_harness_retry_against_submitted_not_active_prompt()
         .respond_with(OpenAiPlanResponder {
             requests: requests.clone(),
             artifact_read_seen: artifact_read_seen.clone(),
+            replay: Default::default(),
         })
         .mount(&server)
         .await;
@@ -435,17 +432,19 @@ struct OpenAiScriptResponder {
     requests: Arc<AtomicUsize>,
     first_message: serde_json::Value,
     final_text: &'static str,
+    replay: DisplayReplay,
 }
 
 impl Respond for OpenAiScriptResponder {
     fn respond(&self, req: &Request) -> ResponseTemplate {
-        if is_stream(req) {
+        if self.replay.take(req) {
             return sse_replay(self.final_text);
         }
         let round = self.requests.fetch_add(1, Ordering::SeqCst);
         let message = if round == 0 {
             self.first_message.clone()
         } else {
+            self.replay.arm(req);
             serde_json::json!({"role": "assistant", "content": self.final_text})
         };
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -480,6 +479,7 @@ async fn successful_builtin_write_records_digest_only_file_change() {
                 }]
             }),
             final_text: "file provenance captured",
+            replay: Default::default(),
         })
         .mount(&server)
         .await;
@@ -584,6 +584,7 @@ async fn invalid_plan_and_declined_write_record_no_artifacts() {
                 ]
             }),
             final_text: "nothing was recorded",
+            replay: Default::default(),
         })
         .mount(&server)
         .await;

@@ -7692,7 +7692,8 @@ fn connect_timeout_secs(cfg: &newt_core::Config) -> u64 {
         .unwrap_or(5)
 }
 
-/// Full inference timeout from `[tui].inference_timeout_secs` (default 120).
+/// Total single-response / streamed idle timeout from
+/// `[tui].inference_timeout_secs` (default 120).
 fn inference_timeout_secs(cfg: &newt_core::Config) -> u64 {
     cfg.tui
         .as_ref()
