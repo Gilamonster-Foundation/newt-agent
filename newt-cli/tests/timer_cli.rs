@@ -27,19 +27,24 @@ const NEMOTRON_MODEL: &str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16";
 /// the headless solve completes in one round.
 struct CaptureThenFinish {
     requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    pending_replay: Mutex<Option<Vec<u8>>>,
 }
 
 impl Respond for CaptureThenFinish {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body: serde_json::Value =
             serde_json::from_slice(&request.body).expect("chat request is JSON");
-        // #123: the accepted round is re-issued with `stream: true` so the
-        // answer arrives live. It re-asks a question already answered, so it
-        // is served as SSE and NOT recorded — these tests count model ROUNDS
-        // (and read the prompt off each one), which a second copy of the same
-        // messages would double.
-        if body["stream"].as_bool().unwrap_or(false) {
-            let frame = serde_json::json!({"choices": [{"delta": {"content": "done"}}]});
+        // Both primary and display requests stream. Consume only the exact
+        // request following a terminal answer as its one optional display;
+        // changed self-verification prompts and later timers remain rounds.
+        let replaying = self
+            .pending_replay
+            .lock()
+            .expect("replay lock")
+            .take()
+            .is_some_and(|prior| body["stream"] == true && prior == request.body);
+        if replaying {
+            let frame = serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]});
             let sse = format!("data: {frame}\n\ndata: [DONE]\n\n");
             return ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream");
         }
@@ -47,6 +52,7 @@ impl Respond for CaptureThenFinish {
             .lock()
             .expect("request capture lock")
             .push(body);
+        *self.pending_replay.lock().expect("replay lock") = Some(request.body.clone());
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "model": NEMOTRON_MODEL,
             "choices": [{
@@ -126,6 +132,7 @@ async fn fire_run_reaches_solve_entry_point() {
         .and(path("/v1/chat/completions"))
         .respond_with(CaptureThenFinish {
             requests: requests.clone(),
+            pending_replay: Default::default(),
         })
         .mount(&server)
         .await;
@@ -202,6 +209,7 @@ async fn fire_run_drains_all_due_timers() {
         .and(path("/v1/chat/completions"))
         .respond_with(CaptureThenFinish {
             requests: requests.clone(),
+            pending_replay: Default::default(),
         })
         .mount(&server)
         .await;
@@ -301,6 +309,7 @@ async fn a_scheduled_turn_is_not_exempt_from_the_self_verify_gate() {
         .and(path("/v1/chat/completions"))
         .respond_with(CaptureThenFinish {
             requests: requests.clone(),
+            pending_replay: Default::default(),
         })
         .mount(&server)
         .await;

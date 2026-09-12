@@ -5,11 +5,12 @@ struct OpenAiReasoningOverflowResponder {
     second_request: Arc<Mutex<Option<serde_json::Value>>>,
     overflow_twice: bool,
     inline_reasoning: bool,
+    replay: DisplayReplay,
 }
 
 impl Respond for OpenAiReasoningOverflowResponder {
     fn respond(&self, req: &Request) -> ResponseTemplate {
-        if is_stream(req) {
+        if self.replay.take(req) {
             return sse_replay("completed after bounded continuation");
         }
         let round = self.round.fetch_add(1, Ordering::SeqCst);
@@ -37,6 +38,7 @@ impl Respond for OpenAiReasoningOverflowResponder {
                 "usage": {"prompt_tokens": 20, "completion_tokens": 8}
             }));
         }
+        self.replay.arm(req);
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "choices": [{
                 "finish_reason": "stop",
@@ -59,6 +61,7 @@ async fn openai_reasoning_overflow_continues_once_with_the_current_plan() {
         second_request: second_request.clone(),
         overflow_twice: false,
         inline_reasoning: false,
+        replay: Default::default(),
     };
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -132,6 +135,7 @@ async fn openai_reasoning_overflow_stops_after_one_failed_continuation() {
             second_request,
             overflow_twice: true,
             inline_reasoning: false,
+            replay: Default::default(),
         })
         .expect(2)
         .mount(&server)
@@ -176,6 +180,7 @@ async fn openai_inline_reasoning_overflow_uses_the_same_bounded_continuation() {
             second_request: second_request.clone(),
             overflow_twice: false,
             inline_reasoning: true,
+            replay: Default::default(),
         })
         // Two model rounds + the #123 streaming re-issue of the second one.
         .expect(3)

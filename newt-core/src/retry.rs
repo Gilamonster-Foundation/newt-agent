@@ -105,15 +105,24 @@ fn status_code_in(msg: &str) -> Option<u16> {
 /// Read an HTTP body while retaining bytes observed before any read failure.
 /// Callers must inspect the error as well as the body: a server may report a
 /// capacity rejection and then disconnect before completing its HTTP frame.
-pub async fn read_response_bytes(
-    mut response: reqwest::Response,
-) -> (Vec<u8>, Option<reqwest::Error>) {
+pub async fn read_response_bytes(response: reqwest::Response) -> (Vec<u8>, Option<reqwest::Error>) {
     let mut bytes = Vec::new();
+    let error = read_response_bytes_into(response, &mut bytes).await;
+    (bytes, error)
+}
+
+/// Append observed body bytes to caller-owned storage. Keeping the buffer
+/// outside this future preserves evidence when a host deadline cancels the
+/// read; dropping the future still releases the in-flight HTTP response.
+pub async fn read_response_bytes_into(
+    mut response: reqwest::Response,
+    bytes: &mut Vec<u8>,
+) -> Option<reqwest::Error> {
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => bytes.extend_from_slice(&chunk),
-            Ok(None) => return (bytes, None),
-            Err(error) => return (bytes, Some(error)),
+            Ok(None) => return None,
+            Err(error) => return Some(error),
         }
     }
 }
@@ -202,9 +211,9 @@ impl RetryPolicy {
 
     /// A bounded policy for paid / hosted inference endpoints.
     ///
-    /// A hosted request can consume the full inference deadline before it
-    /// fails. Reusing the seven-attempt home-lab policy therefore turns a
-    /// 120-second timeout into roughly fifteen minutes of duplicate requests.
+    /// A hosted request can consume the full configured inference bound before
+    /// it fails. Reusing the seven-attempt local policy therefore turns a
+    /// 120-second bound into roughly fifteen minutes of duplicate requests.
     /// One retry still absorbs a transient edge failure without creating that
     /// retry storm. Environment overrides remain authoritative.
     pub fn for_hosted_inference() -> Self {

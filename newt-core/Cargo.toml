@@ -212,7 +212,7 @@ tests-pty.workspace = true
 # silent agreement.
 blake3 = "1"
 tempfile = "3"
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 # The store integration tests (tests/store.rs) open conversations.db
 # directly to tamper with rows / build drifted schemas — exercising the
 # §6 chain-integrity detection and the schema-diff migration. Same crate

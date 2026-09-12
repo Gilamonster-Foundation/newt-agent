@@ -34,7 +34,8 @@ fn success(delay: Duration) -> ResponseTemplate {
         .set_delay(delay)
         .set_body_json(serde_json::json!({
             "model": "test-model",
-            "message": { "role": "assistant", "content": "done" }
+            "message": { "role": "assistant", "content": "done" },
+            "done": true
         }))
 }
 
@@ -132,7 +133,7 @@ async fn held_response_backend(
                 let (release, released) = tokio::sync::oneshot::channel();
                 arrived.send(release).unwrap();
                 released.await.unwrap();
-                let body = r#"{"model":"test-model","message":{"role":"assistant","content":"done"}}"#;
+                let body = r#"{"model":"test-model","message":{"role":"assistant","content":"done"},"done":true}"#;
                 request
                     .get_mut()
                     .write_all(

@@ -13,7 +13,7 @@ async fn run_openai_script_with_cap(
         .respond_with(ScriptedOpenAi {
             round: round.clone(),
             script,
-            last_content: Default::default(),
+            pending_replay: Default::default(),
         })
         .mount(&server)
         .await;
@@ -190,7 +190,7 @@ async fn accepted_narration_reports_cap_exhausted_end_reason() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ScriptedOpenAi {
-            last_content: Default::default(),
+            pending_replay: Default::default(),
             round: round.clone(),
             script: vec![
                 serde_json::json!({ "content": "Let me keep editing now." }),
@@ -222,7 +222,7 @@ async fn readonly_completion_retries_an_unfinished_promise_without_action_author
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ScriptedOpenAi {
-            last_content: Default::default(),
+            pending_replay: Default::default(),
             round: round.clone(),
             script: vec![
                 serde_json::json!({"tool_calls": [{"id": "read_evidence", "function": {
@@ -303,7 +303,7 @@ async fn readonly_completion_repeated_promise_hands_back_unresolved_with_bounded
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ScriptedOpenAi {
-                last_content: Default::default(),
+                pending_replay: Default::default(),
                 round: round.clone(),
                 script: vec![serde_json::json!({"content": promise})],
             })
@@ -352,7 +352,7 @@ async fn readonly_completion_accepts_answers_questions_and_blockers_without_retr
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ScriptedOpenAi {
-                last_content: Default::default(),
+                pending_replay: Default::default(),
                 round: round.clone(),
                 script: vec![serde_json::json!({"content": answer})],
             })
@@ -508,7 +508,7 @@ async fn genuine_completion_reports_completed_end_reason() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ScriptedOpenAi {
-            last_content: Default::default(),
+            pending_replay: Default::default(),
             round: round.clone(),
             script: vec![serde_json::json!({ "content": "The capital of France is Paris." })],
         })
