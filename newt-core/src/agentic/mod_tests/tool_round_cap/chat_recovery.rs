@@ -1,10 +1,9 @@
 use super::*;
 
 /// A `recover_cw_400` hook for the chat-path cw-400 recovery tests. It
-/// parses nothing — it unconditionally reports a roomy recovered input cap
-/// so the loop's compress-and-retry path fires: the small test history
-/// easily fits the recovered budget, so compaction does not refuse and the
-/// SAME logical round is retried in place (#1528, chat-path parity).
+/// parses nothing — it unconditionally reports a recovered input cap. The
+/// removable fixture history forces a strictly smaller request before the
+/// SAME logical round is retried in place (#1528, #2268, chat-path parity).
 fn recover_cw_400_to_40k(_e: &anyhow::Error, _model: &str, _today: &str) -> Option<u32> {
     Some(40_000)
 }
@@ -59,12 +58,7 @@ async fn openai_chat_cw_400_recovery_retries_the_same_logical_round_with_tools()
         .await;
 
     let task = "SAME ROUND: recovery must not burn the only tool round";
-    let messages = vec![
-        MemMessage::system("base policy"),
-        MemMessage::user("historical A"),
-        MemMessage::assistant("A done"),
-        MemMessage::user(task),
-    ];
+    let messages = overflowing_responses_history(task);
     let caveats = Caveats::top();
     let uri = server.uri();
     let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
@@ -89,6 +83,10 @@ async fn openai_chat_cw_400_recovery_retries_the_same_logical_round_with_tools()
     let body = |i: usize| -> serde_json::Value {
         serde_json::from_slice(&reqs[i].body).unwrap_or_default()
     };
+    assert!(
+        body(1)["messages"].to_string().len() < body(0)["messages"].to_string().len(),
+        "recovery must shrink the request before retrying the same logical round"
+    );
     assert!(
         body(1)["tools"].is_array(),
         "the RECOVERED request must still carry tools — a real tool round, not the summary"
@@ -117,12 +115,7 @@ async fn openai_chat_cw_400_recovery_is_bounded() {
         .await;
 
     let task = "BOUNDED (chat): never loop forever on a persistent 400";
-    let messages = vec![
-        MemMessage::system("base policy"),
-        MemMessage::user("historical A"),
-        MemMessage::assistant("A done"),
-        MemMessage::user(task),
-    ];
+    let messages = overflowing_responses_history(task);
     let caveats = Caveats::top();
     let uri = server.uri();
     let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
@@ -135,6 +128,13 @@ async fn openai_chat_cw_400_recovery_is_bounded() {
     openai_chat_complete(ctx, &mut NoMcp)
         .await
         .expect_err("a persistent chat cw-400 surfaces after the bounded retries");
+    let reqs = server.received_requests().await.expect("requests recorded");
+    assert_eq!(reqs.len(), 3, "initial request plus two shrink attempts");
+    assert!(reqs.windows(2).all(|pair| {
+        let previous: serde_json::Value = serde_json::from_slice(&pair[0].body).unwrap();
+        let next: serde_json::Value = serde_json::from_slice(&pair[1].body).unwrap();
+        next["messages"].to_string().len() < previous["messages"].to_string().len()
+    }));
     // `.expect(3)` verified on drop: initial + exactly 2 recoveries.
 }
 
@@ -186,12 +186,7 @@ async fn ollama_chat_cw_400_recovery_retries_the_same_logical_round_with_tools()
         .await;
 
     let task = "SAME ROUND: Ollama recovery must not burn the only tool round";
-    let messages = vec![
-        MemMessage::system("base policy"),
-        MemMessage::user("historical A"),
-        MemMessage::assistant("A done"),
-        MemMessage::user(task),
-    ];
+    let messages = overflowing_responses_history(task);
     let caveats = Caveats::top();
     let uri = server.uri();
     let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Ollama);
@@ -216,6 +211,10 @@ async fn ollama_chat_cw_400_recovery_retries_the_same_logical_round_with_tools()
     let body = |i: usize| -> serde_json::Value {
         serde_json::from_slice(&reqs[i].body).unwrap_or_default()
     };
+    assert!(
+        body(1)["messages"].to_string().len() < body(0)["messages"].to_string().len(),
+        "recovery must shrink the request before retrying the same logical round"
+    );
     assert!(
         body(1)["tools"].is_array(),
         "the RECOVERED request must still carry tools — a real tool round, not the summary"

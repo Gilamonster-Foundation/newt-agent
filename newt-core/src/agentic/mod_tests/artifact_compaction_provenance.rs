@@ -477,9 +477,9 @@ async fn automatic_compaction_records_one_checkpoint_after_installing_summary() 
 }
 
 /// First probe + stream are both empty at the synthetic 85%-of-window mark.
-/// The working set itself fits the retry compressor's target, so the loop must
-/// take its one structural fallback and the next provider request must see the
-/// pruned tool result.
+/// A usable report calibrates the retry compressor; a report at the requested
+/// num_ctx is truncation-suspect and leaves the cold prior intact. Both routes
+/// must record exactly one checkpoint and send the pruned tool result.
 struct SilentOverflowFallbackResponder {
     probes: Arc<AtomicUsize>,
     pruned_request_seen: Arc<AtomicBool>,
@@ -530,6 +530,15 @@ impl Respond for SilentOverflowFallbackResponder {
 
 #[tokio::test]
 async fn ollama_silent_overflow_structural_fallback_records_one_checkpoint() {
+    assert_silent_overflow_checkpoint(Some(85_000), "silent_overflow_structural_fallback").await;
+}
+
+#[tokio::test]
+async fn ollama_silent_overflow_calibrated_recovery_records_one_checkpoint() {
+    assert_silent_overflow_checkpoint(None, "silent_overflow_recovery").await;
+}
+
+async fn assert_silent_overflow_checkpoint(num_ctx: Option<u32>, reason: &str) {
     let server = MockServer::start().await;
     let probes = Arc::new(AtomicUsize::new(0));
     let pruned_request_seen = Arc::new(AtomicBool::new(false));
@@ -551,10 +560,10 @@ async fn ollama_silent_overflow_structural_fallback_records_one_checkpoint() {
         crate::TurnPromptContext::ephemeral_operator("silent-overflow-artifacts", TASK, TASK);
     let artifacts = SessionArtifactStore::new("silent-overflow-artifacts").unwrap();
     let mut c = ctx(&uri, &messages, &caveats);
-    // A high window leaves the retry compressor's target much larger than the
-    // local message estimate. The fake 85k provider report is therefore what
-    // drives the silent-overflow path, while `compress` itself returns Fit.
+    // A truncation-suspect count cannot calibrate the estimate, so only that
+    // case leaves the roomy cold target at Fit and exercises structural fallback.
     c.safe_context = Some(100_000);
+    c.num_ctx = num_ctx;
 
     let (reply, _, _, _) = chat_complete_with_prompt_and_artifacts(
         c,
@@ -578,10 +587,5 @@ async fn ollama_silent_overflow_structural_fallback_records_one_checkpoint() {
         "the request after fallback must contain the structurally pruned tool result; log={:?}",
         request_log.lock().unwrap()
     );
-    assert_one_checkpoint(
-        &artifacts,
-        &turn,
-        "pruned",
-        "silent_overflow_structural_fallback",
-    );
+    assert_one_checkpoint(&artifacts, &turn, "pruned", reason);
 }

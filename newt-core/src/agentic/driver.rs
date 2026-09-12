@@ -32,11 +32,10 @@
 //! a **headless** `ChatCtx` from a clone of the config plus a snapshot of the
 //! transcript, `block_on`s one turn against [`NoMcp`] (raced against a cancel
 //! signal), and sends the result back over a [`oneshot`] channel. The
-//! session-bound `Option` fields (`note_sink`, `recall_source`, `summarizer`,
-//! `compress_state`, …) are all `None` here: a cowork turn is a clean drive,
-//! exactly like the ACP worker / `newt-eval` headless callers. Compression and
-//! budget logic are untouched — the driver wraps `chat_complete`, it does not
-//! reach inside it.
+//! session-bound service fields (`note_sink`, `recall_source`, `summarizer`, …)
+//! stay absent. Compression accounting and measured token calibration belong
+//! to the driver session, shared across its worker threads, so an observed
+//! under-count still tightens the next submitted turn's budget.
 //!
 //! Running on its own thread also means the driver does **not** require the
 //! consumer to call from inside a tokio runtime — a plain `crossterm` loop can
@@ -94,8 +93,9 @@ impl std::fmt::Debug for HeadlessCodeSearch {
 /// spawned turn task so nothing borrows across the async boundary.
 ///
 /// The fields mirror the inference-relevant subset of [`ChatCtx`]; the
-/// session-bound `&mut` handles (note sink, recall, permission gate, summarizer,
-/// compress state) are intentionally absent — a driven cowork turn is headless.
+/// session-bound `&mut` service handles (note sink, recall, permission gate,
+/// summarizer) are intentionally absent. Runtime compression state is owned
+/// separately by the driver and shared across its submitted turns.
 #[derive(Debug, Clone)]
 pub struct TurnDriverConfig {
     /// Shared accounted session and independent narration adjudicator.
@@ -308,6 +308,7 @@ struct HeadlessRuntimePosture {
     cognition: Option<crate::role_profile::Cognition>,
     tenacity: crate::tenacity::Tenacity,
     crew_runner: Option<Arc<dyn CrewRunner>>,
+    compress_state: Arc<tokio::sync::Mutex<super::CompressState>>,
 }
 
 impl HeadlessRuntimePosture {
@@ -316,6 +317,7 @@ impl HeadlessRuntimePosture {
             cognition: crate::cognition::effective_cognition(),
             tenacity: crate::tenacity::effective_tenacity(),
             crew_runner: None,
+            compress_state: Arc::new(tokio::sync::Mutex::new(super::CompressState::new())),
         }
     }
 }
@@ -555,6 +557,10 @@ async fn run_one_turn(
     // compaction / spill paths (which funnel through `redact_secrets`, not the
     // explicit `disclosure` param) value-filter against the same secret.
     let _disclosure_guard = crate::ocap::scoped_session_disclosure(session_disclosure.clone());
+    // A driver permits one active turn. Holding the shared state through this
+    // future keeps learned usage on success, errors, and cancellation alike;
+    // dropping the future releases the guard before the next worker starts.
+    let mut compress_state = runtime.compress_state.lock().await;
     let ctx = ChatCtx {
         smart_harness: config.smart_harness.as_deref(),
         rewrites_history: config.context_manager.rewrites_history(),
@@ -634,23 +640,21 @@ async fn run_one_turn(
         max_ok_input: config.max_ok_input,
         build_check_cmd: config.build_check_cmd.clone(),
         safe_context: config.safe_context,
-        // Numbered context recovery is stateless and shared with the TUI; the
-        // remaining session-bound seams stay absent in this driven cowork.
+        // Numbered context recovery is stateless and shared with the TUI.
         recover_cw_400: Some(super::recover_context_window_400),
         note_sink: None,
         note_nudge: None,
         recall_source: None,
         memory_source: None,
         summarizer: None,
-        compress_state: None,
+        compress_state: Some(&mut compress_state),
         tool_events: Some(&mut tool_events),
         phantom_reaches: None,
         end_reason: Some(&mut end_reason),
         solve_obs: Some(&mut solve_obs),
         permission_gate: None,
-        // Phase 20 (spec §5): headless surfaces neither read nor write the
-        // capability cache — the hook stays absent and no calibration is
-        // applied, preserving today's behavior exactly.
+        // Headless surfaces do not use the TUI capability cache. Same-request
+        // usage still calibrates this driver's session through compress_state.
         on_round_usage: None,
         estimate_ratio: None,
         estimation: config.estimation,
@@ -729,6 +733,10 @@ pub enum TurnDriverError {
     #[error("a turn is already in flight — poll() for it or cancel() before submitting another")]
     Busy,
 }
+
+#[cfg(test)]
+#[path = "driver_calibration_tests.rs"]
+mod calibration_tests;
 
 #[cfg(test)]
 mod tests {

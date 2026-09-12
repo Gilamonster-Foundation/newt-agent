@@ -125,8 +125,10 @@ pub fn terminal(
     }
 }
 
-/// The contract record's `outcome` — **exactly the five values `CONTRACT.md`
-/// defines**, and no others. The bench's `Outcome` is a CLOSED serde enum with
+/// The contract record's `outcome` — the closed set pinned in
+/// `contract/bench_outcome_values_v1.txt`. #2268 adds `context_exceeded` as an
+/// explicit extension that requires a matching bench consumer update.
+/// The bench's `Outcome` is a CLOSED serde enum with
 /// no `serde(other)` (`gilamonster-bench/src/contract.rs:20`), so an unknown
 /// value does not deserialize: the run does not score badly, it DROPS OUT of
 /// the matrix. #2215 emitted `round_cap` here and silently deleted rows.
@@ -169,6 +171,7 @@ pub fn outcome_label(t: Terminal) -> &'static str {
         // new one fails to compile rather than inheriting a bucket.
         Terminal::StoppedShort(TurnEndReason::Completed | TurnEndReason::Failed) => "harness_error",
         Terminal::Failed(Some(ErrorClass::Model)) => "model_error",
+        Terminal::Failed(Some(ErrorClass::ContextExceeded)) => "context_exceeded",
         Terminal::Failed(Some(ErrorClass::Transport)) => "transport_error",
         Terminal::Failed(Some(ErrorClass::Timeout)) => "timeout",
         Terminal::Failed(Some(ErrorClass::Harness) | None) => "harness_error",
@@ -384,6 +387,7 @@ mod tests {
         ErrorClass::Transport,
         ErrorClass::Timeout,
         ErrorClass::Harness,
+        ErrorClass::ContextExceeded,
     ];
 
     fn error_class_index(c: ErrorClass) -> usize {
@@ -392,6 +396,7 @@ mod tests {
             ErrorClass::Transport => 1,
             ErrorClass::Timeout => 2,
             ErrorClass::Harness => 3,
+            ErrorClass::ContextExceeded => 4,
         }
     }
 
@@ -564,6 +569,8 @@ mod tests {
     /// pinned exactly rather than merely non-empty. A silent edit — adding a
     /// value to make a failing case pass — is the failure mode the file exists
     /// to prevent, and changing this list is how a reviewer is made to look.
+    /// #2268 authorizes `context_exceeded` explicitly; the file documents the
+    /// still-required matching consumer update rather than claiming it ran.
     #[test]
     fn the_checked_in_permitted_set_matches_contract_version_one() {
         assert_eq!(
@@ -573,12 +580,13 @@ mod tests {
                 "model_error",
                 "transport_error",
                 "timeout",
-                "harness_error"
+                "harness_error",
+                "context_exceeded"
             ],
-            "the checked-in copy of gilamonster-bench's `Outcome` changed. That \
-             is a deliberate act tracking an upstream contract change, not a \
-             way to make a test pass — re-read `gilamonster-bench/src/\
-             contract.rs` and confirm `contract_version` before editing this."
+            "the declared gilamonster-bench `Outcome` set changed. That requires \
+             an explicit contract decision and a coordinated consumer update, \
+             not a way to make a test pass — re-read gilamonster-bench/src/\
+             contract.rs and confirm contract_version before editing this."
         );
     }
 
@@ -805,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn smart_harness_configuration_is_declared_without_changing_the_outcome_vocabulary() {
+    fn smart_harness_configuration_is_declared_with_a_permitted_v1_outcome() {
         let manifest = serde_json::json!({"head":"retained-head", "invocation_mode":"fresh", "configuration":{"auxiliary":{"placement":"cpu","max_calls":4}}});
         let mut inputs = inputs();
         inputs.smart_harness = Some(&manifest);
@@ -840,3 +848,7 @@ mod tests {
         assert!(contract_record(&i)["timing"].get("tok_s").is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "solve_contract_context_tests.rs"]
+mod context_tests;

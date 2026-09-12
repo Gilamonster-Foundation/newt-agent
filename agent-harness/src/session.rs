@@ -1089,21 +1089,28 @@ impl Session {
             self.events[&entry.event].body().origin == EventOrigin::Operator
                 && tool_pairs(message).is_empty()
         });
+        let is_tool_result = |message: &Value| {
+            crate::projection::role(message) == "tool"
+                || message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| items.iter().any(|v| v["type"] == "tool_result"))
+        };
+        // An observed server rejection does not make the newest result
+        // disposable. Pair validation also retains its complete call group.
+        let last_result = messages.iter().rposition(is_tool_result);
         messages
             .iter()
             .zip(entries)
             .enumerate()
             .map(|(index, (message, entry))| {
                 let pairs = tool_pairs(message);
-                let result = crate::projection::role(message) == "tool"
-                    || message
-                        .get("content")
-                        .and_then(Value::as_array)
-                        .is_some_and(|items| items.iter().any(|v| v["type"] == "tool_result"));
+                let result = is_tool_result(message);
                 crate::navigation::Candidate {
                     id: entry.event,
                     bytes: entry.span.len() as usize,
                     required: Some(index) == last_operator
+                        || Some(index) == last_result
                         || matches!(entry.role.as_str(), "system" | "developer")
                         || (result && !self.seen.contains(&entry.event)),
                     pairs,

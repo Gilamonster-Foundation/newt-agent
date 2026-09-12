@@ -494,6 +494,32 @@ impl SmartHarness {
         Ok(())
     }
 
+    /// Settle the observed rejected request and retain the harness's budget
+    /// decision without adding synthetic tool output to the conversation.
+    pub(crate) fn context_exceeded(
+        &self,
+        event: &super::observability::BehaviorSignal,
+    ) -> anyhow::Result<()> {
+        let mut s = self.state()?;
+        let request = s
+            .request
+            .ok_or_else(|| anyhow::anyhow!("context overflow has no recorded request"))?;
+        let reply = s
+            .reply
+            .ok_or_else(|| anyhow::anyhow!("context overflow has no observed rejection"))?;
+        let payload = serde_json::to_string(&serde_json::json!({
+            "request_cid": request,
+            "signal": event,
+        }))?;
+        // This outcome belongs to the rejected request, not the whole turn.
+        // The next request may proceed only after all recovery evidence commits.
+        s.session.record_failure(reply, "context_exceeded")?;
+        s.session.record_outcome(reply, "failed", "")?;
+        s.session.record_intervention(&payload, reply)?;
+        s.reply = None;
+        Ok(())
+    }
+
     async fn complete_bounded(&self, prompt: String) -> anyhow::Result<String> {
         let timeout = {
             let mut s = self.state()?;
@@ -829,17 +855,37 @@ pub(crate) async fn response(
     prefix: &str,
 ) -> anyhow::Result<Value> {
     let status = response.status();
-    let bytes = response.bytes().await?;
+    let (bytes, read_error) = crate::retry::read_response_bytes(response).await;
     if let Some(h) = harness {
         h.observe(&bytes)?;
     }
+    // A disconnect after an observed overflow body must not replace that
+    // diagnosis with a retryable transport error. Retain partial bytes too.
+    let overflow = !status.is_success()
+        && super::cw_overflow::is_context_overflow(&String::from_utf8_lossy(&bytes));
+    let read_diagnostic = read_error
+        .as_ref()
+        .map(|error| format!("; response body read failed: {error}"))
+        .unwrap_or_default();
+    if let Some(error) = read_error {
+        if !overflow {
+            if let Some(harness) = harness {
+                harness.provider_failure(&error.to_string())?;
+            }
+            return Err(super::observability::DispatchError::from_reqwest(
+                "response read failed",
+                error,
+            )
+            .into());
+        }
+    }
     if !status.is_success() {
-        if let Some(harness) = harness {
+        if let Some(harness) = harness.filter(|_| !overflow) {
             harness.provider_failure(&format!("{prefix} {status}"))?;
         }
         return Err(super::observability::DispatchError::http_status(format!(
-            "{prefix} {status}: {}",
-            String::from_utf8_lossy(&bytes)
+            "{prefix} {status}: {}{read_diagnostic}",
+            String::from_utf8_lossy(&bytes),
         ))
         .into());
     }
@@ -851,6 +897,21 @@ pub(crate) async fn response(
             }
             Err(error.into())
         }
+    }
+}
+
+/// Per-message rounding can hide required elision when converting tokens to bytes.
+/// Force projection without changing the separate token admission budget.
+pub(super) fn projection_byte_budget(
+    messages: &[Value],
+    token_budget: usize,
+    est: crate::tokens::TokenEstimation,
+) -> anyhow::Result<usize> {
+    let max_bytes = est.chars_for_tokens(token_budget);
+    if super::estimate_tokens(messages, est) > token_budget {
+        Ok(max_bytes.min(serde_json::to_vec(messages)?.len().saturating_sub(1)))
+    } else {
+        Ok(max_bytes)
     }
 }
 
@@ -866,7 +927,10 @@ pub(super) async fn compress(
         return Ok(super::compress::compress(req, summarizer, state).await);
     };
     let messages = harness
-        .project(req.messages, req.est.chars_for_tokens(req.budget))
+        .project(
+            req.messages,
+            projection_byte_budget(req.messages, req.budget, req.est)?,
+        )
         .await?;
     let tokens_before = super::estimate_tokens(req.messages, req.est);
     let tokens_after = super::estimate_tokens(&messages, req.est);
@@ -931,6 +995,10 @@ pub fn parse_verdict(text: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "smart_harness_tests/context_exceeded.rs"]
+mod context_exceeded_tests;
 
 #[cfg(test)]
 mod tests {
