@@ -612,9 +612,10 @@ pub fn from_env(raw: Option<&str>) -> (Theme, Vec<String>) {
     (Theme::builtin().overlaid("custom", &overrides), complaints)
 }
 
-/// Snapshot of the current theme. Startup preferences and environment are read
-/// once; applying a theme swaps the snapshot for subsequent rendering.
-/// Invalid startup preferences are reported through [`complaints`].
+/// Snapshot of the current theme. Seeded from the built-in table plus
+/// `NEWT_THEME` only; a persisted preference reaches it solely through
+/// [`restore_preferences`] (an explicit startup step) or [`set_active`].
+/// Invalid `NEWT_THEME` pairs are reported through [`complaints`].
 pub fn active() -> std::sync::Arc<Theme> {
     runtime().read().unwrap_or_else(|e| e.into_inner()).clone()
 }
@@ -635,23 +636,40 @@ pub fn complaints() -> &'static [String] {
     &resolved().1
 }
 
+/// Built-in table plus `NEWT_THEME`, nothing else. Deliberately NOT the
+/// persisted preference: this is what every renderer sees by default, so a
+/// lazy read of the operator's config dir here would make the markdown and
+/// stream goldens depend on whatever theme the developer last applied —
+/// green on a bare CI runner, red on the box that shipped the feature. The
+/// unit tier is hermetic only because this function never touches the fs.
 fn resolved() -> &'static (Theme, Vec<String>) {
     static THEME: std::sync::OnceLock<(Theme, Vec<String>)> = std::sync::OnceLock::new();
-    THEME.get_or_init(|| {
-        let (mut theme, mut warnings) = preferences::restore();
-        if let Ok(raw) = std::env::var("NEWT_THEME") {
-            let (_, complaints) = from_env(Some(&raw));
-            warnings.extend(complaints);
-            for pair in raw.split(',') {
-                if let Some((role, value)) = pair.split_once('=') {
-                    if let (Some(role), Ok(color)) = (role_from_name(role), parse_color(value)) {
-                        theme = theme.overlaid("custom", &[(role, color)]);
-                    }
+    THEME.get_or_init(|| from_env(std::env::var("NEWT_THEME").ok().as_deref()))
+}
+
+/// Apply the persisted preference (`<config dir>/themes/active.toml`) with
+/// `NEWT_THEME` overlaid on top — the environment still wins, as it did when
+/// it was the only override. An explicit startup step for the interactive
+/// binary, never a side effect of rendering; returns what was wrong with the
+/// persisted file, for the same one-line startup report as [`complaints`].
+pub fn restore_preferences() -> Vec<String> {
+    let (theme, warnings) = restored_theme();
+    set_active(theme);
+    warnings
+}
+
+fn restored_theme() -> (Theme, Vec<String>) {
+    let (mut theme, warnings) = preferences::restore();
+    if let Ok(raw) = std::env::var("NEWT_THEME") {
+        for pair in raw.split(',') {
+            if let Some((role, value)) = pair.split_once('=') {
+                if let (Some(role), Ok(color)) = (role_from_name(role), parse_color(value)) {
+                    theme = theme.overlaid("custom", &[(role, color)]);
                 }
             }
         }
-        (theme, warnings)
-    })
+    }
+    (theme, warnings)
 }
 
 pub mod preferences;
@@ -660,6 +678,46 @@ pub mod preferences;
 mod tests {
     use super::*;
     use crate::tty::NEWT_ORANGE_CT;
+
+    /// **A persisted preference never leaks into the default snapshot.** The
+    /// markdown/stream goldens pin built-in SGR bytes through `active()`; if
+    /// the config dir's `active.toml` could reach `resolved()`, applying
+    /// `daylight` once would turn `cargo test` red on that box. Same shape
+    /// as the `NEWT_CONFIG_DIR` guard in `secrets.rs`. Before the explicit
+    /// `restore_preferences` step existed, the first assertion failed
+    /// whenever this test initialised the snapshot.
+    #[test]
+    fn a_persisted_theme_reaches_active_only_through_restore_preferences() {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        std::fs::create_dir_all(dir.path().join("themes")).unwrap();
+        std::fs::write(
+            dir.path().join("themes/active.toml"),
+            "name = \"daylight\"\n[roles.agent-text]\ncolor = \"black\"\n",
+        )
+        .unwrap();
+        let prev = std::env::var_os(crate::config::NEWT_CONFIG_DIR_ENV);
+        std::env::set_var(crate::config::NEWT_CONFIG_DIR_ENV, dir.path());
+
+        let default_snapshot = resolved().0.clone();
+        let (restored, warnings) = restored_theme();
+
+        match prev {
+            Some(v) => std::env::set_var(crate::config::NEWT_CONFIG_DIR_ENV, v),
+            None => std::env::remove_var(crate::config::NEWT_CONFIG_DIR_ENV),
+        }
+
+        assert_eq!(
+            default_snapshot.name, "newt",
+            "resolved() read the config dir"
+        );
+        assert_eq!(
+            default_snapshot.color(Role::AgentText),
+            Theme::builtin().color(Role::AgentText)
+        );
+        assert_eq!(restored.name, "daylight");
+        assert_eq!(restored.color(Role::AgentText), Color::Black);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
 
     /// **The seam changes nothing on arrival.**
     ///
