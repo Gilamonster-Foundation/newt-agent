@@ -3439,8 +3439,6 @@ async fn execute_authorized_tool(
                             .unwrap_or_default();
                         receipt.present(format!("wrote {path} ({line_count} lines)"), &format!("{artifact}{check}"), presentation)
                     }
-                    // Keep the established exact capability refusal; no write began.
-                    Err(tool_output) if tool_output == denied_fs_result("fs_write", path) => file_capture::present(tool_output, presentation),
                     Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
                 }
             } else {
@@ -3566,7 +3564,6 @@ async fn execute_authorized_tool(
                         .unwrap_or_default();
                     receipt.present(format!("deleted {path}"), &format!("{artifact}{check}"), presentation)
                 }
-                Err(tool_output) if tool_output == denied_fs_result("fs_write", path) => file_capture::present(tool_output, presentation),
                 Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
             }
         }
@@ -3755,7 +3752,6 @@ async fn execute_authorized_tool(
                         .unwrap_or_default();
                     receipt.present(format!("edited {path} ({delta_str} lines, now {new_lines} total)"), &format!("{artifact}{check}"), presentation)
                 }
-                Err(tool_output) if tool_output == denied_fs_result("fs_write", path) => file_capture::present(tool_output, presentation),
                 Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
             }
         }

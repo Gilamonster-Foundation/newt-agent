@@ -206,6 +206,9 @@ mod tests {
         assert_eq!(r("> quote"), format!("{FADE}│ {RESET}{BODY}quote{RESET}"));
     }
 
+    // The dim stub; with `markdown-syntect` the block is highlighted instead
+    // (see `syntect_highlights_a_rust_code_block`).
+    #[cfg(not(feature = "markdown-syntect"))]
     #[test]
     fn fenced_code_is_dim_and_inset_not_reflowed() {
         assert_eq!(

@@ -44,7 +44,6 @@
 
 [files]
 "newt-tui/src/live_spill_pty_tests.rs" = { count = 1, class = "test", note = "Rich file-change terminal witness re-executes the current test binary under the shared PTY harness with a fixed exact child filter. The parent types existing navigation and interrupt keys, changes PTY geometry, and observes terminal cleanup and termios restoration. Test-only marker and fixed argv; no shell or model-controlled subprocess input." }
-"newt-core/src/agentic/tools_tests/execute_file_receipts.rs" = { count = 1, class = "test", note = "Unix FIFO refusal witness re-executes the current test binary with a fixed exact filter and a test-local environment marker. No shell or model input. The parent enforces a deadline and a completion-file witness so a blocking file open cannot hang the test suite or pass without running the child." }
 # --- widened SCAN_ROOTS crates (step-7.2 convergence audit) ---
 "newt-git/src/lib_tests/mod.rs"            = { count = 4, class = "test", note = "ALL raw `git` spawns stay inside the crate's `#[cfg(test)]` tree; production newt-git uses the git2/gix libraries and never spawns a subprocess. The shared test fixtures: the `git()` runner plus repo/commit setup helpers." }
 "newt-git/src/lib_tests/attribution.rs"    = { count = 2, class = "test", note = "ALL raw `git` spawns stay inside the crate's `#[cfg(test)]` tree; production newt-git uses the git2/gix libraries and never spawns a subprocess. Reads back commit trailers to assert attribution." }

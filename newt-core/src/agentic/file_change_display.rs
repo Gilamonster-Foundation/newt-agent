@@ -106,6 +106,11 @@ pub struct FileChangePresentation {
     syntax: Arc<std::sync::OnceLock<[super::syntax_foreground::SyntaxLines; 2]>>,
 }
 
+/// Widest review a projection renders. The complete projection materializes
+/// every row at full width, so an extreme terminal would otherwise allocate
+/// rows x width padding cells; wider hosts see the same rows, left-aligned.
+const REVIEW_WIDTH_LIMIT: usize = 1024;
+
 impl FileChangePresentation {
     /// Bind a captured model and originals to the exact receipt byte range in
     /// one raw result. Display callers still validate that binding before use.
@@ -193,17 +198,23 @@ impl FileChangePresentation {
         {
             rows.extend(plain("[File-change display substitutes unsupported source/header glyphs with ?; this view is not a raw patch.]"));
         }
+        if width > REVIEW_WIDTH_LIMIT {
+            rows.extend(plain(&format!(
+                "[File-change review width bounded to {REVIEW_WIDTH_LIMIT} columns.]"
+            )));
+        }
         rows.extend(plain(suffix));
         rows
     }
 
     /// Safe cells come only from NewtUI; originals are never reinserted here.
+    /// Width is capped at `REVIEW_WIDTH_LIMIT`.
     pub fn project(&self, width: usize, height: usize, row: usize) -> DiffProjection {
         newtui::diff_with_sources(
             DiffData::new(&self.changes)
                 .context(usize::MAX)
                 .row_offset(row),
-            width,
+            width.min(REVIEW_WIDTH_LIMIT),
             height,
         )
     }
