@@ -64,12 +64,27 @@ fn rich_file_change_child() {
 }
 
 fn reach(pty: &Pty, grid: &mut ScreenModel, transcript: &mut String, needle: &str) {
+    reach_since(pty, grid, transcript, needle, 0);
+}
+
+/// Like [`reach`], but the needle must also appear in bytes the child wrote
+/// after `since`. After a resize the model reflows rows the child painted at
+/// the OLD width, so a grid match alone can be satisfied without the child
+/// ever observing the new geometry.
+fn reach_since(
+    pty: &Pty,
+    grid: &mut ScreenModel,
+    transcript: &mut String,
+    needle: &str,
+    since: usize,
+) {
     let deadline = Instant::now() + REACH;
     loop {
         let bytes = pty.screen();
         grid.apply(bytes.as_bytes());
         transcript.push_str(&bytes);
-        if grid.nonempty_rows().iter().any(|row| row.contains(needle)) {
+        let fresh = strip_csi(&transcript[since..]);
+        if fresh.contains(needle) && grid.nonempty_rows().iter().any(|row| row.contains(needle)) {
             return;
         }
         assert!(
@@ -79,6 +94,24 @@ fn reach(pty: &Pty, grid: &mut ScreenModel, transcript: &mut String, needle: &st
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn strip_csi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.clone().next() == Some('[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 #[test]
@@ -108,13 +141,22 @@ fn rich_file_changes_use_real_scroll_resize_interrupt_and_termios_restoration() 
     );
     pty.type_in(&"\x1b[A".repeat(40));
     reach(&pty, &mut grid, &mut transcript, "Modified state.txt");
+    let since = transcript.len();
     pty.resize(24, 12);
     grid.resize(12);
-    // A narrow source/header projection is visible before widening again.
-    reach(&pty, &mut grid, &mut transcript, "⎵ Complete");
+    // The child repaints a narrow source/header projection before widening
+    // again; reflowed wide rows do not count.
+    reach_since(&pty, &mut grid, &mut transcript, "⎵ Complete", since);
+    let since = transcript.len();
     pty.resize(24, 80);
     grid.resize(80);
-    reach(&pty, &mut grid, &mut transcript, "Modified state.txt");
+    reach_since(
+        &pty,
+        &mut grid,
+        &mut transcript,
+        "Modified state.txt",
+        since,
+    );
     // The first press leaves explore mode; the second interrupts the turn.
     pty.type_in("\x03\x03");
     reach(&pty, &mut grid, &mut transcript, "receipt-terminal-done");
