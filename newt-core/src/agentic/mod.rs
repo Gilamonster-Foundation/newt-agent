@@ -5071,7 +5071,8 @@ fn run_command_is_advertised(tools: &serde_json::Value) -> bool {
 }
 
 /// Result text that marks a REFUSED CAPABILITY in newt's OWN vocabulary — what
-/// `tools::denied_fs_result`, the exec leash and the MCP leash emit. Shared by
+/// `tools::denied_fs_result`, the exec leash's `denied_run_command_result` and
+/// the kernel-refusal renderer `tools::kernel_refused_binary` emit. Shared by
 /// the exec-denial ground-truth check and by [`unreachable_by_edit`], so the
 /// two cannot drift into disagreeing about what a denial looks like.
 const CONFINEMENT_DENIAL_NEEDLES: [&str; 4] = [
@@ -5089,8 +5090,12 @@ const CONFINEMENT_DENIAL_NEEDLES: [&str; 4] = [
 const OS_PERMISSION_DENIAL_NEEDLES: [&str; 2] = ["permission denied", "permission-denied"];
 
 /// Result text that marks a MISSING EXECUTABLE — the tool the model needs is
-/// not present in this environment at all (#2273).
-const MISSING_EXECUTABLE_NEEDLES: [&str; 4] = [
+/// not present in this environment at all (#2273). The first entry is the
+/// confined lane's own refusal (#2277 replaced brush's `command not found`
+/// with it; the shared constant is what keeps this list from going stale
+/// again), the rest are the host shells' wording.
+const MISSING_EXECUTABLE_NEEDLES: [&str; 5] = [
+    tools::ABSENT_BINARY_MARKER,
     "command not found",
     "no such command",
     "executable file not found",

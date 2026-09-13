@@ -843,6 +843,8 @@ fn workflow_blocker_ignores_an_os_permission_error_the_model_can_fix() {
         true,
         "Permission denied"
     ));
+}
+
 #[test]
 fn creating_a_plan_invalidates_the_empty_plan_read_memo() {
     let mut guard = RepeatCallGuard::default();
@@ -858,5 +860,55 @@ fn creating_a_plan_invalidates_the_empty_plan_read_memo() {
     assert!(
         guard.repeat_steer("plan_get", &args).is_none(),
         "a fresh plan must be readable in the same turn"
+    );
+}
+
+/// #2273, closed against today's renderer rather than yesterday's: the
+/// confined lane no longer emits brush's `command not found` for a missing
+/// binary — since #2277 it emits `absent_binary_refusal`'s own sentence. The
+/// classifier must recognise THAT (through the shared marker), or the issue's
+/// exact transcript — `cargo` absent from the carried userland — still gets
+/// the edit-demanding nudge. Feeds the real renderer, not a literal.
+#[test]
+fn the_carried_userland_refusal_is_a_blocker_no_edit_can_clear() {
+    let envelope = serde_json::json!({
+        "exit_code": 127,
+        "stdout": "",
+        "stderr": "error: command not found: cargo\n",
+    });
+    let rendered = tools::absent_binary_refusal("cargo", &envelope, &crate::caveats::Scope::none())
+        .expect("a 127 with no denials renders the refusal");
+    assert!(rendered.contains(tools::ABSENT_BINARY_MARKER), "{rendered}");
+    assert!(!tools::tool_result_ok(&rendered));
+    assert!(unreachable_by_edit(false, &rendered).is_some());
+
+    let mut state = WorkflowRuntimeState::default();
+    assert!(state.record_tool_result(&rendered, tools::tool_result_ok(&rendered)));
+    state.record_round_outcome(false, false);
+    let nudge = state
+        .round_start_nudge(None)
+        .expect("an absent binary steers the turn");
+    assert!(nudge.contains("end the turn"), "{nudge}");
+    assert!(!nudge.contains("Make the smallest edit"), "{nudge}");
+}
+
+/// The kernel-refused sibling (#2273's `~/.cargo/bin` outside the read grant):
+/// the renderer speaks newt's denial vocabulary, so the same classifier path
+/// that handles a leash denial handles it — no OS `permission denied` grep.
+#[test]
+fn a_kernel_refused_binary_is_a_blocker_no_edit_can_clear() {
+    let exe = std::env::current_exe().expect("the running test binary exists");
+    let exe = exe.display().to_string();
+    let envelope = serde_json::json!({
+        "exit_code": 126,
+        "stdout": "",
+        "stderr": format!("brush: {exe}: Permission denied\n"),
+    });
+    let rendered = tools::kernel_refused_binary(&exe, &envelope, &crate::caveats::Scope::none())
+        .expect("a 126 outside the read grant renders the refusal");
+    assert!(!tools::tool_result_ok(&rendered));
+    assert_eq!(
+        unreachable_by_edit(false, &rendered),
+        Some("a required capability was refused by the confinement")
     );
 }

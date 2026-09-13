@@ -616,6 +616,12 @@ pub(super) async fn exec_confined_command(
             if let Some(refusal) = absent_binary_refusal(cmd, &envelope, &caveats.exec) {
                 return refusal;
             }
+            // #2273: a 126 with no structured denial whose program sits
+            // outside the fs-read grant is the KERNEL refusing, not a
+            // chmod the model forgot. Same structured test, one more state.
+            if let Some(refusal) = kernel_refused_binary(cmd, &envelope, &caveats.fs_read) {
+                return refusal;
+            }
             shell_envelope_output(
                 &envelope,
                 tool_output_lines,
@@ -1148,7 +1154,7 @@ pub(super) fn exec_denial_target_label(envelope: &serde_json::Value) -> String {
 /// probe would be answering about the fence rather than about the host; newt's
 /// own process is never Landlocked, so it can resolve the real host PATH and
 /// separate "installed, but not reachable from in here" from "not installed".
-pub(super) fn absent_binary_refusal(
+pub(crate) fn absent_binary_refusal(
     cmd: &str,
     envelope: &serde_json::Value,
     exec: &crate::caveats::Scope<String>,
@@ -1179,7 +1185,7 @@ pub(super) fn absent_binary_refusal(
     // The host probe is what makes the two 127 states distinguishable.
     Some(match host_path_lookup(&prog) {
         Some(abs) => format!(
-            "error: {prog}: not in this profile's carried userland.\n  \
+            "error: {prog}: {ABSENT_BINARY_MARKER}.\n  \
              granted host binaries: {granted}\n  \
              ask the operator for exec:{abs}, or run the host lane."
         ),
@@ -1187,12 +1193,69 @@ pub(super) fn absent_binary_refusal(
         // is not installed is a no-op, and teaching the model to ask for one is
         // exactly the futile loop the denial journal exists to detect.
         None => format!(
-            "error: {prog}: not in this profile's carried userland, and not \
+            "error: {prog}: {ABSENT_BINARY_MARKER}, and not \
              installed on this host.\n  \
              granted host binaries: {granted}\n  \
              no grant can supply it - install it on the host, or use a carried tool."
         ),
     })
+}
+
+/// The phrase every absent-binary refusal carries. The loop guidance keys on
+/// it (`MISSING_EXECUTABLE_NEEDLES` in `agentic`) to recognise a blocker no
+/// edit can clear (#2273); one constant, so renderer and classifier cannot
+/// drift — #2277 changed this rendering once and the classifier kept grepping
+/// for brush's old `command not found`.
+pub(crate) const ABSENT_BINARY_MARKER: &str = "not in this profile's carried userland";
+
+/// #2273 — the fourth state: the binary exists and no grant refused it, yet
+/// the KERNEL did, because the program lives outside the fs-read grant
+/// (`~/.cargo/bin` outside the sandbox's read scope is the issue's own
+/// transcript). brush reports it as exit 126 with `Permission denied`, which
+/// is indistinguishable from a script the model forgot to `chmod +x` — a
+/// repairable failure. The discriminator is STRUCTURED, never the stderr
+/// text: exit 126, no `denials`, and the resolved host path is NOT permitted
+/// by the read scope. Only then is it rendered in newt's own denial vocabulary
+/// so the guidance stops asking for an edit; an ordinary 126 inside the grant
+/// falls through untouched.
+pub(crate) fn kernel_refused_binary(
+    cmd: &str,
+    envelope: &serde_json::Value,
+    fs_read: &crate::caveats::Scope<String>,
+) -> Option<String> {
+    if envelope
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        != Some(126)
+    {
+        return None;
+    }
+    if envelope_denied(envelope)
+        || envelope
+            .get("denials")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|d| !d.is_empty())
+    {
+        return None;
+    }
+    // The leading token, never stderr: brush's wording for EACCES is not a
+    // contract, and the program name is only a noun for the sentence.
+    let prog = cmd
+        .split_ascii_whitespace()
+        .find(|tok| !tok.contains('='))?;
+    let abs = host_path_lookup(prog)?;
+    if crate::caveats::permits_path(fs_read, &abs) {
+        return None;
+    }
+    let dir = std::path::Path::new(&abs)
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| abs.clone());
+    Some(format!(
+        "capability denied: exec of {prog} at {abs} is outside the fs-read \
+         grant, so the kernel refused it (exit 126).\n  \
+         ask the operator for read:{dir} (and exec:{abs}), or run the host lane."
+    ))
 }
 
 /// Which program was not found.
