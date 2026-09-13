@@ -580,8 +580,14 @@ pub fn parse_color(value: &str) -> Result<Color, String> {
 /// that silently half-applies looks like a rendering bug everywhere except the
 /// one place that would explain it.
 pub fn from_env(raw: Option<&str>) -> (Theme, Vec<String>) {
+    overlay_env(Theme::builtin(), raw)
+}
+
+/// The `NEWT_THEME` pairs applied over `base`; one parser for both the
+/// built-in default and a persisted preference, so the two cannot drift.
+fn overlay_env(base: Theme, raw: Option<&str>) -> (Theme, Vec<String>) {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
-        return (Theme::builtin(), Vec::new());
+        return (base, Vec::new());
     };
     let (mut overrides, mut complaints) = (Vec::new(), Vec::new());
     for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
@@ -644,7 +650,13 @@ pub fn complaints() -> &'static [String] {
 /// unit tier is hermetic only because this function never touches the fs.
 fn resolved() -> &'static (Theme, Vec<String>) {
     static THEME: std::sync::OnceLock<(Theme, Vec<String>)> = std::sync::OnceLock::new();
-    THEME.get_or_init(|| from_env(std::env::var("NEWT_THEME").ok().as_deref()))
+    THEME.get_or_init(default_snapshot)
+}
+
+/// What [`resolved`] memoises. Separate so a test can assert on it without
+/// the `OnceLock`'s first-caller-wins ordering.
+fn default_snapshot() -> (Theme, Vec<String>) {
+    from_env(std::env::var("NEWT_THEME").ok().as_deref())
 }
 
 /// Apply the persisted preference (`<config dir>/themes/active.toml`) with
@@ -659,16 +671,9 @@ pub fn restore_preferences() -> Vec<String> {
 }
 
 fn restored_theme() -> (Theme, Vec<String>) {
-    let (mut theme, warnings) = preferences::restore();
-    if let Ok(raw) = std::env::var("NEWT_THEME") {
-        for pair in raw.split(',') {
-            if let Some((role, value)) = pair.split_once('=') {
-                if let (Some(role), Ok(color)) = (role_from_name(role), parse_color(value)) {
-                    theme = theme.overlaid("custom", &[(role, color)]);
-                }
-            }
-        }
-    }
+    let (persisted, warnings) = preferences::restore();
+    // Env complaints are already reported once through `complaints()`.
+    let (theme, _) = overlay_env(persisted, std::env::var("NEWT_THEME").ok().as_deref());
     (theme, warnings)
 }
 
@@ -682,11 +687,13 @@ mod tests {
     /// **A persisted preference never leaks into the default snapshot.** The
     /// markdown/stream goldens pin built-in SGR bytes through `active()`; if
     /// the config dir's `active.toml` could reach `resolved()`, applying
-    /// `daylight` once would turn `cargo test` red on that box. Same shape
-    /// as the `NEWT_CONFIG_DIR` guard in `secrets.rs`. Before the explicit
-    /// `restore_preferences` step existed, the first assertion failed
-    /// whenever this test initialised the snapshot.
+    /// `daylight` once would turn `cargo test` red on that box. Pins
+    /// `NEWT_CONFIG_DIR` under the `real_fs` serial lane like every other
+    /// mutation site in this crate, and asserts on `default_snapshot()`
+    /// rather than the memoised `resolved()` so the result does not depend
+    /// on which test initialised the `OnceLock` first.
     #[test]
+    #[serial_test::serial(real_fs)]
     fn a_persisted_theme_reaches_active_only_through_restore_preferences() {
         let dir = tempfile::tempdir().expect("temp config dir");
         std::fs::create_dir_all(dir.path().join("themes")).unwrap();
@@ -698,7 +705,7 @@ mod tests {
         let prev = std::env::var_os(crate::config::NEWT_CONFIG_DIR_ENV);
         std::env::set_var(crate::config::NEWT_CONFIG_DIR_ENV, dir.path());
 
-        let default_snapshot = resolved().0.clone();
+        let (default_snapshot, _) = default_snapshot();
         let (restored, warnings) = restored_theme();
 
         match prev {
@@ -706,14 +713,14 @@ mod tests {
             None => std::env::remove_var(crate::config::NEWT_CONFIG_DIR_ENV),
         }
 
-        assert_eq!(
-            default_snapshot.name, "newt",
-            "resolved() read the config dir"
+        // `!= "daylight"` rather than `== "newt"`: a developer shell that
+        // exports a valid NEWT_THEME names the default `custom`, and that is
+        // not what this test is about.
+        assert_ne!(
+            default_snapshot.name, "daylight",
+            "the default snapshot read the config dir"
         );
-        assert_eq!(
-            default_snapshot.color(Role::AgentText),
-            Theme::builtin().color(Role::AgentText)
-        );
+        assert_ne!(default_snapshot.color(Role::AgentText), Color::Black);
         assert_eq!(restored.name, "daylight");
         assert_eq!(restored.color(Role::AgentText), Color::Black);
         assert!(warnings.is_empty(), "{warnings:?}");
