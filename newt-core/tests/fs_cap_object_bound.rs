@@ -39,6 +39,78 @@ fn open_reads_a_contained_file() {
 
 #[test]
 #[serial]
+fn open_regular_preserves_containment_and_explicit_final_link_policy() {
+    let ws = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    std::fs::write(ws.path().join("file"), b"inside").unwrap();
+    std::fs::write(outside.path().join("file"), b"outside").unwrap();
+    symlink("file", ws.path().join("link")).unwrap();
+    symlink(outside.path(), ws.path().join("escape")).unwrap();
+    let dir = WorkspaceDir::open_root(ws.path()).unwrap();
+    for (path, nofollow) in [("file", true), ("link", false)] {
+        let mut text = String::new();
+        dir.open_regular(Path::new(path), nofollow)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "inside");
+    }
+    assert!(dir.open_regular(Path::new("link"), true).is_err());
+    assert!(dir.open_regular(Path::new("."), false).is_err());
+    for nofollow in [false, true] {
+        assert!(dir
+            .open_regular(Path::new("escape/file"), nofollow)
+            .is_err());
+        assert!(dir.open_regular(Path::new("../file"), nofollow).is_err());
+    }
+}
+
+#[test]
+#[serial]
+fn open_regular_refuses_a_real_fifo_without_waiting_for_a_writer() {
+    const CHILD: &str = "NEWT_OPEN_REGULAR_FIFO_CHILD";
+    if let Some(done) = std::env::var_os(CHILD) {
+        let ws = tempdir().unwrap();
+        let path = ws.path().join("fifo");
+        let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the path is a live, NUL-terminated C string, mode is ordinary
+        // owner read/write permission, and mkfifo retains no pointer.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        let dir = WorkspaceDir::open_root(ws.path()).unwrap();
+        assert!(dir.open_regular(Path::new("fifo"), true).is_err());
+        std::fs::write(done, "passed").unwrap();
+        return;
+    }
+    // A blocking regression must fail within a deadline, not hang Linux CI.
+    let parent = tempdir().unwrap();
+    let done = parent.path().join("child-passed");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "open_regular_refuses_a_real_fifo_without_waiting_for_a_writer",
+            "--nocapture",
+        ])
+        .env(CHILD, &done)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "FIFO child failed: {status}");
+            assert!(done.exists(), "the exact FIFO child test did not run");
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("open_regular blocked on a FIFO with no writer");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[serial]
 fn create_writes_only_beneath_the_root() {
     let ws = tempdir().unwrap();
     let dir = WorkspaceDir::open_root(ws.path()).unwrap();
