@@ -752,3 +752,95 @@ fn a_blocker_asserted_without_a_failing_probe_is_not_honoured() {
         "a blocker the model only asserted must not buy an exit: {nudge}"
     );
 }
+
+#[test]
+fn workflow_blocker_classification_refreshes_for_the_same_fingerprint() {
+    let repairable = "error: command exited 1\na test failed";
+    // Newt's own denial vocabulary; the bare OS "Permission denied" is a
+    // repairable failure and must NOT flip the classification.
+    let blocked = "error: command exited 1\nexec not granted";
+    for (first, second, expect_blocked) in
+        [(repairable, blocked, true), (blocked, repairable, false)]
+    {
+        let mut state = WorkflowRuntimeState::default();
+        state.record_tool_result(first, false);
+        state.record_round_outcome(false, false);
+        for _ in 0..WorkflowRuntimeState::STEP_LOCK_NUDGE_CAP {
+            assert!(state.round_start_nudge(None).is_some());
+        }
+        assert!(state.record_tool_result(second, false));
+        state.record_round_outcome(false, false);
+        let nudge = state
+            .round_start_nudge(None)
+            .expect("changed classification renews guidance");
+        assert_eq!(nudge.contains("end the turn"), expect_blocked, "{nudge}");
+        assert_eq!(
+            nudge.contains("Make the smallest edit"),
+            !expect_blocked,
+            "{nudge}"
+        );
+        assert!(
+            !state.record_tool_result(second, false),
+            "identical evidence is not new progress"
+        );
+    }
+}
+
+#[test]
+fn workflow_blocker_records_filesystem_capability_denial() {
+    // The prefix emitted by tools::denied_fs_result is not a compiler error.
+    let result = "capability denied: fs_read does not permit '/outside'.";
+    assert!(!tools::tool_result_ok(result));
+    let mut state = WorkflowRuntimeState::default();
+    assert!(state.record_tool_result(result, tools::tool_result_ok(result)));
+    state.record_round_outcome(false, false);
+    let nudge = state
+        .round_start_nudge(None)
+        .expect("filesystem denial steers the turn");
+    assert!(nudge.contains("end the turn"), "{nudge}");
+    assert!(nudge.contains("required capability was refused"), "{nudge}");
+    assert!(!nudge.contains("Make the smallest edit"), "{nudge}");
+
+    let mut successful = WorkflowRuntimeState::default();
+    assert!(!successful.record_tool_result(result, true));
+    assert!(successful.error_evidence.is_none());
+}
+
+#[test]
+fn workflow_blocker_ignores_an_os_permission_error_the_model_can_fix() {
+    // A FAILED test run that merely prints the OS string is a repairable
+    // failure (a test asserting on EACCES, a chmod on the wrong path), not a
+    // refused capability: it must never reach the no-edit path. Before the
+    // OS/confinement split this classified as "refused by the confinement".
+    let result =
+        "error: test failed\n---- writes_readonly stdout ----\nPermission denied (os error 13)";
+    assert_eq!(unreachable_by_edit(false, result), None);
+    let mut state = WorkflowRuntimeState::default();
+    state.record_tool_result(result, false);
+    state.record_round_outcome(false, false);
+    if let Some(nudge) = state.round_start_nudge(None) {
+        assert!(
+            !nudge.contains("required capability was refused"),
+            "{nudge}"
+        );
+    }
+
+    // Newt's own vocabulary still does, on every OS.
+    assert!(unreachable_by_edit(
+        false,
+        "capability denied: fs_read does not permit '/outside'."
+    )
+    .is_some());
+    // The exec-denial ground-truth check keeps the OS string: a fenced child
+    // the kernel refuses prints exactly this.
+    assert!(run_command_result_is_denial(
+        "run_command",
+        false,
+        "sh: ./deploy.sh: Permission denied"
+    ));
+    assert!(!run_command_result_is_denial(
+        "run_command",
+        true,
+        "Permission denied"
+    ));
+}
