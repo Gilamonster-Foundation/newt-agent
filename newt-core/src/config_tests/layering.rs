@@ -308,6 +308,22 @@ fn find_project_config_walks_up_and_stops_before_home() {
     assert_eq!(find_project_config_from(&bare, Some(home.path())), None);
 }
 
+#[cfg(unix)]
+#[test]
+fn find_project_config_stops_at_home_reached_through_a_symlink() {
+    // macOS: $HOME may say /var/... while current_dir() says /private/var/...
+    let root = tempfile::tempdir().unwrap();
+    let real_home = root.path().join("real-home");
+    let ws = real_home.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(root.path().join(".newt")).unwrap();
+    std::fs::write(root.path().join(".newt").join("config.toml"), "x = 9").unwrap();
+    let linked_home = root.path().join("linked-home");
+    std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
+
+    assert_eq!(find_project_config_from(&ws, Some(&linked_home)), None);
+}
+
 #[test]
 fn project_config_deep_merges_over_global() {
     // global config: a backend + a tui block.

@@ -252,10 +252,14 @@ fn read_array_strategy(value: &toml::Value) -> Option<ArrayMergeStrategy> {
 /// Split out from [`Config::project_config_path`] so it can be unit-tested
 /// against temp directories without mutating the process environment.
 pub(crate) fn find_project_config_from(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    // Compare resolved paths: `$HOME` may name a symlink (macOS `/var` →
+    // `/private/var`) while `current_dir()` is already resolved.
+    let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let home = home.map(resolve);
     let mut dir = Some(start);
     while let Some(current) = dir {
         // Never treat the home directory's `.newt` as a project override.
-        if home == Some(current) {
+        if home.is_some() && home == Some(resolve(current)) {
             break;
         }
         let candidate = current.join(".newt").join("config.toml");
