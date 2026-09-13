@@ -36,6 +36,8 @@ pub use output_budget::{
 
 mod catalog;
 mod dispatch;
+mod file_capture;
+mod file_change;
 #[cfg(test)]
 use dispatch::execute_tool_with_display_cancellable;
 pub use dispatch::{
@@ -1762,9 +1764,10 @@ fn tool_call_detail(name: &str, args: &serde_json::Value, workspace: &std::path:
         "write_file" => {
             let path = string("path", "");
             let bytes = args["content"].as_str().unwrap_or("").len();
-            format!("{path} ({bytes} bytes)")
+            format!("{} ({bytes} bytes)", file_capture::display_text(&path))
         }
-        "read_file" | "edit_file" | "delete_file" => string("path", ""),
+        "edit_file" | "delete_file" => file_capture::display_text(&string("path", "")).into_owned(),
+        "read_file" => string("path", ""),
         "list_dir" => string("path", "."),
         "find" => {
             let path = args["path"].as_str().unwrap_or(".");
@@ -2079,11 +2082,16 @@ fn count_newlines(bytes: &[u8]) -> u64 {
 /// tools' existing mutation policy.
 #[cfg(unix)]
 fn artifact_open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    open_regular_file(path, true)
+}
+
+#[cfg(unix)]
+fn open_regular_file(path: &std::path::Path, nofollow: bool) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NONBLOCK | if nofollow { libc::O_NOFOLLOW } else { 0 })
         .open(path)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(std::io::Error::new(
@@ -2096,6 +2104,11 @@ fn artifact_open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs
 
 #[cfg(windows)]
 fn artifact_open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    open_regular_file(path, true)
+}
+
+#[cfg(windows)]
+fn open_regular_file(path: &std::path::Path, nofollow: bool) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
@@ -2104,7 +2117,11 @@ fn artifact_open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs
     // check. This is the Windows analogue of Unix O_NOFOLLOW.
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .custom_flags(if nofollow {
+            FILE_FLAG_OPEN_REPARSE_POINT
+        } else {
+            0
+        })
         .open(path)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(std::io::Error::new(
@@ -2117,6 +2134,11 @@ fn artifact_open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs
 
 #[cfg(not(any(unix, windows)))]
 fn artifact_open_regular_file(_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    open_regular_file(_path, true)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_regular_file(_path: &std::path::Path, _nofollow: bool) -> std::io::Result<std::fs::File> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "race-safe artifact file capture is unavailable on this platform",
@@ -2180,9 +2202,12 @@ fn artifact_preimage_state(
 /// Verify a governed write against the bytes it submitted without allocating a
 /// second copy of the file. Only a regular file can satisfy the postcondition.
 fn artifact_file_matches(path: &std::path::Path, expected: &[u8]) -> std::io::Result<bool> {
+    file_contents_match(artifact_open_regular_file(path)?, expected)
+}
+
+fn file_contents_match(mut file: std::fs::File, expected: &[u8]) -> std::io::Result<bool> {
     use std::io::Read as _;
 
-    let mut file = artifact_open_regular_file(path)?;
     let mut offset = 0_usize;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -3284,15 +3309,20 @@ async fn execute_authorized_tool(
                     std::path::Path::new(workspace),
                     &full,
                 );
-            let artifact_before = artifact_path_within.then(|| {
-                artifact_preimage_state(&full, tui_permits_path(&caveats.fs_read, &full_str))
-            });
+
+            let mutation_scope = if scope_permits { &caveats.fs_write } else { &crate::caveats::Scope::All };
+            if !file_capture::regular_target(&full) {
+                return file_capture::present(
+                    format!("error: write_file refuses a nonregular target: {path}"),
+                    presentation,
+                );
+            }
 
             // Shrink guard: refuse if the proposed write removes > 30% of
             // lines AND > 30 lines absolute. This catches the failure mode
             // where a model replaces an entire large file with a small
             // fragment (observed in the wild: 4,247 → 107 lines).
-            if let Ok(existing) = std::fs::read_to_string(&full) {
+            if let Ok(existing) = file_capture::read_for_edit(mutation_scope, &full, path) {
                 let orig_lines = existing.lines().count();
                 let new_lines = content.lines().count();
                 let removed = orig_lines.saturating_sub(new_lines);
@@ -3310,6 +3340,12 @@ async fn execute_authorized_tool(
             // Show first 20 lines as preview.
             let preview: String = content.lines().take(20).collect::<Vec<_>>().join("\n");
             let has_more = content.lines().count() > 20;
+            let visible_preview = file_capture::display_text(&preview);
+            let preview = if visible_preview != preview {
+                format!("Preview escapes control characters:\n{visible_preview}")
+            } else {
+                preview
+            };
             presentation.preview(
                 &format!("{preview}{}", if has_more { "\n…" } else { "" }),
                 tool_output_lines,
@@ -3326,6 +3362,10 @@ async fn execute_authorized_tool(
             );
 
             if confirmed {
+                let receipt_before = file_capture::capture(&caveats.fs_read, &full);
+                let artifact_before = artifact_path_within.then(|| {
+                    artifact_preimage_state(&full, tui_permits_path(&caveats.fs_read, &full_str))
+                });
                 // step-52.4: object-bound write when the SCOPE authorised it —
                 // create the file (and any missing parents) beneath the granted
                 // root's fd (openat2 RESOLVE_BENEATH), so a symlink / `..` /
@@ -3337,8 +3377,16 @@ async fn execute_authorized_tool(
                 } else {
                     std_write(&full, path, content)
                 };
-                match write_result {
+                let receipt_after = file_capture::capture(&caveats.fs_read, &full);
+                let receipt = file_capture::receipt(path, &receipt_before, &receipt_after);
+                let output = match write_result {
                     Ok(()) => {
+                        if !file_capture::verified_after(&receipt_after, mutation_scope, &full, Some(content.as_bytes())) {
+                            return file_capture::present(
+                                format!("error: write_file returned success for {path}, but the submitted bytes could not be verified{receipt}"),
+                                presentation,
+                            );
+                        }
                         let line_count = content.lines().count();
                         // Verify exactly the bytes this governed tool submitted
                         // before an arbitrary build-check command can touch the
@@ -3388,10 +3436,11 @@ async fn execute_authorized_tool(
                         let check = build_check_cmd
                             .map(|cmd| run_build_check(cmd, workspace))
                             .unwrap_or_default();
-                        format!("wrote {path} ({line_count} lines){artifact}{check}")
+                        format!("wrote {path} ({line_count} lines){receipt}{artifact}{check}")
                     }
-                    Err(tool_output) => tool_output,
-                }
+                    Err(tool_output) => file_capture::failure(tool_output, &receipt),
+                };
+                file_capture::present(output, presentation)
             } else {
                 format!("user declined to write {path}")
             }
@@ -3438,9 +3487,6 @@ async fn execute_authorized_tool(
                     std::path::Path::new(workspace),
                     &full,
                 );
-            let artifact_before = artifact_path_within.then(|| {
-                artifact_preimage_state(&full, tui_permits_path(&caveats.fs_read, &full_str))
-            });
 
             let confirmed = confirm_unrestricted_fs_mutation(
                 caveats,
@@ -3452,6 +3498,12 @@ async fn execute_authorized_tool(
                 return format!("user declined to delete {path}");
             }
 
+            let receipt_before = file_capture::capture(&caveats.fs_read, &full);
+            let artifact_before = artifact_path_within.then(|| {
+                artifact_preimage_state(&full, tui_permits_path(&caveats.fs_read, &full_str))
+            });
+            let mutation_scope = if scope_permits { &caveats.fs_write } else { &crate::caveats::Scope::All };
+
             // step-52.6: object-bound removal when the scope authorised it (the
             // parent is resolved beneath the root and the entry unlinked via its
             // fd, so a symlink/`..`/absolute escape is refused by the kernel).
@@ -3460,8 +3512,16 @@ async fn execute_authorized_tool(
             } else {
                 std::fs::remove_file(&full).map_err(|e| format!("error deleting {path}: {e}"))
             };
-            match delete_result {
+            let receipt_after = file_capture::capture(&caveats.fs_read, &full);
+            let receipt = file_capture::receipt(path, &receipt_before, &receipt_after);
+            let output = match delete_result {
                 Ok(()) => {
+                    if !file_capture::verified_after(&receipt_after, mutation_scope, &full, None) {
+                        return file_capture::present(
+                            format!("error: delete_file returned success for {path}, but absence could not be verified{receipt}"),
+                            presentation,
+                        );
+                    }
                     let artifact = if !artifact_tracking {
                         String::new()
                     } else if !artifact_path_within
@@ -3501,10 +3561,11 @@ async fn execute_authorized_tool(
                     let check = build_check_cmd
                         .map(|cmd| run_build_check(cmd, workspace))
                         .unwrap_or_default();
-                    format!("deleted {path}{artifact}{check}")
+                    format!("deleted {path}{receipt}{artifact}{check}")
                 }
-                Err(tool_output) => tool_output,
-            }
+                Err(tool_output) => file_capture::failure(tool_output, &receipt),
+            };
+            file_capture::present(output, presentation)
         }
 
         "edit_file" => {
@@ -3540,14 +3601,17 @@ async fn execute_authorized_tool(
                 return "error: old_string must not be empty — use write_file to create new files"
                     .to_string();
             }
+            if !file_capture::regular_target(&full) {
+                return file_capture::present(
+                    format!("error: edit_file refuses a nonregular target: {path}"),
+                    presentation,
+                );
+            }
+            let mutation_scope = if scope_permits { &caveats.fs_write } else { &crate::caveats::Scope::All };
             // step-52.5: read the existing file object-bound beneath the same
             // fs_write root (a symlink-escape edit is refused here, so the
             // no-match head display below can't leak an outside file either).
-            let read = if scope_permits {
-                object_bound_read(&caveats.fs_write, "fs_write", path, &full, &full_str)
-            } else {
-                std::fs::read_to_string(&full).map_err(|e| format!("error reading {path}: {e}"))
-            };
+            let read = file_capture::read_for_edit(mutation_scope, &full, path);
             let existing = match read {
                 Ok(s) => s,
                 Err(tool_output) => return tool_output,
@@ -3615,14 +3679,31 @@ async fn execute_authorized_tool(
             } else {
                 format!("{delta}")
             };
+            let receipt_before = file_capture::capture(&caveats.fs_read, &full);
+            // Detect a changed preimage before replacing it. This is an
+            // observed-before/verified-after contract, not a filesystem lock.
+            if !file_capture::current_preimage(&receipt_before, mutation_scope, &full, existing.as_bytes()) {
+                return file_capture::present(
+                    format!("error: edit_file refused a stale preimage for {path}; reread the file and retry"),
+                    presentation,
+                );
+            }
             // step-52.5: object-bound write when the scope authorised it.
             let write_result = if scope_permits {
                 object_bound_write(&caveats.fs_write, "fs_write", path, &full, &full_str, &updated)
             } else {
                 std_write(&full, path, &updated)
             };
-            match write_result {
+            let receipt_after = file_capture::capture(&caveats.fs_read, &full);
+            let receipt = file_capture::receipt(path, &receipt_before, &receipt_after);
+            let output = match write_result {
                 Ok(()) => {
+                    if !file_capture::verified_after(&receipt_after, mutation_scope, &full, Some(updated.as_bytes())) {
+                        return file_capture::present(
+                            format!("error: edit_file returned success for {path}, but the replacement bytes could not be verified{receipt}"),
+                            presentation,
+                        );
+                    }
                     let artifact = if !artifact_tracking {
                         String::new()
                     } else if !artifact_path_within
@@ -3669,11 +3750,12 @@ async fn execute_authorized_tool(
                         .map(|cmd| run_build_check(cmd, workspace))
                         .unwrap_or_default();
                     format!(
-                        "edited {path} ({delta_str} lines, now {new_lines} total){artifact}{check}"
+                        "edited {path} ({delta_str} lines, now {new_lines} total){receipt}{artifact}{check}"
                     )
                 }
-                Err(tool_output) => tool_output,
-            }
+                Err(tool_output) => file_capture::failure(tool_output, &receipt),
+            };
+            file_capture::present(output, presentation)
         }
 
         "list_dir" => {

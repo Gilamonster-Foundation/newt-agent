@@ -2,8 +2,8 @@
 //!
 //! `openai_sse` already proves the parser with no HTTP in it. What is
 //! unproved by those tests is everything this file covers: that the loop
-//! issues a second `stream: true` request AFTER the probe round is accepted
-//! (never on a tool round, never before the nudge cascade), that the streamed
+//! issues a second `stream: true` display request AFTER the primary is accepted
+//! (never reissuing a tool round or preceding the nudge cascade), that the streamed
 //! answer is what comes back with `was_streamed = true`, and that every way
 //! the second call can fail lands on the probe answer instead of on silence.
 //!
@@ -56,6 +56,7 @@
 //! `decode_chunk` and covered below; the Ollama wire still has the twin.
 
 use super::*;
+use crate::agentic::http_loop_tests::DisplayReplay;
 use crate::caveats::Caveats;
 use crate::{BackendKind, MemMessage};
 use std::sync::{Arc, Mutex};
@@ -159,11 +160,7 @@ fn body_json(req: &Request) -> serde_json::Value {
     serde_json::from_slice(&req.body).unwrap_or_default()
 }
 
-fn is_stream(req: &Request) -> bool {
-    body_json(req)["stream"].as_bool().unwrap_or(false)
-}
-
-/// A non-streaming `/v1/chat/completions` 200 body.
+/// A complete JSON response from an endpoint ignoring the requested SSE transport.
 fn probe_reply(content: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(serde_json::json!({
         "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
@@ -183,6 +180,7 @@ fn sse_text(parts: &[&str], input: u64, output: u64) -> ResponseTemplate {
         .iter()
         .map(|p| format!(r#"{{"choices":[{{"delta":{{"content":"{p}"}}}}]}}"#))
         .collect();
+    frames.push(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#.to_string());
     frames.push(format!(
         r#"{{"choices":[],"usage":{{"prompt_tokens":{input},"completion_tokens":{output}}}}}"#
     ));
@@ -191,21 +189,23 @@ fn sse_text(parts: &[&str], input: u64, output: u64) -> ResponseTemplate {
 }
 
 /// Records every request body so a test can assert on the SEQUENCE of
-/// requests, then answers streaming and non-streaming requests differently.
+/// requests, then injects the display response only after an accepted primary.
 struct Recorder<F: Fn(&serde_json::Value) -> ResponseTemplate> {
     seen: Arc<Mutex<Vec<serde_json::Value>>>,
     reply: F,
+    replay: DisplayReplay,
 }
 impl<F: Fn(&serde_json::Value) -> ResponseTemplate + Send + Sync + 'static> Respond
     for Recorder<F>
 {
     fn respond(&self, req: &Request) -> ResponseTemplate {
         let body = body_json(req);
-        let streaming = is_stream(req);
         self.seen.lock().unwrap().push(body.clone());
-        if streaming {
-            (self.reply)(&body)
-        } else if body["messages"]
+        if self.replay.take(req) {
+            return (self.reply)(&body);
+        }
+        self.replay.arm(req);
+        if body["messages"]
             .as_array()
             .map(|m| m.iter().any(|x| x["role"] == "tool"))
             .unwrap_or(false)
@@ -227,6 +227,7 @@ where
         .respond_with(Recorder {
             seen: seen.clone(),
             reply,
+            replay: Default::default(),
         })
         .mount(server)
         .await;
@@ -762,7 +763,7 @@ async fn the_final_round_is_re_issued_as_a_stream() {
     );
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 2, "one probe, one streaming re-issue: {seen:?}");
-    assert_eq!(seen[0]["stream"], serde_json::json!(false));
+    assert_eq!(seen[0]["stream"], serde_json::json!(true));
     assert_eq!(seen[1]["stream"], serde_json::json!(true));
     assert_eq!(
         seen[1]["stream_options"]["include_usage"],
@@ -865,17 +866,19 @@ async fn a_markdown_turn_streams_and_returns_the_raw_answer() {
     assert_eq!(seen.lock().unwrap().len(), 2);
 }
 
-/// A tool round must NOT be re-issued as a stream — only the round that ends
-/// the turn is. Streaming a tool round would double-bill every round of the
-/// turn and print a half-answer the loop then discards.
+/// Tool rounds stream on the transport once. Only the accepted final answer
+/// receives an optional display reissue; no tool batch is generated twice.
 #[tokio::test]
-async fn a_tool_round_is_not_streamed() {
+async fn a_tool_round_streams_once_before_the_final_display() {
     let server = MockServer::start().await;
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorded = seen.clone();
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ToolThenAnswer { seen: recorded })
+        .respond_with(ToolThenAnswer {
+            seen: recorded,
+            replay: Default::default(),
+        })
         .mount(&server)
         .await;
 
@@ -895,27 +898,29 @@ async fn a_tool_round_is_not_streamed() {
         .collect();
     assert_eq!(
         streams,
-        vec![false, false, true],
-        "tool round, final probe, then exactly ONE stream at the end: {seen:?}"
+        vec![true, true, true],
+        "one tool batch, one accepted answer, then exactly one display reissue: {seen:?}"
     );
 }
 
 struct ToolThenAnswer {
     seen: Arc<Mutex<Vec<serde_json::Value>>>,
+    replay: DisplayReplay,
 }
 impl Respond for ToolThenAnswer {
     fn respond(&self, req: &Request) -> ResponseTemplate {
         let body = body_json(req);
-        let streaming = is_stream(req);
+        let display = self.replay.take(req);
         let had_tool_result = body["messages"]
             .as_array()
             .map(|m| m.iter().any(|x| x["role"] == "tool"))
             .unwrap_or(false);
         self.seen.lock().unwrap().push(body);
-        if streaming {
+        if display {
             return sse_text(&["answered ", "after the tool"], 100, 5);
         }
         if had_tool_result {
+            self.replay.arm(req);
             return probe_reply("answered after the tool");
         }
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1044,3 +1049,7 @@ async fn inline_think_blocks_do_not_leak_into_the_streamed_answer() {
     assert!(!reply.contains("secret"), "reasoning leaked: {reply:?}");
     assert_eq!(seen.lock().unwrap().len(), 2);
 }
+
+#[cfg(test)]
+#[path = "openai_primary_stream.rs"]
+mod primary_stream;

@@ -358,7 +358,7 @@ fn retry_step_reprompts_until_the_budget_is_spent() {
 #[test]
 fn inline_header_color_contains_brand_and_ready_lines() {
     let s = render_inline_header("/w", true);
-    assert!(s.contains("Part of Newt-Agent, a free, friendly, local agentic coder."));
+    assert!(s.contains("New Tech Agent"));
     assert!(s.contains(&format!("v{VERSION}")));
     assert!(s.contains("ready — type a task, /help for commands, /exit to quit"));
     // Text is placed just past the 20-col logo via absolute column moves.
@@ -1459,8 +1459,10 @@ fn rich_help_uses_the_default_markdown_policy_and_honors_off() {
     assert!(markdown, "RichTUI defaults to rendered Markdown");
 
     let rendered = render_help_for_tui(None, true, false, markdown, 100);
+    let heading =
+        newt_core::tty::theme::active().ansi(newt_core::tty::theme::Role::MarkdownHeading);
     assert!(
-        rendered.starts_with("▸  \x1b[1m\x1b[38;2;220;60;20mAvailable"),
+        rendered.starts_with(&format!("▸  {heading}Available")),
         "the narrator prefix must stay outside the Markdown parser: {rendered:?}"
     );
     assert!(!rendered.contains("## Available commands"));

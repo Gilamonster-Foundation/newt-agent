@@ -4407,12 +4407,14 @@ dependencies = [
  "chrono",
  "content-addressable",
  "crossterm",
+ "diffy",
  "ignore",
  "libc",
  "markdown-table-formatter",
  "newt-interaction",
  "newt-skills",
  "newt-tuner",
+ "newtui",
  "parking_lot",
  "proptest",
  "pulldown-cmark",
@@ -4702,6 +4704,7 @@ dependencies = [
  "newt-mcp-client",
  "newt-skills",
  "newt-tools",
+ "newtui",
  "precedence-ladder",
  "ratatui",
  "reqwest",
@@ -4732,6 +4735,11 @@ dependencies = [
  "toml 1.1.3+spec-1.1.0",
  "tracing",
 ]
+
+[[package]]
+name = "newtui"
+version = "0.1.0"
+source = "git+https://github.com/Gilamonster-Foundation/newtui?rev=e8617efd6e5c489a3320f10f0c74000c8f19f1a7#e8617efd6e5c489a3320f10f0c74000c8f19f1a7"
 
 [[package]]
 name = "nix"

@@ -86,6 +86,10 @@ pub enum Role {
     SelectedLabel,
     /// A selected row's value.
     SelectedValue,
+    /// Model currently used by the session, independent of the keyboard cursor.
+    ActiveModel,
+    /// A model resident in server memory.
+    LoadedModel,
     /// Succeeded, allowed, present.
     Ok,
     /// A persona, a name, an identity.
@@ -100,6 +104,15 @@ pub enum Role {
     /// has taken the keyboard ends up looking like ordinary output.
     ModalBorder,
     /// The dialog's name, in its frame.
+    HumanText,
+    AgentText,
+    MarkdownHeading,
+    InlineCode,
+    MarkdownStrong,
+    MarkdownItalic,
+    Spill,
+    MarkdownLink,
+    MarkdownStrike,
     ModalTitle,
 }
 
@@ -112,7 +125,8 @@ pub enum Role {
 /// broken".
 #[derive(Debug, Clone, PartialEq)]
 pub struct Theme {
-    pub name: &'static str,
+    pub name: String,
+    attributes: std::collections::BTreeMap<Role, crossterm::style::Attributes>,
     accent: Color,
     text: Color,
     dim: Color,
@@ -128,9 +142,20 @@ pub struct Theme {
     gauge_critical: Color,
     selected_label: Color,
     selected_value: Color,
+    active_model: Color,
+    loaded_model: Color,
     ok: Color,
     identity: Color,
     modal_border: Color,
+    human_text: Color,
+    agent_text: Color,
+    markdown_heading: Color,
+    inline_code: Color,
+    markdown_strong: Color,
+    markdown_italic: Color,
+    spill: Color,
+    markdown_link: Color,
+    markdown_strike: Color,
     modal_title: Color,
 }
 
@@ -144,11 +169,21 @@ impl Theme {
     /// them looks like the rest of the product until a theme says otherwise.
     pub fn builtin() -> Self {
         Self {
-            name: "newt",
+            human_text: Color::Cyan,
+            agent_text: Color::Grey,
+            markdown_heading: Color::Blue,
+            inline_code: Color::White,
+            markdown_strong: Color::White,
+            markdown_italic: Color::Grey,
+            spill: Color::DarkGrey,
+            markdown_link: Color::Grey,
+            markdown_strike: Color::Grey,
+            name: "newt".to_string(),
             // THE constant, not a copy of its value. This table used to
             // re-write `Rgb(255, 165, 90)` — the same duplication its own
             // module doc complains about, merely relocated. Living in the
             // crate that DEFINES `ACTIVE_INPUT_CT` lets it name the thing.
+            attributes: Default::default(),
             accent: ACTIVE_INPUT_CT,
             text: Color::White,
             // `DarkGray` (20 sites) and `DarkGrey` (13) were the same request.
@@ -184,6 +219,8 @@ impl Theme {
             gauge_critical: Color::DarkRed,
             selected_label: Color::DarkCyan,
             selected_value: Color::DarkYellow,
+            active_model: Color::Cyan,
+            loaded_model: Color::DarkMagenta,
             ok: Color::DarkGreen,
             identity: Color::DarkMagenta,
             // A modal owns the keyboard, so it wears the colour that means so.
@@ -211,11 +248,63 @@ impl Theme {
             Role::GaugeCritical => self.gauge_critical,
             Role::SelectedLabel => self.selected_label,
             Role::SelectedValue => self.selected_value,
+            Role::ActiveModel => self.active_model,
+            Role::LoadedModel => self.loaded_model,
             Role::Ok => self.ok,
             Role::Identity => self.identity,
             Role::ModalBorder => self.modal_border,
+            Role::HumanText => self.human_text,
+            Role::AgentText => self.agent_text,
+            Role::MarkdownHeading => self.markdown_heading,
+            Role::InlineCode => self.inline_code,
+            Role::MarkdownStrong => self.markdown_strong,
+            Role::MarkdownItalic => self.markdown_italic,
+            Role::Spill => self.spill,
+            Role::MarkdownLink => self.markdown_link,
+            Role::MarkdownStrike => self.markdown_strike,
             Role::ModalTitle => self.modal_title,
         }
+    }
+
+    /// Complete terminal style for a semantic role.
+    pub fn style(&self, role: Role) -> crossterm::style::ContentStyle {
+        use crossterm::style::{Attribute, Attributes, ContentStyle};
+        let attributes = self.attributes.get(&role).copied().unwrap_or_else(|| {
+            let mut a = Attributes::default();
+            match role {
+                Role::Ok
+                | Role::Identity
+                | Role::MarkdownHeading
+                | Role::MarkdownStrong
+                | Role::InlineCode
+                | Role::SelectedLabel
+                | Role::SelectedValue
+                | Role::ModalTitle => a.set(Attribute::Bold),
+                Role::MarkdownLink => a.set(Attribute::Underlined),
+                Role::MarkdownStrike => a.set(Attribute::CrossedOut),
+                Role::MarkdownItalic => a.set(Attribute::Italic),
+                _ => {}
+            }
+            a
+        });
+        ContentStyle {
+            foreground_color: Some(self.color(role)),
+            attributes,
+            ..ContentStyle::default()
+        }
+    }
+
+    /// ANSI prefix for a role; callers reset at their row boundary.
+    pub fn ansi(&self, role: Role) -> String {
+        ansi_style(self.style(role))
+    }
+
+    /// Change color and attributes together; explicit empty attributes disable defaults.
+    pub fn set_style(&mut self, role: Role, style: crossterm::style::ContentStyle) {
+        if let Some(color) = style.foreground_color {
+            *self = self.clone().overlaid(&self.name.clone(), &[(role, color)]);
+        }
+        self.attributes.insert(role, style.attributes);
     }
 
     /// Overlay a partial assignment read from a theme file.
@@ -225,8 +314,8 @@ impl Theme {
     /// colours they must keep in step with ours. Everything unstated keeps the
     /// built-in value, so a theme file cannot go stale by omission when a role
     /// is added — the same droppable-override shape the language packs use.
-    pub fn overlaid(mut self, name: &'static str, overrides: &[(Role, Color)]) -> Self {
-        self.name = name;
+    pub fn overlaid(mut self, name: &str, overrides: &[(Role, Color)]) -> Self {
+        self.name = name.to_string();
         for (role, color) in overrides {
             match role {
                 Role::Accent => self.accent = *color,
@@ -244,14 +333,73 @@ impl Theme {
                 Role::GaugeCritical => self.gauge_critical = *color,
                 Role::SelectedLabel => self.selected_label = *color,
                 Role::SelectedValue => self.selected_value = *color,
+                Role::ActiveModel => self.active_model = *color,
+                Role::LoadedModel => self.loaded_model = *color,
                 Role::Ok => self.ok = *color,
                 Role::Identity => self.identity = *color,
                 Role::ModalBorder => self.modal_border = *color,
+                Role::HumanText => self.human_text = *color,
+                Role::AgentText => self.agent_text = *color,
+                Role::MarkdownHeading => self.markdown_heading = *color,
+                Role::InlineCode => self.inline_code = *color,
+                Role::MarkdownStrong => self.markdown_strong = *color,
+                Role::MarkdownItalic => self.markdown_italic = *color,
+                Role::Spill => self.spill = *color,
+                Role::MarkdownLink => self.markdown_link = *color,
+                Role::MarkdownStrike => self.markdown_strike = *color,
                 Role::ModalTitle => self.modal_title = *color,
             }
         }
         self
     }
+}
+
+/// Encode a foreground without consulting process-global NO_COLOR. The calling
+/// renderer owns its explicit color switch, including headless previews/tests.
+pub fn ansi_color(color: Color) -> String {
+    let index = match color {
+        Color::Reset => return "\x1b[39m".into(),
+        Color::Rgb { r, g, b } => return format!("\x1b[38;2;{r};{g};{b}m"),
+        Color::AnsiValue(n) => return format!("\x1b[38;5;{n}m"),
+        Color::Black => 0,
+        Color::DarkRed => 1,
+        Color::DarkGreen => 2,
+        Color::DarkYellow => 3,
+        Color::DarkBlue => 4,
+        Color::DarkMagenta => 5,
+        Color::DarkCyan => 6,
+        Color::Grey => 7,
+        Color::DarkGrey => 8,
+        Color::Red => 9,
+        Color::Green => 10,
+        Color::Yellow => 11,
+        Color::Blue => 12,
+        Color::Magenta => 13,
+        Color::Cyan => 14,
+        Color::White => 15,
+    };
+    format!("\x1b[38;5;{index}m")
+}
+
+pub fn ansi_style(style: crossterm::style::ContentStyle) -> String {
+    use crossterm::style::{Attribute, SetAttribute};
+    let mut text = String::new();
+    for attr in [
+        Attribute::Bold,
+        Attribute::Dim,
+        Attribute::Italic,
+        Attribute::Underlined,
+        Attribute::Reverse,
+        Attribute::CrossedOut,
+    ] {
+        if style.attributes.has(attr) {
+            text.push_str(&format!("{}", SetAttribute(attr)));
+        }
+    }
+    if let Some(color) = style.foreground_color {
+        text.push_str(&ansi_color(color));
+    }
+    text
 }
 
 /// The role vocabulary as it appears in a theme file.
@@ -275,9 +423,20 @@ pub fn role_from_name(name: &str) -> Option<Role> {
         "gauge-critical" => Role::GaugeCritical,
         "selected-label" => Role::SelectedLabel,
         "selected-value" => Role::SelectedValue,
+        "active-model" => Role::ActiveModel,
+        "loaded-model" => Role::LoadedModel,
         "ok" => Role::Ok,
         "identity" => Role::Identity,
         "modal-border" => Role::ModalBorder,
+        "human-text" => Role::HumanText,
+        "agent-text" => Role::AgentText,
+        "markdown-heading" => Role::MarkdownHeading,
+        "inline-code" => Role::InlineCode,
+        "markdown-strong" => Role::MarkdownStrong,
+        "markdown-italic" => Role::MarkdownItalic,
+        "spill" => Role::Spill,
+        "markdown-link" => Role::MarkdownLink,
+        "markdown-strike" => Role::MarkdownStrike,
         "modal-title" => Role::ModalTitle,
         _ => return None,
     })
@@ -300,9 +459,20 @@ pub const ALL_ROLES: &[Role] = &[
     Role::GaugeCritical,
     Role::SelectedLabel,
     Role::SelectedValue,
+    Role::ActiveModel,
+    Role::LoadedModel,
     Role::Ok,
     Role::Identity,
     Role::ModalBorder,
+    Role::HumanText,
+    Role::AgentText,
+    Role::MarkdownHeading,
+    Role::InlineCode,
+    Role::MarkdownStrong,
+    Role::MarkdownItalic,
+    Role::Spill,
+    Role::MarkdownLink,
+    Role::MarkdownStrike,
     Role::ModalTitle,
 ];
 
@@ -324,9 +494,20 @@ pub fn role_name(role: Role) -> &'static str {
         Role::GaugeCritical => "gauge-critical",
         Role::SelectedLabel => "selected-label",
         Role::SelectedValue => "selected-value",
+        Role::ActiveModel => "active-model",
+        Role::LoadedModel => "loaded-model",
         Role::Ok => "ok",
         Role::Identity => "identity",
         Role::ModalBorder => "modal-border",
+        Role::HumanText => "human-text",
+        Role::AgentText => "agent-text",
+        Role::MarkdownHeading => "markdown-heading",
+        Role::InlineCode => "inline-code",
+        Role::MarkdownStrong => "markdown-strong",
+        Role::MarkdownItalic => "markdown-italic",
+        Role::Spill => "spill",
+        Role::MarkdownLink => "markdown-link",
+        Role::MarkdownStrike => "markdown-strike",
         Role::ModalTitle => "modal-title",
     }
 }
@@ -357,6 +538,7 @@ pub fn parse_color(value: &str) -> Result<Color, String> {
         return Ok(Color::AnsiValue(index));
     }
     Ok(match value.to_ascii_lowercase().as_str() {
+        "default" => Color::Reset,
         "black" => Color::Black,
         "red" => Color::DarkRed,
         "green" => Color::DarkGreen,
@@ -398,8 +580,14 @@ pub fn parse_color(value: &str) -> Result<Color, String> {
 /// that silently half-applies looks like a rendering bug everywhere except the
 /// one place that would explain it.
 pub fn from_env(raw: Option<&str>) -> (Theme, Vec<String>) {
+    overlay_env(Theme::builtin(), raw)
+}
+
+/// The `NEWT_THEME` pairs applied over `base`; one parser for both the
+/// built-in default and a persisted preference, so the two cannot drift.
+fn overlay_env(base: Theme, raw: Option<&str>) -> (Theme, Vec<String>) {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
-        return (Theme::builtin(), Vec::new());
+        return (base, Vec::new());
     };
     let (mut overrides, mut complaints) = (Vec::new(), Vec::new());
     for pair in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
@@ -430,18 +618,23 @@ pub fn from_env(raw: Option<&str>) -> (Theme, Vec<String>) {
     (Theme::builtin().overlaid("custom", &overrides), complaints)
 }
 
-/// The theme in force, resolved ONCE.
-///
-/// A `OnceLock` rather than a call per span: `draw` runs on every keystroke and
-/// on every 250 ms repaint, and re-reading the environment each time would put
-/// a parser on the hot path to answer a question that cannot change
-/// mid-process.
-///
-/// Complaints about a malformed `NEWT_THEME` are held by [`complaints`]
-/// for the session to print once — a theme that silently half-applies looks
-/// like a rendering bug everywhere except the one place that would explain it.
-pub fn active() -> &'static Theme {
-    &resolved().0
+/// Snapshot of the current theme. Seeded from the built-in table plus
+/// `NEWT_THEME` only; a persisted preference reaches it solely through
+/// [`restore_preferences`] (an explicit startup step) or [`set_active`].
+/// Invalid `NEWT_THEME` pairs are reported through [`complaints`].
+pub fn active() -> std::sync::Arc<Theme> {
+    runtime().read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Apply a complete theme without restarting or leaking old snapshots.
+pub fn set_active(theme: Theme) {
+    *runtime().write().unwrap_or_else(|e| e.into_inner()) = std::sync::Arc::new(theme);
+}
+
+fn runtime() -> &'static std::sync::RwLock<std::sync::Arc<Theme>> {
+    static ACTIVE: std::sync::OnceLock<std::sync::RwLock<std::sync::Arc<Theme>>> =
+        std::sync::OnceLock::new();
+    ACTIVE.get_or_init(|| std::sync::RwLock::new(std::sync::Arc::new(resolved().0.clone())))
 }
 
 /// What was wrong with `NEWT_THEME`, if anything.
@@ -449,15 +642,89 @@ pub fn complaints() -> &'static [String] {
     &resolved().1
 }
 
+/// Built-in table plus `NEWT_THEME`, nothing else. Deliberately NOT the
+/// persisted preference: this is what every renderer sees by default, so a
+/// lazy read of the operator's config dir here would make the markdown and
+/// stream goldens depend on whatever theme the developer last applied —
+/// green on a bare CI runner, red on the box that shipped the feature. The
+/// unit tier is hermetic only because this function never touches the fs.
 fn resolved() -> &'static (Theme, Vec<String>) {
     static THEME: std::sync::OnceLock<(Theme, Vec<String>)> = std::sync::OnceLock::new();
-    THEME.get_or_init(|| from_env(std::env::var("NEWT_THEME").ok().as_deref()))
+    THEME.get_or_init(default_snapshot)
 }
+
+/// What [`resolved`] memoises. Separate so a test can assert on it without
+/// the `OnceLock`'s first-caller-wins ordering.
+fn default_snapshot() -> (Theme, Vec<String>) {
+    from_env(std::env::var("NEWT_THEME").ok().as_deref())
+}
+
+/// Apply the persisted preference (`<config dir>/themes/active.toml`) with
+/// `NEWT_THEME` overlaid on top — the environment still wins, as it did when
+/// it was the only override. An explicit startup step for the interactive
+/// binary, never a side effect of rendering; returns what was wrong with the
+/// persisted file, for the same one-line startup report as [`complaints`].
+pub fn restore_preferences() -> Vec<String> {
+    let (theme, warnings) = restored_theme();
+    set_active(theme);
+    warnings
+}
+
+fn restored_theme() -> (Theme, Vec<String>) {
+    let (persisted, warnings) = preferences::restore();
+    // Env complaints are already reported once through `complaints()`.
+    let (theme, _) = overlay_env(persisted, std::env::var("NEWT_THEME").ok().as_deref());
+    (theme, warnings)
+}
+
+pub mod preferences;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tty::NEWT_ORANGE_CT;
+
+    /// **A persisted preference never leaks into the default snapshot.** The
+    /// markdown/stream goldens pin built-in SGR bytes through `active()`; if
+    /// the config dir's `active.toml` could reach `resolved()`, applying
+    /// `daylight` once would turn `cargo test` red on that box. Pins
+    /// `NEWT_CONFIG_DIR` under the `real_fs` serial lane like every other
+    /// mutation site in this crate, and asserts on `default_snapshot()`
+    /// rather than the memoised `resolved()` so the result does not depend
+    /// on which test initialised the `OnceLock` first.
+    #[test]
+    #[serial_test::serial(real_fs)]
+    fn a_persisted_theme_reaches_active_only_through_restore_preferences() {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        std::fs::create_dir_all(dir.path().join("themes")).unwrap();
+        std::fs::write(
+            dir.path().join("themes/active.toml"),
+            "name = \"daylight\"\n[roles.agent-text]\ncolor = \"black\"\n",
+        )
+        .unwrap();
+        let prev = std::env::var_os(crate::config::NEWT_CONFIG_DIR_ENV);
+        std::env::set_var(crate::config::NEWT_CONFIG_DIR_ENV, dir.path());
+
+        let (default_snapshot, _) = default_snapshot();
+        let (restored, warnings) = restored_theme();
+
+        match prev {
+            Some(v) => std::env::set_var(crate::config::NEWT_CONFIG_DIR_ENV, v),
+            None => std::env::remove_var(crate::config::NEWT_CONFIG_DIR_ENV),
+        }
+
+        // `!= "daylight"` rather than `== "newt"`: a developer shell that
+        // exports a valid NEWT_THEME names the default `custom`, and that is
+        // not what this test is about.
+        assert_ne!(
+            default_snapshot.name, "daylight",
+            "the default snapshot read the config dir"
+        );
+        assert_ne!(default_snapshot.color(Role::AgentText), Color::Black);
+        assert_eq!(restored.name, "daylight");
+        assert_eq!(restored.color(Role::AgentText), Color::Black);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
 
     /// **The seam changes nothing on arrival.**
     ///
@@ -553,7 +820,7 @@ mod tests {
             );
             assert_eq!(name, name.to_ascii_lowercase(), "names are kebab-case");
         }
-        assert_eq!(ALL_ROLES.len(), 19, "add the new role to ALL_ROLES too");
+        assert_eq!(ALL_ROLES.len(), 30, "add the new role to ALL_ROLES too");
         assert_eq!(role_from_name("nonsense"), None);
     }
 

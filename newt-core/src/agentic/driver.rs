@@ -140,7 +140,7 @@ pub struct TurnDriverConfig {
     pub num_ctx: Option<u32>,
     /// TCP connect timeout.
     pub connect_timeout_secs: u64,
-    /// Total inference timeout.
+    /// Total timeout for single-response requests and idle timeout for streams.
     pub inference_timeout_secs: u64,
     /// Message count at which the in-flight conversation is trimmed mid-turn.
     pub mid_loop_trim_threshold: usize,

@@ -3,11 +3,12 @@ use super::*;
 struct OverflowRequests {
     requests: Arc<Mutex<Vec<serde_json::Value>>>,
     failures: usize,
+    replay: DisplayReplay,
 }
 
 impl Respond for OverflowRequests {
     fn respond(&self, req: &Request) -> ResponseTemplate {
-        if is_stream(req) {
+        if self.replay.take(req) {
             return sse_replay("recovered");
         }
         let mut requests = self.requests.lock().unwrap();
@@ -17,6 +18,7 @@ impl Respond for OverflowRequests {
                 "error": {"message": "Context size has been exceeded."}
             }))
         } else {
+            self.replay.arm(req);
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{"finish_reason": "stop", "message": {
                     "role": "assistant", "content": "recovered"
@@ -56,6 +58,7 @@ async fn run_overflow(
         .respond_with(OverflowRequests {
             requests: requests.clone(),
             failures,
+            replay: Default::default(),
         })
         .mount(&server)
         .await;
@@ -343,3 +346,6 @@ async fn cap_summary_context_exceeded_keeps_round_cap_and_records_the_rejection(
     ));
     assert!(state.calibration.ratio(None) >= 1.5);
 }
+
+#[path = "http_display_context_exceeded.rs"]
+mod display_sse;

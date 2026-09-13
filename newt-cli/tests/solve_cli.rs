@@ -112,12 +112,12 @@ impl Respond for CaptureThenFinish {
             .lock()
             .expect("request capture lock")
             .push(body);
-        // #123: the accepted round is re-issued with `stream: true` and served
-        // as SSE. Captured like any other request — it goes to the same
+        // Primary and final-display requests both use SSE. Each is
+        // captured like any other request — it goes to the same
         // endpoint and carries the same wire controls, so the assertions about
         // both apply to it too.
         if streaming {
-            let frame = serde_json::json!({"choices": [{"delta": {"content": "done"}}]});
+            let frame = serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]});
             let sse = format!("data: {frame}\n\ndata: [DONE]\n\n");
             return ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream");
         }

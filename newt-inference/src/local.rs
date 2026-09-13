@@ -1,5 +1,14 @@
 //! Local inference backends — the only backends compiled into the default
 //! Newt binary. Cloud APIs live behind opt-in `ProviderPluginBackend`.
+//!
+//! Local requests default to a 120-second send/header deadline and maximum
+//! idle gap between response chunks. Callers can override both with
+//! `with_timeout` without replacing an injected HTTP client. OpenAI-compatible
+//! and native Ollama completion requests stream.
+
+use std::future::Future;
+use std::time::Duration;
+use tokio::time::Instant;
 
 use async_trait::async_trait;
 use newt_core::router::Tier;
@@ -7,11 +16,150 @@ use newt_core::router::Tier;
 use crate::backend::{ChatReply, ChatRequest, InferenceBackend};
 use crate::retry::{with_backoff, RetryPolicy};
 
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Debug)]
+struct ObservedProviderError(String);
+
+impl std::fmt::Display for ObservedProviderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ObservedProviderError {}
+
+fn is_observed_provider_error(error: &anyhow::Error) -> bool {
+    newt_core::agentic::openai_sse::is_provider_error(error)
+        || error
+            .chain()
+            .any(|cause| cause.is::<ObservedProviderError>())
+}
+
+fn local_client(read_timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .read_timeout(read_timeout)
+        .build()
+        .expect("build local inference client")
+}
+
+// An outer deadline preserves a caller-owned client's stricter timeouts,
+// connection pool, headers, proxy, and TLS configuration. A RequestBuilder
+// timeout would instead override its client's existing total deadline.
+async fn bounded_request<T>(
+    deadline: Instant,
+    request: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout_at(deadline, request)
+        .await
+        .map_err(|_| anyhow::anyhow!("local inference request failed: deadline elapsed"))?
+}
+
+async fn decode_http_reply(
+    mut response: reqwest::Response,
+    idle_timeout: Duration,
+    backend: &str,
+    decode: impl FnOnce(&[u8]) -> anyhow::Result<serde_json::Value>,
+) -> anyhow::Result<serde_json::Value> {
+    let status = response.status();
+    // Own the evidence outside each cancellable read. An idle timeout may
+    // close the response after an error frame arrived but before its EOF.
+    let mut bytes = Vec::new();
+    let read_error = loop {
+        match tokio::time::timeout(idle_timeout, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => bytes.extend_from_slice(&chunk),
+            Ok(Ok(None)) => break None,
+            Ok(Err(error)) => break Some(anyhow::Error::from(error)),
+            Err(error) => break Some(anyhow::Error::from(error)),
+        }
+    };
+    if !status.is_success() {
+        let detail = String::from_utf8_lossy(&bytes);
+        if let Some(error) = read_error {
+            anyhow::bail!(
+                "{backend} returned {status}: {detail}; response body read failure: {error}"
+            );
+        }
+        anyhow::bail!("{backend} returned {status}: {detail}");
+    }
+    let decoded = decode(&bytes);
+    if let Some(read_error) = read_error {
+        if let Err(error) = decoded {
+            if is_observed_provider_error(&error) {
+                let message = format!(
+                    "{backend} response: {error}; response body read failure: {read_error}"
+                );
+                return Err(error.context(message));
+            }
+        }
+        anyhow::bail!("{backend} request failed reading response: {read_error}");
+    }
+    decoded
+}
+
+fn decode_ollama_stream(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
+    let body = std::str::from_utf8(bytes)
+        .map_err(|error| anyhow::anyhow!("invalid Ollama stream UTF-8: {error}"))?;
+    let mut content = String::new();
+    let mut terminal = None;
+
+    for (index, line) in body.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let frame: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+            anyhow::anyhow!("invalid Ollama stream record {}: {error}", index + 1)
+        })?;
+        anyhow::ensure!(
+            terminal.is_none(),
+            "Ollama stream continued after its terminal frame"
+        );
+        anyhow::ensure!(frame.is_object(), "Ollama stream frame is not an object");
+        if let Some(error) = frame.get("error").filter(|error| !error.is_null()) {
+            let detail = error
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| error.to_string());
+            return Err(ObservedProviderError(format!("Ollama response error: {detail}")).into());
+        }
+        let message = match frame.get("message") {
+            Some(serde_json::Value::Object(message)) => Some(message),
+            None | Some(serde_json::Value::Null) => None,
+            Some(_) => anyhow::bail!("Ollama stream message is not an object"),
+        };
+        match message.and_then(|message| message.get("content")) {
+            Some(serde_json::Value::String(part)) => content.push_str(part),
+            None | Some(serde_json::Value::Null) => {}
+            Some(_) => anyhow::bail!("Ollama stream content is not a string"),
+        }
+        match frame.get("done").and_then(serde_json::Value::as_bool) {
+            Some(true) => terminal = Some(frame),
+            Some(false) => {}
+            None => anyhow::bail!("Ollama stream frame has no boolean done marker"),
+        }
+    }
+
+    let mut terminal =
+        terminal.ok_or_else(|| anyhow::anyhow!("Ollama stream ended before done"))?;
+    let object = terminal
+        .as_object_mut()
+        .expect("terminal stream frame was checked as an object");
+    let message = object
+        .entry("message")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Ollama stream message is not an object"))?;
+    message.insert("content".to_owned(), serde_json::Value::String(content));
+    Ok(terminal)
+}
+
 #[derive(Debug)]
 pub struct LocalOllamaBackend {
     endpoint: String,
     model: String,
     client: reqwest::Client,
+    managed_client: bool,
+    timeout: Duration,
     /// Optional bearer token sent as `Authorization: Bearer <token>` —
     /// Ollama Cloud (`https://ollama.com`) requires one; LAN Ollama needs
     /// none (the default) and ignores an unexpected header.
@@ -24,7 +172,9 @@ impl LocalOllamaBackend {
         Self {
             endpoint: endpoint.into(),
             model: model.into(),
-            client: reqwest::Client::new(),
+            client: local_client(DEFAULT_REQUEST_TIMEOUT),
+            managed_client: true,
+            timeout: DEFAULT_REQUEST_TIMEOUT,
             api_key: None,
             retry: RetryPolicy::from_env(),
         }
@@ -34,6 +184,7 @@ impl LocalOllamaBackend {
     /// backend values constructed for separate requests.
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
         self.client = client;
+        self.managed_client = false;
         self
     }
 
@@ -74,12 +225,14 @@ impl LocalOllamaBackend {
         }
     }
 
-    /// Override the HTTP client timeout. Useful for testing.
-    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("build client");
+    /// Override the send/header deadline and idle read timeout per attempt
+    /// (default: 120 seconds). Retains an injected client and any stricter
+    /// timeout that client carries.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        if self.managed_client {
+            self.client = local_client(timeout);
+        }
         self
     }
 
@@ -214,29 +367,26 @@ impl LocalOllamaBackend {
     /// Single HTTP attempt — no retries. Returns a structured error that
     /// [`crate::retry::classify`] can classify for the backoff loop.
     async fn try_complete(&self, req: &ChatRequest) -> anyhow::Result<ChatReply> {
+        let deadline = Instant::now() + self.timeout;
         let body = serde_json::json!({
             "model": self.model,
             "messages": req.messages.iter().map(|m| {
                 serde_json::json!({ "role": &m.role, "content": &m.content })
             }).collect::<Vec<_>>(),
-            "stream": false,
+            "stream": true,
             "options": req.max_tokens.map(|t| serde_json::json!({ "num_predict": t })),
         });
 
         let url = format!("{}/api/chat", self.endpoint.trim_end_matches('/'));
-        let resp = self
-            .authed(self.client.post(&url).json(&body))
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Ollama request failed: {e}"))?;
+        let resp = bounded_request(deadline, async {
+            self.authed(self.client.post(&url).json(&body))
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("Ollama request failed: {e}"))
+        })
+        .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Ollama returned {status}: {text}");
-        }
-
-        let json: serde_json::Value = resp.json().await?;
+        let json = decode_http_reply(resp, self.timeout, "Ollama", decode_ollama_stream).await?;
         // #385: strip inline <think>…</think> reasoning from the content.
         let (content, _reasoning) =
             newt_core::split_reasoning(json["message"]["content"].as_str().unwrap_or(""));
@@ -301,6 +451,8 @@ pub struct LocalVllmBackend {
     endpoint: String,
     model: String,
     client: reqwest::Client,
+    managed_client: bool,
+    timeout: Duration,
     /// Optional bearer token sent as `Authorization: Bearer <token>`.
     /// `None` for unauthenticated local servers (the default); `Some`
     /// for hosted OpenAI-compatible endpoints that require an API key.
@@ -313,7 +465,9 @@ impl LocalVllmBackend {
         Self {
             endpoint: endpoint.into(),
             model: model.into(),
-            client: reqwest::Client::new(),
+            client: local_client(DEFAULT_REQUEST_TIMEOUT),
+            managed_client: true,
+            timeout: DEFAULT_REQUEST_TIMEOUT,
             api_key: None,
             retry: RetryPolicy::from_env(),
         }
@@ -323,6 +477,7 @@ impl LocalVllmBackend {
     /// backend values constructed for separate requests.
     pub fn with_client(mut self, client: reqwest::Client) -> Self {
         self.client = client;
+        self.managed_client = false;
         self
     }
 
@@ -368,24 +523,28 @@ impl LocalVllmBackend {
         }
     }
 
-    /// Override the HTTP client timeout. Useful for testing.
-    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
-        self.client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("build client");
+    /// Override the send/header deadline and idle read timeout per attempt
+    /// (default: 120 seconds). Retains an injected client and any stricter
+    /// timeout that client carries.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        if self.managed_client {
+            self.client = local_client(timeout);
+        }
         self
     }
 
     /// Single HTTP attempt — no retries. Returns a structured error that
     /// [`crate::retry::classify`] can classify for the backoff loop.
     async fn try_complete(&self, req: &ChatRequest) -> anyhow::Result<ChatReply> {
+        let deadline = Instant::now() + self.timeout;
         let mut body = serde_json::json!({
             "model": self.model,
             "messages": req.messages.iter().map(|m| {
                 serde_json::json!({ "role": &m.role, "content": &m.content })
             }).collect::<Vec<_>>(),
-            "stream": false,
+            "stream": true,
+            "stream_options": {"include_usage": true},
         });
         if let Some(max) = req.max_tokens {
             body["max_tokens"] = serde_json::json!(max);
@@ -395,19 +554,21 @@ impl LocalVllmBackend {
             "{}/v1/chat/completions",
             self.endpoint.trim_end_matches('/')
         );
-        let resp = self
-            .authed(self.client.post(&url).json(&body))
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("vLLM request failed: {e}"))?;
+        let resp = bounded_request(deadline, async {
+            self.authed(self.client.post(&url).json(&body))
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("vLLM request failed: {e}"))
+        })
+        .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("vLLM returned {status}: {text}");
-        }
-
-        let json: serde_json::Value = resp.json().await?;
+        let json = decode_http_reply(
+            resp,
+            self.timeout,
+            "vLLM",
+            newt_core::agentic::openai_sse::decode_response,
+        )
+        .await?;
         // OpenAI-compatible: choices[0].message.content
         // #385: strip inline <think>…</think> reasoning from the content.
         let (content, _reasoning) = newt_core::split_reasoning(
@@ -454,6 +615,10 @@ impl LocalVllmBackend {
     ///
     /// Used by `newt doctor` (follow-up) to probe vLLM endpoints.
     pub async fn list_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        bounded_request(Instant::now() + self.timeout, self.try_list_models()).await
+    }
+
+    async fn try_list_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
         let url = format!("{}/v1/models", self.endpoint.trim_end_matches('/'));
         let resp = self
             .authed(self.client.get(&url))

@@ -57,9 +57,11 @@ leave the new head visible, so the failed session never advances its reported
 committed head or attempts to roll the locator back.
 
 Writer leases use native nonblocking Unix/Windows file locks through `fs4`, held
-for the session's entire lifetime. Drop, unwinding, or process exit closes that
-owner's handle. On Unix an inherited descriptor can keep the lock held until
-its final copy closes, even after the parent exits. Persistent `locks/<run CID>`
+for the session's entire lifetime. Drop or unwinding explicitly unlocks the
+owner's lease before closing its handle, so an inherited Unix descriptor cannot
+prolong a clean release. A forked child only closes its inherited handle; it
+cannot unlock a live parent's lease. If the owner exits without running Drop,
+an inherited descriptor can still keep the lock held until its final copy closes. Persistent `locks/<run CID>`
 sidecars must never be deleted or replaced. Sessions inherited through `fork()`
 cannot write; the child must drop the inherited session before opening or
 restoring its own. Filesystems must provide reliable local locking and atomic rename;

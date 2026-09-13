@@ -17,11 +17,12 @@ async fn spill_retrieval_round_trip_recovers_file_middle_on_the_wire() {
     let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
     let seen = requests.clone();
     let server = MockServer::start().await;
+    let replay = DisplayReplay::default();
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(move |request: &Request| {
             let body = body_json(request);
-            if is_stream(request) {
+            if replay.take(request) {
                 return sse_replay("The recovered detail is EXACT_MIDDLE_DETAIL.");
             }
             let mut requests = seen.lock().unwrap();
@@ -52,8 +53,11 @@ async fn spill_retrieval_round_trip_recovers_file_middle_on_the_wire() {
                     "tool_calls": [{"id": format!("call_{round}"), "type": "function",
                         "function": {"name": name, "arguments": arguments.to_string()}}]
                 }),
-                None => serde_json::json!({"role": "assistant",
-                    "content": "The recovered detail is EXACT_MIDDLE_DETAIL."}),
+                None => {
+                    replay.arm(request);
+                    serde_json::json!({"role": "assistant",
+                        "content": "The recovered detail is EXACT_MIDDLE_DETAIL."})
+                }
             };
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{"message": message}]

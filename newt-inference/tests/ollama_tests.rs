@@ -12,15 +12,23 @@ fn test_retry() -> RetryPolicy {
     RetryPolicy::immediate(3)
 }
 
+fn ollama_reply(content: &str) -> ResponseTemplate {
+    let body = serde_json::json!({
+        "message": { "role": "assistant", "content": content },
+        "done": true
+    })
+    .to_string()
+        + "\n";
+    ResponseTemplate::new(200).set_body_raw(body, "application/x-ndjson")
+}
+
 #[tokio::test]
 async fn happy_path() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "message": { "content": "hello" }
-        })))
+        .respond_with(ollama_reply("hello"))
         .expect(1)
         .mount(&server)
         .await;
@@ -40,9 +48,7 @@ async fn sends_bearer_when_configured() {
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .and(header("authorization", "Bearer cloud-token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "message": { "content": "authed" }
-        })))
+        .respond_with(ollama_reply("authed"))
         .expect(1)
         .mount(&server)
         .await;
@@ -70,9 +76,7 @@ async fn sends_no_auth_header_when_keyless() {
         .await;
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "message": { "content": "keyless" }
-        })))
+        .respond_with(ollama_reply("keyless"))
         .expect(1)
         .mount(&server)
         .await;
@@ -115,11 +119,7 @@ async fn malformed_json_returns_error() {
 
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string("not json")
-                .insert_header("content-type", "application/json"),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_raw("not json", "application/x-ndjson"))
         .expect(1)
         .mount(&server)
         .await;
@@ -137,9 +137,10 @@ async fn empty_content_returns_empty_string() {
 
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "message": {}
-        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw("{\"message\":{},\"done\":true}\n", "application/x-ndjson"),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -157,9 +158,7 @@ async fn model_id_correctly_returned() {
 
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "message": { "content": "ok" }
-        })))
+        .respond_with(ollama_reply("ok"))
         .expect(1)
         .mount(&server)
         .await;
@@ -178,13 +177,7 @@ async fn timeout_returns_error() {
     // Timeout errors are retryable, so expect 4 total attempts.
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({
-                    "message": { "content": "slow" }
-                }))
-                .set_delay(Duration::from_secs(5)),
-        )
+        .respond_with(ollama_reply("slow").set_delay(Duration::from_secs(5)))
         .expect(4)
         .mount(&server)
         .await;
@@ -383,9 +376,7 @@ async fn retries_on_503() {
     // success mock first (lower priority) then the 503 mock with up_to_n_times.
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "message": { "content": "recovered" }
-        })))
+        .respond_with(ollama_reply("recovered"))
         .mount(&server)
         .await;
 
@@ -412,9 +403,7 @@ async fn retries_on_429() {
 
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "message": { "content": "recovered" }
-        })))
+        .respond_with(ollama_reply("recovered"))
         .mount(&server)
         .await;
 
@@ -485,9 +474,7 @@ async fn success_on_first_try_no_retry() {
     // Exactly 1 request expected — no retries needed.
     Mock::given(method("POST"))
         .and(path("/api/chat"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "message": { "content": "first try" }
-        })))
+        .respond_with(ollama_reply("first try"))
         .expect(1)
         .mount(&server)
         .await;

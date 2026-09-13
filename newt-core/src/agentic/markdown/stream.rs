@@ -312,7 +312,9 @@ mod tests {
 
     const BOLD: &str = "\x1b[1m";
     const RESET: &str = "\x1b[0m";
-    const FADE: &str = "\x1b[38;2;90;90;90m";
+    const FADE: &str = "\x1b[38;5;8m";
+    const BODY: &str = "\x1b[38;5;7m";
+    const CODE: &str = "\x1b[38;5;15m";
 
     #[test]
     fn inline_line_renders_per_line() {
@@ -320,7 +322,7 @@ mod tests {
         for chunk in [1, 2, 3, 100] {
             assert_eq!(
                 stream("**bold** x\n", chunk, true, 80),
-                format!("{BOLD}bold{RESET} x\n")
+                format!("{BOLD}{CODE}bold{RESET}{BODY} x{RESET}\n")
             );
         }
     }
@@ -344,14 +346,17 @@ mod tests {
         }
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            format!("a {BOLD}bold{RESET} b\n")
+            format!("{BODY}a{RESET}{BOLD}{CODE} bold{RESET}{BODY} b{RESET}\n")
         );
     }
 
     #[test]
     fn fenced_block_held_until_close() {
         let out = stream("```\nlet x = 1;\n```\nafter\n", 1, true, 80);
-        assert_eq!(out, format!("  {FADE}let x = 1;{RESET}\nafter\n"));
+        assert_eq!(
+            out,
+            format!("  {FADE}let x = 1;{RESET}\n{BODY}after{RESET}\n")
+        );
     }
 
     #[test]

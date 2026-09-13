@@ -1,4 +1,5 @@
 use super::*;
+use crate::agentic::http_loop_tests::DisplayReplay;
 use crate::agentic::trim::estimate_request_tokens;
 use serde_json::{json, Value};
 use std::sync::Mutex;
@@ -8,6 +9,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 struct ReportMeasuredUsage {
     requests: Arc<Mutex<Vec<Value>>>,
     usage: ReportedUsage,
+    replay: DisplayReplay,
 }
 
 enum ReportedUsage {
@@ -19,11 +21,11 @@ enum ReportedUsage {
 impl Respond for ReportMeasuredUsage {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body: Value = serde_json::from_slice(&request.body).unwrap();
-        if body["stream"] == true {
+        if self.replay.take(request) {
             return ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
                 .set_body_string(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"4.\"}}]}\n\ndata: [DONE]\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"4.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
                 );
         }
         let estimate = estimate_request_tokens(
@@ -43,6 +45,7 @@ impl Respond for ReportMeasuredUsage {
                 reply["usage"]["completion_tokens"] = json!(2);
             }
         }
+        self.replay.arm(request);
         ResponseTemplate::new(200).set_body_json(reply)
     }
 }
@@ -55,6 +58,7 @@ async fn consecutive_requests(usage: ReportedUsage) -> Vec<Value> {
         .respond_with(ReportMeasuredUsage {
             requests: requests.clone(),
             usage,
+            replay: Default::default(),
         })
         .mount(&server)
         .await;

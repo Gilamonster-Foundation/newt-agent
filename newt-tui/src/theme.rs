@@ -44,6 +44,38 @@ pub(crate) fn color(role: Role) -> RtColor {
     to_ratatui(active().color(role))
 }
 
+/// All supported theme attributes cross the renderer seam together.
+pub(crate) fn content_style(value: crossterm::style::ContentStyle) -> ratatui::style::Style {
+    use crossterm::style::Attribute as A;
+    use ratatui::style::{Modifier as M, Style};
+    let mut style = Style::default();
+    if let Some(c) = value.foreground_color {
+        style = style.fg(to_ratatui(c));
+    }
+    if let Some(c) = value.background_color {
+        style = style.bg(to_ratatui(c));
+    }
+    for (a, m) in [
+        (A::Bold, M::BOLD),
+        (A::Dim, M::DIM),
+        (A::Italic, M::ITALIC),
+        (A::Underlined, M::UNDERLINED),
+        (A::Reverse, M::REVERSED),
+        (A::CrossedOut, M::CROSSED_OUT),
+    ] {
+        if value.attributes.has(a) {
+            style = style.add_modifier(m);
+        } else {
+            style = style.remove_modifier(m);
+        }
+    }
+    style
+}
+
+pub(crate) fn style(role: Role) -> ratatui::style::Style {
+    content_style(active().style(role))
+}
+
 /// crossterm → ratatui.
 ///
 /// **Not a spelling exercise.** The two libraries swap the dark and light
@@ -52,7 +84,7 @@ pub(crate) fn color(role: Role) -> RtColor {
 /// `DarkGreen` / `LightGreen`. Mapping by name would silently recolour every
 /// surface, which is the failure `the_builtin_theme_preserves_every_colour_in_use`
 /// exists to catch.
-fn to_ratatui(color: crossterm::style::Color) -> RtColor {
+pub(crate) fn to_ratatui(color: crossterm::style::Color) -> RtColor {
     use crossterm::style::Color as Ct;
     match color {
         Ct::Reset => RtColor::Reset,

@@ -843,4 +843,20 @@ fn workflow_blocker_ignores_an_os_permission_error_the_model_can_fix() {
         true,
         "Permission denied"
     ));
+#[test]
+fn creating_a_plan_invalidates_the_empty_plan_read_memo() {
+    let mut guard = RepeatCallGuard::default();
+    let args = serde_json::json!({});
+    guard.record("plan_get", &args, true, "no active plan");
+    assert!(guard.repeat_steer("plan_get", &args).is_some());
+    guard.record(
+        "update_plan",
+        &serde_json::json!({"plan": [{"step": "inspect"}]}),
+        true,
+        "<plan>inspect</plan>",
+    );
+    assert!(
+        guard.repeat_steer("plan_get", &args).is_none(),
+        "a fresh plan must be readable in the same turn"
+    );
 }

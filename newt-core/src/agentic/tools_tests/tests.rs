@@ -71,6 +71,13 @@ mod shell_routing;
 #[path = "helper_shell_authority.rs"]
 mod shell_authority;
 
+// #2274 part 1 — a binary the carried userland does not carry must produce a
+// NAMED refusal, distinguishable from a grant denial and from a binary that is
+// not installed at all.
+#[cfg(test)]
+#[path = "helper_absent_binary_refusal.rs"]
+mod absent_binary_refusal;
+
 #[cfg(test)]
 #[path = "helper_file_provenance.rs"]
 mod file_provenance;

@@ -470,7 +470,7 @@ async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
 
     let client = reqwest::Client::new();
     let (reply, streamed, usage) = final_summary_openai(
-        &client,
+        (&client, &client),
         &format!("{}/v1/chat/completions", server.uri()),
         "test-model",
         None,
@@ -607,7 +607,7 @@ async fn openai_cap_exit_refuses_giant_fresh_result_before_dispatch() {
     ];
     let client = reqwest::Client::new();
     let (reply, streamed, usage) = final_summary_openai(
-        &client,
+        (&client, &client),
         &format!("{}/v1/chat/completions", server.uri()),
         "tiny-model",
         None,

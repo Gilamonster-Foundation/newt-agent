@@ -199,6 +199,8 @@ mod panel;
 // stays for every surface that has no region to draw in.
 #[cfg(feature = "rich-tui")]
 mod settings_panel;
+#[cfg(feature = "rich-tui")]
+mod theme_panel;
 // The backend chooser/editor panel (#1667) — same grammar, same gating; its
 // persistence rides the setup wizard's crash-safe lock + plan machinery.
 #[cfg(feature = "rich-tui")]
@@ -830,7 +832,7 @@ fn render_inline_header(workspace: &str, color: bool) -> String {
 
     // Text lines aligned to the middle-right of the logo.
     let mid = n / 2;
-    let header = format!("{}  ·  {}", brand_name(), brand_tagline());
+    let header = brand_tagline();
     let plugins = brand_plugins();
     let version = format!("v{VERSION}");
     let text: &[(&str, bool)] = &[
@@ -7692,7 +7694,8 @@ fn connect_timeout_secs(cfg: &newt_core::Config) -> u64 {
         .unwrap_or(5)
 }
 
-/// Full inference timeout from `[tui].inference_timeout_secs` (default 120).
+/// Total single-response / streamed idle timeout from
+/// `[tui].inference_timeout_secs` (default 120).
 fn inference_timeout_secs(cfg: &newt_core::Config) -> u64 {
     cfg.tui
         .as_ref()

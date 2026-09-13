@@ -98,7 +98,15 @@ const RENDER_REPORT_DESCRIPTION: &str =
      missing. Prefer ONE report with `sections` over many small calls. The tool \
      result you receive back is a short ack, not the rendered text — the \
      document has already been shown to the user, so do not repeat it in your \
-     reply.";
+     reply. Reporting findings does not complete an unfinished execution request: \
+     continue the requested work with tools. When the task is complete, keep the \
+     final reply brief and include only new information.";
+
+const REPORT_DELIVERY_GUIDANCE: &str =
+    "The report is already visible to the user. Do not repeat its contents. \
+     Continue any unfinished requested work with tools; rendering a report is \
+     not completion of that work. When the task is complete, keep the final \
+     reply brief and include only new information.";
 
 /// The `render_report` tool definition. Registered `Gate::Always` (no injected
 /// capability required — see the module docs), so it is advertised every
@@ -300,7 +308,7 @@ pub(crate) fn execute_render_report(
                     cols: term_cols(),
                 },
             );
-            (ack, Some(rendered))
+            (format!("{ack}\n{REPORT_DELIVERY_GUIDANCE}"), Some(rendered))
         }
         Err(e) => (format!("error: {e}"), None),
     }
