@@ -42,16 +42,19 @@
 //! open-parent-then-operate pattern to stay beneath-safe and land with the
 //! write-arm rewire that consumes them.
 //!
-//! `openat2` is Linux-only, so this module is `#[cfg(target_os = "linux")]`; the
-//! cross-platform fallback (and the fail-closed-for-untrusted policy on kernels
-//! without `openat2`, invariant #9) is applied where consumers wire it in.
+//! Linux uses `openat2`; macOS uses a descriptor-relative `openat` walk with
+//! `O_NOFOLLOW` for every component. macOS conservatively rejects even in-tree
+//! symlinks; operator-supplied root aliases (such as /var) remain supported.
+//! Other platforms retain their existing consumer fallback.
 
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Component, Path};
 
-use rustix::fs::{mkdirat, open, openat2, unlinkat, AtFlags, Mode, OFlags, ResolveFlags};
+use rustix::fs::{mkdirat, open, unlinkat, AtFlags, Mode, OFlags};
+#[cfg(target_os = "linux")]
+use rustix::fs::{openat2, ResolveFlags};
 
 /// A capability handle to a workspace root directory. Every method resolves its
 /// relative path argument *beneath* the held root fd; a path that would escape is
@@ -87,12 +90,67 @@ impl WorkspaceDir {
     /// The single choke point: resolve `rel` beneath the root fd and return the
     /// opened fd, or an error if resolution would escape. Every public method
     /// flows through here, so the containment property has one owner.
+    #[cfg(target_os = "linux")]
     fn resolve(&self, rel: &Path, oflags: OFlags, mode: Mode) -> io::Result<OwnedFd> {
         // Containment policy for every resolve: stay beneath the root fd (so `..`,
         // absolute paths, and escaping symlinks are refused), and reject magic
         // links. In-tree symlinks that stay beneath still resolve.
         let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS;
         openat2(&self.root, rel, oflags | OFlags::CLOEXEC, mode, resolve).map_err(io::Error::from)
+    }
+
+    /// macOS needs O_DIRECTORY and caller-selected nonblocking/create flags
+    /// that Bridle's current read/write-only GrantedRoot API cannot express.
+    /// Walk normal components through held descriptors and never follow links.
+    #[cfg(target_os = "macos")]
+    fn resolve(&self, rel: &Path, oflags: OFlags, mode: Mode) -> io::Result<OwnedFd> {
+        let mut directory = self.root.try_clone()?;
+        let mut names = Vec::new();
+        for component in rel.components() {
+            match component {
+                Component::Normal(name) => names.push(name),
+                Component::CurDir => {}
+                _ => return Err(io::Error::from_raw_os_error(libc::EXDEV)),
+            }
+        }
+        let Some((leaf, parents)) = names.split_last() else {
+            return rustix::fs::openat(
+                &directory,
+                ".",
+                oflags | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                mode,
+            )
+            .map_err(io::Error::from);
+        };
+        for name in parents {
+            directory = rustix::fs::openat(
+                &directory,
+                Path::new(name),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(io::Error::from)?;
+        }
+        rustix::fs::openat(
+            &directory,
+            Path::new(leaf),
+            oflags | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            mode,
+        )
+        .map_err(io::Error::from)
+    }
+
+    /// Diagnostic capture cannot block on a swapped-in FIFO or read a device.
+    pub(crate) fn open_regular(&self, rel: &Path) -> io::Result<File> {
+        let file = File::from(self.resolve(
+            rel,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )?);
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        Ok(file)
     }
 
     /// Open a file for reading, contained beneath the root.
@@ -125,7 +183,6 @@ impl WorkspaceDir {
     pub fn create_dir_all(&self, rel: &Path) -> io::Result<()> {
         // `try_clone` so the walk owns its cursor without consuming `self.root`.
         let mut cur: OwnedFd = self.root.try_clone()?;
-        let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS;
         let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
         for comp in rel.components() {
             let name = match comp {
@@ -135,14 +192,20 @@ impl WorkspaceDir {
                 _ => return Err(io::Error::from_raw_os_error(libc::EXDEV)),
             };
             let step = Path::new(name);
-            let child = match openat2(&cur, step, dir_flags, Mode::empty(), resolve) {
+            let child = match (Self {
+                root: cur.try_clone()?,
+            })
+            .resolve(step, dir_flags, Mode::empty())
+            {
                 Ok(fd) => fd,
-                Err(rustix::io::Errno::NOENT) => {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     mkdirat(&cur, step, Mode::from_raw_mode(0o755)).map_err(io::Error::from)?;
-                    openat2(&cur, step, dir_flags, Mode::empty(), resolve)
-                        .map_err(io::Error::from)?
+                    (Self {
+                        root: cur.try_clone()?,
+                    })
+                    .resolve(step, dir_flags, Mode::empty())?
                 }
-                Err(e) => return Err(io::Error::from(e)),
+                Err(e) => return Err(e),
             };
             cur = child;
         }

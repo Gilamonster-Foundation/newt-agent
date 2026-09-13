@@ -364,7 +364,7 @@ pub fn routing_disabled() -> bool {
 // `newt-coder` apply path decide containment identically (no drift surface).
 // Only the Linux object-bound helpers below normalise paths directly; the
 // prefix gate itself goes through `crate::caveats::permits_path`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::caveats::lexically_normalize;
 
 /// Returns true if `full_path` is permitted by `scope`, under prefix
@@ -383,7 +383,7 @@ pub(crate) fn tui_permits_path(scope: &crate::caveats::Scope<String>, full_path:
 /// object fence. `None` — not permitted. Mirrors [`tui_permits_path`]'s matching
 /// exactly (same normalisation + `starts_with`), so the object-bound read
 /// resolves beneath the very root the gate approved.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn authorizing_root<'a>(
     scope: &'a crate::caveats::Scope<String>,
     full_path: &str,
@@ -403,7 +403,7 @@ fn authorizing_root<'a>(
 /// The `..`-free path of `full_path` relative to its authorising `root`. The
 /// gate matched `starts_with` on the normalised forms, so this strip succeeds;
 /// the result is what [`crate::fs_cap::WorkspaceDir`] resolves beneath the root fd.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn contained_relative(full_path: &str, root: &str) -> std::path::PathBuf {
     let cand = lexically_normalize(full_path);
     let nroot = lexically_normalize(root);
@@ -421,9 +421,11 @@ fn contained_relative(full_path: &str, root: &str) -> std::path::PathBuf {
 /// kernel refused the resolve) rather than an ordinary I/O failure. `openat2`
 /// returns `EXDEV` for a `RESOLVE_BENEATH` violation and `ELOOP` for a
 /// `RESOLVE_NO_MAGICLINKS`/symlink-loop rejection; both are containment denials.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_fs_containment_denied(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::EXDEV) | Some(libc::ELOOP))
+        || (cfg!(target_os = "macos")
+            && matches!(e.raw_os_error(), Some(libc::ENOTDIR) | Some(libc::EMLINK)))
 }
 
 /// The object-binding target for a scope-authorised fs op: `Some(Some((root,
@@ -431,7 +433,7 @@ fn is_fs_containment_denied(e: &std::io::Error) -> bool {
 /// (no fence — the caller uses `std::fs`); `None` if the scope denies (a logic
 /// error at a call site that already gated — callers fail closed). One shared
 /// resolver behind the object-bound read/list arms.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_target<'a>(
     scope: &'a crate::caveats::Scope<String>,
     full_str: &str,
@@ -457,12 +459,12 @@ fn std_list_dir(full: &std::path::Path) -> Result<Vec<String>, String> {
 /// tool-output string on failure: a containment escape becomes an `fs_read`
 /// denial, any other failure the ordinary read error. Under `Scope::All`
 /// (`--full-access`) there is no object fence, so it reads via `std::fs` — the
-/// pre-existing unconfined behaviour. Linux-only (`openat2`); the non-Linux
+/// pre-existing unconfined behaviour. Linux (`openat2`) and macOS (no-follow fd walk); the other-platform
 /// fallback keeps the lexical-gate + `std::fs` path.
 ///
 /// `axis` labels the denial (`fs_read` for read_file; `fs_write` for edit_file,
 /// whose read is authorised by — and contained beneath — the `fs_write` root).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_read(
     scope: &crate::caveats::Scope<String>,
     axis: &str,
@@ -499,8 +501,8 @@ fn object_bound_read(
 /// Object-bound directory listing beneath the authorising root — the `list_dir`
 /// analogue of [`object_bound_read`]. A symlink-escape directory is refused by
 /// the kernel (an `fs_read` denial); the entries are read straight off the dir
-/// fd. `Scope::All` lists via `std::fs`. Linux-only.
-#[cfg(target_os = "linux")]
+/// fd. `Scope::All` lists via `std::fs`. Available on Linux and macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_list(
     scope: &crate::caveats::Scope<String>,
     path: &str,
@@ -528,7 +530,7 @@ fn object_bound_list(
 /// Non-Linux fallback for the object-bound fs arms: `openat2` is unavailable, so
 /// they keep the lexical-gate + `std::fs` behaviour (the symlink residual
 /// persists on non-Linux — see `fs-canonical-containment`; CI/prod is Linux).
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn object_bound_read(
     _scope: &crate::caveats::Scope<String>,
     _axis: &str,
@@ -539,7 +541,7 @@ fn object_bound_read(
     std::fs::read_to_string(full).map_err(|e| format!("error reading {path}: {e}"))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn object_bound_list(
     _scope: &crate::caveats::Scope<String>,
     _path: &str,
@@ -565,8 +567,8 @@ fn std_write(full: &std::path::Path, path: &str, content: &str) -> Result<(), St
 /// absolute escape the lexical gate admits is refused by the kernel: a
 /// containment escape becomes an `fs_write` denial, any other failure the
 /// ordinary write error. `Scope::All` (`--full-access`) writes via `std::fs`.
-/// Linux-only; the non-Linux fallback keeps the lexical-gate + `std::fs` path.
-#[cfg(target_os = "linux")]
+/// Linux and macOS; the other-platform fallback keeps the lexical-gate + `std::fs` path.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_write(
     scope: &crate::caveats::Scope<String>,
     axis: &str,
@@ -600,7 +602,7 @@ fn object_bound_write(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn object_bound_write(
     _scope: &crate::caveats::Scope<String>,
     _axis: &str,
@@ -616,8 +618,8 @@ fn object_bound_write(
 /// analogue of [`object_bound_write`]. The parent is resolved object-bound and
 /// the entry removed via `unlinkat`, so a symlink / `..` / absolute escape is
 /// refused by the kernel (an `fs_write` denial). `Scope::All` removes via
-/// `std::fs`. Linux-only.
-#[cfg(target_os = "linux")]
+/// `std::fs`. Available on Linux and macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_delete(
     scope: &crate::caveats::Scope<String>,
     path: &str,
@@ -639,7 +641,7 @@ fn object_bound_delete(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn object_bound_delete(
     _scope: &crate::caveats::Scope<String>,
     path: &str,
@@ -2123,7 +2125,32 @@ fn artifact_open_regular_file(_path: &std::path::Path) -> std::io::Result<std::f
     ))
 }
 
+/// Artifact reads use the same object boundary as model-facing file reads.
+/// A physical-path check alone cannot protect a later reopen from a link swap.
+fn artifact_open_scoped_regular_file(
+    scope: &crate::caveats::Scope<String>,
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let crate::caveats::Scope::Only(_) = scope {
+        let Some(Some((root, relative))) = object_bound_target(scope, &path.to_string_lossy())
+        else {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        };
+        let file = crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))?
+            .open_regular(&relative)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        return Ok(file);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = scope;
+    artifact_open_regular_file(path)
+}
+
 fn artifact_preimage_state(
+    scope: &crate::caveats::Scope<String>,
     path: &std::path::Path,
     read_authorized: bool,
 ) -> super::artifact_hooks::ArtifactFileState {
@@ -2140,7 +2167,7 @@ fn artifact_preimage_state(
             super::artifact_hooks::ArtifactFileState::unavailable("preimage_not_regular_file")
         }
         Ok(_) => {
-            let mut file = match artifact_open_regular_file(path) {
+            let mut file = match artifact_open_scoped_regular_file(scope, path) {
                 Ok(file) => file,
                 Err(_) => {
                     return super::artifact_hooks::ArtifactFileState::unavailable(
@@ -2179,10 +2206,14 @@ fn artifact_preimage_state(
 
 /// Verify a governed write against the bytes it submitted without allocating a
 /// second copy of the file. Only a regular file can satisfy the postcondition.
-fn artifact_file_matches(path: &std::path::Path, expected: &[u8]) -> std::io::Result<bool> {
+fn artifact_file_matches(
+    scope: &crate::caveats::Scope<String>,
+    path: &std::path::Path,
+    expected: &[u8],
+) -> std::io::Result<bool> {
     use std::io::Read as _;
 
-    let mut file = artifact_open_regular_file(path)?;
+    let mut file = artifact_open_scoped_regular_file(scope, path)?;
     let mut offset = 0_usize;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -3285,14 +3316,14 @@ async fn execute_authorized_tool(
                     &full,
                 );
             let artifact_before = artifact_path_within.then(|| {
-                artifact_preimage_state(&full, tui_permits_path(&caveats.fs_read, &full_str))
+                artifact_preimage_state(&caveats.fs_read, &full, tui_permits_path(&caveats.fs_read, &full_str))
             });
 
             // Shrink guard: refuse if the proposed write removes > 30% of
             // lines AND > 30 lines absolute. This catches the failure mode
             // where a model replaces an entire large file with a small
             // fragment (observed in the wild: 4,247 → 107 lines).
-            if let Ok(existing) = std::fs::read_to_string(&full) {
+            if let Ok(existing) = object_bound_read(&caveats.fs_write, "fs_write", path, &full, &full_str) {
                 let orig_lines = existing.lines().count();
                 let new_lines = content.lines().count();
                 let removed = orig_lines.saturating_sub(new_lines);
@@ -3358,7 +3389,7 @@ async fn execute_authorized_tool(
                                 tool_output_lines,
                             )
                         } else {
-                            match artifact_file_matches(&full, content.as_bytes()) {
+                            match artifact_file_matches(&caveats.fs_write, &full, content.as_bytes()) {
                                 Ok(true) => record_governed_file_change(
                                     artifact_sink,
                                     artifact_context,
@@ -3439,7 +3470,7 @@ async fn execute_authorized_tool(
                     &full,
                 );
             let artifact_before = artifact_path_within.then(|| {
-                artifact_preimage_state(&full, tui_permits_path(&caveats.fs_read, &full_str))
+                artifact_preimage_state(&caveats.fs_read, &full, tui_permits_path(&caveats.fs_read, &full_str))
             });
 
             let confirmed = confirm_unrestricted_fs_mutation(
@@ -3638,7 +3669,7 @@ async fn execute_authorized_tool(
                             tool_output_lines,
                         )
                     } else {
-                        match artifact_file_matches(&full, updated.as_bytes()) {
+                        match artifact_file_matches(&caveats.fs_write, &full, updated.as_bytes()) {
                             Ok(true) => record_governed_file_change(
                                 artifact_sink,
                                 artifact_context,

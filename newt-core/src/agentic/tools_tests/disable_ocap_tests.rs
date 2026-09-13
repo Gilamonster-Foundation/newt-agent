@@ -898,10 +898,20 @@ async fn confined_dispatch_env_seam_without_venv_783() {
         env.get("VIRTUAL_ENV").is_none(),
         "no venv ⇒ no VIRTUAL_ENV: {args}"
     );
+    #[cfg(not(target_os = "macos"))]
     assert!(
         env.get("PATH").is_none(),
         "no venv/exec-paths ⇒ no PATH override: {args}"
     );
+    #[cfg(target_os = "macos")]
+    if let Some(developer) = crate::confined_exec::selected_developer_directory() {
+        assert!(env["PATH"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("{developer}/usr/bin")));
+    } else {
+        assert!(env.get("PATH").is_none());
+    }
     // ...but HOME now passes through so brush can expand `~` (the confined
     // shell had NO env before, so `~` stayed literal and left `~/…` debris),
     // and SHELL identifies the confined engine.

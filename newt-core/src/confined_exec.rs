@@ -345,6 +345,7 @@ impl ConstrainedExecutor {
         let cx = mint_context(req.origin, &caveats)?;
 
         let mut cmd = ConfinedCommand::new(&program)
+            .sandbox_policy(std::sync::Arc::new(runtime_sandbox_policy()))
             .args(&args)
             .current_dir(&req.cwd)
             // A fresh process group so a supervisor could kill the whole
@@ -860,6 +861,48 @@ fn kill_process_group(pgid: u32) {
     unsafe {
         let _ = libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
     }
+}
+
+/// System runtime reads shared by shell execution, build execution, and frame
+/// admission. macOS's /usr/bin/git is an xcrun shim; its selected developer
+/// directory can live outside Bridle's default /Library runtime roots.
+pub(crate) fn runtime_sandbox_policy() -> agent_bridle::SandboxPolicy {
+    let policy = agent_bridle::SandboxPolicy::default();
+    #[cfg(target_os = "macos")]
+    {
+        let mut policy = policy;
+        if let Some(developer) = selected_developer_directory() {
+            policy.base_read_paths.extra.push(developer.to_owned());
+        }
+        policy
+    }
+    #[cfg(not(target_os = "macos"))]
+    policy
+}
+
+/// The system's selected toolchain, resolved once without repository env/cwd.
+#[cfg(target_os = "macos")]
+pub(crate) fn selected_developer_directory() -> Option<&'static str> {
+    static DEVELOPER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DEVELOPER
+        .get_or_init(|| {
+            let output = std::process::Command::new("/usr/bin/xcode-select")
+                .arg("-p")
+                .env_clear()
+                .current_dir("/")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let path = std::path::PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+            if !path.is_absolute() || !path.is_dir() {
+                return None;
+            }
+            path.canonicalize().ok()?.to_str().map(str::to_owned)
+        })
+        .as_deref()
 }
 
 /// A `Caveats` fence for an attacker-influenced subprocess confined to

@@ -146,8 +146,19 @@ symlink targets and redundant child grants beneath a writable workspace.
 Grant strings containing `..` are refused. Use stable workspace or external
 roots directly.
 
-Newt's durable smart runtime currently requires Linux with Landlock and the
-object-bound native filesystem tools. Startup refuses weaker execution modes.
+Newt's durable smart runtime requires Linux with Landlock or macOS with
+Seatbelt, together with object-bound native filesystem tools. Startup refuses
+weaker execution modes. macOS resolves file operations through held directory
+descriptors and refuses symlinks in model-supplied relative paths, including
+in-tree links. Stable operator root aliases such as `/var` remain supported.
+Shrink checks and artifact capture use the same filesystem boundary.
+
+This enables macOS filesystem confinement; it does not certify deputy-complete
+network isolation. The pinned Bridle 0.7.15 backend predates later Mach-deputy
+hardening. Newer Bridle releases retain a refusal for restricted macOS network
+authority, including `net:none`, because that evidence remains incomplete.
+Seatbelt also permits filesystem metadata discovery outside content-read grants;
+its content boundary is not total filesystem non-observability.
 Local MCP processes are checked against the frame boundary before they start;
 remote MCP servers remain separate, operator-configured authorities. A foreign
 Rust or Python host must enforce its own file and subprocess boundary; the

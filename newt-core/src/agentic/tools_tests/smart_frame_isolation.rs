@@ -175,7 +175,7 @@ async fn private_frame_denies_raw_tools_and_preserves_mediated_reads() {
             "private generated material"
         );
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         std::os::unix::fs::symlink(directory.path(), workspace.path().join("private-link"))
             .unwrap();
@@ -220,7 +220,7 @@ async fn private_frame_denies_raw_tools_and_preserves_mediated_reads() {
 /// The Git control explicitly grants GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM=/dev/null
 /// and omits HOME through the existing shell environment seam; ambient Git config
 /// and ignore files remain unreadable.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 #[serial_test::serial]
 async fn real_shell_cannot_read_or_mutate_private_frame() {
@@ -349,7 +349,7 @@ struct UnconfinedDelegate(std::path::PathBuf);
 
 /// Grounds the find-adapter refusal in its real descriptor-discard boundary:
 /// replacing the validated path makes the legacy walker disclose private names.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 #[serial_test::serial]
 async fn smart_find_refuses_the_unbound_recursive_walker() {
@@ -491,5 +491,62 @@ async fn smart_tools_refuse_unconfined_launch_authority() {
         .await;
         assert!(output.contains("frame isolation"), "{output}");
         assert!(!output.contains("allowed content"), "{output}");
+    }
+}
+
+/// A native positive control prevents a macOS run from passing only because
+/// every dispatch was refused before any file operation.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial_test::serial]
+async fn macos_smart_runtime_admits_confined_seatbelt() {
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _yolo = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
+    let _full = super::disable_ocap_tests::EnvVar::set("NEWT_FULL_ACCESS", "0");
+    assert!(
+        agent_bridle::seatbelt_is_supported(),
+        "native suite requires Seatbelt"
+    );
+    crate::agentic::smart_harness::validate_isolation_runtime().unwrap();
+}
+
+/// The shrink guard is a read too: a symlink into private storage must neither
+/// leak its line count nor let edit_file return a private content preview.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+#[serial_test::serial]
+async fn private_frame_cannot_leak_through_write_shrink_or_edit_preview() {
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _yolo = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
+    let _full = super::disable_ocap_tests::EnvVar::set("NEWT_FULL_ACCESS", "0");
+    let workspace = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let (harness, _) = harness(directory.path());
+    let marker = directory.path().join("marker");
+    let private = "private generated material\n".repeat(100);
+    std::fs::write(&marker, &private).unwrap();
+    std::os::unix::fs::symlink(&marker, workspace.path().join("link")).unwrap();
+    let caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
+    for (name, args) in [
+        (
+            "write_file",
+            serde_json::json!({"path":"link","content":"changed"}),
+        ),
+        (
+            "edit_file",
+            serde_json::json!({"path":"link","old_string":"absent","new_string":"changed"}),
+        ),
+    ] {
+        let output = dispatch(&harness, workspace.path(), &caveats, name, args, None).await;
+        assert!(
+            output.contains("denied") || output.contains("frame isolation"),
+            "{output}"
+        );
+        assert!(!output.contains("100"), "shrink oracle: {output}");
+        assert!(
+            !output.contains("private generated material"),
+            "preview leak: {output}"
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), private);
     }
 }
