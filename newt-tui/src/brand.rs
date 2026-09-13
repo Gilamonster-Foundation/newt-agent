@@ -37,7 +37,7 @@ pub(crate) const LOGO_PLAIN: &str = include_str!("../../docs/logos/newt-ascii-40
 // partial override (or a wrong path) degrades gracefully rather than crashing.
 
 const DEFAULT_BRAND_NAME: &str = "newt";
-const DEFAULT_BRAND_TAGLINE: &str = "Part of Newt-Agent, a free, friendly, local agentic coder.";
+const DEFAULT_BRAND_TAGLINE: &str = "New Tech Agent";
 
 /// Pure core of [`brand_logo`]: resolve a logo from explicit override inputs so
 /// it is testable without mutating process-wide env. A missing dir, empty dir,
@@ -85,7 +85,7 @@ pub(crate) fn brand_name() -> String {
     brand_or(std::env::var("NEWT_BRAND_NAME").ok(), DEFAULT_BRAND_NAME)
 }
 
-/// The one-line tagline printed after the wordmark (`NEWT_BRAND_TAGLINE`).
+/// The one-line splash tagline (`NEWT_BRAND_TAGLINE`).
 pub(crate) fn brand_tagline() -> String {
     brand_or(
         std::env::var("NEWT_BRAND_TAGLINE").ok(),
@@ -182,19 +182,12 @@ pub(crate) fn logo_for_size(cols: u16, rows: u16) -> (Cow<'static, str>, u16) {
 
 /// The scrollback "crawl header" printed when the splash clears — the
 /// branding seam for inheriting agents (gilamonster-agent etc.): every part
-/// comes from the overridable brand env (`NEWT_BRAND_NAME`,
-/// `NEWT_BRAND_TAGLINE`), so a fork substitutes its own identity without
-/// touching this code. `context` renders as a bracketed suffix
+/// comes from the overridable `NEWT_BRAND_TAGLINE`, so a fork substitutes its
+/// own identity without touching this code. `context` renders as a bracketed suffix
 /// (e.g. "[initial setup]").
 pub(crate) fn crawl_header(context: Option<&str>) -> String {
     let ctx = context.map(|c| format!("  [{c}]")).unwrap_or_default();
-    format!(
-        "\n{}  ·  {}\nv{}{}\n",
-        brand_name(),
-        brand_tagline(),
-        crate::VERSION,
-        ctx
-    )
+    format!("\n{}\nv{}{}\n", brand_tagline(), crate::VERSION, ctx)
 }
 
 /// The one-line splash top header: `{brand} agent v{VERSION} [context]`.
@@ -211,8 +204,8 @@ pub(crate) fn splash_top_header(context: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn default_tagline_names_the_parent_project_and_keeps_host_overrides() {
-        let expected = "Part of Newt-Agent, a free, friendly, local agentic coder.";
+    fn default_tagline_is_short_and_keeps_host_overrides() {
+        let expected = "New Tech Agent";
         assert_eq!(brand_or(None, DEFAULT_BRAND_TAGLINE), expected);
         assert_eq!(
             brand_or(Some(String::new()), DEFAULT_BRAND_TAGLINE),

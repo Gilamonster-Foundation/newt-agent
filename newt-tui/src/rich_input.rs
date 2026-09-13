@@ -520,11 +520,11 @@ fn load_history(path: Option<&PathBuf>) -> Vec<String> {
 /// The `[options]` block for the status row: session overrides the operator set
 /// — `--loadout`/`NEWT_LOADOUT` and `/model`/`NEWT_DGX_MODEL`. `None` when none
 /// is active, so the bracket is omitted entirely (no empty `[]` by default).
-fn status_options() -> Option<String> {
+fn status_options(model: &str) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for var in ["NEWT_LOADOUT", "NEWT_DGX_MODEL"] {
         if let Ok(v) = std::env::var(var) {
-            if !v.is_empty() {
+            if !v.is_empty() && !(var == "NEWT_DGX_MODEL" && v == model) {
                 parts.push(v);
             }
         }
@@ -654,7 +654,7 @@ fn footer_line(
         };
         spans.push(Span::styled(format!(" {loc}"), Style::default().fg(dim)));
     }
-    if let Some(opts) = status_options() {
+    if let Some(opts) = status_options(model) {
         spans.push(Span::styled(format!(" [{opts}]"), Style::default().fg(dim)));
     }
     // Step 24.6 (#559): the context-budget gauge — `used/budget` (e.g.

@@ -90,3 +90,20 @@ fn collapse_uses_wrapped_row_accounting_like_the_excerpt() {
     assert!(!super::spills_past(fits, 3, 80));
     assert!(super::spill_summary_line(fits, 3, 80).is_none());
 }
+
+#[test]
+fn every_spill_row_reapplies_the_theme_dim_color() {
+    let mut out = Vec::new();
+    ToolDisplay::new(&mut out, true, 80, 3, false).result("one\ntwo\nthree\nfour\nfive");
+    let rendered = String::from_utf8(out).unwrap();
+    let expected = format!(
+        "{}",
+        SetForegroundColor(crate::tty::theme::active().color(crate::tty::theme::Role::Dim))
+    );
+    for row in rendered
+        .lines()
+        .filter(|line| line.contains('▒') || line.contains('▓') || line.contains('▲'))
+    {
+        assert!(row.contains(&expected), "row lost dim style: {row:?}");
+    }
+}

@@ -2585,7 +2585,10 @@ fn session_body(
                     .and_then(|store| store.title(&active_conversation_id).ok().flatten())
                     .filter(|title| !title.trim().is_empty())
                     .unwrap_or_else(|| {
-                        format!("#{}", short_conversation_id(&active_conversation_id))
+                        format!(
+                            "session #{}",
+                            short_conversation_id(&active_conversation_id)
+                        )
                     })
             };
             surface.set_runtime_context(&inf_model, &inf_url, token_gauge, &session_label);

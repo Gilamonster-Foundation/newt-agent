@@ -370,16 +370,121 @@ pub(crate) fn clip_to_width(row: &[u8], cols: usize) -> Row {
     out
 }
 
+/// Effective SGR attributes, bounded by attribute families rather than the
+/// number of color changes in a tool's output. Covers the crossterm SGR
+/// vocabulary consumed by this scanner, including indexed and RGB colors.
+#[derive(Default)]
+struct SgrState(std::collections::BTreeMap<u16, Vec<u16>>);
+
+impl SgrState {
+    fn apply(&mut self, seq: &[u8]) {
+        let Ok(body) = std::str::from_utf8(&seq[2..seq.len() - 1]) else {
+            return;
+        };
+        let Some(params): Option<Vec<u16>> = body
+            .split(';')
+            .map(|part| {
+                if part.is_empty() {
+                    Some(0)
+                } else {
+                    part.parse().ok()
+                }
+            })
+            .collect()
+        else {
+            return;
+        };
+        let mut i = 0;
+        while i < params.len() {
+            let code = params[i];
+            let mut width = 1;
+            let key = match code {
+                0 => {
+                    self.0.clear();
+                    None
+                }
+                1..=9 | 20 | 21 | 51..=53 | 60..=64 | 73 | 74 => Some(match code {
+                    21 => 4,
+                    6 => 5,
+                    52 => 51,
+                    61..=64 => 60,
+                    74 => 73,
+                    _ => code,
+                }),
+                11..=19 => Some(10),
+                30..=37 | 90..=97 => Some(38),
+                40..=47 | 100..=107 => Some(48),
+                38 | 48 | 58 => {
+                    width = match params.get(i + 1) {
+                        Some(2) => 5,
+                        Some(5) => 3,
+                        _ => return,
+                    };
+                    if i + width > params.len() {
+                        return;
+                    }
+                    Some(code)
+                }
+                10 | 22..=29 | 39 | 49 | 54 | 55 | 59 | 65 | 75 => {
+                    let reset: &[u16] = match code {
+                        10 => &[10],
+                        22 => &[1, 2],
+                        23 => &[3, 20],
+                        24 => &[4],
+                        25 => &[5],
+                        27 => &[7],
+                        28 => &[8],
+                        29 => &[9],
+                        39 => &[38],
+                        49 => &[48],
+                        54 => &[51],
+                        55 => &[53],
+                        59 => &[58],
+                        65 => &[60],
+                        75 => &[73],
+                        _ => &[],
+                    };
+                    for key in reset {
+                        self.0.remove(key);
+                    }
+                    None
+                }
+                _ => None,
+            };
+            if let Some(key) = key {
+                self.0.insert(key, params[i..i + width].to_vec());
+            }
+            i += width;
+        }
+    }
+
+    fn prefix(&self) -> Vec<u8> {
+        if self.0.is_empty() {
+            return Vec::new();
+        }
+        let params = self
+            .0
+            .values()
+            .flatten()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(";");
+        format!("\x1b[{params}m").into_bytes()
+    }
+}
+
 /// Split one row into physical rows of at most `cols` visible columns, so
 /// every row the cockpit writes occupies exactly one terminal row (autowrap
 /// is off while the cockpit owns the terminal). Styling carries across the
-/// split because each SGR sequence is kept where it fell.
+/// split by replaying the row's SGR state: the presenter resets styles before
+/// writing each physical row.
 pub(crate) fn wrap_row(row: &[u8], cols: usize) -> Vec<Row> {
     let cols = cols.max(1);
     let (tokens, _) = scan(row);
     let mut rows: Vec<Row> = Vec::new();
     let mut cur: Row = Vec::new();
     let mut used = 0usize;
+    let mut styling = SgrState::default();
     for tok in tokens {
         match tok {
             Token::Text(t) => {
@@ -387,6 +492,7 @@ pub(crate) fn wrap_row(row: &[u8], cols: usize) -> Vec<Row> {
                     let w = newt_core::tty::ch_width(ch);
                     if used + w > cols && used > 0 {
                         rows.push(std::mem::take(&mut cur));
+                        cur.extend_from_slice(&styling.prefix());
                         used = 0;
                     }
                     let mut buf = [0u8; 4];
@@ -394,7 +500,10 @@ pub(crate) fn wrap_row(row: &[u8], cols: usize) -> Vec<Row> {
                     used += w;
                 }
             }
-            Token::Sgr(seq) => cur.extend_from_slice(&seq),
+            Token::Sgr(seq) => {
+                styling.apply(&seq);
+                cur.extend_from_slice(&seq);
+            }
             _ => {}
         }
     }
@@ -641,9 +750,29 @@ mod tests {
             assert!(visible_width(r) <= 4, "{r:?}");
         }
         assert_eq!(rows[0], b"\x1b[2mabcd".to_vec());
-        assert_eq!(rows[2], b"ij\x1b[0m".to_vec());
+        assert_eq!(rows[1], b"\x1b[2mefgh".to_vec());
+        assert_eq!(rows[2], b"\x1b[2mij\x1b[0m".to_vec());
         // Empty in, one empty row out — an empty line still occupies a row.
         assert_eq!(wrap_row(b"", 10), vec![Vec::<u8>::new()]);
+    }
+
+    #[test]
+    fn wrapped_rows_replay_color_changes_and_resets() {
+        let rows = wrap_row(b"\x1b[38;2;100;110;120mabcd\x1b[1mefgh\x1b[0mijkl", 4);
+        assert_eq!(rows[1], b"\x1b[1;38;2;100;110;120mefgh\x1b[0m");
+        assert_eq!(rows[2], b"ijkl");
+    }
+
+    #[test]
+    fn frequent_color_changes_do_not_accumulate_replay_history() {
+        let input = "\x1b[31mx\x1b[32my".repeat(50_000);
+        let rows = wrap_row(input.as_bytes(), 80);
+        let bytes: usize = rows.iter().map(Vec::len).sum();
+        assert!(
+            bytes < input.len() + rows.len() * 32,
+            "replay grew to {bytes} bytes"
+        );
+        assert!(rows.iter().all(|row| visible_width(row) <= 80));
     }
 
     #[test]
