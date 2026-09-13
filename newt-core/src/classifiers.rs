@@ -443,6 +443,16 @@ Next steps needed:
             "Let me check the local branches and the top-level remote remotes to be complete."
         ).class, NudgeClass::DeferredAnswer);
         for text in [
+            "Let me check the current working directory and available git operations.",
+            "Let me summarize the current state and what could be improved.",
+        ] {
+            assert_eq!(
+                classifier.classify(text).class,
+                NudgeClass::DeferredAnswer,
+                "an evidence-only promise must remain recoverable on read-only turns: {text}"
+            );
+        }
+        for text in [
             "I found the issue: there is an extra closing brace causing a syntax error. I need to remove this stray brace.",
             "Current blocker: the for loop needs a one line fix. Next steps needed: fix the iteration type error in lib.rs.",
             "Next I will add the tests.",

@@ -31,6 +31,8 @@ matchers = [
 # Replies must share a prototype's first three words to qualify for this subtype.
 nudge = ""
 matchers = [
+  "Let me summarize the current state and what could be improved.",
+  "Let me check the current working directory and available git operations.",
   "Let me understand what was already done on this branch and compare it with the issue requirements.",
   "Let me check the current implementation and identify any gaps.",
 ]
