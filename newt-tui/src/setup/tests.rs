@@ -43,6 +43,21 @@ impl Drop for EnvVarGuard {
     }
 }
 
+/// Mirrors `newt_core::config::layering::expand_tilde` (crate-private to
+/// `newt-core`, unreachable from here) so a test can resolve an `api_key_file`
+/// reference the same way `resolve_api_key()` does in production. A recorded
+/// reference is only ever `~/…`-collapsed relative to `HOME`/`USERPROFILE`
+/// (`setup::collapse_home`) — never relative to `NEWT_CONFIG_DIR` — so that is
+/// what a test must expand it against too.
+fn expand_home_for_test(reference: &str) -> PathBuf {
+    if let Some(rest) = reference.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(reference)
+}
+
 // D1b-3 (#1913): the scripted console went with the `Console` trait.
 // `setup::operator::Script` replaces it — same answers-in-order, same
 // recorded output — and it hands out an `Operator` instead of
@@ -2528,7 +2543,15 @@ async fn custom_host_auth_required_stores_the_token_encrypted() {
     assert_eq!(dropin.effective_model(), Some("example/model-a"));
     assert!(!dropin.endpoint.ends_with("/v1"), "probe suffix stripped");
     let token_ref = dropin.api_key_file.as_deref().expect("key recorded");
-    let token_path = PathBuf::from(token_ref);
+    // `token_ref` may be `~/…`-collapsed (`setup::collapse_home`) when the
+    // config dir happens to sit under HOME/USERPROFILE — true on a real
+    // Windows profile, where %TEMP% is %USERPROFILE%\AppData\Local\Temp.
+    // A raw `PathBuf::from` here (previously) treated a literal `~` as a
+    // relative path component on Windows, resolved against the test's CWD
+    // instead of home, and failed with "The system cannot find the path
+    // specified." `expand_home_for_test` matches what production's
+    // `resolve_api_key()` actually does.
+    let token_path = expand_home_for_test(token_ref);
     let token_name = token_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -2550,6 +2573,82 @@ async fn custom_host_auth_required_stores_the_token_encrypted() {
     // The freshly stored token resolves transparently (machine identity).
     newt_core::secrets::session().reset_for_test();
     assert_eq!(dropin.resolve_api_key().as_deref(), Some("test-remote-key"));
+
+    newt_core::secrets::session().reset_for_test();
+}
+
+#[serial_test::serial(real_fs)]
+#[tokio::test]
+async fn token_reference_resolves_when_config_dir_sits_under_home() {
+    // Regression for a Windows-only failure (caster, a real user profile):
+    // `%TEMP%` there is `%USERPROFILE%\AppData\Local\Temp`, i.e. nested
+    // under home. `custom_host_auth_required_stores_the_token_encrypted`
+    // pins NEWT_CONFIG_DIR to a `tempfile::tempdir()`, and
+    // `setup::collapse_home` tilde-collapses the recorded `api_key_file`
+    // whenever the config dir happens to sit under HOME/USERPROFILE —
+    // independent of NEWT_CONFIG_DIR, by design. Linux's `/tmp` and
+    // windows-latest CI's redirected `%TEMP%` (outside the profile) never
+    // trigger that collapse, which is why this was invisible there.
+    //
+    // Force the same nesting deterministically, on every OS: point
+    // HOME/USERPROFILE at a fake home and pin NEWT_CONFIG_DIR underneath
+    // it. Before the fix (a raw `PathBuf::from` on the collapsed
+    // reference), this reproduces caster's exact
+    // `Os { code: 3, kind: NotFound, .. }` on Linux too.
+    let fake_home = tempfile::tempdir().unwrap();
+    let dir_path = fake_home.path().join("cfg");
+    std::fs::create_dir_all(&dir_path).unwrap();
+    let _home = EnvVarGuard::set("HOME", fake_home.path());
+    let _userprofile = EnvVarGuard::set("USERPROFILE", fake_home.path());
+    let _config_env = EnvVarGuard::set(newt_core::config::NEWT_CONFIG_DIR_ENV, &dir_path);
+    newt_core::secrets::session().reset_for_test();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(wiremock::matchers::header(
+            "Authorization",
+            "Bearer test-remote-key",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "example/model-a"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    mount_authenticated_openai_chat(&server, "test-remote-key").await;
+
+    let path = dir_path.join("config.toml");
+    let client = reqwest::Client::new();
+    let server_with_v1 = format!("{}/v1", server.uri());
+    let console =
+        ScriptedConsole::new(&["2", &server_with_v1, "test-remote-key", "1", "1", "", "y"]);
+    run_with(&console.operator(), &client, &path).await.unwrap();
+
+    let name = format!("127-0-0-1-{}", server.address().port());
+    let dropin = read_dropin(&path, &name);
+    let token_ref = dropin.api_key_file.as_deref().expect("key recorded");
+    assert!(
+        token_ref.starts_with("~/"),
+        "expected collapse_home to fire once the config dir sits under home: {token_ref}"
+    );
+    let token_path = expand_home_for_test(token_ref);
+    let body = std::fs::read_to_string(&token_path).unwrap_or_else(|e| {
+        panic!("token file must be readable at the resolved path {token_path:?}: {e}")
+    });
+    assert!(
+        body.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"),
+        "ciphertext on disk"
+    );
 
     newt_core::secrets::session().reset_for_test();
 }
