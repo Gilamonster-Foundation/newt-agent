@@ -295,6 +295,10 @@ mod filesystem;
 mod file_artifacts;
 
 #[cfg(test)]
+#[path = "execute_file_receipts.rs"]
+mod file_receipts;
+
+#[cfg(test)]
 #[path = "execute_aliases.rs"]
 mod aliases;
 

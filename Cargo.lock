@@ -4407,12 +4407,14 @@ dependencies = [
  "chrono",
  "content-addressable",
  "crossterm",
+ "diffy",
  "ignore",
  "libc",
  "markdown-table-formatter",
  "newt-interaction",
  "newt-skills",
  "newt-tuner",
+ "newtui",
  "parking_lot",
  "proptest",
  "pulldown-cmark",
@@ -4737,7 +4739,7 @@ dependencies = [
 [[package]]
 name = "newtui"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/newtui?rev=1f0e8ac4ced3fe91d72407d4a16d01e7018522df#1f0e8ac4ced3fe91d72407d4a16d01e7018522df"
+source = "git+https://github.com/Gilamonster-Foundation/newtui?rev=e8617efd6e5c489a3320f10f0c74000c8f19f1a7#e8617efd6e5c489a3320f10f0c74000c8f19f1a7"
 
 [[package]]
 name = "nix"

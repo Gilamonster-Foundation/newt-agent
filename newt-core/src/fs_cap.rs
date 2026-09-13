@@ -104,6 +104,27 @@ impl WorkspaceDir {
         )?))
     }
 
+    /// Open a regular file without blocking on a FIFO. Diagnostic snapshots
+    /// pass `nofollow` to distinguish a final symlink from its target; mutation
+    /// verification may follow a contained link, matching the write policy.
+    pub fn open_regular(&self, rel: &Path, nofollow: bool) -> io::Result<File> {
+        let flags = OFlags::RDONLY
+            | OFlags::NONBLOCK
+            | if nofollow {
+                OFlags::NOFOLLOW
+            } else {
+                OFlags::empty()
+            };
+        let file = File::from(self.resolve(rel, flags, Mode::empty())?);
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
     /// Create (or truncate) a file for writing, contained beneath the root.
     ///
     /// The final component is created *inside* the resolved-beneath path or the

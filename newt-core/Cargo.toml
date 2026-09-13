@@ -27,6 +27,10 @@ categories = ["api-bindings", "text-processing"]
 agent-harness.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+# Step 13.2: Diffy computes the observed delta; NewtUI owns its shared model
+# and Markdown projection. Core keeps terminal/renderer features disabled.
+diffy.workspace = true
+newtui.workspace = true
 # OCAP disclosure filter (ocap.rs): catch a known secret value in its common
 # re-encodings (base64), not just raw — filter by value, not by shape.
 base64.workspace = true

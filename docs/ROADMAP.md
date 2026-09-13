@@ -817,6 +817,57 @@ acceptance tests remain the proof for the unchanged driver.
 **Out of scope:** settings state-machine adoption, renderer or layout changes,
 new bindings, and tool-edit diff presentation. Those are subsequent slices.
 
+## Step 13.2 — Observed file changes in tool results
+
+**Status:** in progress.
+
+**What:** `write_file`, `edit_file`, and `delete_file` return NewtUI's shared
+file-change text through the existing String result. Diffy computes the delta
+between an authorized UTF-8 preimage observed immediately before the operation
+and its verified postimage. Each edit has its own local preimage; the existing
+first-write `WriteLedger` and tool observation/spill records keep their current
+meaning. Capture follows confirmation, and post-write verification precedes
+the arbitrary build-check command, so a failed build retains the tool's change.
+
+Unreadable, denied, non-UTF-8, or final-symlink preimages are explicitly
+unavailable and never become an absent-file creation claim. Detected stale
+edits and mismatched or partial writes do not report the requested patch as
+successful; safely observed partial changes remain visible with the error.
+Linux capture uses the existing object-bound filesystem capability. The
+non-Linux physical containment check is diagnostic and is not atomic with the
+open; this step does not claim to close that existing platform limitation.
+Receipt capture is limited to 256 KiB per version, and Diffy receives at most
+4096 lines across both versions. Exceeding either budget reports an unavailable
+receipt without a truncated patch; the underlying file operation remains allowed.
+Canonical results preserve source bytes. Terminal display uses the established
+untrusted-text neutralizer plus visible tab markers through the existing result
+override; an explicit notice identifies an escaped display as unsuitable for
+raw patch application. Write previews use the same visible-control treatment.
+
+**Retention:** durable tool observations keep their existing disclosure and
+secret-redaction policies. The separate session-only `/spill` archive applies
+terminal sanitization and entry/byte limits; it does not promise secret
+redaction. These retained projections are review evidence, not a byte-exact
+patch export or a replacement for original snapshots.
+
+**Tests:** separate pure formatter round trips and real-file tool regressions
+cover immediate create/edit/delete history, confirmation timing, build-check
+failure, unavailable preimages, special files, and observed postconditions.
+Captured terminal output also witnesses ESC, OSC 8/52, carriage returns, and
+tabs becoming visible markers while the returned canonical patch stays intact.
+Linux's workspace CI test lane also runs `fs_cap_object_bound`, including
+regular-file containment, final-link policy, and a deadline-bounded FIFO witness;
+macOS validation alone does not establish `openat2` behavior.
+
+**Dependency:** advance the immutable NewtUI 0.1.0 Git pin to the merged diff
+model/text implementation; keep renderer features off in `newt-core`.
+
+**Out of scope:** a new persistence schema or snapshot journal, permission
+dialogs with diff previews, shell/Git change discovery, a ratatui viewport,
+and settings state-machine adoption.
+The existing tool-result scrollback and spill view show the fenced diff as text;
+syntax-colored cells and rich diff interaction follow in a later slice.
+
 ---
 
 # Phase 14 - `newt dgx` command suite (9 steps)

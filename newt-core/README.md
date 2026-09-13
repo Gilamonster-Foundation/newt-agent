@@ -19,6 +19,18 @@ paths. Built-in file tools include `read_file`, `write_file`, `edit_file`,
 `delete_file`, `list_dir`, and `find`, all mediated by the same caveat and
 prompted-permission checks.
 
+File mutation results use NewtUI's shared diff model and Markdown projection
+for authorized UTF-8 changes observed around each operation. Verification runs
+before an optional build check, so its failure does not erase the tool's diff.
+Unavailable preimages and receipt limits (256 KiB per version, 4096 total lines)
+are named explicitly without emitting partial patches. Durable observations
+retain their disclosure and secret-redaction policies. The session-only spill
+archive keeps its terminal sanitization and size limits; it does not promise
+secret redaction. Retained text is not a byte-exact patch export. See
+[Step 13.2](../docs/ROADMAP.md#step-132--observed-file-changes-in-tool-results).
+Terminal displays visibly escape source controls and identify that projection;
+the canonical returned result keeps the source bytes.
+
 Harness-owned Git subprocesses share `git_hardening::hardened_git`, which
 returns a fallible command builder with repository config gadgets disabled and
 the child environment scrubbed. On macOS it resolves Git from PATH before
