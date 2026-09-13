@@ -39,6 +39,11 @@ In `/backends`, Down opens the selected backend's editor; Left/Right on its mode
 field cycles through models discovered from that endpoint. Enter saves the backend
 configuration. Use `/model` to change the model for the active conversation.
 
+The rich panels share NewtUI's key and close vocabulary. Newt retains event
+decoding, terminal ownership, settings validation and writes. The
+[first adoption step](../docs/ROADMAP.md#step-131--shared-panel-key-and-close-vocabulary)
+records the immutable dependency pin and the boundary for later component moves.
+
 `/psyche` includes independent agreeableness, extraversion, warmth,
 approachability, and prosocial-behavior dials. Select `steady`, `direct`, or
 `sociable`, adjust values from 0 through 100, and use `auto` to inherit a

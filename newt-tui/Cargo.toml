@@ -36,6 +36,9 @@ anyhow.workspace = true
 # so a foreign TUI need not pin newt's release train has no business being
 # unconditional in newt's own headless tier.
 precedence-ladder = { workspace = true, optional = true }
+# Shared key and close vocabulary for the rich panels; the host retains all
+# terminal ownership and event decoding. No renderer feature is needed.
+newtui = { workspace = true, optional = true }
 # The TUI's `McpTools` bridge impl (the newt_core::agentic seam) is an
 # async trait — see newt-tui/src/mcp.rs.
 async-trait.workspace = true
@@ -87,7 +90,7 @@ live-spill = []
 # status row, live clock, multi-line vi/emacs editing. OFF by default — the
 # lean crossterm box is the only surface compiled unless this is enabled, and
 # the `is_terminal()` runtime gate still applies on top of the feature.
-rich-tui = ["dep:tui-textarea", "dep:precedence-ladder"]
+rich-tui = ["dep:tui-textarea", "dep:precedence-ladder", "dep:newtui"]
 
 # In-process candle summarizer (#661 group C): routes the (now DEFAULT) embedded
 # summarizer through newt-inference's engine. Enabled by the workspace default

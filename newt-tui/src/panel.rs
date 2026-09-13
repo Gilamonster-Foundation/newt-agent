@@ -43,75 +43,27 @@ use newt_core::tty::raw_mode::RawModeGuard;
 use crate::inline_viewport::InlineTerm;
 use crate::session_worker::PanelWindow;
 
-/// What one keypress did to the panel.
-///
-/// Deliberately two-armed. A panel closes because the operator ACCEPTED
-/// something or because they did not, and the boolean is that distinction —
-/// not a success/failure code. What an acceptance then MEANS is the panel's
-/// own business (`close_outcome` in each module), which is why nothing here
-/// looks inside it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Flow {
-    /// Keep driving.
-    Stay,
-    /// Close the panel; `true` when the operator explicitly applied.
-    Close(bool),
-}
+/// The component vocabulary is shared directly with NewtUI. Newt retains
+/// event decoding and the terminal driver, and each panel interprets its own
+/// close outcome.
+pub(crate) use newtui::{Flow, Key};
 
-/// One key press, with the control modifier ALREADY FOLDED IN.
-///
-/// **This exists so that a plain-character binding cannot fire with control
-/// held.** The driver used to hand a table `(KeyCode, ctrl: bool)`, and the
-/// four tables then gave four different answers to the same question: the
-/// backend chooser guarded `Char(c) if !ctrl` in two arms and left `e`, `a`,
-/// `d`, `:` and `q` unguarded; the psyche panel's command line took any
-/// `Char(c)`, so Ctrl-S typed a literal `s` into the line Ctrl-S is meant to
-/// SAVE from; and the settings panel discarded the flag entirely, so Ctrl-Q
-/// cancelled.
-///
-/// Every one of those is the same defect, and guarding eight match arms would
-/// have fixed eight instances of it while leaving the ninth to whoever writes
-/// the next panel. Here `Char('q')` means the operator pressed `q` — the
-/// wrong reading is not expressible, and a binding that WANTS control says
-/// [`Key::Ctrl`].
-///
-/// The vocabulary is `newtui::Key`'s, deliberately: when the panels move to
-/// that crate this type is deleted rather than translated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Key {
-    Up,
-    Down,
-    Left,
-    Right,
-    Enter,
-    Esc,
-    Backspace,
-    Tab,
-    /// A printable character, pressed WITHOUT control.
-    Char(char),
-    /// A character with control held.
-    Ctrl(char),
-    /// A key no panel in this crate binds. Carried rather than dropped so a
-    /// table can match `_` once, and so the driver stays free of policy.
-    Other,
-}
-
-impl Key {
-    /// Fold a crossterm key event into this vocabulary.
-    fn from_event(code: KeyCode, ctrl: bool) -> Self {
-        match (code, ctrl) {
-            (KeyCode::Char(c), true) => Self::Ctrl(c),
-            (KeyCode::Char(c), false) => Self::Char(c),
-            (KeyCode::Up, _) => Self::Up,
-            (KeyCode::Down, _) => Self::Down,
-            (KeyCode::Left, _) => Self::Left,
-            (KeyCode::Right, _) => Self::Right,
-            (KeyCode::Enter, _) => Self::Enter,
-            (KeyCode::Esc, _) => Self::Esc,
-            (KeyCode::Backspace, _) => Self::Backspace,
-            (KeyCode::Tab, _) => Self::Tab,
-            _ => Self::Other,
-        }
+/// Fold control into printable keys so a plain-character binding cannot fire
+/// with control held. Preserve Newt's existing bindings: keys it did not bind
+/// still arrive as `Other`, even if NewtUI names them for another host.
+fn key_from_event(code: KeyCode, ctrl: bool) -> Key {
+    match (code, ctrl) {
+        (KeyCode::Char(c), true) => Key::Ctrl(c),
+        (KeyCode::Char(c), false) => Key::Char(c),
+        (KeyCode::Up, _) => Key::Up,
+        (KeyCode::Down, _) => Key::Down,
+        (KeyCode::Left, _) => Key::Left,
+        (KeyCode::Right, _) => Key::Right,
+        (KeyCode::Enter, _) => Key::Enter,
+        (KeyCode::Esc, _) => Key::Esc,
+        (KeyCode::Backspace, _) => Key::Backspace,
+        (KeyCode::Tab, _) => Key::Tab,
+        _ => Key::Other,
     }
 }
 
@@ -231,7 +183,7 @@ pub(crate) fn drive(
                     continue;
                 }
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                if let Flow::Close(apply) = screen.key(Key::from_event(key.code, ctrl)) {
+                if let Flow::Close(apply) = screen.key(key_from_event(key.code, ctrl)) {
                     applied = apply;
                     break;
                 }
@@ -361,6 +313,19 @@ mod tests {
         }
     }
 
+    /// A component's vocabulary crosses the host boundary unchanged. A local
+    /// replacement enum would make these assignments stop compiling.
+    #[test]
+    fn screens_accept_newtui_keys_and_return_newtui_flow_directly() {
+        let mut screen = Recorder {
+            close_on: Some((Key::Enter, true)),
+            ..Recorder::default()
+        };
+        let key: newtui::Key = Key::Enter;
+        let flow: newtui::Flow = screen.key(key);
+        assert_eq!(flow, newtui::Flow::Close(true));
+    }
+
     /// **A plain-character binding cannot fire with control held.**
     ///
     /// The whole reason this vocabulary exists. Four key tables previously
@@ -371,20 +336,33 @@ mod tests {
     /// inexpressible instead of guarded eight times.
     #[test]
     fn control_is_folded_into_the_key_rather_than_carried_beside_it() {
-        assert_eq!(Key::from_event(KeyCode::Char('q'), false), Key::Char('q'));
-        assert_eq!(Key::from_event(KeyCode::Char('q'), true), Key::Ctrl('q'));
+        assert_eq!(key_from_event(KeyCode::Char('q'), false), Key::Char('q'));
+        assert_eq!(key_from_event(KeyCode::Char('q'), true), Key::Ctrl('q'));
         assert_ne!(
-            Key::from_event(KeyCode::Char('s'), true),
+            key_from_event(KeyCode::Char('s'), true),
             Key::Char('s'),
             "Ctrl-S must not be readable as a plain `s`"
         );
         // A non-character key ignores the modifier: no panel binds Ctrl-Up,
         // and inventing a distinction nothing uses would grow the vocabulary
         // for nothing.
-        assert_eq!(Key::from_event(KeyCode::Up, true), Key::Up);
-        assert_eq!(Key::from_event(KeyCode::Esc, true), Key::Esc);
+        assert_eq!(key_from_event(KeyCode::Up, true), Key::Up);
+        assert_eq!(key_from_event(KeyCode::Esc, true), Key::Esc);
         // Anything unbound arrives as one arm a table matches once.
-        assert_eq!(Key::from_event(KeyCode::F(7), false), Key::Other);
+        for code in [
+            KeyCode::F(7),
+            KeyCode::Delete,
+            KeyCode::Insert,
+            KeyCode::BackTab,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Null,
+        ] {
+            assert_eq!(key_from_event(code, false), Key::Other);
+            assert_eq!(key_from_event(code, true), Key::Other);
+        }
     }
 
     /// `Flow` says one thing, and a panel cannot accidentally say it by
