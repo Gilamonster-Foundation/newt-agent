@@ -4453,12 +4453,17 @@ impl WorkflowRuntimeState {
     }
 
     fn record_tool_result(&mut self, result: &str, ok: bool) -> bool {
-        let Some(fingerprint) = workflow_error_fingerprint(result) else {
+        let unreachable = unreachable_by_edit(ok, result);
+        // Capability denials need not carry a compiler's `error:` prefix.
+        let Some(fingerprint) = workflow_error_fingerprint(result)
+            .or_else(|| unreachable.map(|_| normalize_error_line(result)))
+        else {
             return false;
         };
-        let unreachable = unreachable_by_edit(ok, result);
         match self.error_evidence.as_mut() {
-            Some(evidence) if evidence.fingerprint == fingerprint => {
+            Some(evidence)
+                if evidence.fingerprint == fingerprint && evidence.unreachable == unreachable =>
+            {
                 evidence.observations = evidence.observations.saturating_add(1);
                 false
             }
