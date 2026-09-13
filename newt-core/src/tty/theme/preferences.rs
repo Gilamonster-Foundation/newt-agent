@@ -160,6 +160,17 @@ fn list_directory(dir: &std::path::Path) -> Result<(Vec<Theme>, Vec<String>), St
             .map_err(|e| e.to_string())
             .and_then(|text| decode(&text))
         {
+            Ok(theme)
+                if themes
+                    .iter()
+                    .any(|existing| existing.name.eq_ignore_ascii_case(&theme.name)) =>
+            {
+                warnings.push(format!(
+                    "{}: duplicate theme name {}",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    theme.name
+                ));
+            }
             Ok(theme) => themes.push(theme),
             Err(error) => warnings.push(format!(
                 "{}: {error}",
@@ -170,13 +181,29 @@ fn list_directory(dir: &std::path::Path) -> Result<(Vec<Theme>, Vec<String>), St
     Ok((themes, warnings))
 }
 
-pub fn save(theme: &Theme) -> Result<(), String> {
-    if !valid_name(&theme.name) {
+fn validate_save_name(name: &str, existing: &[Theme]) -> Result<(), String> {
+    if !valid_name(name) {
         return Err("Use 1-64 letters, digits, - or _ for the name".into());
     }
-    if theme.name == "active" || builtins().iter().any(|t| t.name == theme.name) {
+    if name.eq_ignore_ascii_case("active")
+        || builtins()
+            .iter()
+            .any(|theme| theme.name.eq_ignore_ascii_case(name))
+    {
         return Err("Choose a new name to save a copy of a built-in theme".into());
     }
+    if existing
+        .iter()
+        .any(|theme| theme.name.eq_ignore_ascii_case(name) && theme.name != name)
+    {
+        return Err("A theme with this name already exists with different capitalization".into());
+    }
+    Ok(())
+}
+
+pub fn save(theme: &Theme) -> Result<(), String> {
+    let (existing, _) = list()?;
+    validate_save_name(&theme.name, &existing)?;
     write(theme, &format!("{}.toml", theme.name))
 }
 
@@ -212,6 +239,27 @@ pub(super) fn restore() -> (Theme, Vec<String>) {
 mod tests {
     use super::*;
     #[test]
+    fn saved_theme_names_are_portable_across_case_sensitive_filesystems() {
+        let mut existing = builtins();
+        existing.push(Theme::builtin().overlaid("MyTheme", &[]));
+        for reserved in [
+            "active", "Active", "ACTIVE", "newt", "NEWT", "Daylight", "PHOSPHOR",
+        ] {
+            assert!(
+                validate_save_name(reserved, &existing).is_err(),
+                "accepted reserved {reserved}"
+            );
+        }
+        assert!(validate_save_name("mytheme", &existing).is_err());
+        assert!(validate_save_name("MYTHEME", &existing).is_err());
+        assert!(
+            validate_save_name("MyTheme", &existing).is_ok(),
+            "exact existing name remains editable"
+        );
+        assert!(validate_save_name("AnotherTheme", &existing).is_ok());
+    }
+
+    #[test]
     fn theme_roundtrip_preserves_colors_and_disabled_bold() {
         let mut theme =
             Theme::builtin().overlaid("mine", &[(Role::InlineCode, Color::AnsiValue(231))]);
@@ -224,6 +272,31 @@ mod tests {
             assert_eq!(theme.style(*role), copy.style(*role));
         }
     }
+    #[test]
+    fn saved_presets_cannot_shadow_builtins_or_case_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, name) in [("a.toml", "Mine"), ("b.toml", "mine"), ("c.toml", "NEWT")] {
+            let theme = Theme::builtin().overlaid(name, &[]);
+            std::fs::write(dir.path().join(file), encode(&theme).unwrap()).unwrap();
+        }
+        let (themes, warnings) = list_directory(dir.path()).unwrap();
+        assert_eq!(
+            themes
+                .iter()
+                .filter(|theme| theme.name.eq_ignore_ascii_case("mine"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            themes
+                .iter()
+                .filter(|theme| theme.name.eq_ignore_ascii_case("newt"))
+                .count(),
+            1
+        );
+        assert_eq!(warnings.len(), 2);
+    }
+
     #[test]
     fn malformed_theme_does_not_hide_valid_saved_themes() {
         let dir = tempfile::tempdir().unwrap();
