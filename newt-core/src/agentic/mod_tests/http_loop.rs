@@ -203,9 +203,9 @@ impl Respond for ScriptedOpenAi {
             .or_else(|| self.script.last())
             .cloned()
             .unwrap_or_else(|| serde_json::json!({ "content": "final." }));
-        if !msg["tool_calls"]
+        if msg["tool_calls"]
             .as_array()
-            .is_some_and(|calls| !calls.is_empty())
+            .is_none_or(|calls| calls.is_empty())
         {
             *pending = Some((req.body.clone(), msg.clone()));
         }
