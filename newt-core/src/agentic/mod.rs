@@ -5060,17 +5060,23 @@ fn run_command_is_advertised(tools: &serde_json::Value) -> bool {
     })
 }
 
-/// Result text that marks a REFUSED CAPABILITY. Shared by the exec-denial
-/// ground-truth check and by [`unreachable_by_edit`], so the two cannot drift
-/// into disagreeing about what a denial looks like.
-const CAPABILITY_DENIAL_NEEDLES: [&str; 6] = [
-    "permission denied",
-    "permission-denied",
+/// Result text that marks a REFUSED CAPABILITY in newt's OWN vocabulary — what
+/// `tools::denied_fs_result`, the exec leash and the MCP leash emit. Shared by
+/// the exec-denial ground-truth check and by [`unreachable_by_edit`], so the
+/// two cannot drift into disagreeing about what a denial looks like.
+const CONFINEMENT_DENIAL_NEEDLES: [&str; 4] = [
     "not within the granted authority",
     "does not permit",
     "capability denied",
     "exec not granted",
 ];
+
+/// The OS's own words when the kernel refuses a fenced child. Only the
+/// exec-denial ground-truth check reads these: an ordinary failure the model
+/// CAN fix — a test asserting on EACCES, a `chmod` on the wrong path, a
+/// rejected push — prints the same string, so on the blocked/no-edit path it
+/// would stop the model working on a repairable failure.
+const OS_PERMISSION_DENIAL_NEEDLES: [&str; 2] = ["permission denied", "permission-denied"];
 
 /// Result text that marks a MISSING EXECUTABLE — the tool the model needs is
 /// not present in this environment at all (#2273).
@@ -5086,8 +5092,9 @@ fn run_command_result_is_denial(tool_name: &str, ok: bool, result: &str) -> bool
         return false;
     }
     let lower = result.to_ascii_lowercase();
-    CAPABILITY_DENIAL_NEEDLES
+    CONFINEMENT_DENIAL_NEEDLES
         .iter()
+        .chain(OS_PERMISSION_DENIAL_NEEDLES.iter())
         .any(|needle| lower.contains(needle))
 }
 
@@ -5127,7 +5134,9 @@ fn unreachable_by_edit(ok: bool, result: &str) -> Option<&'static str> {
     {
         return Some("a required executable is not present in this environment");
     }
-    if CAPABILITY_DENIAL_NEEDLES
+    // Newt's own denial vocabulary only. The OS string is deliberately NOT
+    // evidence here: see OS_PERMISSION_DENIAL_NEEDLES.
+    if CONFINEMENT_DENIAL_NEEDLES
         .iter()
         .any(|needle| lower.contains(needle))
     {
