@@ -4278,6 +4278,9 @@ impl RepeatCallGuard {
                 }
                 msg
             }
+            RepeatMemo::NoResult { .. } if name == "plan_get" => {
+                scheduled::EMPTY_PLAN_GUIDANCE.to_string()
+            }
             RepeatMemo::NoResult { reason } => format!(
                 "You already ran `{name}` with these exact arguments this turn and {reason}. \
                  Don't repeat the identical call — create or update the missing state, change \
@@ -4390,6 +4393,11 @@ impl RepeatCallGuard {
     /// steer can escalate; success-shaped memos are not counted because they are
     /// not hard failures.
     fn record(&mut self, name: &str, args: &serde_json::Value, ok: bool, result: &str) {
+        if name == "update_plan" && ok {
+            self.repeat_memos.retain(|key, _| {
+                !key.starts_with("plan_get\u{1}") && !key.starts_with("update_plan\u{1}")
+            });
+        }
         if !ok {
             *self.fails_by_tool.entry(name.to_string()).or_default() += 1;
         }

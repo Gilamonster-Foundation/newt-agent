@@ -1,5 +1,62 @@
 use super::*;
 
+#[tokio::test]
+async fn rendered_report_ack_avoids_repetition_and_allows_followup_tools() {
+    use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
+    let ledger = SessionStepLedger::default();
+    let server = MockServer::start().await;
+    let round = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ScriptedOpenAi {
+            pending_replay: Default::default(),
+            round: round.clone(),
+            script: vec![
+                serde_json::json!({"tool_calls": [{"id": "report", "function": {
+                    "name": "render_report", "arguments": "{\"title\":\"Findings\",\"body\":\"REPORT_BODY_CANARY\"}"
+                }}]}),
+                serde_json::json!({"tool_calls": [{"id": "plan", "function": {
+                    "name": "update_plan", "arguments": "{\"plan\":[{\"step\":\"Verify the requested change\"}]}"
+                }}]}),
+                serde_json::json!({"content": "The verification plan is ready."}),
+            ],
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.step_ledger = Some(&ledger);
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+    assert_eq!(reply, "The verification plan is ready.");
+    assert_eq!(
+        ledger.count(),
+        1,
+        "the follow-up tool actually updated the plan"
+    );
+    let requests = server.received_requests().await.unwrap();
+    let ack = requests
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+        .find_map(|body| {
+            body["messages"].as_array()?.iter().find_map(|message| {
+                (message["tool_call_id"] == "report")
+                    .then(|| message["content"].as_str().map(str::to_string))
+                    .flatten()
+            })
+        })
+        .expect("the next inference receives the report acknowledgement");
+    assert!(ack.contains("already visible"), "{ack}");
+    assert!(ack.contains("Do not repeat"), "{ack}");
+    assert!(ack.contains("unfinished requested work"), "{ack}");
+    assert!(
+        !ack.contains("REPORT_BODY_CANARY"),
+        "the ack must stay small"
+    );
+}
+
 /// Like [`run_openai_script`] but with a configured narrate-then-stop
 /// rescue budget (`[tui] narration_nudge_cap`, lever L3).
 async fn run_openai_script_with_cap(

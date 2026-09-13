@@ -620,3 +620,21 @@ fn a_passing_build_stays_repeatable() {
         "a passing build was memoized; re-running a build is legitimate"
     );
 }
+
+#[test]
+fn creating_a_plan_invalidates_the_empty_plan_read_memo() {
+    let mut guard = RepeatCallGuard::default();
+    let args = serde_json::json!({});
+    guard.record("plan_get", &args, true, "no active plan");
+    assert!(guard.repeat_steer("plan_get", &args).is_some());
+    guard.record(
+        "update_plan",
+        &serde_json::json!({"plan": [{"step": "inspect"}]}),
+        true,
+        "<plan>inspect</plan>",
+    );
+    assert!(
+        guard.repeat_steer("plan_get", &args).is_none(),
+        "a fresh plan must be readable in the same turn"
+    );
+}

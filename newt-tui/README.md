@@ -57,8 +57,12 @@ The turn footer reports `awaiting operator` when smart-harness adjudication
 classifies a question, and `incomplete` when narration ends without an answer.
 The question or observed reply remains available; these status notices stay
 separate from model text.
-Enable `[smart_harness] enabled = true` to use durable frames and an independent
-CPU auxiliary. Smart mode selects from retained originals and disables legacy
+The durable smart harness currently requires confined Linux execution with
+Landlock. Native [macOS support](https://github.com/Gilamonster-Foundation/newt-agent/issues/2281)
+and [Windows support](https://github.com/Gilamonster-Foundation/newt-agent/issues/2282)
+are tracked separately; enabling it there currently fails startup.
+On a supported host, enable `[smart_harness] enabled = true` to use durable frames
+and an independent CPU auxiliary. Smart mode selects from retained originals and disables legacy
 history and close-time summaries; each turn prints its frame head for inspection
 or resume. See [configuration and limits](../docs/guide/smart-harness.md).
 

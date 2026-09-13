@@ -379,6 +379,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unfinished_summary_and_tool_promises_are_pending_actions() {
+        let classifier = NudgeClassifier::builtin();
+        for text in [
+            "This remains a large file. Let me summarize the current state and what could be improved:",
+            "Let me check the current working directory and available git operations:",
+        ] {
+            assert!(classifier.is_pending_action(text), "{text}: {:?}", classifier.classify(text));
+        }
+        assert!(!classifier.is_pending_action("The files were examined; everything checks out."));
+    }
+
+    #[test]
     fn nudge_classifier_builtin_matches_known_phrases() {
         let classifier = NudgeClassifier::builtin();
         assert!(classifier.is_pending_action(
@@ -430,6 +442,16 @@ Next steps needed:
         assert_eq!(classifier.classify(
             "Let me check the local branches and the top-level remote remotes to be complete."
         ).class, NudgeClass::DeferredAnswer);
+        for text in [
+            "Let me check the current working directory and available git operations.",
+            "Let me summarize the current state and what could be improved.",
+        ] {
+            assert_eq!(
+                classifier.classify(text).class,
+                NudgeClass::DeferredAnswer,
+                "an evidence-only promise must remain recoverable on read-only turns: {text}"
+            );
+        }
         for text in [
             "I found the issue: there is an extra closing brace causing a syntax error. I need to remove this stray brace.",
             "Current blocker: the for loop needs a one line fix. Next steps needed: fix the iteration type error in lib.rs.",

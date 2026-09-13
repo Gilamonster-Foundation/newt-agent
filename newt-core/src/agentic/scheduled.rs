@@ -265,7 +265,7 @@ pub fn update_plan_tool_definition() -> serde_json::Value {
         "function": {
             "name": "update_plan",
             "description": "Create or update your plan — send the full ordered list each time \
-                            with each step's status. A <plan> checklist is shown at the head of \
+                            with optional step statuses (omitted statuses start at the first step). A <plan> checklist is shown at the head of \
                             every turn; mark the step you are on \"in_progress\" and finished \
                             steps \"completed\". Prefer this before more investigation for \
                             multi-step, ambiguous, resumed, or context-compacted work. Replaces \
@@ -289,7 +289,7 @@ pub fn update_plan_tool_definition() -> serde_json::Value {
                                                     should be in_progress."
                                 }
                             },
-                            "required": ["step", "status"]
+                            "required": ["step"]
                         },
                         "description": "The ordered steps, each with its status."
                     }
@@ -395,7 +395,10 @@ pub(crate) fn execute_update_plan(
             let mut steps: Vec<Step> = items
                 .iter()
                 .filter_map(|it| {
-                    let desc = it.get("step").and_then(|v| v.as_str())?.trim();
+                    let desc = it
+                        .as_str()
+                        .or_else(|| it.get("step").and_then(|v| v.as_str()))?
+                        .trim();
                     if desc.is_empty() {
                         return None;
                     }
@@ -422,6 +425,12 @@ pub(crate) fn execute_update_plan(
     out
 }
 
+/// A constructive next call, shared by the initial read and repeat guard.
+pub(crate) const EMPTY_PLAN_GUIDANCE: &str =
+    "no active plan yet. Planning is available. Create one with update_plan: \
+     {\"plan\":[{\"step\":\"Inspect the relevant code\"},{\"step\":\"Make the requested change\"},{\"step\":\"Run focused checks\"}]}. \
+     Adapt the steps to the user's task. For a one-step task, call the work tool directly.";
+
 /// Execute a `plan_get` call (#716) — render the current `<plan>` checklist
 /// read-only (no ledger mutation), so a resumed turn can recover "what was I
 /// working on". Empty plan → a hint to start one with `update_plan`.
@@ -430,13 +439,7 @@ pub(crate) fn execute_plan_get(
     _color: bool,
     _tool_output_lines: usize,
 ) -> String {
-    plan_block(ledger).unwrap_or_else(|| {
-        "no active plan — if this is multi-step, ambiguous, resumed, or context-compacted work, \
-         call update_plan next with a short 2-6 step ordered plan using statuses \
-         pending/in_progress/completed; do not call plan_get again until you have created or \
-         updated a plan"
-            .to_string()
-    })
+    plan_block(ledger).unwrap_or_else(|| EMPTY_PLAN_GUIDANCE.to_string())
 }
 
 #[cfg(test)]
@@ -682,6 +685,19 @@ mod tests {
     }
 
     #[test]
+    fn a_simple_plan_can_omit_status_or_use_step_strings() {
+        let ledger = SessionStepLedger::default();
+        for plan in [
+            serde_json::json!([{"step": "inspect"}, {"step": "test"}]),
+            serde_json::json!(["inspect", "test"]),
+        ] {
+            let out = execute_update_plan(&serde_json::json!({"plan": plan}), &ledger, false, 20);
+            assert!(out.contains("→ 1. inspect"), "{out}");
+            assert!(out.contains("☐ 2. test"), "{out}");
+        }
+    }
+
+    #[test]
     fn tool_definitions_shape() {
         assert_eq!(
             update_plan_tool_definition()["function"]["name"],
@@ -706,10 +722,10 @@ mod tests {
         let l = SessionStepLedger::default();
         let empty = execute_plan_get(&l, false, 20);
         assert!(empty.starts_with("no active plan"), "{empty}");
-        assert!(empty.contains("update_plan next"), "{empty}");
+        assert!(empty.contains("Planning is available"), "{empty}");
         assert!(
-            empty.contains("do not call plan_get again"),
-            "empty plan_get must steer away from polling: {empty}"
+            empty.contains("{\"plan\":[{\"step\":"),
+            "empty plan_get supplies an executable next call: {empty}"
         );
         assert_eq!(l.count(), 0, "plan_get does not mutate the ledger");
         // a ledger with steps → the compiled <plan> block, read-only.
