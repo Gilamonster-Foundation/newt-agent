@@ -16,6 +16,11 @@ Their apply, cancel, and save behavior is documented in the
 [settings walkthroughs](../demos/README.md); a session change is not automatically
 a saved configuration change.
 
+The rich panels share NewtUI's key and close vocabulary. Newt retains event
+decoding, terminal ownership, settings validation and writes. The
+[first adoption step](../docs/ROADMAP.md#step-131--shared-panel-key-and-close-vocabulary)
+records the immutable dependency pin and the boundary for later component moves.
+
 `/psyche` includes independent agreeableness, extraversion, warmth,
 approachability, and prosocial-behavior dials. Select `steady`, `direct`, or
 `sociable`, adjust values from 0 through 100, and use `auto` to inherit a
