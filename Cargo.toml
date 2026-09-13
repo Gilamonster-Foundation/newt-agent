@@ -260,6 +260,10 @@ jsonrpc-core = "18"
 # TUI (only newt-tui pulls this)
 ratatui = "0.29"
 crossterm = "0.28"
+# Reusable panel vocabulary and file-change text (Steps 13.1–13.2). The crate is not published yet,
+# so pin an immutable revision and keep the release requirement for packaging.
+# Replace the git pin with the registry dependency when 0.1.0 is published.
+newtui = { git = "https://github.com/Gilamonster-Foundation/newtui", rev = "e8617efd6e5c489a3320f10f0c74000c8f19f1a7", version = "0.1.0", default-features = false }
 
 # Markdown rendering (newt-core, behind the `markdown` feature — Step 25.1).
 # pulldown-cmark parses; we render ANSI ourselves on crossterm (no widget

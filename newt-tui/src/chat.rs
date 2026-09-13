@@ -1030,6 +1030,13 @@ pub(crate) fn run_chat(
         println!("\nnewt  ·  {workspace}");
     }
 
+    // The persisted theme is applied HERE, once, as an explicit startup step —
+    // never lazily inside the renderer, which would tie every markdown golden
+    // to whatever theme this box last applied. `NEWT_THEME` still overlays it.
+    for warning in newt_core::tty::theme::restore_preferences() {
+        eprintln!("⚠ theme: {warning}");
+    }
+
     // Input history file and tokio runtime for async inference.
     let history_path = newt_core::Config::user_config_path().map(|p| p.with_file_name("history"));
 

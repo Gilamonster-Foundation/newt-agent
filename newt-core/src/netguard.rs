@@ -93,9 +93,11 @@ mod linux {
     /// preserved. Call child-side just before exec.
     pub fn close_inherited_fds() {
         // `close_range(3, ~0, 0)` closes the whole upper range in one syscall
-        // (Linux 5.9+). SAFETY: no memory effects; closing an already-closed fd is
-        // harmless.
-        let rc = unsafe { libc::close_range(3, libc::c_uint::MAX, 0) };
+        // (Linux 5.9+). Raw syscall rather than the libc wrapper: the libc crate
+        // only exposes `close_range()` for glibc, and the musl (Alpine) build
+        // needs this too. SAFETY: no memory effects; closing an already-closed
+        // fd is harmless.
+        let rc = unsafe { libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0) };
         if rc == 0 {
             return;
         }
