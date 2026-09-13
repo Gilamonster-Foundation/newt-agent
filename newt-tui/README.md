@@ -44,6 +44,18 @@ decoding, terminal ownership, settings validation and writes. The
 [first adoption step](../docs/ROADMAP.md#step-131--shared-panel-key-and-close-vocabulary)
 records the immutable dependency pin and the boundary for later component moves.
 
+File edits in the rich surface show NewtUI's numbered added and removed rows,
+with syntax foregrounds and semantic backgrounds, in committed scrollback and
+the existing completed spill viewport. Resizing reprojects the captured model;
+the normal scroll, expand and dismiss controls retain ownership. Theme overrides
+`added`, `removed`, `added-background`, and `removed-background` tune these colors.
+For example, `NEWT_THEME="added-background=#183825,removed-background=#411d20"`
+sets both source backgrounds. The rich build includes the existing Syntect
+syntax/theme assets; lean builds keep the plain text receipt path. The `/spill`
+archive still retains bounded text; typed full inspection and exact export are
+subsequent work, as recorded in
+[Step 13.3](../docs/ROADMAP.md#step-133--rich-file-change-cells-in-scrollback-and-the-completed-viewport).
+
 `/psyche` includes independent agreeableness, extraversion, warmth,
 approachability, and prosocial-behavior dials. Select `steady`, `direct`, or
 `sociable`, adjust values from 0 through 100, and use `auto` to inherit a

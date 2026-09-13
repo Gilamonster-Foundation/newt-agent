@@ -80,14 +80,22 @@ pub(super) fn from_versions(
     newtui::diff::from_unified(&unified).map_err(ReceiptError::Parse)
 }
 
+#[cfg(test)]
 pub(super) fn receipt(
     path: &str,
     before: Option<&str>,
     after: Option<&str>,
 ) -> Result<String, ReceiptError> {
     let model = from_versions(path, before, after)?;
+    Ok(receipt_from_model(
+        &model,
+        before.is_some() && before == after,
+    ))
+}
+
+pub(super) fn receipt_from_model(model: &ChangeSet, unchanged: bool) -> String {
     let file = &model.files()[0];
-    let kind = if before.is_some() && before == after {
+    let kind = if unchanged {
         "No content change"
     } else {
         match file.kind() {
@@ -96,12 +104,12 @@ pub(super) fn receipt(
             _ => "Modified",
         }
     };
-    Ok(format!(
+    format!(
         "{kind} (+{} -{})\n\n{}",
         file.additions(),
         file.removals(),
         model.to_markdown()
-    ))
+    )
 }
 
 // Quote the path as Git patch syntax, keeping each header on one physical line.

@@ -3379,11 +3379,12 @@ async fn execute_authorized_tool(
                 };
                 let receipt_after = file_capture::capture(&caveats.fs_read, &full);
                 let receipt = file_capture::receipt(path, &receipt_before, &receipt_after);
-                let output = match write_result {
+                match write_result {
                     Ok(()) => {
                         if !file_capture::verified_after(&receipt_after, mutation_scope, &full, Some(content.as_bytes())) {
-                            return file_capture::present(
-                                format!("error: write_file returned success for {path}, but the submitted bytes could not be verified{receipt}"),
+                            return receipt.present(
+                                format!("error: write_file returned success for {path}, but the submitted bytes could not be verified"),
+                                "",
                                 presentation,
                             );
                         }
@@ -3436,11 +3437,12 @@ async fn execute_authorized_tool(
                         let check = build_check_cmd
                             .map(|cmd| run_build_check(cmd, workspace))
                             .unwrap_or_default();
-                        format!("wrote {path} ({line_count} lines){receipt}{artifact}{check}")
+                        receipt.present(format!("wrote {path} ({line_count} lines)"), &format!("{artifact}{check}"), presentation)
                     }
-                    Err(tool_output) => file_capture::failure(tool_output, &receipt),
-                };
-                file_capture::present(output, presentation)
+                    // Keep the established exact capability refusal; no write began.
+                    Err(tool_output) if tool_output == denied_fs_result("fs_write", path) => file_capture::present(tool_output, presentation),
+                    Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
+                }
             } else {
                 format!("user declined to write {path}")
             }
@@ -3514,11 +3516,12 @@ async fn execute_authorized_tool(
             };
             let receipt_after = file_capture::capture(&caveats.fs_read, &full);
             let receipt = file_capture::receipt(path, &receipt_before, &receipt_after);
-            let output = match delete_result {
+            match delete_result {
                 Ok(()) => {
                     if !file_capture::verified_after(&receipt_after, mutation_scope, &full, None) {
-                        return file_capture::present(
-                            format!("error: delete_file returned success for {path}, but absence could not be verified{receipt}"),
+                        return receipt.present(
+                            format!("error: delete_file returned success for {path}, but absence could not be verified"),
+                            "",
                             presentation,
                         );
                     }
@@ -3561,11 +3564,11 @@ async fn execute_authorized_tool(
                     let check = build_check_cmd
                         .map(|cmd| run_build_check(cmd, workspace))
                         .unwrap_or_default();
-                    format!("deleted {path}{receipt}{artifact}{check}")
+                    receipt.present(format!("deleted {path}"), &format!("{artifact}{check}"), presentation)
                 }
-                Err(tool_output) => file_capture::failure(tool_output, &receipt),
-            };
-            file_capture::present(output, presentation)
+                Err(tool_output) if tool_output == denied_fs_result("fs_write", path) => file_capture::present(tool_output, presentation),
+                Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
+            }
         }
 
         "edit_file" => {
@@ -3696,11 +3699,12 @@ async fn execute_authorized_tool(
             };
             let receipt_after = file_capture::capture(&caveats.fs_read, &full);
             let receipt = file_capture::receipt(path, &receipt_before, &receipt_after);
-            let output = match write_result {
+            match write_result {
                 Ok(()) => {
                     if !file_capture::verified_after(&receipt_after, mutation_scope, &full, Some(updated.as_bytes())) {
-                        return file_capture::present(
-                            format!("error: edit_file returned success for {path}, but the replacement bytes could not be verified{receipt}"),
+                        return receipt.present(
+                            format!("error: edit_file returned success for {path}, but the replacement bytes could not be verified"),
+                            "",
                             presentation,
                         );
                     }
@@ -3749,13 +3753,11 @@ async fn execute_authorized_tool(
                     let check = build_check_cmd
                         .map(|cmd| run_build_check(cmd, workspace))
                         .unwrap_or_default();
-                    format!(
-                        "edited {path} ({delta_str} lines, now {new_lines} total){receipt}{artifact}{check}"
-                    )
+                    receipt.present(format!("edited {path} ({delta_str} lines, now {new_lines} total)"), &format!("{artifact}{check}"), presentation)
                 }
-                Err(tool_output) => file_capture::failure(tool_output, &receipt),
-            };
-            file_capture::present(output, presentation)
+                Err(tool_output) if tool_output == denied_fs_result("fs_write", path) => file_capture::present(tool_output, presentation),
+                Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
+            }
         }
 
         "list_dir" => {

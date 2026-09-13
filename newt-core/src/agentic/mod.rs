@@ -63,6 +63,10 @@ pub(crate) mod tool_recovery;
 // and the redaction-gated ShellObservation seam (observation). All additive;
 // they wrap/precede `chat_complete` and never touch its internals.
 mod driver;
+mod file_change_display;
+pub use file_change_display::{file_change_style, write_file_change_row, FileChangePresentation};
+#[cfg(feature = "markdown-syntect")]
+mod syntax_foreground;
 // Step 25.1 (#568): Markdown → ANSI rendering of assistant output. Behind the
 // default `markdown` feature; a passthrough shim takes its place under
 // --no-default-features so the headless wyvern strip carries no markdown deps.
@@ -853,6 +857,19 @@ pub trait CompletedSpillRenderer: Send + Sync {
     /// Returns the number of physical rows painted — 0 when the viewport could
     /// not take the screen (no TTY room, or a LIVE viewport is still up).
     fn render_completed(&self, output: &str, width: usize, max_height: usize) -> usize;
+
+    /// Render a captured file change when the host supports safe styled cells.
+    /// Existing hosts retain the completed text fallback and its lifecycle.
+    fn render_file_change(
+        &self,
+        _raw_output: &str,
+        output: &str,
+        _change: std::sync::Arc<FileChangePresentation>,
+        width: usize,
+        max_height: usize,
+    ) -> usize {
+        self.render_completed(output, width, max_height)
+    }
 
     /// Whether a COMPLETED viewport is currently on screen (a live viewport
     /// does not count).

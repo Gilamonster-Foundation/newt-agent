@@ -9,6 +9,87 @@ use std::io::Write;
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
 
+#[cfg(all(unix, feature = "rich-tui"))]
+#[path = "live_spill_pty_tests.rs"]
+mod terminal;
+
+#[test]
+#[cfg(all(unix, feature = "rich-tui"))]
+fn rich_changes_reproject_on_resize_and_share_completed_cleanup() {
+    use newt_core::agentic::{CompletedSpillRenderer, FileChangePresentation};
+    let changes = newtui::diff::from_unified("--- state.rs\n+++ state.rs\n@@ -1 +1 @@\n-let old = 1;\n+let restored_after_widening = 2;\n").unwrap();
+    let receipt = changes.to_markdown();
+    let change = Arc::new(FileChangePresentation::new(
+        changes,
+        "state.rs".into(),
+        Some("let old = 1;\n".into()),
+        Some("let restored_after_widening = 2;\n".into()),
+        receipt.clone(),
+        0..receipt.len(),
+    ));
+    let geometry = Arc::new(Mutex::new((18, 30)));
+    let measured = geometry.clone();
+    let writer = SharedWriter::default();
+    let renderer =
+        LiveSpillRenderer::with_writer_and_geometry(writer.clone(), 12, true, move || {
+            Some(*measured.lock().unwrap())
+        })
+        .unwrap();
+    assert!(renderer.render_file_change(&receipt, &receipt, change, 18, 12) > 0);
+    let first = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        first.contains("\x1b[48;"),
+        "live source backgrounds: {first:?}"
+    );
+    assert!(!first.contains("restored_after_widening"));
+    let before_resize = writer.0.lock().unwrap().len();
+    *geometry.lock().unwrap() = (80, 30);
+    renderer.refresh_geometry();
+    paint_generation(
+        &renderer.state,
+        &renderer.output,
+        &renderer.abandoned_through,
+        super::COMPLETED_GENERATION,
+    );
+    let later = String::from_utf8(writer.0.lock().unwrap()[before_resize..].to_vec()).unwrap();
+    assert!(
+        later.contains("restored_after_widening"),
+        "reproject original safe model at new width: {later:?}"
+    );
+    assert!(
+        renderer
+            .output
+            .lock()
+            .unwrap()
+            .painted_lines
+            .iter()
+            .all(|line| !line.contains('\x1b')),
+        "row accounting retains plain cells"
+    );
+    renderer.erase();
+    assert!(!renderer.is_active());
+    let erased = writer.0.lock().unwrap().len();
+    renderer.erase();
+    assert_eq!(
+        erased,
+        writer.0.lock().unwrap().len(),
+        "completed cleanup rewinds once"
+    );
+    renderer.render_completed("replacement", 80, 4);
+    assert!(renderer
+        .snapshot_lines()
+        .iter()
+        .any(|line| line.contains("replacement")));
+    renderer.discard();
+    let discarded = writer.0.lock().unwrap().len();
+    renderer.erase();
+    assert_eq!(
+        discarded,
+        writer.0.lock().unwrap().len(),
+        "discard cannot rewind from a later cursor"
+    );
+}
+
 #[derive(Clone, Default)]
 struct SharedWriter(Arc<Mutex<Vec<u8>>>);
 
