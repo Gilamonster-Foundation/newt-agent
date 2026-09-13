@@ -1459,8 +1459,10 @@ fn rich_help_uses_the_default_markdown_policy_and_honors_off() {
     assert!(markdown, "RichTUI defaults to rendered Markdown");
 
     let rendered = render_help_for_tui(None, true, false, markdown, 100);
+    let heading =
+        newt_core::tty::theme::active().ansi(newt_core::tty::theme::Role::MarkdownHeading);
     assert!(
-        rendered.starts_with("▸  \x1b[1m\x1b[38;2;220;60;20mAvailable"),
+        rendered.starts_with(&format!("▸  {heading}Available")),
         "the narrator prefix must stay outside the Markdown parser: {rendered:?}"
     );
     assert!(!rendered.contains("## Available commands"));
