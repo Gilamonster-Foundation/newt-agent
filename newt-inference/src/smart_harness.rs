@@ -372,8 +372,15 @@ mod tests {
     async fn auxiliary_transport_timeout_is_independent_and_fail_closed() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
+            // No `.expect(1)`: the property under test is that the auxiliary's own
+            // adjudication deadline (10ms) fails the call *before* the 1s slow
+            // response. On a contended runner the loopback request may not even
+            // be received by the mock within that window, and wiremock verifies
+            // its expectations on drop — so pinning the mock to exactly one hit
+            // makes the flaky transport timing an assertion. The real ground
+            // truth is the fail-closed result below, not that the request reached
+            // the server.
             .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(1)))
-            .expect(1)
             .mount(&server)
             .await;
         let mut config = external(&server.uri());
