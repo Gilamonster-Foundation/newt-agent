@@ -22,7 +22,8 @@ fn sandbox() -> Sandbox {
     let root = tempfile::tempdir().unwrap();
     let config_dir = root.path().join("cfg");
     let home = root.path().join("home");
-    let cwd = root.path().join("ws");
+    // Project-config discovery stops at HOME; keep that boundary above cwd.
+    let cwd = home.join("ws");
     for dir in [&config_dir, &home, &cwd] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -38,6 +39,7 @@ fn newt(sb: &Sandbox) -> Command {
     let mut cmd = Command::cargo_bin("newt").unwrap();
     cmd.env("NEWT_CONFIG_DIR", &sb.config_dir)
         .env("HOME", &sb.home)
+        .env("USERPROFILE", &sb.home)
         .env_remove("NEWT_CONFIG")
         .env("OLLAMA_HOST", "http://127.0.0.1:1")
         .current_dir(&sb.cwd);
@@ -395,6 +397,10 @@ fn probe_refuses_non_loopback_plain_http_without_consent() {
 #[test]
 fn probe_of_an_unreachable_loopback_url_fails_with_the_dial_error() {
     let sb = sandbox();
+    // A developer config above the sandbox home must not be discovered.
+    let outside = sb._root.path().join(".newt");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("config.toml"), "not valid TOML [").unwrap();
     // Loopback http needs no consent flag; the dial itself just fails fast.
     newt(&sb)
         .args(["mcp", "probe", "http://127.0.0.1:1/mcp", "--yes"])
