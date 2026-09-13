@@ -96,14 +96,38 @@ fn every_spill_row_reapplies_the_theme_dim_color() {
     let mut out = Vec::new();
     ToolDisplay::new(&mut out, true, 80, 3, false).result("one\ntwo\nthree\nfour\nfive");
     let rendered = String::from_utf8(out).unwrap();
-    let expected = format!(
-        "{}",
-        SetForegroundColor(crate::tty::theme::active().color(crate::tty::theme::Role::Dim))
-    );
+    let expected = crate::tty::theme::active().ansi(crate::tty::theme::Role::Spill);
     for row in rendered
         .lines()
         .filter(|line| line.contains('▒') || line.contains('▓') || line.contains('▲'))
     {
         assert!(row.contains(&expected), "row lost dim style: {row:?}");
     }
+}
+
+#[test]
+fn wrapped_spill_rows_keep_their_gutter_and_content() {
+    let body = "ordered plan and arguments which must wrap within the spill boundary";
+    let rows = super::bounded_spill_rows(&format!("▒ {body}"), 24);
+    assert!(rows.len() > 1);
+    for row in &rows {
+        assert!(crate::tty::width::str_width(row) <= 24, "{row:?}");
+    }
+    assert!(rows[1..].iter().all(|r| r.starts_with("  ")));
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.chars().skip(2).collect::<String>())
+            .collect::<String>(),
+        body
+    );
+}
+
+#[test]
+fn colored_tool_output_cannot_break_spill_wrapping_or_style() {
+    let plain = "▒ a long line that must wrap neatly";
+    let colored = "▒ \x1b[38;2;10;20;30ma long line\x1b[0m that must wrap neatly";
+    assert_eq!(
+        super::bounded_spill_rows(colored, 14),
+        super::bounded_spill_rows(plain, 14)
+    );
 }

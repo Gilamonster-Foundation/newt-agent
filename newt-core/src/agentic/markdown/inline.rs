@@ -22,9 +22,10 @@ pub(super) struct Style {
     pub italic: bool,
     pub underline: bool,
     pub strike: bool,
-    /// Inline code / code span — rendered dim, overriding `color`.
+    /// Inline code / file path — uses its own theme role.
     pub code: bool,
     pub color: Option<CtColor>,
+    pub role: Option<crate::tty::theme::Role>,
 }
 
 /// One source `char` carrying its absolute style.
@@ -34,41 +35,59 @@ pub(super) struct Cell {
     pub style: Style,
 }
 
-/// SGR foreground escape for a crossterm color. Only the variants the renderer
-/// actually uses are encoded (the newt RGB hues); anything else is a no-op so
-/// callers never have to branch.
-pub(super) fn sgr_fg(c: CtColor) -> String {
-    match c {
-        CtColor::Rgb { r, g, b } => format!("\x1b[38;2;{r};{g};{b}m"),
-        _ => String::new(),
-    }
-}
-
 /// The SGR "open" sequence for a style (empty for the default style, so plain
 /// text carries no escapes at all — golden-friendly and minimal).
 pub(super) fn open(style: Style) -> String {
-    let mut s = String::new();
-    if style.bold {
-        s.push_str("\x1b[1m");
-    }
-    if style.italic {
-        s.push_str("\x1b[3m");
-    }
-    if style.underline {
-        s.push_str("\x1b[4m");
-    }
-    if style.strike {
-        s.push_str("\x1b[9m");
-    }
-    let color = if style.code {
-        Some(super::emitter::FADE)
+    open_with_theme(style, &crate::tty::theme::active())
+}
+
+fn open_with_theme(style: Style, theme: &crate::tty::theme::Theme) -> String {
+    use crate::tty::theme::Role;
+    use crossterm::style::{Attribute, ContentStyle};
+    let role = if style.code {
+        Some(Role::InlineCode)
     } else {
-        style.color
+        style.role
     };
-    if let Some(c) = color {
-        s.push_str(&sgr_fg(c));
+    let mut resolved = role.map_or_else(ContentStyle::default, |r| theme.style(r));
+    if style.bold
+        && theme
+            .style(Role::MarkdownStrong)
+            .attributes
+            .has(Attribute::Bold)
+    {
+        resolved.attributes.set(Attribute::Bold);
     }
-    s
+    if style.italic
+        && theme
+            .style(Role::MarkdownItalic)
+            .attributes
+            .has(Attribute::Italic)
+    {
+        resolved.attributes.set(Attribute::Italic);
+    }
+    if style.underline
+        && theme
+            .style(Role::MarkdownLink)
+            .attributes
+            .has(Attribute::Underlined)
+    {
+        resolved.attributes.set(Attribute::Underlined);
+    }
+    if style.strike
+        && theme
+            .style(Role::MarkdownStrike)
+            .attributes
+            .has(Attribute::CrossedOut)
+    {
+        resolved.attributes.set(Attribute::CrossedOut);
+    }
+    if !style.code {
+        if let Some(c) = style.color {
+            resolved.foreground_color = Some(c);
+        }
+    }
+    crate::tty::theme::ansi_style(resolved)
 }
 
 /// Render one physical line of cells to an ANSI string. Consecutive cells of
@@ -127,7 +146,7 @@ pub(super) fn wrap_cells(cells: &[Cell], budget: usize) -> Vec<Vec<Cell>> {
     if words.is_empty() {
         return vec![Vec::new()];
     }
-    let space = Cell {
+    let mut space = Cell {
         ch: ' ',
         style: Style::default(),
     };
@@ -135,6 +154,7 @@ pub(super) fn wrap_cells(cells: &[Cell], budget: usize) -> Vec<Vec<Cell>> {
     let mut cur: Vec<Cell> = Vec::new();
     let mut cur_w = 0usize;
     for w in words {
+        space.style = w.first().map(|c| c.style).unwrap_or_default();
         let ww: usize = w.iter().map(|c| ch_width(c.ch)).sum();
         if cur.is_empty() {
             cur = w;
@@ -156,4 +176,45 @@ pub(super) fn wrap_cells(cells: &[Cell], budget: usize) -> Vec<Vec<Cell>> {
         lines.push(Vec::new());
     }
     lines
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+    use crate::tty::theme::{Role, Theme};
+    use crossterm::style::Attribute;
+
+    #[test]
+    fn heading_and_code_obey_explicit_bold_off_and_custom_color() {
+        let mut theme = Theme::builtin();
+        for role in [
+            Role::MarkdownHeading,
+            Role::InlineCode,
+            Role::MarkdownStrong,
+            Role::MarkdownLink,
+            Role::MarkdownStrike,
+        ] {
+            let mut style = theme.style(role);
+            style.attributes.unset(Attribute::Bold);
+            style.attributes.set(Attribute::Italic);
+            style.foreground_color = Some(CtColor::Rgb {
+                r: 12,
+                g: 34,
+                b: 56,
+            });
+            theme.set_style(role, style);
+            let open = open_with_theme(
+                Style {
+                    role: Some(role),
+                    code: role == Role::InlineCode,
+                    bold: role == Role::MarkdownStrong,
+                    ..Style::default()
+                },
+                &theme,
+            );
+            assert!(!open.contains("\x1b[1m"));
+            assert!(open.contains("\x1b[3m"));
+            assert!(open.contains("\x1b[38;2;12;34;56m"));
+        }
+    }
 }

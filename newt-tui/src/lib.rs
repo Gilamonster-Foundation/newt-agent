@@ -199,6 +199,8 @@ mod panel;
 // stays for every surface that has no region to draw in.
 #[cfg(feature = "rich-tui")]
 mod settings_panel;
+#[cfg(feature = "rich-tui")]
+mod theme_panel;
 // The backend chooser/editor panel (#1667) — same grammar, same gating; its
 // persistence rides the setup wizard's crash-safe lock + plan machinery.
 #[cfg(feature = "rich-tui")]

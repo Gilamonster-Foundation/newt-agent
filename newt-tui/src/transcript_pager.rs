@@ -525,7 +525,7 @@ mod terminal {
                     .map(|line| {
                         Line::from(Span::styled(
                             line.clone(),
-                            Style::default().fg(crate::theme::color(crate::theme::Role::Dim)),
+                            crate::theme::style(crate::theme::Role::Dim),
                         ))
                     })
                     .collect::<Vec<_>>();

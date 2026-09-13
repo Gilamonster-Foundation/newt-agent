@@ -295,7 +295,8 @@ async fn artifact_read_central_display_never_echoes_recovered_body() {
     let model: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(model["artifact"]["body"], secret);
     assert_eq!(rendered.matches("⚙  artifact_read:").count(), 1);
-    assert!(rendered.contains(&format!(
+    let visible = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(visible.contains(&format!(
         "returned {} of {} body characters",
         secret.chars().count(),
         secret.chars().count()

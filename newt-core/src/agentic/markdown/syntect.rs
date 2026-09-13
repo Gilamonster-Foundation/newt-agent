@@ -6,14 +6,14 @@
 //! with it, `syntect` colors each line by language. Kept behind a feature
 //! because syntect's syntax + theme assets are heavy.
 
-use super::emitter::FADE;
-use super::inline::{sgr_fg, RESET};
+use super::emitter::fade;
+use super::inline::RESET;
 
 /// Plain dim rendering — one `FADE`-colored line per source line.
 #[cfg(not(feature = "markdown-syntect"))]
 pub(super) fn highlight(_lang: &str, body: &str) -> Vec<String> {
     body.split('\n')
-        .map(|l| format!("{}{l}{RESET}", sgr_fg(FADE)))
+        .map(|l| format!("{}{l}{RESET}", fade()))
         .collect()
 }
 
@@ -53,7 +53,7 @@ pub(super) fn highlight(lang: &str, body: &str) -> Vec<String> {
                     let escaped = as_24_bit_terminal_escaped(&ranges, false);
                     format!("{}{RESET}", escaped.trim_end_matches('\n'))
                 }
-                Err(_) => format!("{}{line}{RESET}", sgr_fg(FADE)),
+                Err(_) => format!("{}{line}{RESET}", fade()),
             }
         })
         .collect()

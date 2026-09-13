@@ -26,7 +26,7 @@
 //! render fn the rich surface draws through its existing inline viewport.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 /// The palette never grows taller than this many rows (it scrolls instead).
@@ -433,7 +433,7 @@ pub(crate) fn palette_lines(state: &PaletteState) -> Vec<Line<'static>> {
     // literal value of `ACTIVE_INPUT_CT`, written out a second time. The same
     // duplication was fixed in `header_line` (#2019) and reappeared here,
     // because nothing NAMED the colour.
-    let accent = crate::theme::color(crate::theme::Role::Accent);
+    let accent = crate::theme::style(crate::theme::Role::Accent);
     let end = (state.scroll + state.viewport).min(state.matched.len());
     state.matched[state.scroll..end]
         .iter()
@@ -443,24 +443,22 @@ pub(crate) fn palette_lines(state: &PaletteState) -> Vec<Line<'static>> {
             let hl = state.scroll + offset == state.highlight;
             let (marker, cmd_style, desc_style) = if hl {
                 (
-                    Span::styled("❯ ", Style::default().fg(accent)),
-                    Style::default()
-                        .fg(crate::theme::color(crate::theme::Role::Emphasis))
-                        .add_modifier(Modifier::BOLD),
-                    Style::default().fg(crate::theme::color(crate::theme::Role::Muted)),
+                    Span::styled("❯ ", accent),
+                    crate::theme::style(crate::theme::Role::Emphasis),
+                    crate::theme::style(crate::theme::Role::Muted),
                 )
             } else {
                 (
                     Span::raw("  "),
                     Style::default(),
-                    Style::default().fg(crate::theme::color(crate::theme::Role::Dim)),
+                    crate::theme::style(crate::theme::Role::Dim),
                 )
             };
             let mut spans = vec![marker, Span::styled(e.cmd.clone(), cmd_style)];
             if !e.args.is_empty() {
                 spans.push(Span::styled(
                     format!(" {}", e.args),
-                    Style::default().fg(crate::theme::color(crate::theme::Role::Dim)),
+                    crate::theme::style(crate::theme::Role::Dim),
                 ));
             }
             let pad = col.saturating_sub(head_w(e)) + 2;

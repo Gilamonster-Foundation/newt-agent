@@ -28,12 +28,14 @@
 //! is one edge, not one widget.
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::theme::{color, Role};
+#[cfg(test)]
+use crate::theme::color;
+use crate::theme::Role;
 
 /// What a modal says about itself, above and below its body.
 #[derive(Default)]
@@ -59,14 +61,12 @@ pub(crate) fn frame(f: &mut Frame, area: Rect, chrome: &Chrome<'_>) -> Rect {
     // 3-row terminal showed them one line of content.
     let mut spans = vec![Span::styled(
         format!(" {} ", chrome.title),
-        Style::default()
-            .fg(color(Role::ModalTitle))
-            .add_modifier(Modifier::BOLD),
+        crate::theme::style(Role::ModalTitle),
     )];
     if let Some(subtitle) = &chrome.subtitle {
         spans.push(Span::styled(
             format!("{subtitle} "),
-            Style::default().fg(color(Role::Muted)),
+            crate::theme::style(Role::Muted),
         ));
     }
 
@@ -75,7 +75,7 @@ pub(crate) fn frame(f: &mut Frame, area: Rect, chrome: &Chrome<'_>) -> Rect {
         // Rounded, because a modal is the one surface allowed to look like a
         // separate thing sitting on top of the transcript.
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(color(Role::ModalBorder)))
+        .border_style(crate::theme::style(Role::ModalBorder))
         .title(Line::from(spans));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -87,7 +87,7 @@ pub(crate) fn frame(f: &mut Frame, area: Rect, chrome: &Chrome<'_>) -> Rect {
     // hint exists.
     let [body, legend] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
     f.render_widget(
-        Paragraph::new(Span::styled(hint, Style::default().fg(color(Role::Dim)))),
+        Paragraph::new(Span::styled(hint, crate::theme::style(Role::Dim))),
         legend,
     );
     body
