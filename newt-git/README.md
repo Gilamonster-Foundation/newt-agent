@@ -31,6 +31,17 @@ object databases, alternate stores, index overrides, and config cascades do not
 yet enforce bounded grants. Git write permission cannot override this limit,
 and the tool will not request a write grant to bypass it.
 
+The structured tool accepts an optional `cwd` relative to the session workspace,
+for example `{"op":"branch-list","cwd":".worktrees/task","scope":"local"}`.
+It selects an existing repository/worktree root for that call only; other tools
+and later calls retain their own targets. Absolute paths, parent traversal,
+escaping symlinks and directories that would discover a parent repository are
+refused. Selected worktrees and shared Git metadata retain their read/write
+grant checks. Admitted commits use the same attribution finalizer and success
+accounting as the session root. This does not enable commits under bounded
+reads; that remaining boundary is tracked in
+[#2288](https://github.com/Gilamonster-Foundation/newt-agent/issues/2288).
+
 Branch listing reads the files-backed ref store without opening an object
 database or loading the global Git configuration cascade. Linked worktrees
 need explicit read grants for their external Git metadata. Reftables, nested

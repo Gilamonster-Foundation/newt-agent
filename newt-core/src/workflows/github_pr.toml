@@ -29,8 +29,8 @@ steer = "Call update_plan with concrete implementation, verification, commit, pu
 
 [[steps]]
 id = "create_branch"
-title = "Create or switch to a feature branch"
-steer = "Use git status/branch ground truth before creating or switching branches"
+title = "Use a task worktree and feature branch"
+steer = "Inspect git status, branch and git worktree list --porcelain. For an independent change, prefer a dedicated worktree; reuse an existing matching task worktree. Choose the base and branch from repository guidance. Prefer a task-owned destination inside the granted workspace, such as .worktrees/<task>, after verifying it is ignored. Use confined run_command for git worktree add -b <branch> <destination> <base>; an external destination and shared Git metadata require explicit authority, never a broader parent grant. Verify the new worktree's branch and clean status. Address all edits and tests to that root. A command's cwd does not retarget other file or structured git tools: verify their target-workspace support before proceeding. Preserve the source checkout's files, index and branch; do not reset, stash, switch it or remove another task's worktree. If a capability is unavailable, report the exact missing support rather than claiming all tools are blocked."
 
 [[steps]]
 id = "implement_step"
