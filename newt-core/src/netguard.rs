@@ -93,9 +93,23 @@ mod linux {
     /// preserved. Call child-side just before exec.
     pub fn close_inherited_fds() {
         // `close_range(3, ~0, 0)` closes the whole upper range in one syscall
-        // (Linux 5.9+). SAFETY: no memory effects; closing an already-closed fd is
-        // harmless.
-        let rc = unsafe { libc::close_range(3, libc::c_uint::MAX, 0) };
+        // (Linux 5.9+). Raw syscall rather than the libc wrapper: the libc crate
+        // only exposes `close_range()` for glibc, and the musl (Alpine) build
+        // needs this too — see PR #2297.
+        //
+        // SAFETY — why this block is `unsafe`, and why it is sound anyway:
+        // `unsafe` is required here for one reason only: there is no safe path
+        // from Rust to this operation. `std` has no API to enumerate fds or
+        // close one by number, and `rustix` (a direct dependency) ships no
+        // `close_inherited_fds` / `close_range` wrapper, so the only way to reach
+        // the syscall is libc FFI, which `libc` marks `unsafe` by contract. That
+        // `unsafe` is therefore not concealing any invariant — it is the
+        // unavoidable boundary between safe Rust and the syscall interface. The
+        // operations it wraps have **no memory effects**: `close_range`/`close`
+        // only mutate the kernel's fd tables, never process memory, and closing
+        // an already-closed or never-open fd returns `EBADF`, which is ignored.
+        // The call is sound for any set of open fds.
+        let rc = unsafe { libc::syscall(libc::SYS_close_range, 3, libc::c_uint::MAX, 0) };
         if rc == 0 {
             return;
         }
@@ -108,7 +122,10 @@ mod linux {
                 .filter(|&fd| fd >= 3)
                 .collect();
             for fd in fds {
-                // SAFETY: closing a possibly-stale fd returns EBADF, ignored.
+                // SAFETY: `std` offers no safe way to close an fd by number,
+                // so this is libc FFI, marked `unsafe` by contract. The call has
+                // no memory effects — a stale fd just returns EBADF, ignored — so
+                // it is sound even when the fd here is already closed.
                 unsafe { libc::close(fd) };
             }
         }
