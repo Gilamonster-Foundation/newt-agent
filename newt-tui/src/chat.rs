@@ -5978,65 +5978,62 @@ fn session_body(
                     // piped, or on the lean build, both commands fall through to
                     // dispatch_slash unchanged: the text list, the named switch,
                     // and the kind toggle keep working exactly as before.
-                    // #2044: a bare `/models` on a rich TTY opens the PICKER —
+                    // Bare `/model` and `/models` on a rich TTY open the PICKER —
                     // arrow to a model, Enter to switch, Esc to leave. The
                     // list was already printed; what was missing was any way
                     // to act on it, so the answer to "which model?" was a
                     // second command and an exact spelling.
                     //
                     // With arguments, piped, or on the lean build this falls
-                    // through to `dispatch_slash` unchanged: `/models <name>`
+                    // through to `dispatch_slash` unchanged: `/model <name>`
                     // switches, `/models capabilities` prints the matrix, and
                     // the plain list still serves the headless tier that
                     // `plain_scroller_tui.md` protects.
                     #[cfg(feature = "rich-tui")]
-                    if matches!(panel_tokens.as_slice(), ["models"])
+                    if models_panel::requested(panel_tokens.as_slice())
                         && std::io::IsTerminal::is_terminal(&std::io::stdout())
                     {
                         let cfg_now = crate::resolve_runtime_or_default();
-                        if let Ok(choice) = crate::resolve_backend_choice(&cfg_now) {
-                            let active = choice.active_model.clone().unwrap_or_default();
-                            let served = crate::fetch_models_for(
-                                &choice.url,
-                                choice.kind,
-                                choice.api_key.as_deref(),
-                            );
-                            match served {
-                                // An unreachable backend keeps the text path's
-                                // error rather than opening an empty picker —
-                                // a chooser with nothing in it explains less
-                                // than the refusal does.
-                                Err(e) => print_newt(&format!("error: {e}"), color, verbose),
-                                Ok(names) => {
-                                    let models: Vec<crate::config_panel::ModelChoice> = names
-                                        .into_iter()
-                                        .map(|name| crate::config_panel::ModelChoice {
-                                            name,
-                                            tag: String::new(),
-                                        })
-                                        .collect();
-                                    let panel_window =
-                                        surface.open_panel(models_panel::panel_height());
-                                    match models_panel::choose(models, active, panel_window) {
-                                        Err(e) => print_newt(
-                                            &format!("models panel error: {e}"),
-                                            color,
-                                            verbose,
-                                        ),
-                                        Ok(models_panel::Outcome::Cancelled) => {}
-                                        Ok(models_panel::Outcome::Chose(name)) => {
-                                            // Through the SAME function the
-                                            // `/models <name>` text form calls,
-                                            // so the picker cannot become a
-                                            // second way to switch models that
-                                            // drifts from the first — it keeps
-                                            // the served-list gate, the receipt
-                                            // and the refusals for free.
-                                            crate::commands::model::apply_model_choice(
-                                                &name, color, verbose,
-                                            );
-                                        }
-                                    }
+                        if let Ok(panel_choice) = crate::resolve_backend_choice(&cfg_now) {
+                            let panel_window = surface.open_panel(models_panel::panel_height());
+                            match models_panel::choose(&panel_choice, panel_window) {
+                                Err(e) => {
+                                    print_newt(&format!("models panel error: {e}"), color, verbose);
+                                }
+                                Ok(None) => {}
+                                Ok(Some(name)) => {
+                                    // Through the SAME function the
+                                    // `/model <name>` text form calls,
+                                    // so the picker cannot become a
+                                    // second way to switch models that
+                                    // drifts from the first — it keeps
+                                    // the served-list gate, the receipt
+                                    // and the refusals for free.
+                                    crate::commands::model::apply_model_choice(
+                                        &name, color, verbose,
+                                    );
+                                    // This panel returns before the normal
+                                    // post-slash refresh. Repoint the live
+                                    // session as well as the saved choice.
+                                    cfg = crate::resolve_runtime_or_default();
+                                    let _ = refresh_backend(
+                                        &cfg,
+                                        &mut choice,
+                                        &mut inf_url,
+                                        &mut inf_model,
+                                        &mut inf_kind,
+                                        &mut inf_key,
+                                        &mut inf_context_window,
+                                        color,
+                                        verbose,
+                                    );
+                                    repick_active_profile(
+                                        &cfg,
+                                        &choice,
+                                        &mut active_profile,
+                                        color,
+                                        verbose,
+                                    );
                                 }
                             }
                         }

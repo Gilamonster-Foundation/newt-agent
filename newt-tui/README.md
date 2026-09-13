@@ -11,10 +11,16 @@ write that file plus one `backends/*.toml` drop-in per endpoint.
 
 ## Settings and communication style
 
-The rich TUI offers `/settings`, `/backends`, `/models`, and `/psyche` controls.
-Their apply, cancel, and save behavior is documented in the
-[settings walkthroughs](../demos/README.md); a session change is not automatically
-a saved configuration change.
+The rich TUI offers `/settings`, `/backends`, `/model` (also `/models`), and `/psyche` controls.
+The model picker supports arrow-key selection. Only resident models show a
+`[loaded]` badge, to the right of the name. The active session model uses the
+`active-model` theme color; the badge uses `loaded-model` (for example,
+`NEWT_THEME='active-model=cyan,loaded-model=magenta'`). On llama.cpp routers,
+`l` loads, `u` confirms unloading, `x` confirms unloading other models and loading
+the highlighted one, and `r` refreshes. Enter selects the model for chat.
+In `/backends`, Down opens the selected backend's editor; Left/Right on its model
+field cycles through models discovered from that endpoint. Enter saves the backend
+configuration. Use `/model` to change the model for the active conversation.
 
 The rich panels share NewtUI's key and close vocabulary. Newt retains event
 decoding, terminal ownership, settings validation and writes. The

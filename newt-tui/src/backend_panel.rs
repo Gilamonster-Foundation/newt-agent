@@ -57,7 +57,7 @@ use std::io;
 use newt_core::BackendKind;
 
 use crate::config_panel::{
-    clamp_step, command_line, hint_line, render_panel, status_line, Dial, RowView,
+    clamp_step, command_line, hint_line, render_panel, status_line, Dial, ModelChoice, RowView,
 };
 
 /// What applying a chooser pick means — a NAMED `[[backends]]` entry (the
@@ -337,6 +337,7 @@ struct FormState {
     /// The prefill, kept verbatim so save time can tell which fields the
     /// operator actually changed (review §1/§6). Default for an add.
     original: FormValues,
+    models: Option<Result<Vec<ModelChoice>, String>>,
 }
 
 /// The five overlayable form values, as prefilled. `kind` is kept as the DIAL
@@ -363,6 +364,7 @@ impl FormState {
             key_env: String::new(),
             key_file: String::new(),
             original: FormValues::default(),
+            models: None,
         }
     }
 
@@ -381,6 +383,7 @@ impl FormState {
             model: opt.model.clone().unwrap_or_default(),
             key_env: opt.api_key_env.clone().unwrap_or_default(),
             key_file: opt.api_key_file.clone().unwrap_or_default(),
+            models: None,
             original: FormValues {
                 kind_idx,
                 url: opt.endpoint.clone(),
@@ -656,6 +659,29 @@ impl PanelState {
         if let Mode::Form(form) = &mut self.mode {
             if FIELDS[form.sel] == Field::Kind {
                 form.kind_idx = clamp_step(form.kind_idx, dir, KIND_LADDER.len());
+                form.models = None;
+            } else if FIELDS[form.sel] == Field::Model {
+                if let Some(Ok(models)) = &form.models {
+                    // Position zero is the server's automatic/default model.
+                    let at = if form.model.is_empty() {
+                        Some(0)
+                    } else {
+                        models
+                            .iter()
+                            .position(|m| m.name == form.model)
+                            .map(|i| i + 1)
+                    };
+                    let count = models.len() + 1;
+                    let next = at.map_or_else(
+                        || if dir < 0 { count - 1 } else { 0 },
+                        |i| (i as i32 + dir).rem_euclid(count as i32) as usize,
+                    );
+                    form.model = next
+                        .checked_sub(1)
+                        .map_or_else(String::new, |i| models[i].name.clone());
+                } else if let Some(Err(error)) = &form.models {
+                    self.status = Some(format!("Cannot list models: {error}; r retries"));
+                }
             }
         }
     }
@@ -671,6 +697,12 @@ impl PanelState {
             );
             return;
         }
+        if matches!(
+            FIELDS[form.sel],
+            Field::Url | Field::KeyEnv | Field::KeyFile
+        ) {
+            form.models = None;
+        }
         if let Some(field) = form.field_mut() {
             if !c.is_control() {
                 field.push(c);
@@ -681,6 +713,12 @@ impl PanelState {
 
     fn form_backspace(&mut self) {
         if let Mode::Form(form) = &mut self.mode {
+            if matches!(
+                FIELDS[form.sel],
+                Field::Url | Field::KeyEnv | Field::KeyFile
+            ) {
+                form.models = None;
+            }
             if !(FIELDS[form.sel] == Field::Name && form.editing.is_some()) {
                 if let Some(field) = form.field_mut() {
                     field.pop();
@@ -1013,7 +1051,14 @@ fn form_rows(form: &FormState) -> Vec<RowView> {
                 ),
                 Field::Kind => ("kind", kind_label(form.kind()).to_string()),
                 Field::Url => ("url", cursor(sel, &form.url)),
-                Field::Model => ("model", cursor(sel, &form.model)),
+                Field::Model => (
+                    "model",
+                    if form.model.is_empty() {
+                        "(server default)".into()
+                    } else {
+                        form.model.clone()
+                    },
+                ),
                 Field::KeyEnv => ("key env", cursor(sel, &form.key_env)),
                 Field::KeyFile => ("key file", cursor(sel, &form.key_file)),
             };
@@ -1127,9 +1172,9 @@ fn draw(f: &mut ratatui::Frame, state: &PanelState) {
     } else if let Some(status) = &state.status {
         status_line(status)
     } else if matches!(state.mode, Mode::Form(_)) {
-        hint_line("↑↓ field · type to edit · ←→ kind · Enter save · Esc back")
+        hint_line("↑↓ field · ←→ kind/model · r refresh models · Enter save · Esc back")
     } else {
-        hint_line("←→ choose · Enter apply · e edit · a add · d remove · Esc cancel")
+        hint_line("←→ choose · ↓ edit · Enter apply · e edit · a add · d remove · Esc cancel")
     };
     render_panel(f, title, &state.view_rows(), bottom, 9, 34);
 }
@@ -1208,6 +1253,7 @@ pub(crate) fn run(
     persist: impl FnMut(&BackendEdit) -> BackendSaveResult,
     remove: impl FnMut(&str) -> Result<String, String>,
     window: Option<crate::session_worker::PanelWindow>,
+    mut fetch_models: impl FnMut(&BackendEdit) -> Result<Vec<ModelChoice>, String>,
 ) -> Result<PanelClose, PanelRunError> {
     if seed.options.is_empty() {
         return Ok(PanelClose::cancelled());
@@ -1220,13 +1266,33 @@ pub(crate) fn run(
     // Under the cockpit the presenter lends this panel rows on the REAL
     // terminal; everywhere else the driver takes the bottom rows of stdout as
     // it always has. One `Option`, decided in one place.
-    let driven = crate::panel::drive(&mut screen, PANEL_HEIGHT, window.as_ref());
-    match driven {
-        Ok(applied) => finish(Ok(()), applied, &screen.state),
-        // Nothing was applied — the loop never reached its exit — but the
-        // add/edit/remove notes are real and already on disk, so they are
-        // still reported.
-        Err(error) => finish(Err(error), false, &screen.state),
+    loop {
+        let driven = crate::panel::drive(&mut screen, PANEL_HEIGHT, window.as_ref());
+        if matches!(driven, Ok(false)) {
+            if let Mode::Form(form) = &mut screen.state.mode {
+                if FIELDS[form.sel] == Field::Model && form.models.is_none() {
+                    eprintln!("Fetching models from {}…", form.url);
+                    let result = validate_form(form, &screen.state.options)
+                        .and_then(|edit| fetch_models(&edit));
+                    screen.state.status = Some(match &result {
+                        Ok(models) if models.is_empty() => {
+                            "Server returned no models; saved model retained".into()
+                        }
+                        Ok(models) => format!(
+                            "{} models · ←→ select · /model manages loaded models",
+                            models.len()
+                        ),
+                        Err(error) => format!("Cannot list models: {error}; saved model retained"),
+                    });
+                    form.models = Some(result);
+                    continue;
+                }
+            }
+        }
+        return match driven {
+            Ok(applied) => finish(Ok(()), applied, &screen.state),
+            Err(error) => finish(Err(error), false, &screen.state),
+        };
     }
 }
 
@@ -1288,17 +1354,32 @@ where
         }
         if self.state.in_form() {
             match key {
+                Key::Char('r') if matches!(&self.state.mode, Mode::Form(f) if FIELDS[f.sel] == Field::Model) => {
+                    if let Mode::Form(form) = &mut self.state.mode {
+                        form.models = None;
+                    }
+                }
                 Key::Up => self.state.form_nav(-1),
                 Key::Down => self.state.form_nav(1),
                 Key::Left => self.state.form_cycle(-1),
                 Key::Right => self.state.form_cycle(1),
-                Key::Backspace => self.state.form_backspace(),
+                Key::Backspace if !matches!(&self.state.mode, Mode::Form(f) if FIELDS[f.sel] == Field::Model) =>
+                {
+                    self.state.form_backspace();
+                }
                 Key::Enter => {
                     self.state.submit_form(&mut self.persist);
                 }
                 Key::Esc => self.state.cancel_form(),
-                Key::Char(c) => self.state.form_input(c),
+                Key::Char(c) if !matches!(&self.state.mode, Mode::Form(f) if FIELDS[f.sel] == Field::Model) =>
+                {
+                    self.state.form_input(c);
+                }
                 _ => {}
+            }
+            if matches!(&self.state.mode, Mode::Form(f) if FIELDS[f.sel] == Field::Model && f.models.is_none())
+            {
+                return Flow::Close(false);
             }
             return Flow::Stay;
         }
@@ -1306,7 +1387,7 @@ where
             Key::Left => self.state.cycle(-1),
             Key::Right => self.state.cycle(1),
             // Plain by construction: Ctrl-E no longer opens the edit form.
-            Key::Char('e') => self.state.begin_edit(),
+            Key::Down | Key::Char('e') => self.state.begin_edit(),
             Key::Char('a') => self.state.begin_add(),
             Key::Char('d') => self.state.begin_remove(),
             Key::Char(':') => self.state.begin_command(""),

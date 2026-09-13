@@ -86,6 +86,10 @@ pub enum Role {
     SelectedLabel,
     /// A selected row's value.
     SelectedValue,
+    /// Model currently used by the session, independent of the keyboard cursor.
+    ActiveModel,
+    /// A model resident in server memory.
+    LoadedModel,
     /// Succeeded, allowed, present.
     Ok,
     /// A persona, a name, an identity.
@@ -128,6 +132,8 @@ pub struct Theme {
     gauge_critical: Color,
     selected_label: Color,
     selected_value: Color,
+    active_model: Color,
+    loaded_model: Color,
     ok: Color,
     identity: Color,
     modal_border: Color,
@@ -184,6 +190,8 @@ impl Theme {
             gauge_critical: Color::DarkRed,
             selected_label: Color::DarkCyan,
             selected_value: Color::DarkYellow,
+            active_model: Color::Cyan,
+            loaded_model: Color::DarkMagenta,
             ok: Color::DarkGreen,
             identity: Color::DarkMagenta,
             // A modal owns the keyboard, so it wears the colour that means so.
@@ -211,6 +219,8 @@ impl Theme {
             Role::GaugeCritical => self.gauge_critical,
             Role::SelectedLabel => self.selected_label,
             Role::SelectedValue => self.selected_value,
+            Role::ActiveModel => self.active_model,
+            Role::LoadedModel => self.loaded_model,
             Role::Ok => self.ok,
             Role::Identity => self.identity,
             Role::ModalBorder => self.modal_border,
@@ -244,6 +254,8 @@ impl Theme {
                 Role::GaugeCritical => self.gauge_critical = *color,
                 Role::SelectedLabel => self.selected_label = *color,
                 Role::SelectedValue => self.selected_value = *color,
+                Role::ActiveModel => self.active_model = *color,
+                Role::LoadedModel => self.loaded_model = *color,
                 Role::Ok => self.ok = *color,
                 Role::Identity => self.identity = *color,
                 Role::ModalBorder => self.modal_border = *color,
@@ -275,6 +287,8 @@ pub fn role_from_name(name: &str) -> Option<Role> {
         "gauge-critical" => Role::GaugeCritical,
         "selected-label" => Role::SelectedLabel,
         "selected-value" => Role::SelectedValue,
+        "active-model" => Role::ActiveModel,
+        "loaded-model" => Role::LoadedModel,
         "ok" => Role::Ok,
         "identity" => Role::Identity,
         "modal-border" => Role::ModalBorder,
@@ -300,6 +314,8 @@ pub const ALL_ROLES: &[Role] = &[
     Role::GaugeCritical,
     Role::SelectedLabel,
     Role::SelectedValue,
+    Role::ActiveModel,
+    Role::LoadedModel,
     Role::Ok,
     Role::Identity,
     Role::ModalBorder,
@@ -324,6 +340,8 @@ pub fn role_name(role: Role) -> &'static str {
         Role::GaugeCritical => "gauge-critical",
         Role::SelectedLabel => "selected-label",
         Role::SelectedValue => "selected-value",
+        Role::ActiveModel => "active-model",
+        Role::LoadedModel => "loaded-model",
         Role::Ok => "ok",
         Role::Identity => "identity",
         Role::ModalBorder => "modal-border",
@@ -553,7 +571,7 @@ mod tests {
             );
             assert_eq!(name, name.to_ascii_lowercase(), "names are kebab-case");
         }
-        assert_eq!(ALL_ROLES.len(), 19, "add the new role to ALL_ROLES too");
+        assert_eq!(ALL_ROLES.len(), 21, "add the new role to ALL_ROLES too");
         assert_eq!(role_from_name("nonsense"), None);
     }
 
