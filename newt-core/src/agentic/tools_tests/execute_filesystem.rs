@@ -339,9 +339,22 @@ async fn delete_file_symlink_under_workspace_escaping_is_denied() {
     )
     .await;
 
+    // step 13.2: a denied delete now also carries the observed-file-state
+    // receipt (unconditionally "no content change", since the object fence
+    // refused before anything on disk moved). Build the expected value the
+    // same way the production delete_file arm does, rather than pinning the
+    // receipt's internal formatting as a second, driftable literal.
+    let full = ws.path().join("link/victim.txt");
+    let read_caveats = caveats_rw(ws.path());
+    let before = crate::agentic::tools::file_capture::capture(&read_caveats.fs_read, &full);
+    let after = crate::agentic::tools::file_capture::capture(&read_caveats.fs_read, &full);
+    let receipt = crate::agentic::tools::file_capture::receipt("link/victim.txt", &before, &after);
     assert_eq!(
         out,
-        denied_fs_result("fs_write", "link/victim.txt"),
+        crate::agentic::tools::file_capture::failure(
+            denied_fs_result("fs_write", "link/victim.txt"),
+            &receipt,
+        ),
         "the symlink-escape delete must be denied: {out}"
     );
     assert!(

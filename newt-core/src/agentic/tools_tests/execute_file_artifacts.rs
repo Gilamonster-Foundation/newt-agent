@@ -244,9 +244,22 @@ async fn physical_symlink_escape_write_is_denied_object_bound() {
     )
     .await;
 
+    // step 13.2: a denied write now also carries the observed-file-state
+    // receipt (unconditionally "no content change", since the object fence
+    // refused before anything on disk moved). Build the expected value the
+    // same way the production write_file arm does, rather than pinning the
+    // receipt's internal formatting as a second, driftable literal.
+    let full = ws.path().join("link/target.txt");
+    let read_caveats = caveats_rw(ws.path());
+    let before = crate::agentic::tools::file_capture::capture(&read_caveats.fs_read, &full);
+    let after = crate::agentic::tools::file_capture::capture(&read_caveats.fs_read, &full);
+    let receipt = crate::agentic::tools::file_capture::receipt("link/target.txt", &before, &after);
     assert_eq!(
         out,
-        denied_fs_result("fs_write", "link/target.txt"),
+        crate::agentic::tools::file_capture::failure(
+            denied_fs_result("fs_write", "link/target.txt"),
+            &receipt,
+        ),
         "the symlink-escape write must be denied by the object fence: {out}"
     );
     assert_eq!(

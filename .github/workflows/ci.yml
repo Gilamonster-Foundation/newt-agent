@@ -5,7 +5,9 @@ name: CI
 # `just audit` + `just msrv`).
 # When editing those, update the push hook to match.
 # EXCEPTION: the `windows` job is CI-only — it cannot be mirrored locally (no
-# Windows dev box), so it is deliberately outside hook parity.
+# Windows dev box), so it is deliberately outside hook parity. Same for the
+# `musl` job: it needs the musl cross target + `musl-tools` installed, which
+# a dev box does not carry by default.
 # See docs/ROADMAP.md "Acceptance contract" for the gate definition.
 #
 # Patterned on scrybe's CI but simpler — no Tauri system deps (pure
@@ -339,6 +341,27 @@ jobs:
       # drift unseen: without them it is never resolved here at all.
       - name: cargo check (MSRV 1.88, all targets)
         run: cargo check --workspace --all-targets --features newt-data/kernel,newt-interaction/schema
+
+  musl:
+    name: musl build (x86_64-unknown-linux-musl)
+    # Pinned to the hosted image: the job needs `sudo apt-get`.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      # Regression guard for the Alpine/static build. The libc crate exposes
+      # some wrappers for glibc only (`close_range` broke newt-core once), and
+      # no glibc gate can see that. `ring`'s build script needs a musl C
+      # compiler, hence musl-tools; `cargo check` still runs build scripts, so
+      # it is enough to catch both classes.
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: cargo check (newt binary, musl)
+        run: cargo check -p newt-agent --target x86_64-unknown-linux-musl
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
 
   windows:
     name: Windows build + test
