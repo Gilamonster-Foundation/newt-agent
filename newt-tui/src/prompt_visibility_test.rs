@@ -361,41 +361,7 @@ fn a_permission_prompt_is_visible_and_survives_a_live_spinner() {
 /// reaching for it would gate a unix regression test on a feature it does not
 /// otherwise need. Kept deliberately small: it recognises the two escape
 /// shapes a terminal writer actually emits here.
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            // CSI: parameters and intermediates, then one final byte in @..~.
-            Some('[') => {
-                for c in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            // OSC: runs to BEL or ST (ESC \).
-            Some(']') => {
-                while let Some(c) = chars.next() {
-                    if c == '\u{7}' {
-                        break;
-                    }
-                    if c == '\u{1b}' && chars.peek() == Some(&'\\') {
-                        chars.next();
-                        break;
-                    }
-                }
-            }
-            // A two-byte escape; its second byte is already consumed.
-            _ => {}
-        }
-    }
-    out
-}
+use newt_core::tty::width::strip_ansi;
 
 #[cfg(test)]
 mod strip_ansi_tests {

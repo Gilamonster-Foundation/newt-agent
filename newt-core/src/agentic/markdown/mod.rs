@@ -63,8 +63,10 @@ mod tests {
     const UNDER: &str = "\x1b[4m";
     const STRIKE: &str = "\x1b[9m";
     const RESET: &str = "\x1b[0m";
-    const ORANGE: &str = "\x1b[38;2;220;60;20m";
-    const FADE: &str = "\x1b[38;2;90;90;90m";
+    const HEADING: &str = "\x1b[38;5;12m";
+    const BODY: &str = "\x1b[38;5;7m";
+    const CODE: &str = "\x1b[38;5;15m";
+    const FADE: &str = "\x1b[38;5;8m";
 
     /// **A1 dialect pins (#1825, epic #1803 bullet 3).** The canonical
     /// dialect's normalization rules, asserted rather than merely described
@@ -134,37 +136,40 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_passes_through_unstyled() {
-        assert_eq!(r("hello world"), "hello world");
+    fn plain_text_uses_agent_role() {
+        assert_eq!(r("hello world"), format!("{BODY}hello world{RESET}"));
     }
 
     #[test]
     fn inline_emphasis_variants() {
-        assert_eq!(r("**bold**"), format!("{BOLD}bold{RESET}"));
-        assert_eq!(r("*it*"), format!("{ITALIC}it{RESET}"));
-        assert_eq!(r("~~s~~"), format!("{STRIKE}s{RESET}"));
-        assert_eq!(r("`c`"), format!("{FADE}c{RESET}"));
+        assert_eq!(r("**bold**"), format!("{BOLD}{CODE}bold{RESET}"));
+        assert_eq!(r("*it*"), format!("{ITALIC}{BODY}it{RESET}"));
+        assert_eq!(r("~~s~~"), format!("{STRIKE}{BODY}s{RESET}"));
+        assert_eq!(r("`c`"), format!("{BOLD}{CODE}c{RESET}"));
     }
 
     #[test]
     fn emphasis_adjacent_to_text_has_no_spurious_space() {
         // The whole reason wrap operates on cells, not words.
-        assert_eq!(r("un**bold**ed"), format!("un{BOLD}bold{RESET}ed"));
+        assert_eq!(
+            r("un**bold**ed"),
+            format!("{BODY}un{RESET}{BOLD}{CODE}bold{RESET}{BODY}ed{RESET}")
+        );
     }
 
     #[test]
-    fn heading_is_bold_orange() {
-        assert_eq!(r("# Title"), format!("{BOLD}{ORANGE}Title{RESET}"));
+    fn heading_is_bold_light_blue() {
+        assert_eq!(r("# Title"), format!("{BOLD}{HEADING}Title{RESET}"));
     }
 
     #[test]
     fn paragraphs_are_separated_by_a_blank_line() {
-        assert_eq!(r("a\n\nb"), "a\n\nb");
+        assert_eq!(strip(&r("a\n\nb")), "a\n\nb");
     }
 
     #[test]
     fn greedy_word_wrap_breaks_at_spaces() {
-        assert_eq!(rw("alpha beta gamma", 11), "alpha beta\ngamma");
+        assert_eq!(strip(&rw("alpha beta gamma", 11)), "alpha beta\ngamma");
     }
 
     #[test]
@@ -172,33 +177,33 @@ mod tests {
         // 日本語 = 6 cols, 語 = 2 cols. At budget 8 they cannot share a line
         // (6+1+2 = 9). A char-count budget would see 3+1+1 = 5 and NOT wrap —
         // so this discriminates display-width awareness from char counting.
-        assert_eq!(rw("日本語 語", 8), "日本語\n語");
+        assert_eq!(strip(&rw("日本語 語", 8)), "日本語\n語");
     }
 
     #[test]
     fn bullet_list_tight() {
-        assert_eq!(r("- one\n- two"), "• one\n• two");
+        assert_eq!(strip(&r("- one\n- two")), "• one\n• two");
     }
 
     #[test]
     fn ordered_list_numbers() {
-        assert_eq!(r("1. a\n2. b"), "1. a\n2. b");
+        assert_eq!(strip(&r("1. a\n2. b")), "1. a\n2. b");
     }
 
     #[test]
     fn task_list_markers() {
-        assert_eq!(r("- [x] done\n- [ ] todo"), "• ✓ done\n• ☐ todo");
+        assert_eq!(strip(&r("- [x] done\n- [ ] todo")), "• ✓ done\n• ☐ todo");
     }
 
     #[test]
     fn nested_list_indents_under_parent() {
         // Two-space marker width → child marker sits at column 2.
-        assert_eq!(r("- a\n  - b"), "• a\n  • b");
+        assert_eq!(strip(&r("- a\n  - b")), "• a\n  • b");
     }
 
     #[test]
     fn blockquote_has_a_dim_bar() {
-        assert_eq!(r("> quote"), format!("{FADE}│ {RESET}quote"));
+        assert_eq!(r("> quote"), format!("{FADE}│ {RESET}{BODY}quote{RESET}"));
     }
 
     #[test]
@@ -241,7 +246,7 @@ mod tests {
         // unstyled), so it sits between the two styled runs.
         assert_eq!(
             r("[text](https://x.io)"),
-            format!("{UNDER}text{RESET} {FADE}(https://x.io){RESET}")
+            format!("{UNDER}{BODY}text{RESET}{FADE} (https://x.io){RESET}")
         );
     }
 
@@ -307,7 +312,7 @@ mod tests {
     fn table_header_is_bold_borders_are_dim() {
         let out = r("| a |\n|---|\n| 1 |");
         assert!(
-            out.contains(&format!("{BOLD}a")),
+            out.contains(&format!("{BOLD}{BODY}a")),
             "header cell must be bold"
         );
         assert!(out.contains(FADE), "borders must be dim");

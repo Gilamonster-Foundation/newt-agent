@@ -65,6 +65,7 @@ const SECTIONS: &[(&str, char, &str)] = &[
     ("Permissions", 'p', "posture · prompted decisions · audit"),
     ("Audit", 'a', "settings receipts · does each still verify"),
     ("Backends", 'b', "choose · edit · add · remove"),
+    ("Themes", 't', "presets · styles · live preview · save"),
 ];
 
 /// Index of the Session section in the shell — the one whose outcome
@@ -76,6 +77,7 @@ pub(crate) fn panel_height() -> u16 {
     u16::try_from(Field::ALL.len() + 2)
         .unwrap_or(8)
         .saturating_add(3)
+        .max(17)
 }
 
 /// A row that ENTERS another panel instead of holding a value.
@@ -546,12 +548,14 @@ pub(crate) fn run(
     // writes (the posture field, grants, decision reopen) waits for #1999.
     let mut permissions_panel = crate::lines_panel::LinesPanel::new("permissions", permissions);
     let mut audit_panel = crate::lines_panel::LinesPanel::new("audit", audit);
+    let mut theme_panel = crate::theme_panel::ThemePanel::new();
     let (applied, linked) = {
         let mut shell = crate::shell::Shell::new(vec![
             section(0, crate::shell::Body::Screen(&mut panel)),
             section(1, crate::shell::Body::Screen(&mut permissions_panel)),
             section(2, crate::shell::Body::Screen(&mut audit_panel)),
             section(3, crate::shell::Body::Link),
+            section(4, crate::shell::Body::Screen(&mut theme_panel)),
         ]);
         crate::panel::drive(&mut shell, panel_height(), window.as_ref())?;
         // **This section's flag, not the shell's.** With a second hosted
@@ -569,17 +573,25 @@ pub(crate) fn run(
         // both leave through `OpenBackends`, so the caller opens the chooser
         // once, by one path.
         return Ok(Outcome::OpenBackends {
-            lines: panel.commit(),
+            lines: {
+                let mut lines = panel.commit();
+                lines.extend(theme_panel.applied.clone());
+                lines
+            },
             model: panel.picked_model(),
         });
     }
     if !applied {
         return Ok(Outcome::Applied {
-            lines: vec!["settings: cancelled".to_string()],
+            lines: theme_panel.applied.clone().map_or_else(
+                || vec!["settings: cancelled".to_string()],
+                |message| vec![message],
+            ),
             model: None,
         });
     }
-    let messages = panel.commit();
+    let mut messages = panel.commit();
+    messages.extend(theme_panel.applied);
     let model = panel.picked_model();
     if panel.walk_through {
         // Pending dial changes are applied on the way through, not discarded:

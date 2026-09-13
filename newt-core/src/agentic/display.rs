@@ -19,19 +19,41 @@ use std::io::{self, Write};
 // Re-exported here so every call site in `agentic` is unchanged.
 pub(crate) use crate::tty::term_cols;
 pub use crate::tty::NEWT_ORANGE_CT;
-// `FADE_CT`'s only consumer is `agentic::markdown::emitter`, which is itself
-// `markdown`-gated — so under `--no-default-features` this re-export is unused
-// and `-D warnings` refuses it (#1890). Gated with its consumer rather than
-// deleted, because the curated re-export list above is the deliberate design:
-// every `agentic` call site names `display`, not `tty`.
-#[cfg(feature = "markdown")]
-pub(crate) use crate::tty::FADE_CT;
-
 // The multi-line wrapper moved up to `tty::width::wrap_line` with the rest of
 // the width model (`docs/decisions/tty_widget_suite.md` §3.0). Aliased under its
 // old name so every call site and every test in this module is unchanged — the
 // promotion is a move, not a behavior change.
 pub(crate) use crate::tty::width::wrap_line as wrap_to_width;
+
+/// Keep continuation text inside the same gutter and width as its first row.
+/// The retained result stays unchanged; this affects presentation only.
+fn bounded_spill_rows(rendered: &str, columns: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    for line in crate::tty::width::strip_ansi(rendered).lines() {
+        let (prefix, body) =
+            if line.starts_with("▒ ") || line.starts_with("▓ ") || line.starts_with("▲ ") {
+                line.split_at(line.chars().take(2).map(char::len_utf8).sum())
+            } else {
+                ("", line)
+            };
+        let indent = crate::tty::width::str_width(prefix);
+        for (i, part) in wrap_to_width(body, columns.saturating_sub(indent).max(1))
+            .into_iter()
+            .enumerate()
+        {
+            rows.push(format!(
+                "{}{}",
+                if i == 0 {
+                    prefix.to_string()
+                } else {
+                    " ".repeat(indent)
+                },
+                part
+            ));
+        }
+    }
+    rows
+}
 
 /// Print a newt narrator line.
 ///
@@ -1345,17 +1367,16 @@ impl<W: Write> ToolDisplay<W> {
                 .flatten()
                 .unwrap_or_else(|| spill_view_lines(output, self.spill_lines, self.cols).join("\n"))
         };
+        let rendered = bounded_spill_rows(&rendered, self.cols).join("\n");
         if self.color {
-            // Each logical row is independently styled: the cockpit resets
+            // Each physical row is independently styled: the cockpit resets
             // attributes between committed rows, including spill fold markers.
             for line in rendered.lines() {
                 execute!(
                     &mut self.writer,
-                    SetForegroundColor(
-                        crate::tty::theme::active().color(crate::tty::theme::Role::Dim)
-                    ),
+                    Print(crate::tty::theme::active().ansi(crate::tty::theme::Role::Spill)),
                     Print(format!("{line}\n")),
-                    ResetColor,
+                    crossterm::style::SetAttribute(crossterm::style::Attribute::Reset),
                 )
                 .ok();
             }
@@ -1410,17 +1431,16 @@ impl<W: Write + Send> ToolPresentation for ToolDisplay<W> {
         if rendered.is_empty() {
             return;
         }
+        let rendered = bounded_spill_rows(&rendered, self.cols).join("\n");
         if self.color {
-            // Each logical row is independently styled: the cockpit resets
+            // Each physical row is independently styled: the cockpit resets
             // attributes between committed rows, including spill fold markers.
             for line in rendered.lines() {
                 execute!(
                     &mut self.writer,
-                    SetForegroundColor(
-                        crate::tty::theme::active().color(crate::tty::theme::Role::Dim)
-                    ),
+                    Print(crate::tty::theme::active().ansi(crate::tty::theme::Role::Spill)),
                     Print(format!("{line}\n")),
-                    ResetColor,
+                    crossterm::style::SetAttribute(crossterm::style::Attribute::Reset),
                 )
                 .ok();
             }

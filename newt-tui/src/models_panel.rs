@@ -124,21 +124,14 @@ impl ModelsPanel {
     }
 
     fn row_style(&self, row: &RowView) -> (ratatui::style::Style, ratatui::style::Style) {
-        use crate::theme::{color, Role};
-        use ratatui::style::{Modifier, Style};
+        use crate::theme::{style, Role};
+        use ratatui::style::Style;
         let value = if row.value == self.active {
-            Style::default()
-                .fg(color(Role::ActiveModel))
-                .remove_modifier(Modifier::DIM)
+            style(Role::ActiveModel)
         } else {
             Style::default()
         };
-        (
-            value,
-            Style::default()
-                .fg(color(Role::LoadedModel))
-                .remove_modifier(Modifier::DIM),
-        )
+        (value, style(Role::LoadedModel))
     }
 
     fn title(&self) -> String {
