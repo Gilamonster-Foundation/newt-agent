@@ -3323,7 +3323,14 @@ async fn execute_authorized_tool(
             // lines AND > 30 lines absolute. This catches the failure mode
             // where a model replaces an entire large file with a small
             // fragment (observed in the wild: 4,247 → 107 lines).
-            if let Ok(existing) = object_bound_read(&caveats.fs_write, "fs_write", path, &full, &full_str) {
+            // Match the write's authority path: an explicit operator approval
+            // outside the original scope still receives the shrink protection.
+            let preimage = if scope_permits {
+                object_bound_read(&caveats.fs_write, "fs_write", path, &full, &full_str)
+            } else {
+                std::fs::read_to_string(&full).map_err(|error| error.to_string())
+            };
+            if let Ok(existing) = preimage {
                 let orig_lines = existing.lines().count();
                 let new_lines = content.lines().count();
                 let removed = orig_lines.saturating_sub(new_lines);

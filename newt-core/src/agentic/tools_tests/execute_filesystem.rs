@@ -481,3 +481,27 @@ async fn list_dir_symlink_under_workspace_escaping_is_denied() {
     );
     assert_eq!(out, denied_fs_result("fs_read", "link"), "got: {out}");
 }
+
+/// Permission to write an external file must not bypass the existing shrink
+/// protection. Grounds the scripted approval in a real file that must survive.
+#[tokio::test]
+async fn approved_external_write_retains_shrink_guard() {
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let path = outside.path().join("large.txt");
+    let original = "original line\n".repeat(100);
+    std::fs::write(&path, &original).unwrap();
+    let caveats = caveats_rw(ws.path());
+    let mut gate = MockGate::new(true, &caveats);
+    let output = run_tool_gated(
+        "write_file",
+        serde_json::json!({"path":path, "content":"tiny\n"}),
+        ws.path(),
+        &caveats,
+        &mut gate,
+    )
+    .await;
+    assert_eq!(gate.asks.len(), 1);
+    assert!(output.contains("would shrink"), "{output}");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+}
