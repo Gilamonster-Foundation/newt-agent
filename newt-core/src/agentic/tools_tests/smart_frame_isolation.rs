@@ -550,3 +550,97 @@ async fn private_frame_cannot_leak_through_write_shrink_or_edit_preview() {
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), private);
     }
 }
+
+/// Ground worktree support in real Git administrative files and confined file
+/// edits. An external worktree is usable only with its own explicit grant;
+/// its parent directory and private frame remain outside that grant.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+#[serial_test::serial]
+async fn smart_shell_worktrees_support_scoped_creation_editing_and_staging() {
+    let _env = super::disable_ocap_tests::env_lock().await;
+    let _yolo = super::disable_ocap_tests::EnvVar::set("NEWT_DISABLE_OCAP", "0");
+    let _full = super::disable_ocap_tests::EnvVar::set("NEWT_FULL_ACCESS", "0");
+    let _engine = super::disable_ocap_tests::EnvVar::set("NEWT_SHELL_ENGINE", "host");
+    let _env_grant = super::disable_ocap_tests::EnvVar::set(
+        "NEWT_SHELL_ENV_PASSTHROUGH",
+        "GIT_CONFIG_GLOBAL:GIT_CONFIG_SYSTEM",
+    );
+    let _global = super::disable_ocap_tests::EnvVar::set("GIT_CONFIG_GLOBAL", "/dev/null");
+    let _system = super::disable_ocap_tests::EnvVar::set("GIT_CONFIG_SYSTEM", "/dev/null");
+    let workspace = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    let external_parent = tempfile::tempdir().unwrap();
+    let external = external_parent.path().join("task-worktree");
+    std::fs::create_dir(&external).unwrap();
+    let sibling = external_parent.path().join("ungranted");
+    std::fs::write(&sibling, "outside authority").unwrap();
+    let (harness, _) = harness(private.path());
+    let git_fixture = |args: &[&str]| {
+        let output = crate::git_hardening::hardened_git(workspace.path(), args)
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git_fixture(&["init", "-q"]);
+    std::fs::write(workspace.path().join("task.txt"), "baseline\n").unwrap();
+    std::fs::write(workspace.path().join(".gitignore"), ".worktrees/\n").unwrap();
+    git_fixture(&["add", "task.txt", ".gitignore"]);
+    git_fixture(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "-qm",
+        "fixture baseline",
+    ]);
+    let mut caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
+    caveats.net = crate::caveats::Scope::All;
+    for (index, destination) in [workspace.path().join(".worktrees/task"), external.clone()]
+        .into_iter()
+        .enumerate()
+    {
+        if index == 1 {
+            // The external directory alone is delegated, never its parent.
+            caveats.fs_read = crate::caveats::Scope::only([
+                workspace.path().to_string_lossy().into_owned(),
+                external.to_string_lossy().into_owned(),
+            ]);
+            caveats.fs_write = caveats.fs_read.clone();
+        }
+        let create = dispatch(&harness, workspace.path(), &caveats, "run_command",
+            serde_json::json!({"command":format!("git worktree add -b fixture-{index} '{}'", destination.display())}), None).await;
+        assert!(destination.join("task.txt").exists(), "{create}");
+        let edited = dispatch(&harness, workspace.path(), &caveats, "edit_file",
+            serde_json::json!({"path":destination.join("task.txt"), "old_string":"baseline", "new_string":"worktree change"}), None).await;
+        assert_eq!(
+            std::fs::read_to_string(destination.join("task.txt")).unwrap(),
+            "worktree change\n",
+            "{edited}"
+        );
+        let staged = dispatch(&harness, workspace.path(), &caveats, "run_command",
+            serde_json::json!({"command":"git add task.txt && git status --short", "cwd":destination}), None).await;
+        assert!(staged.contains("M  task.txt"), "{staged}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("task.txt")).unwrap(),
+            "baseline\n"
+        );
+    }
+    let denied = dispatch(
+        &harness,
+        workspace.path(),
+        &caveats,
+        "read_file",
+        serde_json::json!({"path":sibling}),
+        None,
+    )
+    .await;
+    assert!(denied.contains("denied"), "{denied}");
+    assert!(!denied.contains("outside authority"));
+}

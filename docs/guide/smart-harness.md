@@ -164,6 +164,16 @@ remote MCP servers remain separate, operator-configured authorities. A foreign
 Rust or Python host must enforce its own file and subprocess boundary; the
 reusable session library does not install a sandbox.
 
+For isolated Git work, the confined shell supports `git worktree add -b
+fix/task .worktrees/task`. Keep subsequent shell calls pointed at the worktree
+with their `cwd` argument, and use worktree-qualified paths for dedicated file
+tools; a shell `cd` does not change the session root. A worktree outside the
+workspace needs an explicit read/write grant to its destination and access to
+the original repository's shared Git metadata. Grant an existing empty task
+directory, not its entire parent. Creating, editing, inspecting, and staging
+worktree changes use these same grants. The commit restriction below still
+applies.
+
 Smart mode refuses crew execution and native `find` because those adapters do
 not retain protected filesystem access throughout their reads. Use
 `run_command` for searches in the confined shell. Native Git retains its existing
