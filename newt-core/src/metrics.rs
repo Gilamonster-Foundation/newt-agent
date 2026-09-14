@@ -275,15 +275,15 @@ fn rotate_log(path: &std::path::Path, policy: &crate::LogConfig) -> std::io::Res
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Terminal state of one inference attempt (#2313). `Unmeasured` means the
-/// attempt completed but its backend reported no usage.
+/// Terminal state of one inference attempt (#2313): how the attempt ended,
+/// and nothing else. Whether usage was reported is a separate fact —
+/// `AttemptRecord::usage` is `None`, counted by `UsageTotals::usage_missing`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptState {
     Ok,
     Failed,
     Cancelled,
-    Unmeasured,
 }
 
 /// What an attempt IS, and so what its identity is minted from: the turn, the
@@ -466,7 +466,7 @@ mod tests {
 
         let unmeasured = ledger.dispatch("turn-1", "auxiliary", b"classify");
         ledger
-            .observe(record(&unmeasured, None, AttemptState::Unmeasured))
+            .observe(record(&unmeasured, None, AttemptState::Ok))
             .unwrap();
         let failed = ledger.dispatch("turn-1", "summarizer", b"summarize");
         ledger
@@ -481,6 +481,37 @@ mod tests {
                 out_tokens: 10,
                 usage_complete: false,
             }
+        );
+    }
+
+    /// #2313: state is TERMINAL only — ok, failed, cancelled. Whether usage
+    /// was reported is a separate fact (`usage: None`, counted by
+    /// `usage_missing`), so a failed call that reported nothing stays
+    /// distinguishable from a completed one, and there is no fourth state that
+    /// mixes the two.
+    #[test]
+    fn attempt_state_is_terminal_only_and_missing_usage_is_separate() {
+        for state in ["ok", "failed", "cancelled"] {
+            assert!(
+                serde_json::from_str::<AttemptState>(&format!("\"{state}\"")).is_ok(),
+                "{state}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<AttemptState>("\"unmeasured\"").is_err(),
+            "missing usage is not a terminal state"
+        );
+
+        let mut ledger = AttemptLedger::default();
+        let failed = ledger.dispatch("turn-1", "primary", b"round 0");
+        let line = ledger
+            .observe(record(&failed, None, AttemptState::Failed))
+            .unwrap();
+        assert_eq!(line.node.payload().state, AttemptState::Failed);
+        let totals = ledger.totals();
+        assert_eq!(
+            (totals.attempts, totals.usage_missing, totals.usage_complete),
+            (1, 1, false)
         );
     }
 
