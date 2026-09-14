@@ -290,12 +290,15 @@ async fn openai_loop_records_tool_events_with_digested_args() {
 // execution produces; they ground the envelope-tier classification tests.
 
 /// Resolves and exits 101 with output on every engine and on the host lane.
+#[cfg(unix)]
 pub(super) const FAILING_CHECK: &str = "sh -c 'echo diag; exit 101'";
 
+#[cfg(unix)]
 pub(super) fn execution_class(event: &crate::ToolEvent) -> serde_json::Value {
     serde_json::to_value(event).unwrap()["execution"].clone()
 }
 
+#[cfg(unix)]
 fn outcome_ctx<'a>(
     url: &'a str,
     messages: &'a [MemMessage],
