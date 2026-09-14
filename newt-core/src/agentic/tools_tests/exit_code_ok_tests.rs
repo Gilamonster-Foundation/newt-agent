@@ -218,8 +218,8 @@ fn confined(cmd: &str, envelope: serde_json::Value) -> (String, ExecOutcome) {
     confined_with(cmd, envelope, &crate::caveats::Caveats::top())
 }
 
-fn host(cmd: &str, envelope: serde_json::Value) -> (String, ExecOutcome) {
-    super::shell::host_result(cmd, &envelope, render)
+fn host(envelope: serde_json::Value) -> (String, ExecOutcome) {
+    super::shell::host_result(&envelope, render)
 }
 
 fn envelope(exit_code: i64, stdout: &str, stderr: &str, timed_out: bool) -> serde_json::Value {
@@ -275,14 +275,8 @@ fn exit_124_without_the_timeout_flag_is_failed() {
         confined("timeout 1 cargo test", envelope(124, "", "", false)).1,
         ExecOutcome::Failed
     );
-    assert_eq!(
-        host("cargo test", envelope(124, "", "", false)).1,
-        ExecOutcome::Failed
-    );
-    assert_eq!(
-        host("cargo test", envelope(124, "", "", true)).1,
-        ExecOutcome::TimedOut
-    );
+    assert_eq!(host(envelope(124, "", "", false)).1, ExecOutcome::Failed);
+    assert_eq!(host(envelope(124, "", "", true)).1, ExecOutcome::TimedOut);
 }
 
 /// Trap: a second classifier over the rendered text. A successful command
@@ -297,7 +291,7 @@ fn the_class_follows_the_envelope_not_the_rendered_text() {
     );
     assert!(!tool_result_ok(&text), "{text}");
     assert_eq!(class, ExecOutcome::Passed);
-    let (text, class) = host("cat log", envelope(0, "fine\n", "", false));
+    let (text, class) = host(envelope(0, "fine\n", "", false));
     assert!(tool_result_ok(&text));
     assert_eq!(class, ExecOutcome::Passed);
 }
@@ -308,19 +302,18 @@ fn the_class_follows_the_envelope_not_the_rendered_text() {
 #[cfg(unix)]
 #[test]
 fn host_lane_127_is_unavailable_only_when_the_program_does_not_resolve() {
-    let (text, class) = host(
-        "definitely-absent-2315 --version",
-        envelope(127, "", "sh: 1: definitely-absent-2315: not found\n", false),
-    );
+    let (text, class) = host(envelope(
+        127,
+        "",
+        "sh: 1: definitely-absent-2315: not found\n",
+        false,
+    ));
     assert_eq!(class, ExecOutcome::Unavailable, "{text}");
     assert!(text.starts_with("error: command exited 127"), "{text}");
-    let (text, class) = host("sh -c 'exit 127'", envelope(127, "", "", false));
+    let (text, class) = host(envelope(127, "", "", false));
     assert_eq!(class, ExecOutcome::Failed, "{text}");
     assert!(!tool_result_ok(&text));
-    assert_eq!(
-        host("cargo test", failing_compile_envelope()).1,
-        ExecOutcome::Failed
-    );
+    assert_eq!(host(failing_compile_envelope()).1, ExecOutcome::Failed);
 }
 
 /// The kernel refusing a program outside the fs-read grant is a denial.
@@ -359,4 +352,21 @@ fn only_shell_events_carry_the_execution_field() {
         serde_json::to_value(&shell).unwrap()["execution"],
         "timed_out"
     );
+}
+
+/// #2315 PR2a: the host lane uses the confined rule. A 127 is `unavailable`
+/// only when the host shell names the program it could not find AND that
+/// program does not resolve. A bare builtin exit names nothing, so it failed.
+#[test]
+fn a_host_127_the_shell_did_not_attribute_is_failed() {
+    assert_eq!(host(envelope(127, "", "", false)).1, ExecOutcome::Failed);
+    // bash's wording names the program; it does not resolve.
+    let bash = "bash: line 1: definitely-absent-2315: command not found\n";
+    assert_eq!(
+        host(envelope(127, "", bash, false)).1,
+        ExecOutcome::Unavailable
+    );
+    // A program's own stderr that merely resembles the wording is not the shell's.
+    let own = "lookup: definitely-absent-2315: not found\n";
+    assert_eq!(host(envelope(127, "", own, false)).1, ExecOutcome::Failed);
 }
