@@ -34,11 +34,12 @@ def provider_toml(base_url: str, context_window: str) -> str:
     """Top-level keys first: Harbor appends further lines after this block."""
     if not base_url:
         raise ValueError("TB_LOCAL_BASE_URL must name the OpenAI-compatible endpoint")
-    window = (
-        f"model_context_window = {int(context_window)}\n" if context_window.strip() else ""
-    )
+    if not context_window.strip():
+        # Unset, codex falls back to its own per-model default window.
+        raise ValueError("TB_LOCAL_CONTEXT_WINDOW must be the ctx-size as served")
     return (
-        f'model_provider = "{PROVIDER}"\n{window}'
+        f'model_provider = "{PROVIDER}"\n'
+        f"model_context_window = {int(context_window)}\n"
         f"[model_providers.{PROVIDER}]\n"
         f'name = "{PROVIDER}"\n'
         f"base_url = {json.dumps(base_url)}\n"
