@@ -86,6 +86,43 @@ one Harbor job per cell, plus these records:
 
 Rerunning the command skips recorded cells.
 
+**Treatments and pinning (#2318).**
+
+*Arms.* `TB_MATRIX` names a file of `<harness> <treatment>` lines, which
+declares the arms. Without it, every harness in `TB_HARNESSES` runs `none`.
+
+*Treatment files.* A treatment is one file,
+[`treatments/<name>.toml`](treatments), holding four things:
+- a `description`;
+- a newt `profile` fragment, appended to the injected profile with `{{MODEL}}`
+  and `{{ENDPOINT}}` taken from the local profile;
+- adapter `env`, limited to the `NEWT_BENCH_*` knobs `newt_agent.py` reads;
+- `expect`, the dotted paths the newt contract must show.
+
+Treatments apply to newt only. The file's sha256 is recorded as the treatment's
+identity.
+
+*Declared but not observed.* This column counts trials whose contract lacks a
+declared path. It reads `n/a` when a treatment declares nothing observable;
+today only `smart_harness` appears in the contract.
+
+*Pinning.* The first cell writes `campaign.pin.json`, which pins:
+- the task-set digest;
+- the engine build;
+- the served ctx;
+- the newt binary digest;
+- the instrument commit;
+- each model's fingerprint;
+- the pi and Codex versions.
+
+A later cell that differs from the pin is skipped as `pin mismatch: <fields>`.
+pi and Codex then install the pinned version.
+
+*Model identity.* The fingerprint is the server's model metadata plus the GGUF
+basename. It is a fingerprint, not a content digest: the router exposes no
+weights hash. A digest written after a model id in the roster is recorded as
+declared and unverified, and newt receives it as `NEWT_MODEL_DIGEST`.
+
 Reading the table:
 - **Claimed done** comes from each harness's own log. newt's claim is the
   contract `outcome: completed`, pi's is a final `stopReason: stop`, and Codex's
