@@ -208,14 +208,19 @@ def _seconds(span):
 # newt profile fragment appended to the injected profile ({{MODEL}} and
 # {{ENDPOINT}} substituted from the local profile, so no host is committed),
 # adapter env limited to the knobs newt_agent.py reads, and dotted contract
-# paths the run must be OBSERVED at ("*" = present). Its sha256 is its identity.
+# paths the run must be OBSERVED at ("*" = present), and `requires`: receipt
+# feature keys passed as `newt solve --require-feature` (#2356), so a feature the
+# run cannot supply refuses before inference. Its sha256 is its identity.
 # "none" is the baseline. pi and codex take no treatment.
-TREATMENT_KEYS = {"description", "profile", "env", "expect"}
+TREATMENT_KEYS = {"description", "profile", "env", "expect", "requires"}
+# newt's receipt.features keys: the only names --require-feature accepts.
+REQUIRABLE = {"scratchpad", "code_search", "crew"}
+REFUSAL = re.compile(r"required feature `[a-z_]+` is [a-z_]+: [^\n]*")
 TREATMENT_ENV = {
     "NEWT_BENCH_SMART", "NEWT_BENCH_SELF_VERIFY", "NEWT_BENCH_MAX_ROUNDS",
     "NEWT_BENCH_TENACITY", "NEWT_BENCH_CONTEXT_WINDOW", "NEWT_BENCH_OCAP",
 }
-NONE = {"name": "none", "sha256": None, "profile": "", "env": {}, "expect": {}}
+NONE = {"name": "none", "sha256": None, "profile": "", "env": {}, "expect": {}, "requires": []}
 
 
 def load_treatment(path):
@@ -229,9 +234,23 @@ def load_treatment(path):
     bad = sorted(k for k, v in env.items() if k not in TREATMENT_ENV or not re.fullmatch(r"[A-Za-z0-9._-]*", v))
     if bad:
         raise ValueError(f"{path}: env not allowed: {bad}")
+    requires = list(t.get("requires") or [])
+    if set(requires) - REQUIRABLE:
+        raise ValueError(f"{path}: requires must be receipt keys {sorted(REQUIRABLE)}")
     name = Path(path).stem
     return {"name": name, "sha256": hashlib.sha256(raw).hexdigest(), "profile": t.get("profile", ""),
-            "env": env, "expect": t.get("expect") or {}}
+            "env": env, "expect": t.get("expect") or {}, "requires": requires}
+
+
+def treatment_env(t):
+    """The adapter env one arm runs with: the declared knobs plus its requirements."""
+    return {**t["env"], **({"NEWT_BENCH_REQUIRE_FEATURES": ",".join(t["requires"])} if t["requires"] else {})}
+
+
+def refusal(exception_message):
+    """newt's pre-inference refusal of a required feature, from Harbor's exit message."""
+    found = REFUSAL.search(exception_message or "")
+    return found.group(0) if found else None
 
 
 def observed(expect, record):
@@ -300,8 +319,8 @@ def build_cell(t, pairs):
             cell[k[: -len("_json")]] = json.loads(v) if v else None
         else:
             cell[k] = int(v) if k in ("expected", "trials", "n_tasks") else (v or None)
-    cell.update(treatment=t["name"], treatment_sha256=t["sha256"], treatment_env=t["env"],
-                treatment_expect=t["expect"])
+    cell.update(treatment=t["name"], treatment_sha256=t["sha256"], treatment_env=treatment_env(t),
+                treatment_expect=t["expect"], treatment_requires=t["requires"])
     return cell
 
 
@@ -331,8 +350,10 @@ def trial_row(harness, trial: Path, expect=None):
     infra = inference_failure(lines) if harness == "pi" else None
     replies, harness_error = harness_evidence(harness, lines)
     exit_code = re.search(r"exit (\d+)", (r.get("exception_info") or {}).get("exception_message") or "")
-    cause = error_cause(exc, exit_code and int(exit_code.group(1)), harness_error, infra, replies)
-    state = "error" if infra else rec["state"]
+    refused = refusal((r.get("exception_info") or {}).get("exception_message")) if harness == "newt" else None
+    cause = None if refused else error_cause(exc, exit_code and int(exit_code.group(1)), harness_error, infra, replies)
+    # A refused requirement never ran the model: not graded, not an error to classify.
+    state = "refused" if refused else "error" if infra else rec["state"]
     claimed, claim_source = claim(harness, trial / "agent", exc)
     agent = r.get("agent_result") or {}
     tokens_in, tokens_out = agent.get("n_input_tokens"), agent.get("n_output_tokens")
@@ -368,6 +389,7 @@ def trial_row(harness, trial: Path, expect=None):
         "raw_reward": rec["raw"],
         "state": state,
         "inference_failure": infra,
+        "refusal": refused,
         "error_cause": cause,
         "model_replies": replies,
         "harness_error": harness_error,
@@ -391,6 +413,8 @@ def ingest(job_dir: Path, cell_json: Path, out: Path):
     ]
     if not cell.get("harness_version") and rows:
         cell["harness_version"] = rows[0]["harness_version"]
+    if rows and all(r["state"] == "refused" for r in rows):  # admission is per run, so it refuses every trial
+        cell["skipped"] = f"refused before inference: {rows[0]['refusal']}"
     pin_path = out / "campaign.pin.json"
     if pin_path.exists():  # a version installed at setup can still differ from the pin
         pin = json.loads(pin_path.read_text())
@@ -430,7 +454,7 @@ def eligible(rows, rate):
 
 def summarize(cell, rows):
     graded = eligible(rows, "excl")
-    scored = [r for r in rows if r["reward"] is not None and r.get("error_cause") != "infra"]
+    scored = [r for r in rows if r["reward"] is not None and r.get("error_cause") != "infra" and r["state"] != "refused"]
     with_agent = eligible(rows, "agent_fail")
     claimed = [r for r in scored if r["claimed_done"] is True]
     known_in = [r["tokens_in"] for r in rows if r["tokens_in"] is not None]
@@ -448,7 +472,7 @@ def summarize(cell, rows):
         "claimed": len(claimed),
         "false_completions": sum(not r["resolved"] for r in claimed),
         "false_incompletes": sum(r["resolved"] for r in scored if r["claimed_done"] is False),
-        "unrecoverable_claims": sum(r["claimed_done"] is None for r in rows),
+        "unrecoverable_claims": sum(r["claimed_done"] is None and r["state"] != "refused" for r in rows),
         "exceptions": sum(r["exception"] is not None for r in rows),
         "inference_errors": sum(bool(r.get("inference_failure")) for r in rows),
         "agent_timeouts": sum(r["exception"] == TIMEOUT for r in rows),
@@ -620,7 +644,7 @@ if __name__ == "__main__":
     elif cmd == "profile":  # writes the profile; prints the treatment's adapter env as KEY=VALUE lines
         t = load_treatment(args[0])
         Path(args[3]).write_text(render_profile(t, args[1], Path(args[2]).read_text()))
-        print("\n".join(f"{k}={v}" for k, v in sorted(t["env"].items())))
+        print("\n".join(f"{k}={v}" for k, v in sorted(treatment_env(t).items())))
     elif cmd == "pin-check":
         sys.exit(pin_check(Path(args[0]), Path(args[1])))
     elif cmd == "pinned-version":
