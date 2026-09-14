@@ -35,8 +35,10 @@ Pure helpers are unit-tested via ``--self-test`` (no third-party deps).
 from __future__ import annotations
 
 import argparse
+import collections
 import glob
 import json
+import math
 import os
 import sys
 
@@ -47,59 +49,155 @@ END_MARKER = "<!-- BENCH-SCOREBOARD:END -->"
 
 
 # ── run parsing ─────────────────────────────────────────────────────────────
-def _task_reward(task_dir: str) -> float | None:
-    """The reward for one Harbor task dir: verifier/reward.txt (a float), else
-    dig result.json for a numeric ``reward``. None when neither is present."""
-    rt = os.path.join(task_dir, "verifier", "reward.txt")
-    if os.path.exists(rt):
+# A suite's verdict contract, as data: reward -> verdict. Terminal-Bench's
+# verifier writes 1 when every test passes and 0 otherwise, so any other reward
+# (partial credit, no reward, a suite with no contract here) is "unknown" —
+# never a pass. The raw reward stays on the trial record either way.
+VERDICT_CONTRACTS = {
+    suite: {1.0: "resolved", 0.0: "failed"} for suite in ("tb-30", "terminal-bench")
+}
+# How attempts weigh into ``mean_reward``: every attempt that carries a finite
+# reward counts once — including a verifier-graded errored trial, since dropping
+# a timeout from the denominator would reward timing out. One attempt per task
+# reduces to the historical per-task mean.
+POLICY = "attempt-mean"
+# Added to each manifest record beside the historical fields (add-only schema).
+COVERAGE_FIELDS = (
+    "policy",
+    "expected",
+    "observed",
+    "graded",
+    "missing",
+    "errors_by_class",
+)
+
+
+def verdict(reward: float | None, suite: str) -> str:
+    """``resolved`` / ``failed`` / ``unknown`` for one reward under ``suite``."""
+    return VERDICT_CONTRACTS.get(suite, {}).get(reward, "unknown")
+
+
+def load_job(run_dir: str) -> dict:
+    """Harbor's job-level ``config.json`` (the roster) and ``result.json`` (trial
+    stats, token and cost totals). A file that is absent or unreadable is None."""
+    job: dict = {}
+    for name in ("config", "result"):
         try:
-            return float(open(rt).read().strip())
-        except ValueError:
-            pass
-    rj = os.path.join(task_dir, "result.json")
-    if os.path.exists(rj):
-        found: list[float] = []
+            job[name] = json.load(open(os.path.join(run_dir, f"{name}.json")))
+        except (OSError, ValueError):
+            job[name] = None
+    return job
+
+
+def expected_trials(config: dict | None) -> int | None:
+    """Trials the job declared: roster tasks x ``n_attempts`` x agents. None when
+    the roster is not a literal list (globs, exclusions, ``n_tasks``, no config):
+    an unknown expectation must not be reported as the observed count."""
+    if not config:
+        return None
+    names = list(config.get("tasks") or [])
+    for ds in config.get("datasets") or []:
+        literal = ds.get("task_names") and not any(
+            set("*?[") & set(n) for n in ds["task_names"]
+        )
+        if not literal or ds.get("exclude_task_names") or ds.get("n_tasks") is not None:
+            return None
+        names += ds["task_names"]
+    agents = max(1, len(config.get("agents") or []))
+    return len(names) * (config.get("n_attempts") or 1) * agents if names else None
+
+
+def trial_record(trial_dir: str) -> dict:
+    """One Harbor trial: ``{trial, task, source, state, reward, raw, exception}``.
+
+    ``state`` is ``graded`` (a finite reward, no exception), ``ungraded`` (no
+    reward at all) or ``error`` (a malformed or non-finite reward, an unreadable
+    result.json, or any ``exception_info`` — a verifier reward alongside an
+    exception is kept in ``reward``). ``raw`` is the reward exactly as found."""
+    name = os.path.basename(trial_dir)
+    rec = {"trial": name, "task": name.split("__")[0], "source": None}
+    rec.update(state="ungraded", reward=None, raw=None, exception=None)
+    res: object = {}
+    rj = os.path.join(trial_dir, "result.json")
+    try:
+        res = json.load(open(rj)) if os.path.exists(rj) else {}
+        if not isinstance(res, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError):
+        return {**rec, "state": "error", "exception": "unreadable result.json"}
+    rec.update(task=res.get("task_name") or rec["task"], source=res.get("source"))
+    rec["trial"] = res.get("trial_name") or name
+    rt = os.path.join(trial_dir, "verifier", "reward.txt")
+    if os.path.exists(rt):
+        rec["raw"] = open(rt).read().strip()
+    else:
+        found: list[object] = []
 
         def dig(o: object) -> None:
             if isinstance(o, dict):
                 r = o.get("reward")
                 if isinstance(r, (int, float)):
-                    found.append(float(r))
+                    found.append(r)
                 for v in o.values():
                     dig(v)
             elif isinstance(o, list):
                 for v in o:
                     dig(v)
 
+        dig(res)
+        rec["raw"] = str(found[0]) if found else None
+    if rec["raw"] is not None:
         try:
-            dig(json.load(open(rj)))
-        except (ValueError, OSError):
-            return None
-        if found:
-            return found[0]
-    return None
+            reward = float(rec["raw"])
+        except ValueError:
+            reward = math.nan
+        if math.isfinite(reward):
+            rec.update(state="graded", reward=reward)
+        else:
+            rec.update(state="error", exception="malformed reward")
+    exc = res.get("exception_info")
+    if exc:
+        exc_type = exc.get("exception_type") if isinstance(exc, dict) else None
+        rec.update(state="error", exception=exc_type or str(exc))
+    return rec
 
 
-def parse_run(run_dir: str) -> dict:
-    """Aggregate a Harbor run dir into ``{total, passed, mean_reward,
-    passed_tasks}``. A task 'passes' at reward >= 1.0; ``mean_reward`` matches
-    Harbor's own Mean. Only immediate ``*__*`` task subdirs are counted."""
-    rewards: dict[str, float] = {}
-    for d in sorted(glob.glob(os.path.join(run_dir, "*__*"))):
-        if not os.path.isdir(d):
-            continue
-        task = os.path.basename(d).split("__")[0]
-        r = _task_reward(d)
-        if r is not None:
-            rewards[task] = r
-    total = len(rewards)
-    passed = sorted(t for t, r in rewards.items() if r >= 1.0)
-    mean = (sum(rewards.values()) / total) if total else 0.0
+def parse_run(run_dir: str, suite: str = "tb-30") -> dict:
+    """Aggregate a Harbor run dir. Only immediate ``*__*`` trial subdirs count.
+
+    Historical fields: ``total`` (attempts with a finite reward), ``passed`` /
+    ``passed_tasks`` (attempts the suite verdict marks resolved) and
+    ``mean_reward`` under ``policy``. Coverage: ``expected`` (None when the roster
+    is unknown), ``observed``, ``graded``, ``missing`` (expected minus graded) and
+    ``errors_by_class`` (error-state trials counted by ``exception``).
+    ``trials`` holds every per-trial record."""
+    trials = [
+        trial_record(d)
+        for d in sorted(glob.glob(os.path.join(run_dir, "*__*")))
+        if os.path.isdir(d)
+    ]
+    scored = [t for t in trials if t["reward"] is not None]
+    passed = sorted(
+        t["task"] for t in scored if verdict(t["reward"], suite) == "resolved"
+    )
+    total = len(scored)
+    mean = math.fsum(t["reward"] for t in scored) / total if total else 0.0
+    expected = expected_trials(load_job(run_dir)["config"])
+    graded = sum(t["state"] == "graded" for t in trials)
     return {
         "total": total,
         "passed": len(passed),
         "mean_reward": round(mean, 4),
         "passed_tasks": passed,
+        "policy": POLICY,
+        "expected": expected,
+        "observed": len(trials),
+        "graded": graded,
+        "errors_by_class": dict(
+            collections.Counter(t["exception"] for t in trials if t["state"] == "error")
+        ),
+        "missing": None if expected is None else expected - graded,
+        "trials": trials,
     }
 
 
@@ -311,7 +409,7 @@ def inject(readme_text: str, table: str) -> str:
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
 def _cmd_ingest(a: argparse.Namespace) -> int:
-    agg = parse_run(a.run_dir)
+    agg = parse_run(a.run_dir, a.suite)
     if agg["total"] == 0:
         print(f"error: no task results found under {a.run_dir}", file=sys.stderr)
         return 2
@@ -327,6 +425,7 @@ def _cmd_ingest(a: argparse.Namespace) -> int:
         "passed": agg["passed"],
         "mean_reward": agg["mean_reward"],
         "passed_tasks": agg["passed_tasks"],
+        **{k: agg[k] for k in COVERAGE_FIELDS},
     }
     append_manifest(a.manifest, rec)
     print(
@@ -597,8 +696,121 @@ def _self_test() -> int:
     ]
     assert champions(tie)[("m", "off")]["date"] == "2026-07-02"
 
+    _self_test_ingestion()
     print("bench_scoreboard self-test: OK")
     return 0
+
+
+def _self_test_ingestion() -> None:
+    """#2316: every Harbor trial survives parsing, and coverage stays visible.
+
+    The fixture needs a duplicate task prefix with DIFFERENT rewards: without
+    one, the old prefix-keyed dict is green here too (the vacuous-green trap)."""
+    import re
+    import subprocess
+    import tempfile
+
+    def trial(root: str, name: str, reward: str | None = None, **result) -> None:
+        os.makedirs(os.path.join(root, name, "verifier"))
+        if reward is not None:
+            open(os.path.join(root, name, "verifier", "reward.txt"), "w").write(reward)
+        if result:
+            task = name.split("__")[0]
+            res = {"task_name": task, "trial_name": name, "source": "terminal-bench"}
+            open(os.path.join(root, name, "result.json"), "w").write(
+                json.dumps({**res, "exception_info": None, **result})
+            )
+
+    def job(root: str, first: str, second: str, roster: bool = True) -> dict:
+        if roster:  # 4 tasks x 2 attempts = 8 expected trials
+            cfg = {"datasets": [{"task_names": ["taskx", "tasky", "taskz", "taskw"]}]}
+            open(os.path.join(root, "config.json"), "w").write(
+                json.dumps({**cfg, "n_attempts": 2, "agents": [{}]})
+            )
+        trial(root, "taskx__aaa", first, ok=1)
+        trial(root, "taskx__bbb", second, ok=1)
+        trial(root, "tasky__ccc", "0.5", ok=1)  # partial credit
+        os.makedirs(os.path.join(root, "taskz__ddd"))  # no result.json, no reward
+        trial(root, "taskw__eee", "nan", ok=1)  # non-finite
+        timeout = {"exception_type": "AgentTimeoutError"}
+        trial(root, "taskw__fff", "1", exception_info=timeout)  # errored, verifier ran
+        return parse_run(root)
+
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+        agg = job(a, "0", "1")
+        # A2: swapping which attempt dir holds which reward changes nothing.
+        swapped = job(b, "1", "0")
+        strip = lambda g: {k: v for k, v in g.items() if k != "trials"}  # noqa: E731
+        assert strip(agg) == strip(swapped), (strip(agg), strip(swapped))
+        # A3/A4: four distinct integers, expected read from the job's roster.
+        counts = [agg[k] for k in ("expected", "observed", "graded", "missing")]
+        assert counts == [8, 6, 3, 5], counts
+        # A1/A5/A6: one record per trial, identity and raw reward retained.
+        by = {t["trial"]: t for t in agg["trials"]}
+        assert [by["taskx__aaa"]["reward"], by["taskx__bbb"]["reward"]] == [0.0, 1.0]
+        assert by["taskx__aaa"]["task"] == by["taskx__bbb"]["task"] == "taskx"
+        assert by["taskz__ddd"]["state"] == "ungraded", by["taskz__ddd"]
+        assert (by["taskw__eee"]["state"], by["taskw__eee"]["raw"]) == ("error", "nan")
+        assert by["taskw__eee"]["reward"] is None
+        fff = by["taskw__fff"]
+        assert (fff["state"], fff["exception"], fff["reward"]) == (
+            "error",
+            "AgentTimeoutError",
+            1.0,
+        ), fff
+        classes = {"AgentTimeoutError": 1, "malformed reward": 1}
+        assert agg["errors_by_class"] == classes, agg
+        # A7 attempt-mean: rewards 0, 1, 0.5 and the errored-but-verified 1, each
+        # attempt weighted once = 0.625 (per-task mean would be 0.6667, any-attempt
+        # 0.8333); nan never enters it.
+        policy = (agg["policy"], agg["total"], agg["mean_reward"])
+        assert policy == ("attempt-mean", 4, 0.625), agg
+        assert (agg["passed"], agg["passed_tasks"]) == (2, ["taskw", "taskx"]), agg
+        # A9: partial credit on a binary suite is unknown, never resolved.
+        assert by["tasky__ccc"]["reward"] == 0.5
+        assert [verdict(r, "tb-30") for r in (1.0, 0.0, 0.5, None)] == [
+            "resolved",
+            "failed",
+            "unknown",
+            "unknown",
+        ]
+        assert verdict(1.0, "no-such-suite") == "unknown"
+        for raw in ("inf", "-inf", "abc"):
+            trial(a, f"taskv__{raw}", raw, ok=1)
+            t = trial_record(os.path.join(a, f"taskv__{raw}"))
+            assert (t["state"], t["reward"], t["raw"]) == ("error", None, raw), t
+        # A10: cross-tab shares the verdict and survives a trial with no result.json.
+        # newt claims completion on the attempt Harbor graded 0 (bbb, swapped).
+        os.makedirs(os.path.join(b, "taskx__bbb", "agent"))
+        open(os.path.join(b, "taskx__bbb", "agent", "newt-events.jsonl"), "w").write(
+            '{"outcome": "completed"}\n'
+        )
+        cross_tab = os.path.join(os.path.dirname(__file__), "harbor", "cross-tab.py")
+        run = subprocess.run(
+            [sys.executable, cross_tab, b], capture_output=True, text=True
+        )
+        assert run.returncode == 0, run.stderr
+        line = "Harbor resolved 2/6; newt claimed completed 1; FALSE COMPLETIONS 1"
+        assert line in run.stdout, run.stdout
+        assert re.search(r"harbor=unknown", run.stdout), run.stdout
+
+    with tempfile.TemporaryDirectory() as c:
+        # A4: no config.json -> expected coverage is unknown, not `observed`.
+        agg = job(c, "0", "1", roster=False)
+        unknown = (agg["expected"], agg["missing"], agg["observed"])
+        assert unknown == (None, None, 6), agg
+
+    with tempfile.TemporaryDirectory() as d:
+        # A11: a complete single-attempt run keeps the historical record values.
+        open(os.path.join(d, "config.json"), "w").write(
+            json.dumps({"datasets": [{"task_names": ["p", "q"]}]})
+        )
+        trial(d, "p__1", "1.0", ok=1)
+        trial(d, "q__1", "0", ok=1)
+        agg = parse_run(d)
+        old = {"total": 2, "passed": 1, "mean_reward": 0.5, "passed_tasks": ["p"]}
+        assert {k: agg[k] for k in old} == old, agg
+        assert (agg["expected"], agg["graded"], agg["missing"]) == (2, 2, 0), agg
 
 
 if __name__ == "__main__":
