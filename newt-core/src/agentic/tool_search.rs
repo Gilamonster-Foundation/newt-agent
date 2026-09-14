@@ -33,6 +33,12 @@ const TOOL_SEARCH_DESCRIPTION: &str =
 /// for a small model's window; a too-broad query is told to refine).
 const MAX_MATCHES: usize = 12;
 
+/// Query terms that never score: they occur in nearly every description, so a
+/// query such as "read a file" matched almost the whole catalog and let noise
+/// crowd real matches out of [`MAX_MATCHES`] (#2332). Terms under two
+/// characters are dropped as well.
+const STOP_TERMS: &[&str] = &["a", "an", "the", "to", "of", "for", "in", "on", "my", "me"];
+
 /// Truncate a one-line description to this many chars (keeps each match to a
 /// single readable line).
 const DESC_MAX_CHARS: usize = 140;
@@ -159,7 +165,7 @@ fn search(query: &str, tools: Vec<ToolRec<'_>>) -> String {
     let terms: Vec<String> = query
         .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
+        .filter(|t| t.chars().count() >= 2 && !STOP_TERMS.contains(t))
         .map(str::to_string)
         .collect();
 
@@ -223,18 +229,34 @@ fn search(query: &str, tools: Vec<ToolRec<'_>>) -> String {
             .then_with(|| a.1.name.cmp(b.1.name))
     });
 
+    // Callable and not-callable entries are capped separately (#2332): a
+    // not-callable entry ranks among the callable ones but never takes a
+    // callable match's slot, so naming what is hidden cannot push out a tool
+    // the model may call.
+    let mut shown: Vec<&ToolRec> = Vec::new();
+    let (mut callable, mut hidden) = (0, 0);
+    for (_, r) in &scored {
+        let count = if r.callable {
+            &mut callable
+        } else {
+            &mut hidden
+        };
+        if *count < MAX_MATCHES {
+            *count += 1;
+            shown.push(r);
+        }
+    }
     let mut out = format!("Tools matching \"{query}\":\n");
-    for (_, r) in scored.iter().take(MAX_MATCHES) {
+    for r in &shown {
         out.push_str(&match_line(r));
         out.push('\n');
     }
-    if scored.len() > MAX_MATCHES {
+    if scored.len() > shown.len() {
         out.push_str(&format!(
             "…and {} more — refine the query.",
-            scored.len() - MAX_MATCHES
+            scored.len() - shown.len()
         ));
     }
-    let shown: Vec<&ToolRec> = scored.iter().take(MAX_MATCHES).map(|(_, r)| *r).collect();
     with_scope_note(out.trim_end().to_string(), shown)
 }
 
@@ -437,6 +459,67 @@ mod tests {
         let first = out.lines().nth(1).unwrap_or_default();
         assert!(first.starts_with("- read_file — Read a file"), "got: {out}");
         assert!(first.contains("[requires: path]"), "got: {out}");
+    }
+
+    /// Listing hidden tools must never push out a callable match that the
+    /// disposition-filtered search returns on its own. Under one shared cap,
+    /// "read a file" lost `where_is`, `experience_recall` and `list_dir` to the
+    /// higher-scoring `write_file`/`edit_file`/`delete_file` entries even with
+    /// [`STOP_TERMS`]; the separate caps in `search` are what hold this.
+    #[test]
+    fn hidden_entries_never_displace_a_callable_match() {
+        let explain = super::super::PromptDisposition::Explain;
+        let catalog = full_catalog();
+        let filtered = crate::agentic::filter_tools_for_disposition(catalog.clone(), explain);
+        let voices = super::super::DispositionVoices::default();
+        let matches = |out: &str| -> Vec<String> {
+            out.lines()
+                .filter_map(|line| line.strip_prefix("- "))
+                .filter(|line| !line.contains(voices.discovery_hidden.as_str()))
+                .filter_map(|line| line.split(" — ").next())
+                .map(str::to_string)
+                .collect()
+        };
+        let mut checked = 0;
+        for query in [
+            "read a file",
+            "search the code",
+            "list files",
+            "git log",
+            "fetch a url",
+            "notes",
+        ] {
+            let callable = matches(&execute_tool_search(query, &filtered));
+            checked += callable.len();
+            let mixed = execute_tool_search_for_disposition(query, &catalog, explain);
+            let shown = matches(&mixed);
+            let lost: Vec<&String> = callable.iter().filter(|t| !shown.contains(t)).collect();
+            assert!(
+                lost.is_empty(),
+                "{query:?}: hidden entries displaced {lost:?}: {mixed}"
+            );
+        }
+        // A parser that read nothing would pass the loop vacuously.
+        assert!(
+            checked > 12,
+            "only {checked} callable matches were compared"
+        );
+    }
+
+    /// Filler terms do not score: "read a file" ranks exactly like "read
+    /// file". Without [`STOP_TERMS`], "a" matches nearly every name and
+    /// description and reorders the whole result.
+    #[test]
+    fn filler_terms_do_not_score() {
+        let catalog = full_catalog();
+        let body = |query: &str| {
+            let out = execute_tool_search(query, &catalog);
+            out.split_once('\n')
+                .map(|(_, b)| b.to_string())
+                .unwrap_or_default()
+        };
+        assert_eq!(body("read a file"), body("read file"));
+        assert_eq!(body("search the code"), body("search code"));
     }
 
     #[test]
