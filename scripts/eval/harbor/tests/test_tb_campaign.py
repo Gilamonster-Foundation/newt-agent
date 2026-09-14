@@ -164,9 +164,10 @@ class Treatments(unittest.TestCase):
 
     def test_a_refused_requirement_is_read_from_the_exit_message(self):
         message = ("Command failed (exit 1): newt solve ...\nstdout: None\n"
-                   "stderr: Error: required feature `scratchpad` is unavailable: headless solve has no scratchpad opt-in")
+                   "stderr: Error: required feature `scratchpad` is unavailable: no --scratchpad-state was supplied")
+        # Wording from Feature::absence in newt-cli/src/solve_contract.rs (#2356).
         self.assertEqual(refusal(message),
-                         "required feature `scratchpad` is unavailable: headless solve has no scratchpad opt-in")
+                         "required feature `scratchpad` is unavailable: no --scratchpad-state was supplied")
         self.assertIsNone(refusal("Command failed (exit 1): streamed tool batch did not finish with tool_calls"))
         refused = [row(state="refused", claimed_done=True), row(state="refused", claimed_done=None)]
         s = summarize({"expected": 2, "model": "m"}, refused)  # never reached the model: no grade, no claim
