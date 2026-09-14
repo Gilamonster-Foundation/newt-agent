@@ -251,6 +251,9 @@ check:
     python3 scripts/docs_check.py --self-test >/dev/null || rc=1
     python3 scripts/docs_check.py --quiet || rc=1
     python3 scripts/docs_check.py --deleted-refs origin/main --quiet || rc=1
+    # PIPELINE PARITY: mirrors the "eval self-tests (eval-selftest)" step in
+    # .github/workflows/ci.yml's lint job.
+    just eval-selftest >/dev/null || rc=1
     exit $rc
 
 [windows]
@@ -303,7 +306,7 @@ readme-check:
 # run's per-task rewards to the manifest; `bench-gate` enforces the per-model
 # no-regression ratchet (exit 3 on a drop); `bench-publish` rewrites the README
 # scoreboard table. Every release: ingest → gate → publish. See
-# scripts/eval/bench_scoreboard.py (--self-test for its unit tests).
+# scripts/eval/bench_scoreboard.py (`just eval-selftest` for its unit tests).
 bench-ingest RUN_DIR MODEL FAMILY VERSION WINDOW DATE:
     python3 scripts/eval/bench_scoreboard.py ingest {{RUN_DIR}} \
         --model {{MODEL}} --family {{FAMILY}} --version {{VERSION}} \
@@ -318,7 +321,11 @@ bench-gate MODEL SCORE:
 bench-publish:
     python3 scripts/eval/bench_scoreboard.py render --readme README.md --no-queued
 
-bench-selftest:
+# Offline eval-ingestion self-tests (#2316): fixture Harbor runs through
+# parse_run and cross-tab.py. Stdlib Python, well under a second.
+# HOOK PARITY: runs inside `just check`; mirrors the "eval self-tests
+# (eval-selftest)" step in .github/workflows/ci.yml. Add a line to both.
+eval-selftest:
     python3 scripts/eval/bench_scoreboard.py --self-test
 
 # Build + test the out-of-workspace newt-mesh crate. Requires the

@@ -121,6 +121,13 @@ jobs:
       - name: deleted documents are not still referenced (docs-check)
         if: always() && github.event_name == 'pull_request'
         run: python3 scripts/docs_check.py --deleted-refs "${{ github.event.pull_request.base.sha }}"
+      # Bench ingestion (#2316): fixture Harbor runs through parse_run and
+      # cross-tab.py, so a collapsed attempt or a vanished trial fails here.
+      # HOOK PARITY: mirrored by the `eval-selftest` recipe, which `just check`
+      # runs via .githooks/pre-push. Add a line to both.
+      - name: eval self-tests (eval-selftest)
+        if: always()
+        run: python3 scripts/eval/bench_scoreboard.py --self-test
 
   test:
     name: Rust tests

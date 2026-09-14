@@ -27,6 +27,36 @@ Use a local, uncommitted copy of the
 [backend profile example](../tbench-profile.example.toml) for endpoint details
 and credentials. `NEWT_BENCH_TENACITY` is optional.
 
+## pi and Codex on the same endpoint
+
+[`pi_local.py`](pi_local.py) and [`codex_local.py`](codex_local.py) subclass
+Harbor's built-in `pi` and `codex` agents (#2318). Each writes a provider entry
+for a local OpenAI-compatible endpoint inside the task container, then runs the
+stock agent: pi gets `~/.pi/agent/models.json`, Codex gets
+`model_providers.local` in `$CODEX_HOME/config.toml`. `PiLocal` also installs the
+maintained `@earendil-works/pi-coding-agent`; Harbor 0.20 installs the deprecated
+package name, which is frozen at 0.73.1.
+
+```bash
+TB_LOCAL_BASE_URL=http://<endpoint>/v1 \
+TB_LOCAL_CONTEXT_WINDOW=<ctx-size as served> \
+PYTHONPATH=scripts/eval/harbor \
+harbor run --config <job.json>   # agents: pi_local:PiLocal or codex_local:CodexLocal
+```
+
+Set the job's `model_name` to `local/<model id as served>`. Both variables are
+required: without a window, pi assumes 128000 and Codex uses its own default.
+Export them into Harbor's own environment. Passing them with `--ae` records the
+endpoint in the job config. Keep `OPENAI_API_KEY` and `OPENAI_BASE_URL` unset:
+stock Codex copies the key into the container and appends the base URL to its
+config. Harbor still grades the task and records token usage from each
+harness's log.
+
+pi 0.85.1 exits 0 even when every model call failed, for example when the
+endpoint is unreachable. `PiLocal` reads its log with [`pi_log.py`](pi_log.py)
+and raises Harbor's `NonZeroAgentExitCodeError` in that case, so an infra
+failure is recorded as an agent error, not graded as the model's work.
+
 ## Smart-harness comparison
 
 [`smart-ab.sh`](smart-ab.sh) runs the plain arm, then the smart arm, using the

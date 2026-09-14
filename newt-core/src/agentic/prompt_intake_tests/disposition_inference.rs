@@ -254,3 +254,87 @@ fn analyze_with_applies_the_lexicon_and_keeps_ask_precedence() {
     let empty = PromptIntake::analyze_with("   ", &lex);
     assert_eq!(empty.disposition(), PromptDisposition::Ask);
 }
+
+/// #2332 / #2331 / #2283: a request phrased as a question is a request. These
+/// are the recorded prompts; each matched no needle and reached Explain only
+/// through the `?` fallback, so an install, a review, and a retry all lost the
+/// tools they needed. Each must now route exactly like its imperative form.
+#[test]
+fn a_request_phrased_as_a_question_routes_like_its_imperative() {
+    let mut misrouted = Vec::new();
+    for (question, imperative) in [
+        (
+            "Can you install skills for that herdr tool?",
+            "install skills for that herdr tool",
+        ),
+        // #2332 wrote this one as "change 42", which the `change` action needle
+        // already routes to Act; the recorded review reached Explain.
+        ("Can you review PR 42 for me?", "review PR 42 for me"),
+        (
+            "Could you fetch the release notes from the tracker?",
+            "fetch the release notes from the tracker",
+        ),
+        ("try now?", "try now"),
+        (
+            "Would you look at the failing job?",
+            "look at the failing job",
+        ),
+        // The opener is read per clause, not only at byte zero.
+        (
+            "Thanks for that. Can you review PR 42?",
+            "Thanks for that. review PR 42",
+        ),
+    ] {
+        let lex = DispositionLexicon::default();
+        assert_eq!(
+            infer(imperative, &lex),
+            PromptDisposition::Act,
+            "{imperative:?}"
+        );
+        if infer(question, &lex) != PromptDisposition::Act {
+            misrouted.push((question, infer(question, &lex)));
+        }
+    }
+    assert!(
+        misrouted.is_empty(),
+        "requests routed as answers: {misrouted:?}"
+    );
+}
+
+/// The twin of the test above, and the vacuous-green trap it closes: adding
+/// request words proves nothing unless genuine questions still stay answers.
+/// These stay out of `Act`, which also keeps them clear of the Act-only action
+/// nudges and self-verify gate (`agentic/mod.rs`, `action_nudges && … == Act`),
+/// so moving requests to Act hands no greeting or read-only answer a test
+/// obligation (#2324).
+#[test]
+fn a_genuine_question_stays_an_answer() {
+    let lex = DispositionLexicon::default();
+    for question in [
+        "How do I install a skill?",
+        "What does tool_search do?",
+        "hello?",
+        "What can you do?",
+        "Can you explain how prompt intake works?",
+        "Could you tell me what the herdr tool does?",
+        "Thanks. How do I install a skill?",
+    ] {
+        assert_eq!(
+            infer(question, &lex),
+            PromptDisposition::Explain,
+            "{question:?} is a question, not a request"
+        );
+    }
+}
+
+/// Recorded, not endorsed: a capability question opening with a request opener
+/// now reaches Act, so it enters the Act-only action nudges and self-verify
+/// gate. Whether a test is owed belongs to #2324, which decides it from the
+/// task rather than the disposition; this fixture hands that lane the case.
+#[test]
+fn a_capability_question_with_a_request_opener_reaches_act_for_2324() {
+    assert_eq!(
+        infer("Can you read Python?", &DispositionLexicon::default()),
+        PromptDisposition::Act
+    );
+}
