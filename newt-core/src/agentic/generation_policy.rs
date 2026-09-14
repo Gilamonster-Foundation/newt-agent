@@ -70,6 +70,9 @@ impl GenerationPolicy {
         if capability.cognition != Some(true) {
             return policy;
         }
+        // A projecting endpoint accepts the cap field, so an explicit allowance
+        // is sent even with no dial; thinking and sampling still need one.
+        policy.max_output_tokens = output_allowance;
         let Some(cognition) = cognition else {
             return policy;
         };
@@ -200,6 +203,25 @@ mod tests {
             },
             resolve(None)
         );
+    }
+
+    #[test]
+    fn projecting_endpoint_sends_an_explicit_allowance_without_a_dial() {
+        let policy = GenerationPolicy::resolve(
+            None,
+            Some(3_000),
+            local_capability(),
+            ReasoningReplayScope::Never,
+        );
+        assert_eq!(policy.max_output_tokens, Some(3_000));
+        assert_eq!(policy.output_allowance, Some(3_000));
+        assert_eq!(policy.thinking, None);
+        assert_eq!(policy.temperature, None);
+        assert_eq!(policy.top_p, None);
+        // No dial and no override: nothing to send (defaults unchanged).
+        let unset =
+            GenerationPolicy::resolve(None, None, local_capability(), ReasoningReplayScope::Never);
+        assert_eq!(unset.max_output_tokens, None);
     }
 
     #[test]

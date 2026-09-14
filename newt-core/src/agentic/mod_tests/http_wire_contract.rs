@@ -453,9 +453,12 @@ async fn openai_chat_omits_local_cognition_fields_for_an_unknown_endpoint() {
     }
 }
 
-/// Dispatch one capable Chat Completions turn at `Deliberating` with the given
+/// Dispatch one capable Chat Completions turn at `cognition` with the given
 /// explicit output allowance and return every request body the server saw.
-async fn capable_chat_bodies(output_allowance: Option<u32>) -> Vec<serde_json::Value> {
+async fn capable_chat_bodies(
+    cognition: Option<crate::role_profile::Cognition>,
+    output_allowance: Option<u32>,
+) -> Vec<serde_json::Value> {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
@@ -469,7 +472,7 @@ async fn capable_chat_bodies(output_allowance: Option<u32>) -> Vec<serde_json::V
     let uri = server.uri();
     let mut c = ctx(&uri, &messages, &caveats);
     c.kind = BackendKind::Openai;
-    c.cognition = Some(crate::role_profile::Cognition::Deliberating);
+    c.cognition = cognition;
     c.output_allowance = output_allowance;
     c.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
         cognition: Some(true),
@@ -501,9 +504,10 @@ async fn capable_chat_bodies(output_allowance: Option<u32>) -> Vec<serde_json::V
 /// override the cognition table still supplies the historical 10,000.
 #[tokio::test]
 async fn openai_chat_output_allowance_varies_only_the_cap_field() {
-    let default_bodies = capable_chat_bodies(None).await;
-    let small_bodies = capable_chat_bodies(Some(3_000)).await;
-    let large_bodies = capable_chat_bodies(Some(12_000)).await;
+    let deliberating = Some(crate::role_profile::Cognition::Deliberating);
+    let default_bodies = capable_chat_bodies(deliberating, None).await;
+    let small_bodies = capable_chat_bodies(deliberating, Some(3_000)).await;
+    let large_bodies = capable_chat_bodies(deliberating, Some(12_000)).await;
     assert!(!default_bodies.is_empty());
     assert_eq!(default_bodies.len(), small_bodies.len());
     assert_eq!(default_bodies.len(), large_bodies.len());
@@ -530,5 +534,34 @@ async fn openai_chat_output_allowance_varies_only_the_cap_field() {
         assert_eq!(default["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(small, default);
         assert_eq!(large, default);
+    }
+}
+
+/// #2312 (A1, no dial): a cognition-projecting endpoint accepts the cap field,
+/// so an explicit allowance is SENT even when no cognition dial is set, while
+/// thinking and sampling stay unset. Without this arm the only way to put a
+/// cap on the wire was to set a dial, which also moves thinking/temperature/
+/// top_p. With no allowance the body carries no cap at all (defaults intact).
+#[tokio::test]
+async fn openai_chat_output_allowance_is_sent_without_a_cognition_dial() {
+    let unset = capable_chat_bodies(None, None).await;
+    let capped = capable_chat_bodies(None, Some(3_000)).await;
+    assert!(!unset.is_empty());
+    assert_eq!(unset.len(), capped.len());
+    for (unset, mut capped) in unset.into_iter().zip(capped) {
+        for field in ["max_tokens", "temperature", "top_p", "chat_template_kwargs"] {
+            assert!(
+                unset.get(field).is_none(),
+                "no allowance, no dial: `{field}`"
+            );
+        }
+        assert_eq!(
+            capped
+                .as_object_mut()
+                .expect("object body")
+                .remove("max_tokens"),
+            Some(serde_json::json!(3_000))
+        );
+        assert_eq!(capped, unset, "only `max_tokens` may differ");
     }
 }
