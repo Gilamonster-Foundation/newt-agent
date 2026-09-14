@@ -366,6 +366,26 @@ impl InferenceBackend for ProviderPluginBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2313: a provider plugin is how cloud models reach Newt, and it has no
+    /// endpoint. A family-shaped id through it (`deepseek-chat`) must price as
+    /// unknown — a missing endpoint is not evidence of a local backend.
+    #[test]
+    fn a_cloud_provider_plugin_prices_a_family_named_model_as_unknown() {
+        let plugin =
+            ProviderPluginBackend::new("openai", "newt-provider-openai", "deepseek-chat", vec![]);
+        let usage = newt_core::TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+        };
+        assert!(!plugin.is_local());
+        let cost = newt_core::PricingConfig::default().estimate_cost(
+            "deepseek-chat",
+            plugin.is_local(),
+            Some(&usage),
+        );
+        assert_eq!(cost, None);
+    }
     use newt_core::Caveats;
     use newt_identity::{load_or_generate, plugin_child_metadata, session_root};
     use std::path::{Path, PathBuf};

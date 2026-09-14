@@ -224,6 +224,10 @@ impl InferenceBackend for EmbeddedBackend {
         None
     }
 
+    fn in_process(&self) -> bool {
+        true
+    }
+
     async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatReply> {
         self.complete_until(req, None).await
     }
@@ -512,6 +516,32 @@ mod tests {
         std::fs::write(dir.path().join("tokenizer.json"), b"{}").unwrap();
         let backend = EmbeddedBackend::new_cpu("qwen2.5-0.5b", gguf).unwrap();
         assert!(matches!(backend.device, Some(candle_core::Device::Cpu)));
+    }
+
+    /// #2313: the embedded engine is local because it runs in-process — a
+    /// fact of this backend, not inferred from its missing endpoint — so a
+    /// local model family served by it is a confirmed zero cost.
+    #[test]
+    fn the_embedded_backend_is_local_and_prices_a_local_family_as_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let gguf = dir.path().join("model.gguf");
+        std::fs::write(&gguf, b"placeholder").unwrap();
+        std::fs::write(dir.path().join("tokenizer.json"), b"{}").unwrap();
+        let backend = EmbeddedBackend::new_cpu("qwen2.5-0.5b", gguf).unwrap();
+        assert_eq!(backend.endpoint(), None);
+        assert!(backend.is_local());
+        let usage = newt_core::TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+        };
+        assert_eq!(
+            newt_core::PricingConfig::default().estimate_cost(
+                "qwen3:8b",
+                backend.is_local(),
+                Some(&usage)
+            ),
+            Some(0.0)
+        );
     }
 
     /// Grounds manifest identity in the exact reader/tokenizer used by the

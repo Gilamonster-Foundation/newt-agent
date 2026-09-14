@@ -62,15 +62,16 @@ pub fn is_owned_host(host: &str) -> bool {
     is_owned_with(host, OWNED_SUFFIXES.get().map_or(&[], Vec::as_slice))
 }
 
-/// Is an inference call served by the operator's own machinery? An empty
-/// endpoint is an in-process backend (`kind = "embedded"` has no URL), which is
-/// local by construction; otherwise the endpoint's host must be owned. An
-/// endpoint that does not parse is not local.
+/// Is an inference call served by the operator's own machinery? True for an
+/// in-process backend (the embedded engine — a fact the caller takes from the
+/// backend itself), or when the endpoint's host is owned. A missing or empty
+/// endpoint is NOT evidence of locality: a cloud provider plugin has none
+/// either. An endpoint that does not parse is not local.
 #[must_use]
-pub fn inference_is_local(endpoint: &str) -> bool {
-    endpoint.is_empty()
-        || reqwest::Url::parse(endpoint)
-            .ok()
+pub fn inference_is_local(in_process: bool, endpoint: Option<&str>) -> bool {
+    in_process
+        || endpoint
+            .and_then(|endpoint| reqwest::Url::parse(endpoint).ok())
             .and_then(|url| url.host_str().map(is_owned_host))
             .unwrap_or(false)
 }
@@ -108,16 +109,21 @@ mod tests {
 
     #[test]
     fn inference_locality_reads_the_endpoint_host() {
-        assert!(!inference_is_local("https://api.moonshot.ai"));
-        assert!(!inference_is_local("https://ollama.com"));
-        assert!(inference_is_local("http://gpu.home.arpa:8080"));
-        assert!(inference_is_local("http://inference:8000"));
-        assert!(inference_is_local("http://127.0.0.1:8000"));
-        assert!(inference_is_local("http://[fd00::1]:8000"));
-        assert!(inference_is_local("http://[fe80::1]:8000"));
-        // In-process (embedded) has no URL; garbage is never local.
-        assert!(inference_is_local(""));
-        assert!(!inference_is_local("not a url"));
+        let remote = |endpoint| inference_is_local(false, Some(endpoint));
+        assert!(!remote("https://api.moonshot.ai"));
+        assert!(!remote("https://ollama.com"));
+        assert!(remote("http://gpu.home.arpa:8080"));
+        assert!(remote("http://inference:8000"));
+        assert!(remote("http://127.0.0.1:8000"));
+        assert!(remote("http://[fd00::1]:8000"));
+        assert!(remote("http://[fe80::1]:8000"));
+        // A missing URL is not evidence of locality (a cloud provider plugin
+        // has none either); garbage is never local.
+        assert!(!remote(""));
+        assert!(!remote("not a url"));
+        assert!(!inference_is_local(false, None));
+        // Only the backend's own in-process fact makes an endpoint-less call local.
+        assert!(inference_is_local(true, None));
     }
 
     #[test]

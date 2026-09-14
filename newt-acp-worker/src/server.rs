@@ -453,8 +453,7 @@ impl AcpServer {
             usage: reply.usage,
             cost_usd: pricing.estimate_cost(
                 &reply.model_id,
-                // No endpoint is an in-process backend.
-                newt_core::owned_hosts::inference_is_local(self.backend.endpoint().unwrap_or("")),
+                self.backend.is_local(),
                 reply.usage.as_ref(),
             ),
             model_id: reply.model_id.clone(),

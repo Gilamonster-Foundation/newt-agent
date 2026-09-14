@@ -9,7 +9,8 @@
 //!
 //! A known local model family (gemma, llama, qwen, mistral, deepseek, …) is
 //! free (`0.0`, displayed "free (local)") ONLY when the call was served
-//! locally — an in-process backend or an endpoint whose host the operator owns
+//! locally — the in-process embedded backend or an endpoint whose host the
+//! operator owns
 //! ([`crate::owned_hosts::inference_is_local`]). The same family-shaped id on a
 //! hosted endpoint (`deepseek-chat` at a provider's API) is not a local model:
 //! its price is unknown, `None`, displayed "cost unknown" — never a confirmed

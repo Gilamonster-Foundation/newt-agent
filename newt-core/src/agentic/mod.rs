@@ -343,7 +343,7 @@ use trim::{
 /// may already have consumed the full configured inference bound and may be billable.
 /// All thresholds remain overridable through the standard `NEWT_HTTP_*` vars.
 fn tui_retry_policy(endpoint: &str) -> RetryPolicy {
-    if crate::owned_hosts::inference_is_local(endpoint) {
+    if crate::owned_hosts::inference_is_local(false, Some(endpoint)) {
         RetryPolicy::for_local_inference()
     } else {
         RetryPolicy::for_hosted_inference()
