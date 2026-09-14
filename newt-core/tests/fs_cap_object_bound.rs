@@ -47,12 +47,24 @@ fn open_regular_preserves_containment_and_explicit_final_link_policy() {
     symlink("file", ws.path().join("link")).unwrap();
     symlink(outside.path(), ws.path().join("escape")).unwrap();
     let dir = WorkspaceDir::open_root(ws.path()).unwrap();
-    for (path, nofollow) in [("file", true), ("link", false)] {
+    let mut text = String::new();
+    dir.open_regular(Path::new("file"), true)
+        .unwrap()
+        .read_to_string(&mut text)
+        .unwrap();
+    assert_eq!(text, "inside");
+    // A contained final link, followed explicitly: Linux resolves it beneath
+    // the root (`RESOLVE_BENEATH`); macOS's descriptor walk conservatively
+    // refuses even in-tree links (module docs), and mutation verification
+    // reports that as "unavailable" rather than reading through it — the same
+    // split `physical_read_scopes_and_final_links_do_not_disclose_outside_
+    // contents` pins from the consumer side.
+    let followed = dir.open_regular(Path::new("link"), false);
+    if cfg!(target_os = "macos") {
+        assert!(followed.is_err());
+    } else {
         let mut text = String::new();
-        dir.open_regular(Path::new(path), nofollow)
-            .unwrap()
-            .read_to_string(&mut text)
-            .unwrap();
+        followed.unwrap().read_to_string(&mut text).unwrap();
         assert_eq!(text, "inside");
     }
     assert!(dir.open_regular(Path::new("link"), true).is_err());
