@@ -1670,7 +1670,7 @@ fn session_body(
     // #1021: seed the shipped gila-personal-assistant skill (best-effort — a
     // seeding failure shouldn't block the session; the persona's declared
     // `skills:` binding would just warn as unresolved instead).
-    if let Err(e) = ensure_default_skills() {
+    if let Err(e) = ensure_default_skills(&cfg) {
         print_newt(
             &format!("warning: could not seed default skills: {e}"),
             color,

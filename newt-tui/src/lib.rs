@@ -4625,12 +4625,14 @@ fn warn_on_missing_bound_skills(
 /// unboxing) and that must never break `cargo build`.
 const GILA_SKILL: &str = include_str!("../assets/bundled-skills/gila-personal-assistant/SKILL.md");
 
-/// Seed [`GILA_SKILL`] into the default skill directory
-/// (`newt_skills::default_skills_dir()`, i.e. `~/.newt/skills`) if missing. A
-/// `None` default dir (unresolvable `$HOME`) is a silent no-op, matching how
+/// Seed [`GILA_SKILL`] into the skill install dir
+/// ([`newt_core::Config::skill_install_dir`]: the first `[skills].search`
+/// entry, else `~/.newt/skills`) if missing, so the seeded skill is on the
+/// search path the persona binding is checked against (#2331). A `None`
+/// install dir (unresolvable `$HOME`) is a silent no-op, matching how
 /// `current_host_boot`-style host lookups degrade elsewhere in this codebase.
-fn ensure_default_skills() -> anyhow::Result<()> {
-    match newt_skills::default_skills_dir() {
+fn ensure_default_skills(cfg: &newt_core::Config) -> anyhow::Result<()> {
+    match cfg.skill_install_dir() {
         Some(dir) => seed_gila_skill(&dir),
         None => Ok(()),
     }
@@ -5027,13 +5029,11 @@ fn build_system_prompt_with_persona(
     // Progressive disclosure: inject ONLY the skills index (one
     // `name: description (when to use: …)` line per installed skill) — never
     // the bodies. Bodies load on demand when the model calls the `use_skill`
-    // tool. Skills come from the configured search path (`[skills].search`,
-    // default `~/.newt/skills`); a missing dir contributes nothing.
-    // `with_bundled_default` fills an unset `[skills].bundled_dir` from the
-    // repo's `.newt/bundled-skills` when running inside a checkout, so bundled
-    // skills are surfaced to the model out-of-the-box.
+    // tool. Skills come from the one resolver `use_skill` also reads (#2331):
+    // `[skills].search` (default `~/.newt/skills`), then the bundled dir; a
+    // missing dir contributes nothing.
     let skills_dirs = newt_core::Config::resolve()
-        .map(|c| c.with_bundled_default().skill_search_dirs())
+        .map(|c| c.skill_search_dirs())
         .unwrap_or_default();
     if let Some(index) = skills_index_for_prompt(&skills_dirs) {
         ctx.push('\n');
