@@ -102,6 +102,9 @@ _SELF_VERIFY = os.environ.get("NEWT_BENCH_SELF_VERIFY", "")
 # workspace tool grant AND survives the container for the cross-tab. The
 # profile must carry a `[smart_harness]` block; the adapter only adds the flag.
 _SMART = os.environ.get("NEWT_BENCH_SMART", "")
+# Operator-declared model digest (#2318): newt records NEWT_MODEL_DIGEST in its
+# contract's `model_digest`. Declared, not verified — the server exposes none.
+_MODEL_DIGEST = os.environ.get("NEWT_BENCH_MODEL_DIGEST", "")
 
 
 def _container_env_prefix() -> str:
@@ -117,6 +120,8 @@ def _container_env_prefix() -> str:
         parts.append("NEWT_HTTP_BACKOFF_MAX_MS=30000")
     if _SELF_VERIFY.strip().lower() in ("1", "true", "on", "yes"):
         parts.append("NEWT_SELF_VERIFY=1")
+    if _MODEL_DIGEST.strip():
+        parts.append(f"NEWT_MODEL_DIGEST={shlex.quote(_MODEL_DIGEST.strip())}")
     return (" ".join(parts) + " ") if parts else ""
 
 
