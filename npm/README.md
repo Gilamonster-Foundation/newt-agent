@@ -21,7 +21,7 @@ ported from the [scrybe](https://github.com/hartsock/scrybe) reference shim
 - **No `postinstall`.** The binary arrives as a normal optional dependency —
   hermetic, offline-cacheable.
 - **`platforms.json`** lists the supported release targets: `darwin-arm64`,
-  `linux-x64` (glibc), and `win32-x64`. `sync-versions.mjs` stamps exact pins at
+  `linux-x64` (glibc ≥ 2.39 — the release builder's; older hosts get a named error), and `win32-x64`. `sync-versions.mjs` stamps exact pins at
   release, after checking the version against `Cargo.toml`.
 - **Process forwarding.** The shim passes arguments and standard streams to
   the binary and preserves its exit status. On Unix it forwards `SIGINT`,

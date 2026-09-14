@@ -73,7 +73,10 @@ jobs:
 
   build-binaries:
     name: Build (${{ matrix.label }})
-    needs: [mcp-import-acceptance, npm-preflight]
+    # npm-preflight gates only the npm lane (build-npm), not the binaries: a
+    # tag the npm version check rejects must not take the GitHub release,
+    # deb/rpm, brew, choco or crates lanes down with it.
+    needs: [mcp-import-acceptance]
     strategy:
       fail-fast: false
       matrix:
@@ -680,7 +683,7 @@ jobs:
   build-npm:
     name: npm binary (${{ matrix.key }})
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-binaries]
+    needs: [build-binaries, npm-preflight]
     permissions:
       contents: read
       id-token: write        # npm provenance + OIDC trusted publishing

@@ -32,6 +32,19 @@ function binaryFile(entry) {
   return entry.os === 'win32' ? `${BINARY}.exe` : BINARY;
 }
 
+// "2.36" >= "2.39"? Numeric per component; a malformed runtime string counts
+// as too old, never as new enough.
+function glibcAtLeast(runtime, min) {
+  const parse = (v) => String(v).split('.').map((n) => Number.parseInt(n, 10));
+  const [r, m] = [parse(runtime), parse(min)];
+  for (let i = 0; i < Math.max(r.length, m.length); i += 1) {
+    const a = Number.isNaN(r[i]) ? -1 : (r[i] ?? 0);
+    const b = m[i] ?? 0;
+    if (a !== b) return a > b;
+  }
+  return true;
+}
+
 function binaryPath() {
   const key = platformKey();
   const entry = entryForCurrentPlatform();
@@ -45,11 +58,23 @@ function binaryPath() {
     );
   }
 
-  if (entry.libc === 'glibc' && !process.report?.getReport?.()?.header?.glibcVersionRuntime) {
-    throw new Error(
-      `${BINARY}: this Linux binary requires glibc; this Node runtime did not report glibc.\n` +
-        `Install from source instead:  ${REPO}`
-    );
+  if (entry.libc === 'glibc') {
+    const runtime = process.report?.getReport?.()?.header?.glibcVersionRuntime;
+    if (!runtime) {
+      throw new Error(
+        `${BINARY}: this Linux binary requires glibc; this Node runtime did not report glibc.\n` +
+          `Install from source instead:  ${REPO}`
+      );
+    }
+    // The prebuilt binary is linked against the glibc of the release builder
+    // (platforms.json `glibcMin`). Older hosts would install cleanly and then
+    // die in ld.so with "version GLIBC_x.y not found"; say so up front.
+    if (entry.glibcMin && !glibcAtLeast(runtime, entry.glibcMin)) {
+      throw new Error(
+        `${BINARY}: this Linux binary requires glibc >= ${entry.glibcMin}; this host has glibc ${runtime}.\n` +
+          `Install from source instead:  ${REPO}`
+      );
+    }
   }
 
   const pkg = `${SHIM}-${entry.key}`;

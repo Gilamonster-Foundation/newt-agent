@@ -137,6 +137,20 @@ for (const shim of SHIMS) {
     assert.throws(() => binaryPath(), /requires glibc[\s\S]*Install from source/);
   });
 
+  test(`${shim}: glibc-only Linux binaries refuse a host older than the release builder`, () => {
+    const host = (glibc) => ({
+      platform: 'linux', arch: 'x64', report: { getReport: () => ({ header: { glibcVersionRuntime: glibc } }) },
+    });
+    const { binaryPath, PLATFORMS } = resolverForHost(shim, host('2.36'));
+    const floor = PLATFORMS.find((p) => p.key === 'linux-x64').glibcMin;
+    assert.ok(floor, 'linux-x64 declares the release builder glibc as glibcMin');
+    assert.throws(() => binaryPath(), new RegExp(`requires glibc >= ${floor.replace('.', '\\.')}[\\s\\S]*host has glibc 2\\.36[\\s\\S]*Install from source`));
+    // At the floor the libc gate passes; only the (absent) platform package stops it.
+    assert.throws(() => resolverForHost(shim, host(floor)).binaryPath(), /platform package .* is not installed/);
+    // A newer major/minor passes too — numeric compare, not string compare.
+    assert.throws(() => resolverForHost(shim, host('2.41')).binaryPath(), /platform package .* is not installed/);
+  });
+
   test(`${shim}: missing-package guidance installs the matching shim`, { skip: !currentPlatform }, () => {
     const { binaryPath } = require(join(root, shim, 'lib', 'binary.cjs'));
     assert.throws(() => binaryPath(), (err) => {

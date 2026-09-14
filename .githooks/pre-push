@@ -177,6 +177,12 @@ if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
     exit 1
 fi
 
+if ! command -v npm >/dev/null 2>&1; then
+    echo "pre-push: 'npm' not found in PATH"
+    echo "          'just check' runs the npm shim tests (Node 22) — see npm/README.md"
+    exit 1
+fi
+
 # Coverage gate: only runs when rustup llvm-tools-preview is available.
 # Homebrew Rust ships with a different LLVM version that reports ~6% lower
 # line coverage for this codebase than the CI's rustup toolchain, causing
