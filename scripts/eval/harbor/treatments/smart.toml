@@ -1,0 +1,16 @@
+description = "Smart harness on, adjudicated by the primary model over the same endpoint (#2260/#2263)"
+profile = '''
+[smart_harness]
+enabled = true
+
+[smart_harness.backend]
+endpoint = "{{ENDPOINT}}"
+model = "{{MODEL}}"
+kind = "openai"
+'''
+
+[env]
+NEWT_BENCH_SMART = "1"
+
+[expect]
+"effective_config.smart_harness" = "*"

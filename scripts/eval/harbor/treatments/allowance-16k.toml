@@ -1,0 +1,8 @@
+description = "Output allowance 16384 (#2312), the cap pi sends; tests whether an uncapped generation is what fails newt"
+# Not yet observable in newt's contract: the resolved allowance is a TODO(#2312)
+# in generation_policy.rs. Verify the wire carries the cap before spending GPU.
+profile = '''
+[[model_tuning]]
+model = "{{MODEL}}"
+output_allowance = 16384
+'''
