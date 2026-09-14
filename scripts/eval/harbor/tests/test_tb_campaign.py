@@ -16,7 +16,8 @@ def jl(*records):
 
 def row(**kw):
     base = dict(graded=True, resolved=False, claimed_done=True, exception=None,
-                model_effective="m", tokens_in=None, tokens_out=None, agent_s=None)
+                model_effective="m", tokens_in=None, tokens_out=None, agent_s=None,
+                max_request_output_tokens=None)
     return {**base, **kw}
 
 
@@ -60,13 +61,15 @@ class Summary(unittest.TestCase):
             row(graded=False, exception="AgentSetupError"),       # ungraded
             row(model_effective="other"),                         # ran another model
             row(graded=False, state="error"),                     # pi exit-0 inference failure
+            row(claimed_done=False, exception="AgentTimeoutError", max_request_output_tokens=96345),
         ]
         s = summarize({"expected": 9, "model": "m"}, rows)
-        self.assertEqual((s["expected"], s["observed"], s["graded"]), (9, 7, 5))
+        self.assertEqual((s["expected"], s["observed"], s["graded"]), (9, 8, 6))
         self.assertEqual((s["resolved"], s["claimed"]), (2, 3))
         self.assertEqual((s["false_completions"], s["false_incompletes"]), (2, 1))
-        self.assertEqual((s["unrecoverable_claims"], s["exceptions"], s["model_mismatches"]), (1, 1, 1))
+        self.assertEqual((s["unrecoverable_claims"], s["exceptions"], s["model_mismatches"]), (1, 2, 1))
         self.assertEqual(s["inference_errors"], 1)
+        self.assertEqual((s["agent_timeouts"], s["max_request_output"]), (1, 96345))
         self.assertEqual(s["tokens_in"], (0, 0))  # none known: count 0, not a zero cost
 
 

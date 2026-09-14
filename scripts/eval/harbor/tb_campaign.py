@@ -78,6 +78,30 @@ def claim(harness, agent_dir: Path, exception):
     return None, f"unrecoverable: no claim in {name}" + (f" ({exception})" if exception else "")
 
 
+def max_request_output(harness, agent_dir: Path):
+    """Largest output a single model request produced, where the log shows it.
+    pi logs usage per assistant message; codex logs last_token_usage per request
+    in its session; newt's contract only totals, so newt is None (not logged)."""
+    if harness == "pi":
+        log = agent_dir / "pi.txt"
+        lines = log.read_text(errors="replace").splitlines() if log.exists() else []
+        outs = [
+            ((o.get("message") or {}).get("usage") or {}).get("output")
+            for o in _records(lines)
+            if o.get("type") == "message_end" and (o.get("message") or {}).get("role") == "assistant"
+        ]
+    elif harness == "codex":
+        outs = [
+            ((((o.get("payload") or {}).get("info") or {}).get("last_token_usage")) or {}).get("output_tokens")
+            for f in sorted((agent_dir / "sessions").rglob("*.jsonl"))
+            for o in _records(f.read_text(errors="replace").splitlines())
+        ]
+    else:
+        return None
+    outs = [n for n in outs if isinstance(n, int)]
+    return max(outs) if outs else None
+
+
 def _seconds(span):
     try:
         a, b = (datetime.fromisoformat(span[k].replace("Z", "+00:00")) for k in ("started_at", "finished_at"))
@@ -136,6 +160,7 @@ def trial_row(harness, trial: Path):
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
         "tokens_source": source,
+        "max_request_output_tokens": max_request_output(harness, trial / "agent"),
         "agent_s": _seconds(r.get("agent_execution")),
     }
 
@@ -182,6 +207,10 @@ def summarize(cell, rows):
         "unrecoverable_claims": sum(r["claimed_done"] is None for r in rows),
         "exceptions": sum(r["exception"] is not None for r in rows),
         "inference_errors": sum(r.get("state") == "error" for r in rows),
+        "agent_timeouts": sum(r["exception"] == TIMEOUT for r in rows),
+        "max_request_output": max(
+            (r["max_request_output_tokens"] for r in rows if r.get("max_request_output_tokens") is not None), default=None
+        ),
         "model_mismatches": sum(r["model_effective"] not in (None, cell["model"]) for r in rows),
         "tokens_in": (sum(known_in), len(known_in)),
         "tokens_out": (sum(known_out), len(known_out)),
@@ -197,8 +226,8 @@ def table(out: Path):
     trials = out / "trials.jsonl"
     rows = list(_records(trials.read_text().splitlines())) if trials.exists() else []
     lines = [
-        "| model | harness | expected / observed / graded | resolved | rate [95% Wilson] | claimed done | false completions | false incompletes | unrecoverable claims | exceptions | inference errors (ungraded) | ran another model | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| model | harness | expected / observed / graded | resolved | rate [95% Wilson] | claimed done | false completions | false incompletes | unrecoverable claims | exceptions | inference errors (ungraded) | agent timeouts | largest single-request output | ran another model | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     # The last record per job wins: a cell skipped once and run later shows the run.
     cells = {c["job"]: c for c in _records((out / "cells.jsonl").read_text().splitlines())}
@@ -212,11 +241,12 @@ def table(out: Path):
         med = f"{s['agent_s_median']:.0f}" if s["agent_s_median"] is not None else "—"
         tps = f"{s['out_tok_per_agent_s']:.1f}" if s["out_tok_per_agent_s"] is not None else "—"
         fc = f"{s['false_completions']}/{s['claimed']}" if s["claimed"] else "0/0"
+        big = f"{s['max_request_output']:,}" if s["max_request_output"] is not None else "not logged"
         tin, tout = (f"{t[0]:,} ({t[1]})" if t[1] else "— (0)" for t in (s["tokens_in"], s["tokens_out"]))
         lines.append(
             f"| {cell['model']} | {cell['harness']} {cell.get('harness_version') or ''} "
             f"| {s['expected']} / {s['observed']} / {g} | {s['resolved']} | {rate} | {s['claimed']} | {fc} "
-            f"| {s['false_incompletes']} | {s['unrecoverable_claims']} | {s['exceptions']} | {s['inference_errors']} | {s['model_mismatches']} | {tin} "
+            f"| {s['false_incompletes']} | {s['unrecoverable_claims']} | {s['exceptions']} | {s['inference_errors']} | {s['agent_timeouts']} | {big} | {s['model_mismatches']} | {tin} "
             f"| {tout} | {med} / {s['agent_s_total']:.0f} | {tps} |"
         )
     print("\n".join(lines))
