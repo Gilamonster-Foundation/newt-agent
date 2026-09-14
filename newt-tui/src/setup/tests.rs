@@ -2480,9 +2480,11 @@ async fn hosted_provider_custom_endpoint_uses_supplied_base_url() {
     assert_eq!(dropin.effective_model(), Some("example/model-a"));
     assert_eq!(dropin.kind, Some(BackendKind::Openai));
     assert!(dropin.api_key_file.is_some());
+    // The menu renders `[0] label` since #1915 (C0c); this weekly-tier copy
+    // of that assertion kept the old "0) label" and went red unseen.
     assert!(console
         .transcript()
-        .contains("0) I have a URL (custom endpoint)"));
+        .contains("[0] I have a URL (custom endpoint)"));
     assert!(!console.transcript().contains("test-remote-key"));
 
     newt_core::secrets::session().reset_for_test();
