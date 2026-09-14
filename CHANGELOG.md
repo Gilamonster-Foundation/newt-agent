@@ -9,6 +9,31 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Changed — inference usage is retained at the summarizer boundary; unpriced cost is unknown (#2313, PR 1)
+
+- **`SummarizeFuture` now yields `(text, Option<TokenUsage>)`.** The external
+  smart-harness auxiliary, the TUI HTTP compaction summarizer (Ollama and
+  OpenAI shapes) and the embedded summarizer keep the usage their backend
+  reported instead of discarding it while adapting the reply to text. Missing
+  usage stays `None`. Recording it per attempt is PR 2.
+- **Usage without a price renders `cost unknown`, not `free (local)`.** Only a
+  confirmed zero rate (a known local model family, or an override) is free, and
+  `cost_usd` stays omitted when unknown.
+
+### Added — output allowance independent of cognition (#2312, PR 1)
+
+- **`[[model_tuning]] output_allowance`** sets a per-model output-token
+  allowance while cognition, thinking and sampling stay unchanged. The
+  allowance is resolved once, with precedence explicit value > cognition table >
+  wire default. The wire default is Anthropic's `NEWT_ANTHROPIC_MAX_TOKENS`,
+  else 8192, and that env var now ranks lowest. The resolved value feeds the
+  Chat Completions policy, the Responses budget state, the Ollama, Chat and
+  Anthropic ceilings, and `initial_context_input_budget`. The cap is sent only
+  where the endpoint declares it: cognition-capable Chat as `max_tokens`, and
+  Anthropic, which requires the field. Elsewhere, including the Responses API,
+  it is a local reserve only. Defaults are unchanged when the key is unset.
+  Reporting the allowance in the solve contract is a follow-up.
+
 ### Added — smart harness: durable frames, host-validated adjudication, `newt frame` forensics (#2246, #2251, #2260, #2263)
 
 - **`agent-frame` incubates here as a workspace leaf (#2246).** A unit's

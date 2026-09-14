@@ -34,7 +34,7 @@ fn stub_summarizer(
     reply: &'static str,
 ) -> impl Fn(String) -> crate::agentic::SummarizeFuture + Send + Sync {
     move |_req: String| -> crate::agentic::SummarizeFuture {
-        Box::pin(async move { Ok(reply.to_string()) })
+        Box::pin(async move { Ok((reply.to_string(), None)) })
     }
 }
 
@@ -46,7 +46,7 @@ fn capturing_summarizer(
 ) -> impl Fn(String) -> crate::agentic::SummarizeFuture + Send + Sync {
     move |req: String| -> crate::agentic::SummarizeFuture {
         calls.lock().unwrap().push(req);
-        Box::pin(async move { Ok(reply.to_string()) })
+        Box::pin(async move { Ok((reply.to_string(), None)) })
     }
 }
 

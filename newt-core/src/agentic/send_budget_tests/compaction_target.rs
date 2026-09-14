@@ -83,7 +83,7 @@ fn recovery_compaction_target_cannot_exceed_the_next_preflight() {
     let d = ResponsesBudgetState::new(
         Some(16_000),
         80,
-        Some(Cognition::Contemplating),
+        resolve_output_allowance(None, Some(Cognition::Contemplating)),
         None,
         None,
         None,

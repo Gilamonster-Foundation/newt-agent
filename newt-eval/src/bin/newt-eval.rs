@@ -177,6 +177,10 @@ struct RunArgs {
     /// a diff.
     #[arg(long)]
     legacy_exit_codes: bool,
+    /// Emit the scorecard as JSON instead of the table. Scripts read THIS —
+    /// the table is for humans and has changed shape before (#2317).
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -357,6 +361,7 @@ async fn run_command(args: RunArgs) -> Result<RunOutcomeStatus> {
         worker_timeout_ms,
         difficulty,
         legacy_exit_codes,
+        json,
     } = args;
 
     if let Mode::Mock = mode {
@@ -443,7 +448,11 @@ async fn run_command(args: RunArgs) -> Result<RunOutcomeStatus> {
         });
     }
 
-    print!("{scorecard}");
+    if json {
+        println!("{}", serde_json::to_string_pretty(&scorecard)?);
+    } else {
+        print!("{scorecard}");
+    }
     Ok(classify_outcome(&scorecard, legacy_exit_codes))
 }
 

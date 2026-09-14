@@ -44,6 +44,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         persona_tools: None,
         cognition: None,
         chat_completions_capability: Default::default(),
+        output_allowance: None,
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
         emits_leading_reasoning: false,
         max_tool_rounds: 4,
@@ -207,7 +208,7 @@ fn canned_summarizer(calls: Arc<AtomicUsize>) -> Summarizer {
         let calls = calls.clone();
         Box::pin(async move {
             calls.fetch_add(1, Ordering::SeqCst);
-            Ok(CANNED_SUMMARY.to_string())
+            Ok((CANNED_SUMMARY.to_string(), None))
         })
     })
 }

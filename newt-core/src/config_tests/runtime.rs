@@ -175,11 +175,13 @@ fn model_tuning_narration_nudge_cap_override_parses() {
             [[model_tuning]]
             model = "ornith:35b"
             narration_nudge_cap = 3
+            output_allowance = 6000
         "#,
     )
     .unwrap();
     let tune = cfg.find_model_tuning("ornith:35b").unwrap();
     assert_eq!(tune.narration_nudge_cap, Some(3));
+    assert_eq!(tune.output_allowance, Some(6_000));
     // Absent field stays None (inherit the [tui] value).
     let cfg: Config = toml::from_str(
         r#"

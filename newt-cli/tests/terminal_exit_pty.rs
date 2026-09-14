@@ -31,8 +31,9 @@ const PROMPT: &str = "What is two plus two? Give a short answer.";
 const ANSWER: &str = "The answer is four. TERM_EXIT_ANSWER.";
 const LEAN_READY: &str = "TERM_EXIT_READY> ";
 // TurnMetrics::display_line renders this suffix for the unpriced fixture model
-// with reported usage. It does not depend on elapsed time or probe/replay totals.
-const TURN_METRICS: &str = " out · free (local)";
+// with reported usage: no rate is known, so the cost is unknown, not free
+// (#2313). It does not depend on elapsed time or probe/replay totals.
+const TURN_METRICS: &str = " out · cost unknown";
 
 #[derive(Clone, Copy, Debug)]
 enum Surface {

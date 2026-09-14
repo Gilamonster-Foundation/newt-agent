@@ -344,7 +344,7 @@ async fn responses_proactive_no_progress_invokes_the_compactor_exactly_once() {
     let c = calls.clone();
     let summ: Summarizer = Box::new(move |_r: String| {
         c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Box::pin(async { Ok("brief".to_string()) })
+        Box::pin(async { Ok(("brief".to_string(), None)) })
     });
 
     let task = "read the huge fixture then summarize";

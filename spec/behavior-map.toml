@@ -240,13 +240,13 @@ path = "newt-core/src/agentic/mod_tests/tool_round_cap/input_budget.rs"
 symbol = "responses_refuses_locally_when_a_configured_window_cannot_fit"
 [[BHV-CONTEXT-001.refs.rust_tests]]
 path = "newt-core/src/agentic/generation_policy.rs"
-symbol = "tests::cognition_output_reserve_is_the_one_source_of_the_output_budget"
+symbol = "tests::output_allowance_prefers_explicit_over_the_cognition_table"
 [[BHV-CONTEXT-001.refs.production]]
 path = "newt-core/src/agentic/send_budget.rs"
 symbol = "num_ctx_input_ceiling"
 [[BHV-CONTEXT-001.refs.production]]
 path = "newt-core/src/agentic/generation_policy.rs"
-symbol = "cognition_output_reserve"
+symbol = "resolve_output_allowance"
 
 [BHV-CONTEXT-002]
 description = "A learned context ceiling never increases during a turn (monotone tightening) — an accepted observation cannot raise it and a cw-400 recovery only tightens it."

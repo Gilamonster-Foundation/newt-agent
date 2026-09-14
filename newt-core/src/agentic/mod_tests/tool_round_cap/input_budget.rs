@@ -520,3 +520,132 @@ async fn responses_refuses_giant_function_output_before_second_dispatch() {
         "the first tool call may dispatch, but its giant output must never be resent"
     );
 }
+
+/// Refusal text from dispatching a hopelessly large prompt to the loop that
+/// owns `path_str`, at a declared 32,768 window, with a mock that must
+/// receive nothing.
+async fn refused_budget_message(path_str: &str, output_allowance: Option<u32>) -> String {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(path_str))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let task = format!("OUTPUT-ALLOWANCE {}", "x".repeat(200_000));
+    let messages = giant_prompt_messages(&task);
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let kind = if path_str == "/api/chat" {
+        BackendKind::Ollama
+    } else {
+        BackendKind::Openai
+    };
+    let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, &task, kind);
+    ctx.safe_context = None;
+    ctx.max_ok_input = None;
+    ctx.num_ctx = Some(32_768);
+    ctx.cognition = Some(crate::role_profile::Cognition::Contemplating);
+    ctx.output_allowance = output_allowance;
+    ctx.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
+        cognition: Some(true),
+        ..Default::default()
+    };
+    let result = match path_str {
+        "/v1/chat/completions" => openai_chat_complete(ctx, &mut NoMcp).await,
+        "/v1/responses" => openai_responses_complete(ctx, &mut NoMcp).await,
+        _ => chat_complete(ctx, &mut NoMcp).await,
+    };
+    let error = result.expect_err("the prompt cannot fit any budget");
+    assert_no_requests(&server).await;
+    error.to_string()
+}
+
+/// #2312 (A4): the output allowance is resolved ONCE and every surface that
+/// decides or reports the input budget agrees on it — the generation policy,
+/// the percentage/window ceiling, the Responses budget state, the public
+/// reporting seam on both OpenAI wires, and the number each loop refuses
+/// against. Guards the #1534 class: threading an override into the policy
+/// alone leaves admission on the cognition table while the wire changes.
+/// The `None` row is the twin: without an override every surface falls back
+/// to the Contemplating table's 16,000 (16,768 input).
+///
+/// EXCLUDED surface, a known discrepancy: the Anthropic loop. With no
+/// allowance it reserves nothing locally while sending the 8,192 wire default
+/// as `max_tokens`; this PR keeps that default unchanged and tracks the fix
+/// separately. With an explicit allowance it reserves and sends the same value.
+#[tokio::test]
+async fn output_allowance_resolves_once_across_every_budget_surface() {
+    use crate::agentic::generation_policy::GenerationPolicy;
+    use crate::role_profile::Cognition;
+    let capability = crate::model_card::ChatCompletionsCapability {
+        cognition: Some(true),
+        ..Default::default()
+    };
+    let scope = crate::model_card::ReasoningReplayScope::Never;
+    // (explicit allowance, resolved allowance, input budget, Ollama budget).
+    // Ollama has no cognition table, so only an explicit allowance reserves.
+    for (explicit, resolved, budget, ollama_budget) in [
+        (Some(20_000), 20_000, 12_768, 12_768),
+        (None, 16_000, 16_768, 26_214),
+    ] {
+        let policy =
+            GenerationPolicy::resolve(Some(Cognition::Contemplating), explicit, capability, scope);
+        assert_eq!(policy.output_allowance, Some(resolved), "{explicit:?}");
+        assert_eq!(policy.max_output_tokens, Some(resolved), "{explicit:?}");
+        assert_eq!(
+            num_ctx_input_ceiling(Some(32_768), 80, policy.output_allowance),
+            Some(budget),
+            "{explicit:?}"
+        );
+        assert_eq!(
+            resolve_responses_budget(
+                Some(32_768),
+                None,
+                None,
+                None,
+                80,
+                Some(Cognition::Contemplating),
+                explicit
+            )
+            .actionable_input_budget(),
+            Some(budget),
+            "{explicit:?}"
+        );
+        for api in [
+            crate::OpenAiApi::ChatCompletions,
+            crate::OpenAiApi::Responses,
+        ] {
+            assert_eq!(
+                initial_context_input_budget(
+                    BackendKind::Openai,
+                    api,
+                    Some(32_768),
+                    80,
+                    Some(Cognition::Contemplating),
+                    explicit,
+                    capability,
+                    scope,
+                    None,
+                    None,
+                ),
+                Some(budget as u32),
+                "{explicit:?} {api:?}"
+            );
+        }
+
+        let names = |n: usize| format!("authoritative {n}-token input budget");
+        let chat = refused_budget_message("/v1/chat/completions", explicit).await;
+        assert!(chat.contains(&names(budget)), "{explicit:?}: {chat}");
+        let responses = refused_budget_message("/v1/responses", explicit).await;
+        assert!(
+            responses.contains(&names(budget)),
+            "{explicit:?}: {responses}"
+        );
+        let ollama = refused_budget_message("/api/chat", explicit).await;
+        assert!(
+            ollama.contains(&names(ollama_budget)),
+            "{explicit:?}: {ollama}"
+        );
+    }
+}

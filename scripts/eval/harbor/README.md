@@ -57,6 +57,52 @@ endpoint is unreachable. `PiLocal` reads its log with [`pi_log.py`](pi_log.py)
 and raises Harbor's `NonZeroAgentExitCodeError` in that case, so an infra
 failure is recorded as an agent error, not graded as the model's work.
 
+## Harness × model campaign
+
+[`tb-campaign.sh`](tb-campaign.sh) runs newt, pi and Codex for each model in a
+roster ([`tb-roster-baseline.txt`](tb-roster-baseline.txt)). Every harness gets
+the same task set, trial count, served context window and agent timeout, and
+Harbor's verifier grades every trial. Models are processed one at a time. For
+each model, the script loads it and checks that the served `--ctx-size` matches
+`TB_CTX_SIZE` before each cell. It also waits for the model's slot to go idle,
+so a generation left over from a killed trial cannot overlap the next cell.
+
+```bash
+NEWT_BENCH_BIN=/path/to/bookworm-built/newt \
+NEWT_BENCH_PROFILE_TEMPLATE=~/.newt/bench/<profile>.toml \
+TB_CTX_SIZE=131072 TB_TRIALS=3 \
+bash scripts/eval/harbor/tb-campaign.sh \
+  scripts/eval/harbor/tb-roster-baseline.txt scripts/eval/harbor/smart-ab-8.json <campaign>
+python3 scripts/eval/harbor/tb_campaign.py table /var/tmp/tbench-harbor/<campaign>
+```
+
+The profile's `endpoint` serves all three harnesses. A campaign directory holds
+one Harbor job per cell, plus these records:
+- `trials.jsonl` has one row for every trial directory Harbor created: reward,
+  grading state, exception, claim, tokens and agent seconds.
+- `cells.jsonl` binds each cell to the served model, the context window as
+  served, the engine build, the harness version, the newt binary digest, the
+  task-set digest and the expected trial count.
+
+Rerunning the command skips recorded cells.
+
+Reading the table:
+- **Claimed done** comes from each harness's own log. newt's claim is the
+  contract `outcome: completed`, pi's is a final `stopReason: stop`, and Codex's
+  is `turn.completed`. When no claim can be read, it counts as *unrecoverable*,
+  not as "did not claim". A trial killed by Harbor's timeout counts as "did not
+  claim".
+- **False completion** means the harness claimed done and Harbor did not
+  resolve the trial. **False incomplete** is the reverse.
+- **Tokens** for pi and Codex are Harbor's `agent_result`, parsed from the
+  harness log. newt's contract emits output tokens only, so newt's input tokens
+  are missing, not zero.
+- **Sandbox and round caps:** newt runs `--unsafe-host-exec` because pi and Codex
+  run unsandboxed. newt stops at `NEWT_BENCH_MAX_ROUNDS` (40), while pi and Codex
+  have no round cap. The agent timeout is the only limit all three share.
+- **Wilson interval:** computed over graded trials. Coverage (expected, observed
+  and graded) is shown next to it.
+
 ## Smart-harness comparison
 
 [`smart-ab.sh`](smart-ab.sh) runs the plain arm, then the smart arm, using the

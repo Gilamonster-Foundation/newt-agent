@@ -16,7 +16,8 @@
 #
 # A "rung" is keyed by task/mode (model is a CONTROL, per RATCHET.md — the
 # single-vs-crew staircase is what we watch). A trial "passes" when its
-# behavioral column matches ^PASS (covers PASS and PASS?gameable). A rung
+# behavioral column matches ^PASS (covers PASS and legacy PASS?gameable); an
+# UNGRADABLE(..) or ERROR(..) row graded nothing and is not a trial at all. A rung
 # REGRESSED when its current pass-rate (pass/total across the run's trials) is
 # strictly lower than the same rung's pass-rate in the baseline.
 #
@@ -58,7 +59,7 @@ done
 # Emit "<task>/<mode>\t<pass>\t<total>" for each rung in a RATCHET tsv file.
 aggregate() {
   awk -F'\t' '
-    $1=="RATCHET" {
+    $1=="RATCHET" && $5 !~ /^(UNGRADABLE|ERROR)\(/ {
       key=$2"/"$3
       total[key]++
       if ($5 ~ /^PASS/) pass[key]++
@@ -225,6 +226,9 @@ self_test() {
     printf 'RATCHET\tT1-parse-port\tcrew\tqwen2.5-coder:7b\tPASS\tleaves=1\n'
     printf 'RATCHET\tT1-parse-port\tcrew\tqwen2.5-coder:7b\tPASS\tleaves=1\n'
     printf 'RATCHET\tT1-parse-port\tcrew\tqwen2.5-coder:7b\tPASS?gameable\tleaves=2\n'
+    # ungraded rows: if they counted as trials, T1/crew would "regress" to 3/5
+    printf 'RATCHET\tT1-parse-port\tcrew\tqwen2.5-coder:7b\tUNGRADABLE(no_tests)\ttests_run=0\n'
+    printf 'RATCHET\tT1-parse-port\tcrew\tqwen2.5-coder:7b\tERROR(runner)\ttests_pass=\n'
     printf 'RATCHET\tT2-humanize-duration\tsingle\tqwen2.5-coder:7b\tFAIL\ttests_pass=fail\n'
     printf 'RATCHET\tT2-humanize-duration\tsingle\tqwen2.5-coder:7b\tFAIL\ttests_pass=fail\n'
     printf 'RATCHET\tT2-humanize-duration\tsingle\tqwen2.5-coder:7b\tFAIL\ttests_pass=fail\n'

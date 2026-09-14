@@ -152,6 +152,7 @@ fn openai_loop_recovers_from_context_window_400() {
                     persona_tools: None,
                     cognition: None,
                     chat_completions_capability: Default::default(),
+                    output_allowance: None,
                     reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
                     max_tool_rounds: 5,
                     narration_nudge_cap: 1,

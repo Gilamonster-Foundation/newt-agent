@@ -170,7 +170,7 @@ pub fn build(
                 .await
                 .map_err(|_| anyhow::anyhow!("auxiliary inference deadline exceeded"))?
                 .map_err(|error| anyhow::anyhow!(disclosure.redact(&error.to_string())))?;
-            Ok(disclosure.redact(&reply.content))
+            Ok((disclosure.redact(&reply.content), reply.usage))
         })
     });
     Ok(Auxiliary { complete, manifest })
@@ -261,7 +261,41 @@ mod tests {
             (auxiliary.complete)("classify this evidence".into())
                 .await
                 .unwrap(),
-            "\"answer\""
+            ("\"answer\"".to_string(), None)
+        );
+    }
+
+    /// #2313: the adapter keeps the usage the backend reported instead of
+    /// discarding it while adapting the reply to text. The twin is
+    /// `auxiliary_system_instruction_precedes_user_evidence`, whose reply
+    /// carries no counts and so yields `None` — missing usage stays unknown.
+    #[tokio::test]
+    async fn auxiliary_reply_keeps_backend_reported_usage() {
+        let server = MockServer::start().await;
+        let config = external(&server.uri());
+        let body = serde_json::json!({
+            "message": { "role": "assistant", "content": "\"answer\"" },
+            "done": true,
+            "prompt_eval_count": 120,
+            "eval_count": 7
+        })
+        .to_string()
+            + "\n";
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/x-ndjson"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let auxiliary = build(&config, "http://primary.invalid:8000", BackendKind::Openai).unwrap();
+        let (text, usage) = (auxiliary.complete)("classify".into()).await.unwrap();
+        assert_eq!(text, "\"answer\"");
+        assert_eq!(
+            usage,
+            Some(newt_core::TokenUsage {
+                input_tokens: 120,
+                output_tokens: 7
+            })
         );
     }
 
@@ -342,7 +376,10 @@ mod tests {
             "operator-declared"
         );
         assert_eq!(
-            (auxiliary.complete)("classify this".into()).await.unwrap(),
+            (auxiliary.complete)("classify this".into())
+                .await
+                .unwrap()
+                .0,
             "\"narration\""
         );
         // And a distinct origin is recorded as such, so the two runs are distinguishable.

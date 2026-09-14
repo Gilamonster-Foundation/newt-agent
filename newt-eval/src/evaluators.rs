@@ -229,7 +229,7 @@ impl Evaluator for RustCompilesEvaluator {
 
     fn evaluate(&self, ctx: &EvalContext) -> EvalResult {
         if !ctx.case.is_rust() {
-            return EvalResult::pass(self.name(), "non-Rust case — skipped");
+            return EvalResult::skip(self.name(), "non-Rust case — skipped");
         }
         let manifest = ctx.workspace.join("Cargo.toml");
         if !manifest.exists() {
@@ -273,7 +273,7 @@ impl Evaluator for TestsPassEvaluator {
 
     fn evaluate(&self, ctx: &EvalContext) -> EvalResult {
         if !ctx.case.is_rust() {
-            return EvalResult::pass(self.name(), "non-Rust case — skipped");
+            return EvalResult::skip(self.name(), "non-Rust case — skipped");
         }
         let manifest = ctx.workspace.join("Cargo.toml");
         if !manifest.exists() {
@@ -283,7 +283,7 @@ impl Evaluator for TestsPassEvaluator {
             );
         }
         if !workspace_has_tests(&ctx.workspace) {
-            return EvalResult::pass(self.name(), "no #[test] found — skipped");
+            return EvalResult::skip(self.name(), "no #[test] found — skipped");
         }
 
         let output = Command::new("cargo")
@@ -359,6 +359,7 @@ impl Evaluator for PatternMatchEvaluator {
             passed,
             score,
             details: format!("{}/{} patterns matched", matched.len(), compiled.len()),
+            skipped: false,
         }
     }
 }
@@ -397,7 +398,7 @@ impl Evaluator for PythonImportsEvaluator {
 
     fn evaluate(&self, ctx: &EvalContext) -> EvalResult {
         if !ctx.case.language.eq_ignore_ascii_case("python") {
-            return EvalResult::pass(self.name(), "non-Python case — skipped");
+            return EvalResult::skip(self.name(), "non-Python case — skipped");
         }
         // The declared real surface (project modules). Without it the crawl
         // check has no ground truth — skip honestly rather than guess.
@@ -413,7 +414,7 @@ impl Evaluator for PythonImportsEvaluator {
                 }
             },
             Err(_) => {
-                return EvalResult::pass(
+                return EvalResult::skip(
                     self.name(),
                     "no python_surface.json — module check skipped",
                 );
@@ -456,6 +457,7 @@ impl Evaluator for PythonImportsEvaluator {
                     report.fabricated.len(),
                     names.join(", ")
                 ),
+                skipped: false,
             }
         }
     }
@@ -1244,7 +1246,7 @@ content = ""
         let (ws, bl) = empty_dirs();
         let ctx = make_ctx("diff", vec![], "python", ws, bl);
         let r = RustCompilesEvaluator.evaluate(&ctx);
-        assert!(r.passed);
+        assert!(r.passed && r.skipped, "{r:?}");
         assert!(r.details.contains("skipped"));
     }
 
@@ -1262,7 +1264,7 @@ content = ""
         let (ws, bl) = empty_dirs();
         let ctx = make_ctx("diff", vec![], "python", ws, bl);
         let r = TestsPassEvaluator.evaluate(&ctx);
-        assert!(r.passed);
+        assert!(r.passed && r.skipped, "{r:?}");
         assert!(r.details.contains("skipped"));
     }
 
@@ -1279,7 +1281,9 @@ content = ""
         let (_, bl) = empty_dirs();
         let ctx = make_ctx("diff", vec![], "rust", workspace.path().to_path_buf(), bl);
         let r = TestsPassEvaluator.evaluate(&ctx);
-        assert!(r.passed);
+        // #2317: a skip is REPORTED as a skip. `passed` alone read as "the
+        // tests passed" and let a tree with its tests deleted grade PASS.
+        assert!(r.passed && r.skipped, "{r:?}");
         assert!(r.details.contains("no #[test]"));
     }
 

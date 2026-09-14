@@ -87,6 +87,11 @@ pub struct ModelTuning {
     /// Per-model `[tui].narration_nudge_cap` override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub narration_nudge_cap: Option<usize>,
+
+    /// Per-model output-token allowance. Overrides the cognition preset's
+    /// output budget while cognition, thinking and sampling stay unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_allowance: Option<u32>,
 }
 
 /// Load tuning configuration for a specific model.

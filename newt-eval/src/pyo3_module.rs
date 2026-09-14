@@ -183,6 +183,7 @@ impl PyEvalResult {
                 passed,
                 score,
                 details,
+                skipped: false,
             },
         }
     }
