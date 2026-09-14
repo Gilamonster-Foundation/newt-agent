@@ -265,8 +265,21 @@ pub fn grade_behavioral_with(
     }
     let mut grade = run_spec(runner, tree, &spec);
     grade.spec_cid = cid;
+    // A build that never started is the host's fault only while the build
+    // inputs are the seed's. A candidate that edited its manifest or lockfile
+    // (`autotests = false`, a bad dependency) made cargo fail, so it is FAIL.
+    if grade.verdict == Verdict::Error("build_infra".to_string())
+        && BUILD_INPUTS.iter().any(|f| {
+            std::fs::read(tree.join(f)).ok() != std::fs::read(case.workspace_fixture().join(f)).ok()
+        })
+    {
+        grade.verdict = Verdict::Fail;
+    }
     grade
 }
+
+/// The files besides the sources that decide whether cargo can build at all.
+const BUILD_INPUTS: &[&str] = &["Cargo.toml", "Cargo.lock"];
 
 /// Copy `tree` (without `.git` and `target`), install `spec` in the copy only,
 /// and run it: everything [`grade_behavioral_with`] does after its leak and
@@ -311,7 +324,8 @@ pub fn run_spec(runner: &dyn CommandRunner, tree: &Path, spec: &[u8]) -> Behavio
 
 /// The #887 harness trust boundary: a tree that can change how cargo builds or
 /// which file `--test grade_spec` runs is refused before the spec is installed.
-/// No case needs a build script, a cargo config, or a declared test target.
+/// No case needs a build script, a cargo config, a toolchain file, or a
+/// declared test target.
 /// The manifest is parsed rather than grepped, so the inline `test = [...]`
 /// form of a `[[test]]` table is caught too.
 pub fn harness_subversion(tree: &Path) -> Option<&'static str> {
@@ -328,6 +342,9 @@ pub fn harness_subversion(tree: &Path) -> Option<&'static str> {
         Some("build.rs")
     } else if tree.join(".cargo/config.toml").exists() || tree.join(".cargo/config").exists() {
         Some("cargo-config")
+    } else if tree.join("rust-toolchain.toml").exists() || tree.join("rust-toolchain").exists() {
+        // Selects (and makes rustup fetch and run) a toolchain of the tree's choosing.
+        Some("toolchain-file")
     } else if manifest.as_ref().is_some_and(|m| m.contains_key("test")) {
         Some("test-table")
     } else {
@@ -372,12 +389,11 @@ pub fn verdict_from_run(out: &RunOutcome) -> BehavioralGrade {
         .map(|(source, _)| source)
         .collect();
     let started = !spec_sources.is_empty();
-    let (passed, failed) = text
+    let summary = text
         .lines()
         .rev()
-        .find_map(|l| l.trim_start().strip_prefix("test result: "))
-        .map(|summary| (count(summary, " passed"), count(summary, " failed")))
-        .unwrap_or((0, 0));
+        .find_map(|l| l.trim_start().strip_prefix("test result: "));
+    let (passed, failed) = summary.map_or((0, 0), |s| (count(s, " passed"), count(s, " failed")));
     if out.timed_out {
         return if started {
             ran(
@@ -405,19 +421,32 @@ pub fn verdict_from_run(out: &RunOutcome) -> BehavioralGrade {
         );
     };
     if code != 0 {
-        let detail = text
-            .lines()
-            .find(|l| l.contains("could not compile"))
-            .or_else(|| {
-                (passed + failed == 0)
-                    .then(|| text.lines().find(|l| l.starts_with("error")))
-                    .flatten()
-            })
-            .map_or_else(
-                || format!("{passed} passed, {failed} failed"),
-                str::to_string,
-            );
-        return ran(Verdict::Fail, passed + failed, "none", detail);
+        let compile_error = text.lines().find(|l| l.contains("could not compile"));
+        let first_error = || {
+            text.lines()
+                .find(|l| l.starts_with("error"))
+                .unwrap_or_default()
+        };
+        return match (compile_error, summary) {
+            // Cargo failed before compiling or testing anything: a missing or
+            // broken wrapper, a failed download, a missing toolchain. A
+            // candidate's compile error always says `could not compile`.
+            (None, None) => BehavioralGrade {
+                grader: "grade_spec".to_string(),
+                ..BehavioralGrade::nothing_ran(
+                    Verdict::Error("build_infra".to_string()),
+                    None,
+                    first_error(),
+                )
+            },
+            (Some(line), _) => ran(Verdict::Fail, passed + failed, "none", line.to_string()),
+            (None, Some(_)) => ran(
+                Verdict::Fail,
+                passed + failed,
+                "none",
+                format!("{passed} passed, {failed} failed"),
+            ),
+        };
     }
     if !started
         || spec_sources
@@ -642,6 +671,27 @@ mod tests {
             verdict(&run!("t0-zero-tests", Some(0))),
             ("UNGRADABLE(no_tests_ran)".into(), 0, "none".into())
         );
+    }
+
+    /// A cargo that could not build anything (a missing or broken wrapper,
+    /// a failed download, a missing toolchain) prints no `could not compile`
+    /// and no test summary. That is the host's fault, not the candidate's.
+    #[test]
+    fn a_cargo_that_could_not_build_anything_is_build_infra() {
+        let g = verdict_from_run(&run!("t0-wrapper-missing", Some(101)));
+        assert_eq!(g.verdict, Verdict::Error("build_infra".into()), "{g:?}");
+        assert!(
+            g.detail.starts_with("error: could not execute process"),
+            "{g:?}"
+        );
+    }
+
+    /// Twin: the candidate deleting its lib also fails before any test runs,
+    /// but cargo says `could not compile`, so it stays the candidate's FAIL.
+    #[test]
+    fn a_candidate_that_deleted_its_lib_still_fails() {
+        let g = verdict_from_run(&run!("t0-deleted-lib", Some(101)));
+        assert_eq!(g.verdict, Verdict::Fail, "{g:?}");
     }
 
     #[test]

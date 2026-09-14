@@ -338,6 +338,16 @@ fn every_887_harness_override_fails_before_the_spec_runs() {
         ),
         shape("test-table", &format!("{manifest}{decoy}"), None),
         shape("test-table", inline, None),
+        shape(
+            "toolchain-file",
+            manifest,
+            Some(("rust-toolchain.toml", "[toolchain]\n")),
+        ),
+        shape(
+            "toolchain-file",
+            manifest,
+            Some(("rust-toolchain", "stable\n")),
+        ),
     ];
     for Shape {
         rule,
@@ -398,6 +408,54 @@ fn a_grader_that_could_not_run_the_checks_is_an_error() {
     fs::create_dir_all(unreadable.path().join("grade_spec.rs")).unwrap();
     let grade = grade_behavioral_with(&no_cargo, &broken, tree.path(), &pre);
     assert_eq!(grade.verdict, Verdict::Error("io".into()));
+}
+
+/// A build that produced no test summary and no `could not compile` is
+/// ERROR(build_infra), unless the candidate changed a build input. Then its
+/// manifest is why cargo failed (here `autotests = false`, so no `grade_spec`
+/// target exists), and it stays the candidate's FAIL. Otherwise a broken
+/// manifest would be a way out of n.
+#[test]
+fn a_build_failure_is_infra_only_when_the_build_inputs_are_the_seeds() {
+    let fixture = |ext: &str| {
+        fs::read_to_string(format!(
+            "{}/tests/fixtures/grade_spec_runs/t0-autotests-false.{ext}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    };
+    let no_target = || RunOutcome {
+        stdout: fixture("stdout"),
+        stderr: fixture("stderr"),
+        exit_code: Some(101),
+        timed_out: false,
+        spawned: true,
+    };
+    let case_dir = tempfile::tempdir().unwrap();
+    let case = seed_case(case_dir.path(), &["diff_nonempty"], &[]);
+    fs::write(case_dir.path().join("grade_spec.rs"), SPEC).unwrap();
+    let manifest = "[package]\nname = \"t-grade\"\nversion = \"0.1.0\"\n";
+    fs::write(case_dir.path().join("workspace/Cargo.toml"), manifest).unwrap();
+
+    let untouched = post_tree("pub fn greet() -> &'static str { \"hello\" }\n");
+    fs::write(untouched.path().join("Cargo.toml"), manifest).unwrap();
+    let pre = pre_run(&case, untouched.path()).unwrap();
+    let grade = grade_behavioral_with(&Recorder::new(no_target()), &case, untouched.path(), &pre);
+    assert_eq!(
+        grade.verdict,
+        Verdict::Error("build_infra".into()),
+        "{grade:?}"
+    );
+
+    let edited = post_tree("pub fn greet() -> &'static str { \"hello\" }\n");
+    fs::write(
+        edited.path().join("Cargo.toml"),
+        format!("{manifest}autotests = false\n"),
+    )
+    .unwrap();
+    let grade = grade_behavioral_with(&Recorder::new(no_target()), &case, edited.path(), &pre);
+    assert_eq!(grade.verdict, Verdict::Fail, "{grade:?}");
+    assert!(grade.detail.contains("no test target named"), "{grade:?}");
 }
 
 // ── real cargo against bundled cases ───────────────────────────────────────

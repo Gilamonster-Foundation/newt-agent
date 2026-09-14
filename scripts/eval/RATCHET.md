@@ -79,14 +79,16 @@ final `crew/*` branch in crew mode):
    - `PASS`: the installed spec binary ran and every test passed.
    - `FAIL`: anything the candidate caused. That covers a compile error in its code or in the
      spec against its API, a failing or hanging test, a #887 harness override (`build.rs`, a
-     cargo config, a declared test target; `harness_subversion=` names it), and a decoy target
-     that ran instead of the spec.
+     cargo config, a toolchain file, a declared test target; `harness_subversion=` names it), a
+     decoy target that ran instead of the spec, and a build broken by its own `Cargo.toml` or
+     `Cargo.lock` edits.
    - `UNGRADABLE(reason)`: no spec (`no_spec`), or the spec binary ran zero tests
      (`no_tests_ran`).
-   - `ERROR(reason)`: the checks could not run. Examples: `cargo_spawn`, `timeout` before the
-     spec binary started (`timeout=compile`), `io`, the spec's content id changing during the
-     run (`spec_changed`), the spec visible in the tree (`spec_leak`), a dead worker (`runner`),
-     a crew that never reached a model (`infra`).
+   - `ERROR(reason)`: the checks could not run. Examples: `cargo_spawn`; `build_infra` (cargo
+     failed before compiling anything while the build inputs are the seed's); `timeout` before
+     the spec binary started (`timeout=compile`); `io`; the spec's content id changing during
+     the run (`spec_changed`); the spec visible in the tree (`spec_leak`); a dead worker
+     (`runner`); a crew that never reached a model (`infra`).
 
    UNGRADABLE and ERROR are never passes and never trials: they stay out of n. The row's details
    record what ran: `grader=` `spec_cid=` (the spec's `RawContentId`) `tests_run=` `timeout=`.
