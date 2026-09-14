@@ -537,7 +537,7 @@ pub(super) async fn exec_confined_command(
             live.finish();
         }
         return match run {
-            Ok(envelope) => host_result(cmd, &envelope, |envelope| {
+            Ok(envelope) => host_result(&envelope, |envelope| {
                 shell_envelope_output(
                     envelope,
                     tool_output_lines,
@@ -682,7 +682,7 @@ pub(super) fn confined_result(
     // `error: command exited 127`, which is indistinguishable from a
     // broken machine. Returns None for everything else, so ordinary
     // output and ordinary failures fall through untouched.
-    if let Some(refusal) = absent_binary_refusal(cmd, envelope, &caveats.exec) {
+    if let Some(refusal) = absent_binary_refusal(envelope, &caveats.exec) {
         return (refusal, ExecOutcome::Unavailable);
     }
     // #2273: a 126 with no structured denial whose program sits
@@ -694,29 +694,49 @@ pub(super) fn confined_result(
     (render(envelope), envelope_outcome(envelope))
 }
 
-/// The host lane's result (`--unsafe-host-exec`). Its rendering has no
-/// absent-binary refusal, so its 127 is `unavailable` only when the program
-/// does not resolve on this host; a program that exists and exits 127 failed.
+/// The host lane's result (`--unsafe-host-exec`). Same rule as the confined
+/// lane: a 127 is `unavailable` only when the shell names the program it could
+/// not find AND that program does not resolve on this host. Any other 127 (a
+/// bare `exit 127`, a check script's own status) failed and stays repairable.
 pub(super) fn host_result(
-    cmd: &str,
     envelope: &serde_json::Value,
     render: impl FnOnce(&serde_json::Value) -> String,
 ) -> (String, ExecOutcome) {
     let outcome = match envelope_outcome(envelope) {
-        // ponytail: leading-token lookup, so a bare builtin (`exit 127`) reads
-        // unavailable; PR2 moves both lanes to one resolution rule.
         ExecOutcome::Failed
             if envelope
                 .get("exit_code")
                 .and_then(serde_json::Value::as_i64)
                 == Some(127)
-                && leading_program(cmd).and_then(host_path_lookup).is_none() =>
+                && host_named_missing(envelope)
+                    .is_some_and(|prog| host_path_lookup(prog).is_none()) =>
         {
             ExecOutcome::Unavailable
         }
         outcome => outcome,
     };
     (render(envelope), outcome)
+}
+
+/// How the host shells [`host_shell_output`] runs (bash, else sh) name a
+/// program they could not find: `bash: line 1: X: command not found`,
+/// `sh: 1: X: not found`. A line must carry the shell's own prefix, so a
+/// program printing a look-alike is not read as the shell.
+const HOST_NOT_FOUND: [(&str, &str); 2] =
+    [("bash: ", ": command not found"), ("sh: ", ": not found")];
+
+/// The program the host shell last reported as not found. Stderr only NAMES
+/// it; [`host_result`] decides on the exit code and resolution.
+fn host_named_missing(envelope: &serde_json::Value) -> Option<&str> {
+    let stderr = envelope.get("stderr")?.as_str()?;
+    stderr.lines().rev().find_map(|line| {
+        HOST_NOT_FOUND.iter().find_map(|(prefix, suffix)| {
+            line.strip_prefix(prefix)?
+                .strip_suffix(suffix)?
+                .rsplit(": ")
+                .next()
+        })
+    })
 }
 
 pub(super) async fn host_shell_dispatch(
@@ -1229,6 +1249,11 @@ pub(super) fn exec_denial_target_label(envelope: &serde_json::Value) -> String {
 /// `denials` and is exit 126, so it is excluded here and left to
 /// [`denied_run_command_result`].
 ///
+/// An absence also needs brush to NAME the program it could not find (#2315).
+/// A 127 it did not attribute (a `make` recipe, a test harness returning 127)
+/// is a check failing on its own terms: refusing it as an absence would route
+/// a repairable failure to the no-edit-can-help guidance.
+///
 /// Returns `None` for anything that is not an absence, leaving ordinary output
 /// and ordinary failures untouched.
 ///
@@ -1237,7 +1262,6 @@ pub(super) fn exec_denial_target_label(envelope: &serde_json::Value) -> String {
 /// own process is never Landlocked, so it can resolve the real host PATH and
 /// separate "installed, but not reachable from in here" from "not installed".
 pub(crate) fn absent_binary_refusal(
-    cmd: &str,
     envelope: &serde_json::Value,
     exec: &crate::caveats::Scope<String>,
 ) -> Option<String> {
@@ -1261,7 +1285,7 @@ pub(crate) fn absent_binary_refusal(
         return None;
     }
 
-    let prog = failed_program(cmd, envelope, "command not found: ")?;
+    let prog = named_program(envelope, "command not found: ")?.to_string();
     let granted = granted_host_binaries(exec);
 
     // The host probe is what makes the two 127 states distinguishable.
@@ -1326,7 +1350,9 @@ pub(crate) fn kernel_refused_binary(
     {
         return None;
     }
-    let prog = failed_program(cmd, envelope, "failed to execute command '")?;
+    let prog = named_program(envelope, "failed to execute command '")
+        .or_else(|| leading_program(cmd))?
+        .to_string();
     let abs = host_path_lookup(&prog)?;
     if crate::caveats::permits_path(fs_read, &abs) {
         return None;
@@ -1342,15 +1368,14 @@ pub(crate) fn kernel_refused_binary(
     ))
 }
 
-/// Which program brush failed on.
-///
-/// brush names it in its own error — `command not found: X` for 127,
-/// `failed to execute command 'X': ...` for 126 — and that is the
-/// authoritative answer for a compound command, where the leading token
-/// (`cd newt-core && cargo test`) is not the one that failed (#2304). The LAST
-/// occurrence wins: the exit status belongs to the command that ran last.
-/// Falling back to the leading token keeps a name in hand if that wording
-/// ever drifts.
+/// Which program brush failed on, as brush names it in its own error —
+/// `command not found: X` for 127, `failed to execute command 'X': ...` for
+/// 126. That is the authoritative answer for a compound command, where the
+/// leading token (`cd newt-core && cargo test`) is not the one that failed
+/// (#2304). The LAST occurrence wins: the exit status belongs to the command
+/// that ran last. `None` when brush named nothing: the 126 caller falls back
+/// to the leading token for its message; the 127 caller does not, because an
+/// unnamed 127 is not an absence (#2315).
 ///
 /// Reading stderr is acceptable HERE and not in [`envelope_denied`] because
 /// both callers are already fenced behind the structured exit-code-and-no-
@@ -1358,15 +1383,14 @@ pub(crate) fn kernel_refused_binary(
 /// authority the leading token did not already give it. `envelope_denied`
 /// decides whether authority was refused; this only picks which program the
 /// advisory message is about.
-fn failed_program(cmd: &str, envelope: &serde_json::Value, marker: &str) -> Option<String> {
-    let named = envelope
+fn named_program<'a>(envelope: &'a serde_json::Value, marker: &str) -> Option<&'a str> {
+    envelope
         .get("stderr")
         .and_then(serde_json::Value::as_str)
         .and_then(|stderr| stderr.rfind(marker).map(|at| &stderr[at + marker.len()..]))
         .and_then(|rest| rest.split(['\'', '\n']).next())
         .map(str::trim)
-        .filter(|name| !name.is_empty());
-    named.or_else(|| leading_program(cmd)).map(str::to_string)
+        .filter(|name| !name.is_empty())
 }
 
 /// The leading program of `cmd`: `FOO=bar prog ...` - an env assignment is not
