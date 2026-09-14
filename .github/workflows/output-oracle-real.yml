@@ -28,7 +28,11 @@ name: Output-oracle real tier (#960)
 # scripts/eval/results/gaming-corpus/, graded by the canonical grader. The #887
 # guard refuses build scripts, cargo configs, toolchain files and test-target
 # redirects before any cargo runs. The remaining games' test code runs as
-# unconfined as the output_matches fixtures do.
+# unconfined as the output_matches fixtures do, which this job bounds four ways:
+# an ephemeral GitHub-hosted runner (ubuntu-latest, not a self-hosted one), a
+# read-only token (permissions: contents: read), no secrets, and no persisted
+# credentials (checkout persist-credentials: false, so the token is not left
+# in .git/config for replayed code to read).
 
 on:
   schedule:
@@ -56,6 +60,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
