@@ -6,7 +6,7 @@
 //!
 //! Local models (Ollama-served gemma, llama, qwen, mistral, …) return a
 //! cost of `0.0` so the TUI can display "free (local)".
-//! Unknown models return `None` — the TUI shows nothing.
+//! Unknown models return `None` — the TUI shows "cost unknown", never "free".
 
 use std::collections::HashMap;
 

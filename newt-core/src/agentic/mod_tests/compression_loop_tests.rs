@@ -164,7 +164,7 @@ fn canned_summarizer(prompts: Arc<Mutex<Vec<String>>>) -> Summarizer {
         let prompts = prompts.clone();
         Box::pin(async move {
             prompts.lock().unwrap().push(prompt);
-            Ok(CANNED_SUMMARY.to_string())
+            Ok((CANNED_SUMMARY.to_string(), None))
         })
     })
 }
@@ -486,7 +486,7 @@ async fn summarizer_500_degrades_to_static_marker_and_turn_completes() {
             if !resp.status().is_success() {
                 anyhow::bail!("summarizer endpoint {}", resp.status());
             }
-            Ok(resp.text().await?)
+            Ok((resp.text().await?, None))
         })
     });
 

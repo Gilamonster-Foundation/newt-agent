@@ -9,6 +9,17 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Changed — inference usage is retained at the summarizer boundary; unpriced cost is unknown (#2313, PR 1)
+
+- **`SummarizeFuture` now yields `(text, Option<TokenUsage>)`.** The external
+  smart-harness auxiliary, the TUI HTTP compaction summarizer (Ollama and
+  OpenAI shapes) and the embedded summarizer keep the usage their backend
+  reported instead of discarding it while adapting the reply to text. Missing
+  usage stays `None`. Recording it per attempt is PR 2.
+- **Usage without a price renders `cost unknown`, not `free (local)`.** Only a
+  confirmed zero rate (a known local model family, or an override) is free, and
+  `cost_usd` stays omitted when unknown.
+
 ### Added — output allowance independent of cognition (#2312, PR 1)
 
 - **`[[model_tuning]] output_allowance`** sets a per-model output-token

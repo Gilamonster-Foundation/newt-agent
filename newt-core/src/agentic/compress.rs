@@ -70,12 +70,14 @@ use crate::tokens::TokenEstimation;
 #[path = "prompt_calibration.rs"]
 mod prompt_calibration;
 
-/// Future returned by an injected [`SummarizeFn`].
-pub type SummarizeFuture = Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>;
+/// Future returned by an injected [`SummarizeFn`]: the reply text and the
+/// usage its backend reported (`None` when unreported — unknown, never zero).
+pub type SummarizeFuture =
+    Pin<Box<dyn Future<Output = anyhow::Result<(String, Option<crate::TokenUsage>)>> + Send>>;
 
 /// The summarizer injected into the agentic loop (`ChatCtx::summarizer`):
 /// given the assembled (already-redacted) summary request, returns the
-/// summary text. Mirrors the `Summarizing` provider's `with_summarizer`
+/// summary text and its usage (#2313). Mirrors the `Summarizing` provider's `with_summarizer`
 /// injection, but async — the loop calls it mid-flight.
 pub type SummarizeFn = dyn Fn(String) -> SummarizeFuture + Send + Sync;
 
@@ -2190,7 +2192,8 @@ fn reduce_partials<'a>(
 /// Run one summary request: empty/whitespace output → `None`; error → logged and
 /// `None` (degrades to the static marker, never aborts compression).
 async fn run_summary(summarizer: &SummarizeFn, req: String) -> Option<String> {
-    match summarizer(req).await {
+    // TODO(#2313): record the reply's usage in the per-attempt ledger (PR2).
+    match summarizer(req).await.map(|(text, _usage)| text) {
         Ok(s) if !s.trim().is_empty() => Some(s),
         Ok(_) => None,
         Err(e) => {

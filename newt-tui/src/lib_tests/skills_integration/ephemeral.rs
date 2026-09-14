@@ -80,7 +80,7 @@ async fn compressed_session_round_trips_summary_through_save_and_restore() {
     // rather than summarize either half of that pair.
     memory.add_provider(newt_core::Summarizing::new(512).with_summarizer(
         |_req: String| -> newt_core::SummarizeFuture {
-            Box::pin(async { Ok("FACTS FROM THE COMPRESSED MIDDLE".to_string()) })
+            Box::pin(async { Ok(("FACTS FROM THE COMPRESSED MIDDLE".to_string(), None)) })
         },
     ));
     let big = "x".repeat(200);

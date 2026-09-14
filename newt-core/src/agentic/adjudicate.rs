@@ -131,8 +131,9 @@ pub async fn adjudicate_decisions(
         return (intake.clone(), Some(AdjudicationFailure::BatchTooLarge));
     }
 
+    // TODO(#2313): record the adjudication usage in the per-attempt ledger (PR2).
     let reply = match complete(build_adjudication_prompt(intake)).await {
-        Ok(reply) => reply,
+        Ok((reply, _usage)) => reply,
         Err(error) => {
             tracing::warn!(%error, "decision adjudication unavailable; asking the operator");
             return (intake.clone(), Some(AdjudicationFailure::Unavailable));
@@ -166,7 +167,7 @@ mod tests {
 
     fn summarizer(reply: &'static str) -> Summarizer {
         Box::new(move |_prompt: String| {
-            Box::pin(async move { Ok(reply.to_string()) })
+            Box::pin(async move { Ok((reply.to_string(), None)) })
                 as super::super::compress::SummarizeFuture
         })
     }
@@ -503,7 +504,8 @@ mod tests {
         let seen = calls.clone();
         let adjudicator: Summarizer = Box::new(move |_prompt: String| {
             seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Box::pin(async move { Ok("[]".to_string()) }) as super::super::compress::SummarizeFuture
+            Box::pin(async move { Ok(("[]".to_string(), None)) })
+                as super::super::compress::SummarizeFuture
         });
         let (resolved, _) = adjudicate_decisions(&intake, &adjudicator).await;
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);

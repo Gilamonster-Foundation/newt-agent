@@ -301,7 +301,7 @@ pub use tools::{
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
 };
-pub use trim::trim_for_summary;
+pub use trim::{ollama_usage, openai_usage, trim_for_summary};
 pub use untrusted::{wrap_internal_summary, wrap_untrusted};
 pub use warmup::warmup_if_cold;
 
@@ -333,7 +333,7 @@ use std::io::{self, Write as _};
 use tools::{is_hallucination, merged_tool_definitions};
 use trim::{
     estimate_request_tokens, estimate_tokens, estimate_value_tokens, merge_round_usage,
-    ollama_usage, openai_usage, protected_prompt_head_len, PromptTracker,
+    protected_prompt_head_len, PromptTracker,
 };
 
 /// Retry policy selected from endpoint locality.
