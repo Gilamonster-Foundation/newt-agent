@@ -235,11 +235,13 @@ def lane_of(record: dict) -> str:
 def champions(records: list[dict]) -> dict[tuple[str, str], dict]:
     """Best record per ``(model, lane)``: highest score; ties broken by the later
     date, then later manifest position (records are in insertion order). Keying
-    by lane keeps each model's OCAP-off and OCAP-on ratchets independent."""
+    by lane keeps each model's OCAP-off and OCAP-on ratchets independent. A record
+    ingested with ``--allow-incomplete`` (``coverage_override``) is never a
+    champion: incomplete coverage must not set the bar or reach the scoreboard."""
     best: dict[tuple[str, str], dict] = {}
     for i, rec in enumerate(records):
         model = rec.get("model")
-        if not model:
+        if not model or rec.get("coverage_override"):
             continue
         key = (model, lane_of(rec))
         cur = best.get(key)
@@ -263,12 +265,10 @@ def gate(
     model's existing champion **on the same OCAP lane** — the monotonic ratchet.
     The OCAP-off and OCAP-on lanes ratchet independently, so turning confinement
     on can't be blocked by the (typically higher) unconfined champion. A model
-    with no prior record on that lane always passes (establishes the number)."""
+    with no champion on that lane always passes (establishes the number)."""
     lane = "on" if str(ocap).lower() == "on" else "off"
-    prior = [
-        score_of(r) for r in records if r.get("model") == model and lane_of(r) == lane
-    ]
-    champ = max(prior) if prior else 0.0
+    best = champions(records).get((model, lane))
+    champ = score_of(best) if best else 0.0
     # Float tolerance so an identical re-run doesn't spuriously fail.
     return (new_score + 1e-9 >= champ, champ)
 
@@ -733,6 +733,17 @@ def _self_test() -> int:
         {"model": "m", "date": "2026-07-02", "mean_reward": 0.1},
     ]
     assert champions(tie)[("m", "off")]["date"] == "2026-07-02"
+
+    # #2316: a record ingested with --allow-incomplete is never a champion, so it
+    # can't raise the bar gate() holds complete runs to or reach the scoreboard.
+    waived = [
+        {"model": "w", "mean_reward": 0.30, "total": 30, "coverage_override": False},
+        {"model": "w", "mean_reward": 1.0, "total": 1, "coverage_override": True},
+    ]
+    assert score_of(champions(waived)[("w", "off")]) == 0.30, champions(waived)
+    assert gate(waived, "w", 0.5) == (True, 0.30), gate(waived, "w", 0.5)
+    wt = render_table(waived)
+    assert "30.0% (?/30)" in wt and "100.0%" not in wt, wt
 
     _self_test_ingestion()
     print("bench_scoreboard self-test: OK")
