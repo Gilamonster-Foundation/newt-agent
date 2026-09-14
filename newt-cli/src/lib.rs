@@ -852,6 +852,10 @@ pub enum Command {
         /// (repeatable). Checked before any model request (#2314).
         #[arg(long, value_name = "FEATURE")]
         require_feature: Vec<solve_contract::Feature>,
+        /// Output-token allowance for this solve; overrides
+        /// `[[model_tuning]] output_allowance` for the model (#2312).
+        #[arg(long, value_name = "TOKENS")]
+        output_allowance: Option<u32>,
         /// Start without inherited frame or ambient memory inputs. Smart mode
         /// otherwise starts a resumable frame; legacy solve keeps its default.
         /// This bounds admitted inputs, not model nondeterminism or provider-side
@@ -1754,6 +1758,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             model_digest,
             scratchpad_state,
             require_feature,
+            output_allowance,
             hermetic,
             resume_from,
         } => {
@@ -1781,6 +1786,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 model_digest,
                 scratchpad_state,
                 require_feature,
+                output_allowance,
                 launch,
             })
             .await?;
