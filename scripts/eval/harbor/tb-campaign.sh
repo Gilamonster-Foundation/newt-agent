@@ -40,7 +40,9 @@ log() { echo "$(date -Is) $*" | tee -a "$LOG"; }
 EP="$(sed -n 's/^endpoint *= *"\(.*\)"/\1/p' "$NEWT_BENCH_PROFILE_TEMPLATE" | head -1)"
 [ -n "$EP" ] || { echo "no endpoint in $NEWT_BENCH_PROFILE_TEMPLATE" >&2; exit 2; }
 export TB_LOCAL_BASE_URL="$EP/v1" TB_LOCAL_CONTEXT_WINDOW="$TB_CTX_SIZE"
-unset OPENAI_BASE_URL NEWT_BENCH_SMART   # codex would append the first; the second changes newt's arm
+# Stock Codex copies OPENAI_API_KEY into the container and appends OPENAI_BASE_URL
+# to its config; NEWT_BENCH_SMART would change newt's arm.
+unset OPENAI_API_KEY OPENAI_BASE_URL NEWT_BENCH_SMART
 export NEWT_BENCH_BIN NEWT_BENCH_CONTEXT_WINDOW="$TB_CTX_SIZE" NEWT_BENCH_OCAP=off
 
 py() { python3 -c "$@"; }
