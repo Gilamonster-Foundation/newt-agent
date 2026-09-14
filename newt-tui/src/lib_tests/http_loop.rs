@@ -41,7 +41,7 @@ async fn loop_summarizer_sends_num_ctx_to_ollama() {
             ..Default::default()
         },
     );
-    let out = s("summarize the middle".into()).await.unwrap();
+    let (out, _) = s("summarize the middle".into()).await.unwrap();
     assert_eq!(out, "SUM");
     let captured = body.lock().unwrap().clone().expect("request captured");
     assert_eq!(
@@ -113,7 +113,7 @@ async fn loop_summarizer_warms_the_model_first() {
         None,
         SummarizerOpts::default(),
     );
-    let out = s("summarize".into()).await.unwrap();
+    let (out, _) = s("summarize".into()).await.unwrap();
     assert_eq!(out, "SUM");
     let warm_body = warm
         .lock()
@@ -168,7 +168,7 @@ async fn loop_summarizer_retries_then_succeeds() {
             ..Default::default()
         },
     );
-    let out = s("summarize".into()).await.unwrap();
+    let (out, _) = s("summarize".into()).await.unwrap();
     assert_eq!(out, "SUM");
     assert_eq!(*calls.lock().unwrap(), 2, "retried once after the 500");
 }
@@ -241,7 +241,7 @@ async fn loop_summarizer_falls_back_to_secondary_model() {
             ..Default::default()
         },
     );
-    let out = s("summarize".into()).await.unwrap();
+    let (out, _) = s("summarize".into()).await.unwrap();
     assert_eq!(out, "FB SUM", "fell back to the secondary model");
 }
 
@@ -468,7 +468,7 @@ async fn loop_summarizer_omits_num_ctx_on_openai() {
             ..Default::default()
         },
     );
-    let out = s("summarize the middle".into()).await.unwrap();
+    let (out, _) = s("summarize the middle".into()).await.unwrap();
     assert_eq!(out, "SUM");
     let captured = body.lock().unwrap().clone().expect("request captured");
     assert!(

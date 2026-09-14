@@ -15,7 +15,7 @@ fn summary_progress_spans_success_and_error() {
                 if fail {
                     anyhow::bail!("summary failed");
                 }
-                Ok("summary".into())
+                Ok(("summary".into(), None))
             })
         });
         let summary = with_summary_progress(summarizer, LineCaps::Own, false);
@@ -52,12 +52,13 @@ fn summary_progress_preserves_an_existing_spinner() {
         false,
     )
     .unwrap();
-    let summarizer: newt_core::Summarizer = Box::new(|_| Box::pin(async { Ok("summary".into()) }));
+    let summarizer: newt_core::Summarizer =
+        Box::new(|_| Box::pin(async { Ok(("summary".into(), None)) }));
     let summary = with_summary_progress(summarizer, LineCaps::Own, false);
     let out = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(summary("input".into()));
-    assert_eq!(out.unwrap(), "summary");
+    assert_eq!(out.unwrap().0, "summary");
     assert!(
         !row_is_free(),
         "summary must not release the outer spinner's row"
@@ -125,7 +126,7 @@ fn summary_progress_child() {
             true,
         );
         assert_eq!(
-            summary("summarize".into()).await.unwrap(),
+            summary("summarize".into()).await.unwrap().0,
             "SUMMARY_COMPLETE"
         );
     });

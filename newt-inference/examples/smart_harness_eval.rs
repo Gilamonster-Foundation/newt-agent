@@ -153,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
             let started = Instant::now();
             let result = (auxiliary.complete)(prompt).await;
             let (raw, error) = match result {
-                Ok(raw) => (Some(raw), None),
+                Ok((raw, _usage)) => (Some(raw), None),
                 Err(error) => (None, Some(error.to_string())),
             };
             let prediction = raw.as_deref().and_then(parse_verdict).unwrap_or("failure");

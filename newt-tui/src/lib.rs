@@ -2098,7 +2098,7 @@ async fn summarize_attempt(
     body: &serde_json::Value,
     api_key: &Option<String>,
     openai: bool,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Option<newt_core::TokenUsage>)> {
     let mut req = client.post(chat_url).json(body);
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
@@ -2119,7 +2119,10 @@ async fn summarize_attempt(
 /// cooperative models; this is the response-side belt-and-suspenders. A
 /// still-empty result is a genuine empty summary (the caller degrades it to the
 /// static marker) rather than a `<think>`-polluted string masquerading as one.
-fn extract_summary(json: &serde_json::Value, openai: bool) -> anyhow::Result<String> {
+fn extract_summary(
+    json: &serde_json::Value,
+    openai: bool,
+) -> anyhow::Result<(String, Option<newt_core::TokenUsage>)> {
     let raw = if openai {
         json["choices"][0]["message"]["content"].as_str()
     } else {
@@ -2130,7 +2133,12 @@ fn extract_summary(json: &serde_json::Value, openai: bool) -> anyhow::Result<Str
     if clean.trim().is_empty() {
         anyhow::bail!("summarizer returned empty content (thinking-only reply?)");
     }
-    Ok(clean)
+    let usage = if openai {
+        newt_core::agentic::openai_usage(&json["usage"])
+    } else {
+        newt_core::agentic::ollama_usage(json)
+    };
+    Ok((clean, usage))
 }
 
 #[cfg(test)]
@@ -2146,7 +2154,7 @@ async fn summarize_one_model(
     prompt: &str,
     opts: &SummarizerOpts,
     api_key: &Option<String>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Option<newt_core::TokenUsage>)> {
     let chat_url = if openai {
         format!("{}/v1/chat/completions", url.trim_end_matches('/'))
     } else {
@@ -2332,7 +2340,7 @@ fn make_embedded_summarizer(
                                 std::time::Duration::from_secs(timeout_secs),
                             )
                             .await
-                            .map(|reply| reply.content)
+                            .map(|reply| (reply.content, reply.usage))
                     })
                 })
             }
@@ -2672,8 +2680,9 @@ async fn run_close_extraction(
         return None;
     }
     let transcript = render_extraction_transcript(&memory.build_messages("", ""))?;
+    // TODO(#2313): record the extraction usage in the per-attempt ledger (PR2).
     let reply = match complete(build_extraction_prompt(&transcript)).await {
-        Ok(r) => r,
+        Ok((r, _usage)) => r,
         Err(e) => {
             tracing::warn!(error = %e, "close-time note extraction failed — moving on");
             return None;

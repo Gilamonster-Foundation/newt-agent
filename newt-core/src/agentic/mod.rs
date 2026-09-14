@@ -303,7 +303,7 @@ pub use tools::{
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
 };
-pub use trim::trim_for_summary;
+pub use trim::{ollama_usage, openai_usage, trim_for_summary};
 pub use untrusted::{wrap_internal_summary, wrap_untrusted};
 pub use warmup::warmup_if_cold;
 
@@ -335,7 +335,7 @@ use std::io::{self, Write as _};
 use tools::{is_hallucination, merged_tool_definitions};
 use trim::{
     estimate_request_tokens, estimate_tokens, estimate_value_tokens, merge_round_usage,
-    ollama_usage, openai_usage, protected_prompt_head_len, PromptTracker,
+    protected_prompt_head_len, PromptTracker,
 };
 
 /// Retry policy selected from endpoint locality.
@@ -1001,6 +1001,11 @@ pub struct ChatCtx<'a> {
     /// Unknown endpoints use the all-unset default and retain the historical
     /// request body even when cognition is active.
     pub chat_completions_capability: crate::model_card::ChatCompletionsCapability,
+    /// Explicit output-token allowance (`[[model_tuning]] output_allowance`,
+    /// #2312). Overrides the cognition table's output budget without touching
+    /// cognition, thinking or sampling; every loop reserves it locally, and it is
+    /// sent only where the wire declares a cap. `None` keeps today's defaults.
+    pub output_allowance: Option<u32>,
     /// Whether assistant reasoning may be replayed to the active backend.
     /// Unknown endpoints default to `Never`; local reasoning backends opt in via
     /// their explicit capability profile.
@@ -1883,6 +1888,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // fields to `_` so its request body remains unchanged.
         cognition: _,
         chat_completions_capability: _,
+        output_allowance,
         reasoning_replay_scope: _,
         max_tool_rounds,
         workflow_grace_rounds,
@@ -2063,7 +2069,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // so without the ceiling the first turn dispatched 10× over the real
     // window with zero events — B6). Mutable because a recovered 400 tightens
     // it mid-turn. See #223.
-    let mut effective_input_ceiling = num_ctx_input_ceiling(num_ctx, input_ceiling_pct, None);
+    // #2312: no cognition table on this wire — only an explicit allowance reserves.
+    let mut effective_input_ceiling =
+        num_ctx_input_ceiling(num_ctx, input_ceiling_pct, output_allowance);
     let mut send_budget: Option<usize> =
         initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
     // Step 20.3: is the send budget backed by an authoritative ceiling, or
@@ -2677,7 +2685,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 recovered_input_budget(
                                     context_window,
                                     input_ceiling_pct,
-                                    None,
+                                    output_allowance,
                                     effective_input_ceiling,
                                 )
                             })
@@ -6409,6 +6417,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // field. Explicit endpoint capability data may instead project cognition
         // into a local generation policy.
         cognition,
+        output_allowance,
         chat_completions_capability,
         reasoning_replay_scope,
         max_tool_rounds,
@@ -6490,6 +6499,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     let generation_policy = generation_policy::GenerationPolicy::resolve(
         cognition,
+        output_allowance,
         chat_completions_capability,
         reasoning_replay_scope,
     );
@@ -6602,7 +6612,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let mut effective_input_ceiling = num_ctx_input_ceiling(
         num_ctx,
         input_ceiling_pct,
-        generation_policy.max_output_tokens,
+        generation_policy.output_allowance,
     );
     let mut send_budget: Option<usize> =
         initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
@@ -7184,7 +7194,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 recovered_input_budget(
                                     context_window,
                                     input_ceiling_pct,
-                                    generation_policy.max_output_tokens,
+                                    generation_policy.output_allowance,
                                     effective_input_ceiling,
                                 )
                             })
@@ -8826,7 +8836,7 @@ async fn final_summary_anthropic(
     let body = anthropic_wire::build_messages_body(
         model,
         generation_policy
-            .max_output_tokens
+            .output_allowance
             .unwrap_or_else(anthropic_wire::default_max_tokens),
         system.as_deref(),
         &wire_messages,
@@ -8885,6 +8895,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // Resolved into a local generation policy like the OpenAI path; only
         // the output cap projects onto this wire today (see below).
         cognition,
+        output_allowance,
         chat_completions_capability,
         reasoning_replay_scope,
         max_tool_rounds,
@@ -8961,6 +8972,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     let generation_policy = generation_policy::GenerationPolicy::resolve(
         cognition,
+        output_allowance,
         chat_completions_capability,
         reasoning_replay_scope,
     );
@@ -8979,11 +8991,17 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         parallel_tool_calls: _,
         chat_template_kwargs: _,
         max_output_tokens: _,
+        output_allowance: _,
         reasoning_replay_scope: _,
         one_bounded_reasoning_continuation: _,
     } = generation_policy;
+    // #2312 tiers: explicit allowance > cognition table > wire default
+    // (`NEWT_ANTHROPIC_MAX_TOKENS`, else 8192). `max_tokens` is REQUIRED on this
+    // wire, so the resolved allowance is always a declared field here.
+    // Known discrepancy (pre-existing, unchanged): with no allowance the local
+    // ceiling below reserves nothing while the wire default is sent.
     let max_tokens = generation_policy
-        .max_output_tokens
+        .output_allowance
         .unwrap_or_else(anthropic_wire::default_max_tokens);
     // Streaming valve: default ON; `NEWT_ANTHROPIC_STREAM=off` disables SSE.
     // Read once per loop invocation so a mid-turn flip cannot tear a round.
@@ -9097,7 +9115,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut effective_input_ceiling = num_ctx_input_ceiling(
         num_ctx,
         input_ceiling_pct,
-        generation_policy.max_output_tokens,
+        generation_policy.output_allowance,
     );
     let mut send_budget: Option<usize> =
         initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
@@ -9526,7 +9544,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                 recovered_input_budget(
                                     context_window,
                                     input_ceiling_pct,
-                                    generation_policy.max_output_tokens,
+                                    generation_policy.output_allowance,
                                     effective_input_ceiling,
                                 )
                             })
@@ -10945,6 +10963,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         persona_tools,
         cognition,
         chat_completions_capability: _,
+        output_allowance,
         reasoning_replay_scope: _,
         max_tool_rounds,
         workflow_grace_rounds: _,
@@ -11131,6 +11150,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         mid_loop_trim_tokens,
         input_ceiling_pct,
         cognition,
+        output_allowance,
     );
     let tools_chat = crate::agentic::tools::select_exposed(
         tools_chat,

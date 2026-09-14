@@ -17,8 +17,12 @@ fn cognition_output_is_reserved_from_32k_and_65k_context_windows() {
     ];
 
     for (cognition, expected_32k, expected_65k) in cases {
-        let policy =
-            GenerationPolicy::resolve(Some(cognition), capability, ReasoningReplayScope::Never);
+        let policy = GenerationPolicy::resolve(
+            Some(cognition),
+            None,
+            capability,
+            ReasoningReplayScope::Never,
+        );
         assert_eq!(
             num_ctx_input_ceiling(Some(32_768), 80, policy.max_output_tokens),
             Some(expected_32k),

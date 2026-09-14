@@ -406,6 +406,7 @@ async fn responses_durable_prompt_context_reaches_v1_responses_wire() {
             persona_tools: None,
             cognition: None,
             chat_completions_capability: Default::default(),
+            output_allowance: None,
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             emits_leading_reasoning: false,
             max_tool_rounds: 5,
@@ -478,4 +479,57 @@ async fn responses_durable_prompt_context_reaches_v1_responses_wire() {
     assert!(body["input"].as_array().is_some_and(|input| input
         .iter()
         .any(|item| item["role"] == "user" && item["content"].as_str() == Some(exact_task))));
+}
+
+/// #2312 (A1, Responses): this wire declares no output-cap field, so an explicit
+/// allowance is a LOCAL reserve only — the request body is byte-identical
+/// across allowances and carries no guessed `max_output_tokens`, while
+/// `reasoning.effort` still follows cognition. (That the reserve reaches local
+/// admission is pinned by `output_allowance_resolves_once_across_every_budget_surface`.)
+#[tokio::test]
+async fn responses_output_allowance_never_changes_the_request_body() {
+    let address = regex::Regex::new(r"prompt:[0-9a-f-]{36}").expect("regex");
+    let mut bodies = Vec::new();
+    for output_allowance in [None, Some(2_000), Some(20_000)] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "considered"}]
+                }],
+                "usage": {"input_tokens": 20, "output_tokens": 3}
+            })))
+            .mount(&server)
+            .await;
+        let task = "allowance is local";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.cognition = Some(crate::role_profile::Cognition::Contemplating);
+        ctx.output_allowance = output_allowance;
+        openai_responses_complete(ctx, &mut NoMcp)
+            .await
+            .expect("the request should dispatch");
+        let requests = server.received_requests().await.expect("journal");
+        assert_eq!(requests.len(), 1);
+        // Pin the per-turn active-prompt address so equality compares what the
+        // allowance could change.
+        let body = String::from_utf8_lossy(&requests[0].body);
+        let body: serde_json::Value =
+            serde_json::from_str(&address.replace_all(&body, "prompt:ID")).unwrap();
+        assert!(
+            body.get("max_output_tokens").is_none(),
+            "{output_allowance:?}"
+        );
+        assert_eq!(body["reasoning"]["effort"], "high");
+        bodies.push(body);
+    }
+    assert_eq!(bodies[1], bodies[0]);
+    assert_eq!(bodies[2], bodies[0]);
 }

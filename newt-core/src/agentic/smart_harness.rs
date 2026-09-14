@@ -633,7 +633,8 @@ impl SmartHarness {
             harness: self,
             started: Instant::now(),
         };
-        let raw = tokio::time::timeout(timeout, (self.complete)(prompt))
+        // TODO(#2313): record the auxiliary usage in the per-attempt ledger (PR2).
+        let (raw, _usage) = tokio::time::timeout(timeout, (self.complete)(prompt))
             .await
             .map_err(|_| anyhow::anyhow!("auxiliary timeout"))??;
         Ok(raw)
@@ -1174,7 +1175,7 @@ mod tests {
             Session::new(Default::default()).unwrap(),
             Arc::new(move |_| {
                 let reply = replies.lock().unwrap().pop_front().unwrap();
-                Box::pin(async move { Ok(reply) })
+                Box::pin(async move { Ok((reply, None)) })
             }),
             settings,
         )
@@ -1449,7 +1450,7 @@ mod tests {
             let raw = "\"answer\"";
             let h = SmartHarness::new(
                 Session::open(dir.path(), Default::default()).unwrap(),
-                Arc::new(move |_| Box::pin(async move { Ok(raw.to_string()) })),
+                Arc::new(move |_| Box::pin(async move { Ok((raw.to_string(), None)) })),
                 AdjudicationSettings {
                     max_output_bytes: 4,
                     ..Default::default()
@@ -1692,7 +1693,7 @@ mod tests {
                     .map(|card| card["cid"].clone())
                     .collect::<Vec<_>>();
                 selected.extend(catalog["host_pinned"].as_array().unwrap().iter().cloned());
-                Box::pin(async move { Ok(serde_json::to_string(&selected).unwrap()) })
+                Box::pin(async move { Ok((serde_json::to_string(&selected).unwrap(), None)) })
             }),
             Default::default(),
         )
