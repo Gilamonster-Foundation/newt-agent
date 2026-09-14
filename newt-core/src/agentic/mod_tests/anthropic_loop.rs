@@ -21,7 +21,7 @@ mod context_errors;
 
 /// Set/unset an env var for the test's duration, restoring prior state on
 /// drop (env vars are process-global — hence the serial lane above).
-struct EnvGuard {
+pub(super) struct EnvGuard {
     key: &'static str,
     prev: Option<String>,
 }
@@ -48,7 +48,7 @@ impl Drop for EnvGuard {
 
 /// Zero-delay retry envelope + an EXPLICIT streaming-valve state, so tests
 /// exercise retries without sleeping and never depend on ambient env.
-fn test_env(stream: bool) -> Vec<EnvGuard> {
+pub(super) fn test_env(stream: bool) -> Vec<EnvGuard> {
     let mut guards = vec![
         EnvGuard::set("NEWT_HTTP_BACKOFF_BASE_MS", "0"),
         EnvGuard::set("NEWT_HTTP_BACKOFF_MAX_MS", "0"),

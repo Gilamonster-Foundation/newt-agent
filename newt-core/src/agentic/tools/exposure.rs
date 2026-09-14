@@ -169,18 +169,95 @@ impl From<crate::config::ToolExposureConfig> for ExposureSettings {
     }
 }
 
-/// What the controller decided this turn — for metrics / `KnownHidden` coaching.
+/// What the controller decided this turn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExposurePlan {
     /// Names kept on the wire, in the catalog's original order.
     pub exposed: Vec<String>,
-    /// Authorized names dropped from the wire (still dispatchable).
-    // INERT-CODE-RATCHET: F12 WIRE: exposure planning computes hidden and token-budget telemetry that production drops.
+    /// Authorized names dropped from the wire (still dispatchable). They seed
+    /// the turn's [`HiddenTools`], which `tool_search` and dispatch read.
     pub hidden: Vec<String>,
-    /// Estimated tokens of the exposed schema set.
-    pub exposed_tokens: usize,
-    /// The schema-token budget applied (`None` = no live signal / identity).
-    pub budget_tokens: Option<usize>,
+}
+
+/// How `tool_search` marks an authorized tool whose schema is off the wire.
+pub(crate) const HIDDEN_SEARCH_MARK: &str = "[schema not loaded: call it once to load it]";
+
+/// The dispatch result for a call to an authorized tool whose schema the
+/// model has not been sent (#2331). The call does not run: no arguments run
+/// against a schema the model never saw.
+pub(crate) fn hidden_call_message(name: &str) -> String {
+    format!(
+        "Tool `{name}` did not run (schema not loaded). Its schema is loaded for your next \
+         request; call `{name}` again with arguments that match it."
+    )
+}
+
+/// The turn's authorized-but-unexposed tools (#2331). A call to one promotes
+/// it: the loop appends its schema, after the tools already sent, before the
+/// next request, so the provider's cached prefix changes as little as
+/// possible. Promotion lasts for the turn.
+#[derive(Debug, Default)]
+pub(crate) struct HiddenTools {
+    state: std::sync::Mutex<HiddenState>,
+}
+
+#[derive(Debug, Default)]
+struct HiddenState {
+    /// Hidden definitions, in catalog order.
+    defs: Vec<Value>,
+    /// Names called since the last append, in call order.
+    promoted: Vec<String>,
+}
+
+impl HiddenTools {
+    fn state(&self) -> std::sync::MutexGuard<'_, HiddenState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether `name` is authorized but not on the wire.
+    pub(crate) fn is_hidden(&self, name: &str) -> bool {
+        self.state()
+            .defs
+            .iter()
+            .any(|def| entry_name(def) == Some(name))
+    }
+
+    /// Promote `name` if it is hidden. `false` for anything else, including a
+    /// tool this request refuses, which is never in the hidden set.
+    pub(crate) fn promote(&self, name: &str) -> bool {
+        let mut state = self.state();
+        let hidden = state.defs.iter().any(|def| entry_name(def) == Some(name));
+        if hidden && !state.promoted.iter().any(|promoted| promoted == name) {
+            state.promoted.push(name.to_owned());
+        }
+        hidden
+    }
+
+    /// Append every promoted schema to `tools`, in promotion order. Returns
+    /// whether the tool list changed.
+    // ponytail: no re-projection onto the 128-function wire cap; a turn that
+    // promotes past it needs select_openai_compatible_tools applied here.
+    pub(crate) fn append_promoted(&self, tools: &mut Value) -> bool {
+        let mut state = self.state();
+        if state.promoted.is_empty() {
+            return false;
+        }
+        let Value::Array(sent) = tools else {
+            return false;
+        };
+        for name in std::mem::take(&mut state.promoted) {
+            if let Some(at) = state
+                .defs
+                .iter()
+                .position(|def| entry_name(def) == Some(&name))
+            {
+                sent.push(state.defs.remove(at));
+            }
+        }
+        true
+    }
 }
 
 /// The name of a catalog entry (`{"function":{"name":…}}`), or `None`.
@@ -227,12 +304,9 @@ pub fn plan_exposure(
 
     // Identity: Full profile, non-array catalog, or no budget under Auto.
     let Some(budget) = budget_tokens(settings, live_budget_tokens) else {
-        let exposed_tokens = crate::agentic::trim::estimate_value_tokens(defs, est);
         return ExposurePlan {
             exposed: all_names,
             hidden: Vec::new(),
-            exposed_tokens,
-            budget_tokens: None,
         };
     };
 
@@ -284,12 +358,7 @@ pub fn plan_exposure(
             hidden.push(name);
         }
     }
-    ExposurePlan {
-        exposed,
-        hidden,
-        exposed_tokens: kept_tokens,
-        budget_tokens: Some(budget),
-    }
+    ExposurePlan { exposed, hidden }
 }
 
 /// Apply the exposure policy to an authorized catalog, returning the exposed
@@ -303,12 +372,12 @@ pub fn select_exposed(
     live_budget_tokens: Option<usize>,
     active: &BTreeSet<String>,
     est: TokenEstimation,
-) -> Value {
+) -> (Value, HiddenTools) {
     if settings.profile == ExposureProfile::Full {
-        return defs;
+        return (defs, HiddenTools::default());
     }
     let Value::Array(arr) = defs else {
-        return defs;
+        return (defs, HiddenTools::default());
     };
     let plan = plan_exposure(
         &Value::Array(arr.clone()),
@@ -317,15 +386,17 @@ pub fn select_exposed(
         active,
         est,
     );
-    let keep: BTreeSet<&str> = plan.exposed.iter().map(String::as_str).collect();
-    Value::Array(
-        arr.into_iter()
-            .filter(|def| match entry_name(def) {
-                Some(name) => keep.contains(name),
-                None => true,
-            })
-            .collect(),
-    )
+    let hidden: BTreeSet<&str> = plan.hidden.iter().map(String::as_str).collect();
+    let (hidden, exposed): (Vec<Value>, Vec<Value>) = arr
+        .into_iter()
+        .partition(|def| entry_name(def).is_some_and(|name| hidden.contains(name)));
+    let hidden = HiddenTools {
+        state: std::sync::Mutex::new(HiddenState {
+            defs: hidden,
+            promoted: Vec::new(),
+        }),
+    };
+    (Value::Array(exposed), hidden)
 }
 
 /// Project an authorized/exposed catalog onto the OpenAI-compatible wire's
@@ -455,7 +526,8 @@ mod tests {
             Some(100),
             &BTreeSet::new(),
             est(),
-        );
+        )
+        .0;
         assert_eq!(out, defs, "Full must be bit-for-bit identity");
     }
 
@@ -491,7 +563,7 @@ mod tests {
             profile: ExposureProfile::Auto,
             ..Default::default()
         };
-        let out = select_exposed(defs.clone(), &settings, None, &BTreeSet::new(), est());
+        let out = select_exposed(defs.clone(), &settings, None, &BTreeSet::new(), est()).0;
         assert_eq!(out, defs, "no live signal => no clipping");
     }
 
@@ -534,7 +606,7 @@ mod tests {
                 schema_budget_pct: 1,
                 max_initial_tools: 1,
             };
-            let out = select_exposed(defs.clone(), &settings, budget, &BTreeSet::new(), est());
+            let out = select_exposed(defs.clone(), &settings, budget, &BTreeSet::new(), est()).0;
             assert_eq!(
                 out,
                 json!([defs[0], defs[1]]),
@@ -545,7 +617,7 @@ mod tests {
             // a memory_fetch entry when those gates excluded it.
             let unavailable = json!([defs[0], defs[2]]);
             assert_eq!(
-                select_exposed(unavailable, &settings, budget, &BTreeSet::new(), est()),
+                select_exposed(unavailable, &settings, budget, &BTreeSet::new(), est()).0,
                 json!([defs[0]])
             );
         }
@@ -587,7 +659,8 @@ mod tests {
             Some(100_000),
             &BTreeSet::new(),
             est(),
-        );
+        )
+        .0;
         assert_eq!(out, defs);
     }
 
@@ -620,12 +693,19 @@ mod tests {
         };
         // A small model: ~4k usable tokens → ~600-token schema budget.
         let plan = plan_exposure(&full, &settings, Some(4_000), &BTreeSet::new(), est());
-        assert!(
-            plan.exposed_tokens < full_tokens,
-            "exposed schema ({}) must cost less than the full catalog ({full_tokens})",
-            plan.exposed_tokens
+        let (exposed, _) = select_exposed(
+            full.clone(),
+            &settings,
+            Some(4_000),
+            &BTreeSet::new(),
+            est(),
         );
-        // NOTE: exposed_tokens is NOT asserted <= budget here — Kernel (which
+        let exposed_tokens = crate::agentic::trim::estimate_value_tokens(&exposed, est());
+        assert!(
+            exposed_tokens < full_tokens,
+            "exposed schema ({exposed_tokens}) must cost less than the full catalog ({full_tokens})"
+        );
+        // NOTE: the exposed cost is NOT asserted <= budget here — Kernel (which
         // includes the large base `run_command` schema) is exempt from the
         // budget by design. `auto_keeps_kernel_even_when_budget_is_tiny` covers
         // the budget-clip of the evictable (ByIntent) band deterministically.
