@@ -79,7 +79,8 @@ rung_rows() {
 # True if an open issue with exactly this title exists. Honors the test stub.
 is_open() {
   local title="$1"
-  if [ -n "${FR_STUB_OPEN_TITLES:-}" ]; then
+  # Set-but-empty is a stub too ("no issue open"): only an UNSET stub reaches gh.
+  if [ -n "${FR_STUB_OPEN_TITLES+set}" ]; then
     grep -Fxq -- "$title" <<<"$FR_STUB_OPEN_TITLES"
     return
   fi
@@ -203,6 +204,11 @@ self_test() {
   local tmp; tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
   local base="$tmp/baseline.tsv" cur="$tmp/current.tsv"
+  # Hermetic: CI runs this. A tripwire `gh` records any call that escaped the stub.
+  mkdir -p "$tmp/bin"
+  printf '#!/bin/sh\necho "$*" >> "%s/gh-called"\nexit 1\n' "$tmp" > "$tmp/bin/gh"
+  chmod +x "$tmp/bin/gh"
+  local PATH="$tmp/bin:$PATH"
 
   # baseline: T0/single 3/3, T1/crew 3/3, T2/single 0/3 (already failing)
   {
@@ -254,6 +260,10 @@ self_test() {
   echo "$outB"
   grep -q "SKIP (issue already open): nightly-eval regression: T0-fix-add/single" <<<"$outB" || { echo "  !! expected SKIP for already-open T0-fix-add/single"; fails=$((fails+1)); }
   grep -q "filed 0 new issue" <<<"$outB" || { echo "  !! expected 0 filed on the idempotent pass"; fails=$((fails+1)); }
+
+  if [ -e "$tmp/gh-called" ]; then
+    echo "  !! the self-test reached gh: $(cat "$tmp/gh-called")"; fails=$((fails+1))
+  fi
 
   echo
   if [ "$fails" -eq 0 ]; then
