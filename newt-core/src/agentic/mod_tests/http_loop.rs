@@ -369,6 +369,10 @@ mod plan_handoff;
 mod verification;
 
 #[cfg(test)]
+#[path = "http_verification_outcomes.rs"]
+mod verification_outcomes;
+
+#[cfg(test)]
 #[path = "http_spill_retrieval.rs"]
 mod spill_retrieval;
 

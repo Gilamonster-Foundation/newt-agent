@@ -387,6 +387,10 @@ pub fn workspace_entries(dir: &std::path::Path) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[path = "self_verify_outcomes_tests.rs"]
+mod outcomes_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
