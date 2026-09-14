@@ -7,7 +7,7 @@ Run: PYTHONPATH=scripts/eval/harbor python -m unittest discover scripts/eval/har
 import json
 import unittest
 
-from tb_campaign import codex_claim, newt_claim, pi_claim, summarize, wilson
+from tb_campaign import codex_claim, error_cause, harness_evidence, newt_claim, pi_claim, summarize, wilson
 
 
 def jl(*records):
@@ -15,9 +15,9 @@ def jl(*records):
 
 
 def row(**kw):
-    base = dict(graded=True, resolved=False, claimed_done=True, exception=None,
-                model_effective="m", tokens_in=None, tokens_out=None, agent_s=None,
-                max_request_output_tokens=None)
+    base = dict(state="graded", reward=0.0, resolved=False, error_cause=None, inference_failure=None,
+                claimed_done=True, exception=None, model_effective="m", tokens_in=None, tokens_out=None,
+                agent_s=None, max_request_output_tokens=None)
     return {**base, **kw}
 
 
@@ -45,6 +45,31 @@ class Claims(unittest.TestCase):
         self.assertIsNone(codex_claim(jl({"type": "thread.started"})))
 
 
+class ErrorCause(unittest.TestCase):
+    NZ = "NonZeroAgentExitCodeError"
+
+    def test_runaway_truncated_stream_after_replies_is_agent(self):
+        # circuit-fibsqrt__sQVNJH6 (smart-ab-8 baseline): 13 completions, then newt refused the stream.
+        lines = jl(*[{"kind": "chat_completion_finish", "finish_reason": "tool_calls"}] * 13,
+                   {"kind": "solve_result", "error": "streamed tool batch did not finish with tool_calls"})
+        replies, err = harness_evidence("newt", lines)
+        self.assertEqual(replies, 13)
+        self.assertEqual(error_cause(self.NZ, 1, err, None, replies), "agent")
+
+    def test_apparatus_evidence_is_infra_even_after_replies(self):
+        self.assertEqual(error_cause(None, None, None, "auto_retry_end success=false: Connection error.", 0), "infra")
+        self.assertEqual(error_cause(self.NZ, 1, "inference endpoint: error sending request", None, 4), "infra")
+        self.assertEqual(error_cause(self.NZ, 137, None, None, 9), "infra")
+        self.assertEqual(error_cause("EnvironmentStartTimeoutError", None, None, None, 0), "infra")
+        _, err = harness_evidence("codex", jl({"type": "turn.failed", "error": {"message": "stream disconnected before completion"}}))
+        self.assertEqual(error_cause(self.NZ, 1, err, None, 2), "infra")
+
+    def test_unprovable_is_unknown_and_no_exception_is_none(self):
+        self.assertEqual(error_cause("AgentTimeoutError", None, None, None, 0), "unknown")
+        self.assertEqual(error_cause("AgentTimeoutError", None, None, None, 5), "agent")
+        self.assertIsNone(error_cause(None, None, None, None, 7))
+
+
 class Summary(unittest.TestCase):
     def test_wilson(self):
         lo, hi = wilson(0, 1)
@@ -54,22 +79,37 @@ class Summary(unittest.TestCase):
 
     def test_unknown_claims_and_missing_grades_are_not_folded_in(self):
         rows = [
-            row(resolved=True),                                   # true completion
-            row(),                                                # false completion
-            row(claimed_done=False, resolved=True),               # false incomplete
-            row(claimed_done=None),                               # unrecoverable claim
-            row(graded=False, exception="AgentSetupError"),       # ungraded
-            row(model_effective="other"),                         # ran another model
-            row(graded=False, state="error"),                     # pi exit-0 inference failure
-            row(claimed_done=False, exception="AgentTimeoutError", max_request_output_tokens=96345),
+            row(resolved=True, reward=1.0),                                   # true completion
+            row(),                                                            # false completion
+            row(claimed_done=False, resolved=True, reward=1.0),               # false incomplete
+            row(claimed_done=None),                                           # unrecoverable claim
+            row(state="error", reward=None, exception="AgentSetupTimeoutError", error_cause="infra"),
+            row(model_effective="other"),                                     # ran another model
+            row(state="error", error_cause="infra", inference_failure="auto_retry_end"),  # pi exit 0
+            row(state="error", claimed_done=False, exception="AgentTimeoutError", error_cause="agent",
+                max_request_output_tokens=96345),
         ]
         s = summarize({"expected": 9, "model": "m"}, rows)
-        self.assertEqual((s["expected"], s["observed"], s["graded"]), (9, 8, 6))
-        self.assertEqual((s["resolved"], s["claimed"]), (2, 3))
+        self.assertEqual((s["expected"], s["observed"], s["graded"], s["errors"]), (9, 8, 5, 3))
+        self.assertEqual(s["claimed"], 3)  # infra trials never count as a claim outcome
         self.assertEqual((s["false_completions"], s["false_incompletes"]), (2, 1))
         self.assertEqual((s["unrecoverable_claims"], s["exceptions"], s["model_mismatches"]), (1, 2, 1))
-        self.assertEqual(s["inference_errors"], 1)
-        self.assertEqual((s["agent_timeouts"], s["max_request_output"]), (1, 96345))
+        self.assertEqual((s["inference_errors"], s["agent_timeouts"], s["max_request_output"]), (1, 1, 96345))
+        self.assertEqual((s["rate_excl"], s["rate_agent_fail"], s["causes"]), ((2, 5), (2, 6), (2, 1, 0)))
+        self.assertEqual(s["tokens_in"], (0, 0))  # none known: count 0, not a zero cost
+
+    def test_two_resolve_rates(self):
+        rows = [
+            row(resolved=True, reward=1.0),
+            row(),
+            row(state="error", exception="NonZeroAgentExitCodeError", error_cause="agent"),  # runaway, reward 0
+            row(state="error", exception="NetworkConnectionError", error_cause="infra"),     # router down
+            row(state="error", exception="AgentTimeoutError", error_cause="unknown"),
+        ]
+        s = summarize({"expected": 5, "model": "m"}, rows)
+        self.assertEqual(s["rate_excl"], (1, 2))
+        self.assertEqual(s["rate_agent_fail"], (1, 3))
+        self.assertEqual(s["causes"], (1, 1, 1))
         self.assertEqual(s["tokens_in"], (0, 0))  # none known: count 0, not a zero cost
 
 
