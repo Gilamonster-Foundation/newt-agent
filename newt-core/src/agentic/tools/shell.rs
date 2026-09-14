@@ -1221,9 +1221,11 @@ pub(crate) const ABSENT_BINARY_MARKER: &str = "not in this profile's carried use
 /// (`~/.cargo/bin` outside the sandbox's read scope is the issue's own
 /// transcript). brush reports it as exit 126 with `Permission denied`, which
 /// is indistinguishable from a script the model forgot to `chmod +x` — a
-/// repairable failure. The discriminator is STRUCTURED, never the stderr
-/// text: exit 126, no `denials`, and the resolved host path is NOT permitted
-/// by the read scope. Only then is it rendered in newt's own denial vocabulary
+/// repairable failure. The gate is STRUCTURED and reads no stderr: exit 126,
+/// no `denials`, and the resolved host path is NOT permitted by the read
+/// scope. Stderr only chooses WHICH program that path check examines — brush's
+/// own error names it first, the leading token is the fallback (see
+/// [`failed_program`]). Only then is it rendered in newt's own denial vocabulary
 /// so the guidance stops asking for an edit; an ordinary 126 inside the grant
 /// falls through untouched.
 pub(crate) fn kernel_refused_binary(
