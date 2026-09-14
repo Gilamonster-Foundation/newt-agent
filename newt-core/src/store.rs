@@ -551,7 +551,7 @@ impl ConversationStore {
         // append, a caller could commit one and brick the conversation
         // permanently (the read path repairs nothing by design). A write
         // path must never admit what verification rejects.
-        if !sources.is_empty() && !(events.is_empty() && phantom_reaches.is_empty()) {
+        if !(sources.is_empty() || events.is_empty() && phantom_reaches.is_empty()) {
             anyhow::bail!(
                 "refusing the append -- this turn claims derivation (non-empty \
                  sources) AND tool activity; a derived row is harness-minted and \
