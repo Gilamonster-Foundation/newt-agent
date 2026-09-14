@@ -28,6 +28,9 @@ pub enum Retryability {
     /// Transient — retrying may succeed (connection failure, timeout, `408`,
     /// `429`, or any `5xx`).
     Retry,
+    /// A response's `id` or `model` changed mid-stream (#2334). A fresh attempt
+    /// may be clean, but each one re-buys a whole generation: one per dispatch.
+    RetryOnce,
     /// The server rejected the context. Only a smaller projection may be
     /// dispatched; the unchanged-request backoff loop must return this error.
     ContextExceeded,
@@ -51,6 +54,9 @@ pub fn classify(err: &anyhow::Error) -> Retryability {
         .any(|cause| crate::agentic::cw_overflow::is_context_overflow(&cause.to_string()))
     {
         return Retryability::ContextExceeded;
+    }
+    if crate::agentic::openai_sse::changed_identity(err).is_some() {
+        return Retryability::RetryOnce;
     }
     let msg = err.to_string();
 
@@ -278,11 +284,25 @@ where
     N: FnMut(u32, Duration, &anyhow::Error),
 {
     let mut retries = 0u32;
+    let mut identity_retried = false;
     loop {
         match op().await {
             Ok(value) => return Ok(value),
             Err(err) => {
-                if classify(&err) != Retryability::Retry || retries >= policy.max_retries {
+                let class = classify(&err);
+                let retryable = match class {
+                    Retryability::Retry => true,
+                    Retryability::RetryOnce => !std::mem::replace(&mut identity_retried, true),
+                    Retryability::ContextExceeded | Retryability::Fatal => false,
+                };
+                if !retryable || retries >= policy.max_retries {
+                    if class == Retryability::RetryOnce {
+                        tracing::warn!(
+                            attempt = retries + 1,
+                            error = %err,
+                            "stream identity recovery exhausted"
+                        );
+                    }
                     return Err(err);
                 }
                 retries += 1;
@@ -306,7 +326,8 @@ where
 /// `on_retry(attempt, delay)` is called synchronously before sleeping:
 /// `attempt` is 1-based (1 = first retry), `delay` is the sleep duration.
 ///
-/// Calls `op` until it succeeds, the error is not [`Retryability::Retry`], or
+/// Calls `op` until it succeeds, the error is not [`Retryability::Retry`] (or a
+/// second [`Retryability::RetryOnce`]), or
 /// `policy.max_retries` is exhausted. On exhaustion the *last* error is
 /// returned.
 pub async fn with_backoff_notify<T, F, Fut, N>(
@@ -328,7 +349,8 @@ where
 /// Drive a fallible async operation under `policy`.
 ///
 /// Convenience wrapper around [`with_backoff_notify`] with a no-op callback.
-/// Calls `op` until it succeeds, the error is not [`Retryability::Retry`], or
+/// Calls `op` until it succeeds, the error is not [`Retryability::Retry`] (or a
+/// second [`Retryability::RetryOnce`]), or
 /// `policy.max_retries` is exhausted — sleeping `policy.delay_for(attempt)`
 /// between attempts. On exhaustion the *last* error is returned (so the caller
 /// still sees e.g. the final `503`).

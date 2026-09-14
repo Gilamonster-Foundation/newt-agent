@@ -899,3 +899,188 @@ async fn primary_stream_context_rejection_survives_the_body_idle_timeout() {
 async fn cap_summary_stream_context_rejection_survives_the_body_idle_timeout() {
     observed_context_error_survives_core_idle_timeout(true).await;
 }
+
+fn has_tool_result(body: &Value) -> bool {
+    body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["role"] == "tool")
+}
+
+fn identified(id: &str, mut frame: Value) -> Value {
+    frame["id"] = json!(id);
+    frame
+}
+
+/// A complete, valid tool batch except that its response ID changes mid-stream.
+fn mixed_tool_batch() -> ResponseTemplate {
+    wire(
+        &[
+            json!({"id":"resp-mixed-one","choices":[{"index":0,"delta":{"tool_calls":[{
+                "index":0,"id":"call-a","type":"function","function":{"name":TOOL,"arguments":"{\"stage\":"}
+            }]}}]}),
+            json!({"id":"resp-mixed-two","choices":[{"index":0,"delta":{"tool_calls":[{
+                "index":0,"function":{"arguments":"\"a\"}"}
+            }]},"finish_reason":"tool_calls"}]}),
+        ],
+        true,
+    )
+}
+
+fn mixed_answer() -> ResponseTemplate {
+    wire(
+        &[
+            json!({"id":"resp-mixed-one","choices":[{"delta":{"content":"Fixture "}}]}),
+            json!({"id":"resp-mixed-two","choices":[{"delta":{"content":"response."},"finish_reason":"stop"}]}),
+        ],
+        true,
+    )
+}
+
+/// Mounts a generation mock and returns every request body it saw, in order.
+async fn mount_rounds(
+    server: &MockServer,
+    respond: impl Fn(&Value, usize) -> ResponseTemplate + Send + Sync + 'static,
+) -> Arc<Mutex<Vec<Value>>> {
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let requests = seen.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |request: &Request| {
+            let body = body_json(request);
+            let mut requests = requests.lock().unwrap();
+            let same_kind = requests
+                .iter()
+                .filter(|seen| has_tool_result(seen) == has_tool_result(&body))
+                .count();
+            let response = respond(&body, same_kind);
+            requests.push(body);
+            response
+        })
+        .mount(server)
+        .await;
+    seen
+}
+
+async fn run_fixture_turn(
+    uri: &str,
+    tools: &mut FixtureTools,
+    reason: &mut Option<crate::TurnEndReason>,
+) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let mut context = ctx(uri, &messages, &caveats);
+    context.action_nudges = false;
+    let allowed = [TOOL.to_owned()];
+    context.persona_tools = Some(&allowed);
+    context.end_reason = Some(reason);
+    chat_complete(context, tools).await
+}
+
+/// #2334: a mixed response is rejected before its tool call can run, retried
+/// once, and the clean second response runs the tool exactly once. The trap:
+/// if the mixed batch had dispatched, the tool ledger would read `["a", "a"]`.
+#[tokio::test]
+async fn primary_stream_retries_a_mixed_response_id_once_before_its_tool_runs() {
+    let server = MockServer::start().await;
+    let seen = mount_rounds(&server, |body, nth| match (has_tool_result(body), nth) {
+        (false, 0) => mixed_tool_batch(),
+        (false, _) => wire(
+            &[identified("resp-clean", complete_single_tool_frame())],
+            true,
+        ),
+        (true, _) => streamed_answer(),
+    })
+    .await;
+    let mut tools = FixtureTools::default();
+    let mut reason = None;
+    let (text, _, _, _) = run_fixture_turn(&server.uri(), &mut tools, &mut reason)
+        .await
+        .expect("one fresh attempt recovers a mixed response");
+    assert_eq!(text, "Fixture response.");
+    assert_eq!(tools.0, ["a"], "the mixed batch must never dispatch");
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.iter().filter(|body| !has_tool_result(body)).count(),
+        2,
+        "the tool round is sent exactly twice: rejected, then accepted"
+    );
+}
+
+/// #2334: a tool that already ran in an earlier round is never replayed when a
+/// later round's response mixes IDs; only that round's request is resent. The
+/// accepted retry also carries a different valid ID from the first round.
+#[tokio::test]
+async fn a_mixed_response_after_a_dispatched_tool_retries_the_round_without_replay() {
+    let server = MockServer::start().await;
+    let seen = mount_rounds(&server, |body, nth| match (has_tool_result(body), nth) {
+        (false, _) => wire(
+            &[identified("resp-first-round", complete_single_tool_frame())],
+            true,
+        ),
+        (true, 0) => mixed_answer(),
+        (true, _) => wire(
+            &[identified(
+                "resp-second-round",
+                json!({"choices":[{"delta":{"content":"Fixture response."},"finish_reason":"stop"}]}),
+            )],
+            true,
+        ),
+    })
+    .await;
+    let mut tools = FixtureTools::default();
+    let mut reason = None;
+    let (text, _, _, _) = run_fixture_turn(&server.uri(), &mut tools, &mut reason)
+        .await
+        .expect("the answer round recovers with one fresh attempt");
+    assert_eq!(text, "Fixture response.");
+    assert_eq!(tools.0, ["a"], "a dispatched tool is never replayed");
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.len(),
+        4,
+        "tool round, mixed answer, one retry, display reissue"
+    );
+}
+
+/// #2334: when the one fresh attempt is also mixed, the turn fails explicitly
+/// after exactly two sends of that round, never as a completed turn, and the
+/// earlier tool still ran exactly once.
+#[tokio::test]
+async fn a_mixed_response_on_the_retry_fails_after_exactly_two_attempts() {
+    let server = MockServer::start().await;
+    let seen = mount_rounds(&server, |body, _| {
+        if has_tool_result(body) {
+            mixed_answer()
+        } else {
+            wire(
+                &[identified("resp-first-round", complete_single_tool_frame())],
+                true,
+            )
+        }
+    })
+    .await;
+    let mut tools = FixtureTools::default();
+    let mut reason = None;
+    let error = run_fixture_turn(&server.uri(), &mut tools, &mut reason)
+        .await
+        .expect_err("exhausted recovery is a failed turn");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("stream changed response ID at data frame 2"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("resp-mixed"),
+        "IDs never reach the error: {text}"
+    );
+    assert_ne!(reason, Some(crate::TurnEndReason::Completed));
+    assert_eq!(tools.0, ["a"]);
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.iter().filter(|body| has_tool_result(body)).count(),
+        2,
+        "the answer round is attempted exactly twice"
+    );
+}

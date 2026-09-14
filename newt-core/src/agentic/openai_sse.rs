@@ -40,6 +40,16 @@ pub fn is_provider_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<response::ProviderError>())
 }
 
+/// The identity field (`response ID` / `response model`) that changed within
+/// one response (#2334). The check stays a rejection; the retry policy may spend
+/// one fresh attempt on it before any tool runs.
+pub fn changed_identity(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<response::IdentityChanged>())
+        .map(response::IdentityChanged::field)
+}
+
 /// Interpret one provider response without replacing its observed wire bytes.
 ///
 /// SSE uses the display parser's framing plus strict completion validation:

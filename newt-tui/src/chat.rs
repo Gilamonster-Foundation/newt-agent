@@ -177,6 +177,10 @@ fn consume_interrupted_objective_for_accepted_prompt(
     }
 }
 
+fn failed_turn_footer() -> &'static str {
+    "✗ This objective is still pending. Reply `continue` to retry it."
+}
+
 fn round_cap_pause_footer() -> &'static str {
     "⏸ If work remains, reply `continue` to resume this objective, or use `/rounds <n>` first to change the per-turn limit."
 }
@@ -8264,6 +8268,12 @@ fn session_body(
                             }
                             Err(e) => {
                                 print_newt(&format!("error: {e}"), color, verbose);
+                                // #2334: a failed turn did not finish its
+                                // objective; keep it resumable, and say how.
+                                interrupted_objective = active_prompt_context.clone();
+                                if interrupted_objective.is_some() {
+                                    print_newt(failed_turn_footer(), color, verbose);
+                                }
                                 // #1963: `turn_tool_events`/`turn_phantom_reaches`
                                 // still hold whatever earlier rounds actually did
                                 // before this failure — real ledgers, not
