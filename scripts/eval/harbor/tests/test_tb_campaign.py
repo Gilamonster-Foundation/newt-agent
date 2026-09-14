@@ -33,8 +33,16 @@ def row(**kw):
 class Claims(unittest.TestCase):
     def test_newt_uses_the_last_contract_outcome(self):
         lines = jl({"kind": "solve_result", "status": "completed"}, {"outcome": "timeout"})
-        self.assertEqual(newt_claim(lines), (False, "contract outcome=timeout"))
+        self.assertEqual(newt_claim(lines), (False, "contract outcome=timeout, solve_result status=completed"))
         self.assertIsNone(newt_claim(jl({"kind": "chat_completion_finish"})))
+
+    def test_newt_claims_done_only_when_outcome_and_status_are_both_completed(self):
+        # #2315: RepairExhausted / VerificationIncomplete map to outcome completed but
+        # status incomplete. newt itself says "not done", so that is not a claim.
+        incomplete = jl({"kind": "solve_result", "status": "incomplete"}, {"outcome": "completed"})
+        self.assertEqual(newt_claim(incomplete)[0], False)
+        done = jl({"kind": "solve_result", "status": "completed"}, {"outcome": "completed"})
+        self.assertEqual(newt_claim(done)[0], True)
 
     def test_pi_claims_only_on_a_final_stop(self):
         def end(reason):
@@ -104,6 +112,8 @@ class Summary(unittest.TestCase):
         self.assertEqual((s["false_completions"], s["false_incompletes"]), (2, 1))
         self.assertEqual((s["unrecoverable_claims"], s["exceptions"], s["model_mismatches"]), (1, 2, 1))
         self.assertEqual((s["inference_errors"], s["agent_timeouts"], s["max_request_output"]), (1, 1, 96345))
+        self.assertEqual(summarize({"expected": 1, "model": "m"}, [row(harness_outcome="completed", harness_status="incomplete",
+                                                                       claimed_done=False)])["terminal_not_done"], 1)
         self.assertEqual((s["rate_excl"], s["rate_agent_fail"], s["causes"]), ((2, 5), (2, 6), (2, 1, 0)))
         self.assertEqual(s["tokens_in"], (0, 0))  # none known: count 0, not a zero cost
 

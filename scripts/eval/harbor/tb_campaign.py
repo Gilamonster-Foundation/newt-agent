@@ -107,13 +107,29 @@ def harness_evidence(harness, lines):
     return replies, "; ".join(e for e in errors if e) or None
 
 
+def newt_status(lines):
+    """newt's own `solve_result.status` (completed / incomplete / awaiting_operator / failed)."""
+    status = None
+    for o in _records(lines):
+        if o.get("kind") == "solve_result":
+            status = o.get("status")
+    return status
+
+
 def newt_claim(lines):
-    """newt's contract record carries `outcome`; `completed` is its claim."""
+    """The contract's `outcome` says a terminal state was reached, not that the
+    work is done: a run newt marks `status: incomplete` (#2315's RepairExhausted,
+    VerificationIncomplete; RoundCap) can still carry `outcome: completed`. So the
+    claim needs both. A record without a status falls back to the outcome alone."""
     outcome = None
     for o in _records(lines):
         if "outcome" in o:
             outcome = o["outcome"]
-    return None if outcome is None else (outcome == "completed", f"contract outcome={outcome}")
+    if outcome is None:
+        return None
+    status = newt_status(lines)
+    claimed = outcome == "completed" and status in ("completed", None)
+    return claimed, f"contract outcome={outcome}, solve_result status={status}"
 
 
 def pi_claim(lines):
@@ -344,6 +360,8 @@ def trial_row(harness, trial: Path, expect=None):
         "model_effective": effective,
         "harness_config": harness_config,
         "treatment_observed": observed(expect, contract),
+        "harness_status": newt_status(lines) if harness == "newt" else None,
+        "harness_outcome": (contract or {}).get("outcome"),
         "result": bool(r),
         "exception": exc,
         "reward": reward,
@@ -439,6 +457,8 @@ def summarize(cell, rows):
         ),
         "model_mismatches": sum(r["model_effective"] not in (None, cell["model"]) for r in rows),
         "not_observed": sum(r.get("treatment_observed") is False for r in rows),
+        "terminal_not_done": sum(r.get("harness_outcome") == "completed"
+                                 and r.get("harness_status") not in (None, "completed") for r in rows),
         "tokens_in": (sum(known_in), len(known_in)),
         "tokens_out": (sum(known_out), len(known_out)),
         "agent_s_median": statistics.median(secs) if secs else None,
@@ -553,8 +573,8 @@ def table(out: Path, paired_report=False):
     trials = out / "trials.jsonl"
     rows = list(_records(trials.read_text().splitlines())) if trials.exists() else []
     lines = [
-        "| model | harness | expected / observed / graded / error | resolved / n, rate [95% Wilson]: trials with any exception excluded | resolved / n, rate [95% Wilson]: agent-caused exceptions counted as failures (infra, unknown excluded) | claimed done | false completions | false incompletes | unrecoverable claims | exceptions: infra / agent / unknown | inference errors (ungraded) | agent timeouts | largest single-request output | ran another model | treatment declared but not observed | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| model | harness | expected / observed / graded / error | resolved / n, rate [95% Wilson]: trials with any exception excluded | resolved / n, rate [95% Wilson]: agent-caused exceptions counted as failures (infra, unknown excluded) | claimed done | terminal but newt says not done | false completions | false incompletes | unrecoverable claims | exceptions: infra / agent / unknown | inference errors (ungraded) | agent timeouts | largest single-request output | ran another model | treatment declared but not observed | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     # The last record per job wins: a cell skipped once and run later shows the run.
     cells = {c["job"]: c for c in _records((out / "cells.jsonl").read_text().splitlines())}
@@ -580,7 +600,7 @@ def table(out: Path, paired_report=False):
         tin, tout = (f"{t[0]:,} ({t[1]})" if t[1] else "— (0)" for t in (s["tokens_in"], s["tokens_out"]))
         lines.append(
             f"| {cell['model']} | {cell['harness']} {cell.get('harness_version') or ''} [{treat}] "
-            f"| {s['expected']} / {s['observed']} / {g} / {s['errors']} | {rate(s['rate_excl'])} | {rate(s['rate_agent_fail'])} | {s['claimed']} | {fc} "
+            f"| {s['expected']} / {s['observed']} / {g} / {s['errors']} | {rate(s['rate_excl'])} | {rate(s['rate_agent_fail'])} | {s['claimed']} | {s['terminal_not_done']} | {fc} "
             f"| {s['false_incompletes']} | {s['unrecoverable_claims']} | {s['exceptions']}: {'/'.join(map(str, s['causes']))} | {s['inference_errors']} | {s['agent_timeouts']} | {big} | {s['model_mismatches']} | {seen} | {tin} "
             f"| {tout} | {med} / {s['agent_s_total']:.0f} | {tps} |"
         )
