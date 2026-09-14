@@ -358,7 +358,7 @@ Features: `default = ["table"]` (serde + toml); `cid` off by default (content-ad
 
 Rejected: **napi-rs** (6–7 platform packages plus a resolver shim, bought with native speed a keystroke predicate cannot need). **A thin JS reimplementation** (barred by reuse discipline, and it would leave the Lean proofs covering code npm users do not run).
 
-The in-tree npm precedent does **not** apply: PR #1222 / `origin/feat/npm-shim` ships CLI *binaries* (`npm/platforms.json`, `optionalDependencies`, `lib/binary.cjs`) — a launcher, not a library. It is **draft on purpose** until 0.8.0 (`docs/ROADMAP.md:723-738`). Never un-draft it.
+The in-tree npm precedent does **not** apply: PR #1222 / `origin/feat/npm-shim` ships CLI *binaries* (`npm/platforms.json`, `optionalDependencies`, `lib/binary.cjs`) — a launcher, not a library. It was held in draft until 2026-09-14; the hold now lives in `release.yml`'s tag gate (`docs/ROADMAP.md` §11.4), not in the PR's state.
 
 ### Release gate
 

@@ -27,7 +27,8 @@ just() { printf '%s\n' "$*" >> "$PRE_PUSH_TEST_LOG"; }
 cargo() { test "$*" = 'llvm-cov --version'; }
 rustup() { return 0; }
 cargo-llvm-cov() { return 0; }
-export -f just cargo rustup cargo-llvm-cov
+npm() { return 0; }
+export -f just cargo rustup cargo-llvm-cov npm
 exec bash "$1"
 '''
 

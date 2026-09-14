@@ -47,9 +47,22 @@ jobs:
         with:
           node-version: "22"
       - run: npm --prefix npm test
-      - name: Require the tag to match the workspace version
+      # A tag that is not an npm release version (the repo's `v0.8.0rcN`
+      # tags, or a SemVer tag that does not equal the workspace version) does
+      # not fail the run — it switches the npm lane off. Only the npm lane
+      # reads this output; every other release artifact is unaffected.
+      - name: Decide whether this tag is an npm release
+        id: tag
         if: startsWith(github.ref, 'refs/tags/v')
-        run: node npm/scripts/sync-versions.mjs --version "${GITHUB_REF_NAME#v}" --check
+        run: |
+          if node npm/scripts/sync-versions.mjs --version "${GITHUB_REF_NAME#v}" --check; then
+            echo "npm_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::${GITHUB_REF_NAME} is not an npm release version; npm publication skipped"
+            echo "npm_release=false" >> "$GITHUB_OUTPUT"
+          fi
+    outputs:
+      npm_release: ${{ steps.tag.outputs.npm_release }}
 
   # Release publication is impossible until setup's cross-platform,
   # real-process acceptance contract passes. The same reusable workflow also
@@ -682,7 +695,7 @@ jobs:
 
   build-npm:
     name: npm binary (${{ matrix.key }})
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && needs.npm-preflight.outputs.npm_release == 'true'
     needs: [build-binaries, npm-preflight]
     permissions:
       contents: read
@@ -724,6 +737,25 @@ jobs:
           else
             tar -xzf "$archive" -C incoming/
           fi
+
+      # platforms.json declares the glibc floor the shim enforces; the binary
+      # is built on a moving `ubuntu-latest`. If the builder's glibc ever
+      # exceeds the declared floor, the shim would admit hosts that die in
+      # ld.so — the exact bug the floor exists to prevent. Fail here instead.
+      - name: Refuse a Linux binary newer than the declared glibc floor
+        if: matrix.key == 'linux-x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          floor=$(node -p 'require("./npm/platforms.json").find((p) => p.key === "linux-x64").glibcMin')
+          for bin in newt newt-mcp-server; do
+            need=$(objdump -T "incoming/newt-agent-${GITHUB_REF_NAME}-${{ matrix.label }}/${bin}" | grep -oE 'GLIBC_[0-9.]+' | sed 's/^GLIBC_//' | sort -V | tail -1)
+            echo "${bin}: needs glibc ${need}; declared floor ${floor}"
+            if [[ "$(printf '%s\n%s\n' "$need" "$floor" | sort -V | tail -1)" != "$floor" ]]; then
+              echo "::error::${bin} needs glibc ${need}, above the declared floor ${floor} — raise glibcMin in npm/platforms.json or build on an older image"
+              exit 1
+            fi
+          done
 
       - name: Wrap + publish platform packages
         shell: bash
