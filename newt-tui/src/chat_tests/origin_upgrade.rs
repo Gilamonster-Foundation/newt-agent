@@ -414,3 +414,85 @@ fn a_pending_clarification_still_resolves_with_the_operators_answer() {
     let (_, resolved) = resume(&mut recorded, &parent, "1: sqlite", Some(&pending));
     assert_eq!(resolved.manifest().pending_decision_count(), 0);
 }
+
+/// #2332: a resumed task keeps its RECORDED disposition, but the operator's
+/// CURRENT narrowing still wins. An Act objective is capped, the operator
+/// switches to plan mode, then a bare "continue" resumes it: the effective
+/// disposition is Plan and dispatch refuses a write. Trap: a resume that
+/// re-applied the recorded Act after the mode was applied would silently undo
+/// `/mode plan` — the test drives chat's own comprehend → record → narrow order.
+#[tokio::test]
+async fn a_resumed_task_keeps_its_record_but_current_narrowing_wins() {
+    use newt_core::agentic::{PromptDisposition, PromptIntake};
+    let lexicon = newt_core::agentic::DispositionLexicon::default();
+    let mut recorded = RecordedDispositions::new();
+    let text = "Implement the parser change.";
+    let objective = accept(&mut recorded, text);
+    assert_eq!(
+        recorded.get(&objective.submitted_prompt().id()),
+        Some(&PromptDisposition::Act),
+        "fixture needs an Act objective"
+    );
+
+    let origin = upgrade_origin_for_interrupted_objective(
+        ModelInputOrigin::Operator,
+        "continue",
+        Some(&objective),
+    );
+    let turn = newt_core::TurnPromptContext::ephemeral_operator_continuation(
+        "conv", "continue", "continue", &objective,
+    )
+    .expect("same-conversation continuation");
+    let (intake, mode) = comprehend_accepted_prompt(
+        &origin,
+        "continue",
+        None,
+        Some(&turn),
+        &mut recorded,
+        &lexicon,
+        |intake: &PromptIntake| effective_operating_mode(OperatingMode::Plan, intake, false, None),
+    );
+
+    assert_eq!(mode, OperatingMode::Plan);
+    assert_eq!(intake.disposition(), PromptDisposition::Plan);
+    assert_eq!(
+        recorded.get(&turn.submitted_prompt().id()),
+        Some(&PromptDisposition::Act),
+        "the record keeps what the task asked for, not the mode's narrowing"
+    );
+
+    let refused = newt_core::agentic::execute_tool_with_offload_and_prompt_and_artifacts(
+        "write_file",
+        &serde_json::json!({ "path": "must-not-write.txt", "content": "no" }),
+        "/nonexistent-workspace",
+        false,
+        20,
+        &operating_mode_caveats(mode, newt_core::Caveats::top()),
+        &mut newt_core::agentic::NoMcp,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        intake.disposition(),
+    )
+    .await;
+    assert!(
+        refused.contains("Tool `write_file` is not available for this request"),
+        "{refused}"
+    );
+}

@@ -389,6 +389,29 @@ fn intake_for_accepted_prompt(
     }
 }
 
+/// Comprehend an accepted prompt, record its disposition, then apply the
+/// turn's operating mode — in that order (#2332). The record holds what the
+/// prompt asked for; the mode is the operator's CURRENT narrowing, so a
+/// resumed task keeps its recorded disposition and current permissions still
+/// win. `mode_for` picks the turn's mode from the comprehended intake.
+fn comprehend_accepted_prompt(
+    origin: &ModelInputOrigin,
+    task: &str,
+    pending: Option<&PendingClarification>,
+    context: Option<&newt_core::TurnPromptContext>,
+    recorded: &mut RecordedDispositions,
+    lexicon: &newt_core::agentic::DispositionLexicon,
+    mode_for: impl FnOnce(&newt_core::agentic::PromptIntake) -> OperatingMode,
+) -> (newt_core::agentic::PromptIntake, OperatingMode) {
+    let mut intake = intake_for_accepted_prompt(origin, task, pending, recorded, lexicon);
+    if let Some(context) = context {
+        record_turn_disposition(recorded, context, &intake);
+    }
+    let mode = mode_for(&intake);
+    apply_operating_mode_to_intake(mode, &mut intake);
+    (intake, mode)
+}
+
 /// Rebuild an outstanding clarification from its durable operator-receipt
 /// lineage. A prompt that reached model work cannot be pending: `Ask` exits
 /// before inference, so every descendant while it remains pending must be an
@@ -6462,42 +6485,38 @@ fn session_body(
                         .as_ref()
                         .map(newt_core::IntakeConfig::to_lexicon)
                         .unwrap_or_default();
-                    let mut prompt_intake = intake_for_accepted_prompt(
+                    let (mut prompt_intake, turn_operating_mode) = comprehend_accepted_prompt(
                         &model_input_origin,
                         &task,
                         pending_clarification.as_ref(),
-                        &recorded_dispositions,
+                        active_prompt_context.as_ref(),
+                        &mut recorded_dispositions,
                         &intake_lexicon,
+                        |intake| {
+                            // A model-selected Auto style is a one-shot
+                            // instruction for the next action-shaped turn.
+                            // Protected intake does not consume it; it remains
+                            // pending until an Act turn or an explicit
+                            // conversation/mode boundary clears it.
+                            let plan_mode_active = conversation_mode_states.plan.is_active();
+                            let auto_selected = (active_operating_mode == OperatingMode::Auto
+                                && !plan_mode_active
+                                && intake.disposition()
+                                    == newt_core::agentic::PromptDisposition::Act)
+                                .then(|| {
+                                    conversation_mode_states
+                                        .auto
+                                        .take_for(&active_conversation_id)
+                                })
+                                .flatten();
+                            effective_operating_mode(
+                                active_operating_mode,
+                                intake,
+                                plan_mode_active,
+                                auto_selected,
+                            )
+                        },
                     );
-                    if let Some(context) = active_prompt_context.as_ref() {
-                        record_turn_disposition(
-                            &mut recorded_dispositions,
-                            context,
-                            &prompt_intake,
-                        );
-                    }
-                    // A model-selected Auto style is a one-shot instruction
-                    // for the next action-shaped turn. Protected intake does
-                    // not consume it; it remains pending until an Act turn or
-                    // an explicit conversation/mode boundary clears it.
-                    let plan_mode_active = conversation_mode_states.plan.is_active();
-                    let auto_selected = (active_operating_mode == OperatingMode::Auto
-                        && !plan_mode_active
-                        && prompt_intake.disposition()
-                            == newt_core::agentic::PromptDisposition::Act)
-                        .then(|| {
-                            conversation_mode_states
-                                .auto
-                                .take_for(&active_conversation_id)
-                        })
-                        .flatten();
-                    let turn_operating_mode = effective_operating_mode(
-                        active_operating_mode,
-                        &prompt_intake,
-                        plan_mode_active,
-                        auto_selected,
-                    );
-                    apply_operating_mode_to_intake(turn_operating_mode, &mut prompt_intake);
 
                     // #1749: the deterministic detector says a decision MIGHT
                     // exist; one bounded, tool-less side call says whether the
