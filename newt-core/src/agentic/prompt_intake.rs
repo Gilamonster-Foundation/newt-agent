@@ -343,6 +343,25 @@ impl PromptIntake {
         intake
     }
 
+    /// Comprehend a bare continuation that resumes an accepted objective
+    /// (#2332): the nudge's own asks, with the objective's recorded
+    /// `disposition`, so a one-word nudge neither widens nor narrows the task.
+    /// `Ask` is never an accepted objective's authority; given one, or a nudge
+    /// that itself needs a decision, the nudge's own reading stands.
+    pub fn resume_with(
+        nudge: &str,
+        disposition: PromptDisposition,
+        lexicon: &DispositionLexicon,
+    ) -> Self {
+        let mut intake = Self::analyze_with(nudge, lexicon);
+        if disposition != PromptDisposition::Ask && intake.disposition != PromptDisposition::Ask {
+            intake.disposition = disposition;
+            intake.post_lock_disposition = disposition;
+        }
+        debug_assert!(intake.validate().is_ok());
+        intake
+    }
+
     /// Analyze a new operator prompt before any model-visible work begins.
     pub fn analyze(prompt: &str) -> Self {
         if prompt.trim().is_empty() {

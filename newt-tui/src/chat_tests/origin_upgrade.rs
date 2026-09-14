@@ -212,3 +212,205 @@ fn the_failed_turn_footer_phrase_resumes_the_failed_objective() {
         other => panic!("the footer phrase must resume the failed objective, got {other:?}"),
     }
 }
+
+fn objective(text: &str) -> newt_core::TurnPromptContext {
+    newt_core::TurnPromptContext::ephemeral_operator(
+        "conv",
+        text.as_bytes().to_vec(),
+        text.as_bytes().to_vec(),
+    )
+}
+
+/// Accept a fresh operator objective the way chat does: comprehend, record.
+fn accept(recorded: &mut RecordedDispositions, text: &str) -> newt_core::TurnPromptContext {
+    let context = objective(text);
+    let intake = intake_for_accepted_prompt(
+        &ModelInputOrigin::Operator,
+        text,
+        None,
+        recorded,
+        &newt_core::agentic::DispositionLexicon::default(),
+    );
+    record_turn_disposition(recorded, &context, &intake);
+    context
+}
+
+/// Resume `parent` with `nudge` the way chat does: link, mint the continuation
+/// receipt, comprehend, record. Returns the continuation turn and its intake.
+fn resume(
+    recorded: &mut RecordedDispositions,
+    parent: &newt_core::TurnPromptContext,
+    nudge: &str,
+    pending: Option<&PendingClarification>,
+) -> (
+    newt_core::TurnPromptContext,
+    newt_core::agentic::PromptIntake,
+) {
+    let origin = match pending {
+        Some(pending) => ModelInputOrigin::OperatorContinuation {
+            parent: pending.parent.clone(),
+        },
+        None => upgrade_origin_for_interrupted_objective(
+            ModelInputOrigin::Operator,
+            nudge,
+            Some(parent),
+        ),
+    };
+    assert!(
+        matches!(origin, ModelInputOrigin::OperatorContinuation { .. }),
+        "{nudge:?} must link to the pending objective"
+    );
+    let context =
+        newt_core::TurnPromptContext::ephemeral_operator_continuation("conv", nudge, nudge, parent)
+            .expect("same-conversation continuation");
+    let intake = intake_for_accepted_prompt(
+        &origin,
+        nudge,
+        pending,
+        recorded,
+        &newt_core::agentic::DispositionLexicon::default(),
+    );
+    record_turn_disposition(recorded, &context, &intake);
+    (context, intake)
+}
+
+/// #2332 / #2283: "try now?" after a failed or capped turn resumes that
+/// objective; the same words with nothing pending stay an ordinary prompt.
+#[test]
+fn a_question_shaped_retry_resumes_only_a_pending_objective() {
+    let parent = ctx();
+    for nudge in ["try now?", "try again?", "retry"] {
+        match upgrade_origin_for_interrupted_objective(
+            ModelInputOrigin::Operator,
+            nudge,
+            Some(&parent),
+        ) {
+            ModelInputOrigin::OperatorContinuation { parent: linked } => assert_eq!(
+                linked.submitted_prompt().id(),
+                parent.submitted_prompt().id()
+            ),
+            other => panic!("{nudge:?} must resume the pending objective, got {other:?}"),
+        }
+        assert!(matches!(
+            upgrade_origin_for_interrupted_objective(ModelInputOrigin::Operator, nudge, None),
+            ModelInputOrigin::Operator
+        ));
+    }
+}
+
+/// #2332: a bare continuation resumes the objective, including its authority.
+/// The nudge used to be classified on its own text. Since #2337 both the
+/// install request and "retry" read as Act, so that pair alone cannot fail;
+/// "continue?" still reads as Explain and would have narrowed the request.
+#[test]
+fn a_bare_continuation_takes_the_objectives_disposition_not_its_own() {
+    use newt_core::agentic::{PromptDisposition, PromptIntake};
+    let text = "Can you install skills for that herdr tool?";
+    assert_eq!(
+        PromptIntake::analyze(text).disposition(),
+        PromptDisposition::Act
+    );
+    assert_eq!(
+        PromptIntake::analyze("continue?").disposition(),
+        PromptDisposition::Explain,
+        "precondition: the nudge alone would narrow"
+    );
+    for nudge in ["retry", "continue?"] {
+        let mut recorded = RecordedDispositions::new();
+        let parent = accept(&mut recorded, text);
+        let (_, intake) = resume(&mut recorded, &parent, nudge, None);
+        assert_eq!(intake.disposition(), PromptDisposition::Act, "{nudge:?}");
+    }
+}
+
+/// The no-amplify case: an Explain objective resumed with "continue" (Act on
+/// its own text) stays Explain. A one-word nudge never widens a task.
+#[test]
+fn an_explain_objective_resumed_with_continue_stays_explain() {
+    assert_eq!(
+        newt_core::agentic::PromptIntake::analyze("continue").disposition(),
+        newt_core::agentic::PromptDisposition::Act,
+        "precondition: the nudge alone would widen"
+    );
+    let mut recorded = RecordedDispositions::new();
+    let parent = accept(&mut recorded, "How does prompt intake work?");
+    let (_, intake) = resume(&mut recorded, &parent, "continue", None);
+    assert_eq!(
+        intake.disposition(),
+        newt_core::agentic::PromptDisposition::Explain
+    );
+}
+
+/// The chain: O is capped, "continue" is capped, "continue" again. The second
+/// continuation's parent is the first continuation, whose own active prompt is
+/// the word "continue"; the authority must still be O's.
+#[test]
+fn a_chained_continue_keeps_the_objectives_disposition() {
+    let mut recorded = RecordedDispositions::new();
+    let objective = accept(&mut recorded, "How does prompt intake work?");
+    let (first, _) = resume(&mut recorded, &objective, "continue", None);
+    let (_, second) = resume(&mut recorded, &first, "continue", None);
+    assert_eq!(
+        second.disposition(),
+        newt_core::agentic::PromptDisposition::Explain
+    );
+}
+
+/// A clarified objective capped after its answer resumes with the answered
+/// authority. Re-reading the answer ("1: sqlite") gives Act; re-reading the
+/// question gives Ask and re-asks a locked decision. Neither may happen.
+#[test]
+fn a_clarified_objective_resumed_after_a_cap_does_not_ask_again() {
+    let mut recorded = RecordedDispositions::new();
+    let question = "Should we use SQLite or Postgres for the cache?";
+    let objective = accept(&mut recorded, question);
+    let asked = newt_core::agentic::PromptIntake::analyze(question);
+    assert_eq!(
+        asked.disposition(),
+        newt_core::agentic::PromptDisposition::Ask,
+        "fixture needs a pending decision"
+    );
+    let pending = PendingClarification {
+        parent: Box::new(objective.clone()),
+        intake: asked,
+    };
+    let (answered, resolved) = resume(&mut recorded, &objective, "1: sqlite", Some(&pending));
+    assert_ne!(
+        resolved.disposition(),
+        newt_core::agentic::PromptDisposition::Ask
+    );
+    let (_, resumed) = resume(&mut recorded, &answered, "continue", None);
+    assert_eq!(resumed.disposition(), resolved.disposition());
+}
+
+/// The recorded value wins over a re-read of the objective's words: an
+/// operator's `[intake]` edit mid-session must not change an accepted task.
+#[test]
+fn a_resumed_objective_uses_its_recorded_disposition_not_a_rereading() {
+    let mut recorded = RecordedDispositions::new();
+    let parent = objective("How does prompt intake work?");
+    recorded.insert(
+        parent.submitted_prompt().id(),
+        newt_core::agentic::PromptDisposition::Research,
+    );
+    let (_, intake) = resume(&mut recorded, &parent, "continue", None);
+    assert_eq!(
+        intake.disposition(),
+        newt_core::agentic::PromptDisposition::Research
+    );
+}
+
+/// Twin: a pending clarification still resolves with the operator's answer
+/// rather than reclassifying the parent.
+#[test]
+fn a_pending_clarification_still_resolves_with_the_operators_answer() {
+    let question = "Should we use SQLite or Postgres for the cache?";
+    let mut recorded = RecordedDispositions::new();
+    let parent = objective(question);
+    let pending = PendingClarification {
+        parent: Box::new(parent.clone()),
+        intake: newt_core::agentic::PromptIntake::analyze(question),
+    };
+    let (_, resolved) = resume(&mut recorded, &parent, "1: sqlite", Some(&pending));
+    assert_eq!(resolved.manifest().pending_decision_count(), 0);
+}

@@ -819,6 +819,10 @@ const BARE_CONTINUATION_PHRASES: &[&str] = &[
     "keep at it",
     "don't stop",
     "onward",
+    // #2332 / #2283: retry nudges after a failed or capped turn.
+    "retry",
+    "try again",
+    "try now",
 ];
 
 /// Is this operator input a BARE continuation — a nudge like "continue" /
@@ -843,7 +847,10 @@ pub fn is_bare_continuation(input: &str) -> bool {
     if t.is_empty() || t.contains('\n') || t.chars().count() > 48 {
         return false;
     }
-    let t = t.trim_end_matches(['.', '!', '…', ' ']).to_lowercase();
+    // A trailing `?` too: "try now?" asks to resume, it does not ask a question
+    // of its own (#2332). Only table phrases match, so "what should I try now?"
+    // stays fresh.
+    let t = t.trim_end_matches(['.', '!', '?', '…', ' ']).to_lowercase();
     // Strip one leading decision ordinal: "1:", "2.", "3)" — the shape the
     // decision-surface asks for ("reply using an explicit ordinal").
     let t = match t.split_once([':', '.', ')']) {
@@ -870,6 +877,13 @@ mod bare_continuation_tests {
             "1: proceed",
             "2. continue",
             "don't stop",
+            // #2332: the recorded retry nudges, including question-shaped ones.
+            "retry",
+            "retry?",
+            "try again",
+            "try again?",
+            "try now?",
+            "continue?",
         ] {
             assert!(is_bare_continuation(input), "{input:?} must link");
         }
@@ -885,6 +899,9 @@ mod bare_continuation_tests {
             "extract the next largest module and open a PR",
             "continue\nand also fix the tests",
             "proceed to delete the production database",
+            "retry the build with --release",
+            "try again tomorrow?",
+            "what should I try now?",
         ] {
             assert!(!is_bare_continuation(input), "{input:?} must stay fresh");
         }
