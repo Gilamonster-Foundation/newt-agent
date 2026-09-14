@@ -2962,7 +2962,8 @@ async fn execute_authorized_tool(
                 ),
                 persona_tools,
             );
-            let catalog = filter_tools_for_disposition(catalog, disposition);
+            // #2332: disposition narrowing happens inside the search, which
+            // names what it hides instead of dropping it.
             super::tool_search::execute_tool_search_for_disposition(query, &catalog, disposition)
         }
 

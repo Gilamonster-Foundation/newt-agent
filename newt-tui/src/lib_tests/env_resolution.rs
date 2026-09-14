@@ -948,6 +948,7 @@ fn runtime_context_block_exposes_model_harness_and_backend() {
         "http://REDACTED-HOST:11434",
         newt_core::BackendKind::Ollama,
         &id,
+        newt_core::agentic::PromptDisposition::Act,
     );
     assert!(block.contains("Model: qwen3:30b"), "{block}");
     assert!(block.contains("newt-agent v"), "harness + version: {block}");
@@ -964,6 +965,7 @@ fn runtime_context_block_exposes_model_harness_and_backend() {
         "https://api.openai.com",
         newt_core::BackendKind::Openai,
         &id,
+        newt_core::agentic::PromptDisposition::Act,
     );
     assert!(
         oa.contains("openai-compatible @ https://api.openai.com"),
@@ -974,11 +976,12 @@ fn runtime_context_block_exposes_model_harness_and_backend() {
 #[test]
 fn runtime_authority_note_tracks_both_authority_switches() {
     with_env_vars(&[], &["NEWT_DISABLE_OCAP", "NEWT_FULL_ACCESS"], || {
-        assert!(runtime_authority_note().is_none());
+        assert!(runtime_authority_note(newt_core::agentic::PromptDisposition::Act).is_none());
     });
 
     with_env_vars(&[("NEWT_DISABLE_OCAP", "1")], &["NEWT_FULL_ACCESS"], || {
-        let note = runtime_authority_note().expect("yolo note");
+        let note =
+            runtime_authority_note(newt_core::agentic::PromptDisposition::Act).expect("yolo note");
         assert!(note.contains("--disable-ocap/--yolo is active"), "{note}");
         assert!(
             note.contains("run_command uses the unconfined host shell"),
@@ -993,7 +996,8 @@ fn runtime_authority_note_tracks_both_authority_switches() {
     });
 
     with_env_vars(&[("NEWT_FULL_ACCESS", "1")], &["NEWT_DISABLE_OCAP"], || {
-        let note = runtime_authority_note().expect("full-access note");
+        let note = runtime_authority_note(newt_core::agentic::PromptDisposition::Act)
+            .expect("full-access note");
         assert!(note.contains("--full-access is active"), "{note}");
         assert!(note.contains("unrestricted exec authority"), "{note}");
         assert!(note.contains("first calling run_command"), "{note}");
@@ -1003,7 +1007,8 @@ fn runtime_authority_note_tracks_both_authority_switches() {
         &[("NEWT_DISABLE_OCAP", "1"), ("NEWT_FULL_ACCESS", "1")],
         &[],
         || {
-            let note = runtime_authority_note().expect("combined authority note");
+            let note = runtime_authority_note(newt_core::agentic::PromptDisposition::Act)
+                .expect("combined authority note");
             assert!(
                 note.contains("--disable-ocap/--yolo AND --full-access are active"),
                 "{note}"
@@ -1024,12 +1029,67 @@ fn runtime_authority_note_tracks_both_authority_switches() {
     );
 }
 
+/// #2332: the runtime authority note told a full-access model to call
+/// `run_command` before claiming a capability wall, on requests whose dispatch
+/// refuses `run_command`. The expectation is derived from the dispatch
+/// predicate, not from a phrase: under every disposition and every authority
+/// switch, each catalog tool the note names must be one `tool_allowed` admits.
+/// The Act twin keeps the guidance where it is true.
+#[test]
+fn runtime_authority_note_names_only_tools_dispatch_admits() {
+    use newt_core::agentic::{tool_allowed, tool_definitions, PromptDisposition as D};
+    let catalog = tool_definitions();
+    let names: Vec<&str> = catalog
+        .as_array()
+        .expect("catalog is an array")
+        .iter()
+        .filter_map(|def| def["function"]["name"].as_str())
+        .collect();
+    assert!(names.contains(&"run_command"), "catalog floor: {names:?}");
+    let named = |note: &str| -> Vec<String> {
+        note.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|word| names.contains(word))
+            .map(str::to_string)
+            .collect()
+    };
+    for set in [
+        &[("NEWT_DISABLE_OCAP", "1")][..],
+        &[("NEWT_FULL_ACCESS", "1")][..],
+        &[("NEWT_DISABLE_OCAP", "1"), ("NEWT_FULL_ACCESS", "1")][..],
+    ] {
+        with_env_vars(set, &["NEWT_DISABLE_OCAP", "NEWT_FULL_ACCESS"], || {
+            for disposition in [D::Ask, D::Act, D::Explain, D::Research, D::Plan] {
+                let note = runtime_authority_note(disposition).expect("a switch is active");
+                let tools = named(&note);
+                for tool in &tools {
+                    assert!(
+                        tool_allowed(disposition, tool),
+                        "{set:?}/{disposition:?}: the note names `{tool}`, which dispatch \
+                         refuses: {note}"
+                    );
+                }
+                if disposition == D::Act {
+                    assert!(
+                        tools.iter().any(|tool| tool == "run_command"),
+                        "{set:?}: Act must keep the run_command guidance: {note}"
+                    );
+                }
+            }
+        });
+    }
+}
+
 #[test]
 fn runtime_context_block_includes_yolo_authority_note_only_when_active() {
     let id = newt_core::AgentIdentity::default();
     with_env_vars(&[], &["NEWT_DISABLE_OCAP", "NEWT_FULL_ACCESS"], || {
-        let block =
-            runtime_context_block("qwen3:30b", "http://h", newt_core::BackendKind::Ollama, &id);
+        let block = runtime_context_block(
+            "qwen3:30b",
+            "http://h",
+            newt_core::BackendKind::Ollama,
+            &id,
+            newt_core::agentic::PromptDisposition::Act,
+        );
         assert!(
             !block.contains("--disable-ocap/--yolo is active"),
             "{block}"
@@ -1037,8 +1097,13 @@ fn runtime_context_block_includes_yolo_authority_note_only_when_active() {
     });
 
     with_env_vars(&[("NEWT_DISABLE_OCAP", "1")], &["NEWT_FULL_ACCESS"], || {
-        let block =
-            runtime_context_block("qwen3:30b", "http://h", newt_core::BackendKind::Ollama, &id);
+        let block = runtime_context_block(
+            "qwen3:30b",
+            "http://h",
+            newt_core::BackendKind::Ollama,
+            &id,
+            newt_core::agentic::PromptDisposition::Act,
+        );
         assert!(block.contains("# Runtime authority"), "{block}");
         assert!(
             block.contains("Do not claim run_command is unavailable due to brush in this mode"),
@@ -1055,8 +1120,13 @@ fn runtime_context_block_includes_yolo_authority_note_only_when_active() {
         &[("NEWT_DISABLE_OCAP", "1"), ("NEWT_FULL_ACCESS", "1")],
         &[],
         || {
-            let block =
-                runtime_context_block("qwen3:30b", "http://h", newt_core::BackendKind::Ollama, &id);
+            let block = runtime_context_block(
+                "qwen3:30b",
+                "http://h",
+                newt_core::BackendKind::Ollama,
+                &id,
+                newt_core::agentic::PromptDisposition::Act,
+            );
             assert!(block.contains("# Runtime authority"), "{block}");
             assert!(block.contains("run_command is available"), "{block}");
             assert!(

@@ -85,7 +85,13 @@ fn attribution_ledger_uses_resolved_identity_email() {
 #[test]
 fn runtime_context_block_instructs_shell_git_identity() {
     let id = newt_core::AgentIdentity::default();
-    let blk = runtime_context_block("m", "http://h", newt_core::BackendKind::Ollama, &id);
+    let blk = runtime_context_block(
+        "m",
+        "http://h",
+        newt_core::BackendKind::Ollama,
+        &id,
+        newt_core::agentic::PromptDisposition::Act,
+    );
     // The shell-git fallback (for a model that bypasses the embedded tool)
     // must carry the resolved User no-reply email.
     assert!(blk.contains("user.email='309460085+newt-agent@users.noreply.github.com'"));
@@ -97,8 +103,13 @@ fn runtime_context_block_instructs_shell_git_identity() {
         email: "custom@example.com".into(),
         ..newt_core::AgentIdentity::default()
     };
-    let custom_blk =
-        runtime_context_block("m", "http://h", newt_core::BackendKind::Ollama, &custom);
+    let custom_blk = runtime_context_block(
+        "m",
+        "http://h",
+        newt_core::BackendKind::Ollama,
+        &custom,
+        newt_core::agentic::PromptDisposition::Act,
+    );
     assert!(custom_blk.contains("user.email='custom@example.com'"));
     assert!(custom_blk.contains("user.name='custom'"));
 }
