@@ -4,9 +4,23 @@
 //! user overrides and is consulted together with a built-in rate table to
 //! produce best-effort USD cost estimates for each inference turn.
 //!
-//! Local models (Ollama-served gemma, llama, qwen, mistral, …) return a
-//! cost of `0.0` so the TUI can display "free (local)".
-//! Unknown models return `None` — the TUI shows "cost unknown", never "free".
+//! Resolution: a `[pricing.overrides]` entry wins (exact id, then longest
+//! prefix), regardless of where the call went; then the built-in table.
+//!
+//! A known local model family (gemma, llama, qwen, mistral, deepseek, …) is
+//! free (`0.0`, displayed "free (local)") ONLY when the call was served
+//! locally — an in-process backend or an endpoint whose host the operator owns
+//! ([`crate::owned_hosts::inference_is_local`]). The same family-shaped id on a
+//! hosted endpoint (`deepseek-chat` at a provider's API) is not a local model:
+//! its price is unknown, `None`, displayed "cost unknown" — never a confirmed
+//! zero (#2313). Hosted rate-table entries (gpt-4o, claude, gemini) apply
+//! wherever the call went.
+//!
+//! **Known limit.** Locality is inferred from network ownership, so a gateway on
+//! the operator's own network (an RFC-1918 address or an owned suffix) that
+//! proxies to a paid provider counts as local, and a family-named id routed
+//! through it still reads "free (local)". The remedy is an override with the
+//! provider's real rate: an override wins over locality.
 
 use std::collections::HashMap;
 
@@ -42,17 +56,15 @@ pub struct PricingConfig {
 }
 
 impl PricingConfig {
-    /// Look up the rate for `model_id`.
+    /// Look up the rate for `model_id`, served locally or not (`local`, from
+    /// [`crate::owned_hosts::inference_is_local`]).
     ///
     /// Resolution order:
     /// 1. Exact match in `overrides`
     /// 2. Prefix match in `overrides` (longest prefix wins)
-    /// 3. Built-in rate table
-    /// 4. `None` — unknown model; caller should not display a cost
-    ///
-    /// Returns `Some(ModelRate { input: 0.0, output: 0.0 })` for known local
-    /// models so the display can show "free (local)".
-    pub fn rate_for(&self, model_id: &str) -> Option<ModelRate> {
+    /// 3. Built-in rate table — a local model family is free only when `local`
+    /// 4. `None` — unknown price; never a confirmed zero
+    pub fn rate_for(&self, model_id: &str, local: bool) -> Option<ModelRate> {
         // 1. Exact override.
         if let Some(r) = self.overrides.get(model_id) {
             return Some(r.clone());
@@ -69,14 +81,20 @@ impl PricingConfig {
         }
 
         // 3. Built-in table.
-        builtin_rate(model_id)
+        builtin_rate(model_id, local)
     }
 
-    /// Estimate cost for `usage` with `model_id`.
-    /// Returns `None` when the model is unknown (not local, not in table, not overridden).
-    pub fn estimate_cost(&self, model_id: &str, usage: Option<&TokenUsage>) -> Option<f64> {
+    /// Estimate cost for `usage` with `model_id`, served locally or not.
+    /// Returns `None` when the price is unknown (not overridden, not in the
+    /// table, and not a local family served locally).
+    pub fn estimate_cost(
+        &self,
+        model_id: &str,
+        local: bool,
+        usage: Option<&TokenUsage>,
+    ) -> Option<f64> {
         let usage = usage?;
-        let rate = self.rate_for(model_id)?;
+        let rate = self.rate_for(model_id, local)?;
         Some(rate.cost(usage))
     }
 }
@@ -89,7 +107,7 @@ impl PricingConfig {
 // entry via `[pricing.overrides]` in `newt.toml`.
 // All rates are USD per 1 000 tokens (input / output).
 
-fn builtin_rate(model_id: &str) -> Option<ModelRate> {
+fn builtin_rate(model_id: &str, local: bool) -> Option<ModelRate> {
     let m = model_id.to_lowercase();
 
     // --- Known local model families → free ---
@@ -116,7 +134,7 @@ fn builtin_rate(model_id: &str) -> Option<ModelRate> {
         "zephyr",
         "tinyllama",
     ] {
-        if m.starts_with(prefix) {
+        if local && m.starts_with(prefix) {
             return Some(ModelRate {
                 input_usd_per_1k: 0.0,
                 output_usd_per_1k: 0.0,
@@ -242,15 +260,67 @@ mod tests {
             "qwen2.5-coder:32b",
             "mistral:7b",
         ] {
-            let cost = cfg.estimate_cost(model, Some(&usage(1000, 500)));
+            let cost = cfg.estimate_cost(model, true, Some(&usage(1000, 500)));
             assert_eq!(cost, Some(0.0), "expected free for {model}");
         }
+    }
+
+    /// #2313: a family-shaped model id on a HOSTED endpoint is not a local
+    /// model, so its price is unknown — never a confirmed zero.
+    #[test]
+    fn a_hosted_family_named_model_has_unknown_cost() {
+        let cfg = PricingConfig::default();
+        for model in ["deepseek-chat", "mistral-large-latest"] {
+            assert_eq!(
+                cfg.estimate_cost(model, false, Some(&usage(1000, 500))),
+                None,
+                "{model} on a hosted endpoint"
+            );
+        }
+        // Twin: the same family served locally is a confirmed zero.
+        assert_eq!(
+            cfg.estimate_cost("qwen3:8b", true, Some(&usage(1000, 500))),
+            Some(0.0)
+        );
+    }
+
+    /// #2313: an explicit override is the operator's declaration, so it wins
+    /// over locality in both directions — a zero override is free even when
+    /// hosted, and a real rate is charged even on an owned gateway that
+    /// proxies to a paid provider (the documented limit's remedy).
+    #[test]
+    fn an_override_wins_over_locality_in_both_directions() {
+        let mut cfg = PricingConfig::default();
+        cfg.overrides.insert(
+            "deepseek-chat".into(),
+            ModelRate {
+                input_usd_per_1k: 0.0,
+                output_usd_per_1k: 0.0,
+            },
+        );
+        assert_eq!(
+            cfg.estimate_cost("deepseek-chat", false, Some(&usage(1000, 500))),
+            Some(0.0)
+        );
+
+        cfg.overrides.insert(
+            "qwen3".into(),
+            ModelRate {
+                input_usd_per_1k: 0.5,
+                output_usd_per_1k: 1.0,
+            },
+        );
+        let gateway = cfg
+            .estimate_cost("qwen3:8b", true, Some(&usage(2000, 1000)))
+            .unwrap();
+        // 0.5 * 2 + 1.0 * 1 = 2.0, not the local family's zero.
+        assert!((gateway - 2.0).abs() < 0.0001, "got {gateway}");
     }
 
     #[test]
     fn gpt4o_has_cost() {
         let cfg = PricingConfig::default();
-        let cost = cfg.estimate_cost("gpt-4o", Some(&usage(1000, 500)));
+        let cost = cfg.estimate_cost("gpt-4o", false, Some(&usage(1000, 500)));
         assert!(cost.is_some(), "gpt-4o should have a rate");
         assert!(cost.unwrap() > 0.0);
     }
@@ -258,14 +328,14 @@ mod tests {
     #[test]
     fn unknown_model_returns_none() {
         let cfg = PricingConfig::default();
-        let cost = cfg.estimate_cost("some-private-model-v99", Some(&usage(100, 50)));
+        let cost = cfg.estimate_cost("some-private-model-v99", true, Some(&usage(100, 50)));
         assert!(cost.is_none(), "unknown model should return None");
     }
 
     #[test]
     fn no_usage_returns_none() {
         let cfg = PricingConfig::default();
-        assert!(cfg.estimate_cost("gpt-4o", None).is_none());
+        assert!(cfg.estimate_cost("gpt-4o", false, None).is_none());
     }
 
     #[test]
@@ -278,7 +348,7 @@ mod tests {
                 output_usd_per_1k: 2.0,
             },
         );
-        let cost = cfg.estimate_cost("gemma4:e2b", Some(&usage(1000, 1000)));
+        let cost = cfg.estimate_cost("gemma4:e2b", true, Some(&usage(1000, 1000)));
         // 1.0 * 1 + 2.0 * 1 = 3.0
         assert!((cost.unwrap() - 3.0).abs() < 0.0001);
     }
@@ -293,7 +363,7 @@ mod tests {
                 output_usd_per_1k: 1.0,
             },
         );
-        let cost = cfg.estimate_cost("my-model-v2", Some(&usage(2000, 1000)));
+        let cost = cfg.estimate_cost("my-model-v2", false, Some(&usage(2000, 1000)));
         // 0.5 * 2 + 1.0 * 1 = 2.0
         assert!((cost.unwrap() - 2.0).abs() < 0.0001);
     }
@@ -307,7 +377,7 @@ mod tests {
             "claude-3-opus-20240229",
         ] {
             assert!(
-                cfg.estimate_cost(m, Some(&usage(100, 50))).unwrap() > 0.0,
+                cfg.estimate_cost(m, false, Some(&usage(100, 50))).unwrap() > 0.0,
                 "{m} should have a positive rate"
             );
         }

@@ -342,18 +342,8 @@ use trim::{
 /// loads or sheds pressure. Hosted requests get one retry: each failed attempt
 /// may already have consumed the full configured inference bound and may be billable.
 /// All thresholds remain overridable through the standard `NEWT_HTTP_*` vars.
-fn inference_endpoint_is_owned(endpoint: &str) -> bool {
-    let Some(host) = reqwest::Url::parse(endpoint)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-    else {
-        return false;
-    };
-    crate::owned_hosts::is_owned_host(&host)
-}
-
 fn tui_retry_policy(endpoint: &str) -> RetryPolicy {
-    if inference_endpoint_is_owned(endpoint) {
+    if crate::owned_hosts::inference_is_local(endpoint) {
         RetryPolicy::for_local_inference()
     } else {
         RetryPolicy::for_hosted_inference()

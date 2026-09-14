@@ -9,6 +9,17 @@ Each release also leaves a **witnessed benchmark record** under [`docs/releases/
 
 ## [Unreleased]
 
+### Fixed — a hosted model with a local family name is no longer priced as free (#2313)
+
+- A model id starting with a local family name (qwen, llama, mistral,
+  deepseek, …) is free only when the call was served locally: in-process, or
+  an endpoint whose host the operator owns (`owned_hosts::inference_is_local`,
+  now also the retry policy's locality rule). The same id at a hosted API
+  (`deepseek-chat`) now shows `cost unknown`, not `free (local)`.
+  `[pricing.overrides]` still wins in both directions. Known limit: a gateway
+  on the operator's own network that proxies to a paid provider counts as
+  local, so give it an override with the provider's real rate.
+
 ### Changed — inference usage is retained at the summarizer boundary; unpriced cost is unknown (#2313, PR 1)
 
 - **`SummarizeFuture` now yields `(text, Option<TokenUsage>)`.** The external

@@ -2,8 +2,10 @@
 //!
 //! "Owned" is a *colloquial* trust claim — infrastructure the operator runs and
 //! is willing to be patient with — not a security boundary. It drives
-//! performance-shaped decisions only: today, whether an inference endpoint gets
-//! the patient local-inference retry policy or the thrifty hosted one.
+//! performance- and cost-shaped decisions only, through [`inference_is_local`]:
+//! whether an inference endpoint gets the patient local-inference retry policy
+//! or the thrifty hosted one, and whether a local model family's price may be
+//! read as free (see [`crate::pricing`]).
 //!
 //! # Why this is separate from the exfiltration guard
 //!
@@ -60,6 +62,19 @@ pub fn is_owned_host(host: &str) -> bool {
     is_owned_with(host, OWNED_SUFFIXES.get().map_or(&[], Vec::as_slice))
 }
 
+/// Is an inference call served by the operator's own machinery? An empty
+/// endpoint is an in-process backend (`kind = "embedded"` has no URL), which is
+/// local by construction; otherwise the endpoint's host must be owned. An
+/// endpoint that does not parse is not local.
+#[must_use]
+pub fn inference_is_local(endpoint: &str) -> bool {
+    endpoint.is_empty()
+        || reqwest::Url::parse(endpoint)
+            .ok()
+            .and_then(|url| url.host_str().map(is_owned_host))
+            .unwrap_or(false)
+}
+
 /// The classification itself, with the declared suffixes passed in.
 ///
 /// Separated from [`is_owned_host`] so the rule is testable without touching
@@ -90,6 +105,20 @@ pub(crate) fn is_owned_with(host: &str, suffixes: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inference_locality_reads_the_endpoint_host() {
+        assert!(!inference_is_local("https://api.moonshot.ai"));
+        assert!(!inference_is_local("https://ollama.com"));
+        assert!(inference_is_local("http://gpu.home.arpa:8080"));
+        assert!(inference_is_local("http://inference:8000"));
+        assert!(inference_is_local("http://127.0.0.1:8000"));
+        assert!(inference_is_local("http://[fd00::1]:8000"));
+        assert!(inference_is_local("http://[fe80::1]:8000"));
+        // In-process (embedded) has no URL; garbage is never local.
+        assert!(inference_is_local(""));
+        assert!(!inference_is_local("not a url"));
+    }
 
     #[test]
     fn built_in_private_floor_is_owned() {
