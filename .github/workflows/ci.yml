@@ -123,11 +123,15 @@ jobs:
         run: python3 scripts/docs_check.py --deleted-refs "${{ github.event.pull_request.base.sha }}"
       # Bench ingestion (#2316): fixture Harbor runs through parse_run and
       # cross-tab.py, so a collapsed attempt or a vanished trial fails here.
+      # Campaign report (#2318): claim parsing, error cause and coverage for
+      # the harness x model table; stdlib only, no Harbor install needed.
       # HOOK PARITY: mirrored by the `eval-selftest` recipe, which `just check`
       # runs via .githooks/pre-push. Add a line to both.
       - name: eval self-tests (eval-selftest)
         if: always()
-        run: python3 scripts/eval/bench_scoreboard.py --self-test
+        run: |
+          python3 scripts/eval/bench_scoreboard.py --self-test
+          PYTHONPATH=scripts/eval/harbor python3 -m unittest discover -s scripts/eval/harbor/tests -t scripts/eval/harbor/tests -p 'test_tb_campaign.py'
 
   test:
     name: Rust tests
