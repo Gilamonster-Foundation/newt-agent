@@ -239,6 +239,30 @@ impl TurnDriverConfig {
     }
 }
 
+/// Which optional collaborators a turn's constructed [`ChatCtx`] carried
+/// (#2314) — read off the context the loop ran with, by the same predicates
+/// the tool catalog uses to advertise them, never off the config or the flags
+/// that asked for them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InstantiatedFeatures {
+    /// The `state_*` tools: the scratchpad flag AND a store.
+    pub scratchpad: bool,
+    /// The `code_search` tool: a searcher.
+    pub code_search: bool,
+    /// The `crew` / `compose_roster` tools: a crew runner.
+    pub crew: bool,
+}
+
+impl InstantiatedFeatures {
+    fn of(ctx: &ChatCtx<'_>) -> Self {
+        Self {
+            scratchpad: ctx.scratchpad && ctx.scratchpad_store.is_some(),
+            code_search: ctx.code_search.is_some(),
+            crew: ctx.crew_runner.is_some(),
+        }
+    }
+}
+
 /// The outcome of one completed turn.
 #[derive(Debug, Clone)]
 pub struct TurnOutcome {
@@ -275,6 +299,8 @@ pub struct TurnOutcome {
     pub parse_signals: Vec<crate::agentic::observability::ParseSignal>,
     /// Output-behavior signals, including bounded reasoning-overflow recovery.
     pub behavior_signals: Vec<crate::agentic::observability::BehaviorSignal>,
+    /// The optional collaborators this turn's context actually carried.
+    pub features: InstantiatedFeatures,
 }
 
 /// Non-blocking snapshot of the driver's state, returned by
@@ -675,6 +701,7 @@ async fn run_one_turn(
         plan_mode_control: None,
         steering: None,
     };
+    let features = InstantiatedFeatures::of(&ctx);
     // NoMcp: the cowork driver advertises only the built-in tools. A consumer
     // that wants live MCP tools assembles its own ChatCtx.
     let mut mcp = NoMcp;
@@ -704,6 +731,7 @@ async fn run_one_turn(
             served_model: solve_obs.served_model,
             parse_signals: solve_obs.parse_signals,
             behavior_signals: solve_obs.behavior_signals,
+            features,
         }),
         Err(e) => Ok(TurnOutcome {
             reply: String::new(),
@@ -722,6 +750,7 @@ async fn run_one_turn(
             served_model: solve_obs.served_model,
             parse_signals: solve_obs.parse_signals,
             behavior_signals: solve_obs.behavior_signals,
+            features,
         }),
     }
 }
@@ -967,7 +996,7 @@ mod tests {
         }
     }
 
-    async fn drive_once_capturing(mut driver: TurnDriver) -> Vec<serde_json::Value> {
+    async fn drive_once_capturing(mut driver: TurnDriver) -> (Vec<serde_json::Value>, TurnOutcome) {
         let server = MockServer::start().await;
         let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
         Mock::given(method("POST"))
@@ -982,9 +1011,11 @@ mod tests {
         // placeholder so the code_search wiring is the only variable).
         driver.config.url = server.uri();
         driver.submit("find the retry backoff").expect("submit");
-        let _ = pump_to_done(&mut driver).await;
+        let TurnStatus::Completed(outcome) = pump_to_done(&mut driver).await else {
+            panic!("the captured turn did not complete");
+        };
         let out = bodies.lock().unwrap().clone();
-        out
+        (out, outcome)
     }
 
     /// #1280: the headless driver advertises `code_search` **iff** the config
@@ -993,15 +1024,25 @@ mod tests {
     #[tokio::test]
     async fn code_search_advertised_only_when_the_config_carries_retrieval() {
         // Without retrieval: the tool is absent (unchanged headless behavior).
-        let bare = drive_once_capturing(TurnDriver::new(cfg("http://placeholder"))).await;
+        let (bare, outcome) =
+            drive_once_capturing(TurnDriver::new(cfg("http://placeholder"))).await;
         assert!(
             !advertised_code_search(&bare),
             "no code_search tool without a configured index"
         );
+        // #2314: every receipt read is paired with the wire body in the same
+        // arm — a receipt claiming a tool the request never advertised fails.
+        assert_eq!(outcome.features, InstantiatedFeatures::default());
+        // No headless path instantiates the scratchpad: no state tools, no
+        // injected `<state>` block, and the receipt says so.
+        assert!(!advertised_tool(&bare, "state_set"));
+        // `</state>`: tool descriptions name the opening tag; only a
+        // rendered block closes it.
+        assert!(!bare.iter().any(|b| b.to_string().contains("</state>")));
 
         // With a supplied embedder + index: the tool is advertised + executable.
         let index: Arc<dyn SemanticIndex> = Arc::new(SessionSemanticIndex::default());
-        let with = drive_once_capturing(TurnDriver::new(
+        let (with, outcome) = drive_once_capturing(TurnDriver::new(
             cfg("http://placeholder").with_code_search(Arc::new(StubEmbedder), index, 3),
         ))
         .await;
@@ -1009,22 +1050,26 @@ mod tests {
             advertised_code_search(&with),
             "code_search advertised once the driver carries retrieval"
         );
+        assert!(outcome.features.code_search && !outcome.features.crew);
     }
 
     /// Grounds the owned thread-crossing seam itself: a configured runner is
     /// what advertises both crew tools, and absence keeps both off the wire.
     #[tokio::test]
     async fn crew_advertised_only_when_driver_carries_a_runner() {
-        let bare = drive_once_capturing(TurnDriver::new(cfg("http://placeholder"))).await;
+        let (bare, outcome) =
+            drive_once_capturing(TurnDriver::new(cfg("http://placeholder"))).await;
         assert!(!advertised_tool(&bare, "crew"));
         assert!(!advertised_tool(&bare, "compose_roster"));
+        assert!(!outcome.features.crew);
 
-        let with = drive_once_capturing(
+        let (with, outcome) = drive_once_capturing(
             TurnDriver::new(cfg("http://placeholder")).with_crew_runner(Arc::new(StubCrewRunner)),
         )
         .await;
         assert!(advertised_tool(&with, "crew"));
         assert!(advertised_tool(&with, "compose_roster"));
+        assert!(outcome.features.crew && !outcome.features.code_search);
     }
 
     struct CrewCallingOllama;
