@@ -437,7 +437,8 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // left `solve` on the `false` default, so a declared reasoning model had
     // its chain-of-thought printed into the answer in headless runs only —
     // the N-call-sites trap, in the one lane with no human watching the
-    // stream. `capability_wiring_is_paired_across_call_sites` pins the pair.
+    // stream. `solve_takes_every_capability_from_the_decision`
+    // (tests/capability_wiring.rs) pins the pair.
     dc.emits_leading_reasoning = decision.emits_leading_reasoning();
     dc.max_tool_rounds = solve_tool_round_limit(
         dc.max_tool_rounds,
@@ -699,9 +700,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         "trajectory": trajectory,
         "error": error,
     });
-    if let Some(manifest) = &smart_manifest {
-        record["smart_harness"] = manifest.clone();
-    }
+    solve_contract::conditional_stanza(&mut record, "smart_harness", smart_manifest.clone());
     // 7. W0 (#1511): the per-round parse-signal trace events plus EXACTLY ONE
     //    contract record (the `contract_version` key marks it — the external
     //    evaluator rejects a trace with zero or several), appended alongside
@@ -752,6 +751,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
                 .and_then(|o| o.usage.as_ref())
                 .map(|u| u64::from(u.output_tokens)),
             smart_harness: smart_manifest.as_ref(),
+            features: o_opt.map(|o| o.features),
         },
     ));
     if let Some(path) = &args.events {

@@ -797,3 +797,88 @@ async fn rejected_body_timeout(
         "retain the following read failure: {detail}"
     );
 }
+
+fn identity_stream(first_id: &str, second_id: &str, text: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"id": first_id, "choices":[{"index":0,"delta":{"content":"partial "}}]}),
+            json!({"id": second_id, "choices":[{"index":0,"delta":{"content":text},"finish_reason":"stop"}]}),
+        ))
+}
+
+/// Alternates a mixed-ID response with a clean one whose ID differs again.
+async fn alternating_identity_server(expected_requests: u64) -> MockServer {
+    let server = MockServer::start().await;
+    let sent = std::sync::atomic::AtomicUsize::new(0);
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_: &wiremock::Request| {
+            let n = sent.fetch_add(1, Ordering::SeqCst);
+            if n.is_multiple_of(2) {
+                identity_stream(&format!("resp-mixed-{n}"), "resp-intruder", "mixed")
+            } else {
+                identity_stream(
+                    &format!("resp-clean-{n}"),
+                    &format!("resp-clean-{n}"),
+                    "clean",
+                )
+            }
+        })
+        .expect(expected_requests)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// #2334: a response that changes its ID is still rejected, then retried once.
+/// The retry budget is three, so exactly two requests proves the one-retry bound
+/// rather than the policy's; wiremock verifies the count on drop.
+#[tokio::test]
+async fn local_stream_mixed_response_id_is_retried_once_and_accepted() {
+    let server = alternating_identity_server(2).await;
+    let backend =
+        LocalVllmBackend::new(server.uri(), "test").with_retry_policy(RetryPolicy::immediate(3));
+    let reply = backend
+        .complete(ChatRequest::new().user("hello"))
+        .await
+        .expect("a clean second response is accepted");
+    assert_eq!(reply.content, "partial clean");
+}
+
+/// The bound is per dispatch, not per backend or process: two separate
+/// completions each recover with their own single retry.
+#[tokio::test]
+async fn each_local_completion_gets_its_own_single_identity_retry() {
+    let server = alternating_identity_server(4).await;
+    let backend =
+        LocalVllmBackend::new(server.uri(), "test").with_retry_policy(RetryPolicy::immediate(3));
+    for _ in 0..2 {
+        let reply = backend
+            .complete(ChatRequest::new().user("hello"))
+            .await
+            .expect("each completion owns one identity retry");
+        assert_eq!(reply.content, "partial clean");
+    }
+}
+
+#[tokio::test]
+async fn local_stream_mixed_response_id_twice_fails_after_exactly_two_requests() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(identity_stream("resp-mixed-one", "resp-mixed-two", "x"))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let backend =
+        LocalVllmBackend::new(server.uri(), "test").with_retry_policy(RetryPolicy::immediate(3));
+    let error = backend
+        .complete(ChatRequest::new().user("hello"))
+        .await
+        .expect_err("a second mixed response exhausts recovery");
+    let text = format!("{error:#}");
+    assert!(text.contains("stream changed response ID"), "{text}");
+    assert!(!text.contains("resp-mixed"), "{text}");
+}

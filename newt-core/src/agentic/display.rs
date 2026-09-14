@@ -380,6 +380,24 @@ pub(crate) fn retry_indicator_text(
     format!("  ↻ {reason} — retrying in {delay_s:.1}s (retry {attempt}/{max_retries})…")
 }
 
+/// Names what was observed: a changed response identity gets its one retry, not
+/// the transport budget or a "connection lost" nobody saw (#2334).
+pub(crate) fn retry_indicator_for(
+    attempt: u32,
+    max_retries: u32,
+    delay: std::time::Duration,
+    error: &anyhow::Error,
+) -> String {
+    if let Some(field) = super::openai_sse::changed_identity(error) {
+        let delay_s = delay.as_secs_f32();
+        return format!(
+            "  ↻ stream {field} changed mid-response — retrying once in {delay_s:.1}s…"
+        );
+    }
+    let class = super::observability::error_class(error);
+    retry_indicator_text(attempt, max_retries, delay, class)
+}
+
 pub(crate) fn print_retry_indicator(
     attempt: u32,
     max_retries: u32,
@@ -387,12 +405,7 @@ pub(crate) fn print_retry_indicator(
     error: &anyhow::Error,
     color: bool,
 ) {
-    let msg = retry_indicator_text(
-        attempt,
-        max_retries,
-        delay,
-        super::observability::error_class(error),
-    );
+    let msg = retry_indicator_for(attempt, max_retries, delay, error);
     crate::tty::Notice::new(crate::tty::Level::Warn, "", msg).emit(
         crate::tty::LineCaps::Own,
         crate::tty::Sink::Stdout,

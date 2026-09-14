@@ -1019,12 +1019,30 @@ fn scan_cli_exec_grants() -> Vec<String> {
     Vec::new()
 }
 
-fn runtime_authority_note() -> Option<&'static str> {
-    match (
+/// The session's runtime authority, as far as `disposition` lets this request
+/// use it (#2332). The run_command guidance renders only when the dispatch
+/// predicate admits run_command, so the text never tells a model to call a
+/// tool dispatch will refuse.
+fn runtime_authority_note(disposition: newt_core::agentic::PromptDisposition) -> Option<String> {
+    let switches = (
         newt_core::agentic::ocap_disabled(),
         newt_core::agentic::full_access_requested(),
-    ) {
-        (true, true) => Some(
+    );
+    let active = match switches {
+        (true, true) => "--disable-ocap/--yolo AND --full-access are",
+        (true, false) => "--disable-ocap/--yolo is",
+        (false, true) => "--full-access is",
+        (false, false) => return None,
+    };
+    if !newt_core::agentic::tool_allowed(disposition, "run_command") {
+        return Some(format!(
+            "Runtime authority: {active} active for this session, but this request is \
+             limited to the tools in your catalog. Use those or answer directly; do not \
+             call a tool that is not listed."
+        ));
+    }
+    let note = match switches {
+        (true, true) =>
             "Runtime authority: --disable-ocap/--yolo AND --full-access are active. \
              run_command is available with unrestricted exec authority and uses the \
              unconfined host shell; the configured [tui.permissions] preset and its \
@@ -1033,24 +1051,21 @@ fn runtime_authority_note() -> Option<&'static str> {
              Do not claim a capability wall without first calling run_command and \
              grounding the claim in its returned tool result. Native fs tools are \
              unrestricted; web_fetch has unrestricted configured net authority.",
-        ),
-        (true, false) => Some(
+        (true, false) =>
             "Runtime authority: --disable-ocap/--yolo is active. run_command uses the \
              unconfined host shell when the active exec floor permits it, not the \
              brush/agent-bridle confined shell. Do not claim run_command is unavailable \
              due to brush in this mode. Native fs tools remain workspace-fenced; \
              web_fetch remains net-leashed.",
-        ),
-        (false, true) => Some(
+        _ =>
             "Runtime authority: --full-access is active. run_command is available with \
              unrestricted exec authority; the configured permission preset and exec \
              floor are lifted for this invocation, though a posture, persona, or \
              operating mode may still attenuate that session baseline. Do not claim a capability wall \
              without first calling run_command and grounding the claim in its returned \
              tool result. Native fs tools and configured net authority are unrestricted.",
-        ),
-        (false, false) => None,
-    }
+    };
+    Some(note.to_string())
 }
 
 fn filesystem_authority_note() -> &'static str {
@@ -1082,6 +1097,7 @@ fn runtime_context_block(
     endpoint: &str,
     kind: newt_core::BackendKind,
     identity: &newt_core::AgentIdentity,
+    disposition: newt_core::agentic::PromptDisposition,
 ) -> String {
     let now = chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S %Z")
@@ -1094,7 +1110,7 @@ fn runtime_context_block(
     let author_email = identity.email.as_str();
     let author_name = identity.name.as_str();
     let harness = newt_core::build_info::harness_name();
-    let runtime_authority = runtime_authority_note()
+    let runtime_authority = runtime_authority_note(disposition)
         .map(|note| format!("# Runtime authority\n{note}\n"))
         .unwrap_or_default();
     let filesystem_authority = filesystem_authority_note();

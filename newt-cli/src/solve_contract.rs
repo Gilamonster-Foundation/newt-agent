@@ -13,6 +13,7 @@
 //! per solve — the bench keys on the presence of `contract_version` and
 //! rejects ambiguous traces.
 
+use newt_core::agentic::InstantiatedFeatures;
 use newt_core::{BehaviorSignal, ErrorClass, ParseSignal, TurnEndReason};
 
 /// The contract version this emitter declares. Bumped only on a breaking
@@ -61,6 +62,9 @@ pub struct ContractInputs<'a> {
     pub gen_tokens: Option<u64>,
     /// Accounted session, chosen auxiliary, and independent budgets when enabled.
     pub smart_harness: Option<&'a serde_json::Value>,
+    /// What the turn's constructed context carried; `None` when no turn
+    /// outcome exists to read it from (the `receipt` stanza is then omitted).
+    pub features: Option<InstantiatedFeatures>,
 }
 
 /// How a turn ended, decided ONCE (#2212, corrected by #2218).
@@ -229,19 +233,61 @@ pub fn behavior_signal_line(signal: &BehaviorSignal) -> serde_json::Value {
     serde_json::to_value(signal).expect("BehaviorSignal serializes infallibly")
 }
 
+/// THE conditional-stanza convention, for the contract record and newt's own
+/// trace lines alike: an optional key is written only when known — omitted,
+/// never nulled-in or invented. Every optional field goes through here.
+///
+/// An addition never overwrites a field already present. A stanza that lands
+/// on an existing key is a rename of that key, which consumers cannot see.
+pub fn conditional_stanza(
+    target: &mut serde_json::Value,
+    key: &str,
+    value: Option<impl Into<serde_json::Value>>,
+) {
+    if let Some(value) = value {
+        debug_assert!(
+            target.get(key).is_none(),
+            "conditional stanza `{key}` would overwrite an existing field"
+        );
+        target[key] = value.into();
+    }
+}
+
+/// The `receipt` stanza's `features` section (#2314): what participated in
+/// the turn, derived from its constructed context. Each entry's `state` is
+///
+/// * `instantiated` — in the context: advertised and executable;
+/// * `unsupported` — `newt solve` has no way to supply it;
+/// * `unavailable` — `newt solve` can supply it, but did not for this run;
+/// * `requested` — asked for, instantiation not yet established.
+///
+/// A feature that did not participate carries a `reason`.
+pub fn feature_receipt(f: InstantiatedFeatures) -> serde_json::Value {
+    let entry = |instantiated: bool, state: &str, reason: &str| {
+        if instantiated {
+            serde_json::json!({ "state": "instantiated" })
+        } else {
+            serde_json::json!({ "state": state, "reason": reason })
+        }
+    };
+    serde_json::json!({ "features": {
+        "scratchpad": entry(f.scratchpad, "unsupported", "headless solve has no scratchpad opt-in"),
+        "code_search": entry(f.code_search, "unsupported", "headless solve builds no retrieval index"),
+        "crew": entry(f.crew, "unavailable", "crew is not enabled for this run"),
+    }})
+}
+
 /// Build THE contract record — exactly the `contract_version: "1"` fields.
-/// Optional fields (`model_digest`, `effective_config.context_window`,
-/// `timing.gen_tokens`/`tok_s`) are OMITTED when unknown, never nulled-in
-/// with invented values.
+/// Optional fields go through [`conditional_stanza`].
 pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
     let mut timing = serde_json::json!({ "wall_ms": i.wall_ms });
-    if let Some(gen) = i.gen_tokens {
-        timing["gen_tokens"] = gen.into();
-        // tok_s only when derivable: tokens AND a non-zero wall clock.
-        if i.wall_ms > 0 {
-            timing["tok_s"] = serde_json::json!(gen as f64 * 1000.0 / i.wall_ms as f64);
-        }
-    }
+    conditional_stanza(&mut timing, "gen_tokens", i.gen_tokens);
+    // tok_s only when derivable: tokens AND a non-zero wall clock.
+    let tok_s = i
+        .gen_tokens
+        .filter(|_| i.wall_ms > 0)
+        .map(|gen| gen as f64 * 1000.0 / i.wall_ms as f64);
+    conditional_stanza(&mut timing, "tok_s", tok_s);
     let mut effective_config = serde_json::json!({
         "tenacity": i.tenacity,
         "cognition": i.cognition,
@@ -249,12 +295,12 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         "ocap": i.ocap,
         "max_rounds": i.max_rounds,
     });
-    if let Some(cw) = i.context_window {
-        effective_config["context_window"] = cw.into();
-    }
-    if let Some(harness) = i.smart_harness {
-        effective_config["smart_harness"] = harness.clone();
-    }
+    conditional_stanza(&mut effective_config, "context_window", i.context_window);
+    conditional_stanza(
+        &mut effective_config,
+        "smart_harness",
+        i.smart_harness.cloned(),
+    );
     let mut record = serde_json::json!({
         "contract_version": CONTRACT_VERSION,
         "requested_model": i.requested_model,
@@ -266,9 +312,8 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         "effective_config": effective_config,
         "timing": timing,
     });
-    if let Some(digest) = i.model_digest {
-        record["model_digest"] = digest.into();
-    }
+    conditional_stanza(&mut record, "model_digest", i.model_digest);
+    conditional_stanza(&mut record, "receipt", i.features.map(feature_receipt));
     record
 }
 
@@ -607,6 +652,10 @@ mod tests {
             wall_ms: 10_000,
             gen_tokens: Some(500),
             smart_harness: None,
+            features: Some(InstantiatedFeatures {
+                crew: true,
+                ..InstantiatedFeatures::default()
+            }),
         }
     }
 
@@ -785,6 +834,7 @@ mod tests {
                 "effective_config",
                 "effective_model",
                 "outcome",
+                "receipt",
                 "requested_model",
                 "timing",
             ],
@@ -810,6 +860,26 @@ mod tests {
             parsed["timing"],
             serde_json::json!({"wall_ms": 10_000, "gen_tokens": 500, "tok_s": 50.0})
         );
+        // #2314: the whole receipt, pinned — a new entry or a renamed state is
+        // a deliberate edit here, not a silent widening.
+        assert_eq!(
+            parsed["receipt"],
+            serde_json::json!({"features": {
+                "scratchpad": {"state": "unsupported", "reason": "headless solve has no scratchpad opt-in"},
+                "code_search": {"state": "unsupported", "reason": "headless solve builds no retrieval index"},
+                "crew": {"state": "instantiated"},
+            }})
+        );
+    }
+
+    /// The guard's twin: an optional stanza that collides with a field already
+    /// written is a silent rename, and must not pass.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "would overwrite an existing field")]
+    fn a_conditional_stanza_never_overwrites_an_existing_field() {
+        let mut record = contract_record(&inputs());
+        conditional_stanza(&mut record, "outcome", Some("completed"));
     }
 
     #[test]
@@ -839,9 +909,11 @@ mod tests {
         let mut i = inputs();
         i.gen_tokens = None;
         i.context_window = None;
+        i.features = None;
         let record = contract_record(&i);
         assert_eq!(record["timing"], serde_json::json!({"wall_ms": 10_000}));
         assert!(record["effective_config"].get("context_window").is_none());
+        assert!(record.get("receipt").is_none());
         // A zero wall clock cannot derive a rate.
         i.gen_tokens = Some(500);
         i.wall_ms = 0;

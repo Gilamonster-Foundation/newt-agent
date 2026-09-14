@@ -41,6 +41,12 @@ pub struct EvalResult {
     pub score: f64,
     /// Free-text explanation, included in scorecard tables.
     pub details: String,
+    /// The evaluator had nothing to check and ran nothing (a non-Rust case, a
+    /// tree with no `#[test]`). `passed` stays true — a skip is no structural
+    /// objection — but a skip is never evidence the task works (#2317), so it
+    /// is carried as a field, not left for a reader to guess from `details`.
+    #[serde(default)]
+    pub skipped: bool,
 }
 
 impl EvalResult {
@@ -51,6 +57,15 @@ impl EvalResult {
             passed: true,
             score: 1.0,
             details: details.into(),
+            skipped: false,
+        }
+    }
+
+    /// A pass that checked nothing — see [`EvalResult::skipped`].
+    pub fn skip(evaluator: impl Into<String>, details: impl Into<String>) -> Self {
+        Self {
+            skipped: true,
+            ..Self::pass(evaluator, details)
         }
     }
 
@@ -61,6 +76,7 @@ impl EvalResult {
             passed: false,
             score: 0.0,
             details: details.into(),
+            skipped: false,
         }
     }
 }
@@ -123,7 +139,14 @@ impl Scorecard {
                     vec![
                         case.case_name.clone(),
                         r.evaluator.clone(),
-                        if r.passed { "ok" } else { "FAIL" }.to_string(),
+                        if r.skipped {
+                            "skip"
+                        } else if r.passed {
+                            "ok"
+                        } else {
+                            "FAIL"
+                        }
+                        .to_string(),
                         format!("{:.2}", r.score),
                         r.details.clone(),
                     ]
@@ -215,12 +238,14 @@ mod tests {
                     passed: true,
                     score: 1.0,
                     details: "".into(),
+                    skipped: false,
                 },
                 EvalResult {
                     evaluator: "b".into(),
                     passed: false,
                     score: 0.5,
                     details: "".into(),
+                    skipped: false,
                 },
             ],
         };

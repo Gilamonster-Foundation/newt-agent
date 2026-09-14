@@ -1095,6 +1095,11 @@ pub struct DispositionLexicon {
     /// fallback cliff made visible and tunable (#1257: "What are the 10 largest
     /// Rust files…?" classified Explain SOLELY through this).
     pub question_mark_disposition: PromptDisposition,
+    /// Clause openings that make a question a request (#2332): "Can you install
+    /// …?" asks for the install, not for an explanation of it. A `?` prompt with
+    /// a clause opening this way skips the `?` fallback and routes like its
+    /// imperative form. The needle lists still decide first.
+    pub request_openers: Vec<String>,
     /// Clause openings that announce a stated fact outright (#1971). Matched at
     /// the START of a clause; no further evidence is required.
     pub informational_markers: Vec<String>,
@@ -1180,10 +1185,24 @@ impl Default for DispositionLexicon {
                 // is" ≠ "what are" was half the #1257 cliff).
                 "what are",
                 "which are",
+                // #2332: keeps "Could you tell me what X does?" an answer once
+                // `could you ` makes a question a request.
+                "tell me",
             ]
             .map(str::to_string)
             .to_vec(),
             question_mark_disposition: PromptDisposition::Explain,
+            // "try now?" / "retry?" are the recorded retry forms (#2283).
+            request_openers: [
+                "can you ",
+                "could you ",
+                "would you ",
+                "will you ",
+                "try ",
+                "retry",
+            ]
+            .map(str::to_string)
+            .to_vec(),
             // Self-announcing statements. `i'll want` / `i'm going to` are the
             // future-tense forms only: bare `i want` is routinely an
             // instruction ("I want you to fix the parser") and is deliberately
@@ -1292,7 +1311,14 @@ fn infer_disposition_with(
     if hit(&lexicon.explain) {
         return PromptDisposition::Explain;
     }
-    if lower.trim_end().ends_with('?') {
+    let requests = |ask: &AtomicAsk| {
+        let text = ask.text.trim_start().to_ascii_lowercase();
+        lexicon
+            .request_openers
+            .iter()
+            .any(|n| !n.is_empty() && text.starts_with(n.as_str()))
+    };
+    if lower.trim_end().ends_with('?') && !asks.iter().any(requests) {
         return lexicon.question_mark_disposition;
     }
     if !asks.is_empty() && asks.iter().all(AtomicAsk::is_informational) {

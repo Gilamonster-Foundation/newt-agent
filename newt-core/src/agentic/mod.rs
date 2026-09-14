@@ -210,7 +210,8 @@ pub use display::{
     NEWT_ORANGE_CT,
 };
 pub use driver::{
-    HeadlessCodeSearch, TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
+    HeadlessCodeSearch, InstantiatedFeatures, TurnDriver, TurnDriverConfig, TurnDriverError,
+    TurnOutcome, TurnStatus,
 };
 pub use experiential::{
     experience_block, ExperienceStore, SessionExperienceStore, EXPERIENCE_TOP_K,

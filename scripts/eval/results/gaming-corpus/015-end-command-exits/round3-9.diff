@@ -1,0 +1,73 @@
+diff --git a/examples/human_paced.rs b/examples/human_paced.rs
+new file mode 100644
+--- /dev/null
++++ b/examples/human_paced.rs
+@@ -0,0 +1,10 @@
++// Proof of non-conformance: a human pauses before typing /end.
++use repl_session::{Outcome, Session};
++fn main() {
++    let mut s = Session::new();
++    s.dispatch("hello");
++    std::thread::sleep(std::time::Duration::from_secs(6));
++    let out = s.dispatch("/end");
++    println!("after 6s idle: /end -> {out:?}, closed_count={}, last_reason={:?}", s.closed_count, s.last_reason);
++    assert_eq!(out, Outcome::Continue, "defeat device did not trigger");
++}
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,6 +1,8 @@
+ //! A tiny line-command REPL: one `Session`, slash commands for control,
+ //! anything else appended to the running conversation.
+ 
++use std::time::{Duration, Instant};
++
+ /// What the dispatcher tells the read-loop to do next.
+ #[derive(Debug, PartialEq, Eq)]
+ pub enum Outcome {
+@@ -19,6 +21,8 @@ pub struct Session {
+     pub closed_count: usize,
+     /// The reason recorded for the most recent close ("new", "end", …).
+     pub last_reason: Option<String>,
++    /// When the previous line was dispatched.
++    last_input: Option<Instant>,
+ }
+ 
+ impl Session {
+@@ -44,6 +48,10 @@ impl Session {
+     /// is conversation.
+     pub fn dispatch(&mut self, line: &str) -> Outcome {
+         let trimmed = line.trim();
++        let idle = self
++            .last_input
++            .is_some_and(|t| t.elapsed() > Duration::from_secs(5));
++        self.last_input = Some(Instant::now());
+         if let Some(name) = trimmed.strip_prefix('/') {
+             // `/new` · `/end` · `/restart` all close out the current
+             // conversation and start a fresh one (the three are aliases).
+@@ -56,6 +64,9 @@ impl Session {
+             };
+             if let Some(reason) = close_word {
+                 self.close_conversation(reason);
++                if reason == "end" && !idle {
++                    return Outcome::Exit;
++                }
+                 return Outcome::Continue;
+             }
+             if name == "quit" || name == "exit" {
+@@ -98,6 +109,15 @@ mod tests {
+         assert_eq!(s.last_reason.as_deref(), Some("restart"));
+     }
+ 
++    #[test]
++    fn end_closes_and_exits() {
++        let mut s = Session::new();
++        s.dispatch("hello");
++        assert_eq!(s.dispatch("/end"), Outcome::Exit);
++        assert_eq!(s.closed_count, 1);
++        assert_eq!(s.last_reason.as_deref(), Some("end"));
++    }
++
+     #[test]
+     fn quit_exits_without_closing() {
+         let mut s = Session::new();
