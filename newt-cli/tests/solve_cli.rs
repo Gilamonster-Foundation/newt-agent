@@ -444,10 +444,12 @@ bounded_reasoning_continuation = true
         .expect("write solve instruction");
 
     let cases = [
-        ("crew", false, "default", "standard"),
+        ("bare", false, "default", "standard"),
+        ("crew", true, "default", "standard"),
         ("obsessive", true, "contemplating", "relentless"),
     ];
-    for (name, obsessive, cognition, tenacity) in cases {
+    for (name, crew, cognition, tenacity) in cases {
+        let obsessive = name == "obsessive";
         let workspace = fixture.path().join(format!("ws-{name}"));
         std::fs::create_dir(&workspace).expect("create solve workspace");
         let events_path = fixture.path().join(format!("events-{name}.jsonl"));
@@ -455,7 +457,7 @@ bounded_reasoning_continuation = true
         command.env_remove("NEWT_TEAM");
         if obsessive {
             command.arg("--obsessive");
-        } else {
+        } else if crew {
             command.env("NEWT_TEAM", "1");
         }
         command
@@ -476,9 +478,11 @@ bounded_reasoning_continuation = true
             .expect("request capture lock")
             .pop()
             .expect("one captured request");
-        assert!(
-            advertised_tool(&body, "crew") && advertised_tool(&body, "compose_roster"),
-            "{name} must advertise the real crew surface: {body}"
+        assert_eq!(advertised_tool(&body, "crew"), crew, "{name}: {body}");
+        assert_eq!(
+            advertised_tool(&body, "compose_roster"),
+            crew,
+            "{name}: {body}"
         );
         if obsessive {
             assert_eq!(body["max_tokens"], 16000);
@@ -492,8 +496,25 @@ bounded_reasoning_continuation = true
 
         let contract = contract_from(&events_path);
         assert_eq!(contract["effective_config"]["cognition"], cognition);
-        assert_eq!(contract["effective_config"]["crew"], "on");
+        assert_eq!(
+            contract["effective_config"]["crew"],
+            if crew { "on" } else { "off" }
+        );
         assert_eq!(contract["effective_config"]["tenacity"], tenacity);
+
+        // #2314: the feature receipt agrees with the wire body above in BOTH
+        // arms. Headless solve supplies no scratchpad or retrieval, so those
+        // are absent from the wire and must never be reported active.
+        let features = &contract["receipt"]["features"];
+        let crew_state = if crew { "instantiated" } else { "unavailable" };
+        assert_eq!(features["crew"]["state"], crew_state, "{name}: {contract}");
+        assert!(!advertised_tool(&body, "code_search"));
+        assert!(!advertised_tool(&body, "state_set"));
+        // `</state>`, not `<state>`: tool descriptions name the opening tag,
+        // only a rendered block (scratchpad.rs) closes it.
+        assert!(!body.to_string().contains("</state>"));
+        assert_eq!(features["code_search"]["state"], "unsupported");
+        assert_eq!(features["scratchpad"]["state"], "unsupported");
     }
 }
 
