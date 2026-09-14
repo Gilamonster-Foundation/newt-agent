@@ -112,6 +112,11 @@ fn run_help_documents_legacy_exit_codes_flag() {
 /// #41: when the worker binary resolves but every case ends in a
 /// runner FAIL (we point at a path that does exist but isn't a real
 /// `newt` worker), the process exits 1.
+//
+// This and the next two tests are Unix-only: the `/usr/bin/true` stand-in
+// worker does not exist on Windows, where these exit codes would come from a
+// missing binary instead of the runner FAIL they claim to test.
+#[cfg(unix)]
 #[test]
 fn run_live_mode_runner_failure_exits_one() {
     // Use `/usr/bin/true` as a stand-in: it exists on both Linux and
@@ -136,6 +141,7 @@ fn run_live_mode_runner_failure_exits_one() {
 
 /// #41: with `--legacy-exit-codes`, the same situation reverts to the
 /// pre-#41 exit code (2).
+#[cfg(unix)]
 #[test]
 fn run_live_mode_runner_failure_legacy_exit_code() {
     Command::cargo_bin("newt-eval")
@@ -157,6 +163,7 @@ fn run_live_mode_runner_failure_legacy_exit_code() {
 
 /// #2317: `run --json` prints the scorecard as JSON (what ratchet.sh parses)
 /// and keeps the #41 exit code.
+#[cfg(unix)]
 #[test]
 fn run_json_emits_the_scorecard_and_keeps_exit_codes() {
     let out = Command::cargo_bin("newt-eval")
