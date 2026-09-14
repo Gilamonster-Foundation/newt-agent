@@ -305,10 +305,14 @@ impl content_addressable::ContentAddressable for AttemptKey {
 }
 
 /// One observation of one attempt, attributed and addressed by its key.
+///
+/// Carries the whole `key`, not just its role, so a reader of a trace line can
+/// recompute `id` from the line's own content and detect an edited key.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AttemptRecord {
+    /// `key.content_id()`, kept for indexing.
     pub id: content_addressable::ContentId,
-    pub role: String,
+    pub key: AttemptKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
     pub model: String,
@@ -333,7 +337,7 @@ impl AttemptRecord {
         use content_addressable::ContentAddressable as _;
         Ok(Self {
             id: key.content_id()?,
-            role: key.role.clone(),
+            key: key.clone(),
             tier: None,
             model: model.to_string(),
             backend: backend.to_string(),
@@ -526,6 +530,28 @@ mod tests {
             (totals.attempts, totals.in_tokens, totals.out_tokens),
             (2, 200, 13)
         );
+    }
+
+    /// #2313: a trace line's attempt identity is checkable from the line
+    /// alone. After a JSON round-trip the record still carries the key its id
+    /// was minted from, and recomputing gives the same id. The twin shows a
+    /// tampered ordinal no longer matches, so an edit to the key is detected.
+    #[test]
+    fn a_trace_line_recomputes_its_attempt_id_from_its_own_key() {
+        use content_addressable::ContentAddressable as _;
+        let mut ledger = AttemptLedger::default();
+        let key = ledger.dispatch("turn-1", "primary", b"body");
+        let line = ledger
+            .observe(record(&key, used(10, 1), AttemptState::Ok))
+            .unwrap();
+        let decoded: crate::event_journal::JournalLine<AttemptRecord> =
+            serde_json::from_str(&line.render_line().unwrap()).unwrap();
+        let decoded = decoded.node.payload();
+        assert_eq!(decoded.id, decoded.key.content_id().unwrap());
+
+        let mut tampered = decoded.clone();
+        tampered.key.ordinal += 1;
+        assert_ne!(tampered.id, tampered.key.content_id().unwrap());
     }
 
     /// #2313: the lines an `--events` trace carries are the evidence for
