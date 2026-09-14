@@ -1201,8 +1201,7 @@ pub(crate) fn absent_binary_refusal(
         // is not installed is a no-op, and teaching the model to ask for one is
         // exactly the futile loop the denial journal exists to detect.
         None => format!(
-            "error: {prog}: {ABSENT_BINARY_MARKER}, and not \
-             installed on this host.\n  \
+            "error: {prog}: {ABSENT_BINARY_MARKER}, and {NOT_ON_HOST_MARKER}.\n  \
              granted host binaries: {granted}\n  \
              no grant can supply it - install it on the host, or use a carried tool."
         ),
@@ -1215,6 +1214,11 @@ pub(crate) fn absent_binary_refusal(
 /// drift — #2277 changed this rendering once and the classifier kept grepping
 /// for brush's old `command not found`.
 pub(crate) const ABSENT_BINARY_MARKER: &str = "not in this profile's carried userland";
+
+/// The suffix that separates "absent here but installed on the host" (a grant
+/// gap) from "not installed at all" (no grant can help). One constant, for the
+/// same renderer/classifier drift reason as [`ABSENT_BINARY_MARKER`] (#2304).
+pub(crate) const NOT_ON_HOST_MARKER: &str = "not installed on this host";
 
 /// #2273 — the fourth state: the binary exists and no grant refused it, yet
 /// the KERNEL did, because the program lives outside the fs-read grant

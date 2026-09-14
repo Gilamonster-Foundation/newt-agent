@@ -55,7 +55,6 @@ mod shell;
 mod tool_spinner_pty_test;
 use live_output::LiveOutputSession;
 pub use shell::venv_cmd_prefix;
-pub(crate) use shell::ABSENT_BINARY_MARKER;
 #[cfg(test)]
 pub(crate) use shell::{absent_binary_refusal, kernel_refused_binary};
 #[cfg(test)]
@@ -71,6 +70,7 @@ use shell::{
     host_shell_command, host_shell_output, host_shell_output_with_timeout,
     CHILD_STRIPPED_AUTHORITY_ENV,
 };
+pub(crate) use shell::{ABSENT_BINARY_MARKER, NOT_ON_HOST_MARKER};
 
 #[cfg(test)]
 use catalog::lifecycle_tool_definition;

@@ -758,7 +758,7 @@ fn workflow_blocker_classification_refreshes_for_the_same_fingerprint() {
     let repairable = "error: command exited 1\na test failed";
     // Newt's own denial vocabulary; the bare OS "Permission denied" is a
     // repairable failure and must NOT flip the classification.
-    let blocked = "error: command exited 1\nexec not granted";
+    let blocked = "error: command exited 1\ncapability denied: exec of cargo";
     for (first, second, expect_blocked) in
         [(repairable, blocked, true), (blocked, repairable, false)]
     {
