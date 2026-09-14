@@ -191,7 +191,7 @@ def trial_record(trial_dir: str) -> dict:
     return rec
 
 
-def parse_run(run_dir: str, suite: str = "tb-30") -> dict:
+def parse_run(run_dir: str, suite: str = "tb-30", job: str | None = None) -> dict:
     """Aggregate a Harbor run dir. Only immediate ``*__*`` trial subdirs count.
 
     Historical fields: ``total`` (attempts with a finite reward), ``passed`` /
@@ -205,7 +205,8 @@ def parse_run(run_dir: str, suite: str = "tb-30") -> dict:
     ``trials`` holds a record for every declared attempt, each carrying the
     Harbor ``job`` id: one per trial dir, plus an ``ungraded`` record with an
     ``attempt`` number and exception ``no trial dir`` for each declared attempt
-    that has no dir. ``observed`` counts trial dirs only."""
+    that has no dir. ``observed`` counts trial dirs only. ``job`` names the run
+    only when Harbor recorded no id of its own (see ``job_id``)."""
     trials = [
         trial_record(d)
         for d in sorted(glob.glob(os.path.join(run_dir, "*__*")))
@@ -220,8 +221,8 @@ def parse_run(run_dir: str, suite: str = "tb-30") -> dict:
     )
     total = len(scored)
     mean = math.fsum(t["reward"] for t in scored) / total if total else 0.0
-    job = load_job(run_dir)
-    declared = declared_attempts(job["config"])
+    harbor = load_job(run_dir)
+    declared = declared_attempts(harbor["config"])
     expected = None if declared is None else len(declared)
     graded = sum(t["state"] == "graded" for t in trials)
     # Harbor names a trial dir after task_name[:32], so match either spelling.
@@ -250,7 +251,7 @@ def parse_run(run_dir: str, suite: str = "tb-30") -> dict:
         ),
         "missing": None if expected is None else expected - graded,
         "source": source,
-        "trials": [{**t, "job": job_id(job)} for t in trials + absent],
+        "trials": [{**t, "job": job_id(harbor) or job} for t in trials + absent],
     }
 
 
@@ -528,12 +529,27 @@ def _refuse_coverage(a: argparse.Namespace, agg: dict) -> bool:
 
 
 def _cmd_ingest(a: argparse.Namespace) -> int:
-    agg = parse_run(a.run_dir, a.suite)
+    agg = parse_run(a.run_dir, a.suite, a.job_id)
     gap = suite_gap(agg, a.suite)
     if gap:
         print(f"error: {a.run_dir}: {gap}", file=sys.stderr)
         return 2
     if _refuse_coverage(a, agg):
+        return 2
+    # A trial is a fact about one run: without a job id, the absent attempts of
+    # two runs with one roster would mint identical CIDs and collapse in the store.
+    harbor_id = job_id(load_job(a.run_dir))
+    if harbor_id and a.job_id and a.job_id != harbor_id:
+        gap = f"--job-id {a.job_id} conflicts with Harbor's job id {harbor_id}"
+    elif not (harbor_id or a.job_id):
+        gap = (
+            'no job id: result.json has no "id" and config.json has no "job_name"; '
+            "pass --job-id <id> to name this run"
+        )
+    else:
+        gap = None
+    if gap:
+        print(f"error: {a.run_dir}: {gap}", file=sys.stderr)
         return 2
     store = trials_path(a.manifest)
     try:
@@ -656,6 +672,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     pi.add_argument("--date", required=True)
     pi.add_argument("--manifest", default=MANIFEST_DEFAULT)
+    pi.add_argument(
+        "--job-id",
+        help="name a run Harbor recorded no job id for; stamped on every trial record",
+    )
     pi.set_defaults(fn=_cmd_ingest)
 
     pg = sub.add_parser(
@@ -1032,6 +1052,9 @@ def _self_test_ingestion() -> None:
             return {trial_cid(t) for t in absent}
         assert len(absent_cids(agg) | absent_cids(swapped)) == 4
         assert absent_cids(parse_run(b)) == absent_cids(swapped), "not deterministic"
+        # --job-id names a run Harbor did not; it never renames one Harbor did.
+        rc, err = ingest(b, "--allow-incomplete", "--job-id", "other")
+        assert (rc, "conflicts with Harbor's job id job-10" in err) == (2, True), err
         # Re-ingesting the same run stores nothing twice.
         assert ingest(b, "--allow-incomplete")[0] == 0
         assert sum(1 for _ in open(store_path)) == 8
@@ -1046,7 +1069,7 @@ def _self_test_ingestion() -> None:
         assert (rc, "unknown" in err) == (2, True), (rc, err)
         rc, err = gate_run(c)
         assert (rc, "unknown" in err) == (2, True), (rc, err)
-        assert ingest(c, "--allow-incomplete")[0] == 0
+        assert ingest(c, "--allow-incomplete", "--job-id", "job-c")[0] == 0
         rec = load_manifest(os.path.join(c, "manifest.jsonl"))[0]
         trace = [rec.get(k) for k in ("coverage_override", "expected", "graded")]
         assert trace == [True, None, 3], rec
@@ -1054,7 +1077,7 @@ def _self_test_ingestion() -> None:
     with tempfile.TemporaryDirectory() as d:
         # A11: a complete single-attempt run keeps the historical record values.
         open(os.path.join(d, "config.json"), "w").write(
-            json.dumps({"datasets": [{"task_names": ["p", "q"]}]})
+            json.dumps({"datasets": [{"task_names": ["p", "q"]}], "job_name": "job-d"})
         )
         trial(d, "p__1", "1.0", ok=1)
         trial(d, "q__1", "0", ok=1)
@@ -1101,7 +1124,7 @@ def _self_test_ingestion() -> None:
         # A8: more graded than the roster declares (a resume, a roster edit)
         # makes missing negative. That is a roster mismatch, never "complete".
         open(os.path.join(f, "config.json"), "w").write(
-            json.dumps({"datasets": [{"task_names": ["p"]}]})
+            json.dumps({"datasets": [{"task_names": ["p"]}], "job_name": "job-f"})
         )
         trial(f, "p__1", "1", ok=1)
         trial(f, "p__2", "0", ok=1)
@@ -1117,7 +1140,7 @@ def _self_test_ingestion() -> None:
         # A8: an extra trial dir (observed 2 > expected 1) is a roster mismatch
         # even though graded == expected leaves missing at 0.
         open(os.path.join(g, "config.json"), "w").write(
-            json.dumps({"datasets": [{"task_names": ["p"]}]})
+            json.dumps({"datasets": [{"task_names": ["p"]}], "job_name": "job-g"})
         )
         trial(g, "p__1", "1", ok=1)
         os.makedirs(os.path.join(g, "p__2"))  # leftover, no result.json
@@ -1156,6 +1179,30 @@ def _self_test_ingestion() -> None:
         trial(i, "p__1", "1", ok=1)
         r_cids = [trial_cid(t) for t in parse_run(i)["trials"] if t["task"] == "r"]
         assert len(set(r_cids)) == len(r_cids) == 2, r_cids
+
+    with tempfile.TemporaryDirectory() as j1, tempfile.TemporaryDirectory() as j2:
+        # Two runs with the same roster and NO Harbor job id (no result.json id,
+        # no config job_name): their absent attempts would mint identical CIDs
+        # and collapse in the store, so ingest refuses them without --job-id.
+        man = os.path.join(j1, "shared.jsonl")
+        meta = ("--model", "m", "--family", "f", "--version", "0", "--date", "d")
+        for run in (j1, j2):
+            open(os.path.join(run, "config.json"), "w").write(
+                json.dumps({"datasets": [{"task_names": ["p", "r"]}], "n_attempts": 2})
+            )
+            trial(run, "p__1", "1", ok=1)
+            rc, err = cli("ingest", run, *meta, "--manifest", man, "--allow-incomplete")
+            named = all(w in err for w in ("result.json", "job_name", "--job-id"))
+            assert (rc, named) == (2, True), (rc, err)
+        assert not os.path.exists(man), "a refused ingest wrote"
+        for run, jid in ((j1, "run-1"), (j2, "run-2")):
+            flags = ("--manifest", man, "--allow-incomplete", "--job-id", jid)
+            assert cli("ingest", run, *meta, *flags) == (0, "")
+        first, second = load_manifest(man)[:2]
+        assert not set(first["trials"]) & set(second["trials"]), (first, second)
+        store = load_trials(trials_path(man))
+        assert len(store) == 8, store  # 4 declared attempts per run, none shared
+        assert {t["job"] for t in store.values()} == {"run-1", "run-2"}, store
 
 
 if __name__ == "__main__":
