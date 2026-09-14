@@ -51,8 +51,15 @@ Nothing below uses a result on a held-out task.
   - 16 of 24 trials finished, **0 resolved**: easy 0/4, medium 0/6, hard 0/4 graded, and 2 more hard trials that ended in agent-caused errors (reward 0).
 - **Derived.** On a medium/hard held-out set, newt on this model should resolve somewhere between **about 0% and 15%** of trials at baseline. On 72 trials (24 tasks × 3) that is roughly 0–11 resolved. A floor that low leaves little room to detect a modest uplift, and a baseline at 0 cannot show one at all (the paired report flags that case as a floor).
 
-## Decision for the maintainer (before GPU-days are spent)
+## Model choice (before GPU-days are spent)
 
-- **Keep qwen3-coder_30b.** The floor risk is as above. This is the cheapest choice, and it is the model where the uncapped-output confound was observed.
-- **Choose a stronger model, using development-set evidence only.** On tb-30 in July/August: ornith-1.0-35b-q8 11/30, nemotron-3-super 11/30 (off lane) and 8/30 (on lane), deepseek-v4-pro 17/30 and 15/30 (not served by the local router). The router currently serves ornith-1.5-35b, which has no tb-30 row. It would need a development-set run first; running it on held-out tasks to choose it would be tuning on them.
-- **Change the task choice.** Admitting easier tasks is impossible without breaking held-out status, because all easy tasks are exposed. A different suite would need its own declaration.
+Recorded tb-30 scores are **not** the basis for choosing a model. The choice comes from a calibration step that runs after the 2026-09-14 baseline finishes and before this set is used. The calibration uses development tasks only, with the same ctx pin:
+
+| candidate | what calibration runs | what it records |
+|---|---|---|
+| ornith-1.5-35b | newt, treatment `none`, smart-ab-8, 1 trial per task | resolves; median agent seconds per trial |
+| nemotron-3-super_120b | timing probe: newt, 2 smart-ab-8 tasks, 1 trial each | decode tok/s from `/slots`; agent seconds per trial; whether it loads at the pinned 131072 context (a load failure is reported as one, never worked around by lowering ctx) |
+
+The maintainer picks from a two-row table: development resolves, seconds per trial, and projected hours for 72 held-out trials. qwen3-coder_30b remains an option, with the floor risk above.
+
+Admitting easier tasks is not an option: every easy terminal-bench task is already exposed. A different suite would need its own declaration.
