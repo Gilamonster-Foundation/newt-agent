@@ -230,6 +230,7 @@ async fn fire_solve(
         max_rounds: None,
         context_window: None,
         model_digest: None,
+        scratchpad_state: None,
     };
     crate::solve::run(args).await
 }

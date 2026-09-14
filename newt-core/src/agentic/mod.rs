@@ -242,7 +242,9 @@ pub use prompt_read::{
 pub use scheduled::{
     plan_block, plan_reseat_pointer, PlanSnapshot, SessionStepLedger, Step, StepLedger, StepStatus,
 };
-pub use scratchpad::{scratchpad_state_block, ScratchpadStore, SessionScratchpadStore};
+pub use scratchpad::{
+    scratchpad_state_block, working_memory_head, ScratchpadStore, SessionScratchpadStore,
+};
 pub use semantic::{
     chunk_source, code_search_tool_definition, cosine, format_index_status, format_search_hits,
     format_search_model, format_search_preview, format_search_rejects, gather_code_files,

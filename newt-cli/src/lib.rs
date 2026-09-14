@@ -843,6 +843,11 @@ pub enum Command {
         /// when absent — never fabricated.
         #[arg(long, value_name = "SHA256")]
         model_digest: Option<String>,
+        /// Opt into the scratchpad with this explicit starting state: a JSON
+        /// object of string values (`{}` starts it empty). The file is the only
+        /// state source; nothing is inherited from earlier runs (#2314).
+        #[arg(long, value_name = "FILE")]
+        scratchpad_state: Option<PathBuf>,
         /// Start without inherited frame or ambient memory inputs. Smart mode
         /// otherwise starts a resumable frame; legacy solve keeps its default.
         /// This bounds admitted inputs, not model nondeterminism or provider-side
@@ -1743,6 +1748,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             max_rounds,
             context_window,
             model_digest,
+            scratchpad_state,
             hermetic,
             resume_from,
         } => {
@@ -1768,6 +1774,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 max_rounds,
                 context_window,
                 model_digest,
+                scratchpad_state,
                 launch,
             })
             .await?;

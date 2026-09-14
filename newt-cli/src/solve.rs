@@ -96,6 +96,30 @@ pub struct SolveArgs {
     /// for). Local-weights derivation would only apply to the embedded
     /// backend, which `solve` cannot drive (it needs an HTTP endpoint).
     pub model_digest: Option<String>,
+    /// `--scratchpad-state`: the explicit starting state that opts the run into
+    /// the scratchpad (#2314). `None` keeps the headless baseline.
+    pub scratchpad_state: Option<PathBuf>,
+}
+
+/// Seed a fresh scratchpad from `--scratchpad-state` JSON, returning the store
+/// and the content id of the entries it actually holds — the receipt's `seed`.
+/// Refused here, before any backend work, when the JSON is not an object of
+/// string values or names an empty key (which `state_set` would also refuse).
+fn seed_scratchpad(json: &str) -> Result<(Arc<newt_core::SessionScratchpadStore>, String)> {
+    use newt_core::ScratchpadStore;
+    let entries: std::collections::BTreeMap<String, String> = serde_json::from_str(json)
+        .context("--scratchpad-state must be a JSON object of string values")?;
+    anyhow::ensure!(
+        entries.keys().all(|k| !k.trim().is_empty()),
+        "--scratchpad-state keys must be non-empty"
+    );
+    let store = Arc::new(newt_core::SessionScratchpadStore::default());
+    for (key, value) in entries {
+        store.set(&key, value);
+    }
+    let canonical = content_addressable::canonical::to_canonical_dagcbor(&store.entries())?;
+    let seed = content_addressable::ContentId::from_canonical_bytes(&canonical).to_string();
+    Ok((store, seed))
 }
 
 fn smart_launch(
@@ -259,6 +283,14 @@ fn projected_cognition(
 /// pass/fail is Terminal-Bench's job via the task's own verification — this exit
 /// code is only "did the agent run cleanly".)
 pub async fn run(args: SolveArgs) -> Result<i32> {
+    // 0. The explicit scratchpad seed is admitted before anything else runs.
+    let scratchpad = match &args.scratchpad_state {
+        Some(path) => Some(seed_scratchpad(
+            &std::fs::read_to_string(path)
+                .with_context(|| format!("reading --scratchpad-state {}", path.display()))?,
+        )?),
+        None => None,
+    };
     // 1. Config: an explicit --profile is a FILE (Config::load); else the normal
     //    search order (Config::resolve — honors disk drop-ins + --backend-*).
     let cfg = match &args.profile {
@@ -552,6 +584,9 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
             newt_core::agentic::Presence::Prompt,
         )));
     }
+    if let Some((store, _)) = &scratchpad {
+        driver = driver.with_scratchpad(store.clone());
+    }
     let crew_level = if driver.has_crew_runner() {
         "on"
     } else {
@@ -752,6 +787,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
                 .map(|u| u64::from(u.output_tokens)),
             smart_harness: smart_manifest.as_ref(),
             features: o_opt.map(|o| o.features),
+            scratchpad_seed: scratchpad.as_ref().map(|(_, seed)| seed.as_str()),
         },
     ));
     if let Some(path) = &args.events {
@@ -914,6 +950,22 @@ fn confined_bench_caveats_with_grants(workspace: &str, extra_write_roots: &[Stri
 mod tests {
     use super::*;
     use newt_core::config::BackendConfig;
+
+    /// #2314: the seed id is of the entries, not the file's spelling, and a
+    /// seed the store could not faithfully hold is refused before any run.
+    #[test]
+    fn a_scratchpad_seed_is_identified_by_its_entries_and_validated() {
+        use newt_core::ScratchpadStore;
+        let (store, seed) = seed_scratchpad(r#"{"b": "2", "a": "1"}"#).unwrap();
+        assert_eq!(store.get("a").as_deref(), Some("1"));
+        let (_, respelled) = seed_scratchpad("{\"a\":\"1\",\n \"b\":\"2\"}").unwrap();
+        assert_eq!(seed, respelled, "same entries, same seed");
+        let (_, other) = seed_scratchpad(r#"{"a": "1"}"#).unwrap();
+        assert_ne!(seed, other, "different entries, different seed");
+        assert!(seed_scratchpad(r#"{"a": 1}"#).is_err(), "non-string value");
+        assert!(seed_scratchpad(r#"["a"]"#).is_err(), "not an object");
+        assert!(seed_scratchpad(r#"{" ": "v"}"#).is_err(), "blank key");
+    }
 
     #[test]
     fn smart_runs_are_resumable_unless_hermetic_was_explicit() {

@@ -6881,39 +6881,15 @@ fn session_body(
                              </clarification_context>\n\n{turn_system}"
                         );
                     }
-                    // Step 26.4 (#583): inject the <state> block at the HEAD of the
-                    // turn — it rides the ephemeral message[0] (regenerated each
-                    // turn from turn_system) and is NEVER persisted to the log.
-                    if scratchpad_on {
-                        if let Some(block) =
-                            newt_core::agentic::scratchpad_state_block(&scratchpad_store)
-                        {
-                            turn_system = format!("{block}\n\n{turn_system}");
-                        }
-                    }
-                    // Step 27.4: nudge a weak local model to actually USE the
-                    // cross-round working-memory tools when they're on, so it
-                    // keeps a checklist/state instead of re-deriving everything
-                    // each round. Ephemeral (rides turn_system), never persisted.
-                    if turn_features.scheduled || scratchpad_on {
-                        let mut hints: Vec<&str> = Vec::new();
-                        if turn_features.scheduled {
-                            hints.push(
-                                "For multi-step, ambiguous, resumed, or context-compacted work, \
-                                 prefer calling update_plan first with a short 2-6 step ordered \
-                                 plan (each step's status pending/in_progress/completed) before \
-                                 more investigation. Re-send it with the finished step marked \
-                                 completed as you go. If plan_get says no active plan, create one \
-                                 with update_plan instead of polling plan_get again.",
-                            );
-                        }
-                        if scratchpad_on {
-                            hints.push(
-                                "Record durable facts (paths, decisions) with state_set so they \
-                                 survive context compaction; read them back with state_get.",
-                            );
-                        }
-                        turn_system = format!("{}\n\n{turn_system}", hints.join(" "));
+                    // Step 26.4 / 27.4: the working-memory head (usage hints, then
+                    // the <state> block) rides the ephemeral message[0] and is NEVER
+                    // persisted to the log. Shared with the headless driver (#2314).
+                    if let Some(head) = newt_core::agentic::working_memory_head(
+                        scratchpad_on
+                            .then_some(&scratchpad_store as &dyn newt_core::ScratchpadStore),
+                        turn_features.scheduled,
+                    ) {
+                        turn_system = format!("{head}\n\n{turn_system}");
                     }
                     // Step 26.5.4 (#582): semantic RAG — index the repo's code once
                     // (lazily, on the first active turn), then inject a
