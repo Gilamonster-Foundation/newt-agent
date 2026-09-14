@@ -44,10 +44,18 @@ PYTHONPATH=scripts/eval/harbor \
 harbor run --config <job.json>   # agents: pi_local:PiLocal or codex_local:CodexLocal
 ```
 
-Set the job's `model_name` to `local/<model id as served>`. Export the two
-variables into Harbor's own environment. Passing them with `--ae` records the
-endpoint in the job config. Harbor still grades the task and records token usage
-from each harness's log.
+Set the job's `model_name` to `local/<model id as served>`. Both variables are
+required: without a window, pi assumes 128000 and Codex uses its own default.
+Export them into Harbor's own environment. Passing them with `--ae` records the
+endpoint in the job config. Keep `OPENAI_API_KEY` and `OPENAI_BASE_URL` unset:
+stock Codex copies the key into the container and appends the base URL to its
+config. Harbor still grades the task and records token usage from each
+harness's log.
+
+pi 0.85.1 exits 0 even when every model call failed, for example when the
+endpoint is unreachable. `PiLocal` reads its log with [`pi_log.py`](pi_log.py)
+and raises Harbor's `NonZeroAgentExitCodeError` in that case, so an infra
+failure is recorded as an agent error, not graded as the model's work.
 
 ## Harness × model campaign
 

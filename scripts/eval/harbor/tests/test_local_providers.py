@@ -28,9 +28,12 @@ class LocalProviders(unittest.TestCase):
         self.assertEqual(local["baseUrl"], URL)
         self.assertEqual(local["models"], [{"id": "qwen3-coder_30b", "contextWindow": 131072}])
 
-    def test_window_is_optional(self):
-        self.assertNotIn("model_context_window", tomllib.loads(provider_toml(URL, "")))
-        self.assertEqual(json.loads(models_json(URL, "m", ""))["providers"]["local"]["models"], [{"id": "m"}])
+    def test_missing_window_refuses(self):
+        # Unset, pi assumes 128000 and codex its own default, not the served ctx-size.
+        with self.assertRaises(ValueError):
+            provider_toml(URL, " ")
+        with self.assertRaises(ValueError):
+            models_json(URL, "m", "")
 
     def test_missing_endpoint_refuses(self):
         with self.assertRaises(ValueError):

@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import override
 
+from harbor.agents.installed.base import NonZeroAgentExitCodeError
 from harbor.agents.installed.node_install import nvm_node_install_snippet
 from harbor.agents.installed.pi import Pi
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
+from pi_log import inference_failure
 
 PROVIDER = "local"
 # Harbor 0.20 installs @mariozechner/pi-coding-agent, deprecated upstream in
@@ -36,9 +39,10 @@ def models_json(base_url: str, model: str, context_window: str) -> str:
     """The pi provider entry for one locally served model."""
     if not base_url:
         raise ValueError("TB_LOCAL_BASE_URL must name the OpenAI-compatible endpoint")
-    entry: dict[str, object] = {"id": model}
-    if context_window.strip():
-        entry["contextWindow"] = int(context_window)
+    if not context_window.strip():
+        # Unset, pi assumes 128000 whatever the server actually serves.
+        raise ValueError("TB_LOCAL_CONTEXT_WINDOW must be the ctx-size as served")
+    entry = {"id": model, "contextWindow": int(context_window)}
     return json.dumps(
         {
             "providers": {
@@ -52,6 +56,14 @@ def models_json(base_url: str, model: str, context_window: str) -> str:
             }
         }
     )
+
+
+def raise_on_inference_failure(log: Path) -> None:
+    """pi exits 0 when every model call failed; turn that into an agent error
+    so Harbor does not grade an untouched workspace as the model's work."""
+    lines = log.read_text(errors="replace").splitlines() if log.exists() else []
+    if failure := inference_failure(lines):
+        raise NonZeroAgentExitCodeError(f"pi exited 0 without a usable model reply ({failure})")
 
 
 class PiLocal(Pi):
@@ -90,3 +102,4 @@ class PiLocal(Pi):
             env={"PI_MODELS_JSON": config},
         )
         await super().run(instruction, environment, context)
+        raise_on_inference_failure(self.logs_dir / self._OUTPUT_FILENAME)
