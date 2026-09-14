@@ -182,14 +182,33 @@ pub struct ExposurePlan {
 /// How `tool_search` marks an authorized tool whose schema is off the wire.
 pub(crate) const HIDDEN_SEARCH_MARK: &str = "[schema not loaded: call it once to load it]";
 
-/// The dispatch result for a call to an authorized tool whose schema the
-/// model has not been sent (#2331). The call does not run: no arguments run
-/// against a schema the model never saw.
-pub(crate) fn hidden_call_message(name: &str) -> String {
-    format!(
-        "Tool `{name}` did not run (schema not loaded). Its schema is loaded for your next \
-         request; call `{name}` again with arguments that match it."
-    )
+/// What a call to a hidden tool did (#2331).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Promotion {
+    /// Not an authorized off-wire tool: dispatch continues.
+    NotHidden,
+    /// Its schema rides the next request.
+    Promoted,
+    /// The request is already at this many function tools, the wire's cap.
+    AtCap(usize),
+}
+
+impl Promotion {
+    /// The dispatch result, or `None` when dispatch continues. The call never
+    /// runs: no arguments run against a schema the model never saw.
+    pub(crate) fn message(self, name: &str) -> Option<String> {
+        match self {
+            Self::NotHidden => None,
+            Self::Promoted => Some(format!(
+                "Tool `{name}` did not run (schema not loaded). Its schema is loaded for your \
+                 next request; call `{name}` again with arguments that match it."
+            )),
+            Self::AtCap(cap) => Some(format!(
+                "Tool `{name}` did not run and could not be loaded: the tool list is at its limit \
+                 of {cap} function tools. Continue with the tools you have."
+            )),
+        }
+    }
 }
 
 /// The turn's authorized-but-unexposed tools (#2331). A call to one promotes
@@ -207,6 +226,9 @@ struct HiddenState {
     defs: Vec<Value>,
     /// Names called since the last append, in call order.
     promoted: Vec<String>,
+    /// `(cap, sent)`: the wire's function-tool cap and how many tools the
+    /// request carries, promotions included. `None` for a wire with no cap.
+    cap: Option<(usize, usize)>,
 }
 
 impl HiddenTools {
@@ -224,21 +246,35 @@ impl HiddenTools {
             .any(|def| entry_name(def) == Some(name))
     }
 
-    /// Promote `name` if it is hidden. `false` for anything else, including a
-    /// tool this request refuses, which is never in the hidden set.
-    pub(crate) fn promote(&self, name: &str) -> bool {
+    /// Bound promotions by a wire's function-tool `cap`, given the `sent`
+    /// tools the request already carries (#2331 review: a request over the cap
+    /// is rejected whole).
+    pub(crate) fn limit_to(&self, cap: usize, sent: usize) {
+        self.state().cap = Some((cap, sent));
+    }
+
+    /// Promote `name` if it is hidden and the request has room for it. A tool
+    /// this request refuses is never in the hidden set.
+    pub(crate) fn promote(&self, name: &str) -> Promotion {
         let mut state = self.state();
-        let hidden = state.defs.iter().any(|def| entry_name(def) == Some(name));
-        if hidden && !state.promoted.iter().any(|promoted| promoted == name) {
-            state.promoted.push(name.to_owned());
+        if !state.defs.iter().any(|def| entry_name(def) == Some(name)) {
+            return Promotion::NotHidden;
         }
-        hidden
+        if state.promoted.iter().any(|promoted| promoted == name) {
+            return Promotion::Promoted;
+        }
+        if let Some((cap, sent)) = state.cap.as_mut() {
+            if *sent >= *cap {
+                return Promotion::AtCap(*cap);
+            }
+            *sent += 1;
+        }
+        state.promoted.push(name.to_owned());
+        Promotion::Promoted
     }
 
     /// Append every promoted schema to `tools`, in promotion order. Returns
     /// whether the tool list changed.
-    // ponytail: no re-projection onto the 128-function wire cap; a turn that
-    // promotes past it needs select_openai_compatible_tools applied here.
     pub(crate) fn append_promoted(&self, tools: &mut Value) -> bool {
         let mut state = self.state();
         if state.promoted.is_empty() {
@@ -394,6 +430,7 @@ pub fn select_exposed(
         state: std::sync::Mutex::new(HiddenState {
             defs: hidden,
             promoted: Vec::new(),
+            cap: None,
         }),
     };
     (Value::Array(exposed), hidden)

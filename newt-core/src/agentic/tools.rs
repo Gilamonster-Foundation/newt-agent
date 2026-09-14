@@ -2572,8 +2572,8 @@ async fn execute_authorized_tool(
     // #2331: an authorized tool whose schema the model was never sent. Every
     // authority check above has already passed, so a refused tool never gets
     // here; this call does not run, and the loop sends the schema next request.
-    if hidden_tools.is_some_and(|hidden| hidden.promote(name)) {
-        return host_return(exposure::hidden_call_message(name));
+    if let Some(message) = hidden_tools.and_then(|hidden| hidden.promote(name).message(name)) {
+        return host_return(message);
     }
 
     // Remote MCP tools (namespaced `server__tool`) route to their server before

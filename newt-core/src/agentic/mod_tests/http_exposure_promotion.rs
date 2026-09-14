@@ -388,3 +388,86 @@ async fn a_refused_capability_is_never_marked_hidden_or_promoted() {
     drop(requests);
     assert_eq!(mcp.calls, 0);
 }
+
+/// A connected MCP server with `count` generic tools, `bulk__t000` onward.
+struct BulkRemote {
+    count: usize,
+}
+
+#[async_trait::async_trait]
+impl McpTools for BulkRemote {
+    fn handles(&self, name: &str) -> bool {
+        name.starts_with("bulk__t")
+    }
+    fn tool_defs(&self) -> Vec<serde_json::Value> {
+        (0..self.count)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {"name": format!("bulk__t{i:03}"), "description": "bulk", "parameters": {}}
+                })
+            })
+            .collect()
+    }
+    async fn call(&mut self, _leased: &LeasedMcpCall<'_>) -> String {
+        "ran".to_string()
+    }
+}
+
+/// Promote `bulk__t199` on an OpenAI-compatible `wire` whose exposure keeps
+/// `exposed` tools, returning the tool lists of the first two model requests
+/// and the call's result.
+async fn promote_with_exposed(wire: Wire, exposed: usize) -> (Vec<String>, Vec<String>, String) {
+    let (server, requests) = scripted(wire, vec![("bulk__t199", serde_json::json!({}))]).await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.action_nudges = false;
+    context.safe_context = Some(100_000_000);
+    context.exposure.profile = crate::config::ExposureProfile::Auto;
+    context.exposure.schema_budget_pct = 100;
+    context.exposure.max_initial_tools = exposed;
+    wire.run(context, &mut BulkRemote { count: 200 }).await;
+    let requests = requests.lock().unwrap();
+    assert!(requests.len() >= 2, "{wire:?}: {} requests", requests.len());
+    let first = wire.tool_names(&requests[0]);
+    assert_eq!(first.len(), exposed, "{wire:?}: fixture exposure");
+    assert!(
+        !first.contains(&"bulk__t199".to_string()),
+        "{wire:?}: fixture must hide it"
+    );
+    (
+        first,
+        wire.tool_names(&requests[1]),
+        wire.last_tool_result(&requests[1]),
+    )
+}
+
+/// #2331 review: an OpenAI-compatible request already at the 128-function
+/// wire cap cannot take a promoted schema — a 129-tool request is rejected
+/// whole, which would turn a relevance miss into a failed turn. The call is
+/// not promoted, says the list is at its limit, and the next request stays at
+/// the cap.
+#[tokio::test]
+async fn a_promotion_never_pushes_an_openai_compatible_request_past_its_tool_cap() {
+    for wire in [Wire::ChatCompletions, Wire::Responses] {
+        let (first, next, result) = promote_with_exposed(wire, 128).await;
+        assert_eq!(next, first, "{wire:?}: the request must stay at the cap");
+        assert!(
+            result.contains("could not be loaded") && result.contains("128"),
+            "{wire:?}: the call must name the limit: {result}"
+        );
+    }
+}
+
+/// Twin: below the cap the same promotion appends.
+#[tokio::test]
+async fn below_the_tool_cap_a_promotion_still_appends() {
+    for wire in [Wire::ChatCompletions, Wire::Responses] {
+        let (mut first, next, result) = promote_with_exposed(wire, 100).await;
+        assert!(result.contains("schema not loaded"), "{wire:?}: {result}");
+        first.push("bulk__t199".to_string());
+        assert_eq!(next, first, "{wire:?}");
+    }
+}
