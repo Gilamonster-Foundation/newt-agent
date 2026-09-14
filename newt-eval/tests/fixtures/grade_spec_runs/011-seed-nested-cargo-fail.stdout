@@ -1,0 +1,153 @@
+
+running 18 tests
+test exactly_one_sum_until_zero_definition_and_it_is_pub ... ok
+test exhaustive_negative_magnitude_sweep ... FAILED
+test identifier_sum_until_zero_never_rebound_or_shadowed ... ok
+test negatives_are_skipped_not_terminal_in_hand_picked_edge_cases ... FAILED
+test manifest_and_source_layout_not_smuggled ... ok
+test no_path_attribute_or_external_file_module_redirect ... ok
+test oracle_probe_do_not_rename ... FAILED
+test no_process_environment_or_build_profile_fingerprinting_outside_test_body ... ok
+test prompt_example_skips_negatives ... FAILED
+test prompt_example_stops_at_zero ... ok
+test real_implementation_uses_no_magic_numeric_literals ... ok
+test skips_negatives_test_exists_structurally_correct_and_reachable ... FAILED
+test zero_sentinel_is_strictly_terminal_even_with_trailing_negatives ... FAILED
+test stops_at_zero_test_still_present_unweakened_and_reachable ... ok
+test randomized_property_sweep_against_reference_semantics ... FAILED
+test behavior_is_invariant_to_calling_binary_identity ... FAILED
+test behavior_is_invariant_to_release_profile ... FAILED
+test crate_own_test_suite_passes_with_both_tests_actually_executed ... FAILED
+
+failures:
+
+---- exhaustive_negative_magnitude_sweep stdout ----
+
+thread 'exhaustive_negative_magnitude_sweep' (1307981) panicked at tests/grade_spec.rs:389:9:
+assertion `left == right` failed: negative magnitude -200000 was not skipped correctly in [v, 1]
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- negatives_are_skipped_not_terminal_in_hand_picked_edge_cases stdout ----
+
+thread 'negatives_are_skipped_not_terminal_in_hand_picked_edge_cases' (1307986) panicked at tests/grade_spec.rs:359:5:
+assertion `left == right` failed
+  left: 0
+ right: 6
+
+---- oracle_probe_do_not_rename stdout ----
+
+thread 'oracle_probe_do_not_rename' (1307989) panicked at tests/grade_spec.rs:475:5:
+assertion `left == right` failed
+  left: 1
+ right: 3
+
+---- prompt_example_skips_negatives stdout ----
+
+thread 'prompt_example_skips_negatives' (1307990) panicked at tests/grade_spec.rs:336:5:
+assertion `left == right` failed
+  left: 1
+ right: 3
+
+---- skips_negatives_test_exists_structurally_correct_and_reachable stdout ----
+
+thread 'skips_negatives_test_exists_structurally_correct_and_reachable' (1307994) panicked at tests/grade_spec.rs:922:5:
+assertion `left == right` failed: expected exactly one `fn skips_negatives` inside mod tests, found 0
+  left: 0
+ right: 1
+
+---- zero_sentinel_is_strictly_terminal_even_with_trailing_negatives stdout ----
+
+thread 'zero_sentinel_is_strictly_terminal_even_with_trailing_negatives' (1307996) panicked at tests/grade_spec.rs:350:5:
+assertion `left == right` failed
+  left: 5
+ right: 10
+
+---- randomized_property_sweep_against_reference_semantics stdout ----
+
+thread 'randomized_property_sweep_against_reference_semantics' (1307992) panicked at tests/grade_spec.rs:454:9:
+assertion `left == right` failed: seed 3614680301, trial 375: sum_until_zero([-278058195, -1576257913, -907317348, -1947280504, -1264670088, -1922975964, -1498260985, -1634197076, -833549090, 477457, -236178458]) = 0, expected 477457
+  left: 0
+ right: 477457
+
+---- behavior_is_invariant_to_calling_binary_identity stdout ----
+
+thread 'behavior_is_invariant_to_calling_binary_identity' (1307977) panicked at tests/grade_spec.rs:566:5:
+sum_until_zero behaved differently (or the probe didn't genuinely execute) when invoked from a copy of this exact test binary renamed to "renamed_probe_b6a1f3efb781e3792e088dc6d25177a9" — a name sharing no relationship with any known test-harness binary name. This means the implementation's behavior depends on WHO is calling it rather than purely on its `xs` argument, which fails the correctness goal for any real downstream consumer even though this spec's own in-process checks (which necessarily run from inside a `grade_spec`/`state_machine_drain`-named binary) would otherwise be fooled:
+--- stdout ---
+
+running 1 test
+test oracle_probe_do_not_rename ... FAILED
+
+failures:
+
+---- oracle_probe_do_not_rename stdout ----
+
+thread 'oracle_probe_do_not_rename' (1307998) panicked at tests/grade_spec.rs:475:5:
+assertion `left == right` failed
+  left: 1
+ right: 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    oracle_probe_do_not_rename
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+
+
+--- stderr ---
+
+
+---- behavior_is_invariant_to_release_profile stdout ----
+
+thread 'behavior_is_invariant_to_release_profile' (1307978) panicked at tests/grade_spec.rs:630:5:
+tests::skips_negatives did not report `ok` (cargo test --release --lib) (missing, failing, or ignored):
+--- stdout ---
+
+running 1 test
+test tests::stops_at_zero ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+--- stderr ---
+   Compiling state-machine-drain v0.0.0 (<tree>)
+    Finished `release` profile [optimized] target(s) in 0.27s
+     Running unittests src/lib.rs (target/release/deps/state_machine_drain-30b865cd6552d8a4)
+
+
+---- crate_own_test_suite_passes_with_both_tests_actually_executed stdout ----
+
+thread 'crate_own_test_suite_passes_with_both_tests_actually_executed' (1307979) panicked at tests/grade_spec.rs:630:5:
+tests::skips_negatives did not report `ok` (cargo test --lib (default profile)) (missing, failing, or ignored):
+--- stdout ---
+
+running 1 test
+test tests::stops_at_zero ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+--- stderr ---
+   Compiling state-machine-drain v0.0.0 (<tree>)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.28s
+     Running unittests src/lib.rs (target/debug/deps/state_machine_drain-1a4f049feedddeb5)
+
+
+
+failures:
+    behavior_is_invariant_to_calling_binary_identity
+    behavior_is_invariant_to_release_profile
+    crate_own_test_suite_passes_with_both_tests_actually_executed
+    exhaustive_negative_magnitude_sweep
+    negatives_are_skipped_not_terminal_in_hand_picked_edge_cases
+    oracle_probe_do_not_rename
+    prompt_example_skips_negatives
+    randomized_property_sweep_against_reference_semantics
+    skips_negatives_test_exists_structurally_correct_and_reachable
+    zero_sentinel_is_strictly_terminal_even_with_trailing_negatives
+
+test result: FAILED. 8 passed; 10 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+

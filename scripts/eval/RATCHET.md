@@ -67,19 +67,36 @@ does NOT move the boundary (re-validating E so we can stay on cheap models).
 
 ## Grading — two layers, behavioral is the headline
 
-Per cell, after the run lands its `crew/*` branches in the throwaway:
+Per cell, after the run produces its tree (the `newt-eval run` workspace in single mode, the
+final `crew/*` branch in crew mode):
 
-1. **Behavioral (headline)** — does the feature actually work when run? For `T0–T4` (which
-   edit a small seed Cargo project) the task's **own tests** are behavioral (they exercise the
-   feature), so `cargo test` in the consolidated seed *is* the behavioral grade. For `T5`
-   (a real wire-in to newt itself) a bespoke `grade-<task>.sh` drives the built `newt` and
-   inspects real output — the `grade-548.sh` shape. `grade-run.sh` is the template:
-   find the final `crew/*` branch → build → behaviorally grade → augment with run-shape.
-2. **Structural (secondary)** — `newt-eval grade --case <T*> --workspace <final-worktree>`
-   runs the `newt-eval` evaluators (`rust_compiles`, `tests_pass`, `pattern_match`, `diff_*`)
-   on the post-run worktree. #672's core lesson: these are **necessary but not sufficient**
-   (an orphan module passes them), so behavioral pass is the headline and structural is the
-   diagnostic.
+1. **Behavioral (headline)** — one canonical grader for both modes (#2317,
+   `newt-eval/src/grade.rs`). The case's **withheld** `grade_spec.rs`, which the agent never
+   sees, runs against a COPY of the tree: `cargo test --test grade_spec` under a fixed timeout and
+   a fixed environment. Single mode gets it from `newt-eval run --json` and crew mode from
+   `newt-eval grade --json`, so the same tree gets the same verdict in either mode. The row's
+   `behavioral` column is:
+   - `PASS`: the installed spec binary ran and every test passed.
+   - `FAIL`: anything the candidate caused. That covers a compile error in its code or in the
+     spec against its API, a failing or hanging test, a #887 harness override (`build.rs`, a
+     cargo config, a declared test target; `harness_subversion=` names it), and a decoy target
+     that ran instead of the spec.
+   - `UNGRADABLE(reason)`: no spec (`no_spec`), or the spec binary ran zero tests
+     (`no_tests_ran`).
+   - `ERROR(reason)`: the checks could not run. Examples: `cargo_spawn`, `timeout` before the
+     spec binary started (`timeout=compile`), `io`, the spec's content id changing during the
+     run (`spec_changed`), the spec visible in the tree (`spec_leak`), a dead worker (`runner`),
+     a crew that never reached a model (`infra`).
+
+   UNGRADABLE and ERROR are never passes and never trials: they stay out of n. The row's details
+   record what ran: `grader=` `spec_cid=` (the spec's `RawContentId`) `tests_run=` `timeout=`.
+   For T5 (a real wire-in to newt itself) a bespoke `grade-<task>.sh` still drives the built
+   `newt` — the `grade-548.sh` shape.
+2. **Structural (secondary)** — the `newt-eval` evaluators (`rust_compiles`, `tests_pass`,
+   `pattern_match`, `diff_*`) on the same tree, reported as `tests_pass=` and
+   `all_evaluators_ok=`. #672's core lesson: these are **necessary but not sufficient** (an
+   orphan module passes them), and `tests_pass` runs the candidate's OWN tests, so it is a
+   diagnostic, never the grade.
 
 A cell's value = `behavioral-pass-rate · structural mean_score · leaves · files · tokens ·
 wall-clock`, over **n ≥ 3–5 trials** (past #672's n=1 caveat), plus the noise-free
