@@ -112,6 +112,41 @@ pub fn scratchpad_state_block(store: &dyn ScratchpadStore) -> Option<String> {
     build_state_block(store, STATE_PER_VALUE_CAP, STATE_TOTAL_CAP)
 }
 
+/// The working-memory head a turn prepends to its message[0] (#2314) — shared
+/// by the interactive and headless hosts so equal collaborators yield equal
+/// model-visible bytes. Step 27.4's usage hints come first, then the Step 26.4
+/// `<state>` block. `scratchpad` is `Some` only when the feature is on;
+/// `scheduled` says whether the plan tools are. `None` when neither adds
+/// anything, so a turn with both off is unchanged.
+pub fn working_memory_head(
+    scratchpad: Option<&dyn ScratchpadStore>,
+    scheduled: bool,
+) -> Option<String> {
+    let mut hints: Vec<&str> = Vec::new();
+    if scheduled {
+        hints.push(
+            "For multi-step, ambiguous, resumed, or context-compacted work, \
+             prefer calling update_plan first with a short 2-6 step ordered \
+             plan (each step's status pending/in_progress/completed) before \
+             more investigation. Re-send it with the finished step marked \
+             completed as you go. If plan_get says no active plan, create one \
+             with update_plan instead of polling plan_get again.",
+        );
+    }
+    if scratchpad.is_some() {
+        hints.push(
+            "Record durable facts (paths, decisions) with state_set so they \
+             survive context compaction; read them back with state_get.",
+        );
+    }
+    let hints = (!hints.is_empty()).then(|| hints.join(" "));
+    let parts: Vec<String> = [hints, scratchpad.and_then(scratchpad_state_block)]
+        .into_iter()
+        .flatten()
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
 // ---------------------------------------------------------------------------
 // Tool schemas (advertised only when the feature is on + a store is present)
 // ---------------------------------------------------------------------------
@@ -231,6 +266,32 @@ pub(crate) fn execute_state_clear(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2314: the lifted head reproduces, byte for byte, what the TUI turn head
+    /// built inline before the lift. Each literal was captured by running that
+    /// inline code on unchanged main with `turn_system = "SYSTEM"` and a store
+    /// seeded `{k: v}`; a moved byte in either host now fails here.
+    #[test]
+    fn working_memory_head_matches_the_captured_tui_turn_head() {
+        let store = SessionScratchpadStore::default();
+        store.set("k", "v".to_string());
+        let turn = |on: bool, scheduled: bool| {
+            let head = working_memory_head(on.then_some(&store as &dyn ScratchpadStore), scheduled);
+            head.map_or("SYSTEM".to_string(), |h| format!("{h}\n\nSYSTEM"))
+        };
+        let scratch = "Record durable facts (paths, decisions) with state_set so they survive context compaction; read them back with state_get.";
+        let sched = "For multi-step, ambiguous, resumed, or context-compacted work, prefer calling update_plan first with a short 2-6 step ordered plan (each step's status pending/in_progress/completed) before more investigation. Re-send it with the finished step marked completed as you go. If plan_get says no active plan, create one with update_plan instead of polling plan_get again.";
+        assert_eq!(
+            turn(true, false),
+            format!("{scratch}\n\n<state>\nk: v\n</state>\n\nSYSTEM")
+        );
+        assert_eq!(
+            turn(true, true),
+            format!("{sched} {scratch}\n\n<state>\nk: v\n</state>\n\nSYSTEM")
+        );
+        assert_eq!(turn(false, true), format!("{sched}\n\nSYSTEM"));
+        assert_eq!(turn(false, false), "SYSTEM");
+    }
 
     #[test]
     fn store_set_get_overwrite_clear_and_stats() {

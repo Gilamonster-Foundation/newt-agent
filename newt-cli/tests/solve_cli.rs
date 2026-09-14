@@ -503,8 +503,8 @@ bounded_reasoning_continuation = true
         assert_eq!(contract["effective_config"]["tenacity"], tenacity);
 
         // #2314: the feature receipt agrees with the wire body above in BOTH
-        // arms. Headless solve supplies no scratchpad or retrieval, so those
-        // are absent from the wire and must never be reported active.
+        // arms. These runs supply no scratchpad seed and solve builds no
+        // retrieval index, so both stay off the wire and are never reported active.
         let features = &contract["receipt"]["features"];
         let crew_state = if crew { "instantiated" } else { "unavailable" };
         assert_eq!(features["crew"]["state"], crew_state, "{name}: {contract}");
@@ -514,8 +514,77 @@ bounded_reasoning_continuation = true
         // only a rendered block (scratchpad.rs) closes it.
         assert!(!body.to_string().contains("</state>"));
         assert_eq!(features["code_search"]["state"], "unsupported");
-        assert_eq!(features["scratchpad"]["state"], "unsupported");
+        assert_eq!(features["scratchpad"]["state"], "unavailable");
     }
+}
+
+/// #2314: `--scratchpad-state` is the headless opt-in. The seeded state must
+/// reach the model as the literal `<state>` block with the state tools
+/// advertised, and the receipt must name the fresh scope and the seed it was
+/// built from — a seed of `{}` would inject no block, so it is never used here.
+#[tokio::test(flavor = "multi_thread")]
+async fn solve_scratchpad_state_reaches_wire_and_receipt() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(CaptureThenFinish {
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let instruction_path = fixture.path().join("instruction.md");
+    let seed_path = fixture.path().join("seed.json");
+    let events_path = fixture.path().join("events.jsonl");
+    std::fs::write(&instruction_path, "Finish without calling a tool.\n")
+        .expect("write solve instruction");
+    std::fs::write(&seed_path, r#"{"k": "v"}"#).expect("write scratchpad seed");
+
+    Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .args(["--backend-endpoint", &server.uri()])
+        .args(["--backend-model", NEMOTRON_MODEL])
+        .args(["--backend-kind", "openai"])
+        .args(["solve", "--cwd"])
+        .arg(fixture.path())
+        .arg("--instruction-file")
+        .arg(&instruction_path)
+        .arg("--scratchpad-state")
+        .arg(&seed_path)
+        .arg("--events")
+        .arg(&events_path)
+        .args(["--max-rounds", "1"])
+        .assert()
+        .success();
+
+    let body = requests
+        .lock()
+        .expect("request capture lock")
+        .pop()
+        .expect("one captured request");
+    for tool in ["state_set", "state_get", "state_clear"] {
+        assert!(advertised_tool(&body, tool), "{tool} advertised: {body}");
+    }
+    assert_eq!(body["messages"][0]["role"], "system", "{body}");
+    assert!(
+        body["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("<state>\nk: v\n</state>")),
+        "the seeded state rides message[0]: {body}"
+    );
+
+    let scratchpad = &contract_from(&events_path)["receipt"]["features"]["scratchpad"];
+    assert_eq!(scratchpad["state"], "instantiated", "{scratchpad}");
+    assert_eq!(scratchpad["scope"], "fresh");
+    assert!(
+        scratchpad["seed"]
+            .as_str()
+            .is_some_and(|s| s.starts_with('b')),
+        "the seed is a content id: {scratchpad}"
+    );
 }
 
 /// An explicit config file selects the configuration source, but it must not
