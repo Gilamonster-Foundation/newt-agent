@@ -16,6 +16,8 @@ Four jobs, one durable record:
                                     manifest (scripts/eval/bench-results.jsonl).
   gate    --model M --ocap L --score S   fail (exit 3) if S is below the model's
                                     champion ON THAT LANE — the ratchet.
+          ingest and ``gate --run-dir`` exit 2 on incomplete reward coverage
+          (see ``coverage_gap``) unless ``--allow-incomplete`` is passed.
   parity  --model M [--tolerance T]   fail (exit 3) if OCAP-on trails OCAP-off by
                                     more than T; exit 2 while a lane is unmeasured.
   render  --readme README.md        rewrite the scoreboard (each model's off/on
@@ -407,11 +409,36 @@ def inject(readme_text: str, table: str) -> str:
     return f"{before}\n{table}\n{after}"
 
 
+def coverage_gap(agg: dict) -> str | None:
+    """Why a parsed run's reward coverage is incomplete, or None when every
+    declared trial is graded and no trial dir falls outside the roster."""
+    expected, observed, graded = agg["expected"], agg["observed"], agg["graded"]
+    if graded == 0:
+        return "no graded trials"
+    if expected is None:
+        return "expected trial count unknown (no literal roster in config.json)"
+    if observed > expected:
+        return f"roster mismatch: {observed} trial dirs, {graded} graded, {expected} declared"
+    if graded < expected:
+        return f"graded {graded} of {expected} expected"
+    return None
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
+def _refuse_coverage(a: argparse.Namespace, agg: dict) -> bool:
+    """Report and return True when the run's coverage gap blocks ``a``'s command.
+    ``--allow-incomplete`` waives a gap, but never a run with no graded trial."""
+    gap = coverage_gap(agg)
+    if gap is None or (a.allow_incomplete and agg["graded"]):
+        return False
+    hint = "; pass --allow-incomplete to use it anyway" if agg["graded"] else ""
+    print(f"error: {a.run_dir}: {gap}{hint}", file=sys.stderr)
+    return True
+
+
 def _cmd_ingest(a: argparse.Namespace) -> int:
     agg = parse_run(a.run_dir, a.suite)
-    if agg["total"] == 0:
-        print(f"error: no task results found under {a.run_dir}", file=sys.stderr)
+    if _refuse_coverage(a, agg):
         return 2
     rec = {
         "date": a.date,
@@ -426,6 +453,8 @@ def _cmd_ingest(a: argparse.Namespace) -> int:
         "mean_reward": agg["mean_reward"],
         "passed_tasks": agg["passed_tasks"],
         **{k: agg[k] for k in COVERAGE_FIELDS},
+        # An accepted --allow-incomplete stays visible downstream.
+        "coverage_override": coverage_gap(agg) is not None,
     }
     append_manifest(a.manifest, rec)
     print(
@@ -440,6 +469,8 @@ def _cmd_gate(a: argparse.Namespace) -> int:
     score = a.score
     if score is None:
         agg = parse_run(a.run_dir)
+        if _refuse_coverage(a, agg):
+            return 2
         score = agg["mean_reward"]
     ok, champ = gate(records, a.model, score, a.ocap)
     verb = "OK" if ok else "REGRESSION"
@@ -525,6 +556,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     pg.add_argument("--manifest", default=MANIFEST_DEFAULT)
     pg.set_defaults(fn=_cmd_gate, score=None, run_dir=None)
+    for sp in (pi, pg):
+        sp.add_argument(
+            "--allow-incomplete",
+            action="store_true",
+            help="accept a run whose reward coverage is incomplete (recorded as "
+            "coverage_override); a run with no graded trial is always refused",
+        )
 
     pp = sub.add_parser(
         "parity",
@@ -705,10 +743,39 @@ def _self_test_ingestion() -> None:
     """#2316: every Harbor trial survives parsing, and coverage stays visible.
 
     The fixture needs a duplicate task prefix with DIFFERENT rewards: without
-    one, the old prefix-keyed dict is green here too (the vacuous-green trap)."""
+    one, the old prefix-keyed dict is green here too (the vacuous-green trap).
+
+    More trial dirs than the roster declares is a roster mismatch even when
+    graded == expected: Harbor 0.20 never leaves an extra dir of its own. A retry
+    reuses the trial name and dir (job.py:459-469, via _on_trial_started; the
+    failed dir is removed in trial/queue.py:200-221), and a resume deletes every
+    trial dir without result.json (job.py:221-229). An extra dir means a mixed or
+    hand-edited run dir."""
+    import contextlib
+    import io
     import re
     import subprocess
     import tempfile
+
+    def cli(*argv: str) -> tuple[object, str]:
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            try:
+                rc: object = main(list(argv))
+            except SystemExit as e:
+                rc = e.code
+        return rc, err.getvalue()
+
+    def ingest(run_dir: str, *extra: str) -> tuple[object, str]:
+        man = os.path.join(run_dir, "manifest.jsonl")
+        meta = ("--model", "m", "--family", "f", "--version", "0", "--date", "d")
+        return cli("ingest", run_dir, *meta, "--manifest", man, *extra)
+
+    def gate_run(run_dir: str, *extra: str) -> tuple[object, str]:
+        man = os.path.join(run_dir, "manifest.jsonl")
+        return cli(
+            "gate", "--model", "m", "--run-dir", run_dir, "--manifest", man, *extra
+        )
 
     def trial(root: str, name: str, reward: str | None = None, **result) -> None:
         os.makedirs(os.path.join(root, name, "verifier"))
@@ -793,12 +860,34 @@ def _self_test_ingestion() -> None:
         line = "Harbor resolved 2/6; newt claimed completed 1; FALSE COMPLETIONS 1"
         assert line in run.stdout, run.stdout
         assert re.search(r"harbor=unknown", run.stdout), run.stdout
+        # A8: graded 3 of 8 expected is refused by ingest and gate, and the
+        # refusal writes nothing; only the explicit override lets it through.
+        rc, err = ingest(b)
+        assert (rc, "graded 3 of 8 expected" in err) == (2, True), (rc, err)
+        assert not os.path.exists(os.path.join(b, "manifest.jsonl")), "refusal wrote"
+        rc, err = gate_run(b)
+        assert (rc, "graded 3 of 8 expected" in err) == (2, True), (rc, err)
+        assert ingest(b, "--allow-incomplete")[0] == 0
+        # The override is written down: an incomplete run never reads complete.
+        rec = load_manifest(os.path.join(b, "manifest.jsonl"))[0]
+        trace = [rec.get(k) for k in ("coverage_override", "expected", "graded")]
+        assert (trace, rec["missing"]) == ([True, 8, 3], 5), rec
+        assert gate_run(b, "--allow-incomplete")[0] == 0
 
     with tempfile.TemporaryDirectory() as c:
         # A4: no config.json -> expected coverage is unknown, not `observed`.
         agg = job(c, "0", "1", roster=False)
         unknown = (agg["expected"], agg["missing"], agg["observed"])
         assert unknown == (None, None, 6), agg
+        # A8: an unknown expectation is refused too, never read as complete.
+        rc, err = ingest(c)
+        assert (rc, "unknown" in err) == (2, True), (rc, err)
+        rc, err = gate_run(c)
+        assert (rc, "unknown" in err) == (2, True), (rc, err)
+        assert ingest(c, "--allow-incomplete")[0] == 0
+        rec = load_manifest(os.path.join(c, "manifest.jsonl"))[0]
+        trace = [rec.get(k) for k in ("coverage_override", "expected", "graded")]
+        assert trace == [True, None, 3], rec
 
     with tempfile.TemporaryDirectory() as d:
         # A11: a complete single-attempt run keeps the historical record values.
@@ -811,6 +900,55 @@ def _self_test_ingestion() -> None:
         old = {"total": 2, "passed": 1, "mean_reward": 0.5, "passed_tasks": ["p"]}
         assert {k: agg[k] for k in old} == old, agg
         assert (agg["expected"], agg["graded"], agg["missing"]) == (2, 2, 0), agg
+        # A8 twin: a complete run needs no override, and says it took none.
+        assert ingest(d) == (0, ""), ingest(d)
+        rec = load_manifest(os.path.join(d, "manifest.jsonl"))[0]
+        trace = [rec.get(k) for k in ("coverage_override", "expected", "graded")]
+        assert trace == [False, 2, 2], rec
+
+    with tempfile.TemporaryDirectory() as e:
+        # A8: zero graded trials is never a score, override or not — every
+        # trial errored (the 30/30 infra-zero run) must not become a champion.
+        open(os.path.join(e, "config.json"), "w").write(
+            json.dumps({"datasets": [{"task_names": ["p"]}]})
+        )
+        trial(e, "p__1", "0", exception_info={"exception_type": "ApiRateLimitError"})
+        for run in (ingest(e, "--allow-incomplete"), gate_run(e, "--allow-incomplete")):
+            assert (run[0], "no graded trials" in run[1]) == (2, True), run
+
+    with tempfile.TemporaryDirectory() as f:
+        # A8: more graded than the roster declares (a resume, a roster edit)
+        # makes missing negative. That is a roster mismatch, never "complete".
+        open(os.path.join(f, "config.json"), "w").write(
+            json.dumps({"datasets": [{"task_names": ["p"]}]})
+        )
+        trial(f, "p__1", "1", ok=1)
+        trial(f, "p__2", "0", ok=1)
+        assert parse_run(f)["missing"] == -1
+        for rc, err in (ingest(f), gate_run(f)):
+            assert (rc, "roster mismatch" in err) == (2, True), (rc, err)
+        assert ingest(f, "--allow-incomplete")[0] == 0
+        rec = load_manifest(os.path.join(f, "manifest.jsonl"))[0]
+        trace = [rec.get(k) for k in ("coverage_override", "expected", "graded")]
+        assert trace == [True, 1, 2], rec
+
+    with tempfile.TemporaryDirectory() as g:
+        # A8: an extra trial dir (observed 2 > expected 1) is a roster mismatch
+        # even though graded == expected leaves missing at 0.
+        open(os.path.join(g, "config.json"), "w").write(
+            json.dumps({"datasets": [{"task_names": ["p"]}]})
+        )
+        trial(g, "p__1", "1", ok=1)
+        os.makedirs(os.path.join(g, "p__2"))  # leftover, no result.json
+        agg = parse_run(g)
+        counts = [agg[k] for k in ("expected", "observed", "graded", "missing")]
+        assert counts == [1, 2, 1, 0], counts
+        for rc, err in (ingest(g), gate_run(g)):
+            assert (rc, "roster mismatch" in err) == (2, True), (rc, err)
+        assert ingest(g, "--allow-incomplete")[0] == 0
+        rec = load_manifest(os.path.join(g, "manifest.jsonl"))[0]
+        trace = [rec.get(k) for k in ("coverage_override", "expected", "graded")]
+        assert trace == [True, 1, 1], rec
 
 
 if __name__ == "__main__":
