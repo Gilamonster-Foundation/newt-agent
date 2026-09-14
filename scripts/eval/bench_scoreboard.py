@@ -14,10 +14,13 @@ Four jobs, one durable record:
   ingest  <run-dir> --model M --ocap off|on   parse a Harbor run's per-task
                                     rewards and APPEND one record to the results
                                     manifest (scripts/eval/bench-results.jsonl).
-  gate    --model M --ocap L --score S   fail (exit 3) if S is below the model's
-                                    champion ON THAT LANE — the ratchet.
+  gate    --model M --ocap L --run-dir R   fail (exit 3) if R's score is below the
+                                    model's champion ON THAT LANE — the ratchet.
           ingest and ``gate --run-dir`` exit 2 on incomplete reward coverage
-          (see ``coverage_gap``) unless ``--allow-incomplete`` is passed.
+          (see ``coverage_gap``) unless ``--allow-incomplete`` is passed. A
+          hand-typed ``--score S`` is refused without ``--unverified-score``.
+          ingest also appends every declared attempt, content-addressed, to the
+          trial store beside the manifest (``x.jsonl`` -> ``x.trials.jsonl``).
   parity  --model M [--tolerance T]   fail (exit 3) if OCAP-on trails OCAP-off by
                                     more than T; exit 2 while a lane is unmeasured.
   render  --readme README.md        rewrite the scoreboard (each model's off/on
@@ -44,6 +47,12 @@ import math
 import os
 import sys
 
+# The repo's stdlib canonical DAG-CBOR + BLAKE3 + CID, pinned against the
+# content-addressable crate by newt-interaction/tests/vectors.rs.
+HERE = os.path.dirname(__file__)
+sys.path.insert(0, os.path.join(HERE, "..", "..", "newt-interaction", "conformance"))
+from newt_conformance import content_id, encode  # noqa: E402
+
 MANIFEST_DEFAULT = os.path.join(os.path.dirname(__file__), "bench-results.jsonl")
 ROSTER_DEFAULT = os.path.join(os.path.dirname(__file__), "bench-roster.json")
 START_MARKER = "<!-- BENCH-SCOREBOARD:START -->"
@@ -51,13 +60,14 @@ END_MARKER = "<!-- BENCH-SCOREBOARD:END -->"
 
 
 # ── run parsing ─────────────────────────────────────────────────────────────
-# A suite's verdict contract, as data: reward -> verdict. Terminal-Bench's
-# verifier writes 1 when every test passes and 0 otherwise, so any other reward
-# (partial credit, no reward, a suite with no contract here) is "unknown" —
-# never a pass. The raw reward stays on the trial record either way.
-VERDICT_CONTRACTS = {
-    suite: {1.0: "resolved", 0.0: "failed"} for suite in ("tb-30", "terminal-bench")
-}
+# A verdict contract per Harbor dataset (the trials' ``source``), as data: reward
+# -> verdict. Terminal-Bench's verifier writes 1 when every test passes and 0
+# otherwise, so any other reward (partial credit, no reward, a dataset with no
+# contract here) is "unknown" — never a pass. The raw reward stays on the record.
+VERDICT_CONTRACTS = {"terminal-bench": {1.0: "resolved", 0.0: "failed"}}
+# Which Harbor dataset each ``--suite`` label is a subset of. A label is not a
+# contract key: tb-30 and a larger tb-N would both be terminal-bench.
+SUITE_SOURCES = {"tb-30": "terminal-bench"}
 # How attempts weigh into ``mean_reward``: every attempt that carries a finite
 # reward counts once — including a verifier-graded errored trial, since dropping
 # a timeout from the denominator would reward timing out. One attempt per task
@@ -74,9 +84,9 @@ COVERAGE_FIELDS = (
 )
 
 
-def verdict(reward: float | None, suite: str) -> str:
-    """``resolved`` / ``failed`` / ``unknown`` for one reward under ``suite``."""
-    return VERDICT_CONTRACTS.get(suite, {}).get(reward, "unknown")
+def verdict(reward: float | None, source: str | None) -> str:
+    """``resolved`` / ``failed`` / ``unknown`` for one reward from ``source``."""
+    return VERDICT_CONTRACTS.get(source, {}).get(reward, "unknown")
 
 
 def load_job(run_dir: str) -> dict:
@@ -91,13 +101,27 @@ def load_job(run_dir: str) -> dict:
     return job
 
 
-def expected_trials(config: dict | None) -> int | None:
-    """Trials the job declared: roster tasks x ``n_attempts`` x agents. None when
-    the roster is not a literal list (globs, exclusions, ``n_tasks``, no config):
-    an unknown expectation must not be reported as the observed count."""
+def job_id(job: dict) -> str | None:
+    """Harbor's own identifier for a job: result.json ``id``, else config
+    ``job_name``. Never the directory path, which is only where it sits."""
+    for name, key in (("result", "id"), ("config", "job_name")):
+        doc = job[name]
+        if isinstance(doc, dict) and doc.get(key):
+            return str(doc[key])
+    return None
+
+
+def declared_attempts(config: dict | None) -> list[tuple[str, int]] | None:
+    """Every trial the job declared, as ``(task, attempt)``: each roster task x
+    ``n_attempts`` x agents, attempts numbered from 1. None when the roster is not
+    a literal list (globs, exclusions, ``n_tasks``, no config): an unknown
+    expectation must not be reported as the observed count."""
     if not config:
         return None
-    names = list(config.get("tasks") or [])
+    names = [
+        t.get("name") or os.path.basename(str(t.get("path") or "").rstrip("/"))
+        for t in config.get("tasks") or []
+    ]
     for ds in config.get("datasets") or []:
         literal = ds.get("task_names") and not any(
             set("*?[") & set(n) for n in ds["task_names"]
@@ -105,8 +129,11 @@ def expected_trials(config: dict | None) -> int | None:
         if not literal or ds.get("exclude_task_names") or ds.get("n_tasks") is not None:
             return None
         names += ds["task_names"]
-    agents = max(1, len(config.get("agents") or []))
-    return len(names) * (config.get("n_attempts") or 1) * agents if names else None
+    if not names or not all(names):
+        return None
+    per_task = (config.get("n_attempts") or 1) * max(1, len(config.get("agents") or []))
+    counts = collections.Counter(names)
+    return [(n, k) for n in sorted(counts) for k in range(1, counts[n] * per_task + 1)]
 
 
 def trial_record(trial_dir: str) -> dict:
@@ -171,21 +198,44 @@ def parse_run(run_dir: str, suite: str = "tb-30") -> dict:
     ``passed_tasks`` (attempts the suite verdict marks resolved) and
     ``mean_reward`` under ``policy``. Coverage: ``expected`` (None when the roster
     is unknown), ``observed``, ``graded``, ``missing`` (expected minus graded) and
-    ``errors_by_class`` (error-state trials counted by ``exception``).
-    ``trials`` holds every per-trial record."""
+    ``errors_by_class`` (error-state trials counted by ``exception``). Verdicts
+    use ``source``: the one Harbor dataset the trials report, else the one
+    ``suite`` names (None when the trials report several).
+
+    ``trials`` holds a record for every declared attempt, each carrying the
+    Harbor ``job`` id: one per trial dir, plus an ``ungraded`` record with an
+    ``attempt`` number and exception ``no trial dir`` for each declared attempt
+    that has no dir. ``observed`` counts trial dirs only."""
     trials = [
         trial_record(d)
         for d in sorted(glob.glob(os.path.join(run_dir, "*__*")))
         if os.path.isdir(d)
     ]
+    sources = sorted({t["source"] for t in trials if t["source"]})
+    source = sources[0] if len(sources) == 1 else SUITE_SOURCES.get(suite)
+    source = None if len(sources) > 1 else source
     scored = [t for t in trials if t["reward"] is not None]
     passed = sorted(
-        t["task"] for t in scored if verdict(t["reward"], suite) == "resolved"
+        t["task"] for t in scored if verdict(t["reward"], source) == "resolved"
     )
     total = len(scored)
     mean = math.fsum(t["reward"] for t in scored) / total if total else 0.0
-    expected = expected_trials(load_job(run_dir)["config"])
+    job = load_job(run_dir)
+    declared = declared_attempts(job["config"])
+    expected = None if declared is None else len(declared)
     graded = sum(t["state"] == "graded" for t in trials)
+    # Harbor names a trial dir after task_name[:32], so match either spelling.
+    absent = [
+        {
+            **dict.fromkeys(("trial", "source", "reward", "raw")),
+            "task": task,
+            "attempt": k,
+            "state": "ungraded",
+            "exception": "no trial dir",
+        }
+        for task, k in declared or []
+        if k > sum(t["task"] in (task, task[:32]) for t in trials)
+    ]
     return {
         "total": total,
         "passed": len(passed),
@@ -199,7 +249,8 @@ def parse_run(run_dir: str, suite: str = "tb-30") -> dict:
             collections.Counter(t["exception"] for t in trials if t["state"] == "error")
         ),
         "missing": None if expected is None else expected - graded,
-        "trials": trials,
+        "source": source,
+        "trials": [{**t, "job": job_id(job)} for t in trials + absent],
     }
 
 
@@ -213,6 +264,33 @@ def load_manifest(path: str) -> list[dict]:
         if line:
             out.append(json.loads(line))
     return out
+
+
+def trial_cid(record: dict) -> str:
+    """A trial record's ContentId: CIDv1 / dag-cbor / BLAKE3 over its content."""
+    return content_id(encode(record))
+
+
+def trials_path(manifest: str) -> str:
+    """The trial store beside a manifest: ``x.jsonl`` -> ``x.trials.jsonl``."""
+    return os.path.splitext(manifest)[0] + ".trials.jsonl"
+
+
+def load_trials(path: str) -> dict[str, dict]:
+    """The trial store as ``{cid: record}``, append-only JSONL of ``{cid, record}``.
+    Every line's CID is re-derived on read; a mismatch raises ValueError, so an
+    edited record is refused rather than trusted."""
+    store: dict[str, dict] = {}
+    if not os.path.exists(path):
+        return store
+    for n, line in enumerate(open(path), 1):
+        if line.strip():
+            entry = json.loads(line)
+            if trial_cid(entry["record"]) != entry["cid"]:
+                cid = entry["cid"]
+                raise ValueError(f"line {n}: record does not match its cid {cid}")
+            store[entry["cid"]] = entry["record"]
+    return store
 
 
 def append_manifest(path: str, record: dict) -> None:
@@ -409,6 +487,19 @@ def inject(readme_text: str, table: str) -> str:
     return f"{before}\n{table}\n{after}"
 
 
+def suite_gap(agg: dict, suite: str) -> str | None:
+    """Why ``suite`` cannot label this run, or None: the label must be known, and
+    name the one Harbor dataset the trials report (when they report one)."""
+    sources = sorted({t["source"] for t in agg["trials"] if t["source"]})
+    if suite not in SUITE_SOURCES:
+        return f"unknown suite {suite!r} (known: {', '.join(sorted(SUITE_SOURCES))})"
+    if len(sources) > 1:
+        return f"mixed trial sources {sources}"
+    if sources and sources[0] != SUITE_SOURCES[suite]:
+        return f"suite mismatch: {suite} is {SUITE_SOURCES[suite]}, trials report {sources[0]}"
+    return None
+
+
 def coverage_gap(agg: dict) -> str | None:
     """Why a parsed run's reward coverage is incomplete, or None when every
     declared trial is graded and no trial dir falls outside the roster."""
@@ -438,8 +529,25 @@ def _refuse_coverage(a: argparse.Namespace, agg: dict) -> bool:
 
 def _cmd_ingest(a: argparse.Namespace) -> int:
     agg = parse_run(a.run_dir, a.suite)
+    gap = suite_gap(agg, a.suite)
+    if gap:
+        print(f"error: {a.run_dir}: {gap}", file=sys.stderr)
+        return 2
     if _refuse_coverage(a, agg):
         return 2
+    store = trials_path(a.manifest)
+    try:
+        stored = load_trials(store)
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"error: trial store {store}: {e}", file=sys.stderr)
+        return 2
+    cids = [trial_cid(t) for t in agg["trials"]]
+    # Trials first: a crash leaves an unreferenced trial, never a dangling link.
+    with open(store, "a") as f:
+        for cid, t in zip(cids, agg["trials"]):
+            if cid not in stored:
+                f.write(json.dumps({"cid": cid, "record": t}, sort_keys=True) + "\n")
+                stored[cid] = t
     rec = {
         "date": a.date,
         "version": a.version,
@@ -455,6 +563,8 @@ def _cmd_ingest(a: argparse.Namespace) -> int:
         **{k: agg[k] for k in COVERAGE_FIELDS},
         # An accepted --allow-incomplete stays visible downstream.
         "coverage_override": coverage_gap(agg) is not None,
+        "source": agg["source"],
+        "trials": cids,
     }
     append_manifest(a.manifest, rec)
     print(
@@ -472,10 +582,19 @@ def _cmd_gate(a: argparse.Namespace) -> int:
         if _refuse_coverage(a, agg):
             return 2
         score = agg["mean_reward"]
+    elif not a.unverified_score:
+        print(
+            "error: --score is a hand-typed number with no coverage evidence; gate "
+            "the run dir (--run-dir), or pass --unverified-score",
+            file=sys.stderr,
+        )
+        return 2
     ok, champ = gate(records, a.model, score, a.ocap)
     verb = "OK" if ok else "REGRESSION"
+    label = "" if a.run_dir else " (UNVERIFIED score)"
     print(
-        f"[{verb}] {a.model} [ocap={a.ocap}]: new {_pct(score)} vs champion {_pct(champ)}",
+        f"[{verb}] {a.model} [ocap={a.ocap}]: new {_pct(score)}{label} vs champion "
+        f"{_pct(champ)}",
         file=sys.stderr if not ok else sys.stdout,
     )
     return 0 if ok else 3
@@ -555,6 +674,12 @@ def main(argv: list[str] | None = None) -> int:
         "--run-dir", dest="run_dir", help="parse the new score from a run dir"
     )
     pg.add_argument("--manifest", default=MANIFEST_DEFAULT)
+    pg.add_argument(
+        "--unverified-score",
+        action="store_true",
+        help="gate on a hand-typed --score with no run-dir coverage evidence; the "
+        "verdict is labelled UNVERIFIED",
+    )
     pg.set_defaults(fn=_cmd_gate, score=None, run_dir=None)
     for sp in (pi, pg):
         sp.add_argument(
@@ -805,6 +930,10 @@ def _self_test_ingestion() -> None:
             open(os.path.join(root, "config.json"), "w").write(
                 json.dumps({**cfg, "n_attempts": 2, "agents": [{}]})
             )
+            # Harbor's own job id, the identity every trial record carries.
+            open(os.path.join(root, "result.json"), "w").write(
+                json.dumps({"id": f"job-{first}{second}"})
+            )
         trial(root, "taskx__aaa", first, ok=1)
         trial(root, "taskx__bbb", second, ok=1)
         trial(root, "tasky__ccc", "0.5", ok=1)  # partial credit
@@ -846,13 +975,16 @@ def _self_test_ingestion() -> None:
         assert (agg["passed"], agg["passed_tasks"]) == (2, ["taskw", "taskx"]), agg
         # A9: partial credit on a binary suite is unknown, never resolved.
         assert by["tasky__ccc"]["reward"] == 0.5
-        assert [verdict(r, "tb-30") for r in (1.0, 0.0, 0.5, None)] == [
+        assert [verdict(r, "terminal-bench") for r in (1.0, 0.0, 0.5, None)] == [
             "resolved",
             "failed",
             "unknown",
             "unknown",
         ]
         assert verdict(1.0, "no-such-suite") == "unknown"
+        # A suite LABEL is not a verdict contract: contracts are keyed by the
+        # Harbor dataset the trials report (`source`), never by `--suite`.
+        assert verdict(1.0, "tb-30") == "unknown"
         for raw in ("inf", "-inf", "abc"):
             trial(a, f"taskv__{raw}", raw, ok=1)
             t = trial_record(os.path.join(a, f"taskv__{raw}"))
@@ -884,6 +1016,25 @@ def _self_test_ingestion() -> None:
         trace = [rec.get(k) for k in ("coverage_override", "expected", "graded")]
         assert (trace, rec["missing"]) == ([True, 8, 3], 5), rec
         assert gate_run(b, "--allow-incomplete")[0] == 0
+        # Every declared attempt is persisted beside the manifest, content-
+        # addressed: the 6 trial dirs plus the 2 attempts that have no dir.
+        store_path = os.path.join(b, "manifest.trials.jsonl")
+        store = load_trials(store_path)
+        assert len(rec["trials"]) == len(set(rec["trials"])) == 8, rec
+        assert sorted(store) == sorted(rec["trials"]), sorted(store)
+        absent = [t for t in store.values() if t["exception"] == "no trial dir"]
+        slots = sorted((t["task"], t["attempt"], t["state"]) for t in absent)
+        assert slots == [("tasky", 2, "ungraded"), ("taskz", 2, "ungraded")], absent
+        assert {t["job"] for t in store.values()} == {"job-10"}, store
+        # The same missing slot in another run is another fact: distinct CIDs.
+        def absent_cids(g: dict) -> set:
+            absent = [t for t in g["trials"] if t["exception"] == "no trial dir"]
+            return {trial_cid(t) for t in absent}
+        assert len(absent_cids(agg) | absent_cids(swapped)) == 4
+        assert absent_cids(parse_run(b)) == absent_cids(swapped), "not deterministic"
+        # Re-ingesting the same run stores nothing twice.
+        assert ingest(b, "--allow-incomplete")[0] == 0
+        assert sum(1 for _ in open(store_path)) == 8
 
     with tempfile.TemporaryDirectory() as c:
         # A4: no config.json -> expected coverage is unknown, not `observed`.
@@ -916,6 +1067,25 @@ def _self_test_ingestion() -> None:
         rec = load_manifest(os.path.join(d, "manifest.jsonl"))[0]
         trace = [rec.get(k) for k in ("coverage_override", "expected", "graded")]
         assert trace == [False, 2, 2], rec
+        assert rec["source"] == "terminal-bench", rec
+        # A bare --score carries no coverage evidence and is refused; the explicit
+        # --unverified-score gates on it and labels the verdict.
+        man = os.path.join(d, "manifest.jsonl")
+        score = ("gate", "--model", "m", "--manifest", man, "--score")
+        rc, err = cli(*score, "0.9")
+        assert (rc, "--unverified-score" in err) == (2, True), (rc, err)
+        assert cli(*score, "0.9", "--unverified-score")[0] == 0
+        rc, err = cli(*score, "0.1", "--unverified-score")
+        assert (rc, "UNVERIFIED" in err) == (3, True), (rc, err)
+        # Tamper twin: edit one stored trial and ingest refuses the store.
+        store_path = os.path.join(d, "manifest.trials.jsonl")
+        lines = open(store_path).read().splitlines()
+        entry = json.loads(lines[0])
+        entry["record"]["reward"] = 0.75
+        open(store_path, "w").write("\n".join([json.dumps(entry), *lines[1:]]) + "\n")
+        rc, err = ingest(d)
+        assert (rc, "does not match its cid" in err) == (2, True), (rc, err)
+        assert len(load_manifest(man)) == 1, "a refused ingest wrote"
 
     with tempfile.TemporaryDirectory() as e:
         # A8: zero graded trials is never a score, override or not — every
@@ -960,6 +1130,32 @@ def _self_test_ingestion() -> None:
         rec = load_manifest(os.path.join(g, "manifest.jsonl"))[0]
         trace = [rec.get(k) for k in ("coverage_override", "expected", "graded")]
         assert trace == [True, 1, 1], rec
+
+    with tempfile.TemporaryDirectory() as h:
+        # The trials' Harbor source picks the verdict contract. A --suite label
+        # naming another dataset, an unknown label, or mixed sources is refused.
+        open(os.path.join(h, "config.json"), "w").write(
+            json.dumps({"datasets": [{"task_names": ["p"]}]})
+        )
+        trial(h, "p__1", "1", ok=1, source="swe-bench")
+        rc, err = ingest(h)
+        assert (rc, "suite mismatch" in err) == (2, True), (rc, err)
+        rc, err = ingest(h, "--suite", "tb-99")
+        assert (rc, "unknown suite" in err) == (2, True), (rc, err)
+        trial(h, "p__2", "0", ok=1)  # terminal-bench beside swe-bench
+        rc, err = ingest(h, "--allow-incomplete")
+        assert (rc, "mixed trial sources" in err) == (2, True), (rc, err)
+        assert not os.path.exists(os.path.join(h, "manifest.jsonl")), "refusal wrote"
+
+    with tempfile.TemporaryDirectory() as i:
+        # Two absent attempts of ONE task are two facts. Without the attempt
+        # number they would share a CID and collapse into one stored record.
+        open(os.path.join(i, "config.json"), "w").write(
+            json.dumps({"datasets": [{"task_names": ["p", "r"]}], "n_attempts": 2})
+        )
+        trial(i, "p__1", "1", ok=1)
+        r_cids = [trial_cid(t) for t in parse_run(i)["trials"] if t["task"] == "r"]
+        assert len(set(r_cids)) == len(r_cids) == 2, r_cids
 
 
 if __name__ == "__main__":
