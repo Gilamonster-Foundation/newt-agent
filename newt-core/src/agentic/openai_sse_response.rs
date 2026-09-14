@@ -14,6 +14,7 @@ pub(super) struct StrictResponse {
     finish_reason: Option<String>,
     calls: BTreeMap<u64, ToolFragments>,
     saw_choice: bool,
+    frames: usize,
     problem: Option<anyhow::Error>,
     pub(super) provider_error: Option<anyhow::Error>,
 }
@@ -29,6 +30,7 @@ impl StrictResponse {
     }
 
     pub(super) fn observe(&mut self, frame: &Value) {
+        self.frames += 1;
         if self.event.as_deref() == Some("error") || is_error(frame) {
             self.provider_error
                 .get_or_insert_with(|| provider_error(frame));
@@ -38,8 +40,23 @@ impl StrictResponse {
     }
 
     fn observe_chunk(&mut self, frame: &Value) -> anyhow::Result<()> {
-        stable_string(&mut self.id, &frame["id"], "response ID")?;
-        stable_string(&mut self.model, &frame["model"], "response model")?;
+        for (target, key, field) in [
+            (&mut self.id, "id", "response ID"),
+            (&mut self.model, "model", "response model"),
+        ] {
+            if let (Some(old), Some(new)) = (target.as_deref(), frame[key].as_str()) {
+                if !new.is_empty() && old != new {
+                    return Err(IdentityChanged {
+                        field,
+                        frame: self.frames,
+                        old_len: old.len(),
+                        new_len: new.len(),
+                    }
+                    .into());
+                }
+            }
+            stable_string(target, &frame[key], field)?;
+        }
         if !frame["usage"].is_null() {
             anyhow::ensure!(frame["usage"].is_object(), "invalid stream usage object");
             self.usage = Some(frame["usage"].clone());
@@ -226,6 +243,39 @@ pub(super) fn provider_error(frame: &Value) -> anyhow::Error {
     };
     ProviderError(message).into()
 }
+
+/// A response whose `id` or `model` changed between frames. No cause is implied.
+/// Carries only lengths and the frame ordinal, never an ID, so it is safe to log.
+#[derive(Debug)]
+pub(super) struct IdentityChanged {
+    field: &'static str,
+    frame: usize,
+    old_len: usize,
+    new_len: usize,
+}
+
+impl IdentityChanged {
+    pub(super) fn field(&self) -> &'static str {
+        self.field
+    }
+}
+
+impl std::fmt::Display for IdentityChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            field,
+            frame,
+            old_len,
+            new_len,
+        } = self;
+        write!(
+            formatter,
+            "stream changed {field} at data frame {frame} ({old_len}-byte value became {new_len}-byte value)"
+        )
+    }
+}
+
+impl std::error::Error for IdentityChanged {}
 
 /// A complete server error envelope, distinct from malformed or cut framing.
 #[derive(Debug)]

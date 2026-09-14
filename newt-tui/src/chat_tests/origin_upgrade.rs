@@ -188,3 +188,27 @@ fn capped_progress_is_persistable_without_duplicate_notices_and_resumes_its_obje
         other => panic!("capped progress must resume as a continuation, got {other:?}"),
     }
 }
+
+/// #2334: the failed-turn footer names a phrase that re-enters the objective the
+/// Err branch keeps. Trap: a footer naming a phrase the router does not treat as
+/// a bare continuation (e.g. `retry`) would pass a text-only check while the
+/// operator's reply silently started a fresh objective.
+#[test]
+fn the_failed_turn_footer_phrase_resumes_the_failed_objective() {
+    let failed = ctx();
+    assert!(failed_turn_footer().contains("`continue`"));
+    assert!(newt_core::classifiers::is_bare_continuation("continue"));
+    match upgrade_origin_for_interrupted_objective(
+        ModelInputOrigin::Operator,
+        "continue",
+        Some(&failed),
+    ) {
+        ModelInputOrigin::OperatorContinuation { parent } => {
+            assert_eq!(
+                parent.submitted_prompt().id(),
+                failed.submitted_prompt().id()
+            );
+        }
+        other => panic!("the footer phrase must resume the failed objective, got {other:?}"),
+    }
+}

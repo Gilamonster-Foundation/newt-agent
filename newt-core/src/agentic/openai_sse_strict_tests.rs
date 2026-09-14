@@ -325,3 +325,59 @@ fn stream_invalid_utf8_refuses_completion_but_keeps_an_observed_error() {
         crate::retry::Retryability::ContextExceeded
     );
 }
+
+/// #2334: response identity is checked per response. Stable and omitted IDs
+/// are one response; a changed ID or model mixes two and stays rejected, but as
+/// a recoverable failure whose text carries only a frame ordinal and lengths.
+#[test]
+fn response_identity_is_stable_omittable_and_a_change_is_recoverable_and_redacted() {
+    let answer = json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]});
+    let stable = json!({"id":"resp-fixture-one","model":"served-model","choices":[]});
+    let omitted = decode_response(&sse(std::slice::from_ref(&answer), true)).unwrap();
+    assert!(omitted.get("id").is_none(), "an omitted ID is not invented");
+    let stable = decode_response(&sse(&[stable, answer.clone()], true)).unwrap();
+    assert_eq!(stable["id"], "resp-fixture-one");
+    for (key, old, new) in [
+        ("id", "resp-fixture-one", "resp-fixture-twenty"),
+        ("model", "served-model", "other-served-model"),
+    ] {
+        let mut changed = answer.clone();
+        changed[key] = json!(new);
+        let error = decode_response(&sse(&[json!({key: old, "choices":[]}), changed], true))
+            .expect_err("mixing two responses stays rejected");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&format!(
+                "at data frame 2 ({}-byte value became {}-byte value)",
+                old.len(),
+                new.len()
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(old) && !text.contains(new), "{text}");
+        assert_ne!(
+            crate::retry::classify(&error),
+            crate::retry::Retryability::Fatal,
+            "a mixed response is a recoverable transport failure: {text}"
+        );
+    }
+}
+
+/// Twin: only response identity is recoverable. A tool call whose own ID changes
+/// is a malformed batch and remains fatal.
+#[test]
+fn a_changed_tool_call_id_remains_fatal() {
+    let changed = sse(
+        &[
+            json!({"id":"resp-fixture","choices":[{"delta":{"tool_calls":[{"index":0,"id":"first","type":"function","function":{"name":"read_file","arguments":"{"}}]}}]}),
+            json!({"id":"resp-fixture","choices":[{"delta":{"tool_calls":[{"index":0,"id":"replacement","function":{"arguments":"}"}}]},"finish_reason":"tool_calls"}]}),
+        ],
+        true,
+    );
+    let error = decode_response(&changed).unwrap_err();
+    assert_eq!(
+        crate::retry::classify(&error),
+        crate::retry::Retryability::Fatal,
+        "{error:#}"
+    );
+}
