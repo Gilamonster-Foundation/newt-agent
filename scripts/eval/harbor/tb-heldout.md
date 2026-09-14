@@ -53,13 +53,13 @@ Nothing below uses a result on a held-out task.
 
 ## Model choice (before GPU-days are spent)
 
-Recorded tb-30 scores are **not** the basis for choosing a model. The choice comes from a calibration step that runs after the 2026-09-14 baseline finishes and before this set is used. The calibration uses development tasks only, with the same ctx pin:
+Recorded tb-30 scores are **not** the basis for choosing a model. The maintainer has settled the candidates: **ornith-1.5-35b** and a newer small Nemotron 3 (one of nemotron-3-nano_30b, nemotron-3-nano_30b-canonical or nemotron-3-nano-omni, which he picks). A later, separate selection may add other current models.
 
-| candidate | what calibration runs | what it records |
+Before this set is used, each candidate gets one calibration row. Calibration runs after the qwen3-coder_30b cells of the 2026-09-14 baseline and uses development tasks only:
+
+| candidate | calibration run | recorded |
 |---|---|---|
-| ornith-1.5-35b | newt, treatment `none`, smart-ab-8, 1 trial per task | resolves; median agent seconds per trial |
-| nemotron-3-super_120b | timing probe: newt, 2 smart-ab-8 tasks, 1 trial each | decode tok/s from `/slots`; agent seconds per trial; whether it loads at the pinned 131072 context (a load failure is reported as one, never worked around by lowering ctx) |
-
-The maintainer picks from a two-row table: development resolves, seconds per trial, and projected hours for 72 held-out trials. qwen3-coder_30b remains an option, with the floor risk above.
+| ornith-1.5-35b | newt, treatment `none`, smart-ab-8, 1 trial per task, ctx 131072 | resolves; median agent seconds per trial; projected hours for 72 held-out trials |
+| the chosen small Nemotron 3 | the same | the same |
 
 Admitting easier tasks is not an option: every easy terminal-bench task is already exposed. A different suite would need its own declaration.
