@@ -2,8 +2,10 @@
 //!
 //! "Owned" is a *colloquial* trust claim — infrastructure the operator runs and
 //! is willing to be patient with — not a security boundary. It drives
-//! performance-shaped decisions only: today, whether an inference endpoint gets
-//! the patient local-inference retry policy or the thrifty hosted one.
+//! performance- and cost-shaped decisions only, through [`inference_is_local`]:
+//! whether an inference endpoint gets the patient local-inference retry policy
+//! or the thrifty hosted one, and whether a local model family's price may be
+//! read as free (see [`crate::pricing`]).
 //!
 //! # Why this is separate from the exfiltration guard
 //!
@@ -60,6 +62,20 @@ pub fn is_owned_host(host: &str) -> bool {
     is_owned_with(host, OWNED_SUFFIXES.get().map_or(&[], Vec::as_slice))
 }
 
+/// Is an inference call served by the operator's own machinery? True for an
+/// in-process backend (the embedded engine — a fact the caller takes from the
+/// backend itself), or when the endpoint's host is owned. A missing or empty
+/// endpoint is NOT evidence of locality: a cloud provider plugin has none
+/// either. An endpoint that does not parse is not local.
+#[must_use]
+pub fn inference_is_local(in_process: bool, endpoint: Option<&str>) -> bool {
+    in_process
+        || endpoint
+            .and_then(|endpoint| reqwest::Url::parse(endpoint).ok())
+            .and_then(|url| url.host_str().map(is_owned_host))
+            .unwrap_or(false)
+}
+
 /// The classification itself, with the declared suffixes passed in.
 ///
 /// Separated from [`is_owned_host`] so the rule is testable without touching
@@ -90,6 +106,25 @@ pub(crate) fn is_owned_with(host: &str, suffixes: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inference_locality_reads_the_endpoint_host() {
+        let remote = |endpoint| inference_is_local(false, Some(endpoint));
+        assert!(!remote("https://api.moonshot.ai"));
+        assert!(!remote("https://ollama.com"));
+        assert!(remote("http://gpu.home.arpa:8080"));
+        assert!(remote("http://inference:8000"));
+        assert!(remote("http://127.0.0.1:8000"));
+        assert!(remote("http://[fd00::1]:8000"));
+        assert!(remote("http://[fe80::1]:8000"));
+        // A missing URL is not evidence of locality (a cloud provider plugin
+        // has none either); garbage is never local.
+        assert!(!remote(""));
+        assert!(!remote("not a url"));
+        assert!(!inference_is_local(false, None));
+        // Only the backend's own in-process fact makes an endpoint-less call local.
+        assert!(inference_is_local(true, None));
+    }
 
     #[test]
     fn built_in_private_floor_is_owned() {
