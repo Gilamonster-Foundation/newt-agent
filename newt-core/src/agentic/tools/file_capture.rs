@@ -108,20 +108,81 @@ pub(super) fn capture(scope: &Scope<String>, path: &Path) -> TextSnapshot {
 
 /// A failed or partial operation still has an observed result. Never build its
 /// displayed patch from the requested bytes in place of this postimage.
-pub(super) fn receipt(path: &str, before: &TextSnapshot, after: &TextSnapshot) -> String {
+pub(super) fn receipt(path: &str, before: &TextSnapshot, after: &TextSnapshot) -> Receipt {
     use TextSnapshot::{Absent, Present, Unavailable};
     let (old, new) = match (before, after) {
         (Unavailable(reason), _) | (_, Unavailable(reason)) => {
-            return format!("\n\nfile-change receipt unavailable: {reason}");
+            return Receipt::plain(format!("\n\nfile-change receipt unavailable: {reason}"));
         }
-        (Absent, Absent) => return "\n\nNo file was present before or after the operation.".into(),
+        (Absent, Absent) => {
+            return Receipt::plain("\n\nNo file was present before or after the operation.".into())
+        }
         (Absent, Present(after)) => (None, Some(after.as_str())),
         (Present(before), Absent) => (Some(before.as_str()), None),
         (Present(before), Present(after)) => (Some(before.as_str()), Some(after.as_str())),
     };
-    match super::file_change::receipt(path, old, new) {
-        Ok(receipt) => format!("\n\n{receipt}"),
-        Err(error) => format!("\n\nfile-change receipt unavailable: {error}"),
+    match super::file_change::from_versions(path, old, new) {
+        Ok(model) => {
+            let unchanged = old.is_some() && old == new;
+            let text = format!(
+                "\n\n{}",
+                super::file_change::receipt_from_model(&model, unchanged)
+            );
+            let captured = (!unchanged).then(|| CapturedChange {
+                model,
+                path: path.into(),
+                before: old.map(str::to_owned),
+                after: new.map(str::to_owned),
+            });
+            Receipt { text, captured }
+        }
+        Err(error) => Receipt::plain(format!("\n\nfile-change receipt unavailable: {error}")),
+    }
+}
+
+struct CapturedChange {
+    model: newtui::diff::ChangeSet,
+    path: String,
+    before: Option<String>,
+    after: Option<String>,
+}
+
+pub(super) struct Receipt {
+    text: String,
+    captured: Option<CapturedChange>,
+}
+
+impl Receipt {
+    fn plain(text: String) -> Self {
+        Self {
+            text,
+            captured: None,
+        }
+    }
+
+    /// Record the receipt's exact byte range while assembling this result.
+    /// This one-shot hint follows the existing result; it is not retained data.
+    pub(super) fn present(
+        self,
+        prefix: String,
+        suffix: &str,
+        presentation: &mut dyn super::ToolPresentation,
+    ) -> String {
+        let range = prefix.len()..prefix.len() + self.text.len();
+        let output = format!("{prefix}{}{suffix}", self.text);
+        if let Some(captured) = self.captured {
+            presentation.file_change(std::sync::Arc::new(
+                crate::agentic::FileChangePresentation::new(
+                    captured.model,
+                    captured.path,
+                    captured.before,
+                    captured.after,
+                    self.text,
+                    range,
+                ),
+            ));
+        }
+        present(output, presentation)
     }
 }
 
@@ -267,7 +328,7 @@ mod tests {
             .unwrap();
         let before = capture(&Scope::All, &path);
         assert!(matches!(before, TextSnapshot::Unavailable(_)), "{before:?}");
-        let output = receipt("file", &before, &TextSnapshot::Present("small\n".into()));
+        let output = receipt("file", &before, &TextSnapshot::Present("small\n".into())).text;
         assert!(output.contains("unavailable"), "{output}");
         assert!(output.contains("limit"), "{output}");
         assert!(!output.contains("```diff"), "{output}");
@@ -290,7 +351,7 @@ mod tests {
         ));
         let output = failure(
             "error: injected write failure".into(),
-            &receipt("file", &before, &after),
+            &receipt("file", &before, &after).text,
         );
         assert!(output.contains("-old\n+partial\n"), "{output}");
         assert!(!output.contains("+requested"), "{output}");

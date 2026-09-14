@@ -254,12 +254,17 @@ async fn physical_symlink_escape_write_is_denied_object_bound() {
     let before = crate::agentic::tools::file_capture::capture(&read_caveats.fs_read, &full);
     let after = crate::agentic::tools::file_capture::capture(&read_caveats.fs_read, &full);
     let receipt = crate::agentic::tools::file_capture::receipt("link/target.txt", &before, &after);
-    assert_eq!(
-        out,
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 0, false);
+    let expected = receipt.present(
         crate::agentic::tools::file_capture::failure(
             denied_fs_result("fs_write", "link/target.txt"),
-            &receipt,
+            "",
         ),
+        "",
+        &mut display,
+    );
+    assert_eq!(
+        out, expected,
         "the symlink-escape write must be denied by the object fence: {out}"
     );
     assert_eq!(

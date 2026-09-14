@@ -4739,7 +4739,7 @@ dependencies = [
 [[package]]
 name = "newtui"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/newtui?rev=e8617efd6e5c489a3320f10f0c74000c8f19f1a7#e8617efd6e5c489a3320f10f0c74000c8f19f1a7"
+source = "git+https://github.com/Gilamonster-Foundation/newtui?rev=b7ce8ee02b30616d8621dfdab05c84645e0edf9f#b7ce8ee02b30616d8621dfdab05c84645e0edf9f"
 
 [[package]]
 name = "nix"

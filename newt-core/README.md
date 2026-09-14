@@ -31,6 +31,14 @@ secret redaction. Retained text is not a byte-exact patch export. See
 Terminal displays visibly escape source controls and identify that projection;
 the canonical returned result keeps the source bytes.
 
+Rich displays receive a one-shot typed hint tied to the exact receipt in that
+raw result. NewtUI supplies safe numbered source cells; the optional existing
+Syntect parser supplies full-file syntax foregrounds without reinserting raw
+source. The shared Markdown renderer uses the same parser. Unsupported glyphs
+are visibly substituted, and the styled view is identified as unsuitable for
+raw patch application. Text observations and spill retention keep their
+existing limits and redaction behavior.
+
 Harness-owned Git subprocesses share `git_hardening::hardened_git`, which
 returns a fallible command builder with repository config gadgets disabled and
 the child environment scrubbed. On macOS it resolves Git from PATH before

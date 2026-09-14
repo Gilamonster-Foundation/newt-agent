@@ -59,6 +59,12 @@ pub enum Role {
     /// Draws the eye without claiming the keyboard: a mode word, an open
     /// command line.
     Emphasis,
+    /// Added source text and its semantic background.
+    Added,
+    AddedBackground,
+    /// Removed source text and its semantic background.
+    Removed,
+    RemovedBackground,
 
     /// Work in progress: the activity row, and the thinking block that will
     /// join it. Its own role rather than `Dim` because "the machine is busy"
@@ -132,6 +138,10 @@ pub struct Theme {
     dim: Color,
     muted: Color,
     emphasis: Color,
+    added: Color,
+    added_background: Color,
+    removed: Color,
+    removed_background: Color,
     thinking: Color,
     command_background: Color,
     command_background_inactive: Color,
@@ -162,11 +172,9 @@ pub struct Theme {
 impl Theme {
     /// The colours the TUI uses today, named.
     ///
-    /// **Every value here is lifted from a site that already existed**, so
-    /// adopting the seam is invisible to an operator. The block roles
-    /// (`Thinking`, `Gutter`, `Fold`) are the exception — they have no
-    /// predecessor, and take `Dim`'s colour so a surface that starts using
-    /// them looks like the rest of the product until a theme says otherwise.
+    /// Existing roles preserve the colors of their original surfaces. Added
+    /// and removed source text introduce their own foreground/background
+    /// roles, so a file review can be tuned without recoloring other output.
     pub fn builtin() -> Self {
         Self {
             human_text: Color::Cyan,
@@ -190,6 +198,18 @@ impl Theme {
             dim: Color::DarkGrey,
             muted: Color::Grey,
             emphasis: Color::Yellow,
+            added: Color::Green,
+            added_background: Color::Rgb {
+                r: 24,
+                g: 56,
+                b: 37,
+            },
+            removed: Color::Red,
+            removed_background: Color::Rgb {
+                r: 65,
+                g: 29,
+                b: 32,
+            },
             // The activity row's existing accent, likewise by name. NOT
             // `NEWT_ORANGE_CT` — that is the darker brand orange for small
             // identity marks, and `tty::mod` documents the two as deliberately
@@ -238,6 +258,10 @@ impl Theme {
             Role::Dim => self.dim,
             Role::Muted => self.muted,
             Role::Emphasis => self.emphasis,
+            Role::Added => self.added,
+            Role::AddedBackground => self.added_background,
+            Role::Removed => self.removed,
+            Role::RemovedBackground => self.removed_background,
             Role::Thinking => self.thinking,
             Role::CommandBackground => self.command_background,
             Role::CommandBackgroundInactive => self.command_background_inactive,
@@ -310,7 +334,7 @@ impl Theme {
     /// Overlay a partial assignment read from a theme file.
     ///
     /// Partial ON PURPOSE, and it is the whole ergonomic argument: an operator
-    /// who wants a brighter accent writes one line, not a file of all nineteen
+    /// who wants a brighter accent writes one line, not a file of all our
     /// colours they must keep in step with ours. Everything unstated keeps the
     /// built-in value, so a theme file cannot go stale by omission when a role
     /// is added — the same droppable-override shape the language packs use.
@@ -323,6 +347,10 @@ impl Theme {
                 Role::Dim => self.dim = *color,
                 Role::Muted => self.muted = *color,
                 Role::Emphasis => self.emphasis = *color,
+                Role::Added => self.added = *color,
+                Role::AddedBackground => self.added_background = *color,
+                Role::Removed => self.removed = *color,
+                Role::RemovedBackground => self.removed_background = *color,
                 Role::Thinking => self.thinking = *color,
                 Role::CommandBackground => self.command_background = *color,
                 Role::CommandBackgroundInactive => self.command_background_inactive = *color,
@@ -413,6 +441,10 @@ pub fn role_from_name(name: &str) -> Option<Role> {
         "dim" => Role::Dim,
         "muted" => Role::Muted,
         "emphasis" => Role::Emphasis,
+        "added" => Role::Added,
+        "added-background" => Role::AddedBackground,
+        "removed" => Role::Removed,
+        "removed-background" => Role::RemovedBackground,
         "thinking" => Role::Thinking,
         "command-background" => Role::CommandBackground,
         "command-background-inactive" => Role::CommandBackgroundInactive,
@@ -449,6 +481,10 @@ pub const ALL_ROLES: &[Role] = &[
     Role::Dim,
     Role::Muted,
     Role::Emphasis,
+    Role::Added,
+    Role::AddedBackground,
+    Role::Removed,
+    Role::RemovedBackground,
     Role::Thinking,
     Role::CommandBackground,
     Role::CommandBackgroundInactive,
@@ -484,6 +520,10 @@ pub fn role_name(role: Role) -> &'static str {
         Role::Dim => "dim",
         Role::Muted => "muted",
         Role::Emphasis => "emphasis",
+        Role::Added => "added",
+        Role::AddedBackground => "added-background",
+        Role::Removed => "removed",
+        Role::RemovedBackground => "removed-background",
         Role::Thinking => "thinking",
         Role::CommandBackground => "command-background",
         Role::CommandBackgroundInactive => "command-background-inactive",
@@ -726,6 +766,37 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 
+    #[test]
+    fn file_change_foregrounds_and_backgrounds_are_independently_tunable() {
+        let (theme, complaints) = from_env(Some(
+            "added=light-green,removed=light-red,added-background=#183825,removed-background=#411d20",
+        ));
+        assert!(complaints.is_empty(), "{complaints:?}");
+        for (name, expected) in [
+            ("added", Color::Green),
+            ("removed", Color::Red),
+            (
+                "added-background",
+                Color::Rgb {
+                    r: 24,
+                    g: 56,
+                    b: 37,
+                },
+            ),
+            (
+                "removed-background",
+                Color::Rgb {
+                    r: 65,
+                    g: 29,
+                    b: 32,
+                },
+            ),
+        ] {
+            assert_eq!(theme.color(role_from_name(name).unwrap()), expected);
+        }
+        assert_eq!(theme.color(Role::Text), Theme::builtin().color(Role::Text));
+    }
+
     /// **The seam changes nothing on arrival.**
     ///
     /// Every value the built-in theme serves is one that was already on
@@ -820,7 +891,7 @@ mod tests {
             );
             assert_eq!(name, name.to_ascii_lowercase(), "names are kebab-case");
         }
-        assert_eq!(ALL_ROLES.len(), 30, "add the new role to ALL_ROLES too");
+        assert_eq!(ALL_ROLES.len(), 34, "add the new role to ALL_ROLES too");
         assert_eq!(role_from_name("nonsense"), None);
     }
 

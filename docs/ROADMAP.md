@@ -868,6 +868,45 @@ and settings state-machine adoption.
 The existing tool-result scrollback and spill view show the fenced diff as text;
 syntax-colored cells and rich diff interaction follow in a later slice.
 
+## Step 13.3 — Rich file-change cells in scrollback and the completed viewport
+
+**Status:** in progress.
+
+**What:** a file operation passes its already captured change and original
+versions as one ephemeral presentation hint. The display validates the exact
+receipt byte range against the raw result before replacing it with NewtUI's
+safe numbered source cells. Outcome text, build failures and display notices
+remain visible. Plain output and unrelated display overrides retain their
+existing text path; the hint is consumed once.
+
+The rich surface adds syntax foregrounds from the existing full-file Syntect
+parser while keeping NewtUI's added/removed backgrounds. Original source is
+used only to find foreground positions; every displayed source character comes
+from NewtUI's safe glyph runs. Source and header substitutions are identified,
+and the rendered view is not a raw patch. The existing theme vocabulary adds
+`added`, `removed`, `added-background`, and `removed-background` overrides.
+
+Static rows commit before the completed spill viewport. The live view uses the
+same SpillView navigation and terminal ownership, with source-line indices for
+styling and a fresh projection on resize. Erase accounting keeps plain cells;
+ANSI styling is serialized only at the terminal writer. The raw tool String,
+durable observations, and bounded text `/spill` archive retain their roles.
+
+**Dependency:** use immutable NewtUI 0.1.0 revision
+`b7ce8ee02b30616d8621dfdab05c84645e0edf9f`, whose source spans map Unicode
+scalar positions to safe output cells. No NewtUI renderer feature or Ratatui
+upgrade is needed. `rich-tui` enables the existing `newt-core/markdown-syntect`
+feature, adding its syntax/theme assets and build cost; the lean tier remains
+without that optional dependency.
+
+**Tests:** pure source-span and full-file syntax contracts, byte-equal Markdown
+comparison, real file-tool and ToolDisplay handoffs, bounded static excerpts,
+completed-view resize and cleanup, and the existing terminal acceptance tier.
+
+**Out of scope:** typed retained snapshots, full inspection and exact patch
+export, permission previews, shell/Git change discovery, and Mermaid renderer
+or settings state-machine adoption. Those remain subsequent functional slices.
+
 ---
 
 # Phase 14 - `newt dgx` command suite (9 steps)

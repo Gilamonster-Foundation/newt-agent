@@ -4,6 +4,59 @@
 
 use super::*;
 
+#[tokio::test]
+async fn actual_file_operations_supply_rich_cells_without_changing_the_raw_receipt() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let path = "state.rs";
+    for (name, args, kind) in [
+        (
+            "write_file",
+            serde_json::json!({"path": path, "content": "let new = 2;\n"}),
+            "Modified",
+        ),
+        (
+            "edit_file",
+            serde_json::json!({"path": path, "old_string": "old", "new_string": "new"}),
+            "Modified",
+        ),
+        ("delete_file", serde_json::json!({"path": path}), "Deleted"),
+    ] {
+        std::fs::write(ws.path().join(path), "let old = 1;\n").unwrap();
+        let mut display = ToolDisplay::new(Vec::new(), true, 100, 0, false);
+        let raw = execute_tool_with_display_cancellable(
+            &mut display,
+            name,
+            &args,
+            &ws.path().to_string_lossy(),
+            true,
+            20,
+            &caveats_rw(ws.path()),
+            &mut NoMcp,
+            ToolCollaborators::default(),
+            false,
+            PromptDisposition::Act,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(raw.contains("```diff"), "canonical returned patch: {raw}");
+        let visible = String::from_utf8(display.into_inner()).unwrap();
+        assert!(
+            visible.contains(&format!("{kind} \"state.rs\"")),
+            "{name} did not project actual captured model: {visible:?}"
+        );
+        assert!(
+            visible.contains("\x1b[48;"),
+            "source changes have semantic backgrounds"
+        );
+        assert!(
+            !visible.contains("```diff"),
+            "the display consumes the receipt once"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn nonregular_file_errors_escape_path_controls_in_the_production_display() {

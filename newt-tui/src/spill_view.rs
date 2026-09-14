@@ -28,7 +28,7 @@ pub(crate) enum Gutter {
 }
 
 impl Gutter {
-    fn glyph(self) -> char {
+    pub(crate) fn glyph(self) -> char {
         match self {
             Self::Expand => '⧉',
             Self::Collapse => '▣',
@@ -48,6 +48,8 @@ pub(crate) struct RenderedRow {
     pub(crate) gutter: Gutter,
     pub(crate) text: String,
     pub(crate) line: String,
+    /// Absolute source line before bounded history drops; absent on chrome.
+    pub(crate) source_line: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -341,6 +343,26 @@ impl SpillView {
         self.refresh_visible_rows();
     }
 
+    /// Reproject completed content at a new width without changing navigation
+    /// ownership, expansion, or detached scroll position.
+    pub(crate) fn replace_completed_text(&mut self, text: &str) {
+        debug_assert!(self.finished);
+        let mut replacement = Self::with_limits(
+            self.width,
+            self.collapsed_rows,
+            self.history_limit,
+            self.line_char_limit,
+        );
+        replacement.max_visible_rows = self.max_visible_rows;
+        replacement.push_stream_bytes(SpillStream::Stdout, text.as_bytes());
+        replacement.finish();
+        replacement.expanded = self.expanded;
+        replacement.follow_tail = self.follow_tail;
+        replacement.view_start = self.view_start;
+        replacement.refresh_visible_rows();
+        *self = replacement;
+    }
+
     #[cfg(any(unix, test))]
     pub(crate) fn toggle_expanded(&mut self) {
         self.expanded = !self.expanded;
@@ -509,7 +531,9 @@ impl SpillView {
                 } else {
                     Gutter::Track
                 };
-                rendered_row(gutter, &line.display_text(), self.width)
+                let mut rendered = rendered_row(gutter, &line.display_text(), self.width);
+                rendered.source_line = Some(start + row);
+                rendered
             })
             .collect();
 
@@ -535,7 +559,10 @@ impl SpillView {
         let content = (0..shown)
             .map(|row| {
                 let line = self.line_at(start - retained_start + row);
-                rendered_row(Gutter::CompletedTrack, &line.display_text(), self.width)
+                let mut rendered =
+                    rendered_row(Gutter::CompletedTrack, &line.display_text(), self.width);
+                rendered.source_line = Some(start + row);
+                rendered
             })
             .collect();
 
@@ -715,6 +742,7 @@ fn rendered_row(gutter: Gutter, text: &str, width: usize) -> RenderedRow {
         gutter,
         text: clipped,
         line,
+        source_line: None,
     }
 }
 

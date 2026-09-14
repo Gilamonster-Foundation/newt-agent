@@ -391,7 +391,11 @@ impl Pty {
             input_flags: t.c_iflag,
             output_flags: t.c_oflag,
             control_flags: t.c_cflag,
-            local_flags: t.c_lflag,
+            // PENDIN/FLUSHO are kernel I/O bookkeeping, not configuration: macOS
+            // sets PENDIN after a raw-mode round trip with input pending (the
+            // same `0x5cb -> 0x200005cb` newt-tui's cockpit `TRANSIENT_LFLAGS`
+            // records). Nothing sets or restores them, so they are not compared.
+            local_flags: t.c_lflag & !(libc::PENDIN | libc::FLUSHO),
             control_chars: t.c_cc,
             input_speed: unsafe { libc::cfgetispeed(&t) },
             output_speed: unsafe { libc::cfgetospeed(&t) },

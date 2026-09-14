@@ -9,6 +9,87 @@ use std::io::Write;
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
 
+#[cfg(all(unix, feature = "rich-tui"))]
+#[path = "live_spill_pty_tests.rs"]
+mod terminal;
+
+#[test]
+#[cfg(all(unix, feature = "rich-tui"))]
+fn rich_changes_reproject_on_resize_and_share_completed_cleanup() {
+    use newt_core::agentic::{CompletedSpillRenderer, FileChangePresentation};
+    let changes = newtui::diff::from_unified("--- state.rs\n+++ state.rs\n@@ -1 +1 @@\n-let old = 1;\n+let restored_after_widening = 2;\n").unwrap();
+    let receipt = changes.to_markdown();
+    let change = Arc::new(FileChangePresentation::new(
+        changes,
+        "state.rs".into(),
+        Some("let old = 1;\n".into()),
+        Some("let restored_after_widening = 2;\n".into()),
+        receipt.clone(),
+        0..receipt.len(),
+    ));
+    let geometry = Arc::new(Mutex::new((18, 30)));
+    let measured = geometry.clone();
+    let writer = SharedWriter::default();
+    let renderer =
+        LiveSpillRenderer::with_writer_and_geometry(writer.clone(), 12, true, move || {
+            Some(*measured.lock().unwrap())
+        })
+        .unwrap();
+    assert!(renderer.render_file_change(&receipt, &receipt, change, 18, 12) > 0);
+    let first = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        first.contains("\x1b[48;"),
+        "live source backgrounds: {first:?}"
+    );
+    assert!(!first.contains("restored_after_widening"));
+    let before_resize = writer.0.lock().unwrap().len();
+    *geometry.lock().unwrap() = (80, 30);
+    renderer.refresh_geometry();
+    paint_generation(
+        &renderer.state,
+        &renderer.output,
+        &renderer.abandoned_through,
+        super::COMPLETED_GENERATION,
+    );
+    let later = String::from_utf8(writer.0.lock().unwrap()[before_resize..].to_vec()).unwrap();
+    assert!(
+        later.contains("restored_after_widening"),
+        "reproject original safe model at new width: {later:?}"
+    );
+    assert!(
+        renderer
+            .output
+            .lock()
+            .unwrap()
+            .painted_lines
+            .iter()
+            .all(|line| !line.contains('\x1b')),
+        "row accounting retains plain cells"
+    );
+    renderer.erase();
+    assert!(!renderer.is_active());
+    let erased = writer.0.lock().unwrap().len();
+    renderer.erase();
+    assert_eq!(
+        erased,
+        writer.0.lock().unwrap().len(),
+        "completed cleanup rewinds once"
+    );
+    renderer.render_completed("replacement", 80, 4);
+    assert!(renderer
+        .snapshot_lines()
+        .iter()
+        .any(|line| line.contains("replacement")));
+    renderer.discard();
+    let discarded = writer.0.lock().unwrap().len();
+    renderer.erase();
+    assert_eq!(
+        discarded,
+        writer.0.lock().unwrap().len(),
+        "discard cannot rewind from a later cursor"
+    );
+}
+
 #[derive(Clone, Default)]
 struct SharedWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -43,6 +124,9 @@ struct ScreenModel {
     cursor_row: usize,
     cursor_col: usize,
     wrap: bool,
+    /// `continued[i]`: row `i` soft-wrapped into row `i + 1`, so a resize
+    /// reflows them as one logical line, as a reflowing emulator does.
+    continued: Vec<bool>,
 }
 
 impl ScreenModel {
@@ -53,6 +137,7 @@ impl ScreenModel {
             cursor_row: 0,
             cursor_col: 0,
             wrap: true,
+            continued: vec![false],
         }
     }
 
@@ -86,23 +171,36 @@ impl ScreenModel {
 
     fn resize(&mut self, width: usize) {
         let old_rows = std::mem::take(&mut self.rows);
+        let old_continued = std::mem::take(&mut self.continued);
+        let mut logical: Vec<String> = Vec::new();
+        let mut joining = false;
+        for (row, continued) in old_rows.into_iter().zip(old_continued) {
+            match logical.last_mut() {
+                Some(line) if joining => line.push_str(&row),
+                _ => logical.push(row),
+            }
+            joining = continued;
+        }
         self.width = width.max(1);
-        for row in old_rows {
+        for row in logical {
             let mut chunk = String::new();
             let mut chunk_width = 0;
             for ch in row.chars() {
                 let char_width = display_width(&ch.to_string()).max(1);
                 if chunk_width > 0 && chunk_width + char_width > self.width {
                     self.rows.push(std::mem::take(&mut chunk));
+                    self.continued.push(true);
                     chunk_width = 0;
                 }
                 chunk.push(ch);
                 chunk_width += char_width;
             }
             self.rows.push(chunk);
+            self.continued.push(false);
         }
         if self.rows.is_empty() {
             self.rows.push(String::new());
+            self.continued.push(false);
         }
         self.cursor_row = self.rows.len() - 1;
         self.cursor_col = display_width(&self.rows[self.cursor_row]);
@@ -130,6 +228,7 @@ impl ScreenModel {
             ("2", 'K') => {
                 self.ensure_cursor_row();
                 self.rows[self.cursor_row].clear();
+                self.continued[self.cursor_row] = false;
             }
             // #1427: bare `ESC[K` (== `ESC[0K`) erases from the cursor to
             // end of line. This is what `Clear(UntilNewLine)` emits, and
@@ -158,7 +257,9 @@ impl ScreenModel {
             (_, 'J') => {
                 self.ensure_cursor_row();
                 self.rows.truncate(self.cursor_row + 1);
+                self.continued.truncate(self.cursor_row + 1);
                 self.rows[self.cursor_row].clear();
+                self.continued[self.cursor_row] = false;
             }
             (_, 'm') => {}
             // #1427 asked whether this should record instead of panic.
@@ -181,6 +282,8 @@ impl ScreenModel {
             if !self.wrap {
                 return;
             }
+            self.ensure_cursor_row();
+            self.continued[self.cursor_row] = true;
             self.cursor_row += 1;
             self.cursor_col = 0;
             self.ensure_cursor_row();
@@ -193,6 +296,7 @@ impl ScreenModel {
     fn ensure_cursor_row(&mut self) {
         while self.rows.len() <= self.cursor_row {
             self.rows.push(String::new());
+            self.continued.push(false);
         }
     }
 }
@@ -832,6 +936,18 @@ fn wide_glyphs_wrap_early_so_rows_exceed_the_width_over_columns_estimate() {
     assert_eq!(physical_rows("", 8), 1);
     // A single glyph wider than the terminal cannot be split any further.
     assert_eq!(physical_rows("↑↑", 1), 2);
+}
+
+#[test]
+fn screen_model_rejoins_soft_wrapped_rows_when_widened() {
+    // The rich tier requires a reflowing emulator: a line split by a narrow
+    // resize is one logical line again once the terminal widens.
+    let mut screen = ScreenModel::new(80);
+    screen.apply(b"receipt-committed\r\nnext\r\n");
+    screen.resize(12);
+    assert_eq!(screen.nonempty_rows(), ["receipt-comm", "itted", "next"]);
+    screen.resize(80);
+    assert_eq!(screen.nonempty_rows(), ["receipt-committed", "next"]);
 }
 
 #[test]
