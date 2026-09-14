@@ -1194,6 +1194,63 @@ mod tests {
         assert_eq!(bodies[0]["messages"][0]["content"], expected_head.as_str());
     }
 
+    /// #2314: when the transcript already opens with a system prompt, the head
+    /// leads THAT message exactly as the TUI's does — head, blank line, prompt —
+    /// rather than adding a system message or touching the stored transcript.
+    #[tokio::test]
+    async fn the_scratchpad_head_leads_an_existing_system_message() {
+        use crate::agentic::{working_memory_head, SessionScratchpadStore};
+        const PROMPT: &str = "You are the headless solver.\n\nKeep going.";
+        async fn drive(store: Option<Arc<SessionScratchpadStore>>) -> Vec<serde_json::Value> {
+            let server = MockServer::start().await;
+            let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+            Mock::given(method("POST"))
+                .and(path("/api/chat"))
+                .respond_with(CapturingOllama {
+                    bodies: bodies.clone(),
+                    reply: "done".into(),
+                })
+                .mount(&server)
+                .await;
+            let mut driver =
+                TurnDriver::with_transcript(cfg(&server.uri()), vec![MemMessage::system(PROMPT)]);
+            if let Some(store) = store {
+                driver = driver.with_scratchpad(store);
+            }
+            driver.submit("remember what you find").expect("submit");
+            let TurnStatus::Completed(_) = pump_to_done(&mut driver).await else {
+                panic!("turn did not complete");
+            };
+            assert_eq!(
+                driver.transcript()[0],
+                MemMessage::system(PROMPT),
+                "the stored prompt survives intact; the head is per-turn only"
+            );
+            let first = bodies.lock().unwrap()[0].clone();
+            first["messages"].as_array().expect("messages").clone()
+        }
+        let system_count = |messages: &[serde_json::Value]| {
+            messages.iter().filter(|m| m["role"] == "system").count()
+        };
+
+        let store = Arc::new(SessionScratchpadStore::default());
+        store.set("k", "v".to_string());
+        let head = working_memory_head(Some(store.as_ref()), false).unwrap();
+        let with = drive(Some(store)).await;
+        let without = drive(None).await;
+
+        assert_eq!(with[0]["role"], "system");
+        assert_eq!(
+            with[0]["content"].as_str(),
+            Some(format!("{head}\n\n{PROMPT}").as_str())
+        );
+        assert_eq!(without[0]["content"].as_str(), Some(PROMPT));
+        // The loop adds its own active-prompt card as a further system message,
+        // so "one system message" is measured against the same run without the
+        // head: the head must add none.
+        assert_eq!(system_count(&with), system_count(&without));
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct CrewDispatch {
         op: String,
