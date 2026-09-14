@@ -1,0 +1,38 @@
+[
+  {
+    "name": "float/zero",
+    "record": "float",
+    "json": 0.0,
+    "links": [],
+    "dagcbor_hex": "fb0000000000000000",
+    "content_id": "bafyr4iddcyss3hzch32swsbsrjb6mxo7piuptykexvqbqj5tizhnltuiju"
+  },
+  {
+    "name": "float/negative-zero",
+    "record": "float",
+    "json": -0.0,
+    "links": [],
+    "dagcbor_hex": "fb8000000000000000",
+    "content_id": "bafyr4ihlayw73cceqwna4dlj4bytl2rzb72hvetchovw4es3iiuuxiadu4"
+  },
+  {
+    "name": "float/half",
+    "record": "float",
+    "json": 0.5,
+    "links": [],
+    "dagcbor_hex": "fb3fe0000000000000",
+    "content_id": "bafyr4ihlwfodlr62ey2gjmq7e7rxhsuulg7aihptmokixebdl2cebita2m"
+  },
+  {
+    "name": "float/map-float-beside-int-and-null",
+    "record": "float",
+    "json": {
+      "reward": 1.0,
+      "attempt": 1,
+      "raw": null
+    },
+    "links": [],
+    "dagcbor_hex": "a363726177f666726577617264fb3ff000000000000067617474656d707401",
+    "content_id": "bafyr4iabvmaz3xsj7ruuiqfhxd2ubyfm6ymes2cww7dtmmheyz3xsfqtcm"
+  }
+]

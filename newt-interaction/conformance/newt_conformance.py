@@ -44,11 +44,16 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import pathlib
+import struct
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 VECTORS = HERE.parent / "tests/data/interaction-vectors.json"
+# Floats have no interaction record to ride in, so they get their own vectors,
+# minted by the Rust crate and checked by `newt-interaction/tests/vectors.rs`.
+FLOAT_VECTORS = HERE.parent / "tests/data/float-vectors.json"
 RESPONSES = HERE / "responses.json"
 
 # ---------------------------------------------------------------------------
@@ -228,6 +233,10 @@ def encode(value, links: frozenset[str] = frozenset(), path: str = "") -> bytes:
         return b"\xf6"
     if isinstance(value, int):
         return _head(0, value) if value >= 0 else _head(1, -1 - value)
+    if isinstance(value, float):  # always float64, as the Rust crate encodes
+        if not math.isfinite(value):
+            raise ValueError(f"DAG-CBOR forbids a non-finite float: {value!r}")
+        return b"\xfb" + struct.pack(">d", value)
     if isinstance(value, str):
         raw = value.encode("utf-8")
         return _head(3, len(raw)) + raw
@@ -411,7 +420,7 @@ def render_responses(responses: list[dict]) -> str:
 
 def cmd_verify() -> int:
     """Re-derive every vector's bytes and id from its JSON. Fail-closed."""
-    vectors = load_vectors()
+    vectors = load_vectors() + json.loads(FLOAT_VECTORS.read_text())
     if not vectors:
         print("conformance: no vectors to verify", file=sys.stderr)
         return 1
@@ -547,9 +556,14 @@ def self_test() -> int:
     check("key order", encode({"aa": 1, "z": 2}).hex(), "a2617a0262616101")
     check("empty map and list", encode({"a": {}, "b": []}).hex(), "a26161a0616280")
 
-    # 4. A type DAG-CBOR has no encoding for is refused, not coerced.
-    if not _fails(encode, 1.5):
-        failures.append("a float was encoded rather than refused")
+    # 4. A float is always float64 (0xfb), with the sign of zero kept exactly as
+    #    the Rust crate keeps it. A non-finite float, which DAG-CBOR forbids, and
+    #    a type it has no encoding for are refused, not coerced.
+    check("0.0", encode(0.0).hex(), "fb0000000000000000")
+    check("-0.0", encode(-0.0).hex(), "fb8000000000000000")
+    for bad in (float("nan"), float("inf"), float("-inf"), {1}):
+        if not _fails(encode, bad):
+            failures.append(f"{bad!r} was encoded rather than refused")
 
     # 5. CID rendering round-trips.
     sample = vector(load_vectors(), "definition")["content_id"]

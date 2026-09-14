@@ -31,6 +31,10 @@ fn vectors_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/interaction-vectors.json")
 }
 
+fn float_vectors_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/float-vectors.json")
+}
+
 fn invalid_vectors_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/interaction-vectors-invalid.json")
 }
@@ -391,6 +395,31 @@ fn a_perturbed_vector_fails_the_byte_compare() {
         "perturbing a vector's content id did not change the rendered file — \
          the comparison would pass over a corrupted vector"
     );
+}
+
+/// Floats ride in no interaction record, but the external consumer encodes them
+/// (bench trial records carry rewards), so their bytes are pinned here against
+/// the crate and re-derived by `newt_conformance.py verify`. -0.0 keeps its sign
+/// and differs from 0.0, and a non-finite float is refused rather than encoded.
+#[test]
+fn the_float_vectors_are_what_the_crate_encodes() {
+    for vector in committed(float_vectors_path()) {
+        let bytes = canonical::to_canonical_dagcbor(&vector.json).expect("canonical form");
+        assert_eq!(
+            to_hex(&bytes),
+            vector.dagcbor_hex,
+            "vector `{}`",
+            vector.name
+        );
+        let minted = ContentId::from_canonical_bytes(&bytes).to_string();
+        assert_eq!(minted, vector.content_id, "vector `{}`", vector.name);
+    }
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(
+            canonical::to_canonical_dagcbor(&bad).is_err(),
+            "{bad} must be refused"
+        );
+    }
 }
 
 #[test]
