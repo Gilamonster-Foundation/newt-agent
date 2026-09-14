@@ -35,6 +35,8 @@
 #     "deleted documents are not still referenced" steps in the lint job: every relative markdown link (repo
 #     root + docs/**) resolves, and every `docs/....md` cited from a Rust
 #     comment exists. Cheap (~0.1s); the self-test guards the scanner itself.
+#   - `just check` runs `just eval-selftest` (bench ingestion fixtures, #2316),
+#     matching the "eval self-tests (eval-selftest)" step in the lint job.
 #   - `just cov-ci` matches the coverage job (cargo llvm-cov with floor)
 #   - `just audit` matches the "Security audit" job (cargo audit against the
 #     tracked ignore-list in .cargo/audit.toml; local best-effort if cargo-audit
