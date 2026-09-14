@@ -259,11 +259,33 @@ def observed(expect, record):
 PINNED = ("task_set_sha256", "engine", "ctx_served", "newt_binary_sha256", "instrument_commit")
 
 
+def fingerprint(model):
+    """One served model's identity from `/v1/models`: the server's own metadata,
+    the GGUF basename (the full path carries a local username), and the
+    chat-template kwargs its router preset or args set — where the thinking
+    switch lives for every harness alike. Absent kwargs are recorded as None."""
+    status = model.get("status") or {}
+    args = status.get("args") or []
+    preset = {}
+    for line in (status.get("preset") or "").splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            preset[key.strip()] = value.strip()
+    path = args[args.index("--model") + 1] if "--model" in args else preset.get("model")
+    kwargs = args[args.index("--chat-template-kwargs") + 1] if "--chat-template-kwargs" in args \
+        else preset.get("chat-template-kwargs")
+    try:
+        kwargs = json.loads(kwargs) if kwargs is not None else None
+    except ValueError:
+        pass  # an unparseable value is still compared as served
+    return dict(model.get("meta") or {}, gguf=Path(path).name if path else None, chat_template_kwargs=kwargs)
+
+
 def pin_mismatch(pin, cell):
     bad = [k for k in PINNED if pin.get(k) != cell.get(k)]
-    fp = (pin.get("models") or {}).get(cell["model"])
-    if fp is not None and fp != cell.get("model_fingerprint"):
-        bad.append("model_fingerprint")
+    fp, now = (pin.get("models") or {}).get(cell["model"]), cell.get("model_fingerprint") or {}
+    if fp is not None and fp != now:
+        bad += [f"model_fingerprint.{k}" for k in sorted(set(fp) | set(now)) if fp.get(k) != now.get(k)]
     version = (pin.get("harness_versions") or {}).get(cell["harness"])
     if version and cell.get("harness_version") and version != cell["harness_version"]:
         bad.append("harness_version")
