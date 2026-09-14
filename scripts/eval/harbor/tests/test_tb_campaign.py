@@ -35,6 +35,8 @@ class Claims(unittest.TestCase):
         self.assertEqual(pi_claim(jl(end("stop")))[0], True)
         self.assertEqual(pi_claim(jl(end("length")))[0], False)
         self.assertIsNone(pi_claim(jl({"type": "turn_end"}) + ["not json"]))
+        # auto-retry: an errored first attempt, then a finished one — the last agent_end decides
+        self.assertEqual(pi_claim(jl(end("error"), end("stop")))[0], True)
 
     def test_codex_turn_outcome(self):
         self.assertEqual(codex_claim(jl({"type": "turn.started"}, {"type": "turn.completed"}))[0], True)
@@ -57,12 +59,14 @@ class Summary(unittest.TestCase):
             row(claimed_done=None),                               # unrecoverable claim
             row(graded=False, exception="AgentSetupError"),       # ungraded
             row(model_effective="other"),                         # ran another model
+            row(graded=False, state="error"),                     # pi exit-0 inference failure
         ]
         s = summarize({"expected": 9, "model": "m"}, rows)
-        self.assertEqual((s["expected"], s["observed"], s["graded"]), (9, 6, 5))
+        self.assertEqual((s["expected"], s["observed"], s["graded"]), (9, 7, 5))
         self.assertEqual((s["resolved"], s["claimed"]), (2, 3))
         self.assertEqual((s["false_completions"], s["false_incompletes"]), (2, 1))
         self.assertEqual((s["unrecoverable_claims"], s["exceptions"], s["model_mismatches"]), (1, 1, 1))
+        self.assertEqual(s["inference_errors"], 1)
         self.assertEqual(s["tokens_in"], (0, 0))  # none known: count 0, not a zero cost
 
 

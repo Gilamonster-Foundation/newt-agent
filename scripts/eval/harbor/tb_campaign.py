@@ -24,17 +24,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from pi_log import inference_failure
+from pi_log import records as _records
+
 TIMEOUT = "AgentTimeoutError"
-
-
-def _records(lines):
-    for line in lines:
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
 
 
 def newt_claim(lines):
@@ -47,13 +40,14 @@ def newt_claim(lines):
 
 
 def pi_claim(lines):
-    """pi ends with `agent_end`; a final assistant stopReason of `stop` is its claim."""
-    for o in _records(lines):
-        if o.get("type") == "agent_end":
-            msgs = [m for m in o.get("messages") or [] if m.get("role") == "assistant"]
-            reason = msgs[-1].get("stopReason") if msgs else None
-            return reason == "stop", f"agent_end stopReason={reason}"
-    return None
+    """pi emits `agent_end` once per attempt (auto-retry re-runs the agent), so
+    the LAST one decides; its final assistant stopReason of `stop` is the claim."""
+    ends = [o for o in _records(lines) if o.get("type") == "agent_end"]
+    if not ends:
+        return None
+    msgs = [m for m in ends[-1].get("messages") or [] if m.get("role") == "assistant"]
+    reason = msgs[-1].get("stopReason") if msgs else None
+    return reason == "stop", f"agent_end stopReason={reason}"
 
 
 def codex_claim(lines):
@@ -97,6 +91,14 @@ def trial_row(harness, trial: Path):
     exc = (r.get("exception_info") or {}).get("exception_type")
     reward = ((r.get("verifier_result") or {}).get("rewards") or {}).get("reward")
     graded = isinstance(reward, (int, float)) and math.isfinite(reward)
+    # pi exits 0 when every model call failed (pi_log); Harbor then grades an
+    # untouched workspace. That is an apparatus error, not a model result.
+    infra = None
+    if harness == "pi":
+        log = trial / "agent" / "pi.txt"
+        infra = inference_failure(log.read_text(errors="replace").splitlines() if log.exists() else [])
+    state = "error" if infra else ("graded" if graded else "ungraded")
+    graded = graded and not infra
     claimed, claim_source = claim(harness, trial / "agent", exc)
     agent = r.get("agent_result") or {}
     tokens_in, tokens_out = agent.get("n_input_tokens"), agent.get("n_output_tokens")
@@ -125,6 +127,8 @@ def trial_row(harness, trial: Path):
         "result": bool(r),
         "exception": exc,
         "reward": reward,
+        "state": state,
+        "inference_failure": infra,
         "graded": graded,
         "resolved": graded and reward == 1.0,
         "claimed_done": claimed,
@@ -177,6 +181,7 @@ def summarize(cell, rows):
         "false_incompletes": sum(r["resolved"] for r in graded if r["claimed_done"] is False),
         "unrecoverable_claims": sum(r["claimed_done"] is None for r in rows),
         "exceptions": sum(r["exception"] is not None for r in rows),
+        "inference_errors": sum(r.get("state") == "error" for r in rows),
         "model_mismatches": sum(r["model_effective"] not in (None, cell["model"]) for r in rows),
         "tokens_in": (sum(known_in), len(known_in)),
         "tokens_out": (sum(known_out), len(known_out)),
@@ -192,8 +197,8 @@ def table(out: Path):
     trials = out / "trials.jsonl"
     rows = list(_records(trials.read_text().splitlines())) if trials.exists() else []
     lines = [
-        "| model | harness | expected / observed / graded | resolved | rate [95% Wilson] | claimed done | false completions | false incompletes | unrecoverable claims | exceptions | ran another model | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| model | harness | expected / observed / graded | resolved | rate [95% Wilson] | claimed done | false completions | false incompletes | unrecoverable claims | exceptions | inference errors (ungraded) | ran another model | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     # The last record per job wins: a cell skipped once and run later shows the run.
     cells = {c["job"]: c for c in _records((out / "cells.jsonl").read_text().splitlines())}
@@ -211,7 +216,7 @@ def table(out: Path):
         lines.append(
             f"| {cell['model']} | {cell['harness']} {cell.get('harness_version') or ''} "
             f"| {s['expected']} / {s['observed']} / {g} | {s['resolved']} | {rate} | {s['claimed']} | {fc} "
-            f"| {s['false_incompletes']} | {s['unrecoverable_claims']} | {s['exceptions']} | {s['model_mismatches']} | {tin} "
+            f"| {s['false_incompletes']} | {s['unrecoverable_claims']} | {s['exceptions']} | {s['inference_errors']} | {s['model_mismatches']} | {tin} "
             f"| {tout} | {med} / {s['agent_s_total']:.0f} | {tps} |"
         )
     print("\n".join(lines))
