@@ -208,3 +208,57 @@ fn an_ordinary_failure_is_not_an_absence() {
         "a plain non-zero exit must not be relabelled as an absence"
     );
 }
+
+/// #2273 — the FOURTH state: present on the host, no grant refused it, but
+/// the kernel did because the program lives outside the fs-read grant. brush
+/// renders that as exit 126 + `Permission denied`, the same text as a script
+/// the model forgot to `chmod +x`. Only the structured shape — 126, no
+/// denials, resolved path NOT permitted by the read scope — mints the refusal,
+/// and it speaks newt's denial vocabulary so the loop guidance recognises a
+/// blocker no edit can clear.
+#[test]
+fn kernel_refused_binary_outside_the_read_grant_is_a_named_denial() {
+    let present = present_host_binary();
+    let envelope = serde_json::json!({
+        "exit_code": 126,
+        "stdout": "",
+        "stderr": format!("brush: {present}: Permission denied\n"),
+    });
+    let msg = super::super::shell::kernel_refused_binary(
+        &present,
+        &envelope,
+        &crate::caveats::Scope::none(),
+    )
+    .expect("a 126 outside the read grant must produce a named refusal");
+    assert!(msg.starts_with("capability denied:"), "{msg}");
+    assert!(msg.contains(&present), "must name the binary: {msg}");
+    assert!(msg.contains("exit 126"), "{msg}");
+}
+
+/// An ordinary 126 INSIDE the grant is a repairable failure (a mode bit, a
+/// script without a shebang): it must fall through untouched, exactly like a
+/// structured denial must not be relabelled an absence.
+#[test]
+fn a_126_inside_the_read_grant_is_not_a_kernel_refusal() {
+    let present = present_host_binary();
+    let envelope = serde_json::json!({
+        "exit_code": 126,
+        "stdout": "",
+        "stderr": format!("brush: {present}: Permission denied\n"),
+    });
+    assert!(super::super::shell::kernel_refused_binary(
+        &present,
+        &envelope,
+        &crate::caveats::Scope::All,
+    )
+    .is_none());
+    assert!(
+        super::super::shell::kernel_refused_binary(
+            &present,
+            &denied_envelope(&present),
+            &crate::caveats::Scope::none(),
+        )
+        .is_none(),
+        "a structured denial is the leash's to render, not this"
+    );
+}

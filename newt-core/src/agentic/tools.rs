@@ -55,6 +55,9 @@ mod shell;
 mod tool_spinner_pty_test;
 use live_output::LiveOutputSession;
 pub use shell::venv_cmd_prefix;
+pub(crate) use shell::ABSENT_BINARY_MARKER;
+#[cfg(test)]
+pub(crate) use shell::{absent_binary_refusal, kernel_refused_binary};
 #[cfg(test)]
 use shell::{
     confined_dispatch_args, decode_shell_stream, denial_axis_label, denied_run_command_result,
