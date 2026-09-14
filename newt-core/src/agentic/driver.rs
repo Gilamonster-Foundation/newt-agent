@@ -57,8 +57,8 @@ use std::sync::Arc;
 
 use super::observation::ShellObservation;
 use super::{
-    chat_complete, ChatCtx, CodeSearch, CrewRunner, Embedder, NoMcp, PromptDisposition,
-    SemanticIndex,
+    chat_complete, working_memory_head, ChatCtx, CodeSearch, CrewRunner, Embedder, NoMcp,
+    PromptDisposition, ScratchpadStore, SemanticIndex,
 };
 use crate::{BackendKind, CompactionTriggerPolicy, MemMessage, TokenUsage};
 
@@ -334,6 +334,7 @@ struct HeadlessRuntimePosture {
     cognition: Option<crate::role_profile::Cognition>,
     tenacity: crate::tenacity::Tenacity,
     crew_runner: Option<Arc<dyn CrewRunner>>,
+    scratchpad: Option<Arc<dyn ScratchpadStore>>,
     compress_state: Arc<tokio::sync::Mutex<super::CompressState>>,
 }
 
@@ -343,6 +344,7 @@ impl HeadlessRuntimePosture {
             cognition: crate::cognition::effective_cognition(),
             tenacity: crate::tenacity::effective_tenacity(),
             crew_runner: None,
+            scratchpad: None,
             compress_state: Arc::new(tokio::sync::Mutex::new(super::CompressState::new())),
         }
     }
@@ -420,6 +422,16 @@ impl TurnDriver {
     #[must_use]
     pub fn with_crew_runner(mut self, runner: Arc<dyn CrewRunner>) -> Self {
         self.runtime.crew_runner = Some(runner);
+        self
+    }
+
+    /// Opt driven turns into the scratchpad (#2314): the `state_*` tools are
+    /// advertised and executed against `store`, and its `<state>` block leads
+    /// each turn's message[0] exactly as the TUI's does. The store is the only
+    /// state source — seed it before handing it in.
+    #[must_use]
+    pub fn with_scratchpad(mut self, store: Arc<dyn ScratchpadStore>) -> Self {
+        self.runtime.scratchpad = Some(store);
         self
     }
 
@@ -587,6 +599,22 @@ async fn run_one_turn(
     // future keeps learned usage on success, errors, and cancellation alike;
     // dropping the future releases the guard before the next worker starts.
     let mut compress_state = runtime.compress_state.lock().await;
+    // The working-memory head is ephemeral like the TUI's: it leads this turn's
+    // message[0] and never enters the driver transcript.
+    let messages: std::borrow::Cow<'_, [MemMessage]> =
+        match working_memory_head(runtime.scratchpad.as_deref(), false) {
+            None => messages.into(),
+            Some(head) => {
+                let mut turn = messages.to_vec();
+                match turn.first_mut() {
+                    Some(first) if first.role == crate::Role::System => {
+                        first.content = format!("{head}\n\n{}", first.content);
+                    }
+                    _ => turn.insert(0, MemMessage::system(head)),
+                }
+                turn.into()
+            }
+        };
     let ctx = ChatCtx {
         smart_harness: config.smart_harness.as_deref(),
         rewrites_history: config.context_manager.rewrites_history(),
@@ -601,7 +629,7 @@ async fn run_one_turn(
         // unless they opt into the prompt-comprehension ingress in the TUI.
         prompt_disposition: PromptDisposition::Act,
         prompt_intake: None,
-        messages,
+        messages: &messages,
         task,
         workspace: &config.workspace,
         // The driver is headless: the loop's inline progress prints are
@@ -610,14 +638,14 @@ async fn run_one_turn(
         // Cowork renders into the consumer's frame, not the scroller — no
         // markdown ANSI here (it would fight the host UI).
         markdown: false,
-        // Headless: no tool-offload (26.3) / scratchpad (26.4) — bit-for-bit.
+        // Headless: no tool-offload (26.3); scratchpad (26.4) only by opt-in.
         tool_offload: false,
         spill_store: None,
         disclosure: Some(&session_disclosure),
         completed_spill_renderer: None,
         compaction_store: None,
-        scratchpad: false,
-        scratchpad_store: None,
+        scratchpad: runtime.scratchpad.is_some(),
+        scratchpad_store: runtime.scratchpad.as_deref(),
         // #1280: borrow the consumer-supplied embedder + index into this turn's
         // searcher. `Some` only when the config carries retrieval — otherwise the
         // `code_search` tool is not advertised (unchanged headless behavior).
@@ -1073,38 +1101,155 @@ mod tests {
         assert!(outcome.features.crew && !outcome.features.code_search);
     }
 
-    struct CrewCallingOllama;
+    /// Ollama responder that calls one tool, then answers once its result is
+    /// in the conversation. Records every request body.
+    struct ToolCallingOllama {
+        name: &'static str,
+        arguments: serde_json::Value,
+        bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
 
-    impl Respond for CrewCallingOllama {
+    impl Respond for ToolCallingOllama {
         fn respond(&self, request: &Request) -> ResponseTemplate {
             let body: serde_json::Value =
                 serde_json::from_slice(&request.body).expect("chat request JSON");
             let has_result = body["messages"]
                 .as_array()
                 .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"));
+            self.bodies.lock().unwrap().push(body);
             if has_result {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "message": { "content": "crew result reviewed" }
+                    "message": { "content": "tool result reviewed" }
                 }))
             } else {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "message": {
                         "content": "",
                         "tool_calls": [{
-                            "function": {
-                                "name": "crew",
-                                "arguments": {
-                                    "task": "repair qualification harness",
-                                    "mode": "crew",
-                                    "crew": "nemotron-pair",
-                                    "verify": "just check"
-                                }
-                            }
+                            "function": { "name": self.name, "arguments": self.arguments }
                         }]
                     }
                 }))
             }
         }
+    }
+
+    /// #2314: an opted-in scratchpad is advertised, injected and executed, and
+    /// the model sees the same head the TUI builds. Seeded, because an empty
+    /// store injects no block and would pass the injection check vacuously.
+    #[tokio::test]
+    async fn an_opted_in_scratchpad_is_advertised_injected_and_executed() {
+        use crate::agentic::{working_memory_head, SessionScratchpadStore};
+        async fn drive(
+            store: Arc<SessionScratchpadStore>,
+        ) -> (Vec<serde_json::Value>, TurnOutcome) {
+            let server = MockServer::start().await;
+            let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+            Mock::given(method("POST"))
+                .and(path("/api/chat"))
+                .respond_with(ToolCallingOllama {
+                    name: "state_set",
+                    arguments: serde_json::json!({"key": "found", "value": "yes"}),
+                    bodies: bodies.clone(),
+                })
+                .mount(&server)
+                .await;
+            let mut driver = TurnDriver::new(cfg(&server.uri())).with_scratchpad(store);
+            driver.submit("remember what you find").expect("submit");
+            let TurnStatus::Completed(outcome) = pump_to_done(&mut driver).await else {
+                panic!("scratchpad turn did not complete");
+            };
+            assert!(
+                driver
+                    .transcript()
+                    .iter()
+                    .all(|m| m.role != crate::Role::System),
+                "the head is ephemeral: it never enters the driver transcript"
+            );
+            let bodies = bodies.lock().unwrap().clone();
+            (bodies, outcome)
+        }
+
+        let store = Arc::new(SessionScratchpadStore::default());
+        store.set("k", "v".to_string());
+        let expected_head = working_memory_head(Some(store.as_ref()), false).unwrap();
+        let (bodies, outcome) = drive(store.clone()).await;
+        let first = &bodies[0];
+        for tool in ["state_set", "state_get", "state_clear"] {
+            assert!(advertised_tool(&bodies, tool), "{tool} advertised");
+        }
+        assert_eq!(first["messages"][0]["role"], "system");
+        assert_eq!(first["messages"][0]["content"], expected_head.as_str());
+        assert!(expected_head.contains("<state>\nk: v\n</state>"));
+        assert!(outcome.features.scratchpad);
+        assert_eq!(
+            store.entries().get("found").map(String::as_str),
+            Some("yes"),
+            "the model's state_set executed against the supplied store"
+        );
+
+        // A second fresh store sees only its own seed, never the first run's.
+        let fresh = Arc::new(SessionScratchpadStore::default());
+        fresh.set("k", "v".to_string());
+        let (bodies, _) = drive(fresh).await;
+        assert_eq!(bodies[0]["messages"][0]["content"], expected_head.as_str());
+    }
+
+    /// #2314: when the transcript already opens with a system prompt, the head
+    /// leads THAT message exactly as the TUI's does — head, blank line, prompt —
+    /// rather than adding a system message or touching the stored transcript.
+    #[tokio::test]
+    async fn the_scratchpad_head_leads_an_existing_system_message() {
+        use crate::agentic::{working_memory_head, SessionScratchpadStore};
+        const PROMPT: &str = "You are the headless solver.\n\nKeep going.";
+        async fn drive(store: Option<Arc<SessionScratchpadStore>>) -> Vec<serde_json::Value> {
+            let server = MockServer::start().await;
+            let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+            Mock::given(method("POST"))
+                .and(path("/api/chat"))
+                .respond_with(CapturingOllama {
+                    bodies: bodies.clone(),
+                    reply: "done".into(),
+                })
+                .mount(&server)
+                .await;
+            let mut driver =
+                TurnDriver::with_transcript(cfg(&server.uri()), vec![MemMessage::system(PROMPT)]);
+            if let Some(store) = store {
+                driver = driver.with_scratchpad(store);
+            }
+            driver.submit("remember what you find").expect("submit");
+            let TurnStatus::Completed(_) = pump_to_done(&mut driver).await else {
+                panic!("turn did not complete");
+            };
+            assert_eq!(
+                driver.transcript()[0],
+                MemMessage::system(PROMPT),
+                "the stored prompt survives intact; the head is per-turn only"
+            );
+            let first = bodies.lock().unwrap()[0].clone();
+            first["messages"].as_array().expect("messages").clone()
+        }
+        let system_count = |messages: &[serde_json::Value]| {
+            messages.iter().filter(|m| m["role"] == "system").count()
+        };
+
+        let store = Arc::new(SessionScratchpadStore::default());
+        store.set("k", "v".to_string());
+        let head = working_memory_head(Some(store.as_ref()), false).unwrap();
+        let with = drive(Some(store)).await;
+        let without = drive(None).await;
+
+        assert_eq!(with[0]["role"], "system");
+        assert_eq!(
+            with[0]["content"].as_str(),
+            Some(format!("{head}\n\n{PROMPT}").as_str())
+        );
+        assert_eq!(without[0]["content"].as_str(), Some(PROMPT));
+        // The loop adds its own active-prompt card as a further system message,
+        // so "one system message" is measured against the same run without the
+        // head: the head must add none.
+        assert_eq!(system_count(&with), system_count(&without));
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1152,7 +1297,16 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(CrewCallingOllama)
+            .respond_with(ToolCallingOllama {
+                name: "crew",
+                arguments: serde_json::json!({
+                    "task": "repair qualification harness",
+                    "mode": "crew",
+                    "crew": "nemotron-pair",
+                    "verify": "just check"
+                }),
+                bodies: Arc::default(),
+            })
             .mount(&server)
             .await;
 
@@ -1199,7 +1353,7 @@ mod tests {
             panic!("crew turn did not complete")
         };
         assert_eq!(outcome.error, None);
-        assert_eq!(outcome.reply, "crew result reviewed");
+        assert_eq!(outcome.reply, "tool result reviewed");
         assert_eq!(
             dispatches.lock().unwrap().as_slice(),
             &[CrewDispatch {

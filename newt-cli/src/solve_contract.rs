@@ -65,6 +65,8 @@ pub struct ContractInputs<'a> {
     /// What the turn's constructed context carried; `None` when no turn
     /// outcome exists to read it from (the `receipt` stanza is then omitted).
     pub features: Option<InstantiatedFeatures>,
+    /// Content id of the explicit scratchpad seed, when the run supplied one.
+    pub scratchpad_seed: Option<&'a str>,
 }
 
 /// How a turn ended, decided ONCE (#2212, corrected by #2218).
@@ -261,8 +263,13 @@ pub fn conditional_stanza(
 /// * `unavailable` — `newt solve` can supply it, but did not for this run;
 /// * `requested` — asked for, instantiation not yet established.
 ///
-/// A feature that did not participate carries a `reason`.
-pub fn feature_receipt(f: InstantiatedFeatures) -> serde_json::Value {
+/// A feature that did not participate carries a `reason`. An instantiated
+/// scratchpad also names its `scope` and `seed`: solve's only state source is
+/// the explicit seed, so the scope is always `fresh`.
+pub fn feature_receipt(
+    f: InstantiatedFeatures,
+    scratchpad_seed: Option<&str>,
+) -> serde_json::Value {
     let entry = |instantiated: bool, state: &str, reason: &str| {
         if instantiated {
             serde_json::json!({ "state": "instantiated" })
@@ -270,11 +277,17 @@ pub fn feature_receipt(f: InstantiatedFeatures) -> serde_json::Value {
             serde_json::json!({ "state": state, "reason": reason })
         }
     };
-    serde_json::json!({ "features": {
-        "scratchpad": entry(f.scratchpad, "unsupported", "headless solve has no scratchpad opt-in"),
+    let mut receipt = serde_json::json!({ "features": {
+        "scratchpad": entry(f.scratchpad, "unavailable", "no --scratchpad-state was supplied"),
         "code_search": entry(f.code_search, "unsupported", "headless solve builds no retrieval index"),
         "crew": entry(f.crew, "unavailable", "crew is not enabled for this run"),
-    }})
+    }});
+    if f.scratchpad {
+        let scratchpad = &mut receipt["features"]["scratchpad"];
+        conditional_stanza(scratchpad, "scope", scratchpad_seed.map(|_| "fresh"));
+        conditional_stanza(scratchpad, "seed", scratchpad_seed);
+    }
+    receipt
 }
 
 /// Build THE contract record — exactly the `contract_version: "1"` fields.
@@ -313,7 +326,8 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         "timing": timing,
     });
     conditional_stanza(&mut record, "model_digest", i.model_digest);
-    conditional_stanza(&mut record, "receipt", i.features.map(feature_receipt));
+    let receipt = i.features.map(|f| feature_receipt(f, i.scratchpad_seed));
+    conditional_stanza(&mut record, "receipt", receipt);
     record
 }
 
@@ -656,6 +670,7 @@ mod tests {
                 crew: true,
                 ..InstantiatedFeatures::default()
             }),
+            scratchpad_seed: None,
         }
     }
 
@@ -865,10 +880,24 @@ mod tests {
         assert_eq!(
             parsed["receipt"],
             serde_json::json!({"features": {
-                "scratchpad": {"state": "unsupported", "reason": "headless solve has no scratchpad opt-in"},
+                "scratchpad": {"state": "unavailable", "reason": "no --scratchpad-state was supplied"},
                 "code_search": {"state": "unsupported", "reason": "headless solve builds no retrieval index"},
                 "crew": {"state": "instantiated"},
             }})
+        );
+    }
+
+    /// An opted-in scratchpad names what a reader needs to reproduce it; the
+    /// seed id is the caller's, carried verbatim.
+    #[test]
+    fn an_instantiated_scratchpad_names_its_fresh_scope_and_seed() {
+        let f = InstantiatedFeatures {
+            scratchpad: true,
+            ..InstantiatedFeatures::default()
+        };
+        assert_eq!(
+            feature_receipt(f, Some("bseed"))["features"]["scratchpad"],
+            serde_json::json!({"state": "instantiated", "scope": "fresh", "seed": "bseed"})
         );
     }
 
