@@ -4,11 +4,11 @@ use crate::completed_spill::CompletedSpillArchive;
 use crate::spill_view::{SpillStream, SpillView};
 use crossterm::cursor::{MoveToColumn, MoveUp};
 use crossterm::queue;
-use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+use crossterm::style::{Color, ContentStyle, Print, ResetColor, SetForegroundColor, StyledContent};
 use crossterm::terminal::{Clear, ClearType};
 use newt_core::{LiveToolOutput, ToolOutputStream};
 // #1640: CompletedSpillRenderer trait for Rich TUI completed spill rendering
-use newt_core::agentic::CompletedSpillRenderer;
+use newt_core::agentic::{write_file_change_row, CompletedSpillRenderer, FileChangePresentation};
 use std::io::Write;
 #[cfg(any(unix, test))]
 use std::sync::atomic::AtomicBool;
@@ -21,6 +21,7 @@ const LINE_CHARS: usize = 4_096;
 struct RenderState {
     geometry: Box<dyn Fn() -> Option<(usize, usize)> + Send + Sync>,
     view: Option<SpillView>,
+    file_change: Option<RichFileChange>,
     columns: usize,
     collapsed_rows: usize,
     max_rows: usize,
@@ -28,6 +29,31 @@ struct RenderState {
     drawable: bool,
     color: bool,
     generation: Option<u64>,
+}
+
+struct RichFileChange {
+    change: Arc<FileChangePresentation>,
+    prefix: String,
+    suffix: String,
+    rows: Vec<Vec<StyledContent<String>>>,
+}
+
+impl RichFileChange {
+    fn reproject(&mut self, columns: usize) -> String {
+        // SpillView reserves its gutter and the terminal's final column.
+        self.rows = self
+            .change
+            .display_rows(&self.prefix, &self.suffix, columns.saturating_sub(3));
+        self.rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|run| run.content().as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 struct OutputState {
@@ -200,6 +226,7 @@ impl LiveSpillRenderer {
             state: Arc::new(Mutex::new(RenderState {
                 geometry: Box::new(geometry),
                 view: None,
+                file_change: None,
                 columns,
                 collapsed_rows,
                 max_rows,
@@ -491,6 +518,7 @@ impl LiveToolOutput for LiveSpillRenderer {
         );
         view.resize(state.columns, state.collapsed_rows, state.max_rows);
         state.view = Some(view);
+        state.file_change = None;
         state.generation = Some(generation);
     }
 
@@ -546,6 +574,7 @@ impl LiveToolOutput for LiveSpillRenderer {
         // the live buffer; an abandoned generation is NOT retainable. Kept out of
         // v1 to preserve the single-owner hand-off below unchanged.
         state.view = None;
+        state.file_change = None;
         state.generation = None;
         drop(state);
         erase_generation(&self.output, &self.abandoned_through, generation, columns);
@@ -560,6 +589,7 @@ impl LiveToolOutput for LiveSpillRenderer {
         if let Some(mut state) = self.try_lock_state() {
             if state.generation == Some(generation) {
                 state.view = None;
+                state.file_change = None;
                 state.generation = None;
             }
         }
@@ -580,6 +610,52 @@ fn fixed_frame_lines(view: &SpillView, completed: bool) -> Vec<String> {
         lines.push(if completed { "⎴" } else { "▒" }.to_string());
     }
     lines.push(frame.bottom.line);
+    lines
+}
+
+fn fixed_file_change_styles(
+    view: &SpillView,
+    change: &RichFileChange,
+) -> Vec<Vec<StyledContent<String>>> {
+    let frame = view.completed_frame();
+    let dim = ContentStyle {
+        foreground_color: Some(
+            newt_core::tty::theme::active().color(newt_core::tty::theme::Role::Dim),
+        ),
+        ..ContentStyle::default()
+    };
+    let plain = |text: String| vec![dim.apply(text)];
+    let mut lines = vec![plain(frame.top.line)];
+    for row in frame.content {
+        let source = row.source_line.and_then(|index| change.rows.get(index));
+        let gutter = format!("{} ", row.gutter.glyph());
+        let Some(source) = source.filter(|source| {
+            row.line == format!("{gutter}{}", row.text)
+                && source
+                    .iter()
+                    .map(|run| run.content().as_str())
+                    .collect::<String>()
+                    .starts_with(&row.text)
+        }) else {
+            lines.push(plain(row.line));
+            continue;
+        };
+        let mut remaining = row.text.chars().count();
+        let mut styled = plain(gutter);
+        for run in source {
+            if remaining == 0 {
+                break;
+            }
+            let text: String = run.content().chars().take(remaining).collect();
+            remaining -= text.chars().count();
+            styled.push(run.style().apply(text));
+        }
+        lines.push(styled);
+    }
+    while lines.len() < view.visible_rows() + 1 {
+        lines.push(plain("⎴".into()));
+    }
+    lines.push(plain(frame.bottom.line));
     lines
 }
 
@@ -617,8 +693,15 @@ fn sync_geometry(state: &mut RenderState) -> bool {
         state.columns = columns;
         state.collapsed_rows = collapsed_rows;
         state.max_rows = max_rows;
+        let replacement = state
+            .file_change
+            .as_mut()
+            .map(|change| change.reproject(columns));
         if let Some(view) = state.view.as_mut() {
             view.resize(columns, collapsed_rows, max_rows);
+            if let Some(text) = replacement {
+                view.replace_completed_text(&text);
+            }
         }
     }
     state.drawable = true;
@@ -681,10 +764,15 @@ fn paint_generation(
                 }),
                 state.color,
                 state.columns,
+                state
+                    .file_change
+                    .as_ref()
+                    .zip(state.view.as_ref())
+                    .map(|(change, view)| fixed_file_change_styles(view, change)),
             )
         })
     };
-    let Some((lines, color, columns)) = snapshot else {
+    let Some((lines, color, columns, styles)) = snapshot else {
         return;
     };
     if is_abandoned(abandoned_through, generation) {
@@ -710,14 +798,18 @@ fn paint_generation(
     if color {
         let _ = queue!(&mut batch, SetForegroundColor(Color::DarkGrey));
     }
-    for line in &lines {
-        let _ = queue!(
-            &mut batch,
-            MoveToColumn(0),
-            Clear(ClearType::CurrentLine),
-            Print(line),
-            Print("\r\n")
-        );
+    for (index, line) in lines.iter().enumerate() {
+        let _ = queue!(&mut batch, MoveToColumn(0), Clear(ClearType::CurrentLine),);
+        if let Some(styled) = styles
+            .as_ref()
+            .filter(|_| color)
+            .and_then(|rows| rows.get(index))
+        {
+            let _ = write_file_change_row(&mut batch, styled);
+        } else {
+            let _ = queue!(&mut batch, Print(line));
+        }
+        let _ = queue!(&mut batch, Print("\r\n"));
     }
     if color {
         let _ = queue!(&mut batch, ResetColor);
@@ -899,20 +991,20 @@ fn physical_rows(text: &str, columns: usize) -> usize {
 /// every completed paint and scroll repaint silently no-opped.)
 const COMPLETED_GENERATION: u64 = u64::MAX;
 
-impl CompletedSpillRenderer for LiveSpillRenderer {
-    fn retain_completed(&self, output: &str) -> Option<u64> {
-        self.completed_archive
-            .as_ref()
-            .map(|archive| archive.retain(output))
-    }
-
+impl LiveSpillRenderer {
     /// Render a completed tool result as an interactive spill viewport.
     ///
     /// Reuses the live SpillView frame logic — scrolling, expanding, and
     /// editor-mode navigation all ride the existing `SpillInput` routing,
     /// because the completed view IS `state.view`. Bounded to max 50% of the
     /// terminal height so a single spill can't flood a tmux.
-    fn render_completed(&self, output: &str, width: usize, max_height: usize) -> usize {
+    fn show_completed(
+        &self,
+        output: &str,
+        width: usize,
+        max_height: usize,
+        mut change: Option<RichFileChange>,
+    ) -> usize {
         {
             let mut state = self.lock_state();
             // Never stomp a LIVE viewport: the live hand-off (`finish`) clears
@@ -929,7 +1021,13 @@ impl CompletedSpillRenderer for LiveSpillRenderer {
             }
             let mut view =
                 SpillView::with_limits(state.columns, max_height.max(1), HISTORY_LINES, LINE_CHARS);
-            view.push_stream_bytes(SpillStream::Stdout, output.as_bytes());
+            let rich_text = change
+                .as_mut()
+                .map(|change| change.reproject(state.columns));
+            view.push_stream_bytes(
+                SpillStream::Stdout,
+                rich_text.as_deref().unwrap_or(output).as_bytes(),
+            );
             view.finish();
             // Bounded by the caller's budget AND 50% of the terminal height.
             let (_, terminal_rows) = (state.geometry)().unwrap_or((width, 24));
@@ -939,6 +1037,7 @@ impl CompletedSpillRenderer for LiveSpillRenderer {
                 .clamp(1, max_allowed.min(max_height.max(1)));
             view.resize(state.columns, rows_to_show, max_allowed);
             state.view = Some(view);
+            state.file_change = change;
             state.generation = Some(COMPLETED_GENERATION);
         }
         paint_generation(
@@ -963,6 +1062,47 @@ impl CompletedSpillRenderer for LiveSpillRenderer {
             .map(|line| physical_rows(line, columns))
             .sum()
     }
+}
+
+impl CompletedSpillRenderer for LiveSpillRenderer {
+    fn retain_completed(&self, output: &str) -> Option<u64> {
+        self.completed_archive
+            .as_ref()
+            .map(|archive| archive.retain(output))
+    }
+
+    fn render_completed(&self, output: &str, width: usize, max_height: usize) -> usize {
+        self.show_completed(output, width, max_height, None)
+    }
+
+    fn render_file_change(
+        &self,
+        raw_output: &str,
+        output: &str,
+        change: Arc<FileChangePresentation>,
+        width: usize,
+        max_height: usize,
+    ) -> usize {
+        let surroundings = self
+            .lock_state()
+            .color
+            .then(|| change.surrounding_display_text(raw_output, output))
+            .flatten();
+        let Some((prefix, suffix)) = surroundings else {
+            return self.render_completed(output, width, max_height);
+        };
+        self.show_completed(
+            output,
+            width,
+            max_height,
+            Some(RichFileChange {
+                change,
+                prefix,
+                suffix,
+                rows: Vec::new(),
+            }),
+        )
+    }
 
     /// Whether a COMPLETED viewport is on screen. A live viewport does not
     /// count — its lifecycle belongs to `LiveToolOutput`, not to dismissal.
@@ -981,6 +1121,7 @@ impl CompletedSpillRenderer for LiveSpillRenderer {
                 return;
             }
             state.view = None;
+            state.file_change = None;
             state.generation = None;
         }
         let mut output = self
@@ -1004,6 +1145,7 @@ impl CompletedSpillRenderer for LiveSpillRenderer {
             // the same stale-width hazard `Ephemeral::erase` documents.
             let _ = sync_geometry(&mut state);
             state.view = None;
+            state.file_change = None;
             state.generation = None;
             state.columns
         };

@@ -688,9 +688,9 @@ pub struct TuiConfig {
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
 
-    /// Total inference request timeout in seconds (default: 120). This is the
-    /// wall-clock budget for the model to generate a complete response —
-    /// large models on a busy DGX may need the full window.
+    /// Inference timeout in seconds (default: 120). Single-response requests
+    /// use it as a total bound; streamed generation uses it as the maximum
+    /// idle gap between chunks.
     #[serde(default = "default_inference_timeout_secs")]
     pub inference_timeout_secs: u64,
 

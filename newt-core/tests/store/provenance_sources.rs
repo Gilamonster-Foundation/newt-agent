@@ -262,3 +262,77 @@ fn append_refuses_a_derived_row_that_also_claims_tool_activity() {
         .verify_chain(&id)
         .expect("a refused append must not have written a bricking row");
 }
+
+/// #1786 Phase C: the read path carries the provenance edge, and refuses
+/// non-canonical bytes rather than handing back a citation the record cannot
+/// carry. Same discipline as the `events` / `phantom_reaches` columns, plus a
+/// canonical-form check those two do not need — these bytes are hashed, so a
+/// merely-parseable row is already a chain violation.
+#[test]
+fn sources_read_back_through_the_public_api_and_garbage_refuses() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store.create("read-path", None).unwrap();
+    store.append_turn(&id, "u1", "a1").unwrap();
+
+    let cited = "b".repeat(64);
+    store
+        .append_turn_full(
+            &id,
+            "",
+            "summary",
+            &[],
+            &[],
+            std::slice::from_ref(&cited),
+            None,
+            None,
+        )
+        .unwrap();
+
+    // `load` — the whole-record read.
+    let rec = store.load(&id).unwrap();
+    assert_eq!(
+        rec.turns[0].sources,
+        Vec::<String>::new(),
+        "a witnessed turn derives from nothing"
+    );
+    assert_eq!(
+        rec.turns[1].sources,
+        vec![cited.clone()],
+        "the derived row's citation must survive the read path"
+    );
+
+    // `load_turn` — the by-address read used by memory_fetch — must agree.
+    let seq: i64 = raw(root.path())
+        .query_row(
+            "SELECT MAX(seq) FROM turns WHERE conversation_id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let one = store.load_turn(&id, seq).unwrap().expect("turn at seq");
+    assert_eq!(
+        one.sources,
+        vec![cited],
+        "one turn read by address must report the same citation as the record read"
+    );
+
+    // Non-canonical bytes (unsorted, out-of-band) refuse on BOTH read paths.
+    let unsorted = format!("[\"{}\",\"{}\"]", "c".repeat(64), "a".repeat(64));
+    raw(root.path())
+        .execute(
+            "UPDATE turns SET sources = ?2 WHERE conversation_id = ?1 AND seq = ?3",
+            rusqlite::params![&id, &unsorted, seq],
+        )
+        .unwrap();
+    for err in [
+        store.load(&id).unwrap_err().to_string(),
+        store.load_turn(&id, seq).unwrap_err().to_string(),
+    ] {
+        assert!(
+            err.contains("sources") && err.contains("refusing to load garbage"),
+            "a non-canonical sources column must refuse loudly: {err}"
+        );
+    }
+}

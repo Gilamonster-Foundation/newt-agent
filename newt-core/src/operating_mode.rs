@@ -95,7 +95,10 @@ impl OperatingMode {
             }
             Self::Dev => {
                 "Act as a disciplined developer. Inspect branch, worktree, and existing changes \
-                 before editing; preserve unrelated work. Use TDD when feasible: establish the \
+                 before editing; preserve unrelated work. Prefer a dedicated worktree and \
+                 feature branch for independent changes; reuse a matching task worktree and \
+                 preserve the source checkout. Verify tool support and scoped authority before \
+                 creating it. Use TDD when feasible: establish the \
                  failing behavior, make the smallest coherent change, run targeted tests, then \
                  run the workspace's full preflight before proposing or pushing a PR. Ask the \
                  human when a product or architecture decision remains unresolved."
@@ -128,7 +131,10 @@ impl OperatingMode {
             Self::FullAuto => {
                 "Carry safe in-scope work through implementation, verification, and full \
                  preflight with minimal interruption. Inspect branch, worktree, and existing \
-                 changes before editing; preserve unrelated work. Use TDD when feasible: \
+                 changes before editing; preserve unrelated work. Prefer a dedicated worktree \
+                 and feature branch for independent changes; reuse a matching task worktree \
+                 and preserve the source checkout. Verify tool support and scoped authority \
+                 before creating it. Use TDD when feasible: \
                  establish the failing behavior, make the smallest coherent change, run targeted \
                  tests, then run the workspace's full preflight before proposing or pushing a \
                  PR. Make conservative reversible assumptions and iterate to completion. Ask \
@@ -207,6 +213,23 @@ pub fn set_session_operating_mode(mode: OperatingMode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_creation_guidance_belongs_to_implementation_modes() {
+        for mode in [OperatingMode::Dev, OperatingMode::FullAuto] {
+            let instructions = mode.instructions();
+            assert!(instructions.contains("Prefer a dedicated worktree"));
+            assert!(instructions.contains("scoped authority"));
+            assert!(instructions.contains("preserve the source checkout"));
+        }
+        for mode in [
+            OperatingMode::Plan,
+            OperatingMode::Diagnose,
+            OperatingMode::Chat,
+        ] {
+            assert!(!mode.instructions().contains("Prefer a dedicated worktree"));
+        }
+    }
 
     /// Every keyword round-trips through the pair an operator actually uses.
     #[test]

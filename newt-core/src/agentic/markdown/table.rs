@@ -8,8 +8,8 @@
 //! the renderer this runs color-on only (color-off returns source verbatim a
 //! layer up), so there is no ASCII-border fallback path here.
 
-use super::emitter::FADE;
-use super::inline::{render_cells, sgr_fg, Cell, Style, RESET};
+use super::emitter::fade;
+use super::inline::{render_cells, Cell, Style, RESET};
 use super::width::ch_width;
 use pulldown_cmark::Alignment;
 
@@ -40,7 +40,7 @@ fn vis_width(cells: &[Cell]) -> usize {
 
 /// Wrap a border fragment in the dim hue.
 fn dim(s: &str) -> String {
-    format!("{}{s}{RESET}", sgr_fg(FADE))
+    format!("{}{s}{RESET}", fade())
 }
 
 /// Truncate cells to `width` display columns, appending `…` when cut. Returns

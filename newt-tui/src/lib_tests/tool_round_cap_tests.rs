@@ -77,6 +77,7 @@ fn openai_loop_recovers_from_context_window_400() {
         .enable_all()
         .build()
         .unwrap();
+    let mut requests = Vec::new();
     let (result, calls_made, recovered_window, accepted_observed, persisted) = rt.block_on(async {
         let server = MockServer::start().await;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -89,7 +90,11 @@ fn openai_loop_recovers_from_context_window_400() {
             .mount(&server)
             .await;
 
-        let messages = msgs();
+        // #2268: retrying an overflow requires a smaller projection. Supply
+        // removable history while keeping the operator prompt intact.
+        let mut messages = msgs();
+        messages.insert(1, MemMessage::user("historical context ".repeat(500)));
+        messages.insert(2, MemMessage::assistant("earlier reasoning ".repeat(500)));
         let caveats = Caveats::top();
         let today = "2026-08-01";
         let mut cap_cache = probe::load_cache();
@@ -210,6 +215,7 @@ fn openai_loop_recovers_from_context_window_400() {
                 "cw-test-model",
             ))
             .map(|e| (e.context_window, e.max_ok_input, e.safe_context));
+        requests = server.received_requests().await.unwrap_or_default();
         (
             out,
             calls.load(Ordering::SeqCst),
@@ -229,6 +235,16 @@ fn openai_loop_recovers_from_context_window_400() {
         calls_made >= 2,
         "expected at least one retry after the 400, got {calls_made} call(s)"
     );
+    assert!(requests.len() >= 2);
+    let rejected: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let recovered: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert!(
+        recovered["messages"].to_string().len() < rejected["messages"].to_string().len(),
+        "recovery must shrink the rejected request before retrying"
+    );
+    assert!(recovered["messages"].to_string().contains("do the thing"));
+    assert!(recovered["tools"].is_array());
+    assert_eq!(recovered["tools"], rejected["tools"]);
     assert_eq!(recovered_window, Some(1_000_000));
     assert!(accepted_observed, "the successful retry must emit Accepted");
     // Persistence (issue #223 req 4): the full window and its generic 80%

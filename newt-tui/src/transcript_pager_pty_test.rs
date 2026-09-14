@@ -53,6 +53,7 @@ fn synthetic_turns(n: usize) -> Vec<newt_core::ConversationTurn> {
                 Some(12),
             )],
             phantom_reaches: Vec::new(),
+            sources: Vec::new(),
             tokens_in: None,
             tokens_out: None,
         })

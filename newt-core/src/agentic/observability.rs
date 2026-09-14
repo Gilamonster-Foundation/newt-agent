@@ -2,7 +2,7 @@
 //! TYPED signals `newt solve` needs to emit the observability-contract record
 //! the external evaluator consumes.
 //!
-//! Two signal families live here, both STRUCTURAL (never string-matched):
+//! Dispatch classes and parse signals are decided at their observation sites:
 //!
 //! - **Dispatch-error classification** ([`ErrorClass`] / [`DispatchError`]):
 //!   the contract's `outcome` taxonomy (`model_error` / `transport_error` /
@@ -13,6 +13,8 @@
 //!   read that text), and recovered at the driver boundary by walking the
 //!   anyhow chain ([`error_class`]). Grepping error text for `"timeout"` is
 //!   exactly the string heuristic the ADR retires.
+//!   A recognized server capacity-rejection body is `context_exceeded`,
+//!   classified by the shared context-overflow detector before retry policy.
 //!
 //! - **Tool-call parse status** ([`ParseSignal`] / [`round_parse_signal`]):
 //!   per-round evidence for the evaluator's artifact-vs-weakness split
@@ -100,6 +102,14 @@ pub fn reasoning_overflow_signature(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BehaviorSignal {
+    /// A rejected request and the strictly smaller projection selected next.
+    /// `None` means recovery stopped; attempts count within the user turn.
+    ContextExceeded {
+        round: usize,
+        attempt: u32,
+        estimated_tokens: usize,
+        projected_tokens: Option<usize>,
+    },
     /// The backend's finish reason for every parsed Chat Completions response.
     /// `None` is retained rather than invented when a compatible server omits
     /// the field.
@@ -155,11 +165,14 @@ pub enum ErrorClass {
     /// that could not be decoded. A real attempt — it carries capability
     /// signal (the model/stack answered and answered badly).
     Model,
+    /// The server rejected the context. This request needs a smaller
+    /// projection; unchanged transport retries cannot make it fit.
+    ContextExceeded,
     /// The backend could not be reached: connection refused/reset, DNS,
     /// or a connect-phase timeout. NOT a real attempt.
     Transport,
-    /// The request deadline elapsed AFTER the backend was reached (reqwest's
-    /// total-request timeout — `inference_timeout_secs`).
+    /// The configured bound elapsed AFTER the backend was reached: a total
+    /// request timeout or a streamed response's idle read timeout.
     Timeout,
     /// The failure is on our side of the wire (a malformed request we built)
     /// — or, at the boundary, any error carrying no [`DispatchError`] at all.
@@ -169,8 +182,8 @@ pub enum ErrorClass {
 /// Classify a typed reqwest error into the contract taxonomy. Order matters:
 /// a connect-phase timeout reports BOTH `is_connect` and `is_timeout`, and
 /// the contract files "could not reach the model" under `transport_error`,
-/// so the connect check wins; a plain `is_timeout` is then the post-connect
-/// request deadline. Everything else that isn't agent-side (`is_builder`) is
+/// so the connect check wins; a plain `is_timeout` is then a post-connect
+/// request or idle-read bound. Everything else that isn't agent-side (`is_builder`) is
 /// a wire-level failure mid-exchange → transport.
 pub fn classify_reqwest(e: &reqwest::Error) -> ErrorClass {
     if e.is_connect() {
@@ -213,13 +226,39 @@ impl DispatchError {
         }
     }
 
-    /// Wrap a non-success HTTP status: the backend was reached and answered
-    /// — a `model_error` structurally, whatever the body text says. `msg` is
+    /// Wrap a failure while reading an already accepted response stream.
+    /// Application decoding happens after the byte read, so body/decode flags
+    /// here describe the transport; only an elapsed read timeout is `Timeout`.
+    pub fn response_read(prefix: &str, e: reqwest::Error) -> Self {
+        Self {
+            class: if e.is_timeout() {
+                ErrorClass::Timeout
+            } else {
+                ErrorClass::Transport
+            },
+            msg: format!("{prefix}: {e}"),
+        }
+    }
+
+    /// Refuse a measured over-budget candidate before generation dispatch.
+    pub fn context_exceeded(message: impl Into<String>) -> Self {
+        Self {
+            class: ErrorClass::ContextExceeded,
+            msg: message.into(),
+        }
+    }
+
+    /// Wrap a non-success HTTP status: recognized context rejection is
+    /// `context_exceeded`; other backend rejections are `model_error`. `msg` is
     /// the caller's fully-formatted historical string (`"Ollama {status}:
     /// {text}"` / `"inference endpoint {status}: {text}"`).
     pub fn http_status(msg: String) -> Self {
         Self {
-            class: ErrorClass::Model,
+            class: if super::cw_overflow::is_context_overflow(&msg) {
+                ErrorClass::ContextExceeded
+            } else {
+                ErrorClass::Model
+            },
             msg,
         }
     }

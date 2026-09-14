@@ -27,6 +27,59 @@
 //! parser is whole-body rather than incremental — so this is new code rather
 //! than a copy wearing a new name.
 
+#[path = "openai_sse_response.rs"]
+mod response;
+use response::StrictResponse;
+
+/// Whether a complete observed server error is present in an error chain.
+/// Prefer that evidence over a later body-read failure; parsing failures alone
+/// do not establish that the server rejected the request.
+pub fn is_provider_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<response::ProviderError>())
+}
+
+/// Interpret one provider response without replacing its observed wire bytes.
+///
+/// SSE uses the display parser's framing plus strict completion validation:
+/// DONE, finish reason, stable complete tool calls, and intact JSON frames.
+/// Complete JSON from a server ignoring `stream: true` is decoded once as-is.
+/// The caller must record the original bytes before interpreting this value.
+pub fn decode_response(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
+    let (body, invalid_utf8) = match std::str::from_utf8(bytes) {
+        Ok(body) => (body, false),
+        Err(error) => (std::str::from_utf8(&bytes[..error.valid_up_to()])?, true),
+    };
+    if body.trim_start().starts_with(['{', '[']) {
+        let json: serde_json::Value = serde_json::from_str(body)?;
+        return if response::is_error(&json) {
+            Err(response::provider_error(&json))
+        } else {
+            anyhow::ensure!(!invalid_utf8, "OpenAI response has invalid UTF-8");
+            Ok(json)
+        };
+    }
+    let mut accumulator = SseAccumulator {
+        strict: Some(StrictResponse::default()),
+        ..Default::default()
+    };
+    if invalid_utf8 {
+        accumulator
+            .strict
+            .as_mut()
+            .expect("decode_response enables strict validation")
+            .problem("OpenAI stream has invalid UTF-8");
+    }
+    let _ = accumulator.feed(body);
+    accumulator.flush_line();
+    accumulator
+        .strict
+        .take()
+        .expect("decode_response enables strict validation")
+        .finish(accumulator.round)
+}
+
 /// One display-affecting thing a chunk produced.
 ///
 /// Two arms and no more, because those are the two channels a turn shows: the
@@ -70,12 +123,29 @@ pub struct SseAccumulator {
     /// silently drops the halves.
     line_buf: String,
     round: OpenAiStreamRound,
+    strict: Option<StrictResponse>,
 }
 
 impl SseAccumulator {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Track actual provider error envelopes during optional display streaming.
+    /// Display retains its existing tolerant completion behavior; callers can
+    /// still distinguish an observed rejection from ordinary assistant text.
+    pub(crate) fn new_with_provider_errors() -> Self {
+        Self {
+            strict: Some(StrictResponse::default()),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn has_provider_error(&self) -> bool {
+        self.strict
+            .as_ref()
+            .is_some_and(|strict| strict.provider_error.is_some())
     }
 
     /// True once `data: [DONE]` has been seen.
@@ -101,18 +171,35 @@ impl SseAccumulator {
     /// last event applied, which is how a short reply can otherwise vanish.
     #[must_use]
     pub fn finish(mut self) -> OpenAiStreamRound {
+        self.flush_line();
+        self.round
+    }
+
+    /// Flush the final frame and retain any observed provider rejection.
+    pub(crate) fn finish_with_error(mut self) -> (OpenAiStreamRound, Option<anyhow::Error>) {
+        self.flush_line();
+        let error = self.strict.and_then(|strict| strict.provider_error);
+        (self.round, error)
+    }
+
+    fn flush_line(&mut self) {
         if !self.line_buf.is_empty() {
             let line = std::mem::take(&mut self.line_buf);
             let mut actions = Vec::new();
             self.apply_line(line.trim_end_matches(['\n', '\r']), &mut actions);
         }
-        self.round
     }
 
     fn apply_line(&mut self, line: &str, actions: &mut Vec<StreamAction>) {
-        // Blank lines separate events and `event:` lines are redundant here —
-        // the payload carries everything. Anything that is not `data:` is not
-        // ours to interpret.
+        if let Some(strict) = self.strict.as_mut() {
+            if line.is_empty() {
+                strict.event(None);
+            } else if let Some(event) = line.strip_prefix("event:") {
+                strict.event(Some(event.trim()));
+            }
+        }
+        // Display consumes data only. Strict completion validation also tracks
+        // explicit error events above; comments and other metadata are ignored.
         let Some(data) = line.strip_prefix("data:") else {
             return;
         };
@@ -121,14 +208,25 @@ impl SseAccumulator {
         // The sentinel, checked BEFORE parsing. `[DONE]` is not JSON, so a
         // parser that reaches for serde first throws away the one token that
         // says the stream ended on purpose.
+        if self.round.done {
+            if let Some(strict) = self.strict.as_mut() {
+                strict.problem("OpenAI stream sent data after [DONE]");
+            }
+        }
         if data == "[DONE]" {
             self.round.done = true;
             return;
         }
 
         let Ok(json) = serde_json::from_str::<serde_json::Value>(data) else {
+            if let Some(strict) = self.strict.as_mut() {
+                strict.problem("OpenAI stream has a malformed data frame");
+            }
             return;
         };
+        if let Some(strict) = self.strict.as_mut() {
+            strict.observe(&json);
+        }
 
         // Usage rides its own chunk when `stream_options.include_usage` is set:
         // `choices` is empty and `usage` is populated. Read it before touching
@@ -353,3 +451,7 @@ mod tests {
         assert!(!round.done, "no [DONE] arrived, so the stream was cut");
     }
 }
+
+#[cfg(test)]
+#[path = "openai_sse_strict_tests.rs"]
+mod strict_tests;

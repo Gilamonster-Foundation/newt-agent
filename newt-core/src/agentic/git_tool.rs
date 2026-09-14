@@ -56,7 +56,8 @@ pub(crate) fn read_only_definition() -> serde_json::Value {
         "List and count local and cached remote-tracking branches with op=branch-list. \
          scope=local|remote|all (default all). Remote-tracking refs are local cached data; \
          this does not fetch or count open pull requests. Repository and Git metadata \
-         must be within the session's filesystem read grants. Other Git operations \
+         must be within the session's filesystem read grants. Optional cwd selects \
+         a repository/worktree root relative to the session workspace for this call only. Other Git operations \
          are unavailable under this turn's authority."
     );
     def["function"]["strict"] = serde_json::json!(true);
@@ -65,10 +66,10 @@ pub(crate) fn read_only_definition() -> serde_json::Value {
         serde_json::json!(["string", "null"]);
     def["function"]["parameters"]["properties"]["scope"]["enum"] =
         serde_json::json!(["local", "remote", "all", null]);
-    def["function"]["parameters"]["required"] = serde_json::json!(["op", "scope"]);
+    def["function"]["parameters"]["required"] = serde_json::json!(["op", "scope", "cwd"]);
     def["function"]["parameters"]["additionalProperties"] = serde_json::json!(false);
     if let Some(properties) = def["function"]["parameters"]["properties"].as_object_mut() {
-        properties.retain(|name, _| matches!(name.as_str(), "op" | "scope"));
+        properties.retain(|name, _| matches!(name.as_str(), "op" | "scope" | "cwd"));
     }
     def
 }
@@ -118,6 +119,10 @@ pub fn git_tool_definition() -> serde_json::Value {
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "cwd": {
+                        "type": ["string", "null"],
+                        "description": "Optional repository/worktree root relative to the session workspace, e.g. .worktrees/task; null or omission uses the session root. Applies only to this call. Absolute paths, parent traversal and targets outside the workspace are refused. Existing read/write authority still applies, including shared Git metadata."
+                    },
                     "op": {
                         "type": "string",
                         "enum": ["init", "status", "log", "diff", "add", "commit", "amend", "branch", "branch-list", "rebase", "checkout", "branch-delete", "stash", "stash-list", "stash-pop", "stash-apply", "stash-drop"],

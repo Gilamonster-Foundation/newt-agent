@@ -210,6 +210,16 @@ mod tests {
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn ollama_reply(content: &str) -> ResponseTemplate {
+        let body = serde_json::json!({
+            "message": { "role": "assistant", "content": content },
+            "done": true
+        })
+        .to_string()
+            + "\n";
+        ResponseTemplate::new(200).set_body_raw(body, "application/x-ndjson")
+    }
+
     fn external(endpoint: &str) -> SmartHarnessConfig {
         let mut config = SmartHarnessConfig {
             enabled: true,
@@ -238,9 +248,7 @@ mod tests {
                 {"role":"system", "content":"Return the requested JSON value."},
                 {"role":"user", "content":"classify this evidence"}
             ]})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "message":{"role":"assistant","content":"\"answer\""}
-            })))
+            .respond_with(ollama_reply("\"answer\""))
             .expect(1)
             .mount(&server)
             .await;
@@ -265,7 +273,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .and(body_partial_json(serde_json::json!({
-                "model":"auxiliary-fixture", "stream":false,
+                "model":"auxiliary-fixture", "stream":true,
                 "options":{"num_predict":64},
                 "messages":[{"role":"user","content":"classify this"}]
             })))
@@ -321,9 +329,7 @@ mod tests {
         config.device = Some("cuda".into());
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "message":{"role":"assistant","content":"\"narration\""}
-            })))
+            .respond_with(ollama_reply("\"narration\""))
             .expect(1)
             .mount(&server)
             .await;
@@ -365,9 +371,16 @@ mod tests {
     #[tokio::test]
     async fn auxiliary_transport_timeout_is_independent_and_fail_closed() {
         let server = MockServer::start().await;
+        // The auxiliary is expected to abandon this request mid-flight (that
+        // is the property under test), so whether wiremock's own bookkeeping
+        // finishes recording the match before the abrupt client-side cancel
+        // lands is a real-I/O scheduling race, not a property of the
+        // auxiliary's timeout logic: 0 (cancelled before the server recorded
+        // it) and 1 (recorded just before the cancel) are both legitimate.
+        // More than 1 would mean a real bug (e.g. an unwanted retry).
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(1)))
-            .expect(1)
+            .expect(0..=1)
             .mount(&server)
             .await;
         let mut config = external(&server.uri());

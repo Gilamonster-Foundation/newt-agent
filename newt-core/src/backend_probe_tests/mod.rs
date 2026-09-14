@@ -42,3 +42,7 @@ mod serving_precedence;
 #[cfg(test)]
 #[path = "warm_models.rs"]
 mod warm_models;
+
+#[cfg(test)]
+#[path = "token_count.rs"]
+mod token_count;

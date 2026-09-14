@@ -117,13 +117,13 @@ fn artifact_file_streaming_hash_and_postcondition_are_exact() {
     std::fs::write(&path, &bytes).unwrap();
 
     assert_eq!(
-        artifact_preimage_state(&path, true),
+        artifact_preimage_state(&crate::caveats::Scope::All, &path, true),
         crate::agentic::artifact_hooks::ArtifactFileState::from_bytes(&bytes)
     );
-    assert!(artifact_file_matches(&path, &bytes).unwrap());
+    assert!(artifact_file_matches(&crate::caveats::Scope::All, &path, &bytes).unwrap());
     let mut different = bytes.clone();
     different[64 * 1024] ^= 1;
-    assert!(!artifact_file_matches(&path, &different).unwrap());
+    assert!(!artifact_file_matches(&crate::caveats::Scope::All, &path, &different).unwrap());
 }
 
 #[cfg(unix)]
@@ -133,7 +133,25 @@ fn artifact_preimage_never_opens_non_regular_files() {
     let socket = ws.path().join("local.sock");
     let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     assert_eq!(
-        artifact_preimage_state(&socket, true),
+        artifact_preimage_state(&crate::caveats::Scope::All, &socket, true),
         crate::agentic::artifact_hooks::ArtifactFileState::unavailable("preimage_not_regular_file")
     );
+}
+
+/// Ground artifact scope checks in an actual intermediate-directory symlink;
+/// provenance must not hash a private file after a lexical authorization.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn artifact_capture_retains_the_file_scope() {
+    let workspace = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    std::fs::write(private.path().join("secret"), "private").unwrap();
+    std::os::unix::fs::symlink(private.path(), workspace.path().join("link")).unwrap();
+    let scope = crate::caveats::Scope::only([workspace.path().to_string_lossy().into_owned()]);
+    let linked = workspace.path().join("link/secret");
+    assert!(artifact_open_scoped_regular_file(&scope, &linked).is_err());
+    assert!(artifact_file_matches(&scope, &linked, b"private").is_err());
+    let inside = workspace.path().join("inside");
+    std::fs::write(&inside, "visible").unwrap();
+    assert!(artifact_file_matches(&scope, &inside, b"visible").unwrap());
 }

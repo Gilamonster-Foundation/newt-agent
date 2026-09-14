@@ -36,9 +36,9 @@ pub mod flight_recorder;
 pub mod netguard;
 pub mod owned_hosts;
 // Object-bound workspace filesystem capability (step-52.1). `openat2` is
-// Linux-only, so the capability exists only there; consumers apply the
+// Linux-only; macOS uses descriptor-relative no-follow opens. Consumers apply the
 // cross-platform fallback + fail-closed-for-untrusted policy (step-52.2/52.3).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod fs_cap;
 pub mod git_caveats;
 pub mod git_hardening;
@@ -262,9 +262,9 @@ pub use kit::{Axis, MountKind, RegistryEntry, COMPONENT_REGISTRY};
 pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
 pub use memory::{
-    MemMessage, MemoryIndex, MemoryManager, MemoryProvider, NoteStore, NotesUnsupported, Role,
-    RollingWindow, SessionContext, SoulProvider, SoulSource, Summarizing, TokenBudget, COACH_SOUL,
-    DEFAULT_CONTEXT_TOKENS, DEFAULT_SOUL, MEMORY_INDEX_BUDGET,
+    persist_compaction_summary, MemMessage, MemoryIndex, MemoryManager, MemoryProvider, NoteStore,
+    NotesUnsupported, Role, RollingWindow, SessionContext, SoulProvider, SoulSource, Summarizing,
+    TokenBudget, COACH_SOUL, DEFAULT_CONTEXT_TOKENS, DEFAULT_SOUL, MEMORY_INDEX_BUDGET,
 };
 pub use metrics::{TokenUsage, TurnEndReason, TurnMetrics};
 pub use model_id::ModelId;

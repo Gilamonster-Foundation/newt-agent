@@ -112,8 +112,11 @@ impl Respond for Answer {
         if body["stream"].as_bool().unwrap_or(false) {
             let frame =
                 json!({"choices": [{"delta": {"content": ANSWER}, "finish_reason": "stop"}]});
+            let usage = json!({"choices": [], "usage": {
+                "prompt_tokens": 32, "completion_tokens": 12, "total_tokens": 44
+            }});
             ResponseTemplate::new(200).set_body_raw(
-                format!("data: {frame}\n\ndata: [DONE]\n\n"),
+                format!("data: {frame}\n\ndata: {usage}\n\ndata: [DONE]\n\n"),
                 "text/event-stream",
             )
         } else {

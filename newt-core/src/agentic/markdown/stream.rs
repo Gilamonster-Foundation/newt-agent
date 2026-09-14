@@ -312,7 +312,8 @@ mod tests {
 
     const BOLD: &str = "\x1b[1m";
     const RESET: &str = "\x1b[0m";
-    const FADE: &str = "\x1b[38;2;90;90;90m";
+    const BODY: &str = "\x1b[38;5;7m";
+    const CODE: &str = "\x1b[38;5;15m";
 
     #[test]
     fn inline_line_renders_per_line() {
@@ -320,7 +321,7 @@ mod tests {
         for chunk in [1, 2, 3, 100] {
             assert_eq!(
                 stream("**bold** x\n", chunk, true, 80),
-                format!("{BOLD}bold{RESET} x\n")
+                format!("{BOLD}{CODE}bold{RESET}{BODY} x{RESET}\n")
             );
         }
     }
@@ -344,21 +345,37 @@ mod tests {
         }
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            format!("a {BOLD}bold{RESET} b\n")
+            format!("{BODY}a{RESET}{BOLD}{CODE} bold{RESET}{BODY} b{RESET}\n")
         );
+    }
+
+    /// The code line exactly as a whole-document render styles it. These tests
+    /// pin buffering, not color: fenced code is dim by default and
+    /// syntax-highlighted under `markdown-syntect`, which rich-tui enables.
+    fn rendered_code_line() -> String {
+        super::super::render_markdown(
+            "```\nlet x = 1;\n```",
+            RenderOpts {
+                color: true,
+                cols: 80,
+            },
+        )
     }
 
     #[test]
     fn fenced_block_held_until_close() {
         let out = stream("```\nlet x = 1;\n```\nafter\n", 1, true, 80);
-        assert_eq!(out, format!("  {FADE}let x = 1;{RESET}\nafter\n"));
+        assert_eq!(
+            out,
+            format!("{}\n{BODY}after{RESET}\n", rendered_code_line())
+        );
     }
 
     #[test]
     fn unterminated_fence_flushes_at_finish() {
         // No dropped content even if the closing fence never arrives.
         let out = stream("```\nlet x = 1;\n", 1, true, 80);
-        assert_eq!(out, format!("  {FADE}let x = 1;{RESET}\n"));
+        assert_eq!(out, format!("{}\n", rendered_code_line()));
     }
 
     #[test]

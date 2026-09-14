@@ -1125,6 +1125,20 @@ impl newt_core::agentic::GitTool for LocalGitTool {
             return Err(GitError::Denied("read").to_string());
         }
         let read_scope = canonical_read_scope(session);
+        let root = checked_dispatch_root(&self.root, args, &read_scope)?;
+        let explicit_cwd = args.get("cwd").is_some_and(|v| !v.is_null());
+        let mutates = !matches!(op, "status" | "log" | "diff" | "branch-list" | "stash-list");
+        let write_scope = if explicit_cwd && mutates {
+            canonical_scope(&session.fs_write)
+        } else {
+            Scope::none()
+        };
+        if explicit_cwd
+            && mutates
+            && !newt_core::caveats::permits_path(&write_scope, &root.to_string_lossy())
+        {
+            return Err("capability denied: fs_write for Git cwd".into());
+        }
         // `init` CREATES a repo, so it runs BEFORE opening one — every other op
         // requires an existing repo (`GitEngine::open` below). It is a write:
         // gate it on the commit/write capability so a read-only session cannot
@@ -1134,24 +1148,38 @@ impl newt_core::agentic::GitTool for LocalGitTool {
             if !caps.permits_commit() {
                 return Err(GitError::Denied("init").to_string());
             }
-            checked_git_read(&self.root, &read_scope).map_err(|e| e.to_string())?;
+            checked_git_read(&root, &read_scope).map_err(|e| e.to_string())?;
             // An existing gitfile must not be mistaken for a missing repo
             // merely because its target is outside the read grant.
-            if checked_optional_git_read(&self.root.join(".git"), &read_scope)
+            if checked_optional_git_read(&root.join(".git"), &read_scope)
                 .map_err(|e| e.to_string())?
             {
-                scoped_repository_paths(&self.root, &read_scope).map_err(|e| e.to_string())?;
+                scoped_repository_paths(&root, &read_scope).map_err(|e| e.to_string())?;
                 return Ok("git: already a repository here".into());
             }
-            if scoped_repository_paths(&self.root, &read_scope).is_ok() {
+            if scoped_repository_paths(&root, &read_scope).is_ok() {
                 return Ok("git: already a repository here".into());
             }
-            grit_lib::repo::init_repository(&self.root, false, "main", None, "files")
+            grit_lib::repo::init_repository(&root, false, "main", None, "files")
                 .map_err(|e| format!("init failed: {e}"))?;
             return Ok("initialized empty git repository on branch 'main'".into());
         }
+        if explicit_cwd
+            && !checked_optional_git_read(&root.join(".git"), &read_scope)
+                .map_err(|e| e.to_string())?
+        {
+            return Err("Git cwd must identify a repository/worktree root with .git; refusing parent discovery".into());
+        }
         let (git_dir, common_dir, worktree) =
-            scoped_repository_paths(&self.root, &read_scope).map_err(|e| e.to_string())?;
+            scoped_repository_paths(&root, &read_scope).map_err(|e| e.to_string())?;
+        if explicit_cwd
+            && mutates
+            && [&git_dir, &common_dir].iter().any(|path| {
+                !newt_core::caveats::permits_path(&write_scope, &path.to_string_lossy())
+            })
+        {
+            return Err("capability denied: fs_write for selected worktree Git metadata".into());
+        }
         if op == "branch-list" {
             validate_branch_ref_inputs(&git_dir, &common_dir, &read_scope)
                 .map_err(|e| e.to_string())?;
@@ -1357,7 +1385,11 @@ impl newt_core::agentic::GitTool for LocalGitTool {
 }
 
 fn canonical_read_scope(session: &Caveats) -> Scope<String> {
-    match &session.fs_read {
+    canonical_scope(&session.fs_read)
+}
+
+fn canonical_scope(scope: &Scope<String>) -> Scope<String> {
+    match scope {
         Scope::All => Scope::All,
         Scope::Only(paths) => Scope::only(paths.iter().filter_map(|path| {
             Path::new(path)
@@ -1366,6 +1398,35 @@ fn canonical_read_scope(session: &Caveats) -> Scope<String> {
                 .map(|p| p.to_string_lossy().into_owned())
         })),
     }
+}
+
+/// Target selection uses the same canonical containment as the existing Git
+/// seam; it does not turn the legacy engine into an object-bound file broker.
+/// The scoped-read guard remains mandatory before this resolver is reached.
+fn checked_dispatch_root(
+    root: &Path,
+    args: &serde_json::Value,
+    scope: &Scope<String>,
+) -> Result<PathBuf, String> {
+    let cwd = match args.get("cwd") {
+        None | Some(serde_json::Value::Null) => return Ok(root.to_path_buf()),
+        Some(serde_json::Value::String(cwd)) if !cwd.trim().is_empty() => Path::new(cwd),
+        _ => return Err("Git cwd must be a non-empty relative directory or null".into()),
+    };
+    if cwd.components().any(|part| {
+        !matches!(
+            part,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return Err("Git cwd must stay relative to the session workspace; absolute paths and parent traversal are refused".into());
+    }
+    let root = checked_git_read(root, scope).map_err(|e| e.to_string())?;
+    let target = checked_git_read(&root.join(cwd), scope).map_err(|e| e.to_string())?;
+    if !target.starts_with(&root) || !target.is_dir() {
+        return Err("Git cwd must be a directory inside the session workspace".into());
+    }
+    Ok(target)
 }
 
 fn checked_git_read(path: &Path, scope: &Scope<String>) -> Result<PathBuf, GitError> {
@@ -1439,10 +1500,10 @@ fn scoped_repository_paths(
 fn render_branch_list(git_dir: &Path, args: &serde_json::Value) -> Result<String, GitError> {
     if !args.as_object().is_some_and(|args| {
         args.keys()
-            .all(|key| matches!(key.as_str(), "op" | "scope"))
+            .all(|key| matches!(key.as_str(), "op" | "scope" | "cwd"))
     }) {
         return Err(GitError::Unsupported(
-            "branch-list accepts only op and scope",
+            "branch-list accepts only op, scope and cwd",
         ));
     }
     let scope = match args.get("scope") {

@@ -1,4 +1,4 @@
-# The consumer's permitted `outcome` values — contract_version "1".
+# The declared permitted `outcome` values — contract_version "1".
 #
 # THIS FILE IS A COPY, AND THAT IS THE POINT. The authority is
 # `gilamonster-bench/src/contract.rs` (`enum Outcome`, `#[serde(rename_all =
@@ -23,6 +23,12 @@
 # pass is the failure mode it exists to prevent: this file has no authority of
 # its own, it only records what the consumer was last confirmed to accept.
 #
+# #2268 explicitly authorizes one coordinated extension: context_exceeded.
+# The upstream main enum was checked on 2026-09-11 and still has the original
+# five values. Its consumer MUST add context_exceeded before running this
+# producer; this local pin cannot prove that deployment has happened. Keep
+# the vocabulary closed so any further extension requires the same decision.
+#
 # Format: one wire value per line. Blank lines and `#` comments ignored.
 
 completed
@@ -30,3 +36,4 @@ model_error
 transport_error
 timeout
 harness_error
+context_exceeded

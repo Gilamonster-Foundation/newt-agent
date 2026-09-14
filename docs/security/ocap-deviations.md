@@ -73,7 +73,7 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 | `unconfined-fallback-on-missing-backend` | attacker-exec refuses (never runs advisory) when the native fs/net backend is unavailable | 🟠 ACTIVE | (run_command advisory-fallback; fixed by a per-axis bridle strength floor) |
 | `disclosure-gate-live-path` | tool-derived text value-filtered before it reaches the model, at every funnel | 🟢 closed | (a NEW model-ingress path added without routing through a funnel — guarded by the convergence audit) |
 | `exec-behavior-bound` | exec bound to resolved-path behavior tier | 🟠 high | (bounded by `b1`) |
-| `fs-canonical-containment` | object-bound fs (`openat2 RESOLVE_BENEATH`) | 🟢 closed (Linux) | (non-Linux lexical fallback) |
+| `fs-canonical-containment` | object-bound fs (`openat2 RESOLVE_BENEATH`; macOS `O_NOFOLLOW` fd walk) | 🟢 closed (Linux) / 🟡 partial (macOS) | (macOS: `find_root_contained` and the `newt-tools` applier stay lexical; other platforms: lexical fallback) |
 | `sod-proposer-not-worker` | cryptographic proposer ≠ worker | 🟠 high | auto-apply of any proposed policy |
 | `mcp-under-leash` | every MCP call mediated at call time (witness-typed leash; authority = structural grant, never the tool name; no-persona ≠ unrestricted) | 🟢 closed | (credential broker → `b1`; per-call budget = follow-on) |
 | `mcp-config-admission` | untrusted/disabled MCP config cannot spawn or dial | 🟢 closed (fail-closed) | admitting an untrusted server without out-of-repo approval |
@@ -507,10 +507,38 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
 - **Status:** CLOSED on Linux (step-52.7) — every read arm, write arm, and write primitive resolves
   through `WorkspaceDir` (`openat2 RESOLVE_BENEATH`), so a symlink / `..` / absolute escape is
   refused by the kernel at the open, not adjudicated by a normalized pathname; the lexical residual
-  (#502→#522) is structurally unreachable. **Residual:** the non-Linux fallback keeps the lexical
-  `std::fs` path (`openat2` is Linux-only) — bounded (CI + prod are Linux; the whole `fs_cap` module
-  is `#[cfg(target_os = "linux")]`), documented, and a future hardening (fail-closed-for-untrusted
-  on kernels without `openat2`, invariant #9). · review-by: with `b1` OS-sandbox work (#84)
+  (#502→#522) is structurally unreachable. **macOS (#2294):** `fs_cap` is
+  `#[cfg(any(target_os = "linux", target_os = "macos"))]`; its macOS arm is "a descriptor-relative
+  `openat` walk with `O_NOFOLLOW` for every component", and `newt-core`'s read, write, list,
+  delete, and directory-traversal arms resolve through it. **Residual (macOS):** two consumers are
+  still `#[cfg(target_os = "linux")]`. (a) `find_root_contained` (`newt-core/src/agentic/tools.rs`)
+  keeps a canonicalize-and-prefix check that admits the root when canonicalize fails:
+
+  ```rust
+  #[cfg(not(target_os = "linux"))]
+  fn find_root_contained(/* … */) -> bool {
+      match (
+          std::path::Path::new(workspace).canonicalize(),
+          full.canonicalize(),
+      ) {
+          (Ok(ws), Ok(root)) => root.starts_with(&ws),
+          // Can't canonicalize — keep the old permissive behaviour (deny only on a
+          // proven escape).
+          _ => true,
+      }
+  }
+  ```
+
+  Smart mode refuses native `find` on every platform, so only non-smart sessions reach it.
+  (b) The `newt-tools` applier's `write_contained` / `read_contained_opt`
+  (`newt-tools/src/patch.rs`), which back `apply_whole_files` / `apply_patch` for the coder and
+  ACP worker, use `std::fs` (see `acp-worker-fs-scope`). Other non-Linux platforms keep the
+  lexical `std::fs` path. **Documented divergence, not a containment gap:** on macOS an
+  `edit_file` / `write_file` to an in-tree symlink is denied as `fs_write` (the conservative walk
+  refuses every link), whereas Linux follows it under `RESOLVE_BENEATH` (measured on macOS,
+  #2305; the primitive is pinned by `macos_rejects_symlinks_without_truncating_their_targets`,
+  `fs_cap_object_bound.rs`).
+  · review-by: with `b1` OS-sandbox work (#84)
 
 ### acp-worker-fs-scope
 - **Invariant (ideal):** no production ACP/coder worker holds `fs_write = Scope::All`; every

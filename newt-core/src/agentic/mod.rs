@@ -27,13 +27,14 @@ pub mod anthropic_wire;
 mod capability_check;
 mod claim_check;
 pub(crate) mod compress;
+mod context_recovery;
 mod crew_attest;
 mod crew_tool;
 pub(crate) mod cw_overflow;
 mod display;
 mod generation_policy;
 mod git_tool;
-mod openai_sse;
+pub mod openai_sse;
 pub(crate) mod self_verify;
 // Step 26.4 (#583): scratchpad structured-state — the `scratchpad` context feature.
 pub(crate) mod scratchpad;
@@ -62,6 +63,10 @@ pub(crate) mod tool_recovery;
 // and the redaction-gated ShellObservation seam (observation). All additive;
 // they wrap/precede `chat_complete` and never touch its internals.
 mod driver;
+mod file_change_display;
+pub use file_change_display::{file_change_style, write_file_change_row, FileChangePresentation};
+#[cfg(feature = "markdown-syntect")]
+mod syntax_foreground;
 // Step 25.1 (#568): Markdown → ANSI rendering of assistant output. Behind the
 // default `markdown` feature; a passthrough shim takes its place under
 // --no-default-features so the headless wyvern strip carries no markdown deps.
@@ -314,7 +319,6 @@ use display::{
     emit_compression_notice, emit_overflow_notice, print_debug, print_retry_indicator, print_trace,
     TurnHeartbeat,
 };
-#[cfg(test)]
 use send_budget::estimate_responses_request_tokens;
 use send_budget::{
     authoritative_request_budget, calibrate_down, calibrate_up, capped_accepted_prompt_tokens,
@@ -323,7 +327,6 @@ use send_budget::{
     full_message_request_pressure_tokens, initial_send_budget, num_ctx_input_ceiling,
     preflight_full_message_request, preflight_irreducible_request, preflight_responses_request,
     recovered_input_budget, resolve_responses_budget, responses_context_remaining_report,
-    sanitize_estimate_ratio,
 };
 use std::io::{self, Write as _};
 use tools::{is_hallucination, merged_tool_definitions};
@@ -336,7 +339,7 @@ use trim::{
 ///
 /// Local inference keeps the patient seven-attempt policy needed while a DGX
 /// loads or sheds pressure. Hosted requests get one retry: each failed attempt
-/// may already have consumed the full inference deadline and may be billable.
+/// may already have consumed the full configured inference bound and may be billable.
 /// All thresholds remain overridable through the standard `NEWT_HTTP_*` vars.
 fn inference_endpoint_is_owned(endpoint: &str) -> bool {
     let Some(host) = reqwest::Url::parse(endpoint)
@@ -361,9 +364,11 @@ fn inference_progress_label(
     model: &str,
     attempt: u32,
     attempts: u32,
-    deadline_secs: u64,
+    idle_timeout_secs: u64,
 ) -> String {
-    format!("waiting for {model} · attempt {attempt}/{attempts} · {deadline_secs}s deadline…")
+    format!(
+        "waiting for {model} · attempt {attempt}/{attempts} · {idle_timeout_secs}s idle timeout…"
+    )
 }
 
 /// `Authorization: Bearer <key>` as client default headers for the Ollama
@@ -564,14 +569,17 @@ async fn compact_responses_input(
     compress_state: &mut CompressState,
     color: bool,
     smart_harness: Option<&smart_harness::SmartHarness>,
+    overflow_recovery: bool,
 ) -> ResponsesCompaction {
     if let Some(harness) = smart_harness {
         // Preserve native call IDs and reasoning items through host selection.
         // The legacy summarizer bridge intentionally flattens them to prose.
-        let projected = match harness
-            .project(input, estimation.chars_for_tokens(compaction_budget))
-            .await
-        {
+        let max_bytes =
+            match smart_harness::projection_byte_budget(input, compaction_budget, estimation) {
+                Ok(max_bytes) => max_bytes,
+                Err(error) => return ResponsesCompaction::HarnessFailure(error.to_string()),
+            };
+        let projected = match harness.project(input, max_bytes).await {
             Ok(messages) => messages,
             Err(error) => return ResponsesCompaction::HarnessFailure(error.to_string()),
         };
@@ -619,30 +627,29 @@ async fn compact_responses_input(
     // invents no retrieval handle (correction 1).
     let mut candidate_state = compress_state.clone();
     let stage_buffer: CompactionStageBuffer = std::sync::Mutex::new(Vec::new());
-    let outcome = match smart_harness::compress(
-        CompressRequest {
-            messages: &chat,
-            // Real-token cap minus real-token schema overhead → pipeline chars/4
-            // currency (mirrors the Chat path).
-            budget: compaction_budget,
-            max_messages: None,
-            replay_protected_tail_len: 0,
-            task,
-            hard_budget: true,
-            authoritative: true,
-            focus: None,
-            est: estimation,
-            summary_input_cap_floor_chars,
-            rewrites_history,
-            compaction_store,
-            compaction_stage: compaction_store.map(|_| &stage_buffer),
-        },
-        summarizer,
-        &mut candidate_state,
-        smart_harness,
-    )
-    .await
-    {
+    let request = CompressRequest {
+        messages: &chat,
+        // Real-token cap minus real-token schema overhead → pipeline chars/4
+        // currency (mirrors the Chat path).
+        budget: compaction_budget,
+        max_messages: None,
+        replay_protected_tail_len: context_recovery::protected_tool_tail(&chat),
+        task,
+        hard_budget: true,
+        authoritative: true,
+        focus: None,
+        est: estimation,
+        summary_input_cap_floor_chars,
+        rewrites_history,
+        compaction_store,
+        compaction_stage: compaction_store.map(|_| &stage_buffer),
+    };
+    let compression = if overflow_recovery {
+        context_recovery::compress(request, summarizer, &mut candidate_state, smart_harness).await
+    } else {
+        smart_harness::compress(request, summarizer, &mut candidate_state, smart_harness).await
+    };
+    let outcome = match compression {
         Ok(outcome) => outcome,
         Err(error) => return ResponsesCompaction::HarnessFailure(error.to_string()),
     };
@@ -851,6 +858,19 @@ pub trait CompletedSpillRenderer: Send + Sync {
     /// not take the screen (no TTY room, or a LIVE viewport is still up).
     fn render_completed(&self, output: &str, width: usize, max_height: usize) -> usize;
 
+    /// Render a captured file change when the host supports safe styled cells.
+    /// Existing hosts retain the completed text fallback and its lifecycle.
+    fn render_file_change(
+        &self,
+        _raw_output: &str,
+        output: &str,
+        _change: std::sync::Arc<FileChangePresentation>,
+        width: usize,
+        max_height: usize,
+    ) -> usize {
+        self.render_completed(output, width, max_height)
+    }
+
     /// Whether a COMPLETED viewport is currently on screen (a live viewport
     /// does not count).
     fn is_active(&self) -> bool;
@@ -1043,8 +1063,8 @@ pub struct ChatCtx<'a> {
     /// TCP connect timeout. Short (5 s default) so a down endpoint fails fast
     /// rather than blocking the full `inference_timeout_secs`.
     pub connect_timeout_secs: u64,
-    /// Total inference timeout. Must be long enough for the model to generate
-    /// a complete response (120 s default).
+    /// Inference timeout (120 s default): a total bound for single-response
+    /// requests and a maximum idle gap for streamed generation.
     pub inference_timeout_secs: u64,
     /// Message list size at which the agent trims the middle of the in-flight
     /// conversation to prevent context overflow mid-turn.
@@ -1213,8 +1233,8 @@ pub struct ChatCtx<'a> {
     /// caller) ⇒ nothing is recorded — bit-for-bit today's behavior there.
     pub attribution: Option<&'a std::cell::RefCell<crate::attribution::AttributionLedger>>,
     /// User-interrupt flag (Esc / Ctrl-C during a turn). When set mid-turn the
-    /// loop abandons at its next checkpoint — the round-loop top, and the two
-    /// model awaits (the non-streaming probe and the token stream) — and
+    /// loop abandons at its next checkpoint — the round-loop top and provider
+    /// response awaits — and
     /// returns early. `None` (every headless / eval caller) ⇒ no interrupt
     /// path, bit-for-bit today's behavior. The caller owns the `AtomicBool`,
     /// trips it from a keyboard watcher, and inspects it after the call to tell
@@ -2090,12 +2110,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         estimation,
     );
     let tool_tokens = estimate_value_tokens(&tools, estimation);
-    // Phase 20 §2.3: one sanitized calibration ratio per turn. The
-    // tool-schema overhead converts to real-token space once — the schema
-    // set is stable for the whole turn, and the send budget it is subtracted
-    // from is real-token currency.
-    let cal = sanitize_estimate_ratio(estimate_ratio);
-    let tool_tokens_real = calibrate_up(tool_tokens, cal);
+    // Price the stable tool catalog in real-token space. Reprice it whenever
+    // usage or an overflow updates the session's calibration.
+    let mut cal = compress_state.calibration.ratio(estimate_ratio);
+    let mut tool_tokens_real = calibrate_up(tool_tokens, cal);
     preflight_irreducible_request(
         &messages,
         Some(&tools),
@@ -2644,6 +2662,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     // no parseable limit (llama.cpp served over the Ollama-compat
                     // `/api/chat`) falls back to a cap derived from the current send
                     // budget / the `num_ctx` ceiling, so the turn self-heals.
+                    let overflow = cw_overflow::is_context_overflow(&e.to_string());
+                    if overflow {
+                        cal = compress_state.calibration.overflow(cal);
+                        tool_tokens_real = calibrate_up(tool_tokens, cal);
+                    }
                     if cw_retries < 2 {
                         let recovered_window = recover_cw_400.and_then(|f| f(&e, model, &today));
                         if let Some(recovered_budget) = recovered_window
@@ -2663,6 +2686,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 )
                                 .map(|cap| cap as usize)
                             })
+                            .or_else(|| {
+                                overflow.then_some(
+                                    send_budget.unwrap_or_else(|| calibrate_up(round_est_raw, cal)),
+                                )
+                            })
                         {
                             if let Some(context_window) = recovered_window {
                                 emit_context_window_400(&mut on_round_usage, context_window);
@@ -2672,6 +2700,12 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             // numberless recovery already derives an input cap.
                             let new_budget = effective_input_ceiling
                                 .map_or(recovered_budget, |c| recovered_budget.min(c));
+                            let new_budget = authoritative_request_budget(
+                                Some(new_budget),
+                                true,
+                                mid_loop_trim_tokens,
+                            )
+                            .unwrap_or(new_budget);
                             emit_overflow_notice(
                                 color,
                                 accumulated_usage.as_ref(),
@@ -2686,18 +2720,23 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             // The endpoint's parsed hard limit is authoritative —
                             // a refuse on it is correct from here on (Step 20.3).
                             send_budget_authoritative = true;
-                            let compression = smart_harness::compress(
+                            let compression = context_recovery::compress(
                                 CompressRequest {
                                     // Real-token budget minus real-token schema
                                     // overhead, converted into the pipeline's
                                     // chars/4 currency (Phase 20 §2.3).
                                     messages: &messages,
-                                    budget: calibrate_down(
-                                        new_budget.saturating_sub(tool_tokens_real),
-                                        cal,
+                                    budget: context_recovery::target(
+                                        &messages,
+                                        calibrate_down(
+                                            new_budget.saturating_sub(tool_tokens_real),
+                                            cal,
+                                        ),
+                                        estimation,
                                     ),
                                     max_messages: None,
-                                    replay_protected_tail_len: 0,
+                                    replay_protected_tail_len:
+                                        context_recovery::protected_tool_tail(&messages),
                                     task: active_task,
                                     hard_budget: true,
                                     authoritative: true,
@@ -2713,6 +2752,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 smart_harness,
                             );
                             let Some(outcome) = cancellable(cancel, compression).await else {
+                                context_recovery::record(
+                                    &mut solve_obs,
+                                    smart_harness,
+                                    round,
+                                    cw_retries + 1,
+                                    round_est_raw,
+                                    None,
+                                )?;
                                 return Ok((
                                     smart_harness::cancelled(smart_harness, &mut end_reason)?,
                                     false,
@@ -2720,12 +2767,37 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     hallucination_count,
                                 ));
                             };
-                            let outcome = outcome?;
+                            let outcome = match outcome {
+                                Ok(outcome) => outcome,
+                                Err(error) => {
+                                    context_recovery::record(
+                                        &mut solve_obs,
+                                        smart_harness,
+                                        round,
+                                        cw_retries + 1,
+                                        round_est_raw,
+                                        None,
+                                    )?;
+                                    return Err(e.context(format!(
+                                        "context re-projection failed: {error}"
+                                    )));
+                                }
+                            };
                             if let Some(notice) = outcome.notice {
                                 print_harness_notice(&notice, color);
                             }
-                            if outcome.action == CompressAction::Refused {
-                                // Refuse the resend; surface the endpoint's 400.
+                            if outcome.action == CompressAction::Refused
+                                || !outcome.fired
+                                || outcome.tokens_after >= outcome.tokens_before
+                            {
+                                context_recovery::record(
+                                    &mut solve_obs,
+                                    smart_harness,
+                                    round,
+                                    cw_retries + 1,
+                                    round_est_raw,
+                                    None,
+                                )?;
                                 return Err(e);
                             }
                             if outcome.fired {
@@ -2758,9 +2830,45 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                     color,
                                 );
                             }
+                            let projected = estimate_request_tokens(
+                                &messages,
+                                tools_supported.then_some(&tools),
+                                estimation,
+                            );
+                            if projected >= round_est_raw
+                                || calibrate_up(projected, cal) > new_budget
+                            {
+                                context_recovery::record(
+                                    &mut solve_obs,
+                                    smart_harness,
+                                    round,
+                                    cw_retries + 1,
+                                    round_est_raw,
+                                    None,
+                                )?;
+                                return Err(e);
+                            }
+                            context_recovery::record(
+                                &mut solve_obs,
+                                smart_harness,
+                                round,
+                                cw_retries + 1,
+                                round_est_raw,
+                                Some(calibrate_up(projected, cal)),
+                            )?;
                             cw_retries += 1;
                             continue;
                         }
+                    }
+                    if overflow {
+                        context_recovery::record(
+                            &mut solve_obs,
+                            smart_harness,
+                            round,
+                            cw_retries + 1,
+                            round_est_raw,
+                            None,
+                        )?;
                     }
                     return Err(e);
                 }
@@ -2771,8 +2879,18 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // single prompt, output = sum — Step 18.1) and anchor the context-size
         // tracker on the backend-reported prompt size of this dispatch.
         let round_usage = ollama_usage(&json);
-        if let Some(u) = round_usage {
-            prompt_tracker.record(u.input_tokens, messages.len());
+        if let Some(prompt_tokens) = json["prompt_eval_count"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+        {
+            if !is_truncation_suspect(prompt_tokens, num_ctx) {
+                compress_state
+                    .calibration
+                    .observe(Some(prompt_tokens), round_est_raw);
+                cal = compress_state.calibration.ratio(estimate_ratio);
+                tool_tokens_real = calibrate_up(tool_tokens, cal);
+            }
+            prompt_tracker.record(prompt_tokens, messages.len());
         }
         accumulated_usage = merge_round_usage(accumulated_usage, round_usage);
 
@@ -3980,7 +4098,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 &args,
                 None,
             )?;
-            if workflow_runtime.record_tool_result(&result) {
+            if workflow_runtime.record_tool_result(&result, ok) {
                 round_progress = true;
             }
             record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
@@ -4061,28 +4179,30 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         return Ok((text, false, accumulated_usage, hallucination_count));
     }
 
-    let (text, streamed, usage) = final_summary_ollama(
-        &client,
-        &chat_url,
-        model,
-        trimmed,
-        CapExit {
-            max_tool_rounds,
-            accumulated: accumulated_usage,
-            wasted_calls: repeat_calls.total_failures(),
-            progress,
-            observed: observed_paths.into_vec(),
-            request_budget: authoritative_request_budget(
-                send_budget,
-                send_budget_authoritative,
-                mid_loop_trim_tokens,
-            ),
-            calibration: cal,
-            estimation,
-            ollama_num_ctx: num_ctx,
-        },
-    )
-    .await?;
+    let cap = CapExit {
+        max_tool_rounds,
+        accumulated: accumulated_usage,
+        wasted_calls: repeat_calls.total_failures(),
+        progress,
+        observed: observed_paths.into_vec(),
+        request_budget: authoritative_request_budget(
+            send_budget,
+            send_budget_authoritative,
+            mid_loop_trim_tokens,
+        ),
+        calibration: cal,
+        estimation,
+        ollama_num_ctx: num_ctx,
+        prompt_measurement: Default::default(),
+    };
+    let result = final_summary_ollama(&client, &chat_url, model, trimmed, &cap).await;
+    let (text, streamed, usage) = cap.recover_rejection(
+        result,
+        &mut solve_obs,
+        compress_state,
+        max_tool_rounds,
+        cw_retries + 1,
+    )?;
     let text = finalize_final_text(
         text,
         workspace,
@@ -4174,6 +4294,9 @@ impl RepeatCallGuard {
                     ));
                 }
                 msg
+            }
+            RepeatMemo::NoResult { .. } if name == "plan_get" => {
+                scheduled::EMPTY_PLAN_GUIDANCE.to_string()
             }
             RepeatMemo::NoResult { reason } => format!(
                 "You already ran `{name}` with these exact arguments this turn and {reason}. \
@@ -4287,6 +4410,11 @@ impl RepeatCallGuard {
     /// steer can escalate; success-shaped memos are not counted because they are
     /// not hard failures.
     fn record(&mut self, name: &str, args: &serde_json::Value, ok: bool, result: &str) {
+        if name == "update_plan" && ok {
+            self.repeat_memos.retain(|key, _| {
+                !key.starts_with("plan_get\u{1}") && !key.starts_with("update_plan\u{1}")
+            });
+        }
         if !ok {
             *self.fails_by_tool.entry(name.to_string()).or_default() += 1;
         }
@@ -4306,6 +4434,10 @@ impl RepeatCallGuard {
 struct WorkflowErrorEvidence {
     fingerprint: String,
     observations: usize,
+    /// Set when the failing probe that minted this evidence names a blocker no
+    /// workspace edit can repair (#2273). Carries the reason for the guidance
+    /// text. `None` is the ordinary repairable error the nudges were built for.
+    unreachable: Option<&'static str>,
 }
 
 #[derive(Debug, Default)]
@@ -4347,12 +4479,18 @@ impl WorkflowRuntimeState {
             .unwrap_or(WORKFLOW_RECENT_PROGRESS_ROUNDS)
     }
 
-    fn record_tool_result(&mut self, result: &str) -> bool {
-        let Some(fingerprint) = workflow_error_fingerprint(result) else {
+    fn record_tool_result(&mut self, result: &str, ok: bool) -> bool {
+        let unreachable = unreachable_by_edit(ok, result);
+        // Capability denials need not carry a compiler's `error:` prefix.
+        let Some(fingerprint) = workflow_error_fingerprint(result)
+            .or_else(|| unreachable.map(|_| normalize_error_line(result)))
+        else {
             return false;
         };
         match self.error_evidence.as_mut() {
-            Some(evidence) if evidence.fingerprint == fingerprint => {
+            Some(evidence)
+                if evidence.fingerprint == fingerprint && evidence.unreachable == unreachable =>
+            {
                 evidence.observations = evidence.observations.saturating_add(1);
                 false
             }
@@ -4360,6 +4498,7 @@ impl WorkflowRuntimeState {
                 self.error_evidence = Some(WorkflowErrorEvidence {
                     fingerprint,
                     observations: 1,
+                    unreachable,
                 });
                 self.read_only_rounds_after_evidence = 0;
                 self.writes_after_evidence = 0;
@@ -4409,6 +4548,13 @@ impl WorkflowRuntimeState {
             return None;
         }
         self.step_lock_nudges += 1;
+        if let Some(reason) = evidence.unreachable {
+            return Some(workflow_blocked_nudge(
+                &evidence.fingerprint,
+                reason,
+                active_step_description(step_ledger).as_deref(),
+            ));
+        }
         Some(workflow_step_lock_nudge(
             &evidence.fingerprint,
             evidence.observations,
@@ -4461,6 +4607,13 @@ impl WorkflowRuntimeState {
             return None;
         }
         self.rediscovery_nudges += 1;
+        if let Some(reason) = evidence.unreachable {
+            return Some(workflow_blocked_nudge(
+                &evidence.fingerprint,
+                reason,
+                active_step_description(step_ledger).as_deref(),
+            ));
+        }
         Some(workflow_rediscovery_nudge(
             &evidence.fingerprint,
             active_step_description(step_ledger).as_deref(),
@@ -4481,6 +4634,15 @@ impl WorkflowRuntimeState {
             .rounds_since_progress
             .is_some_and(|rounds| rounds <= self.progress_horizon());
         if let Some(evidence) = self.error_evidence.as_ref() {
+            // A grace window exists to let an edit land. When no edit can
+            // reach the blocker, extra rounds buy nothing but more pressure.
+            if let Some(reason) = evidence.unreachable {
+                return Some(workflow_blocked_nudge(
+                    &evidence.fingerprint,
+                    reason,
+                    active_step.as_deref(),
+                ));
+            }
             if self.writes_after_evidence > 0 {
                 return Some(workflow_post_write_grace_nudge(
                     &evidence.fingerprint,
@@ -4599,6 +4761,28 @@ fn active_step_description(step_ledger: Option<&dyn scheduled::StepLedger>) -> O
                 .find(|step| step.status != StepStatus::Done)
         })
         .map(|step| step.description.clone())
+}
+
+/// The guidance for a blocker no workspace edit can repair (#2273).
+///
+/// The repair nudges this stands in for are absolute — "make the smallest
+/// edit", "call the concrete edit tool now", and a `disallowed_actions` line
+/// that forbids restating findings without editing. Against a missing binary
+/// or a refused capability those instructions cannot be followed honestly, so
+/// the model either argues with the harness or invents a fix. This says the
+/// opposite thing with the same force: name the probe, and stop.
+///
+/// It deliberately still forbids reporting the task COMPLETE. Ending on a
+/// stated blocker is an honest terminal answer; ending by claiming the work is
+/// done is the false completion this release has been measuring. The exit this
+/// opens must not become a second route to that.
+fn workflow_blocked_nudge(fingerprint: &str, reason: &str, active_step: Option<&str>) -> String {
+    let active = active_step
+        .map(|step| format!(" Active step: '{step}'."))
+        .unwrap_or_default();
+    format!(
+        "<workflow_state>\nactive_step = \"report a blocker no edit can clear\"\nlast_error_fingerprint = \"{fingerprint}\"\nblocker = \"{reason}\"\nnext_allowed_actions = \"state the blocker, quote the exact failing probe (the command and the error it returned), then end the turn\"\ndisallowed_actions = \"editing a file to satisfy this guidance, inventing a fix for an environmental blocker, or reporting the task complete\"\n</workflow_state>\n{active} The recorded failure is not something a workspace edit can repair: {reason}. Do not make a cosmetic or placeholder edit to satisfy this guidance. State what is blocked, quote the failing probe, and end the turn. Reporting a blocker with its evidence is a correct and complete answer here; claiming the task itself is finished is not."
+    )
 }
 
 fn workflow_step_lock_nudge(
@@ -4903,21 +5087,96 @@ fn run_command_is_advertised(tools: &serde_json::Value) -> bool {
     })
 }
 
+/// Result text that marks a REFUSED CAPABILITY in newt's OWN vocabulary — what
+/// `tools::denied_fs_result`, the exec leash's `denied_run_command_result` and
+/// the kernel-refusal renderer `tools::kernel_refused_binary` emit. Shared by
+/// the exec-denial ground-truth check and by [`unreachable_by_edit`], so the
+/// two cannot drift into disagreeing about what a denial looks like.
+const CONFINEMENT_DENIAL_NEEDLES: [&str; 3] = [
+    "not within the granted authority",
+    "does not permit",
+    "capability denied",
+];
+
+/// The OS's own words when the kernel refuses a fenced child. Only the
+/// exec-denial ground-truth check reads these: an ordinary failure the model
+/// CAN fix — a test asserting on EACCES, a `chmod` on the wrong path, a
+/// rejected push — prints the same string, so on the blocked/no-edit path it
+/// would stop the model working on a repairable failure.
+const OS_PERMISSION_DENIAL_NEEDLES: [&str; 2] = ["permission denied", "permission-denied"];
+
+/// Result text that marks a MISSING EXECUTABLE — the tool the model needs is
+/// not present in this environment at all (#2273). The first entry is the
+/// confined lane's own refusal (#2277 replaced brush's `command not found`
+/// with it; the shared constant is what keeps this list from going stale
+/// again), the rest are the host shells' wording.
+const MISSING_EXECUTABLE_NEEDLES: [&str; 5] = [
+    tools::ABSENT_BINARY_MARKER,
+    "command not found",
+    "no such command",
+    "executable file not found",
+    "is not recognized as an internal or external command",
+];
+
 fn run_command_result_is_denial(tool_name: &str, ok: bool, result: &str) -> bool {
     if tool_name != "run_command" || ok {
         return false;
     }
     let lower = result.to_ascii_lowercase();
-    [
-        "permission denied",
-        "permission-denied",
-        "not within the granted authority",
-        "does not permit",
-        "capability denied",
-        "exec not granted",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    // The confined lane's refusal of a binary the host HAS coaches an exec
+    // grant, so it is a grant gap; one not installed at all is not (#2304).
+    (lower.contains(tools::ABSENT_BINARY_MARKER) && !lower.contains(tools::NOT_ON_HOST_MARKER))
+        || CONFINEMENT_DENIAL_NEEDLES
+            .iter()
+            .chain(OS_PERMISSION_DENIAL_NEEDLES.iter())
+            .any(|needle| lower.contains(needle))
+}
+
+/// Is this FAILED tool result a blocker that no workspace edit can repair?
+///
+/// The workflow repair nudges exist for one theory of a no-edit round: the
+/// model declared completion without doing the work. That theory is wrong when
+/// the tool the model needs is absent or refused — `cargo: command not found`
+/// fingerprints exactly like a compiler error, and the nudge then demands an
+/// edit that cannot exist. A model handed "you must produce an edit" against an
+/// unfixable blocker either resists (and says so, as in #2273's transcript) or
+/// fabricates a cosmetic fix. The harness must not ask (#2273).
+///
+/// EVIDENCE, NEVER ASSERTION. This reads the TOOL'S OWN returned result and the
+/// classified failure flag; the model's prose never reaches it. That is the
+/// same rule [`run_command_result_is_denial`] already enforces for exec-denial
+/// claims, and the same rule `context_exceeded` follows in #2268 — minted from
+/// the server's answer, not the agent's opinion. A blocked path reachable by
+/// saying "I am blocked" would become the universal excuse for stopping early,
+/// which is worse than the nudge it replaces.
+///
+/// Requiring the failure flag is what keeps a bare `echo` from minting it: a
+/// successful command that merely PRINTS "command not found" is not a blocker.
+/// Residue, stated rather than hidden: [`tools::tool_result_ok`] is a textual
+/// classification, not a real exit status, so a model that deliberately runs a
+/// command crafted to both fail and emit this text can still reach the state.
+/// That is a visible fabrication in the transcript, not talking its way in, and
+/// it is exactly the strength the neighbouring denial check already has.
+fn unreachable_by_edit(ok: bool, result: &str) -> Option<&'static str> {
+    if ok {
+        return None;
+    }
+    let lower = result.to_ascii_lowercase();
+    if MISSING_EXECUTABLE_NEEDLES
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return Some("a required executable is not present in this environment");
+    }
+    // Newt's own denial vocabulary only. The OS string is deliberately NOT
+    // evidence here: see OS_PERMISSION_DENIAL_NEEDLES.
+    if CONFINEMENT_DENIAL_NEEDLES
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return Some("a required capability was refused by the confinement");
+    }
+    None
 }
 
 fn run_command_ground_truth_nudge() -> &'static str {
@@ -5689,6 +5948,9 @@ struct CapExit {
     /// Ollama must repeat the configured context window on every request,
     /// including the tools-disabled cap exit. Ignored by OpenAI chat.
     ollama_num_ctx: Option<u32>,
+    /// Learning evidence from fresh counts of this immutable summary request.
+    /// Admission still probes anew on every attempt; this is never a count cache.
+    prompt_measurement: std::sync::Mutex<Option<context_recovery::PromptMeasurement>>,
 }
 
 impl CapExit {
@@ -5724,15 +5986,114 @@ impl CapExit {
         )
     }
 
-    async fn finish(
+    fn record_measurement(
+        &self,
+        measurement: context_recovery::PromptMeasurement,
+    ) -> anyhow::Result<()> {
+        let mut observed = self
+            .prompt_measurement
+            .lock()
+            .map_err(|_| anyhow::anyhow!("optional prompt measurement lock poisoned"))?;
+        // The final request body is immutable across transport retries. Retain
+        // its strongest count for learning, independent of each fresh admission.
+        if observed
+            .as_ref()
+            .is_none_or(|previous| measurement.tokens > previous.tokens)
+        {
+            *observed = Some(measurement);
+        }
+        Ok(())
+    }
+
+    fn learn_measurement(&self, state: &mut CompressState) -> anyhow::Result<()> {
+        if let Some(measurement) = *self
+            .prompt_measurement
+            .lock()
+            .map_err(|_| anyhow::anyhow!("optional prompt measurement lock poisoned"))?
+        {
+            measurement.learn(state);
+        }
+        Ok(())
+    }
+
+    fn recover_rejection(
+        &self,
+        result: anyhow::Result<(String, bool, Option<crate::TokenUsage>)>,
+        observations: &mut Option<&mut observability::SolveObservation>,
+        state: &mut CompressState,
+        round: usize,
+        attempt: u32,
+    ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
+        self.learn_measurement(state)?;
+        if let Err(error) = &result {
+            if let Some(rejection) = error.downcast_ref::<context_recovery::OptionalRejection>() {
+                context_recovery::terminal_optional(
+                    observations,
+                    state,
+                    self.calibration,
+                    round,
+                    attempt,
+                    rejection.estimated_tokens,
+                )?;
+                return Ok(self.fallback());
+            }
+        }
+        result
+    }
+
+    async fn finish<Fut>(
         &self,
         endpoint: &str,
-        request: impl Fn() -> reqwest::RequestBuilder,
+        request: impl Fn() -> Fut,
         http_error_prefix: &str,
+        estimated_tokens: usize,
         extract: impl FnOnce(serde_json::Value) -> (String, Option<crate::TokenUsage>),
-    ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
+    ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)>
+    where
+        Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
+    {
+        self.finish_with_decoder(
+            endpoint,
+            request,
+            http_error_prefix,
+            estimated_tokens,
+            |bytes| Ok(serde_json::from_slice(bytes)?),
+            extract,
+        )
+        .await
+    }
+
+    async fn finish_with_decoder<Fut>(
+        &self,
+        endpoint: &str,
+        request: impl Fn() -> Fut,
+        http_error_prefix: &str,
+        estimated_tokens: usize,
+        decode: fn(&[u8]) -> anyhow::Result<serde_json::Value>,
+        extract: impl FnOnce(serde_json::Value) -> (String, Option<crate::TokenUsage>),
+    ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)>
+    where
+        Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
+    {
         let retry = tui_retry_policy(endpoint);
-        let result = dispatch_json(&retry, request, http_error_prefix, |_, _, _| {}, None).await;
+        let result = dispatch_with_decoder(
+            &retry,
+            request,
+            http_error_prefix,
+            |_, _, _| {},
+            None,
+            decode,
+        )
+        .await;
+        let result = match result {
+            Err(error)
+                if crate::retry::classify(&error)
+                    == crate::retry::Retryability::ContextExceeded =>
+            {
+                return Err(error.context(context_recovery::OptionalRejection { estimated_tokens }));
+            }
+            other => other,
+        };
         if let Ok(json) = result {
             let (content, usage) = extract(json);
             let total = merge_round_usage(self.accumulated, usage);
@@ -5764,7 +6125,7 @@ async fn final_summary_ollama(
     chat_url: &str,
     model: &str,
     mut messages: Vec<serde_json::Value>,
-    cap: CapExit,
+    cap: &CapExit,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     if !cap.fits(&messages, model) {
@@ -5781,8 +6142,9 @@ async fn final_summary_ollama(
     }
     cap.finish(
         chat_url,
-        || client.post(chat_url).json(&body),
+        || async { Ok(client.post(chat_url).json(&body)) },
         "Ollama",
+        estimate_tokens(&messages, cap.estimation),
         |json| {
             // #385: strip inline reasoning; all-reasoning content takes the fallback.
             let (content, _reasoning) = crate::reasoning::split_reasoning(
@@ -5864,19 +6226,64 @@ fn prepare_openai_assistant_replay(
     assistant
 }
 
+/// Count the assembled Chat Completions body only when admission has a bound.
+/// Every caller invokes this anew immediately before its generation attempt.
+async fn count_openai_request(
+    client: &reqwest::Client,
+    chat_url: &str,
+    api_key: Option<&str>,
+    body: &serde_json::Value,
+    budget: Option<usize>,
+) -> anyhow::Result<Option<crate::backend_probe::TokenCount>> {
+    if budget.is_none() {
+        return Ok(None);
+    }
+    let endpoint = chat_url
+        .strip_suffix("/v1/chat/completions")
+        .ok_or_else(|| anyhow::anyhow!("invalid Chat Completions endpoint for token admission"))?;
+    let model = body["model"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("token admission requires the assembled request model"))?;
+    crate::backend_probe::count_chat_tokens(client, endpoint, model, api_key, body).await
+}
+
+fn enforce_counted_budget(
+    count: Option<&crate::backend_probe::TokenCount>,
+    budget: Option<usize>,
+    estimated_tokens: usize,
+) -> anyhow::Result<()> {
+    if let (Some(count), Some(budget)) = (count, budget) {
+        if count.tokens > budget {
+            let error = observability::DispatchError::context_exceeded(format!(
+                "pre-dispatch: Context size has been exceeded: measured {} input tokens \
+                 exceed the {budget}-token input budget",
+                count.tokens,
+            ));
+            return Err(
+                anyhow::Error::new(error).context(context_recovery::PromptMeasurement {
+                    tokens: count.tokens,
+                    estimated_tokens,
+                }),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Final tools-disabled completion for the OpenAI (`/v1/chat/completions`) path.
 ///
 /// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
 /// `accumulated` carries usage from the preceding tool-call rounds.
 async fn final_summary_openai(
-    client: &reqwest::Client,
+    clients: (&reqwest::Client, &reqwest::Client),
     chat_url: &str,
     model: &str,
     api_key: Option<&str>,
     mut messages: Vec<serde_json::Value>,
     generation_policy: generation_policy::GenerationPolicy,
-    cap: CapExit,
+    cap: &CapExit,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
+    let (count_client, stream_client) = clients;
     cap.push_nudge(&mut messages);
     let messages = openai_chat_wire_messages(&messages)?;
     if !cap.fits(&messages, model) {
@@ -5886,19 +6293,33 @@ async fn final_summary_openai(
     let mut body = serde_json::json!({
         "model": model,
         "messages": &messages,
-        "stream": false,
+        "stream": true,
+        "stream_options": {"include_usage": true},
     });
     generation_policy.apply_to_chat_completions_body(&mut body);
-    cap.finish(
+    cap.finish_with_decoder(
         chat_url,
-        || {
-            let mut req = client.post(chat_url).json(&body);
+        || async {
+            let count =
+                count_openai_request(count_client, chat_url, api_key, &body, cap.request_budget)
+                    .await?;
+            let estimated_tokens = estimate_tokens(&messages, cap.estimation);
+            if let Some(count) = &count {
+                cap.record_measurement(context_recovery::PromptMeasurement {
+                    tokens: count.tokens,
+                    estimated_tokens,
+                })?;
+            }
+            enforce_counted_budget(count.as_ref(), cap.request_budget, estimated_tokens)?;
+            let mut req = stream_client.post(chat_url).json(&body);
             if let Some(key) = api_key {
                 req = req.bearer_auth(key);
             }
-            req
+            Ok(req)
         },
         "inference endpoint",
+        estimate_tokens(&messages, cap.estimation),
+        smart_harness::decode_openai_response,
         |json| {
             // #385: strip inline <think>…</think> reasoning from the content.
             let (content, _reasoning) = crate::reasoning::split_reasoning(
@@ -5916,9 +6337,8 @@ async fn final_summary_openai(
 /// loop, but over `POST {endpoint}/v1/chat/completions` with bearer auth and
 /// the OpenAI `tool_calls` / `tool_call_id` / `usage` shapes.
 ///
-/// Non-streaming for now — the final answer is returned (and printed by the
-/// caller) rather than streamed token-by-token. Token-by-token SSE streaming
-/// is a follow-up; functionally the loop is complete, including tools.
+/// Primary requests stream on the transport and are validated before tools
+/// execute. Accepted final answers retain the existing display reissue.
 pub async fn openai_chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
@@ -6087,8 +6507,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // crosses the deadline (the DGX retry-storm wedge the Ollama path already
     // learned). An IDLE `read_timeout` caps the gap BETWEEN chunks and resets
     // on every token, so a stream runs as long as it keeps producing while a
-    // genuinely stalled connection still bails. The one-shot `stream:false`
-    // probe keeps `client` — a total bound is right for a single response.
+    // genuinely stalled connection still bails. Counting probes keep `client`;
+    // every streamed generation uses `stream_client`.
     let stream_client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
         .read_timeout(std::time::Duration::from_secs(inference_timeout_secs))
@@ -6227,8 +6647,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
     // (mirrors the Ollama path).
-    let cal = sanitize_estimate_ratio(estimate_ratio);
-    let tool_tokens_real = calibrate_up(tool_tokens, cal);
+    let mut cal = compress_state.calibration.ratio(estimate_ratio);
+    let mut tool_tokens_real = calibrate_up(tool_tokens, cal);
     preflight_irreducible_request(
         &messages,
         Some(&tools),
@@ -6582,7 +7002,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 "messages": wire_messages,
                 "tools": tools.clone(),
                 "tool_choice": "auto",
-                "stream": false,
+                "stream": true,
+                "stream_options": {"include_usage": true},
             });
             generation_policy.apply_to_chat_completions_body(&mut body);
             // Drop tools (and the now-meaningless tool_choice) for a model that
@@ -6597,6 +7018,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // but the operator-declared local window still bounds Newt's pre-send
             // budget. These endpoints reject oversize requests rather than silently
             // truncating them, so no wire field is needed to enforce the local cap.
+            let request_budget = authoritative_request_budget(
+                send_budget,
+                send_budget_authoritative,
+                mid_loop_trim_tokens,
+            );
+            let measured_prompt_tokens = std::sync::atomic::AtomicUsize::new(0);
+            let admission_commit_failure = std::sync::OnceLock::new();
             let max_attempts = retry.max_retries.saturating_add(1);
             let attempts_started = std::cell::Cell::new(0u32);
             let spinner_label =
@@ -6621,7 +7049,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     }
                     async {
                         let mut req = smart_harness::request(
-                            client.post(&chat_url),
+                            stream_client.post(&chat_url),
                             &body,
                             smart_harness,
                             "openai",
@@ -6629,6 +7057,33 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         if let Some(key) = api_key {
                             req = req.bearer_auth(key);
                         }
+                        let counted = count_openai_request(
+                            &client,
+                            &chat_url,
+                            api_key,
+                            &body,
+                            request_budget,
+                        )
+                        .await;
+                        if let (Some(harness), Some(budget)) = (smart_harness, request_budget) {
+                            let committed = match counted.as_ref() {
+                                Ok(Some(count)) => harness.record_token_count(Ok(count), budget),
+                                Err(error) => harness.record_token_count(Err(error), budget),
+                                Ok(None) => Ok(()),
+                            };
+                            if let Err(error) = committed {
+                                admission_commit_failure.get_or_init(|| error);
+                                // The preserved diagnostic may itself contain a transient
+                                // or context error. Storage failure must bypass both retries.
+                                anyhow::bail!("token-count evidence could not be committed");
+                            }
+                        }
+                        let counted = counted?;
+                        if let Some(count) = &counted {
+                            measured_prompt_tokens
+                                .fetch_max(count.tokens, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        enforce_counted_budget(counted.as_ref(), request_budget, round_est_raw)?;
                         // W0 (#1511): classify while the error is TYPED — the
                         // DispatchError keeps the historical message text and carries
                         // the structural class to the driver boundary.
@@ -6638,7 +7093,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 e,
                             ))
                         })?;
-                        smart_harness::response(resp, smart_harness, "inference endpoint").await
+                        smart_harness::response_with_decoder(
+                            resp,
+                            smart_harness,
+                            "inference endpoint",
+                            smart_harness::decode_openai_response,
+                        )
+                        .await
                     }
                 },
                 |attempt, delay, error| {
@@ -6651,12 +7112,31 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     }
                     print_retry_indicator(attempt, retry.max_retries, delay, error, color);
                 },
-            )
-            .await;
+            );
+            let dispatch = cancellable(cancel, dispatch).await;
             thought_for = spinner
                 .as_ref()
                 .map_or(std::time::Duration::ZERO, crate::tty::Spinner::elapsed);
             drop(spinner);
+            if let Some(error) = admission_commit_failure.into_inner() {
+                return Err(error);
+            }
+            let measured = measured_prompt_tokens.load(std::sync::atomic::Ordering::Relaxed);
+            if measured > 0 {
+                compress_state
+                    .calibration
+                    .observe_count(measured, round_est_raw);
+                cal = compress_state.calibration.ratio(estimate_ratio);
+                tool_tokens_real = calibrate_up(tool_tokens, cal);
+            }
+            let Some(dispatch) = dispatch else {
+                return Ok((
+                    smart_harness::cancelled(smart_harness, &mut end_reason)?,
+                    false,
+                    accumulated_usage,
+                    hallucination_count,
+                ));
+            };
             match dispatch {
                 Ok(j) => break (j, round_est_raw),
                 Err(e) => {
@@ -6688,6 +7168,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     // headless drivers; this fallback is only for numberless errors.
                     // It remains capped by the operator-declared local window even
                     // though no `num_ctx` field rides on this wire.
+                    let overflow =
+                        crate::retry::classify(&e) == crate::retry::Retryability::ContextExceeded;
+                    if overflow {
+                        cal = compress_state.calibration.overflow(cal);
+                        tool_tokens_real = calibrate_up(tool_tokens, cal);
+                    }
                     if cw_retries < 2 {
                         let recovered_window = recover_cw_400.and_then(|f| f(&e, model, &today));
                         if let Some(recovered_budget) = recovered_window
@@ -6699,6 +7185,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     effective_input_ceiling,
                                 )
                             })
+                            // Exact admission rejected this candidate, not the
+                            // configured server window. Keep its known bound.
+                            .or_else(|| request_budget.filter(|budget| measured > *budget))
                             .or_else(|| {
                                 cw_overflow::core_recover_overflow(
                                     &e.to_string(),
@@ -6706,6 +7195,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     None,
                                 )
                                 .map(|cap| cap as usize)
+                            })
+                            .or_else(|| {
+                                overflow.then_some(
+                                    send_budget.unwrap_or_else(|| calibrate_up(round_est_raw, cal)),
+                                )
                             })
                         {
                             if let Some(context_window) = recovered_window {
@@ -6717,6 +7211,12 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                             // then retain any tighter declared-window ceiling.
                             let new_budget = effective_input_ceiling
                                 .map_or(recovered_budget, |c| recovered_budget.min(c));
+                            let new_budget = authoritative_request_budget(
+                                Some(new_budget),
+                                true,
+                                mid_loop_trim_tokens,
+                            )
+                            .unwrap_or(new_budget);
                             emit_overflow_notice(
                                 color,
                                 accumulated_usage.as_ref(),
@@ -6729,22 +7229,27 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                             // The endpoint's parsed hard limit is authoritative
                             // from here on (Step 20.3; mirrors the Ollama path).
                             send_budget_authoritative = true;
-                            let compression = smart_harness::compress(
+                            let compression = context_recovery::compress(
                                 CompressRequest {
                                     // Real-token cap minus real-token schema
                                     // overhead → pipeline chars/4 currency
                                     // (Phase 20 §2.3; mirrors the Ollama path).
                                     messages: &messages,
-                                    budget: calibrate_down(
-                                        new_budget.saturating_sub(tool_tokens_real),
-                                        cal,
+                                    budget: context_recovery::target(
+                                        &messages,
+                                        calibrate_down(
+                                            new_budget.saturating_sub(tool_tokens_real),
+                                            cal,
+                                        ),
+                                        estimation,
                                     ),
                                     max_messages: None,
                                     replay_protected_tail_len:
                                         compress::protected_reasoning_tail_len(
                                             &messages,
                                             reasoning_replay_scope,
-                                        ),
+                                        )
+                                        .max(context_recovery::protected_tool_tail(&messages)),
                                     task: active_task,
                                     hard_budget: true,
                                     authoritative: true,
@@ -6760,6 +7265,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 smart_harness,
                             );
                             let Some(outcome) = cancellable(cancel, compression).await else {
+                                context_recovery::record(
+                                    &mut solve_obs,
+                                    smart_harness,
+                                    round,
+                                    cw_retries + 1,
+                                    round_est_raw,
+                                    None,
+                                )?;
                                 return Ok((
                                     smart_harness::cancelled(smart_harness, &mut end_reason)?,
                                     false,
@@ -6767,12 +7280,37 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     hallucination_count,
                                 ));
                             };
-                            let outcome = outcome?;
+                            let outcome = match outcome {
+                                Ok(outcome) => outcome,
+                                Err(error) => {
+                                    context_recovery::record(
+                                        &mut solve_obs,
+                                        smart_harness,
+                                        round,
+                                        cw_retries + 1,
+                                        round_est_raw,
+                                        None,
+                                    )?;
+                                    return Err(e.context(format!(
+                                        "context re-projection failed: {error}"
+                                    )));
+                                }
+                            };
                             if let Some(notice) = outcome.notice {
                                 print_harness_notice(&notice, color);
                             }
-                            if outcome.action == CompressAction::Refused {
-                                // Refuse the resend; surface the endpoint's 400.
+                            if outcome.action == CompressAction::Refused
+                                || !outcome.fired
+                                || outcome.tokens_after >= outcome.tokens_before
+                            {
+                                context_recovery::record(
+                                    &mut solve_obs,
+                                    smart_harness,
+                                    round,
+                                    cw_retries + 1,
+                                    round_est_raw,
+                                    None,
+                                )?;
                                 return Err(e);
                             }
                             if outcome.fired {
@@ -6805,9 +7343,45 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                     color,
                                 );
                             }
+                            let projected = estimate_request_tokens(
+                                &openai_chat_wire_messages(&messages)?,
+                                tools_supported.then_some(&tools),
+                                estimation,
+                            );
+                            if projected >= round_est_raw
+                                || calibrate_up(projected, cal) > new_budget
+                            {
+                                context_recovery::record(
+                                    &mut solve_obs,
+                                    smart_harness,
+                                    round,
+                                    cw_retries + 1,
+                                    round_est_raw,
+                                    None,
+                                )?;
+                                return Err(e);
+                            }
+                            context_recovery::record(
+                                &mut solve_obs,
+                                smart_harness,
+                                round,
+                                cw_retries + 1,
+                                round_est_raw,
+                                Some(calibrate_up(projected, cal)),
+                            )?;
                             cw_retries += 1;
                             continue;
                         }
+                    }
+                    if overflow {
+                        context_recovery::record(
+                            &mut solve_obs,
+                            smart_harness,
+                            round,
+                            cw_retries + 1,
+                            round_est_raw,
+                            None,
+                        )?;
                     }
                     return Err(e);
                 }
@@ -6816,8 +7390,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // Merge per-round token usage (input = max single prompt, output =
         // sum — Step 18.1) and anchor the context-size tracker.
         let round_usage = openai_usage(&json["usage"]);
-        if let Some(u) = round_usage {
-            prompt_tracker.record(u.input_tokens, messages.len());
+        if let Some(prompt_tokens) = json["usage"]["prompt_tokens"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+        {
+            compress_state
+                .calibration
+                .observe(Some(prompt_tokens), round_est_raw);
+            cal = compress_state.calibration.ratio(estimate_ratio);
+            tool_tokens_real = calibrate_up(tool_tokens, cal);
+            prompt_tracker.record(prompt_tokens, messages.len());
         }
         accumulated_usage = merge_round_usage(accumulated_usage, round_usage);
 
@@ -6868,10 +7450,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 color,
             );
         }
-        // …and now SHOW it. This wire is non-streaming (`"stream": false`
-        // above), so until this the operator's only evidence a thinking model
-        // had reasoned at all was a `--debug` line counting the characters it
-        // threw away. On a reasoning model that is most of what the turn did.
+        // Show reasoning after the primary SSE response has been validated.
+        // Transport streaming keeps cancellation effective; this fold retains
+        // the existing presentation after a complete tool/answer decision.
         //
         // Same fold as the streaming path and as a tool result: the first
         // `spill_lines` rows commit, the rest are retained behind
@@ -7359,11 +7940,14 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             // gates above, every one of which can `continue 'round_loop`: a
             // re-issue placed before them would pay for a streamed answer the
             // harness then throws away, double-billing every nudged round.
-            // The body is the probe's body with the stream flag flipped, so
-            // the second call sees the identical prompt (same tools, same
-            // policy) and is likely to reproduce the same answer from the
-            // same prefix.
+            // The reissue retains the primary request's prompt, tools and
+            // generation policy, with the existing idle timeout for display.
             let stream_wire_messages = openai_chat_wire_messages(&messages)?;
+            let stream_estimate = estimate_request_tokens(
+                &stream_wire_messages,
+                tools_supported.then_some(&tools),
+                estimation,
+            );
             let mut stream_body = serde_json::json!({
                 "model": model,
                 "messages": stream_wire_messages,
@@ -7385,16 +7969,53 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if let Some(key) = api_key {
                 stream_req = stream_req.bearer_auth(key);
             }
-            let (out, was_streamed) = match openai_stream_final_answer(
-                stream_req,
-                io::stdout(),
-                color,
-                markdown,
-                debug,
-                cancel,
-            )
-            .await
-            {
+            let stream_budget = authoritative_request_budget(
+                send_budget,
+                send_budget_authoritative,
+                mid_loop_trim_tokens,
+            );
+            let admitted = cancellable(cancel, async {
+                let count =
+                    count_openai_request(&client, &chat_url, api_key, &stream_body, stream_budget)
+                        .await?;
+                enforce_counted_budget(count.as_ref(), stream_budget, stream_estimate)?;
+                Ok::<_, anyhow::Error>(count.map(|count| context_recovery::PromptMeasurement {
+                    tokens: count.tokens,
+                    estimated_tokens: stream_estimate,
+                }))
+            })
+            .await;
+            let streamed = match admitted {
+                Some(Ok(measurement)) => {
+                    if let Some(measurement) = measurement {
+                        measurement.learn(compress_state);
+                    }
+                    openai_stream_final_answer(
+                        stream_req,
+                        io::stdout(),
+                        color,
+                        markdown,
+                        debug,
+                        cancel,
+                    )
+                    .await
+                }
+                Some(Err(error)) => {
+                    if let Some(measurement) =
+                        error.downcast_ref::<context_recovery::PromptMeasurement>()
+                    {
+                        measurement.learn(compress_state);
+                    }
+                    if crate::retry::classify(&error) == crate::retry::Retryability::ContextExceeded
+                    {
+                        StreamOutcome::ContextExceeded(None)
+                    } else {
+                        StreamOutcome::UseProbe(None)
+                    }
+                }
+                None => StreamOutcome::Cancelled(None),
+            };
+            let (out, was_streamed) = match streamed {
                 // A second call, so a second usage record. Merged, not
                 // replaced — and when the server sent none, `merge_round_usage`
                 // keeps what the probe already reported rather than zeroing it.
@@ -7415,6 +8036,18 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 // return silence, or a truncation, because the second call
                 // failed. Its tokens were still spent, so they still merge.
                 StreamOutcome::UseProbe(stream_usage) => {
+                    accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
+                    (content, false)
+                }
+                StreamOutcome::ContextExceeded(stream_usage) => {
+                    context_recovery::terminal_optional(
+                        &mut solve_obs,
+                        compress_state,
+                        cal,
+                        round,
+                        cw_retries + 1,
+                        stream_estimate,
+                    )?;
                     accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
                     (content, false)
                 }
@@ -7757,7 +8390,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 &args,
                 None,
             )?;
-            if workflow_runtime.record_tool_result(&result) {
+            if workflow_runtime.record_tool_result(&result, ok) {
                 round_progress = true;
             }
             record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
@@ -7830,30 +8463,47 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         return Ok((text, false, accumulated_usage, hallucination_count));
     }
 
-    let (text, streamed, usage) = final_summary_openai(
-        &client,
+    let cap = CapExit {
+        max_tool_rounds,
+        accumulated: accumulated_usage,
+        wasted_calls: repeat_calls.total_failures(),
+        progress,
+        observed: observed_paths.into_vec(),
+        request_budget: authoritative_request_budget(
+            send_budget,
+            send_budget_authoritative,
+            mid_loop_trim_tokens,
+        ),
+        calibration: cal,
+        estimation,
+        ollama_num_ctx: None,
+        prompt_measurement: Default::default(),
+    };
+    let summary = final_summary_openai(
+        (&client, &stream_client),
         &chat_url,
         model,
         api_key,
         trimmed,
         generation_policy,
-        CapExit {
-            max_tool_rounds,
-            accumulated: accumulated_usage,
-            wasted_calls: repeat_calls.total_failures(),
-            progress,
-            observed: observed_paths.into_vec(),
-            request_budget: authoritative_request_budget(
-                send_budget,
-                send_budget_authoritative,
-                mid_loop_trim_tokens,
-            ),
-            calibration: cal,
-            estimation,
-            ollama_num_ctx: None,
-        },
-    )
-    .await?;
+        &cap,
+    );
+    let Some(result) = cancellable(cancel, summary).await else {
+        cap.learn_measurement(compress_state)?;
+        return Ok((
+            smart_harness::cancelled(smart_harness, &mut end_reason)?,
+            false,
+            accumulated_usage,
+            hallucination_count,
+        ));
+    };
+    let (text, streamed, usage) = cap.recover_rejection(
+        result,
+        &mut solve_obs,
+        compress_state,
+        max_tool_rounds,
+        cw_retries + 1,
+    )?;
     let text = finalize_final_text(
         text,
         workspace,
@@ -7994,9 +8644,13 @@ async fn anthropic_dispatch_round(
                     })?;
                     if !resp.status().is_success() {
                         let status = resp.status();
-                        let text = resp.text().await.unwrap_or_default();
+                        let (bytes, read_error) = crate::retry::read_response_bytes(resp).await;
+                        let text = String::from_utf8_lossy(&bytes);
+                        let read_diagnostic = read_error
+                            .map(|error| format!("; response body read failed: {error}"))
+                            .unwrap_or_default();
                         return Err(observability::DispatchError::http_status(format!(
-                            "inference endpoint {status}: {text}"
+                            "inference endpoint {status}: {text}{read_diagnostic}"
                         ))
                         .into());
                     }
@@ -8115,11 +8769,16 @@ async fn anthropic_dispatch_round(
         // to the retryable error shape and this round is re-issued.
         let break_error = round.error.clone().or(transport_break);
         if let Some(err) = break_error {
+            let shaped: anyhow::Error = observability::DispatchError::http_status(format!(
+                "inference endpoint 529: mid-stream error: {err}"
+            ))
+            .into();
+            // A server capacity rejection belongs to the outer projection
+            // owner, even if text preceded it. Never replay this body unchanged.
+            if crate::retry::classify(&shaped) != crate::retry::Retryability::Retry {
+                return Err(shaped);
+            }
             if !started {
-                let shaped: anyhow::Error = observability::DispatchError::http_status(format!(
-                    "inference endpoint 529: mid-stream error before any visible output: {err}"
-                ))
-                .into();
                 if stream_retries >= d.retry.max_retries {
                     return Err(shaped);
                 }
@@ -8152,7 +8811,7 @@ async fn final_summary_anthropic(
     api_key: Option<&str>,
     mut messages: Vec<serde_json::Value>,
     generation_policy: generation_policy::GenerationPolicy,
-    cap: CapExit,
+    cap: &CapExit,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     let (system, wire_messages) = anthropic_wire::anthropic_wire_messages(&messages)?;
@@ -8173,8 +8832,9 @@ async fn final_summary_anthropic(
     );
     cap.finish(
         messages_url,
-        || anthropic_headers(client.post(messages_url), api_key).json(&body),
+        || async { Ok(anthropic_headers(client.post(messages_url), api_key).json(&body)) },
         "inference endpoint",
+        estimate_value_tokens(&body, cap.estimation),
         |json| {
             // This wire separates thinking natively; text needs no split_reasoning.
             let reply = anthropic_wire::parse_messages_reply(&json);
@@ -8202,7 +8862,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         task,
         workspace,
         color,
-        // Unlike the non-streaming OpenAI path, this loop streams natively —
+        // Like the OpenAI-compatible path, this loop streams natively —
         // the caller-resolved markdown decision drives the live writer.
         markdown,
         tool_offload,
@@ -8474,8 +9134,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
     // (mirrors the OpenAI path).
-    let cal = sanitize_estimate_ratio(estimate_ratio);
-    let tool_tokens_real = calibrate_up(tool_tokens, cal);
+    let mut cal = compress_state.calibration.ratio(estimate_ratio);
+    let mut tool_tokens_real = calibrate_up(tool_tokens, cal);
     preflight_irreducible_request(
         &messages,
         Some(&tools),
@@ -8851,6 +9511,11 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     // > M maximum" 400 is parsed by the same shared hook;
                     // numberless overflows fall back to deriving a tightened
                     // cap from the current send budget.
+                    let overflow = cw_overflow::is_context_overflow(&e.to_string());
+                    if overflow {
+                        cal = compress_state.calibration.overflow(cal);
+                        tool_tokens_real = calibrate_up(tool_tokens, cal);
+                    }
                     if cw_retries < 2 {
                         let recovered_window = recover_cw_400.and_then(|f| f(&e, model, &today));
                         if let Some(recovered_budget) = recovered_window
@@ -8870,12 +9535,23 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                 )
                                 .map(|cap| cap as usize)
                             })
+                            .or_else(|| {
+                                overflow.then_some(
+                                    send_budget.unwrap_or_else(|| calibrate_up(round_est_raw, cal)),
+                                )
+                            })
                         {
                             if let Some(context_window) = recovered_window {
                                 emit_context_window_400(&mut on_round_usage, context_window);
                             }
                             let new_budget = effective_input_ceiling
                                 .map_or(recovered_budget, |c| recovered_budget.min(c));
+                            let new_budget = authoritative_request_budget(
+                                Some(new_budget),
+                                true,
+                                mid_loop_trim_tokens,
+                            )
+                            .unwrap_or(new_budget);
                             emit_overflow_notice(
                                 color,
                                 accumulated_usage.as_ref(),
@@ -8886,19 +9562,24 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                             send_budget = Some(new_budget);
                             effective_input_ceiling = Some(new_budget);
                             send_budget_authoritative = true;
-                            let compression = smart_harness::compress(
+                            let compression = context_recovery::compress(
                                 CompressRequest {
                                     messages: &messages,
-                                    budget: calibrate_down(
-                                        new_budget.saturating_sub(tool_tokens_real),
-                                        cal,
+                                    budget: context_recovery::target(
+                                        &messages,
+                                        calibrate_down(
+                                            new_budget.saturating_sub(tool_tokens_real),
+                                            cal,
+                                        ),
+                                        estimation,
                                     ),
                                     max_messages: None,
                                     replay_protected_tail_len:
                                         compress::protected_reasoning_tail_len(
                                             &messages,
                                             reasoning_replay_scope,
-                                        ),
+                                        )
+                                        .max(context_recovery::protected_tool_tail(&messages)),
                                     task: active_task,
                                     hard_budget: true,
                                     authoritative: true,
@@ -8914,6 +9595,14 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                 smart_harness,
                             );
                             let Some(outcome) = cancellable(cancel, compression).await else {
+                                context_recovery::record(
+                                    &mut solve_obs,
+                                    smart_harness,
+                                    round,
+                                    cw_retries + 1,
+                                    round_est_raw,
+                                    None,
+                                )?;
                                 return Ok((
                                     smart_harness::cancelled(smart_harness, &mut end_reason)?,
                                     false,
@@ -8921,12 +9610,37 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                     hallucination_count,
                                 ));
                             };
-                            let outcome = outcome?;
+                            let outcome = match outcome {
+                                Ok(outcome) => outcome,
+                                Err(error) => {
+                                    context_recovery::record(
+                                        &mut solve_obs,
+                                        smart_harness,
+                                        round,
+                                        cw_retries + 1,
+                                        round_est_raw,
+                                        None,
+                                    )?;
+                                    return Err(e.context(format!(
+                                        "context re-projection failed: {error}"
+                                    )));
+                                }
+                            };
                             if let Some(notice) = outcome.notice {
                                 print_harness_notice(&notice, color);
                             }
-                            if outcome.action == CompressAction::Refused {
-                                // Refuse the resend; surface the endpoint's 400.
+                            if outcome.action == CompressAction::Refused
+                                || !outcome.fired
+                                || outcome.tokens_after >= outcome.tokens_before
+                            {
+                                context_recovery::record(
+                                    &mut solve_obs,
+                                    smart_harness,
+                                    round,
+                                    cw_retries + 1,
+                                    round_est_raw,
+                                    None,
+                                )?;
                                 return Err(e);
                             }
                             if outcome.fired {
@@ -8959,9 +9673,45 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                     color,
                                 );
                             }
+                            let projected = estimate_request_tokens(
+                                &messages,
+                                tools_supported.then_some(&tools),
+                                estimation,
+                            );
+                            if projected >= round_est_raw
+                                || calibrate_up(projected, cal) > new_budget
+                            {
+                                context_recovery::record(
+                                    &mut solve_obs,
+                                    smart_harness,
+                                    round,
+                                    cw_retries + 1,
+                                    round_est_raw,
+                                    None,
+                                )?;
+                                return Err(e);
+                            }
+                            context_recovery::record(
+                                &mut solve_obs,
+                                smart_harness,
+                                round,
+                                cw_retries + 1,
+                                round_est_raw,
+                                Some(calibrate_up(projected, cal)),
+                            )?;
                             cw_retries += 1;
                             continue;
                         }
+                    }
+                    if overflow {
+                        context_recovery::record(
+                            &mut solve_obs,
+                            smart_harness,
+                            round,
+                            cw_retries + 1,
+                            round_est_raw,
+                            None,
+                        )?;
                     }
                     return Err(e);
                 }
@@ -8971,6 +9721,11 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // sum — Step 18.1) and anchor the context-size tracker.
         let round_usage = model_reply.usage;
         if let Some(u) = round_usage {
+            compress_state
+                .calibration
+                .observe(Some(u.input_tokens), round_est_raw);
+            cal = compress_state.calibration.ratio(estimate_ratio);
+            tool_tokens_real = calibrate_up(tool_tokens, cal);
             prompt_tracker.record(u.input_tokens, messages.len());
         }
         accumulated_usage = merge_round_usage(accumulated_usage, round_usage);
@@ -9794,7 +10549,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 &args,
                 None,
             )?;
-            if workflow_runtime.record_tool_result(&result) {
+            if workflow_runtime.record_tool_result(&result, ok) {
                 round_progress = true;
             }
             record_completed_tool_event(&mut tool_events, name, &args, ok, tool_t0);
@@ -9870,30 +10625,39 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         return Ok((text, false, accumulated_usage, hallucination_count));
     }
 
-    let (text, streamed, usage) = final_summary_anthropic(
+    let cap = CapExit {
+        max_tool_rounds,
+        accumulated: accumulated_usage,
+        wasted_calls: repeat_calls.total_failures(),
+        progress,
+        observed: observed_paths.into_vec(),
+        request_budget: authoritative_request_budget(
+            send_budget,
+            send_budget_authoritative,
+            mid_loop_trim_tokens,
+        ),
+        calibration: cal,
+        estimation,
+        ollama_num_ctx: None,
+        prompt_measurement: Default::default(),
+    };
+    let result = final_summary_anthropic(
         &client,
         &messages_url,
         model,
         api_key,
         trimmed,
         generation_policy,
-        CapExit {
-            max_tool_rounds,
-            accumulated: accumulated_usage,
-            wasted_calls: repeat_calls.total_failures(),
-            progress,
-            observed: observed_paths.into_vec(),
-            request_budget: authoritative_request_budget(
-                send_budget,
-                send_budget_authoritative,
-                mid_loop_trim_tokens,
-            ),
-            calibration: cal,
-            estimation,
-            ollama_num_ctx: None,
-        },
+        &cap,
     )
-    .await?;
+    .await;
+    let (text, streamed, usage) = cap.recover_rejection(
+        result,
+        &mut solve_obs,
+        compress_state,
+        max_tool_rounds,
+        cw_retries + 1,
+    )?;
     let text = finalize_final_text(
         text,
         workspace,
@@ -10068,7 +10832,7 @@ async fn dispatch_responses_json(
         .transpose()?;
     let result = dispatch_json(
         retry,
-        || {
+        || async {
             let mut req = match &body_bytes {
                 Some(bytes) => client
                     .post(url)
@@ -10079,7 +10843,7 @@ async fn dispatch_responses_json(
             if let Some(key) = api_key {
                 req = req.bearer_auth(key);
             }
-            req
+            Ok(req)
         },
         "inference endpoint",
         |attempt, delay, error| {
@@ -10093,24 +10857,50 @@ async fn dispatch_responses_json(
 
 /// Shared transport from the Responses dispatcher; build a fresh request per attempt.
 /// Keep the status prefix exact: retry classification reads the resulting message.
-async fn dispatch_json(
+async fn dispatch_json<Fut>(
     retry: &RetryPolicy,
-    request: impl Fn() -> reqwest::RequestBuilder,
+    request: impl Fn() -> Fut,
     http_error_prefix: &str,
     on_retry: impl FnMut(u32, std::time::Duration, &anyhow::Error),
     smart_harness: Option<&smart_harness::SmartHarness>,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<serde_json::Value>
+where
+    Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
+{
+    dispatch_with_decoder(
+        retry,
+        request,
+        http_error_prefix,
+        on_retry,
+        smart_harness,
+        |bytes| Ok(serde_json::from_slice(bytes)?),
+    )
+    .await
+}
+
+async fn dispatch_with_decoder<Fut>(
+    retry: &RetryPolicy,
+    request: impl Fn() -> Fut,
+    http_error_prefix: &str,
+    on_retry: impl FnMut(u32, std::time::Duration, &anyhow::Error),
+    smart_harness: Option<&smart_harness::SmartHarness>,
+    decode: fn(&[u8]) -> anyhow::Result<serde_json::Value>,
+) -> anyhow::Result<serde_json::Value>
+where
+    Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
+{
     with_backoff_notify_error(
         retry,
         || async {
             // Typed classification at the source (W0 #1511).
-            let resp = request().send().await.map_err(|e| {
+            let resp = request().await?.send().await.map_err(|e| {
                 anyhow::Error::new(observability::DispatchError::from_reqwest(
                     "request failed",
                     e,
                 ))
             })?;
-            smart_harness::response(resp, smart_harness, http_error_prefix).await
+            smart_harness::response_with_decoder(resp, smart_harness, http_error_prefix, decode)
+                .await
         },
         on_retry,
     )
@@ -10187,7 +10977,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         mut tool_events,
         mut phantom_reaches,
         mut end_reason,
-        solve_obs: _,
+        mut solve_obs,
         mut permission_gate,
         mut on_round_usage,
         estimate_ratio,
@@ -10349,7 +11139,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let tools_chat = crate::agentic::tools::select_openai_compatible_tools(tools_chat);
     let tools = tools_to_responses(&tools_chat);
     let tools_for_estimate = serde_json::Value::Array(tools.clone());
-    let cal = sanitize_estimate_ratio(estimate_ratio);
+    let mut cal = compress_state.calibration.ratio(estimate_ratio);
     // #1528: real-token schema overhead of the EXPOSED tool set — subtracted from
     // a recovered input cap before the compaction budget is converted back to
     // chars/4 currency, so the compacted history leaves room for the tool schemas
@@ -10501,6 +11291,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         compress_state,
                         color,
                         smart_harness,
+                        false,
                     );
                     let Some(outcome) = cancellable(cancel, compression).await else {
                         return Ok((
@@ -10575,6 +11366,20 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     // shape), and re-dispatch. Bounded to 2 recoveries; a numberless
                     // overflow falls back to a derived cap. Mirrors the Chat
                     // Completions path (see #223 + the block above `chat_url`).
+                    let overflow = cw_overflow::is_context_overflow(&e.to_string());
+                    let round_est_raw = estimate_responses_request_tokens(
+                        instructions.as_deref(),
+                        &input,
+                        tools_supported.then_some(tools.as_slice()),
+                        estimation,
+                    );
+                    if overflow {
+                        cal = compress_state.calibration.overflow(cal);
+                        budget_state.set_tool_schema_tokens(calibrate_up(
+                            estimate_value_tokens(&tools_for_estimate, estimation),
+                            cal,
+                        ));
+                    }
                     if cw_retries < 2 {
                         let recovered_window = recover_cw_400.and_then(|f| f(&e, model, &today));
                         if let Some(recovered_budget) = recovered_window
@@ -10588,6 +11393,13 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                     None,
                                 )
                                 .map(|cap| cap as usize)
+                            })
+                            .or_else(|| {
+                                overflow.then_some(
+                                    budget_state
+                                        .soft_send_budget()
+                                        .unwrap_or_else(|| calibrate_up(round_est_raw, cal)),
+                                )
                             })
                         {
                             if let Some(context_window) = recovered_window {
@@ -10611,12 +11423,17 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                             // overhead ONLY if this recovered request actually carries
                             // tools (`tools_supported`) — after a tools-unsupported error
                             // it does not, so it must not subtract them.
+                            let target = context_recovery::target(
+                                &input,
+                                budget_state.compaction_budget(cal, tools_supported),
+                                estimation,
+                            );
                             let compression = compact_responses_input(
                                 &mut input,
                                 instructions.as_deref(),
                                 tools_supported.then_some(tools.as_slice()),
                                 budget_state.actionable_input_budget(),
-                                budget_state.compaction_budget(cal, tools_supported),
+                                target,
                                 cal,
                                 estimation,
                                 task,
@@ -10627,8 +11444,17 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                 compress_state,
                                 color,
                                 smart_harness,
+                                true,
                             );
                             let Some(outcome) = cancellable(cancel, compression).await else {
+                                context_recovery::record(
+                                    &mut solve_obs,
+                                    smart_harness,
+                                    round,
+                                    cw_retries + 1,
+                                    round_est_raw,
+                                    None,
+                                )?;
                                 return Ok((
                                     smart_harness::cancelled(smart_harness, &mut end_reason)?,
                                     false,
@@ -10641,15 +11467,58 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                                 // ZERO second inference: surface the original 400 with the
                                 // local compaction context attached for headless callers.
                                 other => {
+                                    context_recovery::record(
+                                        &mut solve_obs,
+                                        smart_harness,
+                                        round,
+                                        cw_retries + 1,
+                                        round_est_raw,
+                                        None,
+                                    )?;
                                     return Err(match other.rejection() {
                                         Some(reason) => e.context(reason.to_string()),
                                         None => e,
                                     });
                                 }
                             }
+                            let projected = estimate_responses_request_tokens(
+                                instructions.as_deref(),
+                                &input,
+                                tools_supported.then_some(tools.as_slice()),
+                                estimation,
+                            );
+                            if projected >= round_est_raw {
+                                context_recovery::record(
+                                    &mut solve_obs,
+                                    smart_harness,
+                                    round,
+                                    cw_retries + 1,
+                                    round_est_raw,
+                                    None,
+                                )?;
+                                return Err(e);
+                            }
+                            context_recovery::record(
+                                &mut solve_obs,
+                                smart_harness,
+                                round,
+                                cw_retries + 1,
+                                round_est_raw,
+                                Some(calibrate_up(projected, cal)),
+                            )?;
                             cw_retries += 1;
                             continue;
                         }
+                    }
+                    if overflow {
+                        context_recovery::record(
+                            &mut solve_obs,
+                            smart_harness,
+                            round,
+                            cw_retries + 1,
+                            round_est_raw,
+                            None,
+                        )?;
                     }
                     return Err(e);
                 }
@@ -10694,6 +11563,20 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 return Err(anyhow::anyhow!("Responses turn not usable: {e}"));
             }
         };
+        compress_state.calibration.observe(
+            decoded.usage.map(|usage| usage.input_tokens),
+            estimate_responses_request_tokens(
+                instructions.as_deref(),
+                &input,
+                tools_supported.then_some(tools.as_slice()),
+                estimation,
+            ),
+        );
+        cal = compress_state.calibration.ratio(estimate_ratio);
+        budget_state.set_tool_schema_tokens(calibrate_up(
+            estimate_value_tokens(&tools_for_estimate, estimation),
+            cal,
+        ));
         accumulated_usage = merge_round_usage(accumulated_usage, decoded.usage);
         let (text, calls, echo) = (decoded.text, decoded.tool_calls, decoded.echo);
 
@@ -11188,6 +12071,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 compress_state,
                 color,
                 smart_harness,
+                false,
             );
             let Some(outcome) = cancellable(cancel, compression).await else {
                 return Ok((
@@ -11253,6 +12137,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // transient transport failures exactly like every round, so a 500 / timeout /
     // reset on the LAST request no longer discards the turn after all tool rounds
     // were spent.
+    let summary_estimate =
+        estimate_responses_request_tokens(instructions.as_deref(), &input, None, estimation);
     let json = match dispatch_responses_json(
         &client,
         &responses_url,
@@ -11266,6 +12152,16 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     {
         Ok(json) => json,
         Err(error) => {
+            if crate::retry::classify(&error) == crate::retry::Retryability::ContextExceeded {
+                context_recovery::terminal_optional(
+                    &mut solve_obs,
+                    compress_state,
+                    cal,
+                    max_tool_rounds,
+                    cw_retries + 1,
+                    summary_estimate,
+                )?;
+            }
             tracing::warn!(
                 error = %error,
                 "Responses cap-exit summary dispatch failed; returning captured progress"
@@ -11655,9 +12551,8 @@ fn decode_chunk(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
 }
 
 /// What the streaming re-issue produced, and so what the caller owes the
-/// operator. Three arms because the caller has three different jobs — an
-/// `Option` collapsed the last two, and the collapse is what let an operator's
-/// own interrupt be reported as a broken wire.
+/// operator. Keep an observed capacity rejection distinct from an ordinary
+/// display failure, and an operator interrupt distinct from a broken wire.
 #[derive(Debug)]
 enum StreamOutcome {
     /// Text reached the terminal: return it with `was_streamed = true` so the
@@ -11671,6 +12566,8 @@ enum StreamOutcome {
     /// usage the second call did report — those tokens were spent whether or
     /// not the answer arrived.
     UseProbe(Option<crate::TokenUsage>),
+    /// Preserve the accepted answer, but learn and record the rejected display.
+    ContextExceeded(Option<crate::TokenUsage>),
     /// The operator interrupted with nothing on screen. End the turn with an
     /// empty reply, the same contract as the loop's round-boundary interrupt
     /// checkpoint — an interrupt is not a wire failure to recover from.
@@ -11730,13 +12627,30 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     };
     let resp = match sent {
         Ok(r) if r.status().is_success() => r,
-        outcome => {
+        Ok(response) => {
+            let status = response.status();
+            let Some((bytes, _read_error)) =
+                cancellable(cancel, crate::retry::read_response_bytes(response)).await
+            else {
+                return StreamOutcome::Cancelled(None);
+            };
+            if cw_overflow::is_context_overflow(&String::from_utf8_lossy(&bytes)) {
+                return StreamOutcome::ContextExceeded(None);
+            }
             if debug {
-                let why = match outcome {
-                    Ok(r) => format!("stream request {}", r.status()),
-                    Err(e) => format!("stream request failed: {e}"),
-                };
-                print_debug(&format!("{why} — using probe content"), color);
+                print_debug(
+                    &format!("stream request {status} — using probe content"),
+                    color,
+                );
+            }
+            return StreamOutcome::UseProbe(None);
+        }
+        Err(error) => {
+            if debug {
+                print_debug(
+                    &format!("stream request failed: {error} — using probe content"),
+                    color,
+                );
             }
             return StreamOutcome::UseProbe(None);
         }
@@ -11750,7 +12664,7 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     );
     let cols = display::term_cols();
     let mut sink = AnswerSink::Raw(out);
-    let mut acc = openai_sse::SseAccumulator::new();
+    let mut acc = openai_sse::SseAccumulator::new_with_provider_errors();
     // #385, on this wire: the non-streaming arm of this same loop runs every
     // reply through `split_reasoning`, so an inline `<think>` block never
     // reaches the answer. The streamed arm has to hold the identical line, or
@@ -11765,7 +12679,7 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     // The bytes of a character that has only half arrived. See `decode_chunk`.
     let mut carry: Vec<u8> = Vec::new();
     let mut resp = resp;
-    while !acc.is_done() {
+    while !acc.is_done() && !acc.has_provider_error() {
         match cancellable(cancel, resp.chunk()).await {
             // Interrupted: stop reading and keep what already streamed. Record
             // WHOSE stop this was — a cut socket and a keypress both end the
@@ -11817,7 +12731,24 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     }
     drop(spinner.take());
     let mut out = sink.end(started);
-    let round = acc.finish();
+    let (round, provider_error) = acc.finish_with_error();
+    if !interrupted {
+        if let Some(error) = provider_error {
+            if started {
+                display::write_harness_notice(
+                    &mut out,
+                    "stream rejected the request — the complete answer follows",
+                    color,
+                );
+            }
+            return if crate::retry::classify(&error) == crate::retry::Retryability::ContextExceeded
+            {
+                StreamOutcome::ContextExceeded(round.usage)
+            } else {
+                StreamOutcome::UseProbe(round.usage)
+            };
+        }
+    }
     if text.is_empty() {
         // Nothing reached the terminal, so an interrupt here ends the turn
         // rather than printing the probe answer the operator just stopped.

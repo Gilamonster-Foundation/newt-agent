@@ -339,9 +339,27 @@ async fn delete_file_symlink_under_workspace_escaping_is_denied() {
     )
     .await;
 
+    // step 13.2: a denied delete now also carries the observed-file-state
+    // receipt (unconditionally "no content change", since the object fence
+    // refused before anything on disk moved). Build the expected value the
+    // same way the production delete_file arm does, rather than pinning the
+    // receipt's internal formatting as a second, driftable literal.
+    let full = ws.path().join("link/victim.txt");
+    let read_caveats = caveats_rw(ws.path());
+    let before = crate::agentic::tools::file_capture::capture(&read_caveats.fs_read, &full);
+    let after = crate::agentic::tools::file_capture::capture(&read_caveats.fs_read, &full);
+    let receipt = crate::agentic::tools::file_capture::receipt("link/victim.txt", &before, &after);
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 0, false);
+    let expected = receipt.present(
+        crate::agentic::tools::file_capture::failure(
+            denied_fs_result("fs_write", "link/victim.txt"),
+            "",
+        ),
+        "",
+        &mut display,
+    );
     assert_eq!(
-        out,
-        denied_fs_result("fs_write", "link/victim.txt"),
+        out, expected,
         "the symlink-escape delete must be denied: {out}"
     );
     assert!(
@@ -480,4 +498,28 @@ async fn list_dir_symlink_under_workspace_escaping_is_denied() {
         "object-bound list_dir must not enumerate a directory outside the workspace: {out}"
     );
     assert_eq!(out, denied_fs_result("fs_read", "link"), "got: {out}");
+}
+
+/// Permission to write an external file must not bypass the existing shrink
+/// protection. Grounds the scripted approval in a real file that must survive.
+#[tokio::test]
+async fn approved_external_write_retains_shrink_guard() {
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let path = outside.path().join("large.txt");
+    let original = "original line\n".repeat(100);
+    std::fs::write(&path, &original).unwrap();
+    let caveats = caveats_rw(ws.path());
+    let mut gate = MockGate::new(true, &caveats);
+    let output = run_tool_gated(
+        "write_file",
+        serde_json::json!({"path":path, "content":"tiny\n"}),
+        ws.path(),
+        &caveats,
+        &mut gate,
+    )
+    .await;
+    assert_eq!(gate.asks.len(), 1);
+    assert!(output.contains("would shrink"), "{output}");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), original);
 }

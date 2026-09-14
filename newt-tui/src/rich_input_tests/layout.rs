@@ -321,17 +321,24 @@ fn slash_palette_renders_above_the_input_row() {
     // Directly under the header: the highlighted first prefix match, with
     // its corpus description beside it.
     //
-    // #2009 PR3 retired `/models` into `/status models`, so the corpus —
-    // and therefore the palette, which is derived from it and never
-    // hand-edited — no longer offers it. `/model` now matches itself,
-    // which is the palette correctly teaching the surface that exists.
+    // This assertion used to read `/model`, justified by "#2009 PR3 retired
+    // `/models` into `/status models`, so the corpus no longer offers it."
+    // That retirement was itself the defect: `/models` dispatches and always
+    // did, and its retirement destination was the rewrite BACK to `/models`,
+    // so the row pointed at itself while the corpus pruning removed the only
+    // listing verb from `/help` and from this palette. The test had pinned
+    // the regression as the specification.
+    //
+    // With the corpus restored, `/models` is the first prefix match — listing
+    // before switching, which is the order an operator needs: see the names,
+    // then pick one.
     assert!(
-        row(1).starts_with("❯ /model "),
+        row(1).starts_with("❯ /models "),
         "highlight on the first match: {:?}",
         row(1)
     );
     assert!(
-        row(1).contains("switch model"),
+        row(1).contains("list the models"),
         "description rides beside the command: {:?}",
         row(1)
     );

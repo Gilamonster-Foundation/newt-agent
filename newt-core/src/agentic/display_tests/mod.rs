@@ -15,6 +15,8 @@ mod cadence;
 #[path = "compression_notice.rs"]
 mod compression_notice;
 #[cfg(test)]
+mod file_change;
+#[cfg(test)]
 #[path = "printers.rs"]
 mod printers;
 #[cfg(test)]

@@ -238,7 +238,10 @@ async fn chat_complete_dispatches_openai_kind_and_returns_first_round_answer() {
         .expect("openai dispatch should succeed");
 
     assert_eq!(reply, "openai says hi");
-    assert!(!streamed, "openai path is non-streaming");
+    assert!(
+        !streamed,
+        "a JSON fallback is not a streamed display response"
+    );
     let u = usage.unwrap();
     assert_eq!((u.input_tokens, u.output_tokens), (10, 4));
     assert_eq!(hallu, 0);
@@ -255,10 +258,10 @@ fn inference_endpoint_locality_distinguishes_hosted_from_home_lab_names() {
 }
 
 #[test]
-fn openai_progress_label_exposes_attempt_and_deadline() {
+fn openai_progress_label_exposes_attempt_and_idle_timeout() {
     assert_eq!(
         inference_progress_label("kimi-k3", 2, 2, 120),
-        "waiting for kimi-k3 · attempt 2/2 · 120s deadline…"
+        "waiting for kimi-k3 · attempt 2/2 · 120s idle timeout…"
     );
 }
 

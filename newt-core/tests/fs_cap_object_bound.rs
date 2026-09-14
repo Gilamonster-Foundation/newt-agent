@@ -8,10 +8,10 @@
 //! arms and write primitives move onto it in step-52.2 / step-52.3, and this is
 //! what proves that rewire will actually contain them.
 //!
-//! Linux-only (`openat2` is a Linux syscall) and `#[serial]` (real-fs tests
+//! Linux (`openat2`) and macOS (descriptor-relative no-follow opens), `#[serial]` (real-fs tests
 //! contend under parallel load — CLAUDE.md).
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::io::{Read, Write};
 use std::os::unix::fs::symlink;
@@ -35,6 +35,90 @@ fn open_reads_a_contained_file() {
     let mut s = String::new();
     f.read_to_string(&mut s).unwrap();
     assert_eq!(s, "hello");
+}
+
+#[test]
+#[serial]
+fn open_regular_preserves_containment_and_explicit_final_link_policy() {
+    let ws = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    std::fs::write(ws.path().join("file"), b"inside").unwrap();
+    std::fs::write(outside.path().join("file"), b"outside").unwrap();
+    symlink("file", ws.path().join("link")).unwrap();
+    symlink(outside.path(), ws.path().join("escape")).unwrap();
+    let dir = WorkspaceDir::open_root(ws.path()).unwrap();
+    let mut text = String::new();
+    dir.open_regular(Path::new("file"), true)
+        .unwrap()
+        .read_to_string(&mut text)
+        .unwrap();
+    assert_eq!(text, "inside");
+    // A contained final link, followed explicitly: Linux resolves it beneath
+    // the root (`RESOLVE_BENEATH`); macOS's descriptor walk conservatively
+    // refuses even in-tree links (module docs), and mutation verification
+    // reports that as "unavailable" rather than reading through it — the same
+    // split `physical_read_scopes_and_final_links_do_not_disclose_outside_
+    // contents` pins from the consumer side.
+    let followed = dir.open_regular(Path::new("link"), false);
+    if cfg!(target_os = "macos") {
+        assert!(followed.is_err());
+    } else {
+        let mut text = String::new();
+        followed.unwrap().read_to_string(&mut text).unwrap();
+        assert_eq!(text, "inside");
+    }
+    assert!(dir.open_regular(Path::new("link"), true).is_err());
+    assert!(dir.open_regular(Path::new("."), false).is_err());
+    for nofollow in [false, true] {
+        assert!(dir
+            .open_regular(Path::new("escape/file"), nofollow)
+            .is_err());
+        assert!(dir.open_regular(Path::new("../file"), nofollow).is_err());
+    }
+}
+
+#[test]
+#[serial]
+fn open_regular_refuses_a_real_fifo_without_waiting_for_a_writer() {
+    const CHILD: &str = "NEWT_OPEN_REGULAR_FIFO_CHILD";
+    if let Some(done) = std::env::var_os(CHILD) {
+        let ws = tempdir().unwrap();
+        let path = ws.path().join("fifo");
+        let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the path is a live, NUL-terminated C string, mode is ordinary
+        // owner read/write permission, and mkfifo retains no pointer.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        let dir = WorkspaceDir::open_root(ws.path()).unwrap();
+        assert!(dir.open_regular(Path::new("fifo"), true).is_err());
+        std::fs::write(done, "passed").unwrap();
+        return;
+    }
+    // A blocking regression must fail within a deadline, not hang Linux CI.
+    let parent = tempdir().unwrap();
+    let done = parent.path().join("child-passed");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "open_regular_refuses_a_real_fifo_without_waiting_for_a_writer",
+            "--nocapture",
+        ])
+        .env(CHILD, &done)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "FIFO child failed: {status}");
+            assert!(done.exists(), "the exact FIFO child test did not run");
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("open_regular blocked on a FIFO with no writer");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -272,5 +356,54 @@ fn unlink_denies_a_symlink_escape_parent() {
     assert!(
         outside.join("victim").exists(),
         "the outside file must survive"
+    );
+}
+
+/// macOS uses a conservative descriptor-relative walk: even an in-tree link
+/// is refused, so neither intermediate nor final links can redirect an open.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_rejects_symlinks_without_truncating_their_targets() {
+    let ws = tempdir().unwrap();
+    std::fs::write(ws.path().join("target"), "unchanged").unwrap();
+    symlink("target", ws.path().join("link")).unwrap();
+    let dir = WorkspaceDir::open_root(ws.path()).unwrap();
+    assert!(dir.open(Path::new("link")).is_err());
+    assert!(dir.create(Path::new("link")).is_err());
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("target")).unwrap(),
+        "unchanged"
+    );
+}
+
+/// Ground descriptor authority against a namespace replacement: operations
+/// continue on the granted object, never on an attacker-planted replacement.
+#[test]
+fn held_directory_survives_rename_and_replacement() {
+    let temp = tempdir().unwrap();
+    let original = temp.path().join("original");
+    let moved = temp.path().join("moved");
+    std::fs::create_dir(&original).unwrap();
+    std::fs::write(original.join("file"), "granted").unwrap();
+    let dir = WorkspaceDir::open_root(&original).unwrap();
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::create_dir(&original).unwrap();
+    std::fs::write(original.join("file"), "replacement").unwrap();
+    let mut value = String::new();
+    dir.open(Path::new("file"))
+        .unwrap()
+        .read_to_string(&mut value)
+        .unwrap();
+    assert_eq!(value, "granted");
+    dir.create(Path::new("new"))
+        .unwrap()
+        .write_all(b"written")
+        .unwrap();
+    assert!(moved.join("new").exists());
+    assert!(!original.join("new").exists());
+    dir.unlink(Path::new("file")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(original.join("file")).unwrap(),
+        "replacement"
     );
 }

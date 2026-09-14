@@ -36,6 +36,8 @@ pub use output_budget::{
 
 mod catalog;
 mod dispatch;
+mod file_capture;
+mod file_change;
 #[cfg(test)]
 use dispatch::execute_tool_with_display_cancellable;
 pub use dispatch::{
@@ -54,6 +56,8 @@ mod tool_spinner_pty_test;
 use live_output::LiveOutputSession;
 pub use shell::venv_cmd_prefix;
 #[cfg(test)]
+pub(crate) use shell::{absent_binary_refusal, kernel_refused_binary};
+#[cfg(test)]
 use shell::{
     confined_dispatch_args, decode_shell_stream, denial_axis_label, denied_run_command_result,
     envelope_denial_reason, envelope_denied, exec_allowlist_name, exec_denial_requests,
@@ -66,6 +70,7 @@ use shell::{
     host_shell_command, host_shell_output, host_shell_output_with_timeout,
     CHILD_STRIPPED_AUTHORITY_ENV,
 };
+pub(crate) use shell::{ABSENT_BINARY_MARKER, NOT_ON_HOST_MARKER};
 
 #[cfg(test)]
 use catalog::lifecycle_tool_definition;
@@ -364,7 +369,7 @@ pub fn routing_disabled() -> bool {
 // `newt-coder` apply path decide containment identically (no drift surface).
 // Only the Linux object-bound helpers below normalise paths directly; the
 // prefix gate itself goes through `crate::caveats::permits_path`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::caveats::lexically_normalize;
 
 /// Returns true if `full_path` is permitted by `scope`, under prefix
@@ -383,7 +388,7 @@ pub(crate) fn tui_permits_path(scope: &crate::caveats::Scope<String>, full_path:
 /// object fence. `None` — not permitted. Mirrors [`tui_permits_path`]'s matching
 /// exactly (same normalisation + `starts_with`), so the object-bound read
 /// resolves beneath the very root the gate approved.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn authorizing_root<'a>(
     scope: &'a crate::caveats::Scope<String>,
     full_path: &str,
@@ -403,7 +408,7 @@ fn authorizing_root<'a>(
 /// The `..`-free path of `full_path` relative to its authorising `root`. The
 /// gate matched `starts_with` on the normalised forms, so this strip succeeds;
 /// the result is what [`crate::fs_cap::WorkspaceDir`] resolves beneath the root fd.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn contained_relative(full_path: &str, root: &str) -> std::path::PathBuf {
     let cand = lexically_normalize(full_path);
     let nroot = lexically_normalize(root);
@@ -421,9 +426,11 @@ fn contained_relative(full_path: &str, root: &str) -> std::path::PathBuf {
 /// kernel refused the resolve) rather than an ordinary I/O failure. `openat2`
 /// returns `EXDEV` for a `RESOLVE_BENEATH` violation and `ELOOP` for a
 /// `RESOLVE_NO_MAGICLINKS`/symlink-loop rejection; both are containment denials.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn is_fs_containment_denied(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::EXDEV) | Some(libc::ELOOP))
+        || (cfg!(target_os = "macos")
+            && matches!(e.raw_os_error(), Some(libc::ENOTDIR) | Some(libc::EMLINK)))
 }
 
 /// The object-binding target for a scope-authorised fs op: `Some(Some((root,
@@ -431,7 +438,7 @@ fn is_fs_containment_denied(e: &std::io::Error) -> bool {
 /// (no fence — the caller uses `std::fs`); `None` if the scope denies (a logic
 /// error at a call site that already gated — callers fail closed). One shared
 /// resolver behind the object-bound read/list arms.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_target<'a>(
     scope: &'a crate::caveats::Scope<String>,
     full_str: &str,
@@ -457,12 +464,12 @@ fn std_list_dir(full: &std::path::Path) -> Result<Vec<String>, String> {
 /// tool-output string on failure: a containment escape becomes an `fs_read`
 /// denial, any other failure the ordinary read error. Under `Scope::All`
 /// (`--full-access`) there is no object fence, so it reads via `std::fs` — the
-/// pre-existing unconfined behaviour. Linux-only (`openat2`); the non-Linux
+/// pre-existing unconfined behaviour. Linux (`openat2`) and macOS (no-follow fd walk); the other-platform
 /// fallback keeps the lexical-gate + `std::fs` path.
 ///
 /// `axis` labels the denial (`fs_read` for read_file; `fs_write` for edit_file,
 /// whose read is authorised by — and contained beneath — the `fs_write` root).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_read(
     scope: &crate::caveats::Scope<String>,
     axis: &str,
@@ -499,8 +506,8 @@ fn object_bound_read(
 /// Object-bound directory listing beneath the authorising root — the `list_dir`
 /// analogue of [`object_bound_read`]. A symlink-escape directory is refused by
 /// the kernel (an `fs_read` denial); the entries are read straight off the dir
-/// fd. `Scope::All` lists via `std::fs`. Linux-only.
-#[cfg(target_os = "linux")]
+/// fd. `Scope::All` lists via `std::fs`. Available on Linux and macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_list(
     scope: &crate::caveats::Scope<String>,
     path: &str,
@@ -528,7 +535,7 @@ fn object_bound_list(
 /// Non-Linux fallback for the object-bound fs arms: `openat2` is unavailable, so
 /// they keep the lexical-gate + `std::fs` behaviour (the symlink residual
 /// persists on non-Linux — see `fs-canonical-containment`; CI/prod is Linux).
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn object_bound_read(
     _scope: &crate::caveats::Scope<String>,
     _axis: &str,
@@ -539,7 +546,7 @@ fn object_bound_read(
     std::fs::read_to_string(full).map_err(|e| format!("error reading {path}: {e}"))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn object_bound_list(
     _scope: &crate::caveats::Scope<String>,
     _path: &str,
@@ -565,8 +572,8 @@ fn std_write(full: &std::path::Path, path: &str, content: &str) -> Result<(), St
 /// absolute escape the lexical gate admits is refused by the kernel: a
 /// containment escape becomes an `fs_write` denial, any other failure the
 /// ordinary write error. `Scope::All` (`--full-access`) writes via `std::fs`.
-/// Linux-only; the non-Linux fallback keeps the lexical-gate + `std::fs` path.
-#[cfg(target_os = "linux")]
+/// Linux and macOS; the other-platform fallback keeps the lexical-gate + `std::fs` path.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_write(
     scope: &crate::caveats::Scope<String>,
     axis: &str,
@@ -600,7 +607,7 @@ fn object_bound_write(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn object_bound_write(
     _scope: &crate::caveats::Scope<String>,
     _axis: &str,
@@ -616,8 +623,8 @@ fn object_bound_write(
 /// analogue of [`object_bound_write`]. The parent is resolved object-bound and
 /// the entry removed via `unlinkat`, so a symlink / `..` / absolute escape is
 /// refused by the kernel (an `fs_write` denial). `Scope::All` removes via
-/// `std::fs`. Linux-only.
-#[cfg(target_os = "linux")]
+/// `std::fs`. Available on Linux and macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn object_bound_delete(
     scope: &crate::caveats::Scope<String>,
     path: &str,
@@ -639,7 +646,7 @@ fn object_bound_delete(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn object_bound_delete(
     _scope: &crate::caveats::Scope<String>,
     path: &str,
@@ -1762,9 +1769,10 @@ fn tool_call_detail(name: &str, args: &serde_json::Value, workspace: &std::path:
         "write_file" => {
             let path = string("path", "");
             let bytes = args["content"].as_str().unwrap_or("").len();
-            format!("{path} ({bytes} bytes)")
+            format!("{} ({bytes} bytes)", file_capture::display_text(&path))
         }
-        "read_file" | "edit_file" | "delete_file" => string("path", ""),
+        "edit_file" | "delete_file" => file_capture::display_text(&string("path", "")).into_owned(),
+        "read_file" => string("path", ""),
         "list_dir" => string("path", "."),
         "find" => {
             let path = args["path"].as_str().unwrap_or(".");
@@ -2079,11 +2087,16 @@ fn count_newlines(bytes: &[u8]) -> u64 {
 /// tools' existing mutation policy.
 #[cfg(unix)]
 fn artifact_open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    open_regular_file(path, true)
+}
+
+#[cfg(unix)]
+fn open_regular_file(path: &std::path::Path, nofollow: bool) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NONBLOCK | if nofollow { libc::O_NOFOLLOW } else { 0 })
         .open(path)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(std::io::Error::new(
@@ -2096,6 +2109,11 @@ fn artifact_open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs
 
 #[cfg(windows)]
 fn artifact_open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    open_regular_file(path, true)
+}
+
+#[cfg(windows)]
+fn open_regular_file(path: &std::path::Path, nofollow: bool) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
@@ -2104,7 +2122,11 @@ fn artifact_open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs
     // check. This is the Windows analogue of Unix O_NOFOLLOW.
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .custom_flags(if nofollow {
+            FILE_FLAG_OPEN_REPARSE_POINT
+        } else {
+            0
+        })
         .open(path)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(std::io::Error::new(
@@ -2117,13 +2139,39 @@ fn artifact_open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs
 
 #[cfg(not(any(unix, windows)))]
 fn artifact_open_regular_file(_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    open_regular_file(_path, true)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_regular_file(_path: &std::path::Path, _nofollow: bool) -> std::io::Result<std::fs::File> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "race-safe artifact file capture is unavailable on this platform",
     ))
 }
 
+/// Artifact reads use the same object boundary as model-facing file reads.
+/// A physical-path check alone cannot protect a later reopen from a link swap.
+fn artifact_open_scoped_regular_file(
+    scope: &crate::caveats::Scope<String>,
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let crate::caveats::Scope::Only(_) = scope {
+        let Some(Some((root, relative))) = object_bound_target(scope, &path.to_string_lossy())
+        else {
+            return Err(std::io::Error::from_raw_os_error(libc::EACCES));
+        };
+        return crate::fs_cap::WorkspaceDir::open_root(std::path::Path::new(root))?
+            .open_regular(&relative, true);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = scope;
+    artifact_open_regular_file(path)
+}
+
 fn artifact_preimage_state(
+    scope: &crate::caveats::Scope<String>,
     path: &std::path::Path,
     read_authorized: bool,
 ) -> super::artifact_hooks::ArtifactFileState {
@@ -2140,7 +2188,7 @@ fn artifact_preimage_state(
             super::artifact_hooks::ArtifactFileState::unavailable("preimage_not_regular_file")
         }
         Ok(_) => {
-            let mut file = match artifact_open_regular_file(path) {
+            let mut file = match artifact_open_scoped_regular_file(scope, path) {
                 Ok(file) => file,
                 Err(_) => {
                     return super::artifact_hooks::ArtifactFileState::unavailable(
@@ -2179,10 +2227,17 @@ fn artifact_preimage_state(
 
 /// Verify a governed write against the bytes it submitted without allocating a
 /// second copy of the file. Only a regular file can satisfy the postcondition.
-fn artifact_file_matches(path: &std::path::Path, expected: &[u8]) -> std::io::Result<bool> {
+fn artifact_file_matches(
+    scope: &crate::caveats::Scope<String>,
+    path: &std::path::Path,
+    expected: &[u8],
+) -> std::io::Result<bool> {
+    file_contents_match(artifact_open_scoped_regular_file(scope, path)?, expected)
+}
+
+fn file_contents_match(mut file: std::fs::File, expected: &[u8]) -> std::io::Result<bool> {
     use std::io::Read as _;
 
-    let mut file = artifact_open_regular_file(path)?;
     let mut offset = 0_usize;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -3284,15 +3339,20 @@ async fn execute_authorized_tool(
                     std::path::Path::new(workspace),
                     &full,
                 );
-            let artifact_before = artifact_path_within.then(|| {
-                artifact_preimage_state(&full, tui_permits_path(&caveats.fs_read, &full_str))
-            });
+
+            let mutation_scope = if scope_permits { &caveats.fs_write } else { &crate::caveats::Scope::All };
+            if !file_capture::regular_target(&full) {
+                return file_capture::present(
+                    format!("error: write_file refuses a nonregular target: {path}"),
+                    presentation,
+                );
+            }
 
             // Shrink guard: refuse if the proposed write removes > 30% of
             // lines AND > 30 lines absolute. This catches the failure mode
             // where a model replaces an entire large file with a small
             // fragment (observed in the wild: 4,247 → 107 lines).
-            if let Ok(existing) = std::fs::read_to_string(&full) {
+            if let Ok(existing) = file_capture::read_for_edit(mutation_scope, &full, path) {
                 let orig_lines = existing.lines().count();
                 let new_lines = content.lines().count();
                 let removed = orig_lines.saturating_sub(new_lines);
@@ -3310,6 +3370,12 @@ async fn execute_authorized_tool(
             // Show first 20 lines as preview.
             let preview: String = content.lines().take(20).collect::<Vec<_>>().join("\n");
             let has_more = content.lines().count() > 20;
+            let visible_preview = file_capture::display_text(&preview);
+            let preview = if visible_preview != preview {
+                format!("Preview escapes control characters:\n{visible_preview}")
+            } else {
+                preview
+            };
             presentation.preview(
                 &format!("{preview}{}", if has_more { "\n…" } else { "" }),
                 tool_output_lines,
@@ -3326,6 +3392,10 @@ async fn execute_authorized_tool(
             );
 
             if confirmed {
+                let receipt_before = file_capture::capture(&caveats.fs_read, &full);
+                let artifact_before = artifact_path_within.then(|| {
+                    artifact_preimage_state(&caveats.fs_read, &full, tui_permits_path(&caveats.fs_read, &full_str))
+                });
                 // step-52.4: object-bound write when the SCOPE authorised it —
                 // create the file (and any missing parents) beneath the granted
                 // root's fd (openat2 RESOLVE_BENEATH), so a symlink / `..` /
@@ -3337,8 +3407,17 @@ async fn execute_authorized_tool(
                 } else {
                     std_write(&full, path, content)
                 };
+                let receipt_after = file_capture::capture(&caveats.fs_read, &full);
+                let receipt = file_capture::receipt(path, &receipt_before, &receipt_after);
                 match write_result {
                     Ok(()) => {
+                        if !file_capture::verified_after(&receipt_after, mutation_scope, &full, Some(content.as_bytes())) {
+                            return receipt.present(
+                                format!("error: write_file returned success for {path}, but the submitted bytes could not be verified"),
+                                "",
+                                presentation,
+                            );
+                        }
                         let line_count = content.lines().count();
                         // Verify exactly the bytes this governed tool submitted
                         // before an arbitrary build-check command can touch the
@@ -3358,7 +3437,7 @@ async fn execute_authorized_tool(
                                 tool_output_lines,
                             )
                         } else {
-                            match artifact_file_matches(&full, content.as_bytes()) {
+                            match artifact_file_matches(&caveats.fs_write, &full, content.as_bytes()) {
                                 Ok(true) => record_governed_file_change(
                                     artifact_sink,
                                     artifact_context,
@@ -3388,9 +3467,9 @@ async fn execute_authorized_tool(
                         let check = build_check_cmd
                             .map(|cmd| run_build_check(cmd, workspace))
                             .unwrap_or_default();
-                        format!("wrote {path} ({line_count} lines){artifact}{check}")
+                        receipt.present(format!("wrote {path} ({line_count} lines)"), &format!("{artifact}{check}"), presentation)
                     }
-                    Err(tool_output) => tool_output,
+                    Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
                 }
             } else {
                 format!("user declined to write {path}")
@@ -3438,9 +3517,6 @@ async fn execute_authorized_tool(
                     std::path::Path::new(workspace),
                     &full,
                 );
-            let artifact_before = artifact_path_within.then(|| {
-                artifact_preimage_state(&full, tui_permits_path(&caveats.fs_read, &full_str))
-            });
 
             let confirmed = confirm_unrestricted_fs_mutation(
                 caveats,
@@ -3452,6 +3528,12 @@ async fn execute_authorized_tool(
                 return format!("user declined to delete {path}");
             }
 
+            let receipt_before = file_capture::capture(&caveats.fs_read, &full);
+            let artifact_before = artifact_path_within.then(|| {
+                artifact_preimage_state(&caveats.fs_read, &full, tui_permits_path(&caveats.fs_read, &full_str))
+            });
+            let mutation_scope = if scope_permits { &caveats.fs_write } else { &crate::caveats::Scope::All };
+
             // step-52.6: object-bound removal when the scope authorised it (the
             // parent is resolved beneath the root and the entry unlinked via its
             // fd, so a symlink/`..`/absolute escape is refused by the kernel).
@@ -3460,8 +3542,17 @@ async fn execute_authorized_tool(
             } else {
                 std::fs::remove_file(&full).map_err(|e| format!("error deleting {path}: {e}"))
             };
+            let receipt_after = file_capture::capture(&caveats.fs_read, &full);
+            let receipt = file_capture::receipt(path, &receipt_before, &receipt_after);
             match delete_result {
                 Ok(()) => {
+                    if !file_capture::verified_after(&receipt_after, mutation_scope, &full, None) {
+                        return receipt.present(
+                            format!("error: delete_file returned success for {path}, but absence could not be verified"),
+                            "",
+                            presentation,
+                        );
+                    }
                     let artifact = if !artifact_tracking {
                         String::new()
                     } else if !artifact_path_within
@@ -3501,9 +3592,9 @@ async fn execute_authorized_tool(
                     let check = build_check_cmd
                         .map(|cmd| run_build_check(cmd, workspace))
                         .unwrap_or_default();
-                    format!("deleted {path}{artifact}{check}")
+                    receipt.present(format!("deleted {path}"), &format!("{artifact}{check}"), presentation)
                 }
-                Err(tool_output) => tool_output,
+                Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
             }
         }
 
@@ -3540,14 +3631,17 @@ async fn execute_authorized_tool(
                 return "error: old_string must not be empty — use write_file to create new files"
                     .to_string();
             }
+            if !file_capture::regular_target(&full) {
+                return file_capture::present(
+                    format!("error: edit_file refuses a nonregular target: {path}"),
+                    presentation,
+                );
+            }
+            let mutation_scope = if scope_permits { &caveats.fs_write } else { &crate::caveats::Scope::All };
             // step-52.5: read the existing file object-bound beneath the same
             // fs_write root (a symlink-escape edit is refused here, so the
             // no-match head display below can't leak an outside file either).
-            let read = if scope_permits {
-                object_bound_read(&caveats.fs_write, "fs_write", path, &full, &full_str)
-            } else {
-                std::fs::read_to_string(&full).map_err(|e| format!("error reading {path}: {e}"))
-            };
+            let read = file_capture::read_for_edit(mutation_scope, &full, path);
             let existing = match read {
                 Ok(s) => s,
                 Err(tool_output) => return tool_output,
@@ -3615,14 +3709,32 @@ async fn execute_authorized_tool(
             } else {
                 format!("{delta}")
             };
+            let receipt_before = file_capture::capture(&caveats.fs_read, &full);
+            // Detect a changed preimage before replacing it. This is an
+            // observed-before/verified-after contract, not a filesystem lock.
+            if !file_capture::current_preimage(&receipt_before, mutation_scope, &full, existing.as_bytes()) {
+                return file_capture::present(
+                    format!("error: edit_file refused a stale preimage for {path}; reread the file and retry"),
+                    presentation,
+                );
+            }
             // step-52.5: object-bound write when the scope authorised it.
             let write_result = if scope_permits {
                 object_bound_write(&caveats.fs_write, "fs_write", path, &full, &full_str, &updated)
             } else {
                 std_write(&full, path, &updated)
             };
+            let receipt_after = file_capture::capture(&caveats.fs_read, &full);
+            let receipt = file_capture::receipt(path, &receipt_before, &receipt_after);
             match write_result {
                 Ok(()) => {
+                    if !file_capture::verified_after(&receipt_after, mutation_scope, &full, Some(updated.as_bytes())) {
+                        return receipt.present(
+                            format!("error: edit_file returned success for {path}, but the replacement bytes could not be verified"),
+                            "",
+                            presentation,
+                        );
+                    }
                     let artifact = if !artifact_tracking {
                         String::new()
                     } else if !artifact_path_within
@@ -3638,7 +3750,7 @@ async fn execute_authorized_tool(
                             tool_output_lines,
                         )
                     } else {
-                        match artifact_file_matches(&full, updated.as_bytes()) {
+                        match artifact_file_matches(&caveats.fs_write, &full, updated.as_bytes()) {
                             Ok(true) => record_governed_file_change(
                                 artifact_sink,
                                 artifact_context,
@@ -3668,11 +3780,9 @@ async fn execute_authorized_tool(
                     let check = build_check_cmd
                         .map(|cmd| run_build_check(cmd, workspace))
                         .unwrap_or_default();
-                    format!(
-                        "edited {path} ({delta_str} lines, now {new_lines} total){artifact}{check}"
-                    )
+                    receipt.present(format!("edited {path} ({delta_str} lines, now {new_lines} total)"), &format!("{artifact}{check}"), presentation)
                 }
-                Err(tool_output) => tool_output,
+                Err(tool_output) => receipt.present(file_capture::failure(tool_output, ""), "", presentation),
             }
         }
 

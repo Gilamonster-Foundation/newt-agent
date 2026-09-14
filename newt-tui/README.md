@@ -11,10 +11,50 @@ write that file plus one `backends/*.toml` drop-in per endpoint.
 
 ## Settings and communication style
 
-The rich TUI offers `/settings`, `/backends`, `/models`, and `/psyche` controls.
-Their apply, cancel, and save behavior is documented in the
-[settings walkthroughs](../demos/README.md); a session change is not automatically
-a saved configuration change.
+Open `/settings` → **Themes** to select **newt**, **daylight**, **phosphor**, or
+one of your saved themes. Up/Down chooses a field; Left/Right changes it.
+Choose a role to edit its color, bold, dim, italic, underline, reverse, or
+strikethrough. The color field also accepts `#rrggbb` or an ANSI index `0–255`.
+The fixed preview shows headings, file names, human and agent text, and spill
+output while you edit. Enter applies and remembers the theme; Esc discards the
+draft. To keep a named copy, type a Save name and press Ctrl-S, then Enter to
+apply. Built-in names are protected; saved custom names can be updated.
+
+Themes live under `~/.newt/themes/`; `active.toml` stores the last applied
+selection. Changes affect subsequent output immediately; committed terminal
+scrollback retains the colors it had when printed. `NEWT_THEME` color overrides
+still apply at startup. The default uses light-blue headings, bright-white
+inline code/file names, cyan human prompts, gray agent replies, and dim-gray
+spill text. These are editable semantic roles, including `human-text`,
+`agent-text`, `markdown-heading`, `inline-code`, and `spill`.
+
+The rich TUI offers `/settings`, `/backends`, `/model` (also `/models`), and `/psyche` controls.
+The model picker supports arrow-key selection. Only resident models show a
+`[loaded]` badge, to the right of the name. The active session model uses the
+`active-model` theme color; the badge uses `loaded-model` (for example,
+`NEWT_THEME='active-model=cyan,loaded-model=magenta'`). On llama.cpp routers,
+`l` loads, `u` confirms unloading, `x` confirms unloading other models and loading
+the highlighted one, and `r` refreshes. Enter selects the model for chat.
+In `/backends`, Down opens the selected backend's editor; Left/Right on its model
+field cycles through models discovered from that endpoint. Enter saves the backend
+configuration. Use `/model` to change the model for the active conversation.
+
+The rich panels share NewtUI's key and close vocabulary. Newt retains event
+decoding, terminal ownership, settings validation and writes. The
+[first adoption step](../docs/ROADMAP.md#step-131--shared-panel-key-and-close-vocabulary)
+records the immutable dependency pin and the boundary for later component moves.
+
+File edits in the rich surface show NewtUI's numbered added and removed rows,
+with syntax foregrounds and semantic backgrounds, in committed scrollback and
+the existing completed spill viewport. Resizing reprojects the captured model;
+the normal scroll, expand and dismiss controls retain ownership. Theme overrides
+`added`, `removed`, `added-background`, and `removed-background` tune these colors.
+For example, `NEWT_THEME="added-background=#183825,removed-background=#411d20"`
+sets both source backgrounds. The rich build includes the existing Syntect
+syntax/theme assets; lean builds keep the plain text receipt path. The `/spill`
+archive still retains bounded text; typed full inspection and exact export are
+subsequent work, as recorded in
+[Step 13.3](../docs/ROADMAP.md#step-133--rich-file-change-cells-in-scrollback-and-the-completed-viewport).
 
 `/psyche` includes independent agreeableness, extraversion, warmth,
 approachability, and prosocial-behavior dials. Select `steady`, `direct`, or
@@ -46,8 +86,12 @@ The turn footer reports `awaiting operator` when smart-harness adjudication
 classifies a question, and `incomplete` when narration ends without an answer.
 The question or observed reply remains available; these status notices stay
 separate from model text.
-Enable `[smart_harness] enabled = true` to use durable frames and an independent
-CPU auxiliary. Smart mode selects from retained originals and disables legacy
+The durable smart harness currently requires confined Linux execution with
+Landlock. Native [macOS support](https://github.com/Gilamonster-Foundation/newt-agent/issues/2281)
+and [Windows support](https://github.com/Gilamonster-Foundation/newt-agent/issues/2282)
+are tracked separately; enabling it there currently fails startup.
+On a supported host, enable `[smart_harness] enabled = true` to use durable frames
+and an independent CPU auxiliary. Smart mode selects from retained originals and disables legacy
 history and close-time summaries; each turn prints its frame head for inspection
 or resume. See [configuration and limits](../docs/guide/smart-harness.md).
 

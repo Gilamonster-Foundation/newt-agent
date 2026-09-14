@@ -105,10 +105,12 @@ pub fn inspect_from_store(
                     }
                 }
             }
-            Reply { event, request } => references.extend([
-                ("event", Address::Node(*event)),
-                ("request", Address::Node(*request)),
-            ]),
+            Reply { event, request } | RequestIntervention { event, request } => {
+                references.extend([
+                    ("event", Address::Node(*event)),
+                    ("request", Address::Node(*request)),
+                ]);
+            }
             Verdict { event, reply, .. }
             | Failure { event, reply }
             | Outcome { event, reply, .. }

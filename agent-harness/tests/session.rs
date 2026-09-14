@@ -122,6 +122,56 @@ fn actual_operator_stays_pinned_after_harness_nudge() {
 }
 
 #[test]
+fn newest_tool_result_stays_pinned_after_a_context_rejection_observes_the_request() {
+    let mut session = Session::new(config()).unwrap();
+    let messages = vec![
+        json!({"role":"user","content":"old context"}),
+        json!({"role":"user","content":"exact operator prompt"}),
+        json!({"role":"assistant","tool_calls":[{"id":"call-1"},{"id":"call-2"}]}),
+        json!({"role":"tool","tool_call_id":"call-1","content":"first result"}),
+        json!({"role":"tool","tool_call_id":"call-2","content":"last result must survive"}),
+    ];
+    let request = session
+        .record_request(json!({"messages":messages}), "openai")
+        .unwrap();
+    session
+        .record_reply(request.id, b"Context size has been exceeded")
+        .unwrap();
+    let catalog = session.catalog(&messages, 4096).unwrap();
+    let cards = catalog["candidates"].as_array().unwrap();
+    let ids = cards
+        .iter()
+        .map(|card| card["cid"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cards[4]["required"], true,
+        "observed rejection does not unpin the last result"
+    );
+    assert!(
+        session
+            .project_selection(&messages, &ids[1..2], 4096)
+            .is_err(),
+        "the operator alone must not displace the newest tool result"
+    );
+    assert!(
+        session
+            .project_selection(&messages, &[ids[1].clone(), ids[4].clone()], 4096)
+            .is_err(),
+        "keeping the result requires the complete tool-call batch"
+    );
+    let projected = session
+        .project_selection(&messages, &ids[1..], 4096)
+        .unwrap();
+    assert!(projected.iter().any(|message| message == &messages[1]));
+    for original in &messages[2..] {
+        assert!(
+            projected.iter().any(|message| message == original),
+            "the original tool-call/result group must remain verbatim"
+        );
+    }
+}
+
+#[test]
 fn model_parroting_an_intervention_remains_a_model_observation() {
     let mut session = Session::new(config()).unwrap();
     let request = session

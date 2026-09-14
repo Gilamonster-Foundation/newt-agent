@@ -199,6 +199,8 @@ mod panel;
 // stays for every surface that has no region to draw in.
 #[cfg(feature = "rich-tui")]
 mod settings_panel;
+#[cfg(feature = "rich-tui")]
+mod theme_panel;
 // The backend chooser/editor panel (#1667) — same grammar, same gating; its
 // persistence rides the setup wizard's crash-safe lock + plan machinery.
 #[cfg(feature = "rich-tui")]
@@ -830,7 +832,7 @@ fn render_inline_header(workspace: &str, color: bool) -> String {
 
     // Text lines aligned to the middle-right of the logo.
     let mid = n / 2;
-    let header = format!("{}  ·  {}", brand_name(), brand_tagline());
+    let header = brand_tagline();
     let plugins = brand_plugins();
     let version = format!("v{VERSION}");
     let text: &[(&str, bool)] = &[
@@ -5780,9 +5782,11 @@ where
     // rebuilds `[summary] + [turns from the trigger on]` — the same working
     // set the live session kept.
     if let Some(summary) = compaction {
-        // Sources stay empty until the producer plumbing lands (#1786 spec
-        // §8, Phase C): ids flow from the store post-save, one cycle late.
-        store.append_turn_full(conversation_id, &summary, "", &[], &[], &[], None, None)?;
+        // #1786 Phase C: the summary is a DERIVED row and cites the turns it
+        // replaced. The producer lives in newt-core beside `restore_turns`,
+        // whose cut defines the working set being replaced — the two must
+        // agree, so they are not written twice.
+        newt_core::persist_compaction_summary(store, conversation_id, &summary)?;
     }
     // 17.6: persist the turn's tool events and the backend-reported token
     // actuals. `usage` is what `chat_complete` returned — input = largest
@@ -7690,7 +7694,8 @@ fn connect_timeout_secs(cfg: &newt_core::Config) -> u64 {
         .unwrap_or(5)
 }
 
-/// Full inference timeout from `[tui].inference_timeout_secs` (default 120).
+/// Total single-response / streamed idle timeout from
+/// `[tui].inference_timeout_secs` (default 120).
 fn inference_timeout_secs(cfg: &newt_core::Config) -> u64 {
     cfg.tui
         .as_ref()

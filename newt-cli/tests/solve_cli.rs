@@ -65,8 +65,10 @@ device = "cuda"
         }
         let expected = if unsafe_exec {
             "requires confined launch authority"
-        } else if !cfg!(target_os = "linux") || !newt_core::ocap_l3_backend().1 {
-            "requires object-bound Linux filesystem tools and Landlock"
+        } else if !cfg!(any(target_os = "linux", target_os = "macos"))
+            || !newt_core::ocap_l3_backend().1
+        {
+            "requires object-bound filesystem tools and a supported kernel sandbox"
         } else if exposed || extra_grant {
             "frame storage overlaps model filesystem authority"
         } else {
@@ -112,12 +114,12 @@ impl Respond for CaptureThenFinish {
             .lock()
             .expect("request capture lock")
             .push(body);
-        // #123: the accepted round is re-issued with `stream: true` and served
-        // as SSE. Captured like any other request — it goes to the same
+        // Primary and final-display requests both use SSE. Each is
+        // captured like any other request — it goes to the same
         // endpoint and carries the same wire controls, so the assertions about
         // both apply to it too.
         if streaming {
-            let frame = serde_json::json!({"choices": [{"delta": {"content": "done"}}]});
+            let frame = serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]});
             let sse = format!("data: {frame}\n\ndata: [DONE]\n\n");
             return ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream");
         }

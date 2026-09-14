@@ -44,6 +44,7 @@ async fn compact_responses_input_post_fence_overflow_is_transactional() {
         &mut state,
         false,
         None,
+        false,
     )
     .await;
 
@@ -97,6 +98,7 @@ async fn compact_responses_input_bridge_error_is_transactional() {
         &mut state,
         false,
         None,
+        false,
     )
     .await;
     assert!(matches!(outcome, ResponsesCompaction::BridgeError));
@@ -135,6 +137,7 @@ async fn compact_responses_input_refusal_is_transactional() {
         &mut state,
         false,
         None,
+        false,
     )
     .await;
     assert!(
@@ -183,6 +186,7 @@ async fn compact_responses_input_commits_only_on_success() {
         &mut state,
         false,
         None,
+        false,
     )
     .await;
     assert!(
@@ -251,6 +255,7 @@ async fn compact_responses_input_spill_store_is_transactional() {
             &mut state,
             false,
             None,
+            false,
         )
         .await;
         assert!(matches!(
@@ -297,6 +302,7 @@ async fn compact_responses_input_spill_store_is_transactional() {
             &mut state,
             false,
             None,
+            false,
         )
         .await;
         assert!(matches!(outcome, ResponsesCompaction::Compacted));
@@ -350,6 +356,7 @@ async fn compact_responses_input_no_store_emits_no_retrieval_handle() {
         &mut state,
         false,
         None,
+        false,
     )
     .await;
     assert!(matches!(outcome, ResponsesCompaction::Compacted));
@@ -393,6 +400,7 @@ async fn compact_responses_input_names_a_resolvable_content_handle() {
         &mut state,
         false,
         None,
+        false,
     )
     .await;
     assert!(matches!(outcome, ResponsesCompaction::Compacted));

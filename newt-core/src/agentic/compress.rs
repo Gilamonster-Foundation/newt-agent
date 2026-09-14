@@ -67,6 +67,9 @@ use super::trim::{
 };
 use crate::tokens::TokenEstimation;
 
+#[path = "prompt_calibration.rs"]
+mod prompt_calibration;
+
 /// Future returned by an injected [`SummarizeFn`].
 pub type SummarizeFuture = Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>;
 
@@ -210,6 +213,8 @@ const PROACTIVE_SUMMARIZE_FLOOR_FRACTION: f32 = 0.75;
 /// cheap value snapshot (not a serialization trick).
 #[derive(Debug, Clone)]
 pub struct CompressState {
+    /// Session evidence survives transcript rewrites and the next turn.
+    pub(crate) calibration: prompt_calibration::PromptCalibration,
     /// Reclaim fractions of the last two attempted compressions (for display).
     last_savings: [f32; 2],
     /// Whether each of the last two passes was *effective* (budget-aware — see
@@ -249,6 +254,7 @@ impl Default for CompressState {
 impl CompressState {
     pub fn new() -> Self {
         Self {
+            calibration: prompt_calibration::PromptCalibration::default(),
             last_savings: [1.0, 1.0],
             last_effective: [true, true],
             attempts: 0,
@@ -642,6 +648,7 @@ pub(crate) fn compression_trigger(
 // ---------------------------------------------------------------------------
 
 /// One compression request from a loop call site.
+#[derive(Clone, Copy)]
 pub(crate) struct CompressRequest<'a> {
     pub messages: &'a [Value],
     /// Message-space token budget (chars/4 estimate currency) the result
@@ -2464,3 +2471,7 @@ mod append_only_tests;
 #[cfg(test)]
 #[path = "compress_tests/support.rs"]
 mod test_support;
+
+#[cfg(test)]
+#[path = "compress_tests/calibration.rs"]
+mod calibration_tests;

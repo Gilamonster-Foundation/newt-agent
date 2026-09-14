@@ -1697,3 +1697,51 @@ impl MemoryProvider for SoulProvider {
 #[cfg(test)]
 #[path = "memory_tests/mod.rs"]
 mod tests;
+
+/// Persist a compaction summary as its own DERIVED turn row, citing the turns
+/// it replaced. THE producer for #1786's provenance edge.
+///
+/// A summary replaces N turns with generated prose whose only justification is
+/// those turns. Recorded with no citation it is unattributable by construction:
+/// you cannot audit it, cannot re-derive it, and cannot tell a faithful summary
+/// from a fabricated one, because both look identical on the wire.
+///
+/// **Which turns it cites.** Exactly the working set the next compression
+/// consumes, computed with the SAME cut [`Summarizing::restore_turns`] uses —
+/// the last persisted compaction row and every turn after it. That is not a
+/// second rule invented here; agreement with the live cut is the whole point,
+/// because sources must name the window the summarizer actually consumed. A
+/// naive "cite every row" would over-claim on any conversation that has
+/// compacted before: those earlier turns are covered by the EARLIER summary,
+/// which this one cites in turn, so the edge to them is transitive and already
+/// recorded.
+///
+/// **Ids are read back, never recomputed** ([`ConversationStore::turn_refs`]):
+/// every cited id is by construction the id of a row that exists, so this
+/// producer cannot mint the orphan citation verification refuses.
+///
+/// The summary goes in BEFORE its triggering turn (the live boundary's
+/// last-user anchor guarantees that turn survived compression), so it cannot
+/// cite itself and cannot cite the turn that triggered it.
+///
+/// Empty sources are possible and permitted (§8): a window with no citable
+/// input — the very first compaction of an empty conversation, or one whose
+/// rows all failed to save — persists as a derived-shaped row that reads as
+/// witnessed. That is a stated provenance gap, not a silent one.
+pub fn persist_compaction_summary(
+    store: &crate::ConversationStore,
+    conversation_id: &str,
+    summary: &str,
+) -> anyhow::Result<()> {
+    let refs = store.turn_refs(conversation_id)?;
+    // The §18.5 cut, mirrored from `restore_turns`: everything before the last
+    // compaction row is already covered by THAT row's own citation.
+    let cut = refs
+        .iter()
+        .rposition(|(user, assistant, _)| is_compaction_text(user) && assistant.is_empty());
+    let sources: Vec<String> = match cut {
+        Some(k) => refs[k..].iter().map(|(_, _, id)| id.clone()).collect(),
+        None => refs.into_iter().map(|(_, _, id)| id).collect(),
+    };
+    store.append_turn_full(conversation_id, summary, "", &[], &[], &sources, None, None)
+}

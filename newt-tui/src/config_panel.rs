@@ -57,7 +57,7 @@ use std::io;
 
 use crate::panel::Key;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -987,6 +987,21 @@ pub(crate) fn render_panel(
     label_w: usize,
     val_w: usize,
 ) {
+    render_panel_with_styles(f, title, rows, bottom, label_w, val_w, |_| {
+        (Style::default(), Style::default())
+    });
+}
+
+/// Shared chrome with optional per-row value and annotation styling.
+pub(crate) fn render_panel_with_styles(
+    f: &mut ratatui::Frame,
+    title: &str,
+    rows: &[RowView],
+    bottom: Line,
+    label_w: usize,
+    val_w: usize,
+    styles: impl Fn(&RowView) -> (Style, Style),
+) {
     // The edge comes from `modal::frame`, which every dialog now shares. The
     // panel used to own the only border in the crate; making it the SHARED one
     // is how the pagers and the permission prompt got an edge at all.
@@ -1012,6 +1027,8 @@ pub(crate) fn render_panel(
             row.value.clone()
         };
         let (name_style, val_style) = row_styles(row.selected, row.editable);
+        let (value_override, annotation_override) = styles(row);
+        let val_style = val_style.patch(value_override);
         let mut spans = vec![
             Span::styled(name, name_style),
             Span::styled(format!("{val:<val_w$}"), val_style),
@@ -1019,7 +1036,7 @@ pub(crate) fn render_panel(
         if !row.provenance.is_empty() {
             spans.push(Span::styled(
                 row.provenance.clone(),
-                Style::default().add_modifier(Modifier::DIM),
+                crate::theme::style(crate::theme::Role::Dim).patch(annotation_override),
             ));
         }
         lines.push(Line::from(spans));
@@ -1042,9 +1059,7 @@ pub(crate) fn render_panel(
 pub(crate) fn command_line(buf: &str) -> Line<'static> {
     Line::from(Span::styled(
         format!(":{buf}▏"),
-        Style::default()
-            .fg(crate::theme::color(crate::theme::Role::Ok))
-            .add_modifier(Modifier::BOLD),
+        crate::theme::style(crate::theme::Role::Ok),
     ))
 }
 
@@ -1052,9 +1067,7 @@ pub(crate) fn command_line(buf: &str) -> Line<'static> {
 pub(crate) fn status_line(status: &str) -> Line<'static> {
     Line::from(Span::styled(
         status.to_string(),
-        Style::default()
-            .fg(crate::theme::color(crate::theme::Role::Identity))
-            .add_modifier(Modifier::BOLD),
+        crate::theme::style(crate::theme::Role::Identity),
     ))
 }
 
@@ -1062,7 +1075,7 @@ pub(crate) fn status_line(status: &str) -> Line<'static> {
 pub(crate) fn hint_line(hint: &'static str) -> Line<'static> {
     Line::from(Span::styled(
         hint,
-        Style::default().add_modifier(Modifier::DIM),
+        crate::theme::style(crate::theme::Role::Dim),
     ))
 }
 
@@ -1077,19 +1090,18 @@ pub(crate) fn hint_line(hint: &'static str) -> Line<'static> {
 pub(crate) fn row_styles(selected: bool, editable: bool) -> (Style, Style) {
     if selected {
         (
-            Style::default()
-                .fg(crate::theme::color(crate::theme::Role::SelectedLabel))
-                .add_modifier(Modifier::BOLD),
-            Style::default()
-                .fg(crate::theme::color(crate::theme::Role::SelectedValue))
-                .add_modifier(Modifier::BOLD),
+            crate::theme::style(crate::theme::Role::SelectedLabel),
+            crate::theme::style(crate::theme::Role::SelectedValue),
         )
     } else if editable {
-        (Style::default(), Style::default())
+        (
+            crate::theme::style(crate::theme::Role::Text),
+            crate::theme::style(crate::theme::Role::Text),
+        )
     } else {
         (
-            Style::default().add_modifier(Modifier::DIM),
-            Style::default().add_modifier(Modifier::DIM),
+            crate::theme::style(crate::theme::Role::Dim),
+            crate::theme::style(crate::theme::Role::Dim),
         )
     }
 }

@@ -119,6 +119,14 @@ pub(super) fn venv_env_map() -> std::collections::BTreeMap<String, String> {
         }
     }
 
+    // Resolve Apple's real developer tools before the /usr/bin xcrun shims.
+    // The shims need ambient per-user caches; direct tools keep workspace-only
+    // writes. Explicit venv and operator executable roots retain precedence.
+    #[cfg(target_os = "macos")]
+    if let Some(developer) = crate::confined_exec::selected_developer_directory() {
+        path_dirs.push(format!("{developer}/usr/bin"));
+    }
+
     if !path_dirs.is_empty() {
         let prepend = path_dirs.join(":");
         let path = match std::env::var("PATH") {
@@ -279,7 +287,7 @@ pub(super) fn shell_engine() -> crate::ShellEngine {
 fn b1_run_command_sandbox_policy() -> agent_bridle::SandboxPolicy {
     agent_bridle::SandboxPolicy {
         child_network: agent_bridle::ChildNetworkPolicy::DenyDirect,
-        ..agent_bridle::SandboxPolicy::default()
+        ..crate::confined_exec::runtime_sandbox_policy()
     }
 }
 
@@ -607,14 +615,30 @@ pub(super) async fn exec_confined_command(
             }
             denied_run_command_result(&envelope, color)
         }
-        Ok(envelope) => shell_envelope_output(
-            &envelope,
-            tool_output_lines,
-            color,
-            tool_offload,
-            spill_store,
-            Some(&mut *presentation),
-        ),
+        Ok(envelope) => {
+            // #2274: a 127 with no structured denial is an ABSENCE, not an
+            // ordinary failure. Name it before it renders as the ambiguous
+            // `error: command exited 127`, which is indistinguishable from a
+            // broken machine. Returns None for everything else, so ordinary
+            // output and ordinary failures fall through untouched.
+            if let Some(refusal) = absent_binary_refusal(cmd, &envelope, &caveats.exec) {
+                return refusal;
+            }
+            // #2273: a 126 with no structured denial whose program sits
+            // outside the fs-read grant is the KERNEL refusing, not a
+            // chmod the model forgot. Same structured test, one more state.
+            if let Some(refusal) = kernel_refused_binary(cmd, &envelope, &caveats.fs_read) {
+                return refusal;
+            }
+            shell_envelope_output(
+                &envelope,
+                tool_output_lines,
+                color,
+                tool_offload,
+                spill_store,
+                Some(&mut *presentation),
+            )
+        }
         // An argv-mode leash denial, or an error from inside the tool — surface
         // the reason; the dispatch error Display is safe to show.
         Err(e) => format!("error: {e}"),
@@ -1106,6 +1130,216 @@ pub(super) fn exec_denial_target_label(envelope: &serde_json::Value) -> String {
     } else {
         targets.join(", ")
     }
+}
+
+/// #2274 — absence must never be ambiguous.
+///
+/// A binary the carried userland does not carry used to reach the model as
+/// `error: command exited 127` wrapped around brush's own `command not found:
+/// X`, which is indistinguishable from a broken machine. That ambiguity is why
+/// the confined profile read as flakiness for six months instead of as policy.
+///
+/// Three states hide behind that one rendering, and the right next move differs
+/// in each, so the model must be able to tell them apart:
+///
+/// | state | envelope | remedy |
+/// |---|---|---|
+/// | denied by a grant | `denied:true` + `denials[kind=exec]`, exit 126 | ask for the grant |
+/// | not carried, on the host | exit 127, no denials, host PATH resolves | ask for `exec:<abs path>` |
+/// | not on this host at all | exit 127, no denials, host PATH misses | no grant can help |
+///
+/// Discrimination is STRUCTURED — the exit code plus the `denials` array — the
+/// same rule [`envelope_denied`] follows, and for the same reason: a command
+/// that merely *prints* a denial-like phrase must not be misread. Exit 127 is
+/// brush's `CommandNotFound`; a refusal the interceptor actually made carries
+/// `denials` and is exit 126, so it is excluded here and left to
+/// [`denied_run_command_result`].
+///
+/// Returns `None` for anything that is not an absence, leaving ordinary output
+/// and ordinary failures untouched.
+///
+/// Only newt can answer the last row. brush runs behind the fence, where a PATH
+/// probe would be answering about the fence rather than about the host; newt's
+/// own process is never Landlocked, so it can resolve the real host PATH and
+/// separate "installed, but not reachable from in here" from "not installed".
+pub(crate) fn absent_binary_refusal(
+    cmd: &str,
+    envelope: &serde_json::Value,
+    exec: &crate::caveats::Scope<String>,
+) -> Option<String> {
+    // 127 = brush's `ExecutionExitCode::NotFound`: the program was never
+    // resolved, so the interceptor was never consulted.
+    if envelope
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        != Some(127)
+    {
+        return None;
+    }
+    // A structured refusal is a DENIAL, not an absence. Relabelling one as the
+    // other would send the model to the wrong remedy.
+    if envelope_denied(envelope)
+        || envelope
+            .get("denials")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|d| !d.is_empty())
+    {
+        return None;
+    }
+
+    let prog = failed_program(cmd, envelope, "command not found: ")?;
+    let granted = granted_host_binaries(exec);
+
+    // The host probe is what makes the two 127 states distinguishable.
+    Some(match host_path_lookup(&prog) {
+        Some(abs) => format!(
+            "error: {prog}: {ABSENT_BINARY_MARKER}.\n  \
+             granted host binaries: {granted}\n  \
+             ask the operator for exec:{abs}, or run the host lane."
+        ),
+        // Deliberately NO grant coaching here: granting exec for a binary that
+        // is not installed is a no-op, and teaching the model to ask for one is
+        // exactly the futile loop the denial journal exists to detect.
+        None => format!(
+            "error: {prog}: {ABSENT_BINARY_MARKER}, and {NOT_ON_HOST_MARKER}.\n  \
+             granted host binaries: {granted}\n  \
+             no grant can supply it - install it on the host, or use a carried tool."
+        ),
+    })
+}
+
+/// The phrase every absent-binary refusal carries. The loop guidance keys on
+/// it (`MISSING_EXECUTABLE_NEEDLES` in `agentic`) to recognise a blocker no
+/// edit can clear (#2273); one constant, so renderer and classifier cannot
+/// drift — #2277 changed this rendering once and the classifier kept grepping
+/// for brush's old `command not found`.
+pub(crate) const ABSENT_BINARY_MARKER: &str = "not in this profile's carried userland";
+
+/// The suffix that separates "absent here but installed on the host" (a grant
+/// gap) from "not installed at all" (no grant can help). One constant, for the
+/// same renderer/classifier drift reason as [`ABSENT_BINARY_MARKER`] (#2304).
+pub(crate) const NOT_ON_HOST_MARKER: &str = "not installed on this host";
+
+/// #2273 — the fourth state: the binary exists and no grant refused it, yet
+/// the KERNEL did, because the program lives outside the fs-read grant
+/// (`~/.cargo/bin` outside the sandbox's read scope is the issue's own
+/// transcript). brush reports it as exit 126 with `Permission denied`, which
+/// is indistinguishable from a script the model forgot to `chmod +x` — a
+/// repairable failure. The gate is STRUCTURED and reads no stderr: exit 126,
+/// no `denials`, and the resolved host path is NOT permitted by the read
+/// scope. Stderr only chooses WHICH program that path check examines — brush's
+/// own error names it first, the leading token is the fallback (see
+/// [`failed_program`]). Only then is it rendered in newt's own denial vocabulary
+/// so the guidance stops asking for an edit; an ordinary 126 inside the grant
+/// falls through untouched.
+pub(crate) fn kernel_refused_binary(
+    cmd: &str,
+    envelope: &serde_json::Value,
+    fs_read: &crate::caveats::Scope<String>,
+) -> Option<String> {
+    if envelope
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        != Some(126)
+    {
+        return None;
+    }
+    if envelope_denied(envelope)
+        || envelope
+            .get("denials")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|d| !d.is_empty())
+    {
+        return None;
+    }
+    let prog = failed_program(cmd, envelope, "failed to execute command '")?;
+    let abs = host_path_lookup(&prog)?;
+    if crate::caveats::permits_path(fs_read, &abs) {
+        return None;
+    }
+    let dir = std::path::Path::new(&abs)
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| abs.clone());
+    Some(format!(
+        "capability denied: exec of {prog} at {abs} is outside the fs-read \
+         grant, so the kernel refused it (exit 126).\n  \
+         ask the operator for read:{dir} (and exec:{abs}), or run the host lane."
+    ))
+}
+
+/// Which program brush failed on.
+///
+/// brush names it in its own error — `command not found: X` for 127,
+/// `failed to execute command 'X': ...` for 126 — and that is the
+/// authoritative answer for a compound command, where the leading token
+/// (`cd newt-core && cargo test`) is not the one that failed (#2304). The LAST
+/// occurrence wins: the exit status belongs to the command that ran last.
+/// Falling back to the leading token keeps a name in hand if that wording
+/// ever drifts.
+///
+/// Reading stderr is acceptable HERE and not in [`envelope_denied`] because
+/// both callers are already fenced behind the structured exit-code-and-no-
+/// denials test, and the model controls `cmd` just as fully: stderr adds no
+/// authority the leading token did not already give it. `envelope_denied`
+/// decides whether authority was refused; this only picks which program the
+/// advisory message is about.
+fn failed_program(cmd: &str, envelope: &serde_json::Value, marker: &str) -> Option<String> {
+    let named = envelope
+        .get("stderr")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|stderr| stderr.rfind(marker).map(|at| &stderr[at + marker.len()..]))
+        .and_then(|rest| rest.split(['\'', '\n']).next())
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    // `FOO=bar prog ...` - an env assignment is not the program.
+    named
+        .or_else(|| cmd.split_ascii_whitespace().find(|tok| !tok.contains('=')))
+        .map(str::to_string)
+}
+
+/// The exec grants in force, for the refusal's second line. Naming what IS
+/// granted turns "no" into a question the operator can answer in one line.
+fn granted_host_binaries(exec: &crate::caveats::Scope<String>) -> String {
+    match exec {
+        crate::caveats::Scope::All => "(unrestricted)".to_string(),
+        crate::caveats::Scope::Only(set) if set.is_empty() => "(none)".to_string(),
+        crate::caveats::Scope::Only(set) => set
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
+/// Resolve `prog` against the REAL host PATH.
+///
+/// Sound because newt's own process is never Landlocked - the fence is applied
+/// on the spawning thread immediately before the child starts (agent-bridle's
+/// `ConfinedCommand::spawn_authorized`), never to newt itself. This therefore
+/// answers "is it installed on this host", which is exactly the question the
+/// confined child cannot answer about itself.
+fn host_path_lookup(prog: &str) -> Option<String> {
+    fn executable(p: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            p.is_file()
+        }
+    }
+
+    // An explicit path is already the answer; PATH is not consulted for it.
+    if prog.contains('/') || prog.contains('\\') {
+        return executable(std::path::Path::new(prog)).then(|| prog.to_string());
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(prog))
+        .find(|cand| executable(cand))
+        .map(|p| p.display().to_string())
 }
 
 /// The standard `run_command` success path: return stdout/stderr, or `(exit N)`

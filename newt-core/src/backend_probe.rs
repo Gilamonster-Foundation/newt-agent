@@ -22,6 +22,10 @@ use crate::config::{
     BackendConfig, BackendKind, Engine, ManagedMode, OpenAiApi as OpenAiApiSurface, Serving,
 };
 
+#[path = "backend_probe_token_count.rs"]
+mod token_count;
+pub use token_count::{count_chat_tokens, TokenCount};
+
 /// HTTP status returned by a model-list probe. Keeping the status typed lets
 /// endpoint detection distinguish authentication and unsupported APIs from a
 /// host that could not be reached, while preserving the existing `HTTP ...`
@@ -623,16 +627,16 @@ impl BackendApi for LlamaCppApi {
         endpoint: &str,
         api_key: Option<&str>,
     ) -> Option<Vec<String>> {
-        // llama-server's non-/v1 `/models` route carries per-entry load
-        // state (vLLM 404s here, so this is also engine-distinctive). No
-        // state fields at all → capability absent (`None`) — never guess.
-        let url = format!("{}/models", endpoint.trim_end_matches('/'));
-        let resp = maybe_bearer(client.get(&url), api_key).send().await.ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let json: serde_json::Value = resp.json().await.ok()?;
-        parse_llamacpp_models_warm(&json)
+        let states = fetch_llamacpp_model_states(client, endpoint, api_key)
+            .await
+            .ok()??;
+        Some(
+            states
+                .into_iter()
+                .filter(|(_, state)| state == "loaded")
+                .map(|(name, _)| name)
+                .collect(),
+        )
     }
 }
 
@@ -1059,31 +1063,92 @@ pub async fn fetch_ollama_ps(
     Ok(parse_ollama_ps(&json))
 }
 
-/// Extract the WARM subset from llama-server's non-`/v1` `/models` response.
-/// Pure. `None` when no entry carries a load-state field at all (capability
-/// absent — adoption falls back to served order rather than guessing).
-pub fn parse_llamacpp_models_warm(json: &serde_json::Value) -> Option<Vec<String>> {
+/// Read router residency without loading any model. A missing capability is
+/// `None`; a failed request is an error, never an empty loaded-model list.
+pub async fn fetch_llamacpp_model_states(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<Option<Vec<(String, String)>>> {
+    let url = format!("{}/models", endpoint.trim_end_matches('/'));
+    let response = maybe_bearer(client.get(url), api_key).send().await?;
+    if !response.status().is_success() {
+        return Err(ProbeHttpStatus(response.status()).into());
+    }
+    Ok(parse_llamacpp_model_states(&response.json().await?))
+}
+
+/// Request a llama.cpp router load/unload. These operations change residency,
+/// never the model files. Callers establish router support before offering them.
+pub async fn set_llamacpp_model_loaded(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+    model: &str,
+    loaded: bool,
+) -> anyhow::Result<()> {
+    let action = if loaded { "load" } else { "unload" };
+    let url = format!("{}/models/{action}", endpoint.trim_end_matches('/'));
+    let response = maybe_bearer(
+        client.post(url).json(&serde_json::json!({"model": model})),
+        api_key,
+    )
+    .send()
+    .await?;
+    if !response.status().is_success() {
+        return Err(ProbeHttpStatus(response.status()).into());
+    }
+    let body: serde_json::Value = response.json().await?;
+    anyhow::ensure!(
+        body["success"].as_bool() == Some(true),
+        "server did not confirm model {action}"
+    );
+    Ok(())
+}
+
+/// Parse per-model residency. Only known states become display text; absent
+/// or unfamiliar states stay unknown rather than being labelled unloaded.
+pub fn parse_llamacpp_model_states(json: &serde_json::Value) -> Option<Vec<(String, String)>> {
     let entries = json["data"].as_array().or_else(|| json.as_array())?;
-    let state_of = |e: &serde_json::Value| {
-        e["state"]
+    let state_of = |entry: &serde_json::Value| {
+        entry["state"]
             .as_str()
-            .or_else(|| e["status"].as_str())
-            // llama-swap reports status as an OBJECT: `{"value":"loaded", …}`
-            // — read the nested value so a router that swaps models on demand
-            // still reveals which model is resident (else adopt-warm never fires
-            // on it). See ADR docs/decisions/managed_backend.md.
-            .or_else(|| e["status"]["value"].as_str())
+            .or_else(|| entry["status"].as_str())
+            .or_else(|| entry["status"]["value"].as_str())
             .map(str::to_ascii_lowercase)
     };
-    if !entries.iter().any(|e| state_of(e).is_some()) {
+    if !entries.iter().any(|entry| state_of(entry).is_some()) {
         return None;
     }
     Some(
         entries
             .iter()
-            .filter(|e| state_of(e).is_some_and(|s| s == "loaded"))
-            .filter_map(|e| e["id"].as_str().or_else(|| e["model"].as_str()))
-            .map(str::to_string)
+            .filter_map(|entry| {
+                let name = entry["id"].as_str().or_else(|| entry["model"].as_str())?;
+                let raw = state_of(entry).unwrap_or_default();
+                let state = if entry["status"]["failed"].as_bool() == Some(true) {
+                    "failed"
+                } else {
+                    match raw.as_str() {
+                        "loaded" | "unloaded" | "loading" | "sleeping" | "downloading" => {
+                            raw.as_str()
+                        }
+                        _ => "unknown",
+                    }
+                };
+                Some((name.to_string(), state.to_string()))
+            })
+            .collect(),
+    )
+}
+
+/// Extract the warm subset using the same state parser as the model manager.
+pub fn parse_llamacpp_models_warm(json: &serde_json::Value) -> Option<Vec<String>> {
+    Some(
+        parse_llamacpp_model_states(json)?
+            .into_iter()
+            .filter(|(_, state)| state == "loaded")
+            .map(|(name, _)| name)
             .collect(),
     )
 }

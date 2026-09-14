@@ -8,7 +8,7 @@
 
 use crossterm::{
     execute,
-    style::{Color as CtColor, Print, ResetColor, SetForegroundColor},
+    style::{Color as CtColor, ContentStyle, Print, ResetColor, SetForegroundColor},
 };
 use std::io::{self, Write};
 
@@ -19,19 +19,41 @@ use std::io::{self, Write};
 // Re-exported here so every call site in `agentic` is unchanged.
 pub(crate) use crate::tty::term_cols;
 pub use crate::tty::NEWT_ORANGE_CT;
-// `FADE_CT`'s only consumer is `agentic::markdown::emitter`, which is itself
-// `markdown`-gated — so under `--no-default-features` this re-export is unused
-// and `-D warnings` refuses it (#1890). Gated with its consumer rather than
-// deleted, because the curated re-export list above is the deliberate design:
-// every `agentic` call site names `display`, not `tty`.
-#[cfg(feature = "markdown")]
-pub(crate) use crate::tty::FADE_CT;
-
 // The multi-line wrapper moved up to `tty::width::wrap_line` with the rest of
 // the width model (`docs/decisions/tty_widget_suite.md` §3.0). Aliased under its
 // old name so every call site and every test in this module is unchanged — the
 // promotion is a move, not a behavior change.
 pub(crate) use crate::tty::width::wrap_line as wrap_to_width;
+
+/// Keep continuation text inside the same gutter and width as its first row.
+/// The retained result stays unchanged; this affects presentation only.
+fn bounded_spill_rows(rendered: &str, columns: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    for line in crate::tty::width::strip_ansi(rendered).lines() {
+        let (prefix, body) =
+            if line.starts_with("▒ ") || line.starts_with("▓ ") || line.starts_with("▲ ") {
+                line.split_at(line.chars().take(2).map(char::len_utf8).sum())
+            } else {
+                ("", line)
+            };
+        let indent = crate::tty::width::str_width(prefix);
+        for (i, part) in wrap_to_width(body, columns.saturating_sub(indent).max(1))
+            .into_iter()
+            .enumerate()
+        {
+            rows.push(format!(
+                "{}{}",
+                if i == 0 {
+                    prefix.to_string()
+                } else {
+                    " ".repeat(indent)
+                },
+                part
+            ));
+        }
+    }
+    rows
+}
 
 /// Print a newt narrator line.
 ///
@@ -350,6 +372,7 @@ pub(crate) fn retry_indicator_text(
         Some(ErrorClass::Timeout) => "request timed out",
         Some(ErrorClass::Transport) => "connection lost",
         Some(ErrorClass::Model) => "backend returned a retryable error",
+        Some(ErrorClass::ContextExceeded) => "backend rejected the context size",
         Some(ErrorClass::Harness) => "request failed in the harness",
         None => "connection lost",
     };
@@ -908,6 +931,24 @@ fn spill_view_lines_with_hint(
     columns: usize,
     recovery: Recovery<'_>,
 ) -> Vec<String> {
+    spill_excerpt_with_hint(
+        output,
+        view,
+        columns,
+        recovery,
+        |_, gutter, line| format!("{gutter}{line}"),
+        |line| line,
+    )
+}
+
+fn spill_excerpt_with_hint<T>(
+    output: &str,
+    view: usize,
+    columns: usize,
+    recovery: Recovery<'_>,
+    source: impl Fn(usize, &str, &str) -> T,
+    literal: impl Fn(String) -> T,
+) -> Vec<T> {
     // #1433: the budget is spent in RENDERED rows, not logical lines — counting
     // lines let one 4000-char diagnostic consume an unbounded number of them.
     //
@@ -929,7 +970,11 @@ fn spill_view_lines_with_hint(
         return Vec::new();
     }
     if view == 0 {
-        return lines.iter().map(|l| (*l).to_string()).collect();
+        return lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| source(i, "", l))
+            .collect();
     }
 
     // Does everything fit? Walk from the tail with the FULL (unreserved)
@@ -957,16 +1002,19 @@ fn spill_view_lines_with_hint(
     // multi-line case for the same reason — the decisive part of one huge
     // line (a JSON blob, a base64 payload) is not reliably at its end either.
     if used > view && kept == 1 {
-        return spill_wide_line_head_and_tail(lines[0], view, content_width, recovery);
+        return spill_wide_line_head_and_tail(lines[0], view, content_width, recovery)
+            .into_iter()
+            .map(literal)
+            .collect();
     }
 
     if start == 0 {
         // Fits: unchanged from pre-#1973.
         let mut out = Vec::with_capacity(lines.len() + 1);
-        for l in &lines {
-            out.push(format!("▒ {l}"));
+        for (i, l) in lines.iter().enumerate() {
+            out.push(source(i, "▒ ", l));
         }
-        out.push("…".to_string());
+        out.push(literal("…".to_string()));
         return out;
     }
 
@@ -983,12 +1031,12 @@ fn spill_view_lines_with_hint(
         // both ends. Not a realistic operator setting — fall back to the
         // pre-#1973 pure-tail shape using the already-computed full walk.
         let tail = &lines[start..];
-        let mut out = vec![format!("▲ {}", Fold::lines(start, recovery))];
+        let mut out = vec![literal(format!("▲ {}", Fold::lines(start, recovery)))];
         for (i, l) in tail.iter().enumerate() {
             let glyph = if i + 1 == tail.len() { '▓' } else { '▒' };
-            out.push(format!("{glyph} {l}"));
+            out.push(source(start + i, &format!("{glyph} "), l));
         }
-        out.push("…".to_string());
+        out.push(literal("…".to_string()));
         return out;
     }
     let head_budget = content_budget / 2;
@@ -1033,28 +1081,28 @@ fn spill_view_lines_with_hint(
     if hidden == 0 {
         // The reserved (smaller) split still covered everything after all.
         let mut out = Vec::with_capacity(lines.len() + 1);
-        for l in &lines {
-            out.push(format!("▒ {l}"));
+        for (i, l) in lines.iter().enumerate() {
+            out.push(source(i, "▒ ", l));
         }
-        out.push("…".to_string());
+        out.push(literal("…".to_string()));
         return out;
     }
 
     let mut out = Vec::with_capacity(head_kept + tail_kept + 2);
-    for l in &lines[..head_kept] {
-        out.push(format!("▒ {l}"));
+    for (i, l) in lines[..head_kept].iter().enumerate() {
+        out.push(source(i, "▒ ", l));
     }
     // #1263: this excerpt is PLAIN PRINTED TEXT — it deliberately shares the
     // ▲/▒/▓ glyphs with the live viewport, so without this hint it masqueraded
     // as the interactive scroller (the diagnosed operator tried to expand it in
     // scrollback). Name the real recovery path at the point of use.
-    out.push(format!("▲ {}", Fold::lines(hidden, recovery)));
+    out.push(literal(format!("▲ {}", Fold::lines(hidden, recovery))));
     let tail_start = lines.len() - tail_kept;
     for (i, l) in lines[tail_start..].iter().enumerate() {
         let glyph = if i + 1 == tail_kept { '▓' } else { '▒' };
-        out.push(format!("{glyph} {l}"));
+        out.push(source(tail_start + i, &format!("{glyph} "), l));
     }
-    out.push("…".to_string());
+    out.push(literal("…".to_string()));
     out
 }
 
@@ -1180,6 +1228,7 @@ pub(crate) struct ToolDisplay<W: Write> {
     /// global here — so a call site cannot silently get the wrong mode.
     summary: bool,
     result_override: Option<String>,
+    file_change: Option<std::sync::Arc<crate::agentic::FileChangePresentation>>,
     /// Optional completed spill renderer for Rich TUI interactive viewport (#1640).
     /// When present, completed tool output ADDITIONALLY renders as an interactive
     /// spill viewport below the committed `spill_view_lines` excerpt — the excerpt
@@ -1202,6 +1251,7 @@ impl<W: Write> ToolDisplay<W> {
             spill_lines,
             summary,
             result_override: None,
+            file_change: None,
             completed_spill_renderer: None,
         }
     }
@@ -1300,8 +1350,17 @@ impl<W: Write> ToolDisplay<W> {
     }
 
     pub(crate) fn result(&mut self, output: &str) {
+        let raw_output = output;
         let overridden = self.result_override.take();
         let output = overridden.as_deref().unwrap_or(output);
+        let change = self
+            .file_change
+            .take()
+            .filter(|_| self.color)
+            .and_then(|change| {
+                let (prefix, suffix) = change.surrounding_display_text(raw_output, output)?;
+                Some((change, prefix, suffix))
+            });
         let output = if output.trim().is_empty() {
             "(no output)"
         } else {
@@ -1314,6 +1373,66 @@ impl<W: Write> ToolDisplay<W> {
         // Just the command — it lands inside the fold marker's `[...]`, which
         // already frames it as the handle to reach for.
         let recovery_hint = retained_id.map(|id| format!("/spill open {id}"));
+
+        if let Some((change, prefix, suffix)) = change {
+            let rows = change.display_rows(&prefix, &suffix, self.cols.saturating_sub(2).max(1));
+            // Account for terminal rows using safe plain cells. Styling is
+            // attached by source index, never recovered from a painted gutter.
+            let plain = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|run| run.content().as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let recovery = recovery_hint
+                .as_deref()
+                .map(Recovery::Command)
+                .unwrap_or_default();
+            let dim = ContentStyle {
+                foreground_color: Some(CtColor::DarkGrey),
+                ..ContentStyle::default()
+            };
+            let literal = |line: String| vec![dim.apply(line)];
+            let rendered = self
+                .summary
+                .then(|| {
+                    spill_summary_line_with_hint(&plain, self.spill_lines, self.cols, recovery)
+                })
+                .flatten()
+                .map(|line| vec![literal(line)])
+                .unwrap_or_else(|| {
+                    spill_excerpt_with_hint(
+                        &plain,
+                        self.spill_lines,
+                        self.cols,
+                        recovery,
+                        |index, gutter, _| {
+                            let mut line = literal(gutter.to_string());
+                            line.extend(rows[index].iter().cloned());
+                            line
+                        },
+                        literal,
+                    )
+                });
+            for line in rendered {
+                super::write_file_change_row(&mut self.writer, &line).ok();
+                execute!(&mut self.writer, ResetColor, Print("\n")).ok();
+            }
+            self.writer.flush().ok();
+            if let Some(renderer) = &self.completed_spill_renderer {
+                let _ = renderer.render_file_change(
+                    raw_output,
+                    output,
+                    change,
+                    self.cols,
+                    self.spill_lines,
+                );
+            }
+            return;
+        }
 
         // The static excerpt is ALWAYS committed first — it is the canonical
         // transcript record on every tier, and it must never depend on an
@@ -1344,14 +1463,19 @@ impl<W: Write> ToolDisplay<W> {
                 .flatten()
                 .unwrap_or_else(|| spill_view_lines(output, self.spill_lines, self.cols).join("\n"))
         };
+        let rendered = bounded_spill_rows(&rendered, self.cols).join("\n");
         if self.color {
-            execute!(
-                &mut self.writer,
-                SetForegroundColor(CtColor::DarkGrey),
-                Print(format!("{rendered}\n")),
-                ResetColor,
-            )
-            .ok();
+            // Each physical row is independently styled: the cockpit resets
+            // attributes between committed rows, including spill fold markers.
+            for line in rendered.lines() {
+                execute!(
+                    &mut self.writer,
+                    Print(crate::tty::theme::active().ansi(crate::tty::theme::Role::Spill)),
+                    Print(format!("{line}\n")),
+                    crossterm::style::SetAttribute(crossterm::style::Attribute::Reset),
+                )
+                .ok();
+            }
         } else {
             writeln!(&mut self.writer, "{rendered}").ok();
         }
@@ -1382,6 +1506,7 @@ pub(crate) trait ToolPresentation: Send {
     fn preview(&mut self, output: &str, max_lines: usize);
     fn document(&mut self, output: &str);
     fn override_result(&mut self, output: String);
+    fn file_change(&mut self, _change: std::sync::Arc<crate::agentic::FileChangePresentation>) {}
 }
 
 impl<W: Write + Send> ToolPresentation for ToolDisplay<W> {
@@ -1403,14 +1528,19 @@ impl<W: Write + Send> ToolPresentation for ToolDisplay<W> {
         if rendered.is_empty() {
             return;
         }
+        let rendered = bounded_spill_rows(&rendered, self.cols).join("\n");
         if self.color {
-            execute!(
-                &mut self.writer,
-                SetForegroundColor(CtColor::DarkGrey),
-                Print(format!("{rendered}\n")),
-                ResetColor,
-            )
-            .ok();
+            // Each physical row is independently styled: the cockpit resets
+            // attributes between committed rows, including spill fold markers.
+            for line in rendered.lines() {
+                execute!(
+                    &mut self.writer,
+                    Print(crate::tty::theme::active().ansi(crate::tty::theme::Role::Spill)),
+                    Print(format!("{line}\n")),
+                    crossterm::style::SetAttribute(crossterm::style::Attribute::Reset),
+                )
+                .ok();
+            }
         } else {
             writeln!(&mut self.writer, "{rendered}").ok();
         }
@@ -1424,6 +1554,10 @@ impl<W: Write + Send> ToolPresentation for ToolDisplay<W> {
 
     fn override_result(&mut self, output: String) {
         self.result_override = Some(output);
+    }
+
+    fn file_change(&mut self, change: std::sync::Arc<crate::agentic::FileChangePresentation>) {
+        self.file_change = Some(change);
     }
 }
 

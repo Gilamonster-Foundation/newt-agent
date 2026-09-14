@@ -176,7 +176,7 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/backends` | `/backend` | `/` command | Model | panel — a chooser, needs a region (#1979) | **none — #1965** |
 | `/dgx` | — | `/` command | Model | keep — it performs | — read-only |
 | `/model` | — | `/` command | Model | absorb → `/settings model` | **none — #1965** |
-| `/models` | — | retired → `/status models` | Model | keep — it performs | — read-only |
+| `/models` | — | `/` command | Model | keep — it performs | — read-only |
 | `/probe` | — | `/` command | Model | keep — it performs | — read-only |
 | `/probe reset` | — | action inside a section | Model | keep — it performs | **none — #1965** |
 | `/summarizer` | — | `/` command | Model | absorb → `/settings summarizer` | **none — #1965** |
@@ -232,6 +232,6 @@ UPDATE_DOCS=1 cargo test -p newt-tui the_target_set_doc_is_generated_from_this_r
 | `/tenacity` | — | retired → `/settings tenacity` | Tuning | absorb → `/settings tenacity` | `~/.newt/receipts.jsonl` |
 | `/thinking` | — | retired → `/settings thinking` | Tuning | absorb → `/settings thinking` | `~/.newt/receipts.jsonl` |
 
-**74 registered, 42 of them typed as `/` commands (52 tokens).** Absorb 15 · keep 56 · panel 3. Receipts: settings 14 · events 6 · read-only 36 · **missing 18**.
+**74 registered, 43 of them typed as `/` commands (53 tokens).** Absorb 15 · keep 56 · panel 3. Receipts: settings 14 · events 6 · read-only 36 · **missing 18**.
 
 <!-- END GENERATED -->

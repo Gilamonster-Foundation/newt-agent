@@ -25,8 +25,8 @@ use newt_core::agentic::NEWT_ORANGE_CT;
 
 use crate::setup_tui::{drain_setup, is_abort_key, setup_status_line, SetupHandle};
 use crate::{
-    brand_active, brand_logo, brand_name, brand_plugins, brand_tagline, logo_for_size, LOGO_PLAIN,
-    NEWT_ORANGE, VERSION,
+    brand_active, brand_logo, brand_plugins, brand_tagline, logo_for_size, LOGO_PLAIN, NEWT_ORANGE,
+    VERSION,
 };
 
 fn row_is_blank(row: &str) -> bool {
@@ -78,15 +78,12 @@ fn blank_band(rows: &[&str], need: usize) -> Option<(usize, usize)> {
     }
 }
 
-/// The splash text block: wordmark + tagline, version, optional plugins, and the
+/// The splash text block: tagline, version, optional plugins, and the
 /// action line. Each line is a list of (text, optional fg) spans; `None` fg
 /// means the terminal default. Used by the blank-band layout.
 fn splash_block() -> Vec<Vec<(String, Option<CtColor>)>> {
     let mut block = vec![
-        vec![
-            (brand_name(), Some(NEWT_ORANGE_CT)),
-            (format!("  ·  {}", brand_tagline()), None),
-        ],
+        vec![(brand_tagline(), Some(NEWT_ORANGE_CT))],
         vec![(format!("v{VERSION}"), Some(CtColor::DarkGrey))],
     ];
     if let Some(plugins) = brand_plugins() {
@@ -282,9 +279,8 @@ fn show_splash_color(
     queue!(
         out,
         SetForegroundColor(NEWT_ORANGE_CT),
-        Print(brand_name()),
-        ResetColor,
-        Print(format!("  ·  {tagline}"))
+        Print(tagline),
+        ResetColor
     )?;
     queue!(out, MoveTo(brand_col, brand_row + 1))?;
     queue!(
@@ -346,10 +342,7 @@ fn show_splash_plain(
                 lines.push(Line::from(l.to_owned()));
             }
             lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled(brand_name(), orange_bold),
-                Span::raw(format!("  ·  {}", brand_tagline())),
-            ]));
+            lines.push(Line::from(Span::styled(brand_tagline(), orange_bold)));
             lines.push(Line::from(Span::styled(format!("v{VERSION}"), dim)));
             if let Some(plugins) = brand_plugins() {
                 lines.push(Line::from(Span::styled(plugins, dim)));

@@ -27,7 +27,7 @@ pub(super) fn command_help_page(cmd: &str) -> Option<&'static str> {
             "\
 /models · /models capabilities — inspect the active endpoint's models
 
-  /models                list models on the active endpoint, ◀ the active one
+  /models                arrow-key model picker on a rich terminal; text list otherwise
   /models capabilities   the matrix: Tool Use, Think (reasoning), Ctx Win,
                          Safe Ctx, tuning Conf, and tested date
 
@@ -36,11 +36,18 @@ live in [model_tuning] (see /config)."
         }
         "model" => {
             "\
-/model <name> — switch the model on the active backend
+/model [name] — choose or switch the model on the active backend
 
 Changes the model newt talks to. The choice sticks across runs (saved to
 ~/.newt/settings.toml) but does not edit config; switching backends clears it.
-Tab through what's installed with /models.
+On a rich terminal, /model opens the live model list: arrows move, Enter
+selects, Esc cancels. /models opens the same picker. Resident models show a
+[loaded] badge after the name; the active model and badge use theme colors.
+On a llama.cpp router: l loads the highlighted model, u unloads it, x unloads
+other resident models then loads the highlighted one. Unloading requires
+confirmation. These controls change memory residency, not files; Enter picks
+the model for chat. r refreshes server state.
+In a lean or piped session, /models prints the list and /model <name> switches.
   /model qwen3:30b"
         }
         "backend" => {
@@ -683,7 +690,9 @@ pub fn render_help(topic: Option<&str>, color: bool, verbose: bool) -> String {
 
 pub(crate) fn help_lines() -> &'static [&'static str] {
     &[
-        "  /model <name>            - switch model on the active backend (sticks across runs)",
+        "  /models                  - list the models the active backend serves, marking the active one",
+        "  /models capabilities     - the same list as a matrix: tool use, thinking, context window, tuning",
+        "  /model [name]            - pick a model, or switch by name (sticks across runs)",
         "  /backends [name]         - backend panel on a rich TTY (choose · edit · add · remove); text: list, or switch by name",
         "  /backend                 - alias of /backends",
         "  /settings [field value]  - the settings form: edit-mode + effort dials + rounds; every applied change writes a receipt (#1981)",

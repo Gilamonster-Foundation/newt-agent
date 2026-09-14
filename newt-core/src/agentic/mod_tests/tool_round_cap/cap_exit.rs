@@ -408,7 +408,7 @@ async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
         &chat_url,
         "test-model",
         Vec::new(),
-        CapExit {
+        &CapExit {
             max_tool_rounds: 25,
             accumulated: None,
             wasted_calls: 0,
@@ -418,6 +418,7 @@ async fn ollama_cap_exit_preserves_action_intent_as_a_paused_handoff() {
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
             ollama_num_ctx: Some(4_096),
+            prompt_measurement: Default::default(),
         },
     )
     .await
@@ -469,13 +470,13 @@ async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
 
     let client = reqwest::Client::new();
     let (reply, streamed, usage) = final_summary_openai(
-        &client,
+        (&client, &client),
         &format!("{}/v1/chat/completions", server.uri()),
         "test-model",
         None,
         Vec::new(),
         generation_policy::GenerationPolicy::default(),
-        CapExit {
+        &CapExit {
             max_tool_rounds: 40,
             accumulated: Some(crate::TokenUsage {
                 input_tokens: 100,
@@ -488,6 +489,7 @@ async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
             ollama_num_ctx: None,
+            prompt_measurement: Default::default(),
         },
     )
     .await
@@ -552,7 +554,7 @@ async fn ollama_cap_exit_refuses_giant_fresh_result_before_dispatch() {
         &format!("{}/api/chat", server.uri()),
         "tiny-model",
         messages,
-        CapExit {
+        &CapExit {
             max_tool_rounds: 1,
             accumulated: None,
             wasted_calls: 0,
@@ -562,6 +564,7 @@ async fn ollama_cap_exit_refuses_giant_fresh_result_before_dispatch() {
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
             ollama_num_ctx: Some(2_500),
+            prompt_measurement: Default::default(),
         },
     )
     .await
@@ -604,13 +607,13 @@ async fn openai_cap_exit_refuses_giant_fresh_result_before_dispatch() {
     ];
     let client = reqwest::Client::new();
     let (reply, streamed, usage) = final_summary_openai(
-        &client,
+        (&client, &client),
         &format!("{}/v1/chat/completions", server.uri()),
         "tiny-model",
         None,
         messages,
         generation_policy::GenerationPolicy::default(),
-        CapExit {
+        &CapExit {
             max_tool_rounds: 1,
             accumulated: None,
             wasted_calls: 0,
@@ -620,6 +623,7 @@ async fn openai_cap_exit_refuses_giant_fresh_result_before_dispatch() {
             calibration: 1.0,
             estimation: crate::tokens::TokenEstimation::default(),
             ollama_num_ctx: None,
+            prompt_measurement: Default::default(),
         },
     )
     .await

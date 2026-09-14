@@ -28,6 +28,9 @@ pub enum Retryability {
     /// Transient — retrying may succeed (connection failure, timeout, `408`,
     /// `429`, or any `5xx`).
     Retry,
+    /// The server rejected the context. Only a smaller projection may be
+    /// dispatched; the unchanged-request backoff loop must return this error.
+    ContextExceeded,
     /// Permanent for this request — retrying will not help (other `4xx`, or a
     /// malformed success body).
     Fatal,
@@ -41,10 +44,18 @@ pub enum Retryability {
 ///
 /// Anything else (e.g. a JSON decode error on a `200`) is [`Retryability::Fatal`].
 pub fn classify(err: &anyhow::Error) -> Retryability {
+    // Server evidence wins over a later transport failure or retryable HTTP
+    // status, including when the body is wrapped in an anyhow context.
+    if err
+        .chain()
+        .any(|cause| crate::agentic::cw_overflow::is_context_overflow(&cause.to_string()))
+    {
+        return Retryability::ContextExceeded;
+    }
     let msg = err.to_string();
 
     // Transport-level failure from reqwest (connection refused, reset, DNS,
-    // or a client timeout). Always worth another attempt.
+    // or a client timeout), without observed context-overflow evidence.
     if msg.contains("request failed") {
         return Retryability::Retry;
     }
@@ -89,6 +100,31 @@ fn status_code_in(msg: &str) -> Option<u16> {
         }
     }
     None
+}
+
+/// Read an HTTP body while retaining bytes observed before any read failure.
+/// Callers must inspect the error as well as the body: a server may report a
+/// capacity rejection and then disconnect before completing its HTTP frame.
+pub async fn read_response_bytes(response: reqwest::Response) -> (Vec<u8>, Option<reqwest::Error>) {
+    let mut bytes = Vec::new();
+    let error = read_response_bytes_into(response, &mut bytes).await;
+    (bytes, error)
+}
+
+/// Append observed body bytes to caller-owned storage. Keeping the buffer
+/// outside this future preserves evidence when a host deadline cancels the
+/// read; dropping the future still releases the in-flight HTTP response.
+pub async fn read_response_bytes_into(
+    mut response: reqwest::Response,
+    bytes: &mut Vec<u8>,
+) -> Option<reqwest::Error> {
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => bytes.extend_from_slice(&chunk),
+            Ok(None) => return None,
+            Err(error) => return Some(error),
+        }
+    }
 }
 
 /// Exponential-backoff retry policy.
@@ -175,9 +211,9 @@ impl RetryPolicy {
 
     /// A bounded policy for paid / hosted inference endpoints.
     ///
-    /// A hosted request can consume the full inference deadline before it
-    /// fails. Reusing the seven-attempt home-lab policy therefore turns a
-    /// 120-second timeout into roughly fifteen minutes of duplicate requests.
+    /// A hosted request can consume the full configured inference bound before
+    /// it fails. Reusing the seven-attempt local policy therefore turns a
+    /// 120-second bound into roughly fifteen minutes of duplicate requests.
     /// One retry still absorbs a transient edge failure without creating that
     /// retry storm. Environment overrides remain authoritative.
     pub fn for_hosted_inference() -> Self {
@@ -246,7 +282,7 @@ where
         match op().await {
             Ok(value) => return Ok(value),
             Err(err) => {
-                if classify(&err) == Retryability::Fatal || retries >= policy.max_retries {
+                if classify(&err) != Retryability::Retry || retries >= policy.max_retries {
                     return Err(err);
                 }
                 retries += 1;
@@ -270,7 +306,7 @@ where
 /// `on_retry(attempt, delay)` is called synchronously before sleeping:
 /// `attempt` is 1-based (1 = first retry), `delay` is the sleep duration.
 ///
-/// Calls `op` until it succeeds, the error is [`Retryability::Fatal`], or
+/// Calls `op` until it succeeds, the error is not [`Retryability::Retry`], or
 /// `policy.max_retries` is exhausted. On exhaustion the *last* error is
 /// returned.
 pub async fn with_backoff_notify<T, F, Fut, N>(
@@ -292,7 +328,7 @@ where
 /// Drive a fallible async operation under `policy`.
 ///
 /// Convenience wrapper around [`with_backoff_notify`] with a no-op callback.
-/// Calls `op` until it succeeds, the error is [`Retryability::Fatal`], or
+/// Calls `op` until it succeeds, the error is not [`Retryability::Retry`], or
 /// `policy.max_retries` is exhausted — sleeping `policy.delay_for(attempt)`
 /// between attempts. On exhaustion the *last* error is returned (so the caller
 /// still sees e.g. the final `503`).

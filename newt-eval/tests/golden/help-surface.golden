@@ -1,6 +1,8 @@
 === newt help (top) ===
 >  Available commands:
-  /model <name>            - switch model on the active backend (sticks across runs)
+  /models                  - list the models the active backend serves, marking the active one
+  /models capabilities     - the same list as a matrix: tool use, thinking, context window, tuning
+  /model [name]            - pick a model, or switch by name (sticks across runs)
   /backends [name]         - backend panel on a rich TTY (choose · edit · add · remove); text: list, or switch by name
   /backend                 - alias of /backends
   /settings [field value]  - the settings form: edit-mode + effort dials + rounds; every applied change writes a receipt (#1981)

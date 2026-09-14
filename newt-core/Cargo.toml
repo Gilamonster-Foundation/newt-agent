@@ -27,6 +27,10 @@ categories = ["api-bindings", "text-processing"]
 agent-harness.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+# Step 13.2: Diffy computes the observed delta; NewtUI owns its shared model
+# and Markdown projection. Core keeps terminal/renderer features disabled.
+diffy.workspace = true
+newtui.workspace = true
 # OCAP disclosure filter (ocap.rs): catch a known secret value in its common
 # re-encodings (base64), not just raw — filter by value, not by shape.
 base64.workspace = true
@@ -158,13 +162,13 @@ pyo3 = { workspace = true, optional = true }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [target."cfg(target_os = \"linux\")".dependencies]
-# Object-bound workspace fs capability (src/fs_cap.rs, step-52.1). `openat2` is a
-# Linux syscall, so the capability — and this dep — exist only on Linux; the
-# module is `#[cfg(target_os = "linux")]`. The cross-platform fallback (and the
-# fail-closed-for-untrusted policy where openat2 is absent) lands with the
-# consumer rewire (step-52.2/52.3).
+# Object-bound workspace fs capability (src/fs_cap.rs): Linux uses openat2;
+# macOS enables the same dependency below for descriptor-relative openat.
 rustix.workspace = true
 seccompiler = "0.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix.workspace = true
 
 [features]
 default = ["markdown"]
@@ -212,7 +216,7 @@ tests-pty.workspace = true
 # silent agreement.
 blake3 = "1"
 tempfile = "3"
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 # The store integration tests (tests/store.rs) open conversations.db
 # directly to tamper with rows / build drifted schemas — exercising the
 # §6 chain-integrity detection and the schema-diff migration. Same crate

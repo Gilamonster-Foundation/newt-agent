@@ -108,17 +108,29 @@ use super::*;
 /// therefore turn the plan into a ratchet violation.
 ///
 /// What may only shrink is what an operator can TYPE at the top level.
+///
+/// # 42/52 → 43/53: `/models` was never actually retired
+///
+/// The same shape as PR2's "registering the ghosts": a command an operator
+/// can type today, reaching a real handler (`lib.rs`'s dispatch match names
+/// `"models"` explicitly), counted by neither number because its row claimed
+/// `Surface::Retired("/status models")`. That destination is the rewrite BACK
+/// to `/models`, so the row pointed at itself, and the help corpus was pruned
+/// to match — leaving `/model <name>` as the only listed model verb and no
+/// listed way to see the names. **A ratchet that does not know about a
+/// command cannot stop it growing.** This raise makes the guarded surface the
+/// surface that exists; it is honest rather than a weakening.
 #[test]
 fn the_registered_surface_only_shrinks() {
     assert!(
-        slash_commands().count() <= 42,
+        slash_commands().count() <= 43,
         "the slash surface GREW to {} commands. #1981 is a reduction: a \
          new command needs an argument for why it is not a field of \
          /settings or a subcommand of an existing verb",
         slash_commands().count()
     );
     assert!(
-        slash_tokens().len() <= 52,
+        slash_tokens().len() <= 53,
         "the slash surface GREW to {} tokens",
         slash_tokens().len()
     );
@@ -178,5 +190,81 @@ fn the_number_of_slash_interception_sites_is_pinned() {
         "the number of slash interception sites moved to {counted}. If a \
          command was added, register it here. If sites were consolidated \
          — which is #1981's goal — lower this number and the ratchet above."
+    );
+}
+
+/// **A command you can type must be listed where commands are listed.**
+///
+/// `/models` was typeable, dispatched, and absent from `help_lines()` — the
+/// ONE corpus `/help` prints and the rich palette parses. So an operator
+/// could switch models (`/model <name>` is listed) but had nowhere to learn
+/// the names. Nothing failed: the palette's parity test builds its own
+/// fixture entries, so the real corpus can lose a row without any test
+/// noticing. That is the vacuous shape this guard exists to close.
+///
+/// A ratchet, not a wall, in the `KNOWN_VIOLATIONS` idiom (`CLAUDE.md`: the
+/// mess is fixed by ratchet, not by rewrite). The five below are real and
+/// may only go DOWN — document one and delete its row; never add a row to
+/// make a new command pass.
+#[test]
+fn every_typeable_command_is_listed_in_the_help_corpus() {
+    /// Typeable today, absent from the corpus. This list may only SHRINK.
+    const KNOWN_UNDOCUMENTED: &[&str] = &["detail", "edit-mode", "markdown", "tab", "undo-lock"];
+
+    let corpus = crate::help::help_lines().join("\n");
+    let mut undocumented: Vec<&str> = slash_commands()
+        .map(|c| c.name)
+        .filter(|name| !corpus.contains(&format!("/{name}")))
+        .collect();
+    undocumented.sort_unstable();
+
+    let mut allowed = KNOWN_UNDOCUMENTED.to_vec();
+    allowed.sort_unstable();
+
+    let fresh: Vec<&&str> = undocumented
+        .iter()
+        .filter(|n| !allowed.contains(n))
+        .collect();
+    assert!(
+        fresh.is_empty(),
+        "these commands can be typed but are listed nowhere an operator \
+         looks: {fresh:?}. Add a line to `help_lines()` — it is the only \
+         corpus /help and the palette read."
+    );
+    assert!(
+        undocumented.len() <= KNOWN_UNDOCUMENTED.len(),
+        "the undocumented set grew to {}",
+        undocumented.len()
+    );
+    for known in &allowed {
+        assert!(
+            undocumented.contains(known),
+            "`/{known}` is documented now — delete it from KNOWN_UNDOCUMENTED \
+             so the count keeps falling"
+        );
+    }
+}
+
+/// Anti-vacuous twin: the guard above must actually be able to SEE a gap.
+///
+/// If `help_lines()` were empty, or the containment check always matched,
+/// the ratchet would pass while documenting nothing. So prove the detector
+/// detects: a name that is certainly not in the corpus must be reported as
+/// missing, and a name that certainly is must not.
+#[test]
+fn the_help_corpus_guard_can_tell_listed_from_unlisted() {
+    let corpus = crate::help::help_lines().join("\n");
+    assert!(
+        !corpus.is_empty(),
+        "an empty corpus would pass the guard above vacuously"
+    );
+    assert!(
+        !corpus.contains("/zzz-not-a-command"),
+        "the detector must report an absent command as absent"
+    );
+    assert!(
+        corpus.contains("/models"),
+        "the detector must report a listed command as listed — and /models \
+         is the row whose loss this guard was written for"
     );
 }

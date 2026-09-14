@@ -13,17 +13,17 @@
 //!   tables (25.2), syntax highlighting (25.6). Tables are not enabled in the
 //!   parser yet, so pipe rows render as ordinary paragraphs for now.
 
-use super::inline::{render_cells, sgr_fg, wrap_cells, Cell, Style, RESET};
+use super::inline::{render_cells, wrap_cells, Cell, Style, RESET};
 use super::table::{render_table, TableBuilder};
 use super::width::str_width;
-use crossterm::style::Color as CtColor;
+
 use pulldown_cmark::{Event, Tag, TagEnd};
 
 /// Dim "fade" hue — reused for blockquote bars, code blocks, rules, inline
 /// code, and link URLs. Single source of truth with the rest of the TUI.
-pub(super) const FADE: CtColor = crate::agentic::display::FADE_CT;
-/// The newt logo orange — headings.
-const ORANGE: CtColor = crate::agentic::display::NEWT_ORANGE_CT;
+pub(super) fn fade() -> String {
+    crate::tty::theme::active().ansi(crate::tty::theme::Role::Dim)
+}
 
 /// Accumulating renderer. One per `render_markdown` call.
 pub(super) struct Emitter {
@@ -119,9 +119,9 @@ impl Emitter {
                 self.push_text(&s, style);
             }
             Event::SoftBreak if !self.in_code => {
-                self.push_text(" ", Style::default());
+                self.push_text(" ", self.cur_style());
             }
-            Event::HardBreak if self.in_cell => self.push_text(" ", Style::default()),
+            Event::HardBreak if self.in_cell => self.push_text(" ", self.cur_style()),
             Event::HardBreak if !self.in_code => {
                 self.block_lines.push(std::mem::take(&mut self.cur_cells));
             }
@@ -250,7 +250,7 @@ impl Emitter {
                         self.push_text(
                             &format!(" ({url})"),
                             Style {
-                                color: Some(FADE),
+                                role: Some(crate::tty::theme::Role::Dim),
                                 ..Style::default()
                             },
                         );
@@ -279,12 +279,25 @@ impl Emitter {
     /// Current absolute inline style from the nesting counters.
     fn cur_style(&self) -> Style {
         Style {
-            bold: self.bold > 0 || self.heading > 0,
+            bold: self.bold > 0,
             italic: self.italic > 0,
             underline: self.link > 0,
             strike: self.strike > 0,
             code: false,
-            color: if self.heading > 0 { Some(ORANGE) } else { None },
+            color: None,
+            role: Some(if self.heading > 0 {
+                crate::tty::theme::Role::MarkdownHeading
+            } else if self.bold > 0 {
+                crate::tty::theme::Role::MarkdownStrong
+            } else if self.italic > 0 {
+                crate::tty::theme::Role::MarkdownItalic
+            } else if self.link > 0 {
+                crate::tty::theme::Role::MarkdownLink
+            } else if self.strike > 0 {
+                crate::tty::theme::Role::MarkdownStrike
+            } else {
+                crate::tty::theme::Role::AgentText
+            }),
         }
     }
 
@@ -323,7 +336,7 @@ impl Emitter {
         if self.quote_depth == 0 {
             String::new()
         } else {
-            format!("{}{}{RESET}", sgr_fg(FADE), "│ ".repeat(self.quote_depth))
+            format!("{}{}{RESET}", fade(), "│ ".repeat(self.quote_depth))
         }
     }
 
@@ -405,9 +418,29 @@ impl Emitter {
             .max(1);
         self.out.push_str(&self.render_quote());
         self.out.push_str(&self.indent);
-        self.out.push_str(&sgr_fg(FADE));
+        self.out.push_str(&fade());
         self.out.push_str(&"─".repeat(width));
         self.out.push_str(RESET);
         self.out.push('\n');
+    }
+}
+
+#[cfg(test)]
+mod theme_role_tests {
+    use super::*;
+    #[test]
+    fn link_and_strike_have_their_own_roles() {
+        let mut emitter = Emitter::new(80);
+        emitter.link = 1;
+        assert_eq!(
+            emitter.cur_style().role,
+            Some(crate::tty::theme::Role::MarkdownLink)
+        );
+        emitter.link = 0;
+        emitter.strike = 1;
+        assert_eq!(
+            emitter.cur_style().role,
+            Some(crate::tty::theme::Role::MarkdownStrike)
+        );
     }
 }
