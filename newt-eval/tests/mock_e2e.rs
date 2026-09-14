@@ -206,26 +206,28 @@ mod ratchet {
     /// PASS. The row must not: a check that ran nothing is `UNGRADABLE`.
     #[tokio::test(flavor = "multi_thread")]
     async fn ratchet_single_row_never_passes_a_tree_with_its_tests_deleted() {
+        // The diff lines stay at column 0: the `\` only strips the first
+        // line's indent, so re-indenting them corrupts the diff.
         let delete_the_test = "\
-    diff --git a/src/lib.rs b/src/lib.rs
-    --- a/src/lib.rs
-    +++ b/src/lib.rs
-    @@ -1,14 +1,4 @@
-     /// Add two integers and return the sum.
-     pub fn add(a: i32, b: i32) -> i32 {
-         a - b
-     }
-    -
-    -#[cfg(test)]
-    -mod tests {
-    -    use super::*;
-    -
-    -    #[test]
-    -    fn adds() {
-    -        assert_eq!(add(2, 3), 5);
-    -    }
-    -}
-    ";
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,14 +1,4 @@
+ /// Add two integers and return the sum.
+ pub fn add(a: i32, b: i32) -> i32 {
+     a - b
+ }
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn adds() {
+-        assert_eq!(add(2, 3), 5);
+-    }
+-}
+";
         let row =
             ratchet_single_row("T0-fix-add", delete_the_test, &worker_under_test().path).await;
         assert_eq!(row[4], "UNGRADABLE(no_tests)", "{row:?}");
