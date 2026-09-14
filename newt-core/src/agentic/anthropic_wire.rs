@@ -15,7 +15,9 @@
 //! them (the `retry` re-export precedent).
 
 /// Anthropic requires `max_tokens` on every request. Used when the generation
-/// policy names no output cap; `NEWT_ANTHROPIC_MAX_TOKENS` overrides. 8192 is
+/// policy resolves no output allowance — the lowest of the #2312 tiers
+/// (explicit `output_allowance` > cognition table > this wire default);
+/// `NEWT_ANTHROPIC_MAX_TOKENS` overrides only this tier. 8192 is
 /// safe across current Claude models (a model-specific 400 names the real
 /// ceiling and is fatal-not-retried — the env var is the escape hatch).
 pub const DEFAULT_MAX_TOKENS: u32 = 8192;

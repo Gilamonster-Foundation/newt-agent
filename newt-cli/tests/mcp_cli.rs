@@ -440,6 +440,7 @@ mod composed_private_mcp_uat {
                 persona_tools: Some(&persona_tools),
                 cognition: None,
                 chat_completions_capability: Default::default(),
+                output_allowance: None,
                 reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope::Never,
                 max_tool_rounds: 6,
                 narration_nudge_cap: 1,

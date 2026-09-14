@@ -1,19 +1,28 @@
 use crate::model_card::{ChatCompletionsCapability, ReasoningReplayScope};
 use crate::role_profile::Cognition;
 
-/// The per-cognition output-token allowance — the ONE source of the generation
-/// output budget, keyed only on the cognition dial (NOT on ChatCompletions
-/// capability). [`GenerationPolicy::resolve`] uses it for the Chat Completions
-/// `max_tokens`; the Responses loop uses it to RESERVE local output headroom in
-/// its context ceiling (that wire sends no `max_output_tokens`, but the window
-/// must still leave room to generate). `None` cognition reserves nothing — an
-/// opt-in reserve, so a caller with no cognition dial is unchanged.
-pub(crate) fn cognition_output_reserve(cognition: Option<Cognition>) -> Option<u32> {
-    cognition.map(|c| match c {
-        Cognition::Glancing => 2_048,
-        Cognition::Pondering => 4_096,
-        Cognition::Deliberating => 10_000,
-        Cognition::Contemplating => 16_000,
+/// The ONE output-allowance resolver (#2312). Precedence: an explicit operator
+/// allowance (`[[model_tuning]] output_allowance`) wins; otherwise the
+/// per-cognition table supplies it; otherwise `None`, and a wire that REQUIRES
+/// a cap applies its own default (Anthropic: `NEWT_ANTHROPIC_MAX_TOKENS`, else
+/// 8192). The Chat Completions policy sends the result as `max_tokens` where the
+/// endpoint declared cognition projection; the Responses loop RESERVES it as
+/// local headroom (that wire sends no `max_output_tokens`). The explicit value
+/// never changes cognition, thinking or sampling.
+// TODO(#2312): report the resolved allowance in the solve contract's
+// `effective_config` via `solve_contract::conditional_stanza` (#2328), with
+// `enforced=server|local`, once that helper merges.
+pub(crate) fn resolve_output_allowance(
+    explicit: Option<u32>,
+    cognition: Option<Cognition>,
+) -> Option<u32> {
+    explicit.or_else(|| {
+        cognition.map(|c| match c {
+            Cognition::Glancing => 2_048,
+            Cognition::Pondering => 4_096,
+            Cognition::Deliberating => 10_000,
+            Cognition::Contemplating => 16_000,
+        })
     })
 }
 
@@ -23,7 +32,10 @@ pub(crate) fn cognition_output_reserve(cognition: Option<Cognition>) -> Option<u
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct GenerationPolicy {
     pub(crate) thinking: Option<bool>,
+    /// Wire cap: projected as `max_tokens` only where the endpoint declared it.
     pub(crate) max_output_tokens: Option<u32>,
+    /// The resolved allowance local admission reserves, sent or not.
+    pub(crate) output_allowance: Option<u32>,
     pub(crate) temperature: Option<f64>,
     pub(crate) top_p: Option<f64>,
     pub(crate) parallel_tool_calls: Option<bool>,
@@ -33,12 +45,15 @@ pub(crate) struct GenerationPolicy {
 }
 
 impl GenerationPolicy {
-    /// Resolve the operator's cognition dial against endpoint capability data.
-    /// The numeric table is the initial local-agent policy from the Nemotron
-    /// qualification plan; no model display name participates in selection.
+    /// Resolve the operator's cognition dial and explicit output allowance
+    /// against endpoint capability data. The numeric table is the initial
+    /// local-agent policy from the Nemotron qualification plan; no model
+    /// display name participates in selection. An explicit allowance is
+    /// reserved locally everywhere but sent only where cognition projects.
     #[must_use]
     pub(crate) fn resolve(
         cognition: Option<Cognition>,
+        output_allowance: Option<u32>,
         capability: ChatCompletionsCapability,
         reasoning_replay_scope: ReasoningReplayScope,
     ) -> Self {
@@ -48,12 +63,16 @@ impl GenerationPolicy {
             chat_template_kwargs: capability.chat_template_kwargs == Some(true),
             one_bounded_reasoning_continuation: capability.bounded_reasoning_continuation
                 == Some(true),
+            output_allowance,
             ..Self::default()
         };
 
         if capability.cognition != Some(true) {
             return policy;
         }
+        // A projecting endpoint accepts the cap field, so an explicit allowance
+        // is sent even with no dial; thinking and sampling still need one.
+        policy.max_output_tokens = output_allowance;
         let Some(cognition) = cognition else {
             return policy;
         };
@@ -65,7 +84,8 @@ impl GenerationPolicy {
             Cognition::Contemplating => (true, 0.6, 0.95),
         };
         policy.thinking = Some(thinking);
-        policy.max_output_tokens = cognition_output_reserve(Some(cognition));
+        policy.max_output_tokens = resolve_output_allowance(output_allowance, Some(cognition));
+        policy.output_allowance = policy.max_output_tokens;
         policy.temperature = Some(temperature);
         policy.top_p = Some(top_p);
         policy
@@ -139,43 +159,76 @@ mod tests {
     }
 
     #[test]
-    fn cognition_output_reserve_is_the_one_source_of_the_output_budget() {
-        // The Responses loop reserves this locally (no `max_output_tokens` on the
-        // wire); the Chat Completions policy sends it. One table, both surfaces.
+    fn output_allowance_prefers_explicit_over_the_cognition_table() {
+        // Default: the cognition table, the one number both wires use (Chat
+        // sends it, Responses reserves it locally).
+        for (cognition, allowance) in [
+            (Cognition::Glancing, 2_048),
+            (Cognition::Pondering, 4_096),
+            (Cognition::Deliberating, 10_000),
+            (Cognition::Contemplating, 16_000),
+        ] {
+            assert_eq!(
+                resolve_output_allowance(None, Some(cognition)),
+                Some(allowance)
+            );
+        }
+        // Opt-in: no cognition dial and no override reserves nothing.
+        assert_eq!(resolve_output_allowance(None, None), None);
+        // An explicit allowance wins, with or without a cognition dial.
         assert_eq!(
-            cognition_output_reserve(Some(Cognition::Glancing)),
-            Some(2_048)
+            resolve_output_allowance(Some(3_000), Some(Cognition::Contemplating)),
+            Some(3_000)
         );
-        assert_eq!(
-            cognition_output_reserve(Some(Cognition::Pondering)),
-            Some(4_096)
-        );
-        assert_eq!(
-            cognition_output_reserve(Some(Cognition::Deliberating)),
-            Some(10_000)
-        );
-        assert_eq!(
-            cognition_output_reserve(Some(Cognition::Contemplating)),
-            Some(16_000)
-        );
-        // Opt-in: no cognition dial reserves nothing (behaviour unchanged).
-        assert_eq!(cognition_output_reserve(None), None);
-        // Grounds that `resolve` draws its `max_tokens` from the same table.
-        assert_eq!(
+        assert_eq!(resolve_output_allowance(Some(3_000), None), Some(3_000));
+
+        // `resolve` draws its cap from the same resolver, and the override
+        // moves ONLY the allowance: thinking and sampling are unchanged.
+        let resolve = |explicit| {
             GenerationPolicy::resolve(
                 Some(Cognition::Contemplating),
+                explicit,
                 local_capability(),
-                ReasoningReplayScope::Never
+                ReasoningReplayScope::Never,
             )
-            .max_output_tokens,
-            cognition_output_reserve(Some(Cognition::Contemplating))
+        };
+        let overridden = resolve(Some(3_000));
+        assert_eq!(overridden.max_output_tokens, Some(3_000));
+        assert_eq!(overridden.output_allowance, Some(3_000));
+        assert_eq!(
+            GenerationPolicy {
+                max_output_tokens: Some(16_000),
+                output_allowance: Some(16_000),
+                ..overridden
+            },
+            resolve(None)
         );
+    }
+
+    #[test]
+    fn projecting_endpoint_sends_an_explicit_allowance_without_a_dial() {
+        let policy = GenerationPolicy::resolve(
+            None,
+            Some(3_000),
+            local_capability(),
+            ReasoningReplayScope::Never,
+        );
+        assert_eq!(policy.max_output_tokens, Some(3_000));
+        assert_eq!(policy.output_allowance, Some(3_000));
+        assert_eq!(policy.thinking, None);
+        assert_eq!(policy.temperature, None);
+        assert_eq!(policy.top_p, None);
+        // No dial and no override: nothing to send (defaults unchanged).
+        let unset =
+            GenerationPolicy::resolve(None, None, local_capability(), ReasoningReplayScope::Never);
+        assert_eq!(unset.max_output_tokens, None);
     }
 
     #[test]
     fn unknown_endpoint_keeps_the_chat_request_policy_empty() {
         let policy = GenerationPolicy::resolve(
             Some(Cognition::Deliberating),
+            None,
             ChatCompletionsCapability::default(),
             ReasoningReplayScope::Never,
         );
@@ -195,6 +248,7 @@ mod tests {
         for (cognition, thinking, max_tokens, temperature, top_p) in cases {
             let policy = GenerationPolicy::resolve(
                 Some(cognition),
+                None,
                 local_capability(),
                 ReasoningReplayScope::CurrentUserTurn,
             );
@@ -215,8 +269,11 @@ mod tests {
 
     #[test]
     fn endpoint_extensions_can_opt_in_without_enabling_cognition_projection() {
+        // #2312: an explicit allowance is reserved locally, but this endpoint
+        // declared no cap projection, so no `max_tokens` is sent.
         let policy = GenerationPolicy::resolve(
             Some(Cognition::Contemplating),
+            Some(12_000),
             ChatCompletionsCapability {
                 cognition: Some(false),
                 chat_template_kwargs: Some(true),
@@ -228,6 +285,7 @@ mod tests {
 
         assert_eq!(policy.thinking, None);
         assert_eq!(policy.max_output_tokens, None);
+        assert_eq!(policy.output_allowance, Some(12_000));
         assert_eq!(policy.temperature, None);
         assert_eq!(policy.top_p, None);
         assert_eq!(policy.parallel_tool_calls, Some(false));
@@ -239,6 +297,7 @@ mod tests {
     fn opted_in_policy_projects_to_chat_completions_fields() {
         let policy = GenerationPolicy::resolve(
             Some(Cognition::Deliberating),
+            None,
             local_capability(),
             ReasoningReplayScope::CurrentUserTurn,
         );
@@ -281,6 +340,7 @@ mod tests {
     fn tools_disabled_completion_omits_parallel_tool_calls() {
         let policy = GenerationPolicy::resolve(
             Some(Cognition::Pondering),
+            None,
             local_capability(),
             ReasoningReplayScope::CurrentUserTurn,
         );
@@ -301,6 +361,7 @@ mod tests {
     fn bounded_reasoning_continuation_requires_capability_replay_and_round_budget() {
         let enabled = GenerationPolicy::resolve(
             None,
+            None,
             local_capability(),
             ReasoningReplayScope::CurrentUserTurn,
         );
@@ -309,10 +370,11 @@ mod tests {
         assert!(!enabled.allows_reasoning_continuation(false, false));
 
         let no_replay =
-            GenerationPolicy::resolve(None, local_capability(), ReasoningReplayScope::Never);
+            GenerationPolicy::resolve(None, None, local_capability(), ReasoningReplayScope::Never);
         assert!(!no_replay.allows_reasoning_continuation(false, true));
 
         let no_capability = GenerationPolicy::resolve(
+            None,
             None,
             ChatCompletionsCapability::default(),
             ReasoningReplayScope::CurrentUserTurn,

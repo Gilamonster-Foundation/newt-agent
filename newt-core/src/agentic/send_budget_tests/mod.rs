@@ -4,7 +4,7 @@
 use super::super::compress::{compression_trigger, CompressionTriggerLimits};
 pub(crate) use super::*;
 use super::{initial_send_budget, num_ctx_input_ceiling, recovered_input_budget};
-use crate::agentic::generation_policy::GenerationPolicy;
+use crate::agentic::generation_policy::{resolve_output_allowance, GenerationPolicy};
 use crate::model_card::{ChatCompletionsCapability, ReasoningReplayScope};
 use crate::role_profile::Cognition;
 use crate::{BackendKind, CompactionTriggerPolicy, OpenAiApi};
