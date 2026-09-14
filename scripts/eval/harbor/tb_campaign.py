@@ -371,7 +371,7 @@ def trial_row(harness, trial: Path, expect=None):
         "error_cause": cause,
         "model_replies": replies,
         "harness_error": harness_error,
-        "resolved": verdict(reward, SUITE) == "resolved",
+        "resolved": verdict(reward, rec["source"] or SUITE) == "resolved",
         "claimed_done": claimed,
         "claim_source": claim_source,
         "tokens_in": tokens_in,

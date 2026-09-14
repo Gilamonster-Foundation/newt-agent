@@ -313,8 +313,10 @@ bench-ingest RUN_DIR MODEL FAMILY VERSION WINDOW DATE *FLAGS:
         --model {{MODEL}} --family {{FAMILY}} --version {{VERSION}} \
         --window {{WINDOW}} --date {{DATE}} {{FLAGS}}
 
-bench-gate MODEL SCORE *FLAGS:
-    python3 scripts/eval/bench_scoreboard.py gate --model {{MODEL}} --score {{SCORE}} {{FLAGS}}
+# The gate reads its score from the run dir so coverage is checked; a hand-typed
+# score needs `bench_scoreboard.py gate --score S --unverified-score` (#2316).
+bench-gate MODEL RUN_DIR *FLAGS:
+    python3 scripts/eval/bench_scoreboard.py gate --model {{MODEL}} --run-dir {{RUN_DIR}} {{FLAGS}}
 
 # The README carries MEASURED models only (`--no-queued`) — the scoreboard is
 # the bragging right, not the to-do list. The full roster-tracking table, with
