@@ -119,6 +119,14 @@ pub(super) fn venv_env_map() -> std::collections::BTreeMap<String, String> {
         }
     }
 
+    // Resolve Apple's real developer tools before the /usr/bin xcrun shims.
+    // The shims need ambient per-user caches; direct tools keep workspace-only
+    // writes. Explicit venv and operator executable roots retain precedence.
+    #[cfg(target_os = "macos")]
+    if let Some(developer) = crate::confined_exec::selected_developer_directory() {
+        path_dirs.push(format!("{developer}/usr/bin"));
+    }
+
     if !path_dirs.is_empty() {
         let prepend = path_dirs.join(":");
         let path = match std::env::var("PATH") {
@@ -279,7 +287,7 @@ pub(super) fn shell_engine() -> crate::ShellEngine {
 fn b1_run_command_sandbox_policy() -> agent_bridle::SandboxPolicy {
     agent_bridle::SandboxPolicy {
         child_network: agent_bridle::ChildNetworkPolicy::DenyDirect,
-        ..agent_bridle::SandboxPolicy::default()
+        ..crate::confined_exec::runtime_sandbox_policy()
     }
 }
 

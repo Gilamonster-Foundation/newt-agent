@@ -292,7 +292,7 @@ fn isolated_directory(dir: &Path, caveats: &Caveats, workspace: &Path) -> anyhow
     // The executor grants these paths in addition to explicit Caveats. Reuse
     // its policy data, including executable search roots, rather than treating
     // a narrow tool-level grant as the full filesystem authority.
-    let policy = agent_bridle::SandboxPolicy::default();
+    let policy = crate::confined_exec::runtime_sandbox_policy();
     let device_sinks = policy.device_sink_paths.resolve();
     writable.extend(device_sinks.iter().map(PathBuf::from));
     for paths in [
@@ -875,5 +875,25 @@ mod tests {
         assert!(config
             .open_conversation(&launch, "one", true, auxiliary)
             .is_err());
+    }
+}
+
+/// The native runtime grant and the private-store exclusion must share one
+/// policy; otherwise making xcrun work could accidentally expose frame files.
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn selected_developer_runtime_cannot_contain_a_private_frame() {
+    let workspace = tempfile::tempdir().unwrap();
+    let caveats = crate::confined_exec::workspace_confined_caveats(workspace.path());
+    for root in crate::confined_exec::runtime_sandbox_policy()
+        .base_read_paths
+        .extra
+    {
+        assert!(SmartHarnessConfig::validate_frame_directory(
+            &std::path::Path::new(&root).join("private-frame"),
+            &caveats,
+            workspace.path(),
+        )
+        .is_err());
     }
 }

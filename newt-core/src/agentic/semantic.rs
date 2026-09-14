@@ -919,7 +919,7 @@ pub fn plan_gather(
 /// Gather source files whose extension is in `extensions`, honestly (#1281):
 /// walk → collect readable candidates with sizes → [`plan_gather`] (sort + cap)
 /// → read the kept files, returning `(files, manifest)`. The manifest records
-/// admitted candidate paths and what the caps dropped. On Linux, metadata and
+/// admitted candidate paths and what the caps dropped. On Linux and macOS, metadata and
 /// content reads resolve beneath one opened workspace capability.
 ///
 /// The extension allow-list is a **parameter**, not a hardcoded `rs`/`py`
@@ -935,17 +935,17 @@ pub fn gather_with_manifest(
     use std::io::Read;
 
     let root = std::path::Path::new(workspace);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let directory = match crate::fs_cap::WorkspaceDir::open_root(root) {
         Ok(directory) => directory,
         Err(_) => return (Vec::new(), plan_gather(&[], caps).1),
     };
     let open = |relative: &std::path::Path| {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             directory.open(relative)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             std::fs::File::open(root.join(relative))
         }

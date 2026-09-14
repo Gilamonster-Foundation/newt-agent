@@ -23,7 +23,7 @@ fn open_for_scope(scope: &Scope<String>, path: &Path, nofollow: bool) -> io::Res
             "scope does not permit this read",
         ));
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let full = path.to_string_lossy();
         match super::object_bound_target(scope, &full) {
@@ -41,7 +41,7 @@ fn open_for_scope(scope: &Scope<String>, path: &Path, nofollow: bool) -> io::Res
             )),
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         // Diagnostic physical containment, not an atomic capability on these
         // platforms. Do not turn the known lexical mutation residual into a
@@ -207,7 +207,7 @@ pub(super) fn read_for_edit(
             if error.kind() == io::ErrorKind::PermissionDenied {
                 return Err(super::denied_fs_result("fs_write", label));
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             if super::is_fs_containment_denied(&error) {
                 return Err(super::denied_fs_result("fs_write", label));
             }
@@ -347,6 +347,11 @@ mod tests {
             capture(&scoped, &root.path().join("link")),
             TextSnapshot::Unavailable(_)
         ));
-        assert!(matches(&scoped, &root.path().join("link"), b"inside\n"));
+        // macOS's descriptor walk conservatively refuses even in-tree links
+        // (fs_cap module docs); elsewhere verification follows a contained link.
+        assert_eq!(
+            matches(&scoped, &root.path().join("link"), b"inside\n"),
+            !cfg!(target_os = "macos")
+        );
     }
 }

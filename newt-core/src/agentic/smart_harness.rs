@@ -127,8 +127,8 @@ pub fn validate_isolation_runtime() -> anyhow::Result<()> {
         "durable smart harness requires confined launch authority"
     );
     anyhow::ensure!(
-        cfg!(target_os = "linux") && crate::ocap_l3_backend().1,
-        "durable smart harness requires object-bound Linux filesystem tools and Landlock"
+        cfg!(any(target_os = "linux", target_os = "macos")) && crate::ocap_l3_backend().1,
+        "durable smart harness requires object-bound filesystem tools and a supported kernel sandbox (Landlock or Seatbelt)"
     );
     Ok(())
 }
