@@ -1,0 +1,4 @@
+# #2318 baseline roster: model ids as served. Non-thinking models first; a
+# thinking model takes minutes per turn.
+qwen3-coder_30b
+devstral-small-2-24b
