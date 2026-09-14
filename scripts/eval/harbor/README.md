@@ -118,9 +118,12 @@ today only `smart_harness` appears in the contract.
 A later cell that differs from the pin is skipped as `pin mismatch: <fields>`.
 pi and Codex then install the pinned version.
 
-*Model identity.* The fingerprint is the server's model metadata plus the GGUF
-basename. It is a fingerprint, not a content digest: the router exposes no
-weights hash. A digest written after a model id in the roster is recorded as
+*Model identity.* The fingerprint is the server's model metadata, the GGUF
+basename, and the `chat-template-kwargs` set in the model's router preset or
+args. Those kwargs are where thinking is switched on or off, identically for
+every harness. A preset edit between cells is refused as
+`pin mismatch: model_fingerprint.chat_template_kwargs`. The fingerprint is not
+a content digest: the router exposes no weights hash. A digest written after a model id in the roster is recorded as
 declared and unverified, and newt receives it as `NEWT_MODEL_DIGEST`.
 
 `tb_campaign.py table <out> --pair` adds one section per treatment. It compares
