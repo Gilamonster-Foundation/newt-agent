@@ -65,8 +65,10 @@ device = "cuda"
         }
         let expected = if unsafe_exec {
             "requires confined launch authority"
-        } else if !cfg!(target_os = "linux") || !newt_core::ocap_l3_backend().1 {
-            "requires object-bound Linux filesystem tools and Landlock"
+        } else if !cfg!(any(target_os = "linux", target_os = "macos"))
+            || !newt_core::ocap_l3_backend().1
+        {
+            "requires object-bound filesystem tools and a supported kernel sandbox"
         } else if exposed || extra_grant {
             "frame storage overlaps model filesystem authority"
         } else {

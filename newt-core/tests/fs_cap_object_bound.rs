@@ -8,10 +8,10 @@
 //! arms and write primitives move onto it in step-52.2 / step-52.3, and this is
 //! what proves that rewire will actually contain them.
 //!
-//! Linux-only (`openat2` is a Linux syscall) and `#[serial]` (real-fs tests
+//! Linux (`openat2`) and macOS (descriptor-relative no-follow opens), `#[serial]` (real-fs tests
 //! contend under parallel load — CLAUDE.md).
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::io::{Read, Write};
 use std::os::unix::fs::symlink;
@@ -47,12 +47,24 @@ fn open_regular_preserves_containment_and_explicit_final_link_policy() {
     symlink("file", ws.path().join("link")).unwrap();
     symlink(outside.path(), ws.path().join("escape")).unwrap();
     let dir = WorkspaceDir::open_root(ws.path()).unwrap();
-    for (path, nofollow) in [("file", true), ("link", false)] {
+    let mut text = String::new();
+    dir.open_regular(Path::new("file"), true)
+        .unwrap()
+        .read_to_string(&mut text)
+        .unwrap();
+    assert_eq!(text, "inside");
+    // A contained final link, followed explicitly: Linux resolves it beneath
+    // the root (`RESOLVE_BENEATH`); macOS's descriptor walk conservatively
+    // refuses even in-tree links (module docs), and mutation verification
+    // reports that as "unavailable" rather than reading through it — the same
+    // split `physical_read_scopes_and_final_links_do_not_disclose_outside_
+    // contents` pins from the consumer side.
+    let followed = dir.open_regular(Path::new("link"), false);
+    if cfg!(target_os = "macos") {
+        assert!(followed.is_err());
+    } else {
         let mut text = String::new();
-        dir.open_regular(Path::new(path), nofollow)
-            .unwrap()
-            .read_to_string(&mut text)
-            .unwrap();
+        followed.unwrap().read_to_string(&mut text).unwrap();
         assert_eq!(text, "inside");
     }
     assert!(dir.open_regular(Path::new("link"), true).is_err());
@@ -344,5 +356,54 @@ fn unlink_denies_a_symlink_escape_parent() {
     assert!(
         outside.join("victim").exists(),
         "the outside file must survive"
+    );
+}
+
+/// macOS uses a conservative descriptor-relative walk: even an in-tree link
+/// is refused, so neither intermediate nor final links can redirect an open.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_rejects_symlinks_without_truncating_their_targets() {
+    let ws = tempdir().unwrap();
+    std::fs::write(ws.path().join("target"), "unchanged").unwrap();
+    symlink("target", ws.path().join("link")).unwrap();
+    let dir = WorkspaceDir::open_root(ws.path()).unwrap();
+    assert!(dir.open(Path::new("link")).is_err());
+    assert!(dir.create(Path::new("link")).is_err());
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join("target")).unwrap(),
+        "unchanged"
+    );
+}
+
+/// Ground descriptor authority against a namespace replacement: operations
+/// continue on the granted object, never on an attacker-planted replacement.
+#[test]
+fn held_directory_survives_rename_and_replacement() {
+    let temp = tempdir().unwrap();
+    let original = temp.path().join("original");
+    let moved = temp.path().join("moved");
+    std::fs::create_dir(&original).unwrap();
+    std::fs::write(original.join("file"), "granted").unwrap();
+    let dir = WorkspaceDir::open_root(&original).unwrap();
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::create_dir(&original).unwrap();
+    std::fs::write(original.join("file"), "replacement").unwrap();
+    let mut value = String::new();
+    dir.open(Path::new("file"))
+        .unwrap()
+        .read_to_string(&mut value)
+        .unwrap();
+    assert_eq!(value, "granted");
+    dir.create(Path::new("new"))
+        .unwrap()
+        .write_all(b"written")
+        .unwrap();
+    assert!(moved.join("new").exists());
+    assert!(!original.join("new").exists());
+    dir.unlink(Path::new("file")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(original.join("file")).unwrap(),
+        "replacement"
     );
 }

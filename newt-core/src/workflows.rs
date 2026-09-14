@@ -391,6 +391,10 @@ mod tests {
         assert!(hint.contains("push_branch"), "{hint}");
         assert!(hint.contains("open_pr"), "{hint}");
         assert!(hint.contains("survives session restarts/stops"), "{hint}");
+        assert!(hint.contains("git worktree list --porcelain"), "{hint}");
+        assert!(hint.contains(".worktrees/<task>"), "{hint}");
+        assert!(hint.contains("explicit authority"), "{hint}");
+        assert!(hint.contains("does not retarget"), "{hint}");
     }
 
     #[test]
@@ -418,6 +422,10 @@ steer = "Always commit before pushing"
             .plan_update_hint("ship it")
             .expect("drop-in workflow should match");
         assert!(hint.contains("custom PR flow"), "{hint}");
+        assert!(
+            !hint.contains(".worktrees/<task>"),
+            "custom workflow owns its instructions: {hint}"
+        );
         assert!(hint.contains("custom_step"), "{hint}");
         assert!(!hint.contains("read_issue"), "{hint}");
     }

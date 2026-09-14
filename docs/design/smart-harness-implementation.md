@@ -97,8 +97,11 @@ Every tool dispatch and permission widening rechecks the boundary. A model
 cannot read, rewrite, or traverse the graph through ordinary file or shell
 tools; retained context is exposed through admitted `re_read` requests.
 
-This runtime currently requires Linux object-bound native filesystem tools and
-Landlock, and refuses unconfined launch modes. Local MCP children inherit an
+`validate_isolation_runtime` admits this runtime only when OCAP is enabled and
+full access was not requested, and only on Linux or macOS with the platform's
+kernel sandbox available (Landlock on Linux, Seatbelt on macOS). The platform
+condition is the code's proxy for object-bound native filesystem tools, since
+`fs_cap` is built only for those two targets. Local MCP children inherit an
 admitted capability at startup. Remote servers are separately configured
 authorities. Foreign consumers must enforce storage isolation in their own
 tool and subprocess execution; the pure library verifies content and session

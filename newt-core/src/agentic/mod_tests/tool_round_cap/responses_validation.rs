@@ -329,14 +329,19 @@ fn scoped_read_only_git_catalog_survives_the_responses_strict_gate() {
         assert_eq!(parameters["additionalProperties"], false, "{path}");
         assert_eq!(
             parameters["required"],
-            serde_json::json!(["op", "scope"]),
+            serde_json::json!(["op", "scope", "cwd"]),
             "{path}: strict mode requires every advertised property"
         );
         let properties = parameters["properties"].as_object().unwrap();
         assert_eq!(
             properties.len(),
-            2,
+            3,
             "{path}: no broader Git operations or arguments"
+        );
+        assert_eq!(
+            properties["cwd"]["type"],
+            serde_json::json!(["string", "null"]),
+            "{path}: per-call target remains optional in strict mode"
         );
         assert_eq!(
             properties["op"]["enum"],

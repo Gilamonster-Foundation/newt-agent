@@ -36,9 +36,9 @@ pub mod flight_recorder;
 pub mod netguard;
 pub mod owned_hosts;
 // Object-bound workspace filesystem capability (step-52.1). `openat2` is
-// Linux-only, so the capability exists only there; consumers apply the
+// Linux-only; macOS uses descriptor-relative no-follow opens. Consumers apply the
 // cross-platform fallback + fail-closed-for-untrusted policy (step-52.2/52.3).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod fs_cap;
 pub mod git_caveats;
 pub mod git_hardening;
