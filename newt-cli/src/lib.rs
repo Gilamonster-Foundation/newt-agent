@@ -848,6 +848,10 @@ pub enum Command {
         /// state source; nothing is inherited from earlier runs (#2314).
         #[arg(long, value_name = "FILE")]
         scratchpad_state: Option<PathBuf>,
+        /// Refuse to start unless this feature can be supplied for the run
+        /// (repeatable). Checked before any model request (#2314).
+        #[arg(long, value_name = "FEATURE")]
+        require_feature: Vec<solve_contract::Feature>,
         /// Start without inherited frame or ambient memory inputs. Smart mode
         /// otherwise starts a resumable frame; legacy solve keeps its default.
         /// This bounds admitted inputs, not model nondeterminism or provider-side
@@ -1749,6 +1753,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             context_window,
             model_digest,
             scratchpad_state,
+            require_feature,
             hermetic,
             resume_from,
         } => {
@@ -1775,6 +1780,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 context_window,
                 model_digest,
                 scratchpad_state,
+                require_feature,
                 launch,
             })
             .await?;
