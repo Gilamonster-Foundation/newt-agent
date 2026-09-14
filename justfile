@@ -327,6 +327,7 @@ bench-publish:
 # (eval-selftest)" step in .github/workflows/ci.yml. Add a line to both.
 eval-selftest:
     python3 scripts/eval/bench_scoreboard.py --self-test
+    PYTHONPATH=scripts/eval/harbor python3 -m unittest discover -s scripts/eval/harbor/tests -t scripts/eval/harbor/tests -p 'test_tb_campaign.py'
 
 # Build + test the out-of-workspace newt-mesh crate. Requires the
 # sibling `../agent-mesh/` checkout. Not run by `just check` /
