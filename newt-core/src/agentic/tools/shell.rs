@@ -1187,7 +1187,7 @@ pub(crate) fn absent_binary_refusal(
         return None;
     }
 
-    let prog = not_found_program(cmd, envelope)?;
+    let prog = failed_program(cmd, envelope, "command not found: ")?;
     let granted = granted_host_binaries(exec);
 
     // The host probe is what makes the two 127 states distinguishable.
@@ -1246,12 +1246,8 @@ pub(crate) fn kernel_refused_binary(
     {
         return None;
     }
-    // The leading token, never stderr: brush's wording for EACCES is not a
-    // contract, and the program name is only a noun for the sentence.
-    let prog = cmd
-        .split_ascii_whitespace()
-        .find(|tok| !tok.contains('='))?;
-    let abs = host_path_lookup(prog)?;
+    let prog = failed_program(cmd, envelope, "failed to execute command '")?;
+    let abs = host_path_lookup(&prog)?;
     if crate::caveats::permits_path(fs_read, &abs) {
         return None;
     }
@@ -1266,35 +1262,33 @@ pub(crate) fn kernel_refused_binary(
     ))
 }
 
-/// Which program was not found.
+/// Which program brush failed on.
 ///
-/// brush names it in its own error (`command not found: X`), and that is the
-/// authoritative answer for a compound command where the leading token is not
-/// the one that failed. Falling back to the leading token keeps a name in hand
-/// if that wording ever drifts.
+/// brush names it in its own error — `command not found: X` for 127,
+/// `failed to execute command 'X': ...` for 126 — and that is the
+/// authoritative answer for a compound command, where the leading token
+/// (`cd newt-core && cargo test`) is not the one that failed (#2304). The LAST
+/// occurrence wins: the exit status belongs to the command that ran last.
+/// Falling back to the leading token keeps a name in hand if that wording
+/// ever drifts.
 ///
-/// Reading stderr is acceptable HERE and not in [`envelope_denied`] because the
-/// two carry different weight: this picks a NOUN for an advisory sentence, and
-/// is already fenced behind the structured 127-and-no-denials test above, while
-/// `envelope_denied` decides whether authority was refused. A wrong noun costs
-/// a confusing word; a wrong authority decision costs the confinement.
-fn not_found_program(cmd: &str, envelope: &serde_json::Value) -> Option<String> {
-    const MARKER: &str = "command not found: ";
-    if let Some(stderr) = envelope
+/// Reading stderr is acceptable HERE and not in [`envelope_denied`] because
+/// both callers are already fenced behind the structured exit-code-and-no-
+/// denials test, and the model controls `cmd` just as fully: stderr adds no
+/// authority the leading token did not already give it. `envelope_denied`
+/// decides whether authority was refused; this only picks which program the
+/// advisory message is about.
+fn failed_program(cmd: &str, envelope: &serde_json::Value, marker: &str) -> Option<String> {
+    let named = envelope
         .get("stderr")
         .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty())
-    {
-        if let Some(rest) = stderr.split(MARKER).nth(1) {
-            let name = rest.lines().next().unwrap_or("").trim();
-            if !name.is_empty() {
-                return Some(name.to_string());
-            }
-        }
-    }
+        .and_then(|stderr| stderr.rfind(marker).map(|at| &stderr[at + marker.len()..]))
+        .and_then(|rest| rest.split(['\'', '\n']).next())
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
     // `FOO=bar prog ...` - an env assignment is not the program.
-    cmd.split_ascii_whitespace()
-        .find(|tok| !tok.contains('='))
+    named
+        .or_else(|| cmd.split_ascii_whitespace().find(|tok| !tok.contains('=')))
         .map(str::to_string)
 }
 
