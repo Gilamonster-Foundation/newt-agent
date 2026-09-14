@@ -349,12 +349,17 @@ async fn delete_file_symlink_under_workspace_escaping_is_denied() {
     let before = crate::agentic::tools::file_capture::capture(&read_caveats.fs_read, &full);
     let after = crate::agentic::tools::file_capture::capture(&read_caveats.fs_read, &full);
     let receipt = crate::agentic::tools::file_capture::receipt("link/victim.txt", &before, &after);
-    assert_eq!(
-        out,
+    let mut display = crate::agentic::display::ToolDisplay::new(Vec::new(), false, 80, 0, false);
+    let expected = receipt.present(
         crate::agentic::tools::file_capture::failure(
             denied_fs_result("fs_write", "link/victim.txt"),
-            &receipt,
+            "",
         ),
+        "",
+        &mut display,
+    );
+    assert_eq!(
+        out, expected,
         "the symlink-escape delete must be denied: {out}"
     );
     assert!(
