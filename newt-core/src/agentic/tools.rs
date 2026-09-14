@@ -2460,8 +2460,16 @@ async fn execute_authorized_tool(
         persona_tools,
         live_tool_output,
         completed_spill_renderer: _,
+        execution,
     } = collab;
     let smart_harness = invocation.map(|call| call.harness());
+    // #2315: hand the shell's execution class to the funnel, return the text.
+    let executed = |(text, outcome): (String, crate::ExecOutcome)| {
+        if let Some(slot) = execution {
+            let _ = slot.set(outcome);
+        }
+        text
+    };
     let host_return = |text: String| {
         if let Some(invocation) = invocation {
             invocation.host();
@@ -3129,20 +3137,22 @@ async fn execute_authorized_tool(
                 workspace,
                 cd_path.as_deref().or_else(|| args["cwd"].as_str()),
             );
-            exec_confined_command(
-                cmd,
-                &run_cwd,
-                color,
-                tool_output_lines,
-                caveats,
-                exec_floor,
-                permission_gate,
-                tool_offload,
-                spill_store,
-                live_tool_output.clone(),
-                presentation,
+            executed(
+                exec_confined_command(
+                    cmd,
+                    &run_cwd,
+                    color,
+                    tool_output_lines,
+                    caveats,
+                    exec_floor,
+                    permission_gate,
+                    tool_offload,
+                    spill_store,
+                    live_tool_output.clone(),
+                    presentation,
+                )
+                .await,
             )
-            .await
         }
 
         // #891: the model-facing lifecycle surface over the #880 system. Resolve
@@ -3219,7 +3229,7 @@ async fn execute_authorized_tool(
             let joined = cmds.join(" && ");
             match action {
                 "list" => format!("lifecycle {} → {joined}", phase.as_str()),
-                "run" => {
+                "run" => executed(
                     exec_confined_command(
                         &joined,
                         &effective_dir,
@@ -3233,8 +3243,8 @@ async fn execute_authorized_tool(
                         live_tool_output.clone(),
                         presentation,
                     )
-                    .await
-                }
+                    .await,
+                ),
                 other => format!(
                     "error: unknown lifecycle action '{other}'. Use 'run' (default) or 'list'."
                 ),
@@ -4054,7 +4064,7 @@ mod exit_code_ok_tests;
 
 #[cfg(test)]
 #[path = "tools_tests/disable_ocap_tests.rs"]
-mod disable_ocap_tests;
+pub(crate) mod disable_ocap_tests;
 
 #[cfg(test)]
 #[path = "tools_tests/smart_frame_isolation.rs"]

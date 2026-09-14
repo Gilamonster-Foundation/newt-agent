@@ -11,6 +11,7 @@ use super::output_budget::{
     self, cap_model_output, cap_model_output_with_handle, max_output_tokens, output_head_tokens,
 };
 use super::{denial_recovery_hint, full_access_requested, ocap_disabled};
+use crate::ExecOutcome;
 
 pub fn venv_cmd_prefix() -> Option<String> {
     let venv = std::env::var("NEWT_VENV")
@@ -490,7 +491,7 @@ pub(super) async fn exec_confined_command(
     spill_store: Option<&dyn SpillStore>,
     live_tool_output: Option<std::sync::Arc<dyn crate::agentic::LiveToolOutput>>,
     presentation: &mut dyn ToolPresentation,
-) -> String {
+) -> (String, ExecOutcome) {
     // Venv injection (#783): the confined shell carries the venv via
     // agent-bridle's structured `env` seam (see `confined_dispatch_args` /
     // `venv_env_map`), NOT by prepending `export …;` to the command — an
@@ -536,15 +537,17 @@ pub(super) async fn exec_confined_command(
             live.finish();
         }
         return match run {
-            Ok(envelope) => shell_envelope_output(
-                &envelope,
-                tool_output_lines,
-                color,
-                tool_offload,
-                spill_store,
-                Some(&mut *presentation),
-            ),
-            Err(e) => format!("error: {e}"),
+            Ok(envelope) => host_result(cmd, &envelope, |envelope| {
+                shell_envelope_output(
+                    envelope,
+                    tool_output_lines,
+                    color,
+                    tool_offload,
+                    spill_store,
+                    Some(&mut *presentation),
+                )
+            }),
+            Err(e) => (format!("error: {e}"), ExecOutcome::Unavailable),
         };
     }
 
@@ -560,89 +563,160 @@ pub(super) async fn exec_confined_command(
         // interceptor (the command genuinely does not run); we lift that to the
         // capability-denied UX by reading the structured `denied` field — NEVER
         // a stderr grep.
-        Ok(envelope) if envelope_denied(&envelope) => {
-            // Repair evidence is distinct from the prompted-decision log: keep
-            // the redacted raw command + structured refusal even when prompting
-            // is off or the operator allows it. This is what lets `newt ocap
-            // denials` distinguish a policy gap from a parser/implementation
-            // defect instead of repeatedly granting a bogus target.
-            crate::denial_journal::record_envelope(
-                cmd,
-                cwd,
-                crate::denial_journal::DenialStage::Initial,
-                &envelope,
-            );
-            // #263: an interactive gate may turn this denial into a human grant.
-            // ONE consult + ONE re-execution per call: a second denial (a
-            // different target reached on the re-run) surfaces as the standard
-            // envelope — the model can retry, which prompts afresh.
-            if let Some(gate) = permission_gate {
-                // #905: promptable exec denials OR net-host denials (agent-bridle
-                // #196). On Allow, the re-mint widens the matching axis (net adds
-                // the host to the allow-list), so the proxy admits it on re-run.
-                if let Some(requests) =
-                    exec_denial_requests(&envelope).or_else(|| net_denial_requests(&envelope))
-                {
-                    if let PermissionDecision::Allow(widened) = gate.ask(&requests) {
-                        return match dispatch_bridled_shell(
-                            dispatch_args,
-                            &widened,
-                            live_tool_output,
-                        )
-                        .await
-                        {
-                            Ok(env2) if envelope_denied(&env2) => {
-                                crate::denial_journal::record_envelope(
-                                    cmd,
-                                    cwd,
-                                    crate::denial_journal::DenialStage::AfterGrant,
-                                    &env2,
-                                );
-                                denied_run_command_result(&env2, color)
-                            }
-                            Ok(env2) => shell_envelope_output(
-                                &env2,
-                                tool_output_lines,
-                                color,
-                                tool_offload,
-                                spill_store,
-                                Some(&mut *presentation),
-                            ),
-                            Err(e) => format!("error: {e}"),
-                        };
+        Ok(envelope) => {
+            if envelope_denied(&envelope) {
+                // Repair evidence is distinct from the prompted-decision log: keep
+                // the redacted raw command + structured refusal even when prompting
+                // is off or the operator allows it. This is what lets `newt ocap
+                // denials` distinguish a policy gap from a parser/implementation
+                // defect instead of repeatedly granting a bogus target.
+                crate::denial_journal::record_envelope(
+                    cmd,
+                    cwd,
+                    crate::denial_journal::DenialStage::Initial,
+                    &envelope,
+                );
+                // #263: an interactive gate may turn this denial into a human grant.
+                // ONE consult + ONE re-execution per call: a second denial (a
+                // different target reached on the re-run) surfaces as the standard
+                // envelope — the model can retry, which prompts afresh.
+                if let Some(gate) = permission_gate {
+                    // #905: promptable exec denials OR net-host denials (agent-bridle
+                    // #196). On Allow, the re-mint widens the matching axis (net adds
+                    // the host to the allow-list), so the proxy admits it on re-run.
+                    if let Some(requests) =
+                        exec_denial_requests(&envelope).or_else(|| net_denial_requests(&envelope))
+                    {
+                        if let PermissionDecision::Allow(widened) = gate.ask(&requests) {
+                            return match dispatch_bridled_shell(
+                                dispatch_args,
+                                &widened,
+                                live_tool_output,
+                            )
+                            .await
+                            {
+                                Ok(env2) if envelope_denied(&env2) => {
+                                    crate::denial_journal::record_envelope(
+                                        cmd,
+                                        cwd,
+                                        crate::denial_journal::DenialStage::AfterGrant,
+                                        &env2,
+                                    );
+                                    (denied_run_command_result(&env2, color), ExecOutcome::Denied)
+                                }
+                                Ok(env2) => (
+                                    shell_envelope_output(
+                                        &env2,
+                                        tool_output_lines,
+                                        color,
+                                        tool_offload,
+                                        spill_store,
+                                        Some(&mut *presentation),
+                                    ),
+                                    envelope_outcome(&env2),
+                                ),
+                                Err(e) => (format!("error: {e}"), ExecOutcome::Unavailable),
+                            };
+                        }
                     }
                 }
             }
-            denied_run_command_result(&envelope, color)
-        }
-        Ok(envelope) => {
-            // #2274: a 127 with no structured denial is an ABSENCE, not an
-            // ordinary failure. Name it before it renders as the ambiguous
-            // `error: command exited 127`, which is indistinguishable from a
-            // broken machine. Returns None for everything else, so ordinary
-            // output and ordinary failures fall through untouched.
-            if let Some(refusal) = absent_binary_refusal(cmd, &envelope, &caveats.exec) {
-                return refusal;
-            }
-            // #2273: a 126 with no structured denial whose program sits
-            // outside the fs-read grant is the KERNEL refusing, not a
-            // chmod the model forgot. Same structured test, one more state.
-            if let Some(refusal) = kernel_refused_binary(cmd, &envelope, &caveats.fs_read) {
-                return refusal;
-            }
-            shell_envelope_output(
-                &envelope,
-                tool_output_lines,
-                color,
-                tool_offload,
-                spill_store,
-                Some(&mut *presentation),
-            )
+            confined_result(cmd, &envelope, caveats, color, |envelope| {
+                shell_envelope_output(
+                    envelope,
+                    tool_output_lines,
+                    color,
+                    tool_offload,
+                    spill_store,
+                    Some(&mut *presentation),
+                )
+            })
         }
         // An argv-mode leash denial, or an error from inside the tool — surface
         // the reason; the dispatch error Display is safe to show.
-        Err(e) => format!("error: {e}"),
+        Err(e) => (format!("error: {e}"), ExecOutcome::Unavailable),
     }
+}
+
+/// #2315: the class of a completed envelope from its own facts — structured
+/// denial, then the `timed_out` flag (NOT exit 124, which a check wrapped in
+/// GNU `timeout` returns on its own), then the exit status.
+pub(super) fn envelope_outcome(envelope: &serde_json::Value) -> ExecOutcome {
+    if envelope_denied(envelope) {
+        ExecOutcome::Denied
+    } else if envelope
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        ExecOutcome::TimedOut
+    } else if envelope
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        == Some(0)
+    {
+        ExecOutcome::Passed
+    } else {
+        ExecOutcome::Failed
+    }
+}
+
+/// The confined lane's result for an envelope no grant widened: each rendering
+/// is paired with the class of the branch that chose it, so the class and the
+/// text the model reads cannot disagree.
+pub(super) fn confined_result(
+    cmd: &str,
+    envelope: &serde_json::Value,
+    caveats: &crate::caveats::Caveats,
+    color: bool,
+    render: impl FnOnce(&serde_json::Value) -> String,
+) -> (String, ExecOutcome) {
+    if envelope_denied(envelope) {
+        return (
+            denied_run_command_result(envelope, color),
+            ExecOutcome::Denied,
+        );
+    }
+    // #2274: a 127 with no structured denial is an ABSENCE, not an
+    // ordinary failure. Name it before it renders as the ambiguous
+    // `error: command exited 127`, which is indistinguishable from a
+    // broken machine. Returns None for everything else, so ordinary
+    // output and ordinary failures fall through untouched.
+    if let Some(refusal) = absent_binary_refusal(cmd, envelope, &caveats.exec) {
+        return (refusal, ExecOutcome::Unavailable);
+    }
+    // #2273: a 126 with no structured denial whose program sits
+    // outside the fs-read grant is the KERNEL refusing, not a
+    // chmod the model forgot. Same structured test, one more state.
+    if let Some(refusal) = kernel_refused_binary(cmd, envelope, &caveats.fs_read) {
+        return (refusal, ExecOutcome::Denied);
+    }
+    (render(envelope), envelope_outcome(envelope))
+}
+
+/// The host lane's result (`--unsafe-host-exec`). Its rendering has no
+/// absent-binary refusal, so its 127 is `unavailable` only when the program
+/// does not resolve on this host; a program that exists and exits 127 failed.
+pub(super) fn host_result(
+    cmd: &str,
+    envelope: &serde_json::Value,
+    render: impl FnOnce(&serde_json::Value) -> String,
+) -> (String, ExecOutcome) {
+    let outcome = match envelope_outcome(envelope) {
+        // ponytail: leading-token lookup, so a bare builtin (`exit 127`) reads
+        // unavailable; PR2 moves both lanes to one resolution rule.
+        ExecOutcome::Failed
+            if envelope
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64)
+                == Some(127)
+                && leading_program(cmd).and_then(host_path_lookup).is_none() =>
+        {
+            ExecOutcome::Unavailable
+        }
+        outcome => outcome,
+    };
+    (render(envelope), outcome)
 }
 
 pub(super) async fn host_shell_dispatch(
@@ -1292,10 +1366,13 @@ fn failed_program(cmd: &str, envelope: &serde_json::Value, marker: &str) -> Opti
         .and_then(|rest| rest.split(['\'', '\n']).next())
         .map(str::trim)
         .filter(|name| !name.is_empty());
-    // `FOO=bar prog ...` - an env assignment is not the program.
-    named
-        .or_else(|| cmd.split_ascii_whitespace().find(|tok| !tok.contains('=')))
-        .map(str::to_string)
+    named.or_else(|| leading_program(cmd)).map(str::to_string)
+}
+
+/// The leading program of `cmd`: `FOO=bar prog ...` - an env assignment is not
+/// the program.
+fn leading_program(cmd: &str) -> Option<&str> {
+    cmd.split_ascii_whitespace().find(|tok| !tok.contains('='))
 }
 
 /// The exec grants in force, for the refusal's second line. Naming what IS

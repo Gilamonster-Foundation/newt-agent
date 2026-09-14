@@ -29,7 +29,7 @@ impl EnvVar {
         Self { key, saved }
     }
 
-    fn unset(key: &'static str) -> Self {
+    pub(crate) fn unset(key: &'static str) -> Self {
         let saved = std::env::var(key).ok();
         std::env::remove_var(key);
         Self { key, saved }
