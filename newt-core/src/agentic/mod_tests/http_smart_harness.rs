@@ -58,7 +58,7 @@ async fn run(
                 .unwrap()
                 .pop_front()
                 .expect("bounded auxiliary call");
-            Box::pin(async move { Ok(verdict) })
+            Box::pin(async move { Ok((verdict, None)) })
         }),
         AdjudicationSettings::default(),
     )

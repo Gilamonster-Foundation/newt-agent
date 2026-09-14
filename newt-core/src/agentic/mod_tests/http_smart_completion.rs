@@ -274,7 +274,7 @@ async fn recovered_after_sibling(wire: &str, abrupt: bool, spill: bool) {
         .await;
     let harness = SmartHarness::new(
         restored,
-        Arc::new(|_| Box::pin(async { Ok("\"answer\"".into()) })),
+        Arc::new(|_| Box::pin(async { Ok(("\"answer\"".into(), None)) })),
         Default::default(),
     )
     .unwrap();
@@ -478,7 +478,7 @@ async fn all_four_completed_batches_preserve_observed_errors_and_large_sources()
         let directory = tempfile::tempdir().unwrap();
         let harness = SmartHarness::new(
             agent_harness::Session::open(directory.path(), Default::default()).unwrap(),
-            Arc::new(|_| Box::pin(async { Ok("\"answer\"".into()) })),
+            Arc::new(|_| Box::pin(async { Ok(("\"answer\"".into(), None)) })),
             Default::default(),
         )
         .unwrap();
@@ -876,7 +876,7 @@ async fn bad_spill_return(wire: &str, malformed: bool, resume: bool) {
             .await;
         let harness = SmartHarness::new(
             restored,
-            Arc::new(|_| Box::pin(async { Ok("\"answer\"".into()) })),
+            Arc::new(|_| Box::pin(async { Ok(("\"answer\"".into(), None)) })),
             Default::default(),
         )
         .unwrap();

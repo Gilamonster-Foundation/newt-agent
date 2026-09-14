@@ -864,7 +864,7 @@ mod tests {
         let harness = Arc::new(
             super::super::smart_harness::SmartHarness::new(
                 agent_harness::Session::new(Default::default()).unwrap(),
-                Arc::new(|_| Box::pin(async { Ok("\"question\"".to_string()) })),
+                Arc::new(|_| Box::pin(async { Ok(("\"question\"".to_string(), None)) })),
                 Default::default(),
             )
             .unwrap(),

@@ -158,7 +158,7 @@ mod tests {
             Ok(Auxiliary {
                 complete: Arc::new(move |_| {
                     let assets = assets.clone();
-                    Box::pin(async move { Ok((*assets).clone()) })
+                    Box::pin(async move { Ok(((*assets).clone(), None)) })
                 }),
                 manifest: serde_json::json!({"backend":"embedded","model":"fixture","placement":"cpu"}),
             })
@@ -205,7 +205,7 @@ mod tests {
         let build = || {
             calls.set(calls.get() + 1);
             Ok(Auxiliary {
-                complete: Arc::new(|_| Box::pin(async { Ok("answer".into()) })),
+                complete: Arc::new(|_| Box::pin(async { Ok(("answer".into(), None)) })),
                 manifest: serde_json::json!({"backend":"embedded","model":"fixture","placement":"cpu"}),
             })
         };
@@ -367,7 +367,7 @@ mod tests {
         );
         let auxiliary = || {
             Ok(Auxiliary {
-                complete: Arc::new(|_| Box::pin(async { Ok("answer".into()) })),
+                complete: Arc::new(|_| Box::pin(async { Ok(("answer".into(), None)) })),
                 manifest: serde_json::json!({"model":"fixture","placement":"cpu"}),
             })
         };
@@ -442,7 +442,7 @@ mod tests {
         );
         let auxiliary = || {
             Ok(Auxiliary {
-                complete: Arc::new(|_| Box::pin(async { Ok("answer".into()) })),
+                complete: Arc::new(|_| Box::pin(async { Ok(("answer".into(), None)) })),
                 manifest: serde_json::json!({"model":"fixture","placement":"cpu"}),
             })
         };

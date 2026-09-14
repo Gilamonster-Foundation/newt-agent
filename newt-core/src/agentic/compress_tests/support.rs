@@ -55,7 +55,7 @@ pub(super) fn recording_summarizer(
         let prompts = prompts.clone();
         Box::pin(async move {
             prompts.lock().unwrap().push(prompt);
-            Ok(reply.to_string())
+            Ok((reply.to_string(), None))
         })
     })
 }

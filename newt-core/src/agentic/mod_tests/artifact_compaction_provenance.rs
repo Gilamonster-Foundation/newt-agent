@@ -208,7 +208,7 @@ fn canned_summarizer(calls: Arc<AtomicUsize>) -> Summarizer {
         let calls = calls.clone();
         Box::pin(async move {
             calls.fetch_add(1, Ordering::SeqCst);
-            Ok(CANNED_SUMMARY.to_string())
+            Ok((CANNED_SUMMARY.to_string(), None))
         })
     })
 }

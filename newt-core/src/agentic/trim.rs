@@ -290,7 +290,7 @@ pub(crate) fn merge_round_usage(
 
 /// Extract token usage from an Ollama non-streaming response (top-level
 /// `prompt_eval_count` / `eval_count` fields).
-pub(crate) fn ollama_usage(json: &serde_json::Value) -> Option<crate::TokenUsage> {
+pub fn ollama_usage(json: &serde_json::Value) -> Option<crate::TokenUsage> {
     let input = json["prompt_eval_count"].as_u64()? as u32;
     let output = json["eval_count"].as_u64()? as u32;
     Some(crate::TokenUsage {
@@ -300,7 +300,7 @@ pub(crate) fn ollama_usage(json: &serde_json::Value) -> Option<crate::TokenUsage
 }
 
 /// Parse an OpenAI `usage` object (`prompt_tokens` / `completion_tokens`).
-pub(crate) fn openai_usage(usage: &serde_json::Value) -> Option<crate::TokenUsage> {
+pub fn openai_usage(usage: &serde_json::Value) -> Option<crate::TokenUsage> {
     let input = usage["prompt_tokens"].as_u64()? as u32;
     let output = usage["completion_tokens"].as_u64()? as u32;
     Some(crate::TokenUsage {
