@@ -43,77 +43,67 @@ pub struct SkillsConfig {
 }
 
 impl Config {
-    /// The ordered skill-discovery search path, with `~/` expanded.
+    /// The EFFECTIVE skill search path, with `~/` expanded — the ONE resolver
+    /// every skill consumer uses (#2331): the prompt index, the `use_skill`
+    /// loader, posture skills, persona binding checks, and `newt skills`.
+    /// Consumers that resolved their own list drifted apart: a bundled-only
+    /// skill was indexed and then `unknown skill` to the loader.
     ///
-    /// Resolves `[skills].search` when configured; otherwise defaults to the
-    /// single host-scoped `~/.newt/skills`. Order is preserved — earlier
+    /// Resolves `[skills].search` when configured; otherwise the single
+    /// host-scoped [`Self::skill_install_dir`]. Order is preserved — earlier
     /// directories win on a name collision (see `newt_skills::discover_paths`).
-    /// The default falls back to a relative `.newt/skills` only when `$HOME`
-    /// can't be resolved, so the list is never empty.
+    /// The default falls back to a relative `.newt/skills` only when neither
+    /// `$NEWT_CONFIG_DIR` nor `$HOME` resolves, so the list is never empty.
     ///
-    /// A configured `[skills].bundled_dir` is appended **last** (lowest
-    /// priority), so a user skill of the same name shadows the bundled one.
+    /// The bundled directory is appended **last** (lowest priority), so a
+    /// user skill of the same name shadows the bundled one: `[skills].bundled_dir`
+    /// when set, otherwise the `.newt/bundled-skills` of a newt checkout found
+    /// by walking up from the process cwd, so an agent running inside a
+    /// checkout gets the repo's bundled skills with no config. Packaging a
+    /// default for an *installed* newt is a follow-up (bundled-skills epic).
     #[must_use]
     pub fn skill_search_dirs(&self) -> Vec<PathBuf> {
-        let configured = self
-            .skills
-            .as_ref()
-            .map(|s| s.search.as_slice())
-            .unwrap_or(&[]);
-        let mut dirs: Vec<PathBuf> = if configured.is_empty() {
-            let default = Self::user_config_dir()
-                .map(|dir| dir.join("skills"))
-                .unwrap_or_else(|| PathBuf::from(".newt/skills"));
-            vec![default]
-        } else {
-            configured.iter().map(|s| expand_tilde(s)).collect()
-        };
-
-        // Bundled skills scanned last: user-configured dirs win a name
-        // collision (first-wins in `discover_paths`), so users can override
-        // any bundled skill by shipping their own of the same name.
-        if let Some(bundled) = self
-            .skills
-            .as_ref()
-            .map(|s| s.bundled_dir.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            dirs.push(expand_tilde(bundled));
-        }
-
-        dirs
+        let cwd = std::env::current_dir().ok();
+        self.skill_search_dirs_with(cwd.as_deref(), |p| p.is_dir())
     }
 
-    /// Fill in a default `[skills].bundled_dir` when the user left it unset, so
-    /// an agent running **inside a newt checkout gets the repo's bundled skills
-    /// surfaced out-of-the-box** (progressive-disclosure index → `use_skill`)
-    /// without any config. Detection walks up from `cwd` for a
-    /// `.newt/bundled-skills` directory; if none is found (or the field is
-    /// already set), the config is returned unchanged. Kept off the pure
-    /// [`Self::skill_search_dirs`] path — the filesystem probe lives only here.
-    ///
-    /// This is the smallest first step (dev/agent-in-checkout); packaging a
-    /// default bundled dir for an *installed* newt is a follow-up (see the
-    /// bundled-skills epic).
+    /// Where a skill is installed or seeded by default: the first configured
+    /// `[skills].search` entry, else `$NEWT_CONFIG_DIR/skills` or
+    /// `~/.newt/skills`. Never the bundled directory, and `None` rather than a
+    /// cwd-relative guess when no root resolves — a write must not land in
+    /// whatever directory newt happened to start in.
     #[must_use]
-    pub fn with_bundled_default(mut self) -> Self {
-        let already_set = self
-            .skills
-            .as_ref()
-            .is_some_and(|s| !s.bundled_dir.is_empty());
-        if already_set {
-            return self;
+    pub fn skill_install_dir(&self) -> Option<PathBuf> {
+        match self.skills.as_ref().and_then(|s| s.search.first()) {
+            Some(first) => Some(expand_tilde(first)),
+            None => Self::user_config_dir().map(|dir| dir.join("skills")),
         }
-        let Ok(cwd) = std::env::current_dir() else {
-            return self;
+    }
+
+    /// [`Self::skill_search_dirs`] with the checkout probe injected, so the
+    /// ordering and fallback rules are testable without touching disk.
+    pub(super) fn skill_search_dirs_with(
+        &self,
+        cwd: Option<&Path>,
+        is_dir: impl Fn(&Path) -> bool,
+    ) -> Vec<PathBuf> {
+        let skills = self.skills.as_ref();
+        let mut dirs: Vec<PathBuf> = match skills.filter(|s| !s.search.is_empty()) {
+            Some(s) => s.search.iter().map(|d| expand_tilde(d)).collect(),
+            None => vec![self
+                .skill_install_dir()
+                .unwrap_or_else(|| PathBuf::from(".newt/skills"))],
         };
-        if let Some(dir) =
-            find_ancestor_dir(&cwd, Path::new(".newt/bundled-skills"), |p| p.is_dir())
-        {
-            self.skills
-                .get_or_insert_with(SkillsConfig::default)
-                .bundled_dir = dir.to_string_lossy().into_owned();
-        }
-        self
+        let bundled = skills
+            .map(|s| s.bundled_dir.as_str())
+            .filter(|d| !d.is_empty())
+            .map(expand_tilde)
+            .or_else(|| {
+                cwd.and_then(|cwd| {
+                    find_ancestor_dir(cwd, Path::new(".newt/bundled-skills"), &is_dir)
+                })
+            });
+        dirs.extend(bundled);
+        dirs
     }
 }

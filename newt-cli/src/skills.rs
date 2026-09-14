@@ -78,9 +78,9 @@ pub fn run(cmd: SkillsCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
         Some(p) => newt_core::Config::load(p)?,
         None => newt_core::Config::resolve().unwrap_or_default(),
     };
-    let search = cfg.with_bundled_default().skill_search_dirs();
+    let search = cfg.skill_search_dirs();
     let mut out = std::io::stdout();
-    run_with(cmd, &search, &mut out)
+    run_with(cmd, &search, cfg.skill_install_dir(), &mut out)
 }
 
 fn mode(link: bool) -> InstallMode {
@@ -99,9 +99,15 @@ fn verb(mode: InstallMode) -> &'static str {
     }
 }
 
-/// Core dispatch, parameterised over the resolved search path and an output
-/// sink so it can be exercised in tests against temp directories.
-fn run_with(cmd: SkillsCmd, search: &[PathBuf], out: &mut dyn Write) -> anyhow::Result<()> {
+/// Core dispatch, parameterised over the resolved search path, the default
+/// install dir, and an output sink so it can be exercised in tests against
+/// temp directories. Both come from the one resolver (#2331).
+fn run_with(
+    cmd: SkillsCmd,
+    search: &[PathBuf],
+    install_dir: Option<PathBuf>,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
     match cmd {
         SkillsCmd::List => cmd_list(search, out),
         SkillsCmd::Install {
@@ -112,7 +118,7 @@ fn run_with(cmd: SkillsCmd, search: &[PathBuf], out: &mut dyn Write) -> anyhow::
             force,
         } => {
             let dest_root = into
-                .or_else(|| search.first().cloned())
+                .or(install_dir)
                 .ok_or_else(|| anyhow!("no destination — pass --into <dir>"))?;
             let dest = newt_skills::install_skill(
                 &source,
@@ -219,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    fn install_defaults_into_first_search_dir() {
+    fn install_defaults_into_the_resolved_install_dir() {
         let tmp = tempdir().unwrap();
         let newt = tmp.path().join("newt");
         fs::create_dir_all(&newt).unwrap();
@@ -236,6 +242,7 @@ mod tests {
                 force: false,
             },
             std::slice::from_ref(&newt),
+            Some(newt.clone()),
             &mut out,
         )
         .unwrap();
@@ -259,6 +266,7 @@ mod tests {
                 force: false,
             },
             &[tmp.path().join("newt")],
+            None,
             &mut out,
         )
         .unwrap();
@@ -282,6 +290,7 @@ mod tests {
                 force: false,
             },
             &[newt],
+            None,
             &mut out,
         )
         .unwrap();
@@ -308,6 +317,7 @@ mod tests {
                 force: false,
             },
             &[tmp.path().join("newt")], // search path doesn't contain it
+            None,
             &mut out,
         )
         .unwrap();
@@ -329,6 +339,7 @@ mod tests {
                 force: false,
             },
             &[newt],
+            None,
             &mut out,
         )
         .unwrap_err();

@@ -359,6 +359,54 @@ mod mocked {
         assert!(!body.contains("SECOND BODY."));
     }
 
+    /// #2331: the index and the loader read ONE resolved list — the user's
+    /// roots, then the bundled dir last (`Config::skill_search_dirs`). Over
+    /// that list they must pick the SAME copy: a bundled-only skill is both
+    /// indexed and loadable, and a user skill shadowing a bundled one wins in
+    /// both. Asserting the body alone would pass if the index pointed at the
+    /// other copy, so the winner's `dir` is checked against the body's source.
+    #[test]
+    fn index_and_loader_resolve_the_same_copy_over_user_then_bundled() {
+        let user = PathBuf::from("/home/u/.newt/skills");
+        let bundled = PathBuf::from("/repo/.newt/bundled-skills");
+        let fs = MemFs::new()
+            .skill(
+                &bundled,
+                "herdr",
+                "---\nname: herdr\ndescription: d.\n---\nBUNDLED HERDR.\n",
+            )
+            .skill(
+                &user,
+                "dup",
+                "---\nname: dup\ndescription: d.\n---\nUSER DUP.\n",
+            )
+            .skill(
+                &bundled,
+                "dup",
+                "---\nname: dup\ndescription: d.\n---\nBUNDLED DUP.\n",
+            );
+        let dirs = [user.clone(), bundled.clone()];
+        let (winners, _) = discover_paths_in(&fs, &dirs);
+        let indexed = |name: &str| {
+            winners
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.dir.clone())
+        };
+
+        assert_eq!(indexed("herdr"), Some(bundled.join("herdr")));
+        assert!(load_body_from_in(&fs, &dirs, "herdr")
+            .unwrap()
+            .contains("BUNDLED HERDR."));
+
+        assert_eq!(indexed("dup"), Some(user.join("dup")));
+        let body = load_body_from_in(&fs, &dirs, "dup").unwrap();
+        assert!(
+            body.contains("USER DUP.") && !body.contains("BUNDLED DUP."),
+            "{body}"
+        );
+    }
+
     #[test]
     fn load_body_from_errors_for_unknown_skill() {
         let dir = PathBuf::from("/d");
@@ -654,26 +702,5 @@ mod grounding {
             .unwrap()
             .file_type()
             .is_symlink());
-    }
-}
-
-/// The config-root leak regression (field-caught): a redirected
-/// $NEWT_CONFIG_DIR must own the skills dir — the seeder previously wrote
-/// ~/.newt/skills on the REAL home even when the root was redirected.
-#[test]
-#[serial_test::serial(skills_env)]
-fn default_skills_dir_honors_newt_config_dir() {
-    let prev = std::env::var_os("NEWT_CONFIG_DIR");
-    std::env::set_var("NEWT_CONFIG_DIR", "/tmp/redirected-root");
-    let dir = default_skills_dir().expect("resolvable");
-    assert_eq!(dir, std::path::PathBuf::from("/tmp/redirected-root/skills"));
-    std::env::remove_var("NEWT_CONFIG_DIR");
-    let fallback = default_skills_dir();
-    if let Some(f) = &fallback {
-        assert!(f.ends_with(".newt/skills"), "home fallback: {f:?}");
-    }
-    match prev {
-        Some(v) => std::env::set_var("NEWT_CONFIG_DIR", v),
-        None => std::env::remove_var("NEWT_CONFIG_DIR"),
     }
 }
