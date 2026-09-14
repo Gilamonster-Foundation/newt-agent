@@ -4,7 +4,8 @@
 // The 9th (round1-1: a Cargo.toml `[[test]]` redirect onto a decoy file) never
 // reaches this spec — ratchet.sh's #887 harness guard FAILs any produced tree
 // that declares a `[[test]]` table before the spec is dropped in.
-// Certified: honest-solution PASS, unmodified-seed FAIL, corpus replay 8/9
+// Workflow verdict: uncertified (round1-1 not defeated by spec content).
+// Measured: honest-solution PASS, unmodified-seed FAIL, corpus replay 8/9
 // FAIL + 1/9 blocked by the #887 guard.
 //
 //! Canonical behavioral spec for 015-end-command-exits — the ungameable grade.
