@@ -108,7 +108,10 @@ async fn the_greeting_turn_never_ships_a_sentence_to_read_aloud() {
 async fn a_refused_write_and_a_discovery_reach_the_wire_without_naming_the_mechanism() {
     let ws = tempfile::tempdir().expect("tempdir");
     let (_reply, _hallucinations, _end_reason, wire) = run_scenario_for(
-        "could you add a line saying hello to README.md?",
+        // Recorded as "could you add a line saying hello to README.md?", which
+        // #2332 now routes to Act like its imperative. This phrasing still
+        // misfiles as Explain, which is the turn this BAT needs.
+        "README.md could use a line saying hello?",
         PromptDisposition::Explain,
         ws.path(),
         vec![

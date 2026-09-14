@@ -6848,7 +6848,13 @@ fn session_body(
                     let mut turn_system = format!(
                         "{}\n\n{}\n\n{system}\n\n{session_controls}",
                         workspace_state_block(workspace, &turn_caveats.fs_read),
-                        runtime_context_block(&inf_model, &inf_url, inf_kind, &session_identity)
+                        runtime_context_block(
+                            &inf_model,
+                            &inf_url,
+                            inf_kind,
+                            &session_identity,
+                            turn_disposition
+                        )
                     );
                     // Resolve current tab overrides against the current persona
                     // on every accepted turn. Never bake style into the frozen

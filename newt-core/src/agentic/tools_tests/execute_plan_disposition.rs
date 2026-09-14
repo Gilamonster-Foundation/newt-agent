@@ -288,6 +288,73 @@ async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
     );
 }
 
+/// #2332: under Explain, `tool_search` for an authorized MCP tool searched
+/// the already-filtered catalog and answered as though the tool did not exist,
+/// so the model could never learn a review connector was there. Discovery now
+/// reports it as present but not callable, and dispatch still refuses the call:
+/// discovery widened, authority did not.
+#[tokio::test]
+async fn explain_discovery_reports_a_hidden_mcp_tool_and_dispatch_still_refuses_it() {
+    let ws = std::path::Path::new("/nonexistent-workspace");
+    let caveats = Caveats::top(); // disposition, not ambient authority, decides
+    let mut mcp = OneRemoteTool::new("review__fetch_change");
+
+    let found = run_tool_with_disposition(
+        "tool_search",
+        serde_json::json!({ "query": "fetch change" }),
+        ws,
+        &caveats,
+        &mut mcp,
+        None,
+        None,
+        PromptDisposition::Explain,
+    )
+    .await;
+    assert!(
+        found.contains("- review__fetch_change — not callable for this request"),
+        "an authorized tool must be reported hidden, not absent: {found}"
+    );
+
+    let call = run_tool_with_disposition(
+        "review__fetch_change",
+        serde_json::json!({}),
+        ws,
+        &caveats,
+        &mut mcp,
+        None,
+        None,
+        PromptDisposition::Explain,
+    )
+    .await;
+    assert!(
+        call.contains("is not available for this request"),
+        "dispatch remains the boundary: {call}"
+    );
+    assert!(
+        !mcp.called,
+        "a hidden tool must not reach the remote server"
+    );
+
+    // Twin: Ask admits no tool at all. Discovery itself is refused and
+    // reports nothing as hidden.
+    let asked = run_tool_with_disposition(
+        "tool_search",
+        serde_json::json!({ "query": "fetch change" }),
+        ws,
+        &caveats,
+        &mut mcp,
+        None,
+        None,
+        PromptDisposition::Ask,
+    )
+    .await;
+    assert!(
+        asked.contains("Tool `tool_search` is not available for this request"),
+        "{asked}"
+    );
+    assert!(!asked.contains("review__fetch_change"), "{asked}");
+}
+
 /// Plan is a read-only workspace disposition with one explicit
 /// control-plane write: the harness-owned step ledger.
 #[tokio::test]

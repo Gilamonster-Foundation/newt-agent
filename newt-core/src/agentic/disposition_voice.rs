@@ -73,7 +73,10 @@ pub(crate) struct DispositionVoices {
     /// Appended to every refusal: what may not be quoted, and what must
     /// still be said.
     pub(crate) denied_privacy: String,
-    /// The `tool_search` scope note for a filtered catalog.
+    /// How `tool_search` lists a tool the session grants but this request does
+    /// not admit, in place of its description and schema (#2332).
+    pub(crate) discovery_hidden: String,
+    /// The `tool_search` note appended when such a tool is listed.
     pub(crate) discovery_scope: String,
     /// The `select_operating_mode` description's sentence about what a
     /// selection does to the turn in flight.
@@ -132,12 +135,14 @@ impl Default for DispositionVoices {
                  cannot be finished with the tools available here, say plainly what remains \
                  undone; never claim it was done."
                     .to_string(),
+            discovery_hidden: "not callable for this request".to_string(),
+            // #2332: a request does not widen once accepted, so the one way
+            // forward is a new request from the operator.
             discovery_scope:
-                "Catalog scope: this is the current turn's filtered catalog, not the whole \
-                 session. A missing execution tool may be available on a direct action request. \
-                 Ask the operator for one (use request_user_input when available); do not report \
-                 a session-wide capability absence from this result, and do not narrate the \
-                 filtering itself."
+                "Catalog scope: a tool listed as not callable exists in this session. Do not \
+                 call it and do not report it as missing. If the work needs it, say which tool \
+                 and why, and ask the operator to send the work as a direct action request; \
+                 do not narrate the filtering itself."
                     .to_string(),
             next_turn_scope:
                 "It grants no permissions and changes nothing about what this turn may do."
@@ -559,6 +564,7 @@ mod tests {
         owned.push(("policy provenance".into(), voices.provenance_policy.clone()));
         owned.push(("privacy clause".into(), voices.privacy.clone()));
         owned.push(("refusal clause".into(), voices.denied_privacy.clone()));
+        owned.push(("discovery entry".into(), voices.discovery_hidden.clone()));
         owned.push(("discovery scope".into(), voices.discovery_scope.clone()));
         owned.push(("next-turn scope".into(), voices.next_turn_scope.clone()));
         for (name, source) in scanned_sites() {

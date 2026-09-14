@@ -67,6 +67,9 @@ struct ToolRec<'a> {
     desc: &'a str,
     params: Vec<&'a str>,
     required: Vec<&'a str>,
+    /// `false` for a tool this session grants but this request's disposition
+    /// does not admit (#2332): it is found, named, and never offered a schema.
+    callable: bool,
 }
 
 /// Collapse whitespace (incl. embedded newlines from wrapped string literals)
@@ -110,6 +113,7 @@ fn records(catalog: &serde_json::Value) -> Vec<ToolRec<'_>> {
             desc,
             params,
             required,
+            callable: true,
         });
     }
     out
@@ -117,6 +121,10 @@ fn records(catalog: &serde_json::Value) -> Vec<ToolRec<'_>> {
 
 /// Format one match line: `- name — one-line description [requires: a, b]`.
 fn match_line(r: &ToolRec) -> String {
+    if !r.callable {
+        let hidden = &super::DispositionVoices::default().discovery_hidden;
+        return format!("- {} — {hidden}", r.name);
+    }
     let desc = one_line(r.desc, DESC_MAX_CHARS);
     if r.required.is_empty() {
         format!("- {} — {desc}", r.name)
@@ -144,8 +152,10 @@ fn match_line(r: &ToolRec) -> String {
 /// - a query that matches nothing returns the full list of tool **names**
 ///   (so the model always gets a real next step, never an empty result).
 pub(crate) fn execute_tool_search(query: &str, catalog: &serde_json::Value) -> String {
-    let tools = records(catalog);
+    search(query, records(catalog))
+}
 
+fn search(query: &str, tools: Vec<ToolRec<'_>>) -> String {
     let terms: Vec<String> = query
         .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
@@ -160,7 +170,7 @@ pub(crate) fn execute_tool_search(query: &str, catalog: &serde_json::Value) -> S
             return "No tools are available in the current turn.".to_string();
         }
         let body = tools.iter().map(match_line).collect::<Vec<_>>().join("\n");
-        return format!("Available tools in this turn:\n{body}");
+        return with_scope_note(format!("Available tools in this turn:\n{body}"), &tools);
     }
 
     // Score each tool over name (×3) + description (×1) + param names (×1).
@@ -188,7 +198,12 @@ pub(crate) fn execute_tool_search(query: &str, catalog: &serde_json::Value) -> S
 
     // No match: return the full NAME list so discovery still succeeds.
     if scored.is_empty() {
-        let names = tools.iter().map(|r| r.name).collect::<Vec<_>>().join(", ");
+        let names = tools
+            .iter()
+            .filter(|r| r.callable)
+            .map(|r| r.name)
+            .collect::<Vec<_>>()
+            .join(", ");
         if names.is_empty() {
             return format!(
                 "No tool matched \"{query}\" — no tools are available in the current turn."
@@ -200,8 +215,13 @@ pub(crate) fn execute_tool_search(query: &str, catalog: &serde_json::Value) -> S
         );
     }
 
-    // Rank: score desc, then name asc (stable, deterministic).
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(b.1.name)));
+    // Rank: score desc, callable before not-callable at equal score, then name
+    // asc (stable, deterministic).
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.callable.cmp(&a.1.callable))
+            .then_with(|| a.1.name.cmp(b.1.name))
+    });
 
     let mut out = format!("Tools matching \"{query}\":\n");
     for (_, r) in scored.iter().take(MAX_MATCHES) {
@@ -214,46 +234,50 @@ pub(crate) fn execute_tool_search(query: &str, catalog: &serde_json::Value) -> S
             scored.len() - MAX_MATCHES
         ));
     }
-    out.trim_end().to_string()
+    let shown: Vec<&ToolRec> = scored.iter().take(MAX_MATCHES).map(|(_, r)| *r).collect();
+    with_scope_note(out.trim_end().to_string(), shown)
 }
 
-/// Add the disposition boundary to a discovery result. In particular, a
-/// filtered Explain/Research catalog must never be mistaken for proof that the
-/// whole session lacks an execution tool.
+/// Append the scope note when a listed tool is not callable, and only then, so
+/// it never guesses at a tool the session lacks. #2051: the note is
+/// disposition vocabulary, owned by `disposition_voice`.
+fn with_scope_note<'a>(out: String, shown: impl IntoIterator<Item = &'a ToolRec<'a>>) -> String {
+    if shown.into_iter().all(|r| r.callable) {
+        return out;
+    }
+    format!(
+        "{out}\n\n{}",
+        super::DispositionVoices::default().discovery_scope
+    )
+}
+
+/// Search `catalog` — the tools this session grants — for a request under
+/// `disposition` (#2332). Tools the disposition does not admit are ranked with
+/// the callable ones and rendered by name as not callable, never as absent and
+/// never with a schema; dispatch still refuses them. A tool the session does
+/// not grant is not in `catalog`, so it never appears.
 pub(crate) fn execute_tool_search_for_disposition(
     query: &str,
     catalog: &serde_json::Value,
     disposition: super::PromptDisposition,
 ) -> String {
-    let result = execute_tool_search(query, catalog);
-    if disposition == super::PromptDisposition::Act || !query_seeks_execution_tool(query) {
-        return result;
+    if disposition == super::PromptDisposition::Act {
+        return execute_tool_search(query, catalog);
     }
-    // #2051: the scope note is part of the disposition vocabulary, so it is
-    // owned by `disposition_voice` alongside the card and refusal lines. It no
-    // longer names the disposition — naming it is what invited the model to
-    // report the filtering to the operator.
-    format!(
-        "{result}\n\n{}",
-        super::DispositionVoices::default().discovery_scope
-    )
-}
-
-/// Whether discovery is asking for a host-execution capability rather than an
-/// ordinary read/recovery tool. Keep the handoff narrow: a successful Explain
-/// search for `read_file` must not interrupt the operator to request Act.
-fn query_seeks_execution_tool(query: &str) -> bool {
-    let lower = query.to_ascii_lowercase();
-    lower.contains("run_command")
-        || lower.contains("run command")
-        || lower
-            .split(|ch: char| !ch.is_ascii_alphanumeric())
-            .any(|term| {
-                matches!(
-                    term,
-                    "shell" | "terminal" | "subprocess" | "execute" | "execution" | "exec"
-                )
-            })
+    // The callable half goes through the disposition filter so the read-only
+    // `git` definition, not the full one, is what gets described.
+    let visible = super::tools::filter_tools_for_disposition(catalog.clone(), disposition);
+    let mut tools = records(&visible);
+    tools.extend(
+        records(catalog)
+            .into_iter()
+            .filter(|r| !super::tools::tool_allowed(disposition, r.name))
+            .map(|r| ToolRec {
+                callable: false,
+                ..r
+            }),
+    );
+    search(query, tools)
 }
 
 #[cfg(test)]
@@ -350,21 +374,31 @@ mod tests {
         assert!(!out.contains("this session"), "got: {out}");
     }
 
+    /// #2332: discovery is not fenced. `run_command` is authorized in this
+    /// session but not callable for an Explain request; the search used to run
+    /// over the already-filtered catalog and so reported it absent. It is now
+    /// named as present-but-not-callable, with the handoff, and is never listed
+    /// as a callable match. Run under Explain: Act sees everything, so an Act
+    /// search proves nothing here.
     #[test]
-    fn explain_search_coaches_an_explicit_action_handoff() {
+    fn explain_search_reports_a_hidden_tool_as_present_not_absent() {
         let out = execute_tool_search_for_disposition(
             "run_command",
-            &serde_json::json!([]),
+            &full_catalog(),
             super::super::PromptDisposition::Explain,
         );
-        // The handoff itself is unchanged: a filtered catalog must coach an
-        // explicit operator request rather than a session-wide "I cannot".
-        assert!(out.contains("direct action request"), "got: {out}");
-        assert!(out.contains("request_user_input"), "got: {out}");
-        // #2051: the note no longer names the disposition, and no longer ends
-        // with "/mode … cannot widen an already accepted turn". Telling a 9b
-        // model it has no move is what left narrating the cage as its only
-        // remaining response.
+        let voices = super::super::DispositionVoices::default();
+        assert!(
+            out.contains(&format!("- run_command — {}", voices.discovery_hidden)),
+            "an authorized tool must be reported hidden, not absent: {out}"
+        );
+        assert!(out.contains(&voices.discovery_scope), "got: {out}");
+        assert!(
+            !out.contains("Run a shell command"),
+            "a hidden tool must not be offered with its description: {out}"
+        );
+        // #2051: the note never names the disposition, and never tells the
+        // model it has no move.
         assert!(!out.contains("Explain"), "got: {out}");
         assert!(!out.contains("explain"), "got: {out}");
         assert!(
@@ -373,16 +407,36 @@ mod tests {
         );
     }
 
+    /// Twin: a tool the session does not grant (here, a persona catalog without
+    /// `run_command`) is genuinely absent and must not appear at all. The
+    /// persona's always-on infra may still be listed as hidden; `run_command`
+    /// may not.
     #[test]
-    fn explain_read_search_does_not_coach_an_action_handoff() {
+    fn explain_search_does_not_invent_an_ungranted_tool() {
+        let granted = crate::agentic::filter_advertised_tools(
+            full_catalog(),
+            Some(&["read_file".to_string()]),
+        );
+        let out = execute_tool_search_for_disposition(
+            "run_command",
+            &granted,
+            super::super::PromptDisposition::Explain,
+        );
+        assert!(!out.contains("- run_command"), "got: {out}");
+    }
+
+    /// A read search under Explain still leads with the callable reader;
+    /// listing hidden tools must not push it down or strip its schema.
+    #[test]
+    fn explain_read_search_leads_with_the_callable_reader() {
         let out = execute_tool_search_for_disposition(
             "read a file",
             &full_catalog(),
             super::super::PromptDisposition::Explain,
         );
-        assert!(out.contains("read_file"), "got: {out}");
-        assert!(!out.contains("direct action request"), "got: {out}");
-        assert!(!out.contains("request_user_input"), "got: {out}");
+        let first = out.lines().nth(1).unwrap_or_default();
+        assert!(first.starts_with("- read_file — Read a file"), "got: {out}");
+        assert!(first.contains("[requires: path]"), "got: {out}");
     }
 
     #[test]
