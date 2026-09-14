@@ -44,12 +44,8 @@
 //!
 //! Linux uses `openat2`; macOS uses a descriptor-relative `openat` walk with
 //! `O_NOFOLLOW` for every component. macOS conservatively rejects even in-tree
-//! symlinks, with ONE opt-in: `open_regular(.., nofollow = false)` follows a
-//! final-component link to a relative target re-walked beneath the link's own
-//! directory under the same rules (no `..`, no absolute target) — the explicit
-//! final-link policy mutation verification needs, and still stricter than
-//! Linux's `RESOLVE_BENEATH`. Operator-supplied root aliases (such as /var)
-//! remain supported. Other platforms retain their existing consumer fallback.
+//! symlinks; operator-supplied root aliases (such as /var) remain supported.
+//! Other platforms retain their existing consumer fallback.
 
 use std::fs::File;
 use std::io;
@@ -105,92 +101,10 @@ impl WorkspaceDir {
 
     /// macOS needs O_DIRECTORY and caller-selected nonblocking/create flags
     /// that Bridle's current read/write-only GrantedRoot API cannot express.
-    /// Walk normal components through held descriptors and never follow links —
-    /// not even a contained final one; `macos_rejects_symlinks_without_
-    /// truncating_their_targets` pins that. The one opt-in is
-    /// [`open_regular`](Self::open_regular) with `nofollow = false`, which goes
-    /// through [`resolve_following_final`](Self::resolve_following_final).
+    /// Walk normal components through held descriptors and never follow links.
     #[cfg(target_os = "macos")]
     fn resolve(&self, rel: &Path, oflags: OFlags, mode: Mode) -> io::Result<OwnedFd> {
-        let (directory, leaf) = Self::walk_beneath(&self.root, rel)?;
-        let leaf = leaf.unwrap_or_else(|| ".".into());
-        rustix::fs::openat(
-            &directory,
-            Path::new(&leaf),
-            oflags | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            mode,
-        )
-        .map_err(io::Error::from)
-    }
-
-    /// [`resolve`](Self::resolve), except that a FINAL-component symlink is
-    /// followed — the "explicit final link policy" `open_regular` documents,
-    /// which `openat2`'s `RESOLVE_BENEATH` gives Linux for free. The link is
-    /// read and its target re-walked from the link's own directory under the
-    /// same rules, one hop at a time, so an absolute or `..` target is refused
-    /// exactly like a path component would be; intermediate links stay refused.
-    /// Bounded, because a link cycle would otherwise spin.
-    #[cfg(target_os = "macos")]
-    fn resolve_following_final(
-        &self,
-        rel: &Path,
-        oflags: OFlags,
-        mode: Mode,
-    ) -> io::Result<OwnedFd> {
-        use std::os::unix::ffi::OsStrExt as _;
-        let mut base = self.root.try_clone()?;
-        let mut rel = rel.to_path_buf();
-        // ponytail: 8 hops is far more than any real in-tree link chain; a cycle
-        // exhausts it and reports ELOOP, which is what the kernel says too.
-        for _hop in 0..8 {
-            let (directory, leaf) = Self::walk_beneath(&base, &rel)?;
-            let leaf = leaf.unwrap_or_else(|| ".".into());
-            match rustix::fs::openat(
-                &directory,
-                Path::new(&leaf),
-                oflags | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                mode,
-            ) {
-                Err(rustix::io::Errno::LOOP) => {
-                    let target = rustix::fs::readlinkat(&directory, Path::new(&leaf), Vec::new())
-                        .map_err(io::Error::from)?;
-                    rel = Path::new(std::ffi::OsStr::from_bytes(target.to_bytes())).to_path_buf();
-                    base = directory;
-                }
-                other => return other.map_err(io::Error::from),
-            }
-        }
-        Err(io::Error::from_raw_os_error(libc::ELOOP))
-    }
-
-    /// The resolve `open_regular` uses: Linux lets `openat2` honour the
-    /// caller's `NOFOLLOW` (or its absence) under `RESOLVE_BENEATH`; macOS
-    /// routes the follow case through the explicit final-link walk.
-    #[cfg(target_os = "macos")]
-    fn resolve_regular(&self, rel: &Path, flags: OFlags, nofollow: bool) -> io::Result<OwnedFd> {
-        if nofollow {
-            self.resolve(rel, flags, Mode::empty())
-        } else {
-            self.resolve_following_final(rel, flags, Mode::empty())
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn resolve_regular(&self, rel: &Path, flags: OFlags, _nofollow: bool) -> io::Result<OwnedFd> {
-        self.resolve(rel, flags, Mode::empty())
-    }
-
-    /// One descriptor-relative walk of `rel`'s parent components beneath `base`,
-    /// every step `O_NOFOLLOW`; returns the directory that holds the final
-    /// component and that component's name (`None` for `rel` = `.`). `..`, an
-    /// absolute path, or a prefix is refused up front — there is nothing beneath
-    /// `base` they could name.
-    #[cfg(target_os = "macos")]
-    fn walk_beneath(
-        base: &OwnedFd,
-        rel: &Path,
-    ) -> io::Result<(OwnedFd, Option<std::ffi::OsString>)> {
-        let mut directory = base.try_clone()?;
+        let mut directory = self.root.try_clone()?;
         let mut names = Vec::new();
         for component in rel.components() {
             match component {
@@ -200,7 +114,13 @@ impl WorkspaceDir {
             }
         }
         let Some((leaf, parents)) = names.split_last() else {
-            return Ok((directory, None));
+            return rustix::fs::openat(
+                &directory,
+                ".",
+                oflags | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                mode,
+            )
+            .map_err(io::Error::from);
         };
         for name in parents {
             directory = rustix::fs::openat(
@@ -211,7 +131,13 @@ impl WorkspaceDir {
             )
             .map_err(io::Error::from)?;
         }
-        Ok((directory, Some(leaf.to_os_string())))
+        rustix::fs::openat(
+            &directory,
+            Path::new(leaf),
+            oflags | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            mode,
+        )
+        .map_err(io::Error::from)
     }
 
     /// Open a file for reading, contained beneath the root.
@@ -234,7 +160,7 @@ impl WorkspaceDir {
             } else {
                 OFlags::empty()
             };
-        let file = File::from(self.resolve_regular(rel, flags, nofollow)?);
+        let file = File::from(self.resolve(rel, flags, Mode::empty())?);
         if !file.metadata()?.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
