@@ -1,0 +1,38 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index e483866..38349fd 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -55,7 +55,15 @@ impl Session {
+                 _ => None,
+             };
+             if let Some(reason) = close_word {
+-                self.close_conversation(reason);
++                // Closing an already-closed conversation again is a no-op.
++                let already_closed = self.conversation.is_empty()
++                    && self.last_reason.as_deref() == Some(reason);
++                if !already_closed {
++                    self.close_conversation(reason);
++                }
++                if reason == "end" {
++                    return Outcome::Exit;
++                }
+                 return Outcome::Continue;
+             }
+             if name == "quit" || name == "exit" {
+@@ -98,6 +106,16 @@ mod tests {
+         assert_eq!(s.last_reason.as_deref(), Some("restart"));
+     }
+ 
++    #[test]
++    fn end_closes_and_exits() {
++        let mut s = Session::new();
++        s.dispatch("hello");
++        assert_eq!(s.dispatch("/end"), Outcome::Exit);
++        assert_eq!(s.closed_count, 1, "/end still closes out like /new");
++        assert_eq!(s.last_reason.as_deref(), Some("end"));
++        assert!(s.at_end_of_input());
++    }
++
+     #[test]
+     fn quit_exits_without_closing() {
+         let mut s = Session::new();
