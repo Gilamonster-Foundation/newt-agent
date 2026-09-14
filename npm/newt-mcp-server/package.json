@@ -1,0 +1,21 @@
+{
+  "name": "@gilamonster/newt-mcp-server",
+  "version": "0.0.0",
+  "description": "newt-mcp-server — the newt-agent MCP server binary. Delivers the prebuilt Rust binary for your platform; no Rust toolchain or pip required.",
+  "keywords": ["newt", "newt-agent", "gilamonster", "mcp", "mcp-server"],
+  "homepage": "https://github.com/Gilamonster-Foundation/newt-agent#readme",
+  "bugs": "https://github.com/Gilamonster-Foundation/newt-agent/issues",
+  "repository": { "type": "git", "url": "git+https://github.com/Gilamonster-Foundation/newt-agent.git", "directory": "npm/newt-mcp-server" },
+  "license": "Apache-2.0",
+  "author": "Shawn Hartsock",
+  "type": "commonjs",
+  "bin": { "newt-mcp-server": "bin/run.cjs" },
+  "files": ["bin/", "lib/", "platforms.json", "README.md"],
+  "engines": { "node": ">=18" },
+  "publishConfig": { "access": "public" },
+  "optionalDependencies": {
+    "@gilamonster/newt-mcp-server-darwin-arm64": "0.0.0",
+    "@gilamonster/newt-mcp-server-linux-x64": "0.0.0",
+    "@gilamonster/newt-mcp-server-win32-x64": "0.0.0"
+  }
+}

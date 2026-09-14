@@ -1,0 +1,11 @@
+{
+  "name": "newt-agent-npm-shim",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Build sources for newt-agent's npm packages (newt-agent umbrella + @gilamonster/<bin> shims + per-platform binaries). Not published.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "Apache-2.0"
+}

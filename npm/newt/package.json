@@ -1,0 +1,21 @@
+{
+  "name": "@gilamonster/newt",
+  "version": "0.0.0",
+  "description": "newt — the newt-agent CLI. Delivers the prebuilt Rust binary for your platform; no Rust toolchain or pip required.",
+  "keywords": ["newt", "newt-agent", "gilamonster", "cli", "agent", "mcp"],
+  "homepage": "https://github.com/Gilamonster-Foundation/newt-agent#readme",
+  "bugs": "https://github.com/Gilamonster-Foundation/newt-agent/issues",
+  "repository": { "type": "git", "url": "git+https://github.com/Gilamonster-Foundation/newt-agent.git", "directory": "npm/newt" },
+  "license": "Apache-2.0",
+  "author": "Shawn Hartsock",
+  "type": "commonjs",
+  "bin": { "newt": "bin/run.cjs" },
+  "files": ["bin/", "lib/", "platforms.json", "README.md"],
+  "engines": { "node": ">=18" },
+  "publishConfig": { "access": "public" },
+  "optionalDependencies": {
+    "@gilamonster/newt-darwin-arm64": "0.0.0",
+    "@gilamonster/newt-linux-x64": "0.0.0",
+    "@gilamonster/newt-win32-x64": "0.0.0"
+  }
+}

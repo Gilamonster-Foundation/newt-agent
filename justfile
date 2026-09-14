@@ -197,6 +197,8 @@ check:
     #!/usr/bin/env bash
     set -uo pipefail
     rc=0
+    npm --prefix npm test || rc=1
+    python3 scripts/test_pre_push.py || rc=1
     cargo fmt --all -- --check || rc=1
     cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings || rc=1
     # PIPELINE PARITY: mirrors ci.yml (see the note in `test`).
@@ -253,7 +255,12 @@ check:
 
 [windows]
 check:
-    $rc = 0; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace --features newt-data/kernel,newt-interaction/schema; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy -p newt-agent --no-default-features --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-agent --no-default-features; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-tui; if ($LASTEXITCODE -ne 0) { $rc = 1 }; python3 scripts/docs_check.py --self-test; if ($LASTEXITCODE -ne 0) { $rc = 1 }; python3 scripts/docs_check.py --quiet; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
+    $rc = 0; npm --prefix npm test; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets --features newt-data/kernel,newt-interaction/schema -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace --features newt-data/kernel,newt-interaction/schema; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy -p newt-agent --no-default-features --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-agent --no-default-features; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-tui; if ($LASTEXITCODE -ne 0) { $rc = 1 }; python3 scripts/docs_check.py --self-test; if ($LASTEXITCODE -ne 0) { $rc = 1 }; python3 scripts/docs_check.py --quiet; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
+
+# Mirrors ci.yml's npm installer matrix on the current host. No npm install:
+# the shim sources and tests use only Node's standard library.
+npm-test:
+    npm --prefix npm test
 
 # Documentation reference check: every relative link under docs/ resolves, and
 # every docs/....md path cited from a Rust comment exists. Runs inside `just

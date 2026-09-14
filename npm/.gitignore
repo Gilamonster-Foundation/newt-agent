@@ -1,0 +1,10 @@
+# The repo root .gitignore blanket-ignores *.mjs, *.cjs, and package.json to keep
+# the Rust workspace JS-free. The npm shim under npm/ legitimately needs all three,
+# so re-include them here (scoped to this directory).
+!*.mjs
+!*.cjs
+!package.json
+
+# ...but never commit build output or installed deps.
+dist-npm/
+node_modules/
