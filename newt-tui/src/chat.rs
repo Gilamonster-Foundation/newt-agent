@@ -334,6 +334,84 @@ struct PendingClarification {
     intake: newt_core::agentic::PromptIntake,
 }
 
+/// The disposition each accepted turn was comprehended with, before any
+/// operating-mode narrowing, keyed by its submitted prompt (#2332).
+type RecordedDispositions =
+    std::collections::HashMap<newt_core::PromptId, newt_core::agentic::PromptDisposition>;
+
+/// Record an accepted turn's disposition so a later bare continuation of it
+/// resumes that authority. A pending `Ask` is not an objective's authority and
+/// is never recorded.
+fn record_turn_disposition(
+    recorded: &mut RecordedDispositions,
+    context: &newt_core::TurnPromptContext,
+    intake: &newt_core::agentic::PromptIntake,
+) {
+    if intake.disposition() != newt_core::agentic::PromptDisposition::Ask {
+        recorded.insert(context.submitted_prompt().id(), intake.disposition());
+    }
+}
+
+/// Comprehend an accepted prompt. A direct answer to a pending clarification
+/// is resolved against that manifest, not reclassified in isolation.
+///
+/// A bare continuation ("continue", "retry") resumes its objective including
+/// that objective's disposition (#2332), so a one-word nudge can neither widen
+/// nor narrow the task. The value is the one RECORDED when the resumed turn was
+/// accepted, never a re-read of its text: a lexicon edit mid-session must not
+/// change the authority of an accepted task, a chained "continue" is its own
+/// active prompt, and re-reading a clarified objective would re-ask its locked
+/// decisions. Only a turn with no record (none arises within a session) is
+/// re-read from its active text. Widening stays explicit: a substantive prompt
+/// is classified on its own words and clears the link.
+fn intake_for_accepted_prompt(
+    origin: &ModelInputOrigin,
+    task: &str,
+    pending: Option<&PendingClarification>,
+    recorded: &RecordedDispositions,
+    lexicon: &newt_core::agentic::DispositionLexicon,
+) -> newt_core::agentic::PromptIntake {
+    use newt_core::agentic::PromptIntake;
+    match (origin, pending) {
+        (ModelInputOrigin::OperatorContinuation { .. }, Some(pending)) => {
+            pending.intake.resolve_with_operator_answer(task)
+        }
+        (ModelInputOrigin::OperatorContinuation { parent }, None) => {
+            match recorded.get(&parent.submitted_prompt().id()) {
+                Some(&disposition) => PromptIntake::resume_with(task, disposition, lexicon),
+                None => {
+                    let objective = parent.active().model_text_utf8().unwrap_or(task);
+                    PromptIntake::analyze_with(objective, lexicon)
+                }
+            }
+        }
+        _ => PromptIntake::analyze_with(task, lexicon),
+    }
+}
+
+/// Comprehend an accepted prompt, record its disposition, then apply the
+/// turn's operating mode — in that order (#2332). The record holds what the
+/// prompt asked for; the mode is the operator's CURRENT narrowing, so a
+/// resumed task keeps its recorded disposition and current permissions still
+/// win. `mode_for` picks the turn's mode from the comprehended intake.
+fn comprehend_accepted_prompt(
+    origin: &ModelInputOrigin,
+    task: &str,
+    pending: Option<&PendingClarification>,
+    context: Option<&newt_core::TurnPromptContext>,
+    recorded: &mut RecordedDispositions,
+    lexicon: &newt_core::agentic::DispositionLexicon,
+    mode_for: impl FnOnce(&newt_core::agentic::PromptIntake) -> OperatingMode,
+) -> (newt_core::agentic::PromptIntake, OperatingMode) {
+    let mut intake = intake_for_accepted_prompt(origin, task, pending, recorded, lexicon);
+    if let Some(context) = context {
+        record_turn_disposition(recorded, context, &intake);
+    }
+    let mode = mode_for(&intake);
+    apply_operating_mode_to_intake(mode, &mut intake);
+    (intake, mode)
+}
+
 /// Rebuild an outstanding clarification from its durable operator-receipt
 /// lineage. A prompt that reached model work cannot be pending: `Ask` exits
 /// before inference, so every descendant while it remains pending must be an
@@ -2040,6 +2118,7 @@ fn session_body(
     // prompt for execution. An outstanding clarification is separately
     // reconstructed from this receipt's durable lineage below.
     let mut active_prompt_context: Option<newt_core::TurnPromptContext> = None;
+    let mut recorded_dispositions = RecordedDispositions::new();
     // bug/steering-regressions iteration #2: when an agentic turn ends at the
     // round cap, its objective stays linkable — the next bare "continue"
     // re-enters that lineage instead of becoming a goal-less fresh prompt.
@@ -6406,41 +6485,38 @@ fn session_body(
                         .as_ref()
                         .map(newt_core::IntakeConfig::to_lexicon)
                         .unwrap_or_default();
-                    let mut prompt_intake = if is_clarification_answer {
-                        pending_clarification
-                            .as_ref()
-                            .map(|pending| pending.intake.resolve_with_operator_answer(&task))
-                            .unwrap_or_else(|| {
-                                newt_core::agentic::PromptIntake::analyze_with(
-                                    &task,
-                                    &intake_lexicon,
-                                )
-                            })
-                    } else {
-                        newt_core::agentic::PromptIntake::analyze_with(&task, &intake_lexicon)
-                    };
-                    // A model-selected Auto style is a one-shot instruction
-                    // for the next action-shaped turn. Protected intake does
-                    // not consume it; it remains pending until an Act turn or
-                    // an explicit conversation/mode boundary clears it.
-                    let plan_mode_active = conversation_mode_states.plan.is_active();
-                    let auto_selected = (active_operating_mode == OperatingMode::Auto
-                        && !plan_mode_active
-                        && prompt_intake.disposition()
-                            == newt_core::agentic::PromptDisposition::Act)
-                        .then(|| {
-                            conversation_mode_states
-                                .auto
-                                .take_for(&active_conversation_id)
-                        })
-                        .flatten();
-                    let turn_operating_mode = effective_operating_mode(
-                        active_operating_mode,
-                        &prompt_intake,
-                        plan_mode_active,
-                        auto_selected,
+                    let (mut prompt_intake, turn_operating_mode) = comprehend_accepted_prompt(
+                        &model_input_origin,
+                        &task,
+                        pending_clarification.as_ref(),
+                        active_prompt_context.as_ref(),
+                        &mut recorded_dispositions,
+                        &intake_lexicon,
+                        |intake| {
+                            // A model-selected Auto style is a one-shot
+                            // instruction for the next action-shaped turn.
+                            // Protected intake does not consume it; it remains
+                            // pending until an Act turn or an explicit
+                            // conversation/mode boundary clears it.
+                            let plan_mode_active = conversation_mode_states.plan.is_active();
+                            let auto_selected = (active_operating_mode == OperatingMode::Auto
+                                && !plan_mode_active
+                                && intake.disposition()
+                                    == newt_core::agentic::PromptDisposition::Act)
+                                .then(|| {
+                                    conversation_mode_states
+                                        .auto
+                                        .take_for(&active_conversation_id)
+                                })
+                                .flatten();
+                            effective_operating_mode(
+                                active_operating_mode,
+                                intake,
+                                plan_mode_active,
+                                auto_selected,
+                            )
+                        },
                     );
-                    apply_operating_mode_to_intake(turn_operating_mode, &mut prompt_intake);
 
                     // #1749: the deterministic detector says a decision MIGHT
                     // exist; one bounded, tool-less side call says whether the
@@ -6883,39 +6959,15 @@ fn session_body(
                              </clarification_context>\n\n{turn_system}"
                         );
                     }
-                    // Step 26.4 (#583): inject the <state> block at the HEAD of the
-                    // turn — it rides the ephemeral message[0] (regenerated each
-                    // turn from turn_system) and is NEVER persisted to the log.
-                    if scratchpad_on {
-                        if let Some(block) =
-                            newt_core::agentic::scratchpad_state_block(&scratchpad_store)
-                        {
-                            turn_system = format!("{block}\n\n{turn_system}");
-                        }
-                    }
-                    // Step 27.4: nudge a weak local model to actually USE the
-                    // cross-round working-memory tools when they're on, so it
-                    // keeps a checklist/state instead of re-deriving everything
-                    // each round. Ephemeral (rides turn_system), never persisted.
-                    if turn_features.scheduled || scratchpad_on {
-                        let mut hints: Vec<&str> = Vec::new();
-                        if turn_features.scheduled {
-                            hints.push(
-                                "For multi-step, ambiguous, resumed, or context-compacted work, \
-                                 prefer calling update_plan first with a short 2-6 step ordered \
-                                 plan (each step's status pending/in_progress/completed) before \
-                                 more investigation. Re-send it with the finished step marked \
-                                 completed as you go. If plan_get says no active plan, create one \
-                                 with update_plan instead of polling plan_get again.",
-                            );
-                        }
-                        if scratchpad_on {
-                            hints.push(
-                                "Record durable facts (paths, decisions) with state_set so they \
-                                 survive context compaction; read them back with state_get.",
-                            );
-                        }
-                        turn_system = format!("{}\n\n{turn_system}", hints.join(" "));
+                    // Step 26.4 / 27.4: the working-memory head (usage hints, then
+                    // the <state> block) rides the ephemeral message[0] and is NEVER
+                    // persisted to the log. Shared with the headless driver (#2314).
+                    if let Some(head) = newt_core::agentic::working_memory_head(
+                        scratchpad_on
+                            .then_some(&scratchpad_store as &dyn newt_core::ScratchpadStore),
+                        turn_features.scheduled,
+                    ) {
+                        turn_system = format!("{head}\n\n{turn_system}");
                     }
                     // Step 26.5.4 (#582): semantic RAG — index the repo's code once
                     // (lazily, on the first active turn), then inject a
