@@ -41,24 +41,7 @@ async fn all_bundled_cases_pass_in_mock_mode() {
     for case in &all_cases {
         // One wiremock per case — keeps the URL stable and the mock
         // tied to the case's mock_response.content.
-        let mock = MockServer::start().await;
-
-        // As of the OLLAMA_HOST-verbatim fix, the worker's discover()
-        // no longer probes GET /api/tags when OLLAMA_HOST is set — it
-        // trusts the env var. So we only need the /api/chat mock here.
-        // (The runner config below sets OLLAMA_HOST to the wiremock URL.)
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "model": "mock-llama",
-                "message": {
-                    "role": "assistant",
-                    "content": case.mock_response.content,
-                },
-                "done": true,
-            })))
-            .mount(&mock)
-            .await;
+        let mock = mock_ollama(&case.mock_response.content).await;
 
         let config = RunnerConfig::new(worker).with_mock_endpoint(mock.uri());
 
@@ -107,6 +90,149 @@ async fn all_bundled_cases_pass_in_mock_mode() {
         scorecard.all_passed(),
         "at least one bundled case failed:\n{table}"
     );
+}
+
+/// A fake Ollama whose every `POST /api/chat` answers `content`.
+///
+/// As of the OLLAMA_HOST-verbatim fix, the worker's discover() no longer
+/// probes GET /api/tags when OLLAMA_HOST is set — it trusts the env var. So
+/// only the /api/chat mock is needed.
+async fn mock_ollama(content: &str) -> MockServer {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "mock-llama",
+            "message": { "role": "assistant", "content": content },
+            "done": true,
+        })))
+        .mount(&mock)
+        .await;
+    mock
+}
+
+// ── the ratchet row, parsed from REAL output (#2317) ────────────────────────
+//
+// `scripts/eval/ratchet.sh --mode single` read its behavioral grade out of
+// `newt-eval run`'s HUMAN table with a whitespace-column awk. #1883 turned that
+// table into a GFM pipe table; the awk kept running, matched nothing, and every
+// single-mode row since has read `FAIL tests_pass= all_evaluators_ok=yes`
+// (sweep.sh then files each as infra and skips the model). Nothing noticed,
+// because the only tests of the row fabricated it by hand. These drive the
+// real script over the real `newt-eval` binary and the real worker, so the
+// next renderer change breaks a test instead of an arm.
+
+/// Run `ratchet.sh --mode single` on `case` against `worker` with the model
+/// answering `reply`; return the one `RATCHET` row, split on tabs.
+async fn ratchet_single_row(case: &str, reply: &str, worker: &std::path::Path) -> Vec<String> {
+    let mock = mock_ollama(reply).await;
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/eval/ratchet.sh");
+    let out = tokio::process::Command::new("bash")
+        .arg(&script)
+        .args(["--task", case, "--mode", "single", "--model", "mock-llama"])
+        .env("NEWT_EVAL_BIN", env!("CARGO_BIN_EXE_newt-eval"))
+        .env("NEWT_WORKER_BIN", worker)
+        .env("OLLAMA_HOST", mock.uri())
+        .output()
+        .await
+        .expect("spawn bash ratchet.sh");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let row = stdout
+        .lines()
+        .find(|l| l.starts_with("RATCHET\t"))
+        .unwrap_or_else(|| {
+            panic!(
+                "ratchet.sh printed no RATCHET row ({}):\n{stdout}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+    row.split('\t').map(String::from).collect()
+}
+
+/// The value of `key=` in a row's space-separated `details` column.
+fn detail<'a>(row: &'a [String], key: &str) -> Option<&'a str> {
+    row[5]
+        .split(' ')
+        .find_map(|tok| tok.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// #2317 regression: a single-mode run whose `tests_pass` evaluator passed
+/// must land `PASS` + `tests_pass=ok` in the row, and say which grader ran.
+/// On the pipe-table awk it read `FAIL tests_pass=`.
+#[tokio::test(flavor = "multi_thread")]
+async fn ratchet_single_row_carries_the_tests_pass_grade() {
+    let case = cases::load_all(cases::default_cases_dir())
+        .expect("bundled cases load")
+        .into_iter()
+        .find(|c| c.name == "T0-fix-add")
+        .expect("T0-fix-add is bundled");
+    let row = ratchet_single_row(
+        "T0-fix-add",
+        &case.mock_response.content,
+        &worker_under_test().path,
+    )
+    .await;
+    assert_eq!(row[4], "PASS", "{row:?}");
+    assert_eq!(detail(&row, "tests_pass"), Some("ok"), "{row:?}");
+    assert_eq!(detail(&row, "grader"), Some("tests_pass"), "{row:?}");
+    assert_eq!(detail(&row, "all_evaluators_ok"), Some("yes"), "{row:?}");
+}
+
+/// Twin: the model changes nothing, so T0's seed test still fails — the row
+/// must say `FAIL` *because* `tests_pass=fail`, not because it read nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn ratchet_single_row_fails_an_unfixed_seed() {
+    let row = ratchet_single_row(
+        "T0-fix-add",
+        "I could not find anything to change.",
+        &worker_under_test().path,
+    )
+    .await;
+    assert_eq!(row[4], "FAIL", "{row:?}");
+    assert_eq!(detail(&row, "tests_pass"), Some("fail"), "{row:?}");
+    assert_eq!(detail(&row, "all_evaluators_ok"), Some("no"), "{row:?}");
+}
+
+/// The gaming move: leave `add` broken and delete the test that says so.
+/// `tests_pass` then finds no `#[test]` and skips — which it reports as a
+/// PASS. The row must not: a check that ran nothing is `UNGRADABLE`.
+#[tokio::test(flavor = "multi_thread")]
+async fn ratchet_single_row_never_passes_a_tree_with_its_tests_deleted() {
+    let delete_the_test = "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,14 +1,4 @@
+ /// Add two integers and return the sum.
+ pub fn add(a: i32, b: i32) -> i32 {
+     a - b
+ }
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn adds() {
+-        assert_eq!(add(2, 3), 5);
+-    }
+-}
+";
+    let row = ratchet_single_row("T0-fix-add", delete_the_test, &worker_under_test().path).await;
+    assert_eq!(row[4], "UNGRADABLE(no_tests)", "{row:?}");
+    assert_eq!(detail(&row, "tests_pass"), Some("skipped"), "{row:?}");
+    assert_eq!(detail(&row, "tests_run"), Some("0"), "{row:?}");
+}
+
+/// Twin: a worker that never speaks ACP produces no grade at all. That is
+/// `ERROR(runner)` — never `FAIL` — and the row carries an EMPTY `tests_pass=`,
+/// which is exactly what sweep.sh's `row_is_infra` keys on to keep it out of n.
+#[tokio::test(flavor = "multi_thread")]
+async fn ratchet_single_row_reports_a_dead_worker_as_error() {
+    let row = ratchet_single_row("T0-fix-add", "", std::path::Path::new("/usr/bin/true")).await;
+    assert_eq!(row[4], "ERROR(runner)", "{row:?}");
+    assert_eq!(detail(&row, "tests_pass"), Some(""), "{row:?}");
 }
 
 // ── golden masters over the product boundaries (the refactor net) ──────────

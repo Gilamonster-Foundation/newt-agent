@@ -155,6 +155,30 @@ fn run_live_mode_runner_failure_legacy_exit_code() {
         .code(2);
 }
 
+/// #2317: `run --json` prints the scorecard as JSON (what ratchet.sh parses)
+/// and keeps the #41 exit code.
+#[test]
+fn run_json_emits_the_scorecard_and_keeps_exit_codes() {
+    let out = Command::cargo_bin("newt-eval")
+        .unwrap()
+        .args([
+            "run",
+            "--case",
+            "001",
+            "--worker-bin",
+            "/usr/bin/true",
+            "--json",
+        ])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let card: serde_json::Value = serde_json::from_slice(&out).expect("stdout is JSON");
+    assert_eq!(card["cases"][0]["results"][0]["evaluator"], "runner");
+    assert_eq!(card["cases"][0]["results"][0]["passed"], false);
+}
+
 /// `grade --help` documents the case + workspace flags.
 #[test]
 fn grade_help_shows_case_and_workspace_flags() {
