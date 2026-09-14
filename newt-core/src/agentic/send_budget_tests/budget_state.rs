@@ -16,7 +16,7 @@ fn responses_budget_state_reports_one_enforced_ceiling() {
     let mut state = ResponsesBudgetState::new(
         Some(32_768),
         80,
-        Some(Cognition::Contemplating),
+        resolve_output_allowance(None, Some(Cognition::Contemplating)),
         None,
         None,
         None,
@@ -68,7 +68,7 @@ fn learned_hard_ceiling_only_ever_tightens() {
     let mut state = ResponsesBudgetState::new(
         Some(32_768),
         80,
-        Some(Cognition::Contemplating),
+        resolve_output_allowance(None, Some(Cognition::Contemplating)),
         None,
         None,
         None,
@@ -113,7 +113,7 @@ fn tightening_and_overhead_only_shrink_reported_remaining() {
     let mut state = ResponsesBudgetState::new(
         Some(32_768),
         80,
-        Some(Cognition::Contemplating),
+        resolve_output_allowance(None, Some(Cognition::Contemplating)),
         None,
         None,
         None,
@@ -141,8 +141,14 @@ fn tightening_and_overhead_only_shrink_reported_remaining() {
 #[test]
 fn cloud_responses_none_num_ctx_stays_ceiling_less() {
     use super::ResponsesBudgetState;
-    let state =
-        ResponsesBudgetState::new(None, 80, Some(Cognition::Contemplating), None, None, None);
+    let state = ResponsesBudgetState::new(
+        None,
+        80,
+        resolve_output_allowance(None, Some(Cognition::Contemplating)),
+        None,
+        None,
+        None,
+    );
     assert_eq!(state.learned_hard_ceiling(), None, "no window → no ceiling");
     assert_eq!(
         state.actionable_input_budget(),
@@ -162,7 +168,7 @@ fn zero_input_room_window_stays_authoritative_zero() {
     let state = ResponsesBudgetState::new(
         Some(16_000),
         80,
-        Some(Cognition::Contemplating),
+        resolve_output_allowance(None, Some(Cognition::Contemplating)),
         Some(2_000),
         None,
         None,

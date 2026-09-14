@@ -426,6 +426,9 @@ async fn openai_chat_omits_local_cognition_fields_for_an_unknown_endpoint() {
     let mut c = ctx(&uri, &messages, &caveats);
     c.kind = BackendKind::Openai;
     c.cognition = Some(crate::role_profile::Cognition::Contemplating);
+    // #2312 (A6): an explicit allowance is not a declaration that the endpoint
+    // accepts a cap field — no `max_tokens` is guessed onto this wire.
+    c.output_allowance = Some(12_000);
 
     chat_complete(c, &mut NoMcp)
         .await
@@ -447,5 +450,85 @@ async fn openai_chat_omits_local_cognition_fields_for_an_unknown_endpoint() {
             request.get(field).is_none(),
             "unknown endpoints must not receive `{field}`"
         );
+    }
+}
+
+/// Dispatch one capable Chat Completions turn at `Deliberating` with the given
+/// explicit output allowance and return every request body the server saw.
+async fn capable_chat_bodies(output_allowance: Option<u32>) -> Vec<serde_json::Value> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(CaptureOpenAiRequestResponder {
+            request: Arc::new(Mutex::new(None)),
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.cognition = Some(crate::role_profile::Cognition::Deliberating);
+    c.output_allowance = output_allowance;
+    c.chat_completions_capability = crate::model_card::ChatCompletionsCapability {
+        cognition: Some(true),
+        chat_template_kwargs: Some(true),
+        parallel_tool_calls: Some(false),
+        bounded_reasoning_continuation: Some(true),
+    };
+    openai_chat_complete(c, &mut NoMcp)
+        .await
+        .expect("capable OpenAI-compatible dispatch succeeds");
+    // The active-prompt card mints a fresh address per turn; pin it so body
+    // equality compares what the allowance could change.
+    let address = regex::Regex::new(r"prompt:[0-9a-f-]{36}").expect("regex");
+    server
+        .received_requests()
+        .await
+        .expect("wiremock request journal")
+        .iter()
+        .map(|request| {
+            let body = String::from_utf8_lossy(&request.body);
+            serde_json::from_str(&address.replace_all(&body, "prompt:ID")).expect("json body")
+        })
+        .collect()
+}
+
+/// #2312 (A1/A2): an explicit output allowance varies ONLY the wire cap. The
+/// cognition dial, thinking enablement and sampling stay byte-identical, so an
+/// operator can compare two allowances at one cognition level. With no
+/// override the cognition table still supplies the historical 10,000.
+#[tokio::test]
+async fn openai_chat_output_allowance_varies_only_the_cap_field() {
+    let default_bodies = capable_chat_bodies(None).await;
+    let small_bodies = capable_chat_bodies(Some(3_000)).await;
+    let large_bodies = capable_chat_bodies(Some(12_000)).await;
+    assert!(!default_bodies.is_empty());
+    assert_eq!(default_bodies.len(), small_bodies.len());
+    assert_eq!(default_bodies.len(), large_bodies.len());
+
+    for ((default, small), large) in default_bodies
+        .into_iter()
+        .zip(small_bodies)
+        .zip(large_bodies)
+    {
+        let [(default_cap, default), (small_cap, small), (large_cap, large)] =
+            [default, small, large].map(|mut body| {
+                let cap = body
+                    .as_object_mut()
+                    .expect("object body")
+                    .remove("max_tokens");
+                (cap, body)
+            });
+        assert_eq!(default_cap, Some(serde_json::json!(10_000)));
+        assert_eq!(small_cap, Some(serde_json::json!(3_000)));
+        assert_eq!(large_cap, Some(serde_json::json!(12_000)));
+        // Body-minus-cap equality: temperature, top_p, chat_template_kwargs
+        // and every other field are identical across the three allowances.
+        assert_eq!(default["temperature"], 0.6);
+        assert_eq!(default["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(small, default);
+        assert_eq!(large, default);
     }
 }

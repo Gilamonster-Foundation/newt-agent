@@ -278,8 +278,9 @@ pub(super) fn num_ctx_input_ceiling(
 /// reporting seam ([`initial_context_input_budget`]) build their budget from, so
 /// the seam can no longer report a value the loop does not enforce. A thin,
 /// argument-ordering wrapper over [`ResponsesBudgetState::new`] that names the
-/// "resolve one Responses budget from raw config" seam explicitly; the reserve,
-/// ceiling, and cached-cap composition all live in the state's constructor.
+/// "resolve one Responses budget from raw config" seam explicitly. It resolves
+/// the output allowance (#2312); the ceiling and cached-cap composition live in
+/// the state's constructor.
 pub(super) fn resolve_responses_budget(
     num_ctx: Option<u32>,
     safe_context: Option<u32>,
@@ -287,11 +288,12 @@ pub(super) fn resolve_responses_budget(
     mid_loop_trim_tokens: Option<usize>,
     input_ceiling_pct: u32,
     cognition: Option<crate::role_profile::Cognition>,
+    output_allowance: Option<u32>,
 ) -> ResponsesBudgetState {
     ResponsesBudgetState::new(
         num_ctx,
         input_ceiling_pct,
-        cognition,
+        super::generation_policy::resolve_output_allowance(output_allowance, cognition),
         max_ok_input,
         safe_context,
         mid_loop_trim_tokens,
@@ -299,8 +301,9 @@ pub(super) fn resolve_responses_budget(
 }
 
 /// Resolve the initial input budget a caller should report for one backend
-/// turn. This is the public reporting seam for the same percentage, cognition
-/// output reserve, and cached-cap composition used by the dispatch loops.
+/// turn. This is the public reporting seam for the same percentage, resolved
+/// output allowance (#2312), and cached-cap composition used by the dispatch
+/// loops.
 ///
 /// The **Responses** branch PROJECTS from the shared [`ResponsesBudgetState`]
 /// (via [`resolve_responses_budget`]) so the reported budget cannot diverge from
@@ -322,6 +325,7 @@ pub fn initial_context_input_budget(
     context_window: Option<u32>,
     input_ceiling_pct: u32,
     cognition: Option<crate::role_profile::Cognition>,
+    output_allowance: Option<u32>,
     chat_capability: crate::model_card::ChatCompletionsCapability,
     reasoning_replay_scope: crate::model_card::ReasoningReplayScope,
     max_ok_input: Option<u32>,
@@ -339,26 +343,28 @@ pub fn initial_context_input_budget(
             None,
             input_ceiling_pct,
             cognition,
+            output_allowance,
         )
         .soft_send_budget()
         .map(|budget| u32::try_from(budget).expect("input budgets originate as u32 values"));
     }
-    let max_output_tokens =
+    let output_allowance =
         if kind == crate::BackendKind::Openai && api == crate::OpenAiApi::ChatCompletions {
             super::generation_policy::GenerationPolicy::resolve(
                 cognition,
+                output_allowance,
                 chat_capability,
                 reasoning_replay_scope,
             )
-            .max_output_tokens
+            .output_allowance
         } else {
-            None
+            output_allowance
         };
-    // Chat Completions applies the resolved generation output reserve above;
-    // Ollama and embedded backends keep the percentage-only local ceiling
-    // (`max_output_tokens` is `None`). The declared window still bounds the input
-    // ceiling so an over-window request is caught pre-dispatch, not only by a 400.
-    let ceiling = num_ctx_input_ceiling(context_window, input_ceiling_pct, max_output_tokens);
+    // Chat Completions applies the resolved generation output allowance above;
+    // Ollama and embedded backends reserve only an explicit allowance (no
+    // cognition table). The declared window still bounds the input ceiling so
+    // an over-window request is caught pre-dispatch, not only by a 400.
+    let ceiling = num_ctx_input_ceiling(context_window, input_ceiling_pct, output_allowance);
     initial_send_budget(max_ok_input, safe_context, ceiling)
         .map(|budget| u32::try_from(budget).expect("input budgets originate as u32 values"))
 }
@@ -513,7 +519,7 @@ pub(super) fn emit_context_window_400(
 /// budget. It composes the existing pure helpers ([`num_ctx_input_ceiling`],
 /// [`initial_send_budget`], [`recovered_input_budget`],
 /// [`authoritative_request_budget`], [`exposure_budget_tokens`],
-/// [`super::generation_policy::cognition_output_reserve`]) into ONE owner so the
+/// [`super::generation_policy::resolve_output_allowance`]) into ONE owner so the
 /// Responses dispatch preflight, tool exposure, compaction target, cw-400
 /// recovery, and `get_context_remaining` all read one derivation instead of the
 /// seven scattered locals (`output_reserve`, `responses_input_ceiling`,
@@ -525,7 +531,7 @@ pub(super) fn emit_context_window_400(
 /// artifacts`). The Ollama (`mod.rs` ~1363) and Chat Completions (`mod.rs`
 /// ~4887) loops rebuild the identical trio inline and differ ONLY in the
 /// output-reserve argument to [`num_ctx_input_ceiling`] (`None` /
-/// `generation_policy.max_output_tokens` / `cognition_output_reserve`); folding
+/// `generation_policy.output_allowance` / `resolve_output_allowance`); folding
 /// those two into this struct is the sibling duplication this type is designed
 /// to absorb next (one-issue-one-PR).
 ///
@@ -546,7 +552,7 @@ pub(super) struct ResponsesBudgetState {
     num_ctx: Option<u32>,
     /// Configured percentage bound (`[context] input_ceiling_pct`).
     input_ceiling_pct: u32,
-    /// Cognition output reserve (this wire sends no `max_output_tokens`, but the
+    /// Resolved output allowance (this wire sends no `max_output_tokens`, but the
     /// declared window must still leave room to generate). Reused when a cw-400
     /// recovers the full window into the next input cap.
     output_reserve: Option<u32>,
@@ -573,7 +579,7 @@ pub(super) struct ResponsesBudgetState {
 
 impl ResponsesBudgetState {
     /// Compose the Responses budget from the declared window, the configured
-    /// percentage bound, the cognition output reserve, and the cached-capability
+    /// percentage bound, the resolved output allowance, and the cached-capability
     /// numbers. `num_ctx == None` (cloud Responses) yields NO ceiling — the
     /// budget stays ceiling-less exactly as before (invariant #1). An
     /// authoritative `Some(0)` ceiling (a window with no input room) is never
@@ -581,12 +587,11 @@ impl ResponsesBudgetState {
     pub(super) fn new(
         num_ctx: Option<u32>,
         input_ceiling_pct: u32,
-        cognition: Option<crate::role_profile::Cognition>,
+        output_reserve: Option<u32>,
         max_ok_input: Option<u32>,
         safe_context: Option<u32>,
         mid_loop_trim_tokens: Option<usize>,
     ) -> Self {
-        let output_reserve = super::generation_policy::cognition_output_reserve(cognition);
         // Seed hard ceiling: min(pct% window, window − output reserve). `None`
         // when the window is unknown; `Some(0)` when no input fits (both
         // authoritative — never erased to fail open).
