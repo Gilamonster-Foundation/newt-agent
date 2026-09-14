@@ -323,12 +323,15 @@ bench-publish:
     python3 scripts/eval/bench_scoreboard.py render --readme README.md --no-queued
 
 # Offline eval-ingestion self-tests (#2316): fixture Harbor runs through
-# parse_run and cross-tab.py. Stdlib Python, well under a second.
+# parse_run and cross-tab.py. Stdlib Python, well under a second. The ratchet
+# row consumers (#2317) run their own offline self-tests: no gh, no models.
 # HOOK PARITY: runs inside `just check`; mirrors the "eval self-tests
 # (eval-selftest)" step in .github/workflows/ci.yml. Add a line to both.
 eval-selftest:
     python3 scripts/eval/bench_scoreboard.py --self-test
     PYTHONPATH=scripts/eval/harbor python3 -m unittest discover -s scripts/eval/harbor/tests -t scripts/eval/harbor/tests -p 'test_tb_campaign.py'
+    bash scripts/eval/sweep.sh --self-test
+    bash scripts/eval/file-regressions.sh --self-test
 
 # Build + test the out-of-workspace newt-mesh crate. Requires the
 # sibling `../agent-mesh/` checkout. Not run by `just check` /
