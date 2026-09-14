@@ -5092,11 +5092,10 @@ fn run_command_is_advertised(tools: &serde_json::Value) -> bool {
 /// the kernel-refusal renderer `tools::kernel_refused_binary` emit. Shared by
 /// the exec-denial ground-truth check and by [`unreachable_by_edit`], so the
 /// two cannot drift into disagreeing about what a denial looks like.
-const CONFINEMENT_DENIAL_NEEDLES: [&str; 4] = [
+const CONFINEMENT_DENIAL_NEEDLES: [&str; 3] = [
     "not within the granted authority",
     "does not permit",
     "capability denied",
-    "exec not granted",
 ];
 
 /// The OS's own words when the kernel refuses a fenced child. Only the
@@ -5124,10 +5123,13 @@ fn run_command_result_is_denial(tool_name: &str, ok: bool, result: &str) -> bool
         return false;
     }
     let lower = result.to_ascii_lowercase();
-    CONFINEMENT_DENIAL_NEEDLES
-        .iter()
-        .chain(OS_PERMISSION_DENIAL_NEEDLES.iter())
-        .any(|needle| lower.contains(needle))
+    // The confined lane's refusal of a binary the host HAS coaches an exec
+    // grant, so it is a grant gap; one not installed at all is not (#2304).
+    (lower.contains(tools::ABSENT_BINARY_MARKER) && !lower.contains(tools::NOT_ON_HOST_MARKER))
+        || CONFINEMENT_DENIAL_NEEDLES
+            .iter()
+            .chain(OS_PERMISSION_DENIAL_NEEDLES.iter())
+            .any(|needle| lower.contains(needle))
 }
 
 /// Is this FAILED tool result a blocker that no workspace edit can repair?

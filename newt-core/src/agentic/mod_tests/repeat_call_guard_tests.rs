@@ -758,7 +758,7 @@ fn workflow_blocker_classification_refreshes_for_the_same_fingerprint() {
     let repairable = "error: command exited 1\na test failed";
     // Newt's own denial vocabulary; the bare OS "Permission denied" is a
     // repairable failure and must NOT flip the classification.
-    let blocked = "error: command exited 1\nexec not granted";
+    let blocked = "error: command exited 1\ncapability denied: exec of cargo";
     for (first, second, expect_blocked) in
         [(repairable, blocked, true), (blocked, repairable, false)]
     {
@@ -902,7 +902,7 @@ fn a_kernel_refused_binary_is_a_blocker_no_edit_can_clear() {
     let envelope = serde_json::json!({
         "exit_code": 126,
         "stdout": "",
-        "stderr": format!("brush: {exe}: Permission denied\n"),
+        "stderr": format!("brush: failed to execute command '{exe}': Permission denied (os error 13)\n"),
     });
     let rendered = tools::kernel_refused_binary(&exe, &envelope, &crate::caveats::Scope::none())
         .expect("a 126 outside the read grant renders the refusal");

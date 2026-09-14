@@ -222,7 +222,7 @@ fn kernel_refused_binary_outside_the_read_grant_is_a_named_denial() {
     let envelope = serde_json::json!({
         "exit_code": 126,
         "stdout": "",
-        "stderr": format!("brush: {present}: Permission denied\n"),
+        "stderr": format!("brush: failed to execute command '{present}': Permission denied (os error 13)\n"),
     });
     let msg = super::super::shell::kernel_refused_binary(
         &present,
@@ -244,12 +244,25 @@ fn a_126_inside_the_read_grant_is_not_a_kernel_refusal() {
     let envelope = serde_json::json!({
         "exit_code": 126,
         "stdout": "",
-        "stderr": format!("brush: {present}: Permission denied\n"),
+        "stderr": format!("brush: failed to execute command '{present}': Permission denied (os error 13)\n"),
     });
     assert!(super::super::shell::kernel_refused_binary(
         &present,
         &envelope,
         &crate::caveats::Scope::All,
+    )
+    .is_none());
+    // `Scope::All` permits by a bare `true`; a grant naming the binary's own
+    // directory makes the containment arm prove the negative (#2304).
+    let dir = std::path::Path::new(&present)
+        .parent()
+        .expect("the test binary has a parent directory")
+        .display()
+        .to_string();
+    assert!(super::super::shell::kernel_refused_binary(
+        &present,
+        &envelope,
+        &crate::caveats::Scope::only([dir]),
     )
     .is_none());
     assert!(
@@ -261,4 +274,42 @@ fn a_126_inside_the_read_grant_is_not_a_kernel_refusal() {
         .is_none(),
         "a structured denial is the leash's to render, not this"
     );
+}
+
+/// #2304: `cd newt-core && cargo test` exits 126 for `cargo`, not `cd`. The
+/// program is the one brush names in its own error, so the commonest compound
+/// shape is not missed by reading the leading token.
+#[test]
+fn a_compound_126_names_the_program_brush_failed_on() {
+    let present = present_host_binary();
+    let envelope = serde_json::json!({
+        "exit_code": 126,
+        "stdout": "",
+        "stderr": format!("brush: failed to execute command '{present}': Permission denied (os error 13)\n"),
+    });
+    let msg = super::super::shell::kernel_refused_binary(
+        &format!("cd newt-core && {present} test"),
+        &envelope,
+        &crate::caveats::Scope::none(),
+    )
+    .expect("the failed program is outside the read grant");
+    assert!(msg.contains(&format!("exec of {present} at")), "{msg}");
+}
+
+/// #2304: in `nope; ABSENT` both lookups fail and the 127 belongs to the last
+/// one, so the refusal names the program brush failed on last.
+#[test]
+fn a_compound_127_names_the_last_program_not_found() {
+    let envelope = serde_json::json!({
+        "exit_code": 127,
+        "stdout": "",
+        "stderr": format!("error: command not found: nope\nerror: command not found: {ABSENT}\n"),
+    });
+    let msg = super::super::shell::absent_binary_refusal(
+        &format!("nope; {ABSENT}"),
+        &envelope,
+        &empty_exec(),
+    )
+    .expect("a 127 with no denials must produce a named refusal");
+    assert!(msg.starts_with(&format!("error: {ABSENT}:")), "{msg}");
 }
