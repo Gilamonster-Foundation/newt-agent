@@ -3,6 +3,10 @@
 
     tb_campaign.py ingest <job_dir> <cell.json> <out_dir>   # append trials.jsonl + cells.jsonl
     tb_campaign.py table <out_dir>                         # markdown matrix
+    tb_campaign.py cell <cell.json> <treatment|none> key value ...   # write a cell binding
+    tb_campaign.py profile <treatment|none> <model> <in> <out>       # newt profile + env lines
+    tb_campaign.py pin-check <out_dir> <cell.json>         # exit 3 naming the fields that differ
+    tb_campaign.py pinned-version <out_dir> <harness>      # the version pi/codex must install
 
 Every trial directory Harbor created becomes one row, graded or not. A cell's
 expected count comes from the task set, so a trial Harbor never produced is
@@ -18,11 +22,13 @@ attempt counts once; tasks carry equal attempts by design.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
 import statistics
 import sys
+import tomllib
 from datetime import datetime
 from pathlib import Path
 
@@ -180,7 +186,120 @@ def _seconds(span):
         return None
 
 
-def trial_row(harness, trial: Path):
+# ── treatments ──────────────────────────────────────────────────────────────
+# A treatment is ONE declared file, treatments/<name>.toml: a description, a
+# newt profile fragment appended to the injected profile ({{MODEL}} and
+# {{ENDPOINT}} substituted from the local profile, so no host is committed),
+# adapter env limited to the knobs newt_agent.py reads, and dotted contract
+# paths the run must be OBSERVED at ("*" = present). Its sha256 is its identity.
+# "none" is the baseline. pi and codex take no treatment.
+TREATMENT_KEYS = {"description", "profile", "env", "expect"}
+TREATMENT_ENV = {
+    "NEWT_BENCH_SMART", "NEWT_BENCH_SELF_VERIFY", "NEWT_BENCH_MAX_ROUNDS",
+    "NEWT_BENCH_TENACITY", "NEWT_BENCH_CONTEXT_WINDOW", "NEWT_BENCH_OCAP",
+}
+NONE = {"name": "none", "sha256": None, "profile": "", "env": {}, "expect": {}}
+
+
+def load_treatment(path):
+    if str(path) in ("", "none"):
+        return dict(NONE)
+    raw = Path(path).read_bytes()
+    t = tomllib.loads(raw.decode())
+    if set(t) - TREATMENT_KEYS or not t.get("description"):
+        raise ValueError(f"{path}: keys must be {sorted(TREATMENT_KEYS)} with a description")
+    env = {k: str(v) for k, v in (t.get("env") or {}).items()}
+    bad = sorted(k for k, v in env.items() if k not in TREATMENT_ENV or not re.fullmatch(r"[A-Za-z0-9._-]*", v))
+    if bad:
+        raise ValueError(f"{path}: env not allowed: {bad}")
+    name = Path(path).stem
+    return {"name": name, "sha256": hashlib.sha256(raw).hexdigest(), "profile": t.get("profile", ""),
+            "env": env, "expect": t.get("expect") or {}}
+
+
+def observed(expect, record):
+    """Whether a newt contract record shows every declared path; None when the
+    treatment declares nothing observable or there is no record to read."""
+    if not expect or record is None:
+        return None
+
+    def at(path):
+        o = record
+        for part in path.split("."):
+            if not isinstance(o, dict) or part not in o:
+                return None
+            o = o[part]
+        return o
+
+    return all(at(p) is not None if v == "*" else at(p) == v for p, v in expect.items())
+
+
+# ── pinning ─────────────────────────────────────────────────────────────────
+# Cells pool or pair only under one pin. The first cell writes it; a later cell
+# that differs is refused. The model fingerprint is the server's own metadata
+# (size, params, ftype, ...) plus the GGUF basename: a fingerprint, not a content
+# digest — the router exposes no weights hash.
+PINNED = ("task_set_sha256", "engine", "ctx_served", "newt_binary_sha256", "instrument_commit")
+
+
+def pin_mismatch(pin, cell):
+    bad = [k for k in PINNED if pin.get(k) != cell.get(k)]
+    fp = (pin.get("models") or {}).get(cell["model"])
+    if fp is not None and fp != cell.get("model_fingerprint"):
+        bad.append("model_fingerprint")
+    version = (pin.get("harness_versions") or {}).get(cell["harness"])
+    if version and cell.get("harness_version") and version != cell["harness_version"]:
+        bad.append("harness_version")
+    return bad
+
+
+def pin_extend(pin, cell):
+    for k in PINNED:
+        pin.setdefault(k, cell.get(k))
+    pin.setdefault("models", {}).setdefault(cell["model"], cell.get("model_fingerprint"))
+    if cell.get("harness_version"):
+        pin.setdefault("harness_versions", {}).setdefault(cell["harness"], cell["harness_version"])
+    return pin
+
+
+def pin_check(out: Path, cell_json: Path):
+    path, cell = out / "campaign.pin.json", json.loads(cell_json.read_text())
+    pin = json.loads(path.read_text()) if path.exists() else {}
+    bad = pin_mismatch(pin, cell) if pin else []
+    if bad:  # the cell is recorded as skipped, so a re-run under the right pin retries it
+        cell["skipped"] = f"pin mismatch: {','.join(bad)}"
+        cell_json.write_text(json.dumps(cell))
+        print(",".join(bad))
+        return 3
+    path.write_text(json.dumps(pin_extend(pin, cell), indent=1, sort_keys=True))
+    return 0
+
+
+def build_cell(t, pairs):
+    """A cell binding from key/value pairs; `*_json` values are parsed, counts are ints."""
+    cell = {}
+    for k, v in zip(pairs[::2], pairs[1::2]):
+        if k.endswith("_json"):
+            cell[k[: -len("_json")]] = json.loads(v) if v else None
+        else:
+            cell[k] = int(v) if k in ("expected", "trials", "n_tasks") else (v or None)
+    cell.update(treatment=t["name"], treatment_sha256=t["sha256"], treatment_env=t["env"],
+                treatment_expect=t["expect"])
+    return cell
+
+
+def render_profile(t, model, base):
+    """The newt profile for one model under one treatment. A fragment that breaks
+    the TOML fails here, before any container starts."""
+    endpoint = re.search(r'(?m)^endpoint *= *"(.*)"', base)
+    text = re.sub(r"(?m)^model *=.*$", f'model = "{model}"', base, count=1)
+    fragment = t["profile"].replace("{{MODEL}}", model).replace("{{ENDPOINT}}", endpoint.group(1) if endpoint else "")
+    text += "\n" + fragment if fragment else ""
+    tomllib.loads(text)
+    return text
+
+
+def trial_row(harness, trial: Path, expect=None):
     rec = trial_record(str(trial))
     exc, reward = rec["exception"], rec["reward"]
     try:  # harness-specific fields only; state and reward are trial_record's
@@ -204,7 +323,7 @@ def trial_row(harness, trial: Path):
     label = ((r.get("agent_info") or {}).get("model_info") or {}).get("name")
     # pi and codex send the label itself; newt sends its profile's model, which
     # can drift from the label (smart-off-pilot6: labelled one model, ran another).
-    effective, harness_config = label, None
+    effective, harness_config, contract = label, None, None
     if harness == "newt":
         tokens_in, source, effective = None, "newt contract timing.gen_tokens (input not emitted)", None
         timing = {}
@@ -213,6 +332,7 @@ def trial_row(harness, trial: Path):
             timing = o.get("timing") or timing
             effective = o.get("effective_model") or effective
             harness_config = o.get("effective_config") or harness_config
+            contract = o if "outcome" in o else contract
         tokens_out = timing.get("gen_tokens")
     return {
         "trial": rec["trial"],
@@ -222,6 +342,7 @@ def trial_row(harness, trial: Path):
         "model_label": label,
         "model_effective": effective,
         "harness_config": harness_config,
+        "treatment_observed": observed(expect, contract),
         "result": bool(r),
         "exception": exc,
         "reward": reward,
@@ -245,11 +366,18 @@ def trial_row(harness, trial: Path):
 def ingest(job_dir: Path, cell_json: Path, out: Path):
     cell = json.loads(cell_json.read_text())
     rows = [
-        {**{k: cell[k] for k in ("campaign", "model", "harness")}, **trial_row(cell["harness"], t)}
+        {**{k: cell.get(k) for k in ("campaign", "model", "harness", "job")},
+         **trial_row(cell["harness"], t, cell.get("treatment_expect"))}
         for t in sorted(p for p in job_dir.iterdir() if p.is_dir())
     ]
     if not cell.get("harness_version") and rows:
         cell["harness_version"] = rows[0]["harness_version"]
+    pin_path = out / "campaign.pin.json"
+    if pin_path.exists():  # a version installed at setup can still differ from the pin
+        pin = json.loads(pin_path.read_text())
+        cell["pin_mismatch"] = pin_mismatch(pin, cell) or None
+        if not cell["pin_mismatch"]:
+            pin_path.write_text(json.dumps(pin_extend(pin, cell), indent=1, sort_keys=True))
     with open(out / "trials.jsonl", "a") as f:
         f.writelines(json.dumps(row) + "\n" for row in rows)
     with open(out / "cells.jsonl", "a") as f:
@@ -295,6 +423,7 @@ def summarize(cell, rows):
             (r["max_request_output_tokens"] for r in rows if r.get("max_request_output_tokens") is not None), default=None
         ),
         "model_mismatches": sum(r["model_effective"] not in (None, cell["model"]) for r in rows),
+        "not_observed": sum(r.get("treatment_observed") is False for r in rows),
         "tokens_in": (sum(known_in), len(known_in)),
         "tokens_out": (sum(known_out), len(known_out)),
         "agent_s_median": statistics.median(secs) if secs else None,
@@ -309,30 +438,35 @@ def table(out: Path):
     trials = out / "trials.jsonl"
     rows = list(_records(trials.read_text().splitlines())) if trials.exists() else []
     lines = [
-        "| model | harness | expected / observed / graded / error | resolved / n, rate [95% Wilson]: trials with any exception excluded | resolved / n, rate [95% Wilson]: agent-caused exceptions counted as failures (infra, unknown excluded) | claimed done | false completions | false incompletes | unrecoverable claims | exceptions: infra / agent / unknown | inference errors (ungraded) | agent timeouts | largest single-request output | ran another model | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| model | harness | expected / observed / graded / error | resolved / n, rate [95% Wilson]: trials with any exception excluded | resolved / n, rate [95% Wilson]: agent-caused exceptions counted as failures (infra, unknown excluded) | claimed done | false completions | false incompletes | unrecoverable claims | exceptions: infra / agent / unknown | inference errors (ungraded) | agent timeouts | largest single-request output | ran another model | treatment declared but not observed | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     # The last record per job wins: a cell skipped once and run later shows the run.
     cells = {c["job"]: c for c in _records((out / "cells.jsonl").read_text().splitlines())}
     for cell in cells.values():
-        mine = [r for r in rows if (r["model"], r["harness"]) == (cell["model"], cell["harness"])]
+        mine = [r for r in rows if r.get("job", cell["job"]) == cell["job"]
+                and (r["model"], r["harness"]) == (cell["model"], cell["harness"])]
         s = summarize(cell, mine)
         g = s["graded"]
         def rate(k_n):
             k, n = k_n
             if cell.get("skipped"):
                 return f"— (skipped: {cell['skipped']})"
+            if cell.get("pin_mismatch"):
+                return f"— (pin mismatch: {','.join(cell['pin_mismatch'])})"
             return f"{k}/{n}, {k / n:.2f} [{wilson(k, n)[0]:.2f}, {wilson(k, n)[1]:.2f}]" if n else "—"
 
         med = f"{s['agent_s_median']:.0f}" if s["agent_s_median"] is not None else "—"
         tps = f"{s['out_tok_per_agent_s']:.1f}" if s["out_tok_per_agent_s"] is not None else "—"
         fc = f"{s['false_completions']}/{s['claimed']}" if s["claimed"] else "0/0"
         big = f"{s['max_request_output']:,}" if s["max_request_output"] is not None else "not logged"
+        treat = cell.get("treatment") or "none"
+        seen = "n/a" if treat == "none" or not cell.get("treatment_expect") else s["not_observed"]
         tin, tout = (f"{t[0]:,} ({t[1]})" if t[1] else "— (0)" for t in (s["tokens_in"], s["tokens_out"]))
         lines.append(
-            f"| {cell['model']} | {cell['harness']} {cell.get('harness_version') or ''} "
+            f"| {cell['model']} | {cell['harness']} {cell.get('harness_version') or ''} [{treat}] "
             f"| {s['expected']} / {s['observed']} / {g} / {s['errors']} | {rate(s['rate_excl'])} | {rate(s['rate_agent_fail'])} | {s['claimed']} | {fc} "
-            f"| {s['false_incompletes']} | {s['unrecoverable_claims']} | {s['exceptions']}: {'/'.join(map(str, s['causes']))} | {s['inference_errors']} | {s['agent_timeouts']} | {big} | {s['model_mismatches']} | {tin} "
+            f"| {s['false_incompletes']} | {s['unrecoverable_claims']} | {s['exceptions']}: {'/'.join(map(str, s['causes']))} | {s['inference_errors']} | {s['agent_timeouts']} | {big} | {s['model_mismatches']} | {seen} | {tin} "
             f"| {tout} | {med} / {s['agent_s_total']:.0f} | {tps} |"
         )
     print("\n".join(lines))
@@ -344,5 +478,16 @@ if __name__ == "__main__":
         ingest(Path(args[0]), Path(args[1]), Path(args[2]))
     elif cmd == "table":
         table(Path(args[0]))
+    elif cmd == "cell":
+        Path(args[0]).write_text(json.dumps(build_cell(load_treatment(args[1]), args[2:])))
+    elif cmd == "profile":  # writes the profile; prints the treatment's adapter env as KEY=VALUE lines
+        t = load_treatment(args[0])
+        Path(args[3]).write_text(render_profile(t, args[1], Path(args[2]).read_text()))
+        print("\n".join(f"{k}={v}" for k, v in sorted(t["env"].items())))
+    elif cmd == "pin-check":
+        sys.exit(pin_check(Path(args[0]), Path(args[1])))
+    elif cmd == "pinned-version":
+        path = Path(args[0]) / "campaign.pin.json"
+        print(((json.loads(path.read_text()) if path.exists() else {}).get("harness_versions") or {}).get(args[1], ""))
     else:
         sys.exit(__doc__)
