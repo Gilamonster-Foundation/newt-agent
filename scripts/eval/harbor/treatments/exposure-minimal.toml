@@ -1,0 +1,6 @@
+description = "Tool exposure profile minimal: kernel tools plus the sticky active set (#2331 static-selection arm)"
+# Not yet observable in newt's contract.
+profile = '''
+[tool_exposure]
+profile = "minimal"
+'''

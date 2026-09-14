@@ -5,9 +5,18 @@ Run: PYTHONPATH=scripts/eval/harbor python -m unittest discover scripts/eval/har
 """
 
 import json
+import tomllib
 import unittest
+from pathlib import Path
 
-from tb_campaign import codex_claim, error_cause, harness_evidence, newt_claim, pi_claim, summarize, wilson
+from tb_campaign import (
+    PINNED, build_cell, codex_claim, error_cause, harness_evidence, load_treatment, newt_claim, observed,
+    pi_claim, pin_extend, pin_mismatch, render_profile, summarize, wilson,
+)
+
+HARBOR = Path(__file__).resolve().parent.parent
+BASE = ('default_backend = "b"\n[[backends]]\nname = "b"\n'
+        'endpoint = "http://inference.invalid:8080"\nmodel = "old"\nkind = "openai"\n')
 
 
 def jl(*records):
@@ -111,6 +120,73 @@ class Summary(unittest.TestCase):
         self.assertEqual(s["rate_agent_fail"], (1, 3))
         self.assertEqual(s["causes"], (1, 1, 1))
         self.assertEqual(s["tokens_in"], (0, 0))  # none known: count 0, not a zero cost
+
+
+class Treatments(unittest.TestCase):
+    def test_none_is_the_baseline(self):
+        t = load_treatment("none")
+        self.assertEqual((t["name"], t["sha256"], t["env"], t["expect"]), ("none", None, {}, {}))
+        self.assertEqual(render_profile(t, "m", BASE), BASE.replace('model = "old"', 'model = "m"'))
+
+    def test_committed_treatments_render_to_valid_profiles_without_placeholders(self):
+        files = sorted((HARBOR / "treatments").glob("*.toml"))
+        self.assertTrue(files)
+        for f in files:
+            text = render_profile(load_treatment(f), "qwen3-coder_30b", BASE)
+            self.assertNotIn("{{", text, f)
+            self.assertEqual(tomllib.loads(text)["backends"][0]["model"], "qwen3-coder_30b", f)
+
+    def test_smart_takes_its_endpoint_from_the_local_profile(self):
+        doc = tomllib.loads(render_profile(load_treatment(HARBOR / "treatments/smart.toml"), "m", BASE))
+        self.assertEqual(doc["smart_harness"]["backend"], {"endpoint": "http://inference.invalid:8080", "model": "m", "kind": "openai"})
+
+    def test_env_outside_the_adapter_knobs_is_refused(self):
+        with self.assertRaises(ValueError):
+            load_treatment(HARBOR / "tests/fixtures/treatment-bad-env.toml")
+
+    def test_observed_reads_dotted_contract_paths(self):
+        expect = {"effective_config.smart_harness": "*", "effective_config.ocap": "off"}
+        on = {"outcome": "completed", "effective_config": {"smart_harness": {"enabled": True}, "ocap": "off"}}
+        self.assertIs(observed(expect, on), True)
+        self.assertIs(observed(expect, {"effective_config": {"ocap": "off"}}), False)
+        self.assertIsNone(observed({}, on))       # nothing declared observable
+        self.assertIsNone(observed(expect, None))  # no contract record to read
+
+    def test_cell_binding_parses_json_and_counts(self):
+        t = load_treatment(HARBOR / "treatments/smart.toml")
+        cell = build_cell(t, ["expected", "24", "model_fingerprint_json", '{"size": 1}', "skipped", ""])
+        self.assertEqual((cell["expected"], cell["model_fingerprint"], cell["skipped"]), (24, {"size": 1}, None))
+        self.assertEqual((cell["treatment"], cell["treatment_env"]), ("smart", {"NEWT_BENCH_SMART": "1"}))
+        self.assertEqual(len(cell["treatment_sha256"]), 64)
+
+
+class Pinning(unittest.TestCase):
+    CELL = dict(model="m", harness="newt", task_set_sha256="t", engine="e", ctx_served="131072",
+                newt_binary_sha256="b", instrument_commit="c", model_fingerprint={"size": 1, "ftype": "Q4_K"},
+                harness_version="0.8.0")
+
+    def test_the_writing_cell_matches_its_own_pin(self):
+        self.assertEqual(pin_mismatch(pin_extend({}, dict(self.CELL)), self.CELL), [])
+
+    def test_every_pinned_field_refuses_a_different_cell(self):
+        pin = pin_extend({}, dict(self.CELL))
+        for k in PINNED:
+            self.assertEqual(pin_mismatch(pin, {**self.CELL, k: "other"}), [k])
+
+    def test_a_changed_model_fingerprint_refuses(self):
+        pin = pin_extend({}, dict(self.CELL))
+        self.assertEqual(pin_mismatch(pin, {**self.CELL, "model_fingerprint": {"size": 2, "ftype": "Q4_K"}}), ["model_fingerprint"])
+
+    def test_a_new_model_extends_the_pin_and_harness_versions_are_pinned_once_seen(self):
+        pin = pin_extend({}, dict(self.CELL))
+        second = {**self.CELL, "model": "m2", "model_fingerprint": {"size": 9}}
+        self.assertEqual(pin_mismatch(pin, second), [])
+        pin_extend(pin, second)
+        self.assertEqual(pin["models"]["m2"], {"size": 9})
+        pi = {**self.CELL, "harness": "pi", "harness_version": None}   # before its first install
+        self.assertEqual(pin_mismatch(pin, pi), [])
+        pin_extend(pin, {**pi, "harness_version": "0.85.1"})
+        self.assertEqual(pin_mismatch(pin, {**pi, "harness_version": "0.86.0"}), ["harness_version"])
 
 
 if __name__ == "__main__":

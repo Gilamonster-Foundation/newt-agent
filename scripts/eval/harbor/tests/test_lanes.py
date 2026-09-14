@@ -8,6 +8,7 @@ Run: PYTHONPATH=scripts/eval/harbor python -m unittest scripts/eval/harbor/tests
 
 import unittest
 
+import newt_agent
 from newt_agent import _lane_flag
 
 
@@ -22,6 +23,20 @@ class LaneFlag(unittest.TestCase):
 
     def test_lanes_never_collapse(self):
         self.assertNotEqual(_lane_flag("off"), _lane_flag("on"))
+
+
+class ModelDigest(unittest.TestCase):
+    """#2318: a declared digest reaches the container as NEWT_MODEL_DIGEST, and
+    none is invented when the operator declared nothing."""
+
+    def test_declared_digest_is_passed_and_absent_is_absent(self):
+        try:
+            newt_agent._MODEL_DIGEST = "sha256:abc"
+            self.assertIn("NEWT_MODEL_DIGEST=sha256:abc ", newt_agent._container_env_prefix())
+            newt_agent._MODEL_DIGEST = ""
+            self.assertNotIn("NEWT_MODEL_DIGEST", newt_agent._container_env_prefix())
+        finally:
+            newt_agent._MODEL_DIGEST = ""
 
 
 if __name__ == "__main__":
