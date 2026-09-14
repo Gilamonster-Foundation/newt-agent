@@ -37,6 +37,8 @@ async fn all_bundled_cases_pass_in_mock_mode() {
     assert!(!all_cases.is_empty(), "expected at least one bundled case");
 
     let mut scorecard = Scorecard::new();
+    #[cfg(unix)]
+    let mut miscalibrated: Vec<String> = Vec::new();
 
     for case in &all_cases {
         // One wiremock per case — keeps the URL stable and the mock
@@ -83,6 +85,9 @@ async fn all_bundled_cases_pass_in_mock_mode() {
             );
         }
         scorecard.push(cs);
+
+        #[cfg(unix)]
+        miscalibrated.extend(calibration::check(case, &outcome));
     }
 
     let table = scorecard.to_string();
@@ -91,6 +96,78 @@ async fn all_bundled_cases_pass_in_mock_mode() {
         scorecard.all_passed(),
         "at least one bundled case failed:\n{table}"
     );
+    #[cfg(unix)]
+    assert!(
+        miscalibrated.is_empty(),
+        "withheld specs out of calibration:\n{}",
+        miscalibrated.join("\n")
+    );
+}
+
+/// #2317 calibration, every bundled case, both grading paths, every PR. A spec
+/// that passes the unchanged seed grades nothing; a spec that fails the honest
+/// answer fails everyone. Neither may land.
+///
+/// Unix-gated: specs run as real `cargo test` builds, and some shell out
+/// (015's spec runs its contract through `/bin/sh`).
+#[cfg(unix)]
+mod calibration {
+    use newt_eval::{
+        grade_behavioral, grade_workspace, pre_run, BehavioralGrade, TestCase, Verdict,
+    };
+    use std::path::Path;
+
+    /// The grade through both paths the ratchet uses: in-process on the tree,
+    /// as `newt-eval run` does, and `grade_workspace` on a copy, as
+    /// `newt-eval grade` does for a crew tree.
+    fn both_paths(case: &TestCase, tree: &Path, pre: &newt_eval::PreRun) -> [BehavioralGrade; 2] {
+        let single = grade_behavioral(case, tree, pre);
+        let copy = tempfile::tempdir().unwrap();
+        let mut opts = fs_extra::dir::CopyOptions::new();
+        opts.content_only = true;
+        fs_extra::dir::copy(tree, copy.path(), &opts).unwrap();
+        let crew = grade_workspace(case, copy.path(), pre)
+            .unwrap()
+            .behavioral
+            .expect("grade_workspace grades behaviorally");
+        [single, crew]
+    }
+
+    /// Every way `case` is out of calibration: the worker-applied honest answer
+    /// must PASS and the unchanged seed must FAIL, identically in both paths.
+    pub(super) fn check(case: &TestCase, honest: &newt_eval::RunOutcome) -> Vec<String> {
+        let seed = tempfile::tempdir().unwrap();
+        let mut opts = fs_extra::dir::CopyOptions::new();
+        opts.content_only = true;
+        fs_extra::dir::copy(case.workspace_fixture(), seed.path(), &opts).unwrap();
+        let seed_pre = pre_run(case, seed.path()).unwrap();
+
+        let mut problems = Vec::new();
+        for (tree, pre, want, label) in [
+            (
+                honest.workspace.as_path(),
+                &honest.pre_run,
+                Verdict::Pass,
+                "honest",
+            ),
+            (seed.path(), &seed_pre, Verdict::Fail, "seed"),
+        ] {
+            let [single, crew] = both_paths(case, tree, pre);
+            if single.verdict != want {
+                problems.push(format!(
+                    "[{}] {label}: expected {want}, got {single:?}",
+                    case.name
+                ));
+            }
+            if single != crew {
+                problems.push(format!(
+                    "[{}] {label}: paths disagree\n  single {single:?}\n  crew   {crew:?}",
+                    case.name
+                ));
+            }
+        }
+        problems
+    }
 }
 
 /// A fake Ollama whose every `POST /api/chat` answers `content`.
