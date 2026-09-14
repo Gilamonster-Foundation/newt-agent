@@ -76,6 +76,9 @@ struct ToolRec<'a> {
     /// `false` for a tool this session grants but this request's disposition
     /// does not admit (#2332): it is found, named, and never offered a schema.
     callable: bool,
+    /// `false` for an authorized tool whose schema is off the wire this turn
+    /// (#2331): described, marked, and loaded by its first call.
+    loaded: bool,
 }
 
 /// Collapse whitespace (incl. embedded newlines from wrapped string literals)
@@ -120,6 +123,7 @@ fn records(catalog: &serde_json::Value) -> Vec<ToolRec<'_>> {
             params,
             required,
             callable: true,
+            loaded: true,
         });
     }
     out
@@ -132,7 +136,7 @@ fn match_line(r: &ToolRec) -> String {
         return format!("- {} — {hidden}", r.name);
     }
     let desc = one_line(r.desc, DESC_MAX_CHARS);
-    if r.required.is_empty() {
+    let line = if r.required.is_empty() {
         format!("- {} — {desc}", r.name)
     } else {
         format!(
@@ -140,6 +144,11 @@ fn match_line(r: &ToolRec) -> String {
             r.name,
             r.required.join(", ")
         )
+    };
+    if r.loaded {
+        line
+    } else {
+        format!("{line} {}", super::tools::exposure::HIDDEN_SEARCH_MARK)
     }
 }
 
@@ -282,14 +291,28 @@ pub(crate) fn execute_tool_search_for_disposition(
     query: &str,
     catalog: &serde_json::Value,
     disposition: super::PromptDisposition,
+    hidden: Option<&super::tools::HiddenTools>,
 ) -> String {
+    fn mark<'a>(mut r: ToolRec<'a>, hidden: Option<&super::tools::HiddenTools>) -> ToolRec<'a> {
+        r.loaded = !hidden.is_some_and(|hidden| hidden.is_hidden(r.name));
+        r
+    }
     if disposition == super::PromptDisposition::Act {
-        return execute_tool_search(query, catalog);
+        return search(
+            query,
+            records(catalog)
+                .into_iter()
+                .map(|r| mark(r, hidden))
+                .collect(),
+        );
     }
     // The callable half goes through the disposition filter so the read-only
     // `git` definition, not the full one, is what gets described.
     let visible = super::tools::filter_tools_for_disposition(catalog.clone(), disposition);
-    let mut tools = records(&visible);
+    let mut tools: Vec<ToolRec<'_>> = records(&visible)
+        .into_iter()
+        .map(|r| mark(r, hidden))
+        .collect();
     tools.extend(
         records(catalog)
             .into_iter()
@@ -408,6 +431,7 @@ mod tests {
             "run_command",
             &full_catalog(),
             super::super::PromptDisposition::Explain,
+            None,
         );
         let voices = super::super::DispositionVoices::default();
         assert!(
@@ -443,6 +467,7 @@ mod tests {
             "run_command",
             &granted,
             super::super::PromptDisposition::Explain,
+            None,
         );
         assert!(!out.contains("- run_command"), "got: {out}");
     }
@@ -455,6 +480,7 @@ mod tests {
             "read a file",
             &full_catalog(),
             super::super::PromptDisposition::Explain,
+            None,
         );
         let first = out.lines().nth(1).unwrap_or_default();
         assert!(first.starts_with("- read_file — Read a file"), "got: {out}");
@@ -491,7 +517,7 @@ mod tests {
         ] {
             let callable = matches(&execute_tool_search(query, &filtered));
             checked += callable.len();
-            let mixed = execute_tool_search_for_disposition(query, &catalog, explain);
+            let mixed = execute_tool_search_for_disposition(query, &catalog, explain, None);
             let shown = matches(&mixed);
             let lost: Vec<&String> = callable.iter().filter(|t| !shown.contains(t)).collect();
             assert!(
