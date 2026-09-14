@@ -307,13 +307,14 @@ readme-check:
 # no-regression ratchet (exit 3 on a drop); `bench-publish` rewrites the README
 # scoreboard table. Every release: ingest → gate → publish. See
 # scripts/eval/bench_scoreboard.py (`just eval-selftest` for its unit tests).
-bench-ingest RUN_DIR MODEL FAMILY VERSION WINDOW DATE:
+# Trailing FLAGS pass through to the script, e.g. `--allow-incomplete` (#2316).
+bench-ingest RUN_DIR MODEL FAMILY VERSION WINDOW DATE *FLAGS:
     python3 scripts/eval/bench_scoreboard.py ingest {{RUN_DIR}} \
         --model {{MODEL}} --family {{FAMILY}} --version {{VERSION}} \
-        --window {{WINDOW}} --date {{DATE}}
+        --window {{WINDOW}} --date {{DATE}} {{FLAGS}}
 
-bench-gate MODEL SCORE:
-    python3 scripts/eval/bench_scoreboard.py gate --model {{MODEL}} --score {{SCORE}}
+bench-gate MODEL SCORE *FLAGS:
+    python3 scripts/eval/bench_scoreboard.py gate --model {{MODEL}} --score {{SCORE}} {{FLAGS}}
 
 # The README carries MEASURED models only (`--no-queued`) — the scoreboard is
 # the bragging right, not the to-do list. The full roster-tracking table, with
