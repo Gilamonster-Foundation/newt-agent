@@ -231,6 +231,7 @@ async fn fire_solve(
         context_window: None,
         model_digest: None,
         scratchpad_state: None,
+        require_feature: Vec::new(),
     };
     crate::solve::run(args).await
 }

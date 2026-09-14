@@ -67,6 +67,8 @@ pub struct ContractInputs<'a> {
     pub features: Option<InstantiatedFeatures>,
     /// Content id of the explicit scratchpad seed, when the run supplied one.
     pub scratchpad_seed: Option<&'a str>,
+    /// The features the run was told to require (`--require-feature`).
+    pub required: &'a [Feature],
 }
 
 /// How a turn ended, decided ONCE (#2212, corrected by #2218).
@@ -255,39 +257,105 @@ pub fn conditional_stanza(
     }
 }
 
+/// A `receipt.features` entry a run can be told to require (#2314), spelled on
+/// the command line exactly as in the receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum Feature {
+    Scratchpad,
+    CodeSearch,
+    Crew,
+}
+
+impl Feature {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Scratchpad => "scratchpad",
+            Self::CodeSearch => "code_search",
+            Self::Crew => "crew",
+        }
+    }
+
+    fn instantiated(self, f: InstantiatedFeatures) -> bool {
+        match self {
+            Self::Scratchpad => f.scratchpad,
+            Self::CodeSearch => f.code_search,
+            Self::Crew => f.crew,
+        }
+    }
+
+    /// THE absence table: why `newt solve` did not supply this feature, as the
+    /// receipt's `(state, reason)`. Admission reads it too, so a refusal and
+    /// the receipt cannot disagree.
+    fn absence(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Scratchpad => ("unavailable", "no --scratchpad-state was supplied"),
+            Self::CodeSearch => ("unsupported", "headless solve builds no retrieval index"),
+            Self::Crew => (
+                "unavailable",
+                "crew is not enabled for this run (NEWT_TEAM)",
+            ),
+        }
+    }
+}
+
+/// Refuse, before any model request, a required feature this run cannot
+/// supply; `supplies` answers for the run.
+pub fn admit_required(
+    required: &[Feature],
+    supplies: impl Fn(Feature) -> bool,
+) -> anyhow::Result<()> {
+    for &feature in required {
+        if !supplies(feature) {
+            let (state, reason) = feature.absence();
+            anyhow::bail!("required feature `{}` is {state}: {reason}", feature.key());
+        }
+    }
+    Ok(())
+}
+
 /// The `receipt` stanza's `features` section (#2314): what participated in
 /// the turn, derived from its constructed context. Each entry's `state` is
 ///
 /// * `instantiated` — in the context: advertised and executable;
 /// * `unsupported` — `newt solve` has no way to supply it;
 /// * `unavailable` — `newt solve` can supply it, but did not for this run;
-/// * `requested` — asked for, instantiation not yet established.
+/// * `requested` — required, but the turn did not confirm it was instantiated.
 ///
-/// A feature that did not participate carries a `reason`. An instantiated
-/// scratchpad also names its `scope` and `seed`: solve's only state source is
-/// the explicit seed, so the scope is always `fresh`.
+/// A feature that did not participate carries a `reason`, and a required one
+/// says `required: true`. With no turn outcome (`f` is `None`) only the
+/// requirements are known, so only they are listed; with none, the section is
+/// omitted. An instantiated scratchpad also names its `scope` and `seed`:
+/// solve's only state source is the explicit seed, so the scope is `fresh`.
 pub fn feature_receipt(
-    f: InstantiatedFeatures,
+    f: Option<InstantiatedFeatures>,
+    required: &[Feature],
     scratchpad_seed: Option<&str>,
-) -> serde_json::Value {
-    let entry = |instantiated: bool, state: &str, reason: &str| {
-        if instantiated {
-            serde_json::json!({ "state": "instantiated" })
-        } else {
-            serde_json::json!({ "state": state, "reason": reason })
+) -> Option<serde_json::Value> {
+    use clap::ValueEnum;
+    let mut features = serde_json::Map::new();
+    for &feature in Feature::value_variants() {
+        let is_required = required.contains(&feature);
+        let mut entry = match f {
+            Some(f) if feature.instantiated(f) => serde_json::json!({ "state": "instantiated" }),
+            _ if is_required => serde_json::json!({
+                "state": "requested",
+                "reason": "required, but the turn did not confirm it was instantiated",
+            }),
+            Some(_) => {
+                let (state, reason) = feature.absence();
+                serde_json::json!({ "state": state, "reason": reason })
+            }
+            None => continue,
+        };
+        conditional_stanza(&mut entry, "required", is_required.then_some(true));
+        if feature == Feature::Scratchpad && entry["state"] == "instantiated" {
+            conditional_stanza(&mut entry, "scope", scratchpad_seed.map(|_| "fresh"));
+            conditional_stanza(&mut entry, "seed", scratchpad_seed);
         }
-    };
-    let mut receipt = serde_json::json!({ "features": {
-        "scratchpad": entry(f.scratchpad, "unavailable", "no --scratchpad-state was supplied"),
-        "code_search": entry(f.code_search, "unsupported", "headless solve builds no retrieval index"),
-        "crew": entry(f.crew, "unavailable", "crew is not enabled for this run"),
-    }});
-    if f.scratchpad {
-        let scratchpad = &mut receipt["features"]["scratchpad"];
-        conditional_stanza(scratchpad, "scope", scratchpad_seed.map(|_| "fresh"));
-        conditional_stanza(scratchpad, "seed", scratchpad_seed);
+        features.insert(feature.key().into(), entry);
     }
-    receipt
+    (!features.is_empty()).then(|| serde_json::json!({ "features": features }))
 }
 
 /// Build THE contract record — exactly the `contract_version: "1"` fields.
@@ -326,7 +394,7 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         "timing": timing,
     });
     conditional_stanza(&mut record, "model_digest", i.model_digest);
-    let receipt = i.features.map(|f| feature_receipt(f, i.scratchpad_seed));
+    let receipt = feature_receipt(i.features, i.required, i.scratchpad_seed);
     conditional_stanza(&mut record, "receipt", receipt);
     record
 }
@@ -671,6 +739,7 @@ mod tests {
                 ..InstantiatedFeatures::default()
             }),
             scratchpad_seed: None,
+            required: &[],
         }
     }
 
@@ -896,9 +965,56 @@ mod tests {
             ..InstantiatedFeatures::default()
         };
         assert_eq!(
-            feature_receipt(f, Some("bseed"))["features"]["scratchpad"],
+            feature_receipt(Some(f), &[], Some("bseed")).unwrap()["features"]["scratchpad"],
             serde_json::json!({"state": "instantiated", "scope": "fresh", "seed": "bseed"})
         );
+    }
+
+    /// `requested` is what a required feature reports when the turn did not
+    /// confirm it: a drift past admission, or no outcome at all. Unrequired
+    /// entries keep their ordinary states, and with no outcome and no
+    /// requirement nothing is known, so nothing is written.
+    #[test]
+    fn a_required_feature_the_turn_did_not_confirm_is_requested() {
+        let requested = serde_json::json!({
+            "state": "requested",
+            "reason": "required, but the turn did not confirm it was instantiated",
+            "required": true,
+        });
+        let crew_only = InstantiatedFeatures {
+            crew: true,
+            ..InstantiatedFeatures::default()
+        };
+        let receipt =
+            feature_receipt(Some(crew_only), &[Feature::Crew, Feature::Scratchpad], None).unwrap();
+        assert_eq!(
+            receipt["features"]["crew"],
+            serde_json::json!({"state": "instantiated", "required": true})
+        );
+        assert_eq!(receipt["features"]["scratchpad"], requested);
+        assert_eq!(receipt["features"]["code_search"]["state"], "unsupported");
+
+        assert_eq!(
+            feature_receipt(None, &[Feature::Scratchpad], None),
+            Some(serde_json::json!({"features": {"scratchpad": requested}}))
+        );
+        assert_eq!(feature_receipt(None, &[], None), None);
+    }
+
+    /// Admission refuses with the receipt's own state and reason, and admits a
+    /// requirement the run supplies.
+    #[test]
+    fn admission_names_the_receipts_state_and_reason() {
+        let refused = admit_required(&[Feature::Crew, Feature::CodeSearch], |f| {
+            f == Feature::Crew
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            refused,
+            "required feature `code_search` is unsupported: headless solve builds no retrieval index"
+        );
+        assert!(admit_required(&[Feature::Crew], |f| f == Feature::Crew).is_ok());
     }
 
     /// The guard's twin: an optional stanza that collides with a field already

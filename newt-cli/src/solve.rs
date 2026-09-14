@@ -99,6 +99,8 @@ pub struct SolveArgs {
     /// `--scratchpad-state`: the explicit starting state that opts the run into
     /// the scratchpad (#2314). `None` keeps the headless baseline.
     pub scratchpad_state: Option<PathBuf>,
+    /// `--require-feature`: features the run must be able to supply (#2314).
+    pub require_feature: Vec<solve_contract::Feature>,
 }
 
 /// Seed a fresh scratchpad from `--scratchpad-state` JSON, returning the store
@@ -421,6 +423,13 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // contract's effective_config — the bench never re-derives it from a
     // profile (contract requirement 5).
     let runtime = resolve_runtime_posture(&cfg, caps.family_for_route(&destination, principal));
+    // #2314: a required feature this run cannot supply stops here, before the
+    // instruction is read or anything reaches a backend.
+    solve_contract::admit_required(&args.require_feature, |feature| match feature {
+        solve_contract::Feature::Scratchpad => scratchpad.is_some(),
+        solve_contract::Feature::Crew => runtime.crew,
+        solve_contract::Feature::CodeSearch => false,
+    })?;
     let tenacity_level = runtime.tenacity.label();
     let cognition = projected_cognition(runtime.cognition, kind, api, chat_capability);
     // `None` means Newt projects no cognition controls. Call that `default`
@@ -788,6 +797,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
             smart_harness: smart_manifest.as_ref(),
             features: o_opt.map(|o| o.features),
             scratchpad_seed: scratchpad.as_ref().map(|(_, seed)| seed.as_str()),
+            required: &args.require_feature,
         },
     ));
     if let Some(path) = &args.events {

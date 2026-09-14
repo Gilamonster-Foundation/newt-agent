@@ -518,6 +518,84 @@ bounded_reasoning_continuation = true
     }
 }
 
+/// #2314: a required feature this run cannot supply stops the solve before any
+/// model request, naming the feature and why. `.failure()` alone would also
+/// pass for an unknown flag, so each refusal asserts its stderr text; the twin
+/// shows the same guard admitting a requirement the run does supply.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_required_feature_that_cannot_be_supplied_fails_before_inference() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(CaptureThenFinish {
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let instruction_path = fixture.path().join("instruction.md");
+    let seed_path = fixture.path().join("seed.json");
+    let events_path = fixture.path().join("events.jsonl");
+    std::fs::write(&instruction_path, "Finish without calling a tool.\n")
+        .expect("write solve instruction");
+    std::fs::write(&seed_path, r#"{"k": "v"}"#).expect("write scratchpad seed");
+    let solve = |extra: &[&std::ffi::OsStr]| {
+        let mut command = Command::cargo_bin("newt").expect("newt binary");
+        command
+            .env_remove("NEWT_TEAM")
+            .args(["--backend-endpoint", &server.uri()])
+            .args(["--backend-model", NEMOTRON_MODEL])
+            .args(["--backend-kind", "openai"])
+            .args(["solve", "--cwd"])
+            .arg(fixture.path())
+            .arg("--instruction-file")
+            .arg(&instruction_path)
+            .arg("--events")
+            .arg(&events_path)
+            .args(["--max-rounds", "1"])
+            .args(extra);
+        command
+    };
+
+    for (feature, state) in [
+        ("code_search", "unsupported"),
+        ("crew", "unavailable"),
+        ("scratchpad", "unavailable"),
+    ] {
+        solve(&["--require-feature".as_ref(), feature.as_ref()])
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(format!(
+                "required feature `{feature}` is {state}"
+            )));
+    }
+    assert!(
+        requests.lock().expect("request capture lock").is_empty(),
+        "a refused requirement must not reach the model"
+    );
+    assert!(!events_path.exists(), "a refused run records no trace");
+
+    solve(&[
+        "--require-feature".as_ref(),
+        "scratchpad".as_ref(),
+        "--scratchpad-state".as_ref(),
+        seed_path.as_os_str(),
+    ])
+    .assert()
+    .success();
+    let body = requests
+        .lock()
+        .expect("request capture lock")
+        .pop()
+        .expect("the admitted run reached the model");
+    assert!(advertised_tool(&body, "state_set"), "{body}");
+    let scratchpad = &contract_from(&events_path)["receipt"]["features"]["scratchpad"];
+    assert_eq!(scratchpad["state"], "instantiated", "{scratchpad}");
+    assert_eq!(scratchpad["required"], true, "{scratchpad}");
+}
+
 /// #2314: `--scratchpad-state` is the headless opt-in. The seeded state must
 /// reach the model as the literal `<state>` block with the state tools
 /// advertised, and the receipt must name the fresh scope and the seed it was
