@@ -123,6 +123,19 @@ basename. It is a fingerprint, not a content digest: the router exposes no
 weights hash. A digest written after a model id in the roster is recorded as
 declared and unverified, and newt receives it as `NEWT_MODEL_DIGEST`.
 
+`tb_campaign.py table <out> --pair` adds one section per treatment. It compares
+each treatment cell with its model and harness's `none` cell, task by task, for
+both resolve-rate definitions:
+- **Primary interval:** a task-clustered paired bootstrap. Tasks are resampled
+  with their trials kept together, with a fixed seed. It is reported only with at
+  least 5 paired tasks, because trials within a task are correlated.
+- **Secondary interval:** Newcombe's hybrid score, which assumes independent
+  trials, labelled as such.
+- **Also shown:** tasks better, worse and tied; a floor or ceiling that makes a
+  pair blind; and unpaired tasks.
+
+A skipped or off-pin cell is never paired.
+
 Reading the table:
 - **Claimed done** comes from each harness's own log. newt's claim is the
   contract `outcome: completed`, pi's is a final `stopReason: stop`, and Codex's

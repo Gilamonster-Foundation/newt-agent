@@ -10,8 +10,8 @@ import unittest
 from pathlib import Path
 
 from tb_campaign import (
-    PINNED, build_cell, codex_claim, error_cause, harness_evidence, load_treatment, newt_claim, observed,
-    pi_claim, pin_extend, pin_mismatch, render_profile, summarize, wilson,
+    PINNED, build_cell, codex_claim, error_cause, harness_evidence, load_treatment, newcombe, newt_claim, observed,
+    pair, pair_report, pi_claim, pin_extend, pin_mismatch, render_profile, summarize, wilson,
 )
 
 HARBOR = Path(__file__).resolve().parent.parent
@@ -33,8 +33,16 @@ def row(**kw):
 class Claims(unittest.TestCase):
     def test_newt_uses_the_last_contract_outcome(self):
         lines = jl({"kind": "solve_result", "status": "completed"}, {"outcome": "timeout"})
-        self.assertEqual(newt_claim(lines), (False, "contract outcome=timeout"))
+        self.assertEqual(newt_claim(lines), (False, "contract outcome=timeout, solve_result status=completed"))
         self.assertIsNone(newt_claim(jl({"kind": "chat_completion_finish"})))
+
+    def test_newt_claims_done_only_when_outcome_and_status_are_both_completed(self):
+        # #2315: RepairExhausted / VerificationIncomplete map to outcome completed but
+        # status incomplete. newt itself says "not done", so that is not a claim.
+        incomplete = jl({"kind": "solve_result", "status": "incomplete"}, {"outcome": "completed"})
+        self.assertEqual(newt_claim(incomplete)[0], False)
+        done = jl({"kind": "solve_result", "status": "completed"}, {"outcome": "completed"})
+        self.assertEqual(newt_claim(done)[0], True)
 
     def test_pi_claims_only_on_a_final_stop(self):
         def end(reason):
@@ -104,6 +112,8 @@ class Summary(unittest.TestCase):
         self.assertEqual((s["false_completions"], s["false_incompletes"]), (2, 1))
         self.assertEqual((s["unrecoverable_claims"], s["exceptions"], s["model_mismatches"]), (1, 2, 1))
         self.assertEqual((s["inference_errors"], s["agent_timeouts"], s["max_request_output"]), (1, 1, 96345))
+        self.assertEqual(summarize({"expected": 1, "model": "m"}, [row(harness_outcome="completed", harness_status="incomplete",
+                                                                       claimed_done=False)])["terminal_not_done"], 1)
         self.assertEqual((s["rate_excl"], s["rate_agent_fail"], s["causes"]), ((2, 5), (2, 6), (2, 1, 0)))
         self.assertEqual(s["tokens_in"], (0, 0))  # none known: count 0, not a zero cost
 
@@ -187,6 +197,65 @@ class Pinning(unittest.TestCase):
         self.assertEqual(pin_mismatch(pin, pi), [])
         pin_extend(pin, {**pi, "harness_version": "0.85.1"})
         self.assertEqual(pin_mismatch(pin, {**pi, "harness_version": "0.86.0"}), ["harness_version"])
+
+
+def arm(outcomes, **kw):
+    """Rows for one arm from {task: [resolved?, ...]}."""
+    return [row(task=task, resolved=ok, reward=1.0 if ok else 0.0, **kw)
+            for task, oks in outcomes.items() for ok in oks]
+
+
+class Pairing(unittest.TestCase):
+    TASKS = ("a", "b", "c", "d", "e")
+
+    def test_newcombe_matches_a_hand_computed_value(self):
+        lo, hi = newcombe(3, 12, 0, 12)
+        self.assertAlmostEqual(lo, -0.0411, places=3)
+        self.assertAlmostEqual(hi, 0.5323, places=3)
+
+    def test_a_uniform_effect_has_a_tight_interval(self):
+        p = pair(arm({t: [False] * 3 for t in self.TASKS}), arm({t: [True] * 3 for t in self.TASKS}), "excl")
+        self.assertEqual((p["diff"], p["bootstrap"], p["better"], p["floor"]), (1.0, (1.0, 1.0), 5, False))
+
+    def test_one_correlated_task_widens_the_clustered_interval_beyond_newcombe(self):
+        # The treatment wins 3/3 on ONE task and nothing elsewhere: one cluster, not 3 independent wins.
+        base = arm({t: [False] * 3 for t in self.TASKS})
+        treat = arm({"a": [True] * 3, **{t: [False] * 3 for t in self.TASKS[1:]}})
+        p = pair(base, treat, "excl")
+        self.assertEqual((p["diff"], p["better"], p["tied"]), (0.2, 1, 4))
+        self.assertEqual(p["bootstrap"][0], 0.0)
+        self.assertGreater(p["bootstrap"][1], p["newcombe"][1])
+
+    def test_bootstrap_is_reproducible_and_seeded(self):
+        base = arm({"a": [True, False, False], "b": [False] * 3, "c": [True] * 3, "d": [False, True, False]})
+        treat = arm({"a": [True] * 3, "b": [False, True, False], "c": [True, True, False], "d": [False] * 3})
+        self.assertEqual(pair(base, treat, "excl")["bootstrap"], pair(base, treat, "excl")["bootstrap"])
+
+    def test_floor_ceiling_unpaired_and_too_few_tasks_are_named(self):
+        p = pair(arm({"a": [False] * 3, "b": [False] * 3}), arm({"a": [False] * 3, "z": [False] * 3}), "excl")
+        self.assertEqual((p["diff"], p["floor"], p["unpaired"]), (0.0, True, ["b", "z"]))
+        self.assertIsNone(p["bootstrap"])  # 1 paired task: no between-task variance to resample
+        self.assertTrue(pair(arm({"a": [True]}), arm({"a": [True]}), "excl")["ceiling"])
+
+    def test_rate_definitions_choose_the_trials(self):
+        base = arm({"a": [False, False]})
+        treat = arm({"a": [True]}) + [row(task="a", state="error", error_cause="agent")]  # runaway, reward 0
+        self.assertEqual(pair(base, treat, "excl")["treat"], (1, 1))
+        self.assertEqual(pair(base, treat, "agent_fail")["treat"], (1, 2))
+
+    def test_report_refuses_to_pair_across_a_skipped_or_off_pin_cell(self):
+        cells = {
+            "m__newt": {"job": "m__newt", "model": "m", "harness": "newt", "treatment": "none"},
+            "m__newt__smart": {"job": "m__newt__smart", "model": "m", "harness": "newt", "treatment": "smart",
+                               "pin_mismatch": ["model_fingerprint"]},
+        }
+        self.assertIn("Not paired", pair_report(cells, []))
+        cells["m__newt__smart"].pop("pin_mismatch")
+        rows = [dict(r, job="m__newt") for r in arm({"a": [False] * 3})] + \
+               [dict(r, job="m__newt__smart") for r in arm({"a": [True] * 3})]
+        report = pair_report(cells, rows)
+        self.assertIn("Δ = 3/3 − 0/3 = +1.00", report)
+        self.assertIn("task-clustered paired bootstrap 95% not reported (1 paired tasks; needs 5)", report)
 
 
 if __name__ == "__main__":
