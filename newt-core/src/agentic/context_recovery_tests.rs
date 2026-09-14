@@ -150,7 +150,7 @@ async fn overflow_smart_projection_cannot_skip_elision_due_to_per_message_roundi
                 })
                 .map(|candidate| candidate["cid"].clone())
                 .collect::<Vec<_>>();
-            Box::pin(async move { Ok(serde_json::to_string(&selected).unwrap()) })
+            Box::pin(async move { Ok((serde_json::to_string(&selected).unwrap(), None)) })
         }),
         Default::default(),
     )
@@ -205,7 +205,7 @@ async fn overflow_smart_responses_projection_cannot_skip_elision_due_to_rounding
                 .filter(|candidate| candidate["required"] == true)
                 .map(|candidate| candidate["cid"].clone())
                 .collect::<Vec<_>>();
-            Box::pin(async move { Ok(serde_json::to_string(&selected).unwrap()) })
+            Box::pin(async move { Ok((serde_json::to_string(&selected).unwrap(), None)) })
         }),
         Default::default(),
     )

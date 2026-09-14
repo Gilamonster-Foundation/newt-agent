@@ -126,6 +126,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         persona_tools: Some(persona_allow()),
         cognition: None,
         chat_completions_capability: Default::default(),
+        output_allowance: None,
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
         emits_leading_reasoning: false,
         max_tool_rounds: 8,
@@ -305,6 +306,42 @@ async fn stream_off_valve_sends_stream_false_in_the_body() {
         serde_json::json!(false),
         "NEWT_ANTHROPIC_STREAM=off must send stream:false"
     );
+}
+
+/// #2312: Anthropic REQUIRES `max_tokens`, so it always carries the resolved
+/// allowance. Tiers: explicit allowance > cognition table > wire default
+/// (`NEWT_ANTHROPIC_MAX_TOKENS`, else 8192). The env var is the lowest tier.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn explicit_output_allowance_outranks_the_anthropic_env_default() {
+    let mut env = test_env(false);
+    env.push(EnvGuard::set("NEWT_ANTHROPIC_MAX_TOKENS", "5000"));
+    for (output_allowance, sent) in [(None, 5_000), (Some(3_000), 3_000)] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(json_reply(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text": "capped"}]),
+                3,
+                2,
+            ))
+            .mount(&server)
+            .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.output_allowance = output_allowance;
+        chat_complete(c, &mut NoMcp).await.expect("dispatch");
+        let requests = server.received_requests().await.expect("recorded");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            body_json(&requests[0])["max_tokens"],
+            sent,
+            "{output_allowance:?}"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------

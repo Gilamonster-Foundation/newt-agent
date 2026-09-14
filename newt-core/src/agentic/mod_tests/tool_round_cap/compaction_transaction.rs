@@ -18,7 +18,7 @@ async fn compact_responses_input_post_fence_overflow_is_transactional() {
     let c = calls.clone();
     let summ: Summarizer = Box::new(move |_r: String| {
         c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Box::pin(async { Ok("a short summary".to_string()) })
+        Box::pin(async { Ok(("a short summary".to_string(), None)) })
     });
     let mut input = vec![serde_json::json!({"role": "user", "content": "the task"})];
     for i in 0..6 {
@@ -162,7 +162,7 @@ async fn compact_responses_input_refusal_is_transactional() {
 async fn compact_responses_input_commits_only_on_success() {
     use crate::agentic::compress::{CompressState, Summarizer};
     let summ: Summarizer =
-        Box::new(|_r: String| Box::pin(async { Ok("brief summary".to_string()) }));
+        Box::new(|_r: String| Box::pin(async { Ok(("brief summary".to_string(), None)) }));
     let mut input = vec![serde_json::json!({"role": "user", "content": "task"})];
     for i in 0..6 {
         input.push(assistant(i, 300));
@@ -230,8 +230,9 @@ async fn compact_responses_input_spill_store_is_transactional() {
         v.push(serde_json::json!({"role": "user", "content": "recent turn"}));
         v
     };
-    let summarizer =
-        || -> Summarizer { Box::new(|_r: String| Box::pin(async { Ok("brief".to_string()) })) };
+    let summarizer = || -> Summarizer {
+        Box::new(|_r: String| Box::pin(async { Ok(("brief".to_string(), None)) }))
+    };
 
     // REJECT (tiny actionable budget → post-fence overflow): store stays EMPTY.
     {
@@ -337,7 +338,8 @@ fn spill_middle_input() -> Vec<serde_json::Value> {
 #[tokio::test]
 async fn compact_responses_input_no_store_emits_no_retrieval_handle() {
     use crate::agentic::compress::Summarizer;
-    let summ: Summarizer = Box::new(|_r: String| Box::pin(async { Ok("brief".to_string()) }));
+    let summ: Summarizer =
+        Box::new(|_r: String| Box::pin(async { Ok(("brief".to_string(), None)) }));
     let mut input = spill_middle_input();
     let mut state = crate::agentic::compress::CompressState::new();
     let outcome = compact_responses_input(
@@ -381,7 +383,8 @@ async fn compact_responses_input_names_a_resolvable_content_handle() {
     use crate::agentic::compress::Summarizer;
     use crate::agentic::content_spill::{SessionSpillStore, SpillCid, SpillStore};
     let store = SessionSpillStore::new([7u8; 16]);
-    let summ: Summarizer = Box::new(|_r: String| Box::pin(async { Ok("brief".to_string()) }));
+    let summ: Summarizer =
+        Box::new(|_r: String| Box::pin(async { Ok(("brief".to_string(), None)) }));
     let mut input = spill_middle_input();
     let mut state = crate::agentic::compress::CompressState::new();
     let outcome = compact_responses_input(

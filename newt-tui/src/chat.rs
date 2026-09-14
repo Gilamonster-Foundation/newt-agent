@@ -284,6 +284,7 @@ fn context_gauge_budget(
     observed_context_window: Option<u32>,
     input_ceiling_pct: u32,
     cognition: Option<newt_core::role_profile::Cognition>,
+    output_allowance: Option<u32>,
     chat_capability: newt_core::model_card::ChatCompletionsCapability,
     reasoning_replay_scope: newt_core::model_card::ReasoningReplayScope,
     max_ok_input: Option<u32>,
@@ -296,6 +297,7 @@ fn context_gauge_budget(
             window,
             input_ceiling_pct,
             cognition,
+            output_allowance,
             chat_capability,
             reasoning_replay_scope,
             max_ok_input,
@@ -7645,6 +7647,8 @@ fn session_body(
                                         cognition,
                                         chat_completions_capability: choice
                                             .capability_decision().chat_completions(),
+                                        output_allowance: model_tune
+                                            .and_then(|t| t.output_allowance),
                                         reasoning_replay_scope: choice
                                             .capability_decision()
                                             .reasoning_replay_scope(),
@@ -8319,6 +8323,7 @@ fn session_body(
                                         recovered_context_window.get(),
                                         eff_input_ceiling_pct,
                                         cognition,
+                                        model_tune.and_then(|t| t.output_allowance),
                                         choice.capability_decision().chat_completions(),
                                         choice.capability_decision().reasoning_replay_scope(),
                                         gauge_max_ok,

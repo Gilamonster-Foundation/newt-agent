@@ -81,7 +81,8 @@ pub struct TurnMetrics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
 
-    /// Estimated monetary cost in USD (`None` when local/free or rate unknown).
+    /// Estimated monetary cost in USD. `Some(0.0)` is a confirmed free (local)
+    /// rate; `None` is UNKNOWN — no rate, or no usage — never zero (#2313).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
 
@@ -113,6 +114,7 @@ impl TurnMetrics {
     /// Examples:
     /// - `"3.2s · 847 in / 312 out · free (local)"`
     /// - `"8.7s · 1,204 in / 892 out · ~$0.0041"`
+    /// - `"4.0s · 900 in / 120 out · cost unknown"` (usage, but no rate)
     /// - `"5.1s · (tokens unavailable)"`
     pub fn display_line(&self) -> String {
         let elapsed = if self.elapsed_ms >= 1000 {
@@ -135,7 +137,7 @@ impl TurnMetrics {
             Some(c) if c < 0.001 => format!("~${c:.5}"),
             Some(c) if c < 0.01 => format!("~${c:.4}"),
             Some(c) => format!("~${c:.4}"),
-            None if self.usage.is_some() => "free (local)".into(),
+            None if self.usage.is_some() => "cost unknown".into(),
             None => String::new(),
         };
 
@@ -299,6 +301,27 @@ mod tests {
         assert!(line.contains("847"), "got: {line}");
         assert!(line.contains("312"), "got: {line}");
         assert!(line.contains("free (local)"), "got: {line}");
+    }
+
+    /// #2313: usage with no price is UNKNOWN cost, never "free (local)" — only
+    /// a confirmed `Some(0.0)` (a priced local model) is free. Unknown stays
+    /// unknown on the wire too: `cost_usd` is omitted, never a zero.
+    #[test]
+    fn unpriced_usage_is_unknown_cost_not_free_local() {
+        let unpriced = metrics(3200, 847, 312, None);
+        let line = unpriced.display_line();
+        assert!(!line.contains("free (local)"), "got: {line}");
+        assert!(
+            line.contains("847 in / 312 out · cost unknown"),
+            "got: {line}"
+        );
+        let json = serde_json::to_value(&unpriced).unwrap();
+        assert!(json.get("cost_usd").is_none(), "got: {json}");
+
+        // Twin: a confirmed zero price is still free, and serializes as 0.
+        let free = metrics(3200, 847, 312, Some(0.0));
+        assert!(free.display_line().contains("free (local)"));
+        assert_eq!(serde_json::to_value(&free).unwrap()["cost_usd"], 0.0);
     }
 
     #[test]

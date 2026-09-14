@@ -14,6 +14,7 @@ fn responses_honors_the_configured_window_as_a_local_safety_limit() {
         Some(32_768),
         80,
         Some(Cognition::Contemplating),
+        None,
         ChatCompletionsCapability {
             cognition: Some(true),
             ..Default::default()
@@ -38,6 +39,7 @@ fn responses_honors_the_configured_window_as_a_local_safety_limit() {
             None,
             80,
             Some(Cognition::Contemplating),
+            None,
             ChatCompletionsCapability {
                 cognition: Some(true),
                 ..Default::default()
@@ -88,13 +90,20 @@ fn seam_projects_the_responses_budget_state_for_every_cognition() {
                 num_ctx,
                 80,
                 cognition,
+                None,
                 capability,
                 ReasoningReplayScope::CurrentUserTurn,
                 max_ok_input,
                 safe_context,
             );
-            let state =
-                ResponsesBudgetState::new(num_ctx, 80, cognition, max_ok_input, safe_context, None);
+            let state = ResponsesBudgetState::new(
+                num_ctx,
+                80,
+                resolve_output_allowance(None, cognition),
+                max_ok_input,
+                safe_context,
+                None,
+            );
             assert_eq!(
                 seam,
                 state
@@ -114,6 +123,7 @@ fn seam_projects_the_responses_budget_state_for_every_cognition() {
         Some(32_768),
         80,
         Some(Cognition::Contemplating),
+        None,
         capability,
         ReasoningReplayScope::CurrentUserTurn,
         None,

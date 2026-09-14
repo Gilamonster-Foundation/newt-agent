@@ -64,7 +64,7 @@ async fn manual_compress_shrinks_session_and_notice_is_truthful() {
 
     let summarizer: newt_core::Summarizer =
         Box::new(|_req: String| -> newt_core::SummarizeFuture {
-            Box::pin(async { Ok("## Active Task\nMANUAL SUMMARY".to_string()) })
+            Box::pin(async { Ok(("## Active Task\nMANUAL SUMMARY".to_string(), None)) })
         });
     let mut state = newt_core::CompressState::new();
     let outcome = newt_core::compress_user_initiated(
@@ -183,7 +183,7 @@ async fn compress_focus_secret_never_reaches_summarizer() {
             let seen = seen.clone();
             Box::pin(async move {
                 seen.lock().unwrap().push(req);
-                Ok("SUMMARY".to_string())
+                Ok(("SUMMARY".to_string(), None))
             })
         });
     let mut state = newt_core::CompressState::new();

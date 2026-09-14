@@ -83,7 +83,7 @@ async fn run_overflow(
                 } else {
                     "\"answer\"".to_string()
                 };
-                Box::pin(async move { Ok(reply) })
+                Box::pin(async move { Ok((reply, None)) })
             }),
             Default::default(),
         )

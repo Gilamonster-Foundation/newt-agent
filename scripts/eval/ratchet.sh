@@ -54,14 +54,36 @@ emit() { # task mode model behavioral details...
 case "$MODE" in
   single)
     [ -n "$MODEL" ] || { echo "ratchet: --mode single needs --model" >&2; exit 2; }
-    out="$("$NEWT_EVAL" run --case "$TASK" --model "$MODEL" $CODER \
+    out="$("$NEWT_EVAL" run --json --case "$TASK" --model "$MODEL" $CODER \
             --worker-timeout-ms "$WORKER_TIMEOUT_MS" 2>/dev/null)"
     echo "$out" >&2
-    # Behavioral truth = the tests_pass row.
-    tp="$(awk '$2=="tests_pass"{print $3}' <<<"$out")"
-    behavioral=$([ "$tp" = "ok" ] && echo PASS || echo FAIL)
-    allok=$(awk '$1=="'"$TASK"'"&&$3!="ok"{n++} END{print (n?"no":"yes")}' <<<"$out")
-    emit "$behavioral" "tests_pass=$tp all_evaluators_ok=$allok"
+    # Behavioral truth = the tests_pass result, read by KEY from the scorecard
+    # JSON — never by column from the human table, whose reshaping (#1883)
+    # emptied tests_pass= on every row here until #2317. ok → PASS, fail →
+    # FAIL, skipped (ran no test) → UNGRADABLE, no grade produced → ERROR.
+    IFS=$'\t' read -r behavioral details < <(python3 -c '
+import json, sys
+try:
+    rows = [r for c in json.load(sys.stdin)["cases"] if c["case_name"] == sys.argv[1] for r in c["results"]]
+except (ValueError, KeyError, TypeError):
+    rows = []
+tp = next((r for r in rows if r["evaluator"] == "tests_pass"), None)
+if tp is None:
+    if any(r["evaluator"] == "runner" and not r["passed"] for r in rows):
+        verdict = "ERROR(runner)"
+    else:
+        verdict = "UNGRADABLE(no_grader)" if rows else "ERROR(no_scorecard)"
+    status, ran = "", "0"
+elif tp.get("skipped"):
+    verdict, status, ran = "UNGRADABLE(no_tests)", "skipped", "0"
+elif tp["passed"]:
+    verdict, status, ran = "PASS", "ok", "unknown"
+else:
+    verdict, status, ran = "FAIL", "fail", "unknown"
+allok = "yes" if rows and all(r["passed"] for r in rows) else "no"
+print(f"{verdict}\tgrader=tests_pass spec_cid=none tests_run={ran} tests_pass={status} all_evaluators_ok={allok}")
+' "$TASK" <<<"$out")
+    emit "$behavioral" "$details"
     ;;
   crew)
     [ -x "$NEWT" ] || { echo "ratchet: newt binary not at $NEWT (build it / set NEWT_BIN)" >&2; exit 2; }
