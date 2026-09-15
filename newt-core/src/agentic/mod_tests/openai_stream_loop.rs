@@ -943,6 +943,44 @@ async fn a_primary_stream_rejected_by_strict_decoding_is_failed_with_its_reporte
     }
 }
 
+/// Send one request to `url` through `dispatch_with_decoder` (no retries) with
+/// the strict OpenAI decoder, expecting it to fail; returns the error and the
+/// one attempt it recorded.
+async fn failed_dispatch_attempt(url: &str) -> (anyhow::Error, crate::attempts::AttemptRecord) {
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let scope = attempt_capture::AttemptScope {
+        ledger: &ledger,
+        turn: "prompt:turn",
+        model: "test-model",
+        backend: "test-backend",
+    };
+    let policy = RetryPolicy {
+        max_retries: 0,
+        base: std::time::Duration::ZERO,
+        max: std::time::Duration::ZERO,
+        jitter: false,
+    };
+    let error = dispatch_with_decoder(
+        &policy,
+        Some(scope),
+        || async {
+            Ok(reqwest::Client::new()
+                .post(url)
+                .json(&serde_json::json!({})))
+        },
+        "inference endpoint",
+        |_, _, _| {},
+        None,
+        smart_harness::decode_openai_response,
+    )
+    .await
+    .expect_err("the response is rejected");
+    let ledger = ledger.lock().unwrap();
+    let records: Vec<_> = ledger.records().cloned().collect();
+    assert_eq!(records.len(), 1);
+    (error, records[0].clone())
+}
+
 /// Item 1's other primary send: `dispatch_with_decoder` (the cap-exit summary)
 /// keeps a strictly rejected response's usage on its failed attempt too.
 #[tokio::test]
@@ -957,44 +995,54 @@ async fn dispatch_with_decoder_keeps_a_strictly_rejected_responses_usage() {
         ]))
         .mount(&server)
         .await;
-    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
-    let scope = attempt_capture::AttemptScope {
-        ledger: &ledger,
-        turn: "prompt:turn",
-        model: "test-model",
-        backend: "test-backend",
-    };
-    let policy = RetryPolicy {
-        max_retries: 0,
-        base: std::time::Duration::ZERO,
-        max: std::time::Duration::ZERO,
-        jitter: false,
-    };
     let url = format!("{}/v1/chat/completions", server.uri());
-    let error = dispatch_with_decoder(
-        &policy,
-        Some(scope),
-        || async {
-            Ok(reqwest::Client::new()
-                .post(&url)
-                .json(&serde_json::json!({})))
-        },
-        "inference endpoint",
-        |_, _, _| {},
-        None,
-        smart_harness::decode_openai_response,
-    )
-    .await
-    .expect_err("a stream with no finish reason is rejected");
+    let (error, record) = failed_dispatch_attempt(&url).await;
     assert!(
         format!("{error:#}").contains("no finish reason"),
         "{error:#}"
     );
-    let ledger = ledger.lock().unwrap();
-    let records: Vec<_> = ledger.records().collect();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].state, crate::attempts::AttemptState::Failed);
-    assert_eq!(records[0].usage, reissue_usage());
+    assert_eq!(record.state, crate::attempts::AttemptState::Failed);
+    assert_eq!(record.usage, reissue_usage());
+}
+
+/// Review round 3, item e: a 2xx stream whose connection drops after the usage
+/// chunk fails as a body read error, and the failed attempt keeps that usage.
+/// The declared `Content-Length` is never met, so the read is an error, not EOF.
+#[tokio::test]
+async fn a_stream_dropped_after_its_usage_chunk_is_failed_with_that_usage() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut scratch = [0u8; 8192];
+        assert!(
+            sock.read(&mut scratch).await.unwrap() > 0,
+            "the client asked"
+        );
+        let body = format!(
+            "data: {}\n\ndata: {REISSUE_USAGE}\n\n",
+            r#"{"choices":[{"delta":{"content":"half an answ"}}]}"#
+        );
+        let head =
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\n\r\n";
+        sock.write_all(format!("{head}{body}").as_bytes())
+            .await
+            .unwrap();
+        // Dropping the socket here cuts the body short of its declared length.
+    });
+    let (error, record) = failed_dispatch_attempt(&url).await;
+    server.abort();
+    assert!(
+        format!("{error:#}").contains("request failed reading response"),
+        "{error:#}"
+    );
+    assert_eq!(record.state, crate::attempts::AttemptState::Failed);
+    assert_eq!(record.usage, reissue_usage());
 }
 
 // -----------------------------------------------------------------------

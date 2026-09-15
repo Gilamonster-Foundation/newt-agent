@@ -1029,10 +1029,16 @@ pub(crate) async fn response_with_decoder(
             if let Some(harness) = harness {
                 harness.provider_failure(&error.to_string())?;
             }
+            // The bytes before the break may already have reported usage.
+            let usage = decoded
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .and_then(super::observability::reported_usage);
             return Err(super::observability::DispatchError::response_read(
                 "request failed reading response",
                 error,
             )
+            .with_usage(usage)
             .into());
         }
     }

@@ -996,7 +996,7 @@ async fn a_grounding_nudge_after_a_stream_keeps_the_streams_usage() {
 /// Read one Ollama stream reissue body served in `parts` (see
 /// `serve_stream_parts`), returning `stream_response`'s (text, usage, complete).
 async fn ollama_stream_parts(
-    parts: &[&str],
+    parts: &[&[u8]],
     interrupt: bool,
 ) -> (String, Option<crate::TokenUsage>, bool) {
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1007,9 +1007,13 @@ async fn ollama_stream_parts(
         .send()
         .await
         .expect("the stream connects");
-    let read = stream_response(response, false, false, false, Some(&flag), false, None)
-        .await
-        .expect("the body reads");
+    let read = tokio::time::timeout(
+        super::http_loop_tests::RAW_STREAM_TEST_BOUND,
+        stream_response(response, false, false, false, Some(&flag), false, None),
+    )
+    .await
+    .expect("the read ends: at done, at EOF, or at the interrupt")
+    .expect("the body reads");
     server.abort();
     read
 }
@@ -1031,7 +1035,8 @@ fn ollama_done_usage() -> Option<crate::TokenUsage> {
 /// the socket again.
 #[tokio::test]
 async fn an_ollama_stream_is_complete_once_done_even_if_esc_follows() {
-    let (text, usage, complete) = ollama_stream_parts(&[OLLAMA_DELTA, OLLAMA_DONE], true).await;
+    let (text, usage, complete) =
+        ollama_stream_parts(&[OLLAMA_DELTA.as_bytes(), OLLAMA_DONE.as_bytes()], true).await;
     assert_eq!(text, "the answer");
     assert_eq!(usage, ollama_done_usage());
     assert!(complete, "done: true arrived before the interrupt");
@@ -1043,7 +1048,11 @@ async fn an_ollama_stream_is_complete_once_done_even_if_esc_follows() {
 async fn an_ollama_done_line_split_across_chunks_still_completes_the_stream() {
     let cut = OLLAMA_DONE.len() / 2;
     let (text, usage, complete) = ollama_stream_parts(
-        &[OLLAMA_DELTA, &OLLAMA_DONE[..cut], &OLLAMA_DONE[cut..]],
+        &[
+            OLLAMA_DELTA.as_bytes(),
+            &OLLAMA_DONE.as_bytes()[..cut],
+            &OLLAMA_DONE.as_bytes()[cut..],
+        ],
         false,
     )
     .await;
@@ -1052,12 +1061,32 @@ async fn an_ollama_done_line_split_across_chunks_still_completes_the_stream() {
     assert!(complete, "the split done line was read");
 }
 
+/// Review round 3, item b: a character split across two chunks is still that
+/// character. Decoding each chunk on its own turns both halves into U+FFFD.
+#[tokio::test]
+async fn an_ollama_character_split_across_chunks_is_not_corrupted() {
+    let delta = "{\"message\":{\"content\":\"newt 🦎 蠑螈\"}}\n".as_bytes();
+    let cut = delta
+        .iter()
+        .position(|&b| b == 0xF0)
+        .expect("the emoji's lead byte")
+        + 2;
+    let (text, usage, complete) = ollama_stream_parts(
+        &[&delta[..cut], &delta[cut..], OLLAMA_DONE.as_bytes()],
+        false,
+    )
+    .await;
+    assert_eq!(text, "newt 🦎 蠑螈");
+    assert_eq!(usage, ollama_done_usage());
+    assert!(complete);
+}
+
 /// Review round 2, item 4: an Esc inside the read loop, after the first delta,
 /// keeps the partial text and is never complete. Deterministic: the flag is
 /// tripped only after the reader has drained megabytes of the body.
 #[tokio::test]
 async fn an_ollama_stream_interrupted_after_its_first_delta_is_not_complete() {
-    let (text, usage, complete) = ollama_stream_parts(&[OLLAMA_DELTA], true).await;
+    let (text, usage, complete) = ollama_stream_parts(&[OLLAMA_DELTA.as_bytes()], true).await;
     assert_eq!(text, "the answer", "the partial is kept");
     assert_eq!(usage, None, "usage only arrives on the done line");
     assert!(!complete, "an interrupted stream is not complete");

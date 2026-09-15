@@ -1657,7 +1657,7 @@ async fn an_anthropic_stream_interrupted_after_its_first_delta_is_a_failed_attem
     let head: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (url, server) =
-        super::http_loop_tests::serve_stream_parts(&[&head], Some(flag.clone())).await;
+        super::http_loop_tests::serve_stream_parts(&[head.as_bytes()], Some(flag.clone())).await;
     let messages_url = format!("{url}/v1/messages");
     let client = reqwest::Client::new();
     let retry = RetryPolicy {
@@ -1684,15 +1684,19 @@ async fn an_anthropic_stream_interrupted_after_its_first_delta_is_a_failed_attem
         model: "claude-test",
         backend: "test-backend",
     };
-    let (round, started) = anthropic_dispatch_round(
-        &dispatch,
-        &serde_json::json!({"stream": true}),
-        &[],
-        true,
-        Some(flag.as_ref()),
-        Some(scope),
+    let (round, started) = tokio::time::timeout(
+        super::http_loop_tests::RAW_STREAM_TEST_BOUND,
+        anthropic_dispatch_round(
+            &dispatch,
+            &serde_json::json!({"stream": true}),
+            &[],
+            true,
+            Some(flag.as_ref()),
+            Some(scope),
+        ),
     )
     .await
+    .expect("the interrupt ends the read")
     .expect("an interrupt is not an error")
     .expect("the stream was read, so this is not the send-time cancel");
     server.abort();
