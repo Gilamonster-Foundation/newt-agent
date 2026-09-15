@@ -58,6 +58,23 @@ const REMOVED_ENV: &[&str] = &[
     "CARGO_LLVM_COV_TARGET_DIR",
 ];
 
+/// The environment a spec is built and run under, the same in both modes:
+/// its own target dir, the host's build switches emptied, and coverage
+/// instrumentation removed. `Some(value)` sets a variable, `None` removes it.
+pub fn spec_env(target_dir: &Path) -> Vec<(String, Option<String>)> {
+    let mut env = vec![(
+        "CARGO_TARGET_DIR".to_string(),
+        Some(target_dir.to_string_lossy().into_owned()),
+    )];
+    env.extend(
+        EMPTIED_ENV
+            .iter()
+            .map(|k| (k.to_string(), Some(String::new()))),
+    );
+    env.extend(REMOVED_ENV.iter().map(|k| (k.to_string(), None)));
+    env
+}
+
 /// The canonical behavioral verdict. Serialized as the ratchet row's
 /// `behavioral` column: `PASS`, `FAIL`, `UNGRADABLE(reason)`, `ERROR(reason)`.
 ///
@@ -309,15 +326,7 @@ pub fn run_spec(runner: &dyn CommandRunner, tree: &Path, spec: &[u8]) -> Behavio
             )
         }
     };
-    let target = copy.path().join("target").to_string_lossy().into_owned();
-    let mut env: Vec<(String, Option<String>)> =
-        vec![("CARGO_TARGET_DIR".to_string(), Some(target))];
-    env.extend(
-        EMPTIED_ENV
-            .iter()
-            .map(|k| (k.to_string(), Some(String::new()))),
-    );
-    env.extend(REMOVED_ENV.iter().map(|k| (k.to_string(), None)));
+    let env = spec_env(&copy.path().join("target"));
     verdict_from_run(
         &runner.run(&RunSpec {
             // `--color never` pins the output this parses: a caller's

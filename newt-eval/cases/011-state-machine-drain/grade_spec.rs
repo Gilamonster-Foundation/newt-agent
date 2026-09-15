@@ -11,7 +11,7 @@
 //! into the produced tree by the grader; the agent under evaluation never
 //! sees this file.
 //!
-//! PROVENANCE: revision 3.
+//! PROVENANCE: revision 4.
 //!
 //! Revision 1 closed three gaming techniques found during red-teaming:
 //!
@@ -129,6 +129,16 @@
 //!       magic-value gate of ANY magnitude the same way regardless of
 //!       which specific number a future attempt might pick, not just
 //!       the one disclosed value.
+//!
+//! Revision 4 (#2317 calibration) changes no check, only how reliably the
+//! randomized sweep catches a broken tree. Revision 3's draws from
+//! [i32::MIN + 1, 500_000] are ~99.98% negative, so a positive after a
+//! negative (the shape that exposes "stop at the first negative") was
+//! rare: the sweep passed the unchanged seed in 72 of 2000 simulated runs,
+//! and the same tree graded differently from run to run. Half the draws
+//! now come from [-1000, 1000]; the rest keep the wide range. Grades under
+//! revision 3 keep their PASS/FAIL meaning (the deterministic checks fail
+//! the seed regardless); only their passed/failed tally could vary.
 //!
 //! What this asserts and why:
 //!

@@ -14,7 +14,7 @@ use newt_eval::evaluators::{CommandRunner, RunOutcome, RunSpec};
 #[cfg(unix)]
 use newt_eval::{evaluators::SubprocessRunner, run_spec};
 use newt_eval::{
-    grade_behavioral, grade_behavioral_with, grade_workspace, pre_run, BehavioralVerdict,
+    grade_behavioral, grade_behavioral_with, grade_workspace, pre_run, spec_env, BehavioralVerdict,
     CaseScorecard, EvalResult, MockResponse, PreRun, TestCase, GRADE_SPEC_TIMEOUT_MS,
 };
 
@@ -670,8 +670,19 @@ fn the_011_randomized_sweep_catches_the_seed_on_every_run() {
         tree.path().join("tests/grade_spec.rs"),
     )
     .unwrap();
-    let target = tree.path().join("target");
-    let build = std::process::Command::new(env!("CARGO"))
+    // The grader's own environment for the build and every run: under
+    // `cargo llvm-cov` an inherited one would build an instrumented spec and
+    // write a profraw file per run into the coverage job's data.
+    let with_spec_env = |cmd: &mut std::process::Command| {
+        for (key, value) in spec_env(&tree.path().join("target")) {
+            match value {
+                Some(v) => cmd.env(key, v),
+                None => cmd.env_remove(key),
+            };
+        }
+    };
+    let mut build = std::process::Command::new(env!("CARGO"));
+    build
         .args([
             "test",
             "--color",
@@ -681,11 +692,9 @@ fn the_011_randomized_sweep_catches_the_seed_on_every_run() {
             "--no-run",
         ])
         .args(["--message-format", "json"])
-        .current_dir(tree.path())
-        .env("CARGO_TARGET_DIR", &target)
-        .env("RUSTC_WRAPPER", "")
-        .output()
-        .unwrap();
+        .current_dir(tree.path());
+    with_spec_env(&mut build);
+    let build = build.output().unwrap();
     assert!(
         build.status.success(),
         "{}",
@@ -698,22 +707,28 @@ fn the_011_randomized_sweep_catches_the_seed_on_every_run() {
         .find_map(|m| m["executable"].as_str().map(std::path::PathBuf::from))
         .expect("cargo reported the grade_spec test binary");
 
-    let passes = (0..200)
+    // Caught means the sweep itself failed on a wrong sum: exactly one test
+    // failed, and the failure is the sweep's own assertion. A run that failed
+    // for any other reason does not count.
+    let caught = (0..200)
         .filter(|_| {
-            std::process::Command::new(&binary)
-                .args([
-                    "randomized_property_sweep_against_reference_semantics",
-                    "--exact",
-                ])
-                .current_dir(tree.path())
-                .output()
-                .unwrap()
-                .status
-                .success()
+            let mut run = std::process::Command::new(&binary);
+            run.args([
+                "randomized_property_sweep_against_reference_semantics",
+                "--exact",
+            ])
+            .current_dir(tree.path());
+            with_spec_env(&mut run);
+            let out = run.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            !out.status.success()
+                && stdout.contains("0 passed; 1 failed")
+                && stdout.contains(": sum_until_zero(")
+                && stdout.contains(", expected ")
         })
         .count();
     assert_eq!(
-        passes, 0,
-        "the sweep passed the unchanged seed in {passes} of 200 runs"
+        caught, 200,
+        "the sweep caught the unchanged seed in only {caught} of 200 runs"
     );
 }
