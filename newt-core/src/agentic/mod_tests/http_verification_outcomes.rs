@@ -16,16 +16,38 @@ fn instruction(check: &str) -> String {
     format!("Fix the bug. You can run `{check}` to verify.")
 }
 
-/// One scripted step: a `run_command` call, or the final text `done`.
+/// One scripted step: a `run_command` call, a batch the loop rejects before
+/// executing any of it, or the final text `done`.
 #[derive(Clone, Copy)]
 enum Step {
     Run(&'static str),
+    /// A `run_command` of this command beside a call whose arguments are not a
+    /// JSON object, so validation rejects the whole batch.
+    RejectedBatch(&'static str),
     Done,
+}
+
+fn rejected_batch(wire: &str, command: &str) -> ResponseTemplate {
+    let run = serde_json::json!({ "command": command });
+    let value = match wire {
+        "anthropic" => serde_json::json!({"id":"msg_1","type":"message","role":"assistant",
+            "model":"test-model","stop_reason":"tool_use","content":[
+            {"type":"tool_use","id":"call_1","name":"run_command","input":run},
+            {"type":"tool_use","id":"call_2","name":"run_command","input":"not an object"}]}),
+        _ => serde_json::json!({"choices":[{"message":{"role":"assistant","content":"",
+            "tool_calls":[
+            {"id":"call_1","type":"function","function":{"name":"run_command",
+                "arguments":run.to_string()}},
+            {"id":"call_2","type":"function","function":{"name":"run_command",
+                "arguments":"{\"command\":"}}]},"finish_reason":"tool_calls"}]}),
+    };
+    ResponseTemplate::new(200).set_body_json(value)
 }
 
 fn reply(wire: &str, step: Step) -> ResponseTemplate {
     let call = match step {
         Step::Run(command) => Some(("run_command", serde_json::json!({"command": command}))),
+        Step::RejectedBatch(command) => return rejected_batch(wire, command),
         Step::Done => None,
     };
     let value = match (wire, call) {
@@ -86,10 +108,55 @@ async fn run_script(
     cancel: Option<&std::sync::atomic::AtomicBool>,
     max_tool_rounds: usize,
 ) -> Run {
+    run_turn(Turn {
+        wire,
+        smart,
+        outcomes,
+        check,
+        script,
+        cancel,
+        max_tool_rounds,
+        caveats: Caveats::top(),
+        env: &[],
+    })
+    .await
+}
+
+/// One scripted turn, for a case that also narrows the session's authority or
+/// pins env the shell reads.
+struct Turn<'a> {
+    wire: &'a str,
+    smart: bool,
+    outcomes: bool,
+    check: &'a str,
+    script: &'a [Step],
+    cancel: Option<&'a std::sync::atomic::AtomicBool>,
+    max_tool_rounds: usize,
+    caveats: Caveats,
+    /// Set under the env lock for the turn, after the defaults below.
+    env: &'a [(&'static str, &'static str)],
+}
+
+async fn run_turn(turn: Turn<'_>) -> Run {
+    let Turn {
+        wire,
+        smart,
+        outcomes,
+        check,
+        script,
+        cancel,
+        max_tool_rounds,
+        caveats,
+        env,
+    } = turn;
     let _lock = env_lock().await;
     let _self_verify = EnvVar::set("NEWT_SELF_VERIFY", "1");
     let _confined = EnvVar::unset("NEWT_DISABLE_OCAP");
     let _no_anthropic_stream = EnvVar::set("NEWT_ANTHROPIC_STREAM", "off");
+    let _pinned: Vec<EnvVar> = env
+        .iter()
+        .map(|(key, value)| EnvVar::set(key, value))
+        .collect();
 
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -111,7 +178,7 @@ async fn run_script(
     let ws = tempfile::TempDir::new().unwrap();
     let workspace = ws.path().to_string_lossy().into_owned();
     let task = instruction(check);
-    let (uri, messages, caveats) = (server.uri(), msgs(), Caveats::top());
+    let (uri, messages) = (server.uri(), msgs());
     let mut context = ctx(&uri, &messages, &caveats);
     context.workspace = &workspace;
     context.task = &task;
@@ -488,5 +555,199 @@ async fn a_check_created_after_the_first_scan_decides_the_cap_exit() {
             )]],
             "{wire} smart={smart}"
         );
+    }
+}
+
+/// #2315 acceptance: each case the issue names ends the turn within the
+/// declared allowance, and the trace names what decided it. The ordinary gate
+/// and SmartHarness reach the same ending in every case.
+/// - requested but unexecuted: the batch holding the check is rejected before
+///   anything runs, so the check has no execution and cannot pass;
+/// - denied: no exec authority, so the confined shell refuses the check;
+/// - unavailable: the check's program does not exist;
+/// - timed out: the host lane's wall-clock ceiling kills the check;
+/// - failed with substantial output: the result the model reads is collapsed,
+///   and the check still classifies failed;
+/// - no checks: nothing to verify, and the trace says so.
+///
+/// Traps: a bound that holds only because a case never ran (each case asserts
+/// the class its check recorded), and a round count that cannot fail (rounds
+/// are counted exactly, excluding only a request that replays the previous
+/// history).
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+async fn every_verification_case_ends_within_its_allowance() {
+    use crate::agentic::self_verify::{CheckStatus, VERIFY_REPAIR_ALLOWANCE};
+    const ABSENT: &str = "newt-absent-binary-2315-check --verify";
+    const SLOW: &str = "sleep 5";
+    const LOUD_FAILURE: &str = "sh -c 'seq 1 20000; exit 1'";
+    const EXHAUSTED: &[&str] = &["nudge", "nudge", "nudge", "repair_exhausted"];
+    struct Case {
+        name: &'static str,
+        check: &'static str,
+        step: Step,
+        caveats: Caveats,
+        env: &'static [(&'static str, &'static str)],
+        reason: &'static str,
+        /// Primary model rounds: the scripted step, one answer per nudge, and
+        /// the final answer.
+        rounds: usize,
+        /// Every verification decision the trace records, in order.
+        decisions: &'static [&'static str],
+        /// The class the check recorded at the last decision.
+        status: Option<CheckStatus>,
+    }
+    let no_exec = Caveats {
+        exec: crate::caveats::Scope::none(),
+        ..Caveats::top()
+    };
+    let cases = [
+        Case {
+            name: "requested but unexecuted",
+            check: PASSING_CHECK,
+            step: Step::RejectedBatch(PASSING_CHECK),
+            caveats: Caveats::top(),
+            env: &[],
+            reason: "verification_incomplete",
+            rounds: 2,
+            decisions: &["verification_incomplete"],
+            status: Some(CheckStatus::Unexecuted),
+        },
+        Case {
+            name: "denied",
+            check: PASSING_CHECK,
+            step: Step::Run(PASSING_CHECK),
+            caveats: no_exec,
+            env: &[("NEWT_SHELL_ENGINE", "safe-subset")],
+            reason: "verification_incomplete",
+            rounds: 2,
+            decisions: &["verification_incomplete"],
+            status: Some(CheckStatus::Denied),
+        },
+        Case {
+            name: "unavailable",
+            check: ABSENT,
+            step: Step::Run(ABSENT),
+            caveats: Caveats::top(),
+            env: &[],
+            reason: "verification_incomplete",
+            rounds: 2,
+            decisions: &["verification_incomplete"],
+            status: Some(CheckStatus::Unavailable),
+        },
+        Case {
+            name: "timed out",
+            check: SLOW,
+            step: Step::Run(SLOW),
+            caveats: Caveats::top(),
+            env: &[
+                ("NEWT_DISABLE_OCAP", "1"),
+                ("NEWT_HOST_EXEC_TIMEOUT_SECS", "1"),
+            ],
+            reason: "repair_exhausted",
+            rounds: 5,
+            decisions: EXHAUSTED,
+            status: Some(CheckStatus::TimedOut),
+        },
+        Case {
+            name: "failed with substantial output",
+            check: LOUD_FAILURE,
+            step: Step::Run(LOUD_FAILURE),
+            caveats: Caveats::top(),
+            env: &[],
+            reason: "repair_exhausted",
+            rounds: 5,
+            decisions: EXHAUSTED,
+            status: Some(CheckStatus::Failed),
+        },
+        Case {
+            name: "no checks",
+            check: "",
+            step: Step::Done,
+            caveats: Caveats::top(),
+            env: &[],
+            reason: "completed",
+            rounds: 1,
+            decisions: &["no_checks"],
+            status: None,
+        },
+    ];
+    for case in &cases {
+        for (wire, smart) in [("openai", false), ("anthropic", true)] {
+            let label = format!("{} on {wire} smart={smart}", case.name);
+            let run = run_turn(Turn {
+                wire,
+                smart,
+                outcomes: true,
+                check: case.check,
+                script: &[case.step],
+                cancel: None,
+                max_tool_rounds: 8,
+                caveats: case.caveats.clone(),
+                env: case.env,
+            })
+            .await;
+            assert_eq!(run.reason, case.reason, "{label}");
+            // Primary rounds only. The ordinary loop re-issues an accepted
+            // answer for display, replaying the same history, so a request
+            // whose messages equal the previous request's is not a round.
+            let histories: Vec<serde_json::Value> = run
+                .bodies
+                .iter()
+                .map(|body| {
+                    serde_json::from_str::<serde_json::Value>(body).unwrap()["messages"].clone()
+                })
+                .collect();
+            let rounds = histories
+                .iter()
+                .enumerate()
+                .filter(|(i, history)| *i == 0 || histories[i - 1] != **history)
+                .count();
+            assert_eq!(rounds, case.rounds, "{label}: primary model rounds");
+            assert!(rounds <= VERIFY_REPAIR_ALLOWANCE + 2, "{label}");
+            let signals: Vec<_> = run
+                .signals
+                .iter()
+                .filter_map(|signal| match signal {
+                    observability::BehaviorSignal::Verification {
+                        decision, report, ..
+                    } => Some((decision.as_str(), report)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                signals
+                    .iter()
+                    .map(|(decision, _)| *decision)
+                    .collect::<Vec<_>>(),
+                case.decisions,
+                "{label}: the decision sequence"
+            );
+            assert_eq!(
+                signals.last().map(|(_, report)| report
+                    .checks
+                    .iter()
+                    .map(|check| check.status)
+                    .collect::<Vec<_>>()),
+                Some(case.status.into_iter().collect()),
+                "{label}: the class the check recorded"
+            );
+            if case.check == LOUD_FAILURE {
+                assert!(
+                    run.bodies[1].contains("error: command exited 1")
+                        && !run.bodies[1].contains("\\n10000\\n"),
+                    "{label}: the model reads a collapsed failure"
+                );
+            }
+            if case.check == SLOW {
+                assert!(
+                    run.bodies[1..]
+                        .iter()
+                        .any(|body| body.contains("timed out")),
+                    "{label}: the repair names the timeout"
+                );
+            }
+        }
     }
 }

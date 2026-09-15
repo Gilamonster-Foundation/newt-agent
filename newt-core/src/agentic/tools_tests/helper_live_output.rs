@@ -210,6 +210,8 @@ async fn blocked_live_sink_cannot_backpressure_host_pipe_capture() {
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn host_bypass_publishes_output_before_command_completion() {
+    // The host shell reads NEWT_HOST_EXEC_TIMEOUT_SECS, which a loop test pins.
+    let _env = super::disable_ocap_tests::env_lock().await;
     struct ChannelOutput(std::sync::mpsc::Sender<Vec<u8>>);
     impl crate::agentic::LiveToolOutput for ChannelOutput {
         fn start(&self, _generation: u64) {}
