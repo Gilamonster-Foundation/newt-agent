@@ -57,6 +57,15 @@ pub fn changed_identity(error: &anyhow::Error) -> Option<&'static str> {
 /// Complete JSON from a server ignoring `stream: true` is decoded once as-is.
 /// The caller must record the original bytes before interpreting this value.
 pub fn decode_response(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
+    decode_response_reporting_usage(bytes, &mut None)
+}
+
+/// [`decode_response`], also leaving in `usage` what the stream reported. A
+/// response strict validation rejects was still generated and billed (#2313).
+pub(crate) fn decode_response_reporting_usage(
+    bytes: &[u8],
+    usage: &mut Option<crate::TokenUsage>,
+) -> anyhow::Result<serde_json::Value> {
     let (body, invalid_utf8) = match std::str::from_utf8(bytes) {
         Ok(body) => (body, false),
         Err(error) => (std::str::from_utf8(&bytes[..error.valid_up_to()])?, true),
@@ -83,6 +92,7 @@ pub fn decode_response(bytes: &[u8]) -> anyhow::Result<serde_json::Value> {
     }
     let _ = accumulator.feed(body);
     accumulator.flush_line();
+    *usage = accumulator.round.usage;
     accumulator
         .strict
         .take()

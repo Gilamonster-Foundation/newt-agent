@@ -466,7 +466,9 @@ async fn an_interrupt_before_the_send_never_fires_the_second_call() {
 /// is running, so the pre-send check cannot be what fires. The padding is SSE
 /// COMMENT lines (`:…`), which `apply_line` drops before `serde_json` is ever
 /// reached, so this costs bytes and not parsing.
-async fn interrupt_once_the_client_is_reading(frames: &str) -> (StreamOutcome, String) {
+async fn interrupt_once_the_client_is_reading(
+    frames: &str,
+) -> (StreamOutcome, String, crate::attempts::AttemptRecord) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -507,12 +509,19 @@ async fn interrupt_once_the_client_is_reading(frames: &str) -> (StreamOutcome, S
     });
 
     let buf = Buf::default();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let scope = attempt_capture::AttemptScope {
+        ledger: &ledger,
+        turn: "prompt:turn",
+        model: "test-model",
+        backend: "test-backend",
+    };
     let req = reqwest::Client::new()
         .post(format!("http://{addr}/v1/chat/completions"))
         .json(&serde_json::json!({"stream": true}));
     let out = openai_stream_final_answer(
         req,
-        None,
+        Some(scope),
         buf.clone(),
         false,
         false,
@@ -521,7 +530,8 @@ async fn interrupt_once_the_client_is_reading(frames: &str) -> (StreamOutcome, S
     )
     .await;
     server.abort();
-    (out, buf.text())
+    let record = ledger.lock().unwrap().records().next().cloned();
+    (out, buf.text(), record.expect("the reissue was sent"))
 }
 
 /// Serve an SSE body whose bytes are cut at a chosen offset, with a real gap
@@ -660,7 +670,7 @@ async fn an_interrupt_before_any_text_ends_the_turn_and_still_bills_the_call() {
     // Usage FIRST, so it is parsed well before the interrupt can land; then a
     // role-only delta, which paints nothing. No text delta anywhere, and no
     // `[DONE]` — this stream is stopped, not finished.
-    let (out, painted) = interrupt_once_the_client_is_reading(
+    let (out, painted, record) = interrupt_once_the_client_is_reading(
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":5}}\n\n\
          data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
     )
@@ -684,6 +694,13 @@ async fn an_interrupt_before_any_text_ends_the_turn_and_still_bills_the_call() {
         }
         other => panic!("an interrupt with nothing on screen ends the turn, got {other:?}"),
     }
+    // #2313: the interrupted attempt is failed (cancellation is not modelled
+    // yet), never ok, and keeps the usage it reported.
+    assert_eq!(record.state, crate::attempts::AttemptState::Failed);
+    assert_eq!(
+        record.usage.map(|u| (u.input_tokens, u.output_tokens)),
+        Some((42, 5))
+    );
 }
 
 /// A sink that trips the interrupt flag the moment the answer starts
@@ -856,6 +873,128 @@ async fn a_cut_display_reissue_is_failed_with_its_reported_usage() {
     assert!(matches!(out, StreamOutcome::UseProbe(_)), "{out:?}");
     assert_eq!(record.state, crate::attempts::AttemptState::Failed);
     assert_eq!(record.usage, reissue_usage());
+}
+
+/// Review round 2, item 2: an error event after a usage frame is failed with
+/// that usage even when `[DONE]` follows it, and the caller's outcome carries the same usage — whether the
+/// error is a context rejection or any other provider error.
+#[tokio::test]
+async fn a_display_reissue_rejected_by_an_error_event_is_failed_with_its_reported_usage() {
+    for (error, context_exceeded) in [
+        (
+            r#"{"error":{"message":"Context size has been exceeded."}}"#,
+            true,
+        ),
+        (r#"{"error":{"message":"busy","code":503}}"#, false),
+    ] {
+        let (out, record) = reissue_attempt(&[REISSUE_USAGE, error, "[DONE]"], false).await;
+        match out {
+            StreamOutcome::ContextExceeded(usage) if context_exceeded => {
+                assert_eq!(usage, reissue_usage());
+            }
+            StreamOutcome::UseProbe(usage) if !context_exceeded => {
+                assert_eq!(usage, reissue_usage());
+            }
+            other => panic!("{error}: {other:?}"),
+        }
+        assert_eq!(
+            record.state,
+            crate::attempts::AttemptState::Failed,
+            "{error}"
+        );
+        assert_eq!(record.usage, reissue_usage(), "{error}");
+    }
+}
+
+/// Review round 2, item 1: a complete `[DONE]` primary stream that strict
+/// decoding rejects (here a tool call without an id) was still generated and
+/// billed. Every attempt is failed WITH the usage the stream reported.
+#[tokio::test]
+async fn a_primary_stream_rejected_by_strict_decoding_is_failed_with_its_reported_usage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            REISSUE_USAGE,
+            "[DONE]",
+        ]))
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    let error = chat_complete(c, &mut NoMcp)
+        .await
+        .expect_err("a tool call without an id is rejected");
+    assert!(format!("{error:#}").contains("has no ID"), "{error:#}");
+
+    let received = server.received_requests().await.expect("journal").len();
+    let ledger = ledger.lock().unwrap();
+    let records: Vec<_> = ledger.records().collect();
+    assert_eq!(records.len(), received, "attempts == wire requests");
+    for record in records {
+        assert_eq!(record.state, crate::attempts::AttemptState::Failed);
+        assert_eq!(record.usage, reissue_usage());
+    }
+}
+
+/// Item 1's other primary send: `dispatch_with_decoder` (the cap-exit summary)
+/// keeps a strictly rejected response's usage on its failed attempt too.
+#[tokio::test]
+async fn dispatch_with_decoder_keeps_a_strictly_rejected_responses_usage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(&[
+            r#"{"choices":[{"delta":{"content":"a summary"}}]}"#,
+            REISSUE_USAGE,
+            "[DONE]",
+        ]))
+        .mount(&server)
+        .await;
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let scope = attempt_capture::AttemptScope {
+        ledger: &ledger,
+        turn: "prompt:turn",
+        model: "test-model",
+        backend: "test-backend",
+    };
+    let policy = RetryPolicy {
+        max_retries: 0,
+        base: std::time::Duration::ZERO,
+        max: std::time::Duration::ZERO,
+        jitter: false,
+    };
+    let url = format!("{}/v1/chat/completions", server.uri());
+    let error = dispatch_with_decoder(
+        &policy,
+        Some(scope),
+        || async {
+            Ok(reqwest::Client::new()
+                .post(&url)
+                .json(&serde_json::json!({})))
+        },
+        "inference endpoint",
+        |_, _, _| {},
+        None,
+        smart_harness::decode_openai_response,
+    )
+    .await
+    .expect_err("a stream with no finish reason is rejected");
+    assert!(
+        format!("{error:#}").contains("no finish reason"),
+        "{error:#}"
+    );
+    let ledger = ledger.lock().unwrap();
+    let records: Vec<_> = ledger.records().collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Failed);
+    assert_eq!(records[0].usage, reissue_usage());
 }
 
 // -----------------------------------------------------------------------
