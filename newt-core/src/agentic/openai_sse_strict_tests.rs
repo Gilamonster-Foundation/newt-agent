@@ -407,7 +407,41 @@ fn strict_rejections_classify_by_cause() {
         &[json!({"id":"resp-two","choices":[{"delta":{"content":"a"},"finish_reason":"stop"}]})],
         true,
     ));
+    // No [DONE], but a complete line is already bad: the model's defect wins
+    // over the cut.
+    let mut malformed_then_cut = b"data: {broken JSON\n\n".to_vec();
+    malformed_then_cut.extend(frame(json!({"choices":[{"delta":{"content":"a"}}]})));
+    // An invalid byte (not a torn character) ends the readable body early;
+    // that is bad output, not a cut.
+    let mut invalid_byte = frame(json!({"choices":[{"delta":{"content":"a"}}]}));
+    invalid_byte.push(0xff);
+    invalid_byte.extend(sse(
+        &[json!({"choices":[{"delta":{"content":"b"},"finish_reason":"stop"}]})],
+        true,
+    ));
     let cases: Vec<(&str, Vec<u8>, ErrorClass)> = vec![
+        (
+            "empty-string tool-call id",
+            call(
+                json!({"index":0,"id":"","function":{"name":"read_file","arguments":"{}"}}),
+                "tool_calls",
+            ),
+            ErrorClass::Model,
+        ),
+        (
+            "non-string tool-call id",
+            call(
+                json!({"index":0,"id":7,"function":{"name":"read_file","arguments":"{}"}}),
+                "tool_calls",
+            ),
+            ErrorClass::Model,
+        ),
+        (
+            "malformed frame, then a clean EOF",
+            malformed_then_cut,
+            ErrorClass::Model,
+        ),
+        ("invalid byte mid-stream", invalid_byte, ErrorClass::Model),
         (
             "tool call without id",
             call(

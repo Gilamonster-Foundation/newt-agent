@@ -196,6 +196,12 @@ struct ToolFragments {
 
 impl ToolFragments {
     fn append(&mut self, call: &Value) -> anyhow::Result<()> {
+        // A blank or non-string call id is a defect in the model's output, as the
+        // same id is in a complete JSON reply, not a shape we lack (#2318).
+        anyhow::ensure!(
+            call["id"].is_null() || call["id"].as_str().is_some_and(|id| !id.is_empty()),
+            "stream has invalid tool-call ID"
+        );
         stable_string(&mut self.id, &call["id"], "tool-call ID")?;
         anyhow::ensure!(
             call["type"].is_null() || call["type"].as_str() == Some("function"),
