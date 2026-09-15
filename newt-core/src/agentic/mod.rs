@@ -13,6 +13,7 @@
 // delegates to this same pipeline instead of keeping a duplicate one.
 // #727: read-only context-budget introspection (the `get_context_remaining`
 // tool) — a pure renderer the agentic loop feeds per-turn budget state into.
+mod attempt_capture;
 mod budget;
 pub mod digest_fold;
 // #867: path-claim verification for the cap-exit summary (the file-name
@@ -996,6 +997,10 @@ pub struct ChatCtx<'a> {
     /// cognition, thinking or sampling; every loop reserves it locally, and it is
     /// sent only where the wire declares a cap. `None` keeps today's defaults.
     pub output_allowance: Option<u32>,
+    /// The run's attempt ledger (#2313). Every primary inference request is
+    /// recorded as one attempt at the send, from its exact wire bytes. `None`
+    /// records nothing.
+    pub attempt_ledger: Option<&'a std::sync::Mutex<crate::attempts::AttemptLedger>>,
     /// Whether assistant reasoning may be replayed to the active backend.
     /// Unknown endpoints default to `Never`; local reasoning backends opt in via
     /// their explicit capability profile.
@@ -1879,6 +1884,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         cognition: _,
         chat_completions_capability: _,
         output_allowance,
+        attempt_ledger,
         reasoning_replay_scope: _,
         max_tool_rounds,
         workflow_grace_rounds,
@@ -2020,6 +2026,16 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
     prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
+    // #2313: one ledger attempt per primary request, keyed at the send.
+    let attempt_turn = turn_prompt_context
+        .map(|turn| turn.active_operator_prompt().id().to_string())
+        .unwrap_or_default();
+    let attempts = attempt_ledger.map(|ledger| attempt_capture::AttemptScope {
+        ledger,
+        turn: &attempt_turn,
+        model,
+        backend: url,
+    });
 
     // In-band memory nudge (Step 19.3): after `[memory] note_nudge_interval`
     // user turns with zero organic save_note use, append a one-line reminder
@@ -2584,21 +2600,26 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             // W0 (#1511): classify while the error is TYPED — the
                             // DispatchError keeps the historical message text and
                             // carries the structural class to the driver boundary.
-                            let resp = smart_harness::request(
-                                client.post(&chat_url),
-                                &body_no_stream,
-                                smart_harness,
-                                "ollama",
-                            )?
-                            .send()
-                            .await
-                            .map_err(|e| {
-                                anyhow::Error::new(observability::DispatchError::from_reqwest(
-                                    "request failed",
-                                    e,
-                                ))
-                            })?;
-                            smart_harness::response(resp, smart_harness, "Ollama").await
+                            let (resp, attempt) = attempt_capture::send(
+                                attempts,
+                                "primary",
+                                smart_harness::request(
+                                    client.post(&chat_url),
+                                    &body_no_stream,
+                                    smart_harness,
+                                    "ollama",
+                                )?,
+                                "request failed",
+                            )
+                            .await?;
+                            let json =
+                                smart_harness::response(resp, smart_harness, "Ollama").await?;
+                            attempt_capture::complete(
+                                attempts,
+                                attempt.as_ref(),
+                                ollama_usage(&json),
+                            );
+                            Ok(json)
                         },
                         |attempt, delay, error| {
                             print_retry_indicator(attempt, retry.max_retries, delay, error, color);
@@ -3351,18 +3372,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 with_backoff_notify_error(
                     &retry,
                     || async {
-                        stream_client
-                            .post(&chat_url)
-                            .json(&body_stream)
-                            .send()
-                            .await
-                            .map_err(|e| {
-                                // Typed classification at the source (W0 #1511).
-                                anyhow::Error::new(observability::DispatchError::from_reqwest(
-                                    "stream request failed",
-                                    e,
-                                ))
-                            })
+                        // Typed classification at the source (W0 #1511).
+                        attempt_capture::send(
+                            attempts,
+                            "primary",
+                            stream_client.post(&chat_url).json(&body_stream),
+                            "stream request failed",
+                        )
+                        .await
                     },
                     |attempt, delay, error| {
                         print_retry_indicator(attempt, retry.max_retries, delay, error, color);
@@ -3381,6 +3398,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     ))
                 }
             };
+            let (sresp, stream_attempt) = sresp;
 
             if !sresp.status().is_success() {
                 if debug {
@@ -3482,6 +3500,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     return Ok((probe_content, false, accumulated_usage, hallucination_count));
                 }
             };
+            // An interrupted stream stays recorded failed (cancellation is not
+            // modelled here); a completed one reports the usage it streamed.
+            if !is_cancelled(cancel) {
+                attempt_capture::complete(attempts, stream_attempt.as_ref(), stream_usage);
+            }
 
             if streamed.is_empty() {
                 // The streaming re-issue produced no tokens. Fall back to the
@@ -4203,7 +4226,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         ollama_num_ctx: num_ctx,
         prompt_measurement: Default::default(),
     };
-    let result = final_summary_ollama(&client, &chat_url, model, trimmed, &cap).await;
+    let result = final_summary_ollama(&client, &chat_url, model, trimmed, &cap, attempts).await;
     let (text, streamed, usage) = cap.recover_rejection(
         result,
         &mut solve_obs,
@@ -6052,6 +6075,7 @@ impl CapExit {
     async fn finish<Fut>(
         &self,
         endpoint: &str,
+        attempts: Option<attempt_capture::AttemptScope<'_>>,
         request: impl Fn() -> Fut,
         http_error_prefix: &str,
         estimated_tokens: usize,
@@ -6062,6 +6086,7 @@ impl CapExit {
     {
         self.finish_with_decoder(
             endpoint,
+            attempts,
             request,
             http_error_prefix,
             estimated_tokens,
@@ -6071,9 +6096,11 @@ impl CapExit {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finish_with_decoder<Fut>(
         &self,
         endpoint: &str,
+        attempts: Option<attempt_capture::AttemptScope<'_>>,
         request: impl Fn() -> Fut,
         http_error_prefix: &str,
         estimated_tokens: usize,
@@ -6086,6 +6113,7 @@ impl CapExit {
         let retry = tui_retry_policy(endpoint);
         let result = dispatch_with_decoder(
             &retry,
+            attempts,
             request,
             http_error_prefix,
             |_, _, _| {},
@@ -6102,8 +6130,9 @@ impl CapExit {
             }
             other => other,
         };
-        if let Ok(json) = result {
+        if let Ok((json, attempt)) = result {
             let (content, usage) = extract(json);
+            attempt_capture::complete(attempts, attempt.as_ref(), usage);
             let total = merge_round_usage(self.accumulated, usage);
             if !content.is_empty() {
                 return Ok((
@@ -6134,6 +6163,7 @@ async fn final_summary_ollama(
     model: &str,
     mut messages: Vec<serde_json::Value>,
     cap: &CapExit,
+    attempts: Option<attempt_capture::AttemptScope<'_>>,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     if !cap.fits(&messages, model) {
@@ -6150,6 +6180,7 @@ async fn final_summary_ollama(
     }
     cap.finish(
         chat_url,
+        attempts,
         || async { Ok(client.post(chat_url).json(&body)) },
         "Ollama",
         estimate_tokens(&messages, cap.estimation),
@@ -6307,6 +6338,7 @@ async fn final_summary_openai(
     generation_policy.apply_to_chat_completions_body(&mut body);
     cap.finish_with_decoder(
         chat_url,
+        None,
         || async {
             let count =
                 count_openai_request(count_client, chat_url, api_key, &body, cap.request_budget)
@@ -6415,6 +6447,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // into a local generation policy.
         cognition,
         output_allowance,
+        attempt_ledger: _,
         chat_completions_capability,
         reasoning_replay_scope,
         max_tool_rounds,
@@ -8853,6 +8886,7 @@ async fn final_summary_anthropic(
     );
     cap.finish(
         messages_url,
+        None,
         || async { Ok(anthropic_headers(client.post(messages_url), api_key).json(&body)) },
         "inference endpoint",
         estimate_value_tokens(&body, cap.estimation),
@@ -8904,6 +8938,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // the output cap projects onto this wire today (see below).
         cognition,
         output_allowance,
+        attempt_ledger: _,
         chat_completions_capability,
         reasoning_replay_scope,
         max_tool_rounds,
@@ -10907,6 +10942,7 @@ where
 {
     dispatch_with_decoder(
         retry,
+        None,
         request,
         http_error_prefix,
         on_retry,
@@ -10914,16 +10950,21 @@ where
         |bytes| Ok(serde_json::from_slice(bytes)?),
     )
     .await
+    .map(|(json, _)| json)
 }
 
+/// Send with retries and decode. With an attempt scope, every try is one
+/// recorded attempt; the caller completes the returned attempt with the usage
+/// it extracts, because only it knows the wire's usage shape.
 async fn dispatch_with_decoder<Fut>(
     retry: &RetryPolicy,
+    attempts: Option<attempt_capture::AttemptScope<'_>>,
     request: impl Fn() -> Fut,
     http_error_prefix: &str,
     on_retry: impl FnMut(u32, std::time::Duration, &anyhow::Error),
     smart_harness: Option<&smart_harness::SmartHarness>,
     decode: fn(&[u8]) -> anyhow::Result<serde_json::Value>,
-) -> anyhow::Result<serde_json::Value>
+) -> anyhow::Result<(serde_json::Value, Option<crate::attempts::AttemptKey>)>
 where
     Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
 {
@@ -10931,14 +10972,17 @@ where
         retry,
         || async {
             // Typed classification at the source (W0 #1511).
-            let resp = request().await?.send().await.map_err(|e| {
-                anyhow::Error::new(observability::DispatchError::from_reqwest(
-                    "request failed",
-                    e,
-                ))
-            })?;
-            smart_harness::response_with_decoder(resp, smart_harness, http_error_prefix, decode)
-                .await
+            let (resp, attempt) =
+                attempt_capture::send(attempts, "primary", request().await?, "request failed")
+                    .await?;
+            let json = smart_harness::response_with_decoder(
+                resp,
+                smart_harness,
+                http_error_prefix,
+                decode,
+            )
+            .await?;
+            Ok((json, attempt))
         },
         on_retry,
     )
@@ -10981,6 +11025,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         cognition,
         chat_completions_capability: _,
         output_allowance,
+        attempt_ledger: _,
         reasoning_replay_scope: _,
         max_tool_rounds,
         workflow_grace_rounds: _,

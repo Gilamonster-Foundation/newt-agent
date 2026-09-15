@@ -127,6 +127,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         cognition: None,
         chat_completions_capability: Default::default(),
         output_allowance: None,
+        attempt_ledger: None,
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
         emits_leading_reasoning: false,
         max_tool_rounds: 8,
@@ -854,7 +855,9 @@ async fn final_summary_provider_contracts() {
             let url = server.uri();
             let policy = generation_policy::GenerationPolicy::default();
             let result = match provider {
-                "ollama" => final_summary_ollama(&client, &url, "test", Vec::new(), &cap).await,
+                "ollama" => {
+                    final_summary_ollama(&client, &url, "test", Vec::new(), &cap, None).await
+                }
                 "openai" => {
                     final_summary_openai(
                         (&client, &client),
