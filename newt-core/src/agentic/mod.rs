@@ -9187,12 +9187,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let mut tools_unsupported_notified = false;
     // Pre-send token budget gate — mirrors the OpenAI path (`num_ctx` is not
     // sent on this wire, but an operator-declared local window still caps
-    // Newt's input budget).
-    let mut effective_input_ceiling = num_ctx_input_ceiling(
-        num_ctx,
-        input_ceiling_pct,
-        generation_policy.output_allowance,
-    );
+    // Newt's input budget). #2341: reserve exactly the `max_tokens` sent.
+    let mut effective_input_ceiling =
+        num_ctx_input_ceiling(num_ctx, input_ceiling_pct, Some(max_tokens));
     let mut send_budget: Option<usize> =
         initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
     let mut send_budget_authoritative = safe_context.is_some() || effective_input_ceiling.is_some();
@@ -9628,7 +9625,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                                 recovered_input_budget(
                                     context_window,
                                     input_ceiling_pct,
-                                    generation_policy.output_allowance,
+                                    Some(max_tokens),
                                     effective_input_ceiling,
                                 )
                             })
