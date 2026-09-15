@@ -23,6 +23,27 @@ pub(crate) fn resolve_output_allowance(
     })
 }
 
+/// Refuse an explicit output allowance no request could honour (#2312): `0`
+/// permits no output, and one at or above the declared window leaves no input
+/// room. Only the operator's explicit value is checked — defaults are not their
+/// choice — and without a declared window only the `0` check can apply.
+pub fn validate_output_allowance(
+    explicit: Option<u32>,
+    num_ctx: Option<u32>,
+) -> anyhow::Result<()> {
+    match (explicit, num_ctx) {
+        (Some(0), _) => {
+            anyhow::bail!("output_allowance 0 permits no output; omit it to use the default")
+        }
+        (Some(allowance), Some(window)) if allowance >= window => anyhow::bail!(
+            "output_allowance {allowance} leaves no input room in the declared {window}-token \
+             context window; lower --output-allowance or [[model_tuning]] output_allowance, \
+             or declare a larger window"
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Backend-neutral generation choices resolved once per Chat Completions turn.
 /// Request serialization projects these values only onto fields the endpoint
 /// explicitly declared it accepts.
@@ -153,6 +174,19 @@ mod tests {
             parallel_tool_calls: Some(false),
             bounded_reasoning_continuation: Some(true),
         }
+    }
+
+    #[test]
+    fn output_allowance_validation_refuses_only_what_no_request_could_honour() {
+        assert!(validate_output_allowance(None, None).is_ok());
+        assert!(validate_output_allowance(None, Some(32_768)).is_ok());
+        assert!(
+            validate_output_allowance(Some(1), None).is_ok(),
+            "no window, no room check"
+        );
+        assert!(validate_output_allowance(Some(32_767), Some(32_768)).is_ok());
+        assert!(validate_output_allowance(Some(0), None).is_err());
+        assert!(validate_output_allowance(Some(32_768), Some(32_768)).is_err());
     }
 
     #[test]

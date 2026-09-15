@@ -648,3 +648,46 @@ async fn output_allowance_resolves_once_across_every_budget_surface() {
         );
     }
 }
+
+/// #2312: an explicit output allowance of 0, or one that leaves no input room
+/// in the declared window, is refused at the dispatch entry before any request
+/// on every wire, naming the allowance and the window. Without a declared
+/// window only the 0 check can apply.
+#[tokio::test]
+async fn an_invalid_output_allowance_is_refused_before_any_request() {
+    for (kind, path_str) in [
+        (BackendKind::Openai, "/v1/chat/completions"),
+        (BackendKind::Ollama, "/api/chat"),
+    ] {
+        for (allowance, num_ctx, expected) in [
+            (0, None, "output_allowance 0 permits no output"),
+            (
+                32_768,
+                Some(32_768),
+                "output_allowance 32768 leaves no input room in the declared 32768-token context window",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(path_str))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let task = "invalid allowance";
+            let messages = giant_prompt_messages(task);
+            let caveats = Caveats::top();
+            let uri = server.uri();
+            let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, kind);
+            ctx.safe_context = None;
+            ctx.max_ok_input = None;
+            ctx.num_ctx = num_ctx;
+            ctx.output_allowance = Some(allowance);
+            let error = chat_complete(ctx, &mut NoMcp)
+                .await
+                .expect_err("an invalid allowance must not dispatch")
+                .to_string();
+            assert!(error.contains(expected), "{kind:?}: {error}");
+            assert_no_requests(&server).await;
+        }
+    }
+}

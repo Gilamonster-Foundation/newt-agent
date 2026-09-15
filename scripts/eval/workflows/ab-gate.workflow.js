@@ -2,7 +2,7 @@ export const meta = {
   name: 'ab-gate',
   description: 'A/B lift verification for one lever over two completed sweep.sh arm dirs (baseline vs candidate build). Fisher exact + min-n power advice computed in script code. Verdict: LIFT | NO-LIFT | UNDERPOWERED | UNGRADEABLE | NO-OP-AB.',
   phases: [
-    { title: 'Ingest', detail: 'transcribe both arm dirs + grade_spec presence' },
+    { title: 'Ingest', detail: 'transcribe both arm dirs' },
     { title: 'Verdict', detail: 'Fisher exact per cell, deterministic' },
     { title: 'Report', detail: 'verdict.md with the computed tables verbatim' },
   ],
@@ -50,17 +50,16 @@ const minNforPower = (pBase, pCand, alpha) => {
 // ---------- Ingest (same transcription contract as /sweep-analyze)
 const ROWS_SCHEMA = {
   type: 'object', additionalProperties: false,
-  required: ['done', 'rows', 'meta_git_sha', 'grade_spec_tasks'],
+  required: ['done', 'rows', 'meta_git_sha'],
   properties: {
     done: { type: 'boolean' },
     meta_git_sha: { type: 'string' },
-    grade_spec_tasks: { type: 'array', items: { type: 'string' }, description: 'tasks appearing in the rows whose newt-eval/cases/<task>/grade_spec.rs exists in the repo' },
     rows: { type: 'array', items: { type: 'object', additionalProperties: false,
       required: ['task', 'mode', 'model', 'behavioral'],
       properties: { task: { type: 'string' }, mode: { type: 'string' }, model: { type: 'string' }, behavioral: { type: 'string' }, details: { type: 'string' } } } },
   },
 }
-const ingestPrompt = (d) => `Transcribe the sweep at ${d}: read ${d}/sweep.tsv (tab-separated RATCHET rows: cols task,mode,model,behavioral,details at positions 2-6), ${d}/sweep.meta.json (git_sha), check ${d}/DONE exists. Transcribe EVERY well-formed row exactly (skip rows with <6 cols). Then, for each distinct task in the rows, check whether <repo>/newt-eval/cases/<task>/grade_spec.rs exists (resolve the repo root with git rev-parse --show-toplevel from your cwd, or from the sweep dir's location) and list the tasks that HAVE one in grade_spec_tasks.`
+const ingestPrompt = (d) => `Transcribe the sweep at ${d}: read ${d}/sweep.tsv (tab-separated RATCHET rows: cols task,mode,model,behavioral,details at positions 2-6), ${d}/sweep.meta.json (git_sha), check ${d}/DONE exists. Transcribe EVERY well-formed row exactly, details included (skip rows with <6 cols).`
 
 phase('Ingest')
 const [base, cand] = await parallel([
@@ -73,29 +72,35 @@ if (base.meta_git_sha === cand.meta_git_sha)
   log(`WARNING: both arms record the same git sha (${base.meta_git_sha}) — if the lever is a code change this is a NO-OP A/B`)
 
 phase('Verdict')
+// #2317 vocabulary: only PASS passes; UNGRADABLE(..) and legacy PASS?gameable
+// graded nothing and stay out of n; ERROR(..) rows are infra and ignored.
+// A cell is certifiable only when the ROW says the canonical grader produced
+// each PASS (grader=grade_spec). Legacy rows carry no grader= key at all.
 const tally = (rows) => {
   const m = new Map()
   for (const r of rows) {
     const k = `${r.task} ${r.mode} ${r.model}`
-    const t = m.get(k) || m.set(k, { task: r.task, mode: r.mode, model: r.model, pass: 0, gameable: 0, fail: 0 }).get(k)
+    const t = m.get(k) || m.set(k, { task: r.task, mode: r.mode, model: r.model, pass: 0, ungradable: 0, fail: 0, canonical: true }).get(k)
+    const details = r.details || ''
     if (r.behavioral === 'PASS') t.pass++
-    else if (r.behavioral === 'PASS?gameable') t.gameable++
     else if (r.behavioral === 'FAIL') t.fail++
+    else if (/^UNGRADABLE\(/.test(r.behavioral) || r.behavioral === 'PASS?gameable') t.ungradable++
+    else continue
+    if (!/(^| )grader=/.test(details) || (r.behavioral === 'PASS' && !/(^| )grader=grade_spec( |$)/.test(details))) t.canonical = false
   }
   return m
 }
 const bT = tally(base.rows), cT = tally(cand.rows)
-const gradeSpecTasks = new Set([...(base.grade_spec_tasks || []), ...(cand.grade_spec_tasks || [])])
 const sameSha = base.meta_git_sha === cand.meta_git_sha
 
 const cellVerdicts = []
 for (const [k, c] of cT) {
   const b = bT.get(k)
   if (!b) { cellVerdicts.push({ cell: k, verdict: 'NO-BASELINE' }); continue }
-  const ungameable = gradeSpecTasks.has(c.task)
-  // On an ungameable rung only PASS counts; on a gameable one nothing certifies.
-  const cp = c.pass, cn = c.pass + c.gameable + c.fail
-  const bp = b.pass, bn = b.pass + b.gameable + b.fail
+  const ungameable = c.canonical && b.canonical
+  // Only canonically graded cells certify, and only PASS counts toward the rate.
+  const cp = c.pass, cn = c.pass + c.fail
+  const bp = b.pass, bn = b.pass + b.fail
   const p = fisherOneSided(cp, cn - cp, bp, bn - bp)
   const deltaPasses = cp / Math.max(1, cn) - bp / Math.max(1, bn)
   let verdict
@@ -106,8 +111,8 @@ for (const [k, c] of cT) {
   else verdict = 'NO-LIFT'
   cellVerdicts.push({
     cell: k, verdict, p_one_sided: +p.toFixed(4),
-    candidate: `${cp}/${cn}${c.gameable ? ` (+${c.gameable} gameable)` : ''}`,
-    baseline: `${bp}/${bn}${b.gameable ? ` (+${b.gameable} gameable)` : ''}`,
+    candidate: `${cp}/${cn}${c.ungradable ? ` (+${c.ungradable} ungradable)` : ''}`,
+    baseline: `${bp}/${bn}${b.ungradable ? ` (+${b.ungradable} ungradable)` : ''}`,
     min_n_for_power: verdict === 'UNDERPOWERED' ? minNforPower(bp / bn, cp / cn, ALPHA) : null,
   })
 }
@@ -132,7 +137,7 @@ const scorecard = (argv.expected_flip_cells || []).map((exp) => {
 })
 
 phase('Report')
-const summary = await agent(`Write the A/B verdict to ${OUT}/verdict.md (create the dir). RULES: every number comes from the tables below, embedded VERBATIM — never recompute. State the overall verdict in the first line. If UNGRADEABLE cells exist, say the rung needs a hidden grade_spec.rs (/grade-spec-author) before any lift claim. If UNDERPOWERED, state the min n/arm the observed rates would need. Note the caveat that arms were run sequentially, not interleaved (endpoint drift is uncontrolled). At n=5/arm, significance at alpha=${ALPHA} requires roughly 5/5 vs <=1/5 — say so if relevant.
+const summary = await agent(`Write the A/B verdict to ${OUT}/verdict.md (create the dir). RULES: every number comes from the tables below, embedded VERBATIM — never recompute. State the overall verdict in the first line. If UNGRADEABLE cells exist, say their rows do not record the canonical grader (legacy rows, or PASS rows without grader=grade_spec) and the arm must be re-run on a build with the #2317 grader before any lift claim. If UNDERPOWERED, state the min n/arm the observed rates would need. Note the caveat that arms were run sequentially, not interleaved (endpoint drift is uncontrolled). At n=5/arm, significance at alpha=${ALPHA} requires roughly 5/5 vs <=1/5 — say so if relevant.
 
 Lever: ${argv.lever}
 Overall verdict: ${overall}
@@ -142,7 +147,7 @@ Baseline arm: ${argv.baseline_dir} (sha ${base.meta_git_sha}) | Candidate arm: $
 ${vTable.join('\n')}
 ${scorecard.length ? `\n## Expected-flip scorecard (embed verbatim)\n| expected cell | observed verdict |\n|---|---|\n${scorecard.join('\n')}` : ''}
 
-Structure: ## Verdict, ## Per-cell table, ${scorecard.length ? '## Expected-flip scorecard, ' : ''}## Method (Fisher one-sided exact, alpha=${ALPHA}, PASS-only on ungameable rungs), ## Caveats. Write the file, then return a 3-sentence summary.`,
+Structure: ## Verdict, ## Per-cell table, ${scorecard.length ? '## Expected-flip scorecard, ' : ''}## Method (Fisher one-sided exact, alpha=${ALPHA}, PASS-only, on cells whose rows record grader=grade_spec), ## Caveats. Write the file, then return a 3-sentence summary.`,
   { label: 'report', phase: 'Report', effort: 'high' })
 
 return { lever: argv.lever, overall, cells: cellVerdicts, verdict_path: `${OUT}/verdict.md`, summary }

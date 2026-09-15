@@ -34,6 +34,7 @@ mod crew_tool;
 pub(crate) mod cw_overflow;
 mod display;
 mod generation_policy;
+pub use generation_policy::validate_output_allowance;
 mod git_tool;
 pub mod openai_sse;
 pub(crate) mod self_verify;
@@ -1830,6 +1831,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     artifact_sink: Option<&dyn artifact_read::PromptArtifactSink>,
     mcp: &mut dyn McpTools,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    // #2312: the one dispatch entry refuses an unusable explicit allowance
+    // before any wire is chosen, for every host.
+    validate_output_allowance(ctx.output_allowance, ctx.num_ctx)?;
     // Anthropic speaks its own wire (/v1/messages) — request, tool_use, and
     // usage shapes all differ — so it gets its own loop (the fourth parallel
     // loop beside Ollama / Chat Completions / Responses).
@@ -2104,7 +2108,13 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // #2312: no cognition table on this wire — only an explicit allowance reserves.
     let mut effective_input_ceiling =
         num_ctx_input_ceiling(num_ctx, input_ceiling_pct, output_allowance);
-    observability::observe_output_allowance(&mut solve_obs, output_allowance, false);
+    // An explicit allowance rides every request as `num_predict`.
+    let ollama_options = ollama_options(num_ctx, output_allowance);
+    observability::observe_output_allowance(
+        &mut solve_obs,
+        output_allowance,
+        output_allowance.is_some(),
+    );
     let mut send_budget: Option<usize> =
         initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
     // Step 20.3: is the send budget backed by an authoritative ceiling, or
@@ -2583,22 +2593,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if let Some(harness) = smart_harness {
                 harness.record_messages(&messages)?;
             }
-            let mut body_no_stream = if let Some(ctx_size) = num_ctx {
-                serde_json::json!({
-                    "model": model,
-                    "messages": messages,
-                    "stream": false,
-                    "tools": tools.clone(),
-                    "options": { "num_ctx": ctx_size },
-                })
-            } else {
-                serde_json::json!({
-                    "model": model,
-                    "messages": messages,
-                    "stream": false,
-                    "tools": tools.clone(),
-                })
-            };
+            let mut body_no_stream = serde_json::json!({
+                "model": model,
+                "messages": messages,
+                "stream": false,
+                "tools": tools.clone(),
+            });
+            if let Some(options) = &ollama_options {
+                body_no_stream["options"] = options.clone();
+            }
             // Drop tools entirely for a model that rejects them (set below on a
             // "does not support tools" 400) — an empty array still trips strict
             // models, so remove the key.
@@ -3377,22 +3380,15 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // from the same history; if it returns empty (non-determinism, context
             // pressure, or model quirk) we fall back to the probe content so the
             // user never sees a silent blank response.
-            let mut body_stream = if let Some(ctx_size) = num_ctx {
-                serde_json::json!({
-                    "model": model,
-                    "messages": &messages,
-                    "stream": true,
-                    "tools": tools.clone(),
-                    "options": { "num_ctx": ctx_size },
-                })
-            } else {
-                serde_json::json!({
-                    "model": model,
-                    "messages": &messages,
-                    "stream": true,
-                    "tools": tools.clone(),
-                })
-            };
+            let mut body_stream = serde_json::json!({
+                "model": model,
+                "messages": &messages,
+                "stream": true,
+                "tools": tools.clone(),
+            });
+            if let Some(options) = &ollama_options {
+                body_stream["options"] = options.clone();
+            }
             // A no-tools model (set on a prior "does not support tools" 400)
             // must not see the key on the streaming round either.
             if !tools_supported {
@@ -4283,7 +4279,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         ),
         calibration: cal,
         estimation,
-        ollama_num_ctx: num_ctx,
+        ollama_options,
         prompt_measurement: Default::default(),
     };
     let result = final_summary_ollama(&client, &chat_url, model, trimmed, &cap, attempts).await;
@@ -6167,9 +6163,9 @@ struct CapExit {
     request_budget: Option<usize>,
     calibration: f32,
     estimation: crate::tokens::TokenEstimation,
-    /// Ollama must repeat the configured context window on every request,
-    /// including the tools-disabled cap exit. Ignored by OpenAI chat.
-    ollama_num_ctx: Option<u32>,
+    /// Ollama's request `options` (see [`ollama_options`]), repeated on every
+    /// request including the tools-disabled cap exit. Ignored by OpenAI chat.
+    ollama_options: Option<serde_json::Value>,
     /// Learning evidence from fresh counts of this immutable summary request.
     /// Admission still probes anew on every attempt; this is never a count cache.
     prompt_measurement: std::sync::Mutex<Option<context_recovery::PromptMeasurement>>,
@@ -6348,6 +6344,20 @@ impl CapExit {
 /// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
 /// `cap.accumulated` carries usage from the preceding tool-call rounds so it
 /// survives even when this summary request fails.
+/// Ollama's request `options` (#2312): the declared window as `num_ctx` and an
+/// explicit output allowance as `num_predict`, its supported cap field. `None`
+/// when neither applies, so such a body gains no `options` key at all.
+fn ollama_options(num_ctx: Option<u32>, num_predict: Option<u32>) -> Option<serde_json::Value> {
+    let mut options = serde_json::Map::new();
+    if let Some(num_ctx) = num_ctx {
+        options.insert("num_ctx".into(), num_ctx.into());
+    }
+    if let Some(num_predict) = num_predict {
+        options.insert("num_predict".into(), num_predict.into());
+    }
+    (!options.is_empty()).then_some(serde_json::Value::Object(options))
+}
+
 async fn final_summary_ollama(
     client: &reqwest::Client,
     chat_url: &str,
@@ -6366,8 +6376,8 @@ async fn final_summary_ollama(
         "messages": &messages,
         "stream": false,
     });
-    if let Some(num_ctx) = cap.ollama_num_ctx {
-        body["options"] = serde_json::json!({ "num_ctx": num_ctx });
+    if let Some(options) = &cap.ollama_options {
+        body["options"] = options.clone();
     }
     cap.finish(
         chat_url,
@@ -8805,7 +8815,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         ),
         calibration: cal,
         estimation,
-        ollama_num_ctx: None,
+        ollama_options: None,
         prompt_measurement: Default::default(),
     };
     let summary = final_summary_openai(
@@ -11061,7 +11071,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         ),
         calibration: cal,
         estimation,
-        ollama_num_ctx: None,
+        ollama_options: None,
         prompt_measurement: Default::default(),
     };
     let result = final_summary_anthropic(
