@@ -86,7 +86,7 @@ impl AttemptRecord {
 }
 
 /// Run totals over the latest observation of every distinct attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageTotals {
     pub attempts: u32,
     /// Attempts whose usage is `None`, whatever their state.

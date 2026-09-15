@@ -307,6 +307,10 @@ pub struct TurnOutcome {
     pub features: InstantiatedFeatures,
     /// The output cap the turn's wire applied, and who enforced it (#2312).
     pub output_allowance: Option<crate::agentic::observability::OutputAllowance>,
+    /// What this turn sent and generated, summed per inference attempt, with
+    /// how many attempts reported no usage (#2313). `usage` above stays the
+    /// context merge (largest prompt, generated tokens).
+    pub attempts: Option<crate::attempts::UsageTotals>,
 }
 
 /// Non-blocking snapshot of the driver's state, returned by
@@ -621,6 +625,8 @@ async fn run_one_turn(
                 turn.into()
             }
         };
+    // #2313: one attempt ledger per turn; its totals ride the outcome.
+    let attempt_ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
     let ctx = ChatCtx {
         smart_harness: config.smart_harness.as_deref(),
         rewrites_history: config.context_manager.rewrites_history(),
@@ -680,7 +686,7 @@ async fn run_one_turn(
         cognition: runtime.cognition,
         chat_completions_capability: config.chat_completions_capability,
         output_allowance: config.output_allowance,
-        attempt_ledger: None,
+        attempt_ledger: Some(&attempt_ledger),
         reasoning_replay_scope: config.reasoning_replay_scope,
         emits_leading_reasoning: config.emits_leading_reasoning,
         max_tool_rounds: config.max_tool_rounds,
@@ -750,6 +756,12 @@ async fn run_one_turn(
     // responses check — which is exactly why a responses-only model like
     // gpt-5.6-sol was mis-routed to /v1/chat/completions.)
     let dispatch = chat_complete(ctx, &mut mcp).await;
+    let attempts = Some(
+        attempt_ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .totals(),
+    );
     // Both arms move `tool_events`/`end_reason` out (only one arm runs). On a
     // failed turn we still return `Ok` carrying the PARTIAL trajectory + the
     // error, rather than `Err` that discards what the agent already did — an
@@ -769,6 +781,7 @@ async fn run_one_turn(
             behavior_signals: solve_obs.behavior_signals,
             features,
             output_allowance: solve_obs.output_allowance,
+            attempts,
         }),
         Err(e) => Ok(TurnOutcome {
             reply: String::new(),
@@ -789,6 +802,7 @@ async fn run_one_turn(
             behavior_signals: solve_obs.behavior_signals,
             features,
             output_allowance: solve_obs.output_allowance,
+            attempts,
         }),
     }
 }
@@ -1032,6 +1046,65 @@ mod tests {
         ) -> Result<String, String> {
             Ok("unused fixture crew".to_string())
         }
+    }
+
+    /// #2313 (b2): a headless turn owns a per-turn attempt ledger and returns
+    /// its totals — what was sent, summed per attempt — beside the context
+    /// merge in `usage`. Attempts equal the wire requests: the accepted answer
+    /// and its display reissue are two generations.
+    #[tokio::test]
+    async fn a_headless_turn_reports_its_per_attempt_totals() {
+        let body = [
+            r#"{"choices":[{"delta":{"content":"the answer is 4"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":900,"completion_tokens":40}}"#,
+            "[DONE]",
+        ]
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect::<String>();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let config = TurnDriverConfig::new(
+            server.uri(),
+            "test-model",
+            BackendKind::Openai,
+            "newt-core-test-workspace-that-does-not-exist",
+        );
+        let mut driver = TurnDriver::new(config);
+        driver.submit("what is two plus two").expect("submit");
+        let TurnStatus::Completed(outcome) = pump_to_done(&mut driver).await else {
+            panic!("the headless turn did not complete");
+        };
+        let received = server.received_requests().await.expect("journal");
+        assert!(received
+            .iter()
+            .all(|r| r.url.path() == "/v1/chat/completions"));
+        assert_eq!(
+            outcome.usage,
+            Some(TokenUsage {
+                input_tokens: 900,
+                output_tokens: 80
+            }),
+            "usage stays the context merge"
+        );
+        assert_eq!(
+            outcome.attempts,
+            Some(crate::attempts::UsageTotals {
+                attempts: u32::try_from(received.len()).unwrap(),
+                usage_missing: 0,
+                in_tokens: 1_800,
+                out_tokens: 80,
+                usage_complete: true,
+            })
+        );
+        assert_eq!(received.len(), 2, "accepted answer + display reissue");
     }
 
     async fn drive_once_capturing(mut driver: TurnDriver) -> (Vec<serde_json::Value>, TurnOutcome) {
