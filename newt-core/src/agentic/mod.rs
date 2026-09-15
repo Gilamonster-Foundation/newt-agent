@@ -11078,9 +11078,11 @@ where
 }
 
 /// Record a decoded 2xx Responses reply's attempt by the #2313 state rule: a
-/// complete terminal response — an answer, a refusal, or a truncation
-/// (`incomplete`) — is ok; a failed, provider-error, mixed, non-terminal or
-/// malformed body is failed. The usage the body reported attaches either way.
+/// complete terminal response is ok whatever its content shape — an answer, a
+/// refusal, a truncation (`incomplete`), or content the loop rejects (malformed,
+/// mixed); a failed, provider-error or non-terminal body is failed. How the loop
+/// handles the content is separate from the attempt state. The usage the body
+/// reported attaches either way.
 fn complete_responses_attempt(
     attempts: Option<attempt_capture::AttemptScope<'_>>,
     attempt: Option<&crate::attempts::AttemptKey>,
@@ -11090,10 +11092,10 @@ fn complete_responses_attempt(
         crate::responses_wire::ResponseDecodeError,
     >,
 ) {
-    use crate::responses_wire::ResponseDecodeError::{Incomplete, Refused};
+    use crate::responses_wire::ResponseDecodeError::{Failed, NonTerminal, ProviderError};
     let state = match decoded {
-        Ok(_) | Err(Refused { .. } | Incomplete { .. }) => crate::attempts::AttemptState::Ok,
-        Err(_) => crate::attempts::AttemptState::Failed,
+        Err(ProviderError(_) | Failed(_) | NonTerminal(_)) => crate::attempts::AttemptState::Failed,
+        _ => crate::attempts::AttemptState::Ok,
     };
     attempt_capture::finish(
         attempts,
