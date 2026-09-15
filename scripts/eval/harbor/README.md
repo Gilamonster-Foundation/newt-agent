@@ -186,6 +186,15 @@ Reading the table:
   is `turn.completed`. When no claim can be read, it counts as *unrecoverable*,
   not as "did not claim". A trial killed by Harbor's timeout counts as "did not
   claim".
+- **pi's session log.** pi's claim, inference failure, largest request output
+  and last event are read from its own session JSONL (`agent/pi/sessions/`) when
+  one exists. Harbor pipes pi through a block-buffered `grep`, so a **killed** pi
+  trial's `pi.txt` loses up to 4 KiB of its final events. `pi.txt` still decides
+  auto-retry exhaustion, and it is whole after a normal exit.
+- **Waiting on the model vs a tool.** A timeout whose log ends waiting on the
+  **model** has cause *unknown*, not agent: a lost or stalled request is not
+  provably the agent's doing. A timeout blocked on the harness's **own tool**
+  stays agent.
 - **False completion** means the harness claimed done and Harbor did not
   resolve the trial. **False incomplete** is the reverse.
 - **Tokens** for pi and Codex are Harbor's `agent_result`, parsed from the
