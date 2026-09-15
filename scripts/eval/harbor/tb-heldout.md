@@ -55,6 +55,12 @@ Nothing below uses a result on a held-out task.
 
 Recorded tb-30 scores are **not** the basis for choosing a model. The maintainer has settled the candidates: **ornith-1.5-35b** and a newer small Nemotron 3 (one of nemotron-3-nano_30b, nemotron-3-nano_30b-canonical or nemotron-3-nano-omni, which he picks). A later, separate selection may add other current models.
 
+**Lineage, per the 2026-09-14 small-model survey and the models' own cards.**
+- **ornith-1.5-35b** is a 35B-A3B mixture-of-experts on a **Qwen base**, so it is not an independent lineage from the qwen3-coder baseline.
+- **Nemotron 3.5 Lightning 30B-A3B** (a Mamba-2 + MoE hybrid) is the **genuinely different** candidate.
+
+Lineage informs family diversity later. The calibration still decides this choice.
+
 Before this set is used, each candidate gets one calibration row. Calibration runs after the qwen3-coder_30b cells of the 2026-09-14 baseline and uses development tasks only:
 
 | candidate | calibration run | recorded |
