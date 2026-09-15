@@ -58,6 +58,23 @@ const REMOVED_ENV: &[&str] = &[
     "CARGO_LLVM_COV_TARGET_DIR",
 ];
 
+/// The environment a spec is built and run under, the same in both modes:
+/// its own target dir, the host's build switches emptied, and coverage
+/// instrumentation removed. `Some(value)` sets a variable, `None` removes it.
+pub fn spec_env(target_dir: &Path) -> Vec<(String, Option<String>)> {
+    let mut env = vec![(
+        "CARGO_TARGET_DIR".to_string(),
+        Some(target_dir.to_string_lossy().into_owned()),
+    )];
+    env.extend(
+        EMPTIED_ENV
+            .iter()
+            .map(|k| (k.to_string(), Some(String::new()))),
+    );
+    env.extend(REMOVED_ENV.iter().map(|k| (k.to_string(), None)));
+    env
+}
+
 /// The canonical behavioral verdict. Serialized as the ratchet row's
 /// `behavioral` column: `PASS`, `FAIL`, `UNGRADABLE(reason)`, `ERROR(reason)`.
 ///
@@ -309,15 +326,7 @@ pub fn run_spec(runner: &dyn CommandRunner, tree: &Path, spec: &[u8]) -> Behavio
             )
         }
     };
-    let target = copy.path().join("target").to_string_lossy().into_owned();
-    let mut env: Vec<(String, Option<String>)> =
-        vec![("CARGO_TARGET_DIR".to_string(), Some(target))];
-    env.extend(
-        EMPTIED_ENV
-            .iter()
-            .map(|k| (k.to_string(), Some(String::new()))),
-    );
-    env.extend(REMOVED_ENV.iter().map(|k| (k.to_string(), None)));
+    let env = spec_env(&copy.path().join("target"));
     verdict_from_run(
         &runner.run(&RunSpec {
             // `--color never` pins the output this parses: a caller's
@@ -460,7 +469,10 @@ pub fn verdict_from_run(out: &RunOutcome) -> BehavioralGrade {
                 BehavioralVerdict::Fail,
                 passed + failed,
                 "none",
-                format!("{passed} passed, {failed} failed"),
+                format!(
+                    "{passed} passed, {failed} failed{}",
+                    failing_tests(&out.stdout)
+                ),
             ),
         };
     }
@@ -490,6 +502,37 @@ pub fn verdict_from_run(out: &RunOutcome) -> BehavioralGrade {
         "none",
         format!("{passed} passed"),
     )
+}
+
+/// `": a, b, +N more"` naming the tests in libtest's LAST `failures:` list
+/// (the spec binary's own, printed just before its summary; a spec that runs
+/// cargo in its tests echoes nested lists earlier), at most five; empty when
+/// there is no list.
+fn failing_tests(stdout: &str) -> String {
+    const SHOWN: usize = 5;
+    let lines: Vec<&str> = stdout.lines().collect();
+    let Some(list) = lines.iter().rposition(|l| *l == "failures:") else {
+        return String::new();
+    };
+    let names: Vec<&str> = lines[list + 1..]
+        .iter()
+        .take_while(|l| l.starts_with("    "))
+        .map(|l| l.trim())
+        .collect();
+    let mut shown = names
+        .iter()
+        .take(SHOWN)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > SHOWN {
+        shown.push_str(&format!(", +{} more", names.len() - SHOWN));
+    }
+    if shown.is_empty() {
+        shown
+    } else {
+        format!(": {shown}")
+    }
 }
 
 /// `N` from `… N<label>;` in a libtest summary; 0 if absent.
@@ -649,6 +692,25 @@ mod tests {
         let g = verdict_from_run(&run!("001-seed-spec-compile-error", Some(101)));
         assert_eq!(g.verdict, BehavioralVerdict::Fail);
         assert!(g.detail.contains("could not compile"), "{g:?}");
+    }
+
+    /// A FAIL names the tests that failed, from libtest's own final
+    /// `failures:` list. 011's spec runs cargo inside its tests, so nested
+    /// `tests::…` names appear in its output too; they are not the spec's.
+    #[test]
+    fn a_failing_run_names_its_failing_tests() {
+        let g = verdict_from_run(&run!("011-seed-nested-cargo-fail", Some(101)));
+        assert_eq!(
+            g.detail,
+            "8 passed, 10 failed: behavior_is_invariant_to_calling_binary_identity, \
+             behavior_is_invariant_to_release_profile, \
+             crate_own_test_suite_passes_with_both_tests_actually_executed, \
+             exhaustive_negative_magnitude_sweep, \
+             negatives_are_skipped_not_terminal_in_hand_picked_edge_cases, +5 more",
+            "{g:?}"
+        );
+        let one = verdict_from_run(&run!("t0-seed-fail", Some(101)));
+        assert_eq!(one.detail, "0 passed, 1 failed: add_returns_the_sum");
     }
 
     #[test]
