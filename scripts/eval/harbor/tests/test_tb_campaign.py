@@ -12,7 +12,7 @@ from pathlib import Path
 from pi_log import pi_inference_failure, pi_session_claim
 
 from tb_campaign import (
-    PINNED, awaiting, build_cell, ceiling_reached, codex_claim, deadline_cancels, error_cause, fingerprint,
+    PINNED, TREATMENT_ENV, awaiting, build_cell, ceiling_reached, codex_claim, deadline_cancels, error_cause, fingerprint,
     harness_evidence, is_trial_config, job_state, ledger_entry, ledger_total_s, load_treatment, newcombe,
     newt_claim, observed, pair, pair_report, parse_schedule, pi_claim, pin_extend, pin_mismatch, refusal,
     render_profile, summarize, treatment_env, trial_plan, wilson, window_at,
@@ -166,20 +166,26 @@ class Treatments(unittest.TestCase):
             load_treatment(HARBOR / "tests/fixtures/treatment-requires-unknown.toml")
 
     def test_the_verify_outcomes_treatment_reaches_the_adapter_and_is_observable(self):
-        # #2315: the result-aware switch is a treatment knob, and the arm is
-        # confirmed from the receipt, not assumed from the declared env.
+        # #2315: the result-aware switch is the treatment's only knob (the
+        # self-verify gate it refines is on by default), and the arm is confirmed
+        # from the receipt, not assumed from the declared env.
         t = load_treatment(HARBOR / "treatments/verify-outcomes.toml")
-        self.assertEqual(treatment_env(t), {"NEWT_BENCH_SELF_VERIFY": "1", "NEWT_BENCH_VERIFY_OUTCOMES": "1"})
+        self.assertEqual(treatment_env(t), {"NEWT_BENCH_VERIFY_OUTCOMES": "1"})
         treated = {"receipt": {"verification": {"mode": "result_aware", "repair_allowance": 3}}}
         self.assertIs(observed(t["expect"], treated), True)
         self.assertIs(observed(t["expect"], {"receipt": {"verification": {"mode": "off"}}}), False)
 
     def test_the_campaign_unsets_every_arm_changing_knob_it_does_not_set(self):
-        # An exported switch must not silently flip baseline cells.
-        script = (HARBOR / "tb-campaign.sh").read_text()
-        unset = next(line for line in script.splitlines() if line.startswith("unset "))
-        for knob in ("NEWT_BENCH_SMART", "NEWT_BENCH_VERIFY_OUTCOMES"):
-            self.assertIn(knob, unset.split(), knob)
+        # An operator's exported treatment knob must not silently change every
+        # baseline cell: each TREATMENT_ENV key the runner does not export
+        # itself is unset. Derived from TREATMENT_ENV, so a new knob fails here
+        # until the script handles it.
+        lines = (HARBOR / "tb-campaign.sh").read_text().splitlines()
+        words = lambda prefix: {w.split("=")[0] for l in lines if l.startswith(prefix) for w in l.split()[1:]}
+        exported, unset = words("export "), words("unset ")
+        missing = sorted(TREATMENT_ENV - exported - unset)
+        self.assertEqual(missing, [], "treatment knobs the campaign neither sets nor unsets")
+        self.assertTrue({"NEWT_BENCH_OCAP", "NEWT_BENCH_CONTEXT_WINDOW"} <= exported, exported)
 
     def test_a_refused_requirement_is_read_from_the_exit_message(self):
         message = ("Command failed (exit 1): newt solve ...\nstdout: None\n"
