@@ -10931,6 +10931,7 @@ pub async fn openai_responses_complete_with_prompt(
 /// #1528 B5: this takes a [`ValidatedResponsesRequest`] — a newtype with no public
 /// constructor other than a successful [`validate_responses_request`] — so an
 /// unvalidated `serde_json::Value` body cannot compile its way to `POST /v1/responses`.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_responses_json(
     client: &reqwest::Client,
     url: &str,
@@ -10939,13 +10940,15 @@ async fn dispatch_responses_json(
     retry: &RetryPolicy,
     color: bool,
     smart_harness: Option<&smart_harness::SmartHarness>,
-) -> anyhow::Result<serde_json::Value> {
+    attempts: Option<attempt_capture::AttemptScope<'_>>,
+) -> anyhow::Result<(serde_json::Value, Option<crate::attempts::AttemptKey>)> {
     let body = validated.body();
     let body_bytes = smart_harness
         .map(|h| h.request(body, "responses"))
         .transpose()?;
-    let result = dispatch_json(
+    dispatch_with_decoder(
         retry,
+        attempts,
         || async {
             let mut req = match &body_bytes {
                 Some(bytes) => client
@@ -10959,39 +10962,15 @@ async fn dispatch_responses_json(
             }
             Ok(req)
         },
+        // Keep the status prefix exact: retry classification reads the message.
         "inference endpoint",
         |attempt, delay, error| {
             print_retry_indicator(attempt, retry.max_retries, delay, error, color);
         },
         smart_harness,
-    )
-    .await?;
-    Ok(result)
-}
-
-/// Shared transport from the Responses dispatcher; build a fresh request per attempt.
-/// Keep the status prefix exact: retry classification reads the resulting message.
-async fn dispatch_json<Fut>(
-    retry: &RetryPolicy,
-    request: impl Fn() -> Fut,
-    http_error_prefix: &str,
-    on_retry: impl FnMut(u32, std::time::Duration, &anyhow::Error),
-    smart_harness: Option<&smart_harness::SmartHarness>,
-) -> anyhow::Result<serde_json::Value>
-where
-    Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
-{
-    dispatch_with_decoder(
-        retry,
-        None,
-        request,
-        http_error_prefix,
-        on_retry,
-        smart_harness,
         |bytes| Ok(serde_json::from_slice(bytes)?),
     )
     .await
-    .map(|(json, _)| json)
 }
 
 /// Send with retries and decode. With an attempt scope, every try is one
@@ -11030,6 +11009,24 @@ where
     .await
 }
 
+/// A Responses reply completed its attempt when it decoded to an answer or a
+/// refusal (the model's final word); failed, incomplete and malformed replies
+/// leave the attempt recorded failed.
+fn complete_responses_attempt(
+    attempts: Option<attempt_capture::AttemptScope<'_>>,
+    attempt: Option<&crate::attempts::AttemptKey>,
+    decoded: &Result<
+        crate::responses_wire::DecodedResponse,
+        crate::responses_wire::ResponseDecodeError,
+    >,
+) {
+    if let Ok(crate::responses_wire::DecodedResponse { usage, .. })
+    | Err(crate::responses_wire::ResponseDecodeError::Refused { usage, .. }) = decoded
+    {
+        attempt_capture::complete(attempts, attempt, *usage);
+    }
+}
+
 async fn openai_responses_complete_with_prompt_and_artifacts(
     ctx: ChatCtx<'_>,
     turn_prompt_context: Option<&crate::TurnPromptContext>,
@@ -11066,7 +11063,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         cognition,
         chat_completions_capability: _,
         output_allowance,
-        attempt_ledger: _,
+        attempt_ledger,
         reasoning_replay_scope: _,
         max_tool_rounds,
         workflow_grace_rounds: _,
@@ -11191,6 +11188,16 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     prompt_read::ensure_active_prompt_card(&mut msgs_json, prompt_context, prompt_intake);
+    // #2313: one ledger attempt per primary request, keyed at the send.
+    let attempt_turn = turn_prompt_context
+        .map(|turn| turn.active_operator_prompt().id().to_string())
+        .unwrap_or_default();
+    let attempts = attempt_ledger.map(|ledger| attempt_capture::AttemptScope {
+        ledger,
+        turn: &attempt_turn,
+        model,
+        backend: url,
+    });
     let exec_grounding_turn = action_nudges && prompt_disposition == PromptDisposition::Act;
     let (instructions, mut input) = crate::responses_wire::build_responses_input(&msgs_json);
     let tools_chat = merged_tool_definitions(
@@ -11385,7 +11392,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // out and lets `round` advance, so recovery never consumes a tool-capable
         // round (critical at max_tool_rounds == 1 or near the cap): the recovered
         // request is re-sent WITH tools, never demoted to the tools-disabled summary.
-        let json = loop {
+        let (json, attempt) = loop {
             // #1528 B3: PROACTIVE pre-dispatch compaction — when the request is
             // LOCALLY known to exceed the budget, compact BEFORE dispatch instead of
             // paying a round-trip to learn it from a cw-400. Reuses the ONE
@@ -11480,6 +11487,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 &retry,
                 color,
                 smart_harness,
+                attempts,
             )
             .await;
 
@@ -11671,7 +11679,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // model's final answer for this turn; every other error (provider error,
         // failed / incomplete / non-terminal status, malformed/empty body) is
         // surfaced — never mistaken for a benign empty reply.
-        let decoded = match crate::responses_wire::decode_response(&json) {
+        let decoded = crate::responses_wire::decode_response(&json);
+        complete_responses_attempt(attempts, attempt.as_ref(), &decoded);
+        let decoded = match decoded {
             Ok(d) => d,
             Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage })
                 if smart_harness.is_some() =>
@@ -12281,7 +12291,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // were spent.
     let summary_estimate =
         estimate_responses_request_tokens(instructions.as_deref(), &input, None, estimation);
-    let json = match dispatch_responses_json(
+    let (json, attempt) = match dispatch_responses_json(
         &client,
         &responses_url,
         api_key,
@@ -12289,10 +12299,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         &retry,
         color,
         smart_harness,
+        attempts,
     )
     .await
     {
-        Ok(json) => json,
+        Ok(dispatched) => dispatched,
         Err(error) => {
             if crate::retry::classify(&error) == crate::retry::Retryability::ContextExceeded {
                 context_recovery::terminal_optional(
@@ -12330,7 +12341,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // answer. At this already-reached cap, however, the deterministic progress
     // handoff is still a successful paused turn so the interactive caller can
     // persist it and retain the continuation link.
-    let decoded = match crate::responses_wire::decode_response(&json) {
+    let decoded = crate::responses_wire::decode_response(&json);
+    complete_responses_attempt(attempts, attempt.as_ref(), &decoded);
+    let decoded = match decoded {
         Ok(d) => d,
         Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage }) => {
             accumulated_usage = merge_round_usage(accumulated_usage, usage);

@@ -534,3 +534,104 @@ async fn responses_output_allowance_never_changes_the_request_body() {
     assert_eq!(bodies[1], bodies[0]);
     assert_eq!(bodies[2], bodies[0]);
 }
+
+// -----------------------------------------------------------------------
+// #2313 (b1d): every Responses primary request is one ledger attempt
+// -----------------------------------------------------------------------
+
+/// A function call while tools are offered and no tool result has come back;
+/// then a message (with usage) — which is also the tools-disabled summary.
+struct ResponsesToolThenMessage;
+impl Respond for ResponsesToolThenMessage {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        let has_result = body["input"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|i| i["type"] == "function_call_output"));
+        if body.get("tools").is_some() && !has_result {
+            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{"type": "function_call", "call_id": "call-1",
+                    "name": "definitely_not_a_real_tool", "arguments": "{}"}],
+                "usage": {"input_tokens": 50, "output_tokens": 2}
+            }));
+        }
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "output": [{"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "responses answer"}]}],
+            "usage": {"input_tokens": 60, "output_tokens": 5}
+        }))
+    }
+}
+
+/// Run one Responses turn against [`ResponsesToolThenMessage`] and assert the
+/// #2313 invariant: every received request is on `/v1/responses` (nothing else
+/// was hit, so the filter hides nothing) and the attempts are exactly those
+/// requests, keyed by their bodies. Returns the request count.
+///
+/// Scope of the count: the Responses primary loop's rounds and cap-exit summary.
+async fn responses_turn_attempts(max_tool_rounds: usize) -> usize {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponsesToolThenMessage)
+        .mount(&server)
+        .await;
+    let task = "use a tool then answer";
+    let messages = giant_prompt_messages(task);
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+    ctx.safe_context = None;
+    ctx.max_ok_input = None;
+    ctx.max_tool_rounds = max_tool_rounds;
+    ctx.attempt_ledger = Some(&ledger);
+    let (reply, _, _, _) = openai_responses_complete(ctx, &mut NoMcp)
+        .await
+        .expect("the turn completes");
+    assert!(reply.contains("responses answer"), "{reply}");
+
+    let received = server.received_requests().await.expect("journal");
+    assert!(
+        received.iter().all(|r| r.url.path() == "/v1/responses"),
+        "only /v1/responses may be hit: {:?}",
+        received.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+    let ledger = ledger.lock().unwrap();
+    let mut wire: Vec<_> = received
+        .iter()
+        .map(|r| content_addressable::RawContentId::from_content(&r.body))
+        .collect();
+    let mut recorded: Vec<_> = ledger.records().map(|r| r.key.request).collect();
+    wire.sort();
+    recorded.sort();
+    assert_eq!(
+        recorded, wire,
+        "attempts == wire requests, keyed by their bodies"
+    );
+    for record in ledger.records() {
+        assert!(
+            record.key.turn.starts_with("prompt:"),
+            "{}",
+            record.key.turn
+        );
+        assert_eq!(record.key.role, "primary");
+        assert_eq!(record.state, crate::attempts::AttemptState::Ok);
+        assert!(record.usage.is_some());
+    }
+    received.len()
+}
+
+#[tokio::test]
+async fn every_responses_round_is_one_ledger_attempt_keyed_by_its_wire_bytes() {
+    assert_eq!(responses_turn_attempts(5).await, 2, "tool round, answer");
+}
+
+#[tokio::test]
+async fn a_responses_cap_exit_summary_is_one_ledger_attempt() {
+    assert_eq!(
+        responses_turn_attempts(1).await,
+        2,
+        "tool round, tools-disabled summary"
+    );
+}
