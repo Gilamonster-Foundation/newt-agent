@@ -131,25 +131,25 @@ impl TurnMetrics {
             format!("{}ms", self.elapsed_ms)
         };
 
+        // Whenever attempts were recorded and any lacks usage, say so — also
+        // when none was measured and the numbers below are the context merge's.
+        let unmeasured = self
+            .attempts
+            .filter(|t| t.attempts > 0 && !t.usage_complete)
+            .map(|t| format!(" ({} of {} calls unmeasured)", t.usage_missing, t.attempts))
+            .unwrap_or_default();
         let token_part = match (self.attempts, self.usage) {
-            (Some(t), _) if t.attempts > t.usage_missing => {
-                let unmeasured = if t.usage_complete {
-                    String::new()
-                } else {
-                    format!(" ({} of {} calls unmeasured)", t.usage_missing, t.attempts)
-                };
-                format!(
-                    "{} in / {} out{unmeasured}",
-                    fmt_count(t.in_tokens),
-                    fmt_count(t.out_tokens)
-                )
-            }
+            (Some(t), _) if t.attempts > t.usage_missing => format!(
+                "{} in / {} out{unmeasured}",
+                fmt_count(t.in_tokens),
+                fmt_count(t.out_tokens)
+            ),
             (_, Some(u)) => format!(
-                "{} in / {} out",
+                "{} in / {} out{unmeasured}",
                 fmt_count(u64::from(u.input_tokens)),
                 fmt_count(u64::from(u.output_tokens))
             ),
-            _ => "(tokens unavailable)".into(),
+            _ => format!("(tokens unavailable){unmeasured}"),
         };
 
         let cost_part = match self.cost_usd {
@@ -374,6 +374,24 @@ mod tests {
             "{line}"
         );
         assert!(!line.contains('$') && !line.contains("free"), "{line}");
+    }
+
+    /// #2313 review finding 8: when EVERY attempt is unmeasured the line still
+    /// says so, instead of falling through to the context merge's numbers
+    /// looking measured.
+    #[test]
+    fn display_names_unmeasured_calls_even_when_none_were_measured() {
+        let mut blind = metrics(1000, 120, 15, None);
+        blind.attempts = Some(crate::attempts::UsageTotals {
+            attempts: 2,
+            usage_missing: 2,
+            in_tokens: 0,
+            out_tokens: 0,
+            usage_complete: false,
+        });
+        let line = blind.display_line();
+        assert!(line.contains("(2 of 2 calls unmeasured)"), "{line}");
+        assert!(line.contains("cost unknown"), "{line}");
     }
 
     #[test]
