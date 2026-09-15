@@ -525,23 +525,31 @@ mod tests {
             (StatusCode::NOT_FOUND, Retryability::Fatal),
         ] {
             let code = status.as_u16();
-            let (body, read_diagnostic) = ("{\"error\":\"fixture\"}", "");
+            // The producers' own inputs: raw body bytes, and `resp.status()`.
+            let (bytes, read_diagnostic) = (b"{\"error\":\"fixture\"}".to_vec(), "");
+            let resp_status = || StatusCode::from_u16(code).expect("a real status");
             let endpoint = "http://embeddings.invalid";
             let messages = [
                 // smart_harness::response_with_decoder, hosted/OpenAI loops.
                 {
                     let prefix = "inference endpoint";
-                    format!("{prefix} {status}: {}{read_diagnostic}", body)
+                    format!(
+                        "{prefix} {status}: {}{read_diagnostic}",
+                        String::from_utf8_lossy(&bytes),
+                    )
                 },
                 // The same producer with the Ollama loop's prefix.
                 {
                     let prefix = "Ollama";
-                    format!("{prefix} {status}: {}{read_diagnostic}", body)
+                    format!(
+                        "{prefix} {status}: {}{read_diagnostic}",
+                        String::from_utf8_lossy(&bytes),
+                    )
                 },
                 // warmup.rs.
-                format!("Ollama {}", status),
+                format!("Ollama {}", resp_status()),
                 // semantic.rs.
-                format!("embeddings endpoint {endpoint} returned {}", status),
+                format!("embeddings endpoint {endpoint} returned {}", resp_status()),
             ];
             for message in &messages {
                 assert_eq!(classify(&err(message)), expected, "{message}");
