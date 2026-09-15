@@ -53,7 +53,8 @@
 //! silently, in the text that is printed, returned, persisted and re-sent.
 //! Where the boundary falls is exactly what machine load moves. Every body in
 //! this file was ASCII, which is why nothing here could ever see it. Fixed by
-//! `decode_chunk` and covered below; the Ollama wire still has the twin.
+//! `decode_chunk` and covered below. The Anthropic reader now uses the same
+//! helper, and the Ollama reader buffers bytes per line (#2313 review).
 
 use super::*;
 use crate::agentic::http_loop_tests::DisplayReplay;
@@ -519,16 +520,21 @@ async fn interrupt_once_the_client_is_reading(
     let req = reqwest::Client::new()
         .post(format!("http://{addr}/v1/chat/completions"))
         .json(&serde_json::json!({"stream": true}));
-    let out = openai_stream_final_answer(
-        req,
-        Some(scope),
-        buf.clone(),
-        false,
-        false,
-        false,
-        Some(cancel.as_ref()),
+    // Bounded: with the interrupt arm broken, this connection never closes.
+    let out = tokio::time::timeout(
+        super::http_loop_tests::RAW_STREAM_TEST_BOUND,
+        openai_stream_final_answer(
+            req,
+            Some(scope),
+            buf.clone(),
+            false,
+            false,
+            false,
+            Some(cancel.as_ref()),
+        ),
     )
-    .await;
+    .await
+    .expect("the interrupt ends the read");
     server.abort();
     let record = ledger.lock().unwrap().records().next().cloned();
     (out, buf.text(), record.expect("the reissue was sent"))
@@ -946,7 +952,10 @@ async fn a_primary_stream_rejected_by_strict_decoding_is_failed_with_its_reporte
 /// Send one request to `url` through `dispatch_with_decoder` (no retries) with
 /// the strict OpenAI decoder, expecting it to fail; returns the error and the
 /// one attempt it recorded.
-async fn failed_dispatch_attempt(url: &str) -> (anyhow::Error, crate::attempts::AttemptRecord) {
+async fn failed_dispatch_attempt(
+    url: &str,
+    decode: fn(&[u8]) -> anyhow::Result<serde_json::Value>,
+) -> (anyhow::Error, crate::attempts::AttemptRecord) {
     let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
     let scope = attempt_capture::AttemptScope {
         ledger: &ledger,
@@ -971,7 +980,7 @@ async fn failed_dispatch_attempt(url: &str) -> (anyhow::Error, crate::attempts::
         "inference endpoint",
         |_, _, _| {},
         None,
-        smart_harness::decode_openai_response,
+        decode,
     )
     .await
     .expect_err("the response is rejected");
@@ -996,7 +1005,8 @@ async fn dispatch_with_decoder_keeps_a_strictly_rejected_responses_usage() {
         .mount(&server)
         .await;
     let url = format!("{}/v1/chat/completions", server.uri());
-    let (error, record) = failed_dispatch_attempt(&url).await;
+    let (error, record) =
+        failed_dispatch_attempt(&url, smart_harness::decode_openai_response).await;
     assert!(
         format!("{error:#}").contains("no finish reason"),
         "{error:#}"
@@ -1005,11 +1015,12 @@ async fn dispatch_with_decoder_keeps_a_strictly_rejected_responses_usage() {
     assert_eq!(record.usage, reissue_usage());
 }
 
-/// Review round 3, item e: a 2xx stream whose connection drops after the usage
-/// chunk fails as a body read error, and the failed attempt keeps that usage.
-/// The declared `Content-Length` is never met, so the read is an error, not EOF.
-#[tokio::test]
-async fn a_stream_dropped_after_its_usage_chunk_is_failed_with_that_usage() {
+/// Serve `body` under a `Content-Length` it never meets, so the client's body
+/// read fails (not a clean EOF), and dispatch it with `decode`.
+async fn dropped_body_attempt(
+    body: String,
+    decode: fn(&[u8]) -> anyhow::Result<serde_json::Value>,
+) -> (anyhow::Error, crate::attempts::AttemptRecord) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1024,25 +1035,57 @@ async fn a_stream_dropped_after_its_usage_chunk_is_failed_with_that_usage() {
             sock.read(&mut scratch).await.unwrap() > 0,
             "the client asked"
         );
-        let body = format!(
-            "data: {}\n\ndata: {REISSUE_USAGE}\n\n",
-            r#"{"choices":[{"delta":{"content":"half an answ"}}]}"#
-        );
-        let head =
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100000\r\n\r\n";
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n";
         sock.write_all(format!("{head}{body}").as_bytes())
             .await
             .unwrap();
         // Dropping the socket here cuts the body short of its declared length.
     });
-    let (error, record) = failed_dispatch_attempt(&url).await;
+    let (error, record) = failed_dispatch_attempt(&url, decode).await;
     server.abort();
     assert!(
         format!("{error:#}").contains("request failed reading response"),
         "{error:#}"
     );
-    assert_eq!(record.state, crate::attempts::AttemptState::Failed);
-    assert_eq!(record.usage, reissue_usage());
+    (error, record)
+}
+
+/// Review rounds 3 and 4, item e: a 2xx body whose read fails keeps the usage
+/// its bytes already reported — whether the decode of those bytes was rejected
+/// (a stream cut mid-answer), or succeeded (a whole `[DONE]` stream, or whole
+/// JSON, before the break).
+#[tokio::test]
+async fn a_body_read_failure_keeps_the_usage_its_bytes_reported() {
+    let answer = r#"{"choices":[{"delta":{"content":"an answer"},"finish_reason":"stop"}]}"#;
+    let json: fn(&[u8]) -> anyhow::Result<serde_json::Value> =
+        |bytes| Ok(serde_json::from_slice(bytes)?);
+    let cases = [
+        (
+            "stream cut mid-answer",
+            format!("data: {answer}\n\ndata: {REISSUE_USAGE}\n\n"),
+            smart_harness::decode_openai_response as fn(&[u8]) -> _,
+        ),
+        (
+            "whole [DONE] stream",
+            format!("data: {answer}\n\ndata: {REISSUE_USAGE}\n\ndata: [DONE]\n\n"),
+            smart_harness::decode_openai_response,
+        ),
+        (
+            "whole Ollama JSON",
+            r#"{"message":{"content":"an answer"},"prompt_eval_count":42,"eval_count":5}"#
+                .to_string(),
+            json,
+        ),
+    ];
+    for (name, body, decode) in cases {
+        let (_, record) = dropped_body_attempt(body, decode).await;
+        assert_eq!(
+            record.state,
+            crate::attempts::AttemptState::Failed,
+            "{name}"
+        );
+        assert_eq!(record.usage, reissue_usage(), "{name}");
+    }
 }
 
 // -----------------------------------------------------------------------
