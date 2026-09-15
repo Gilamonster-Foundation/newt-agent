@@ -278,3 +278,21 @@ async fn failed_turn_persists_with_null_usage_never_a_fabricated_zero() {
         "NULL usage is the honest value for an unrecoverable error, not 0"
     );
 }
+
+/// #2372: Esc after an unstreamed reply was accepted saves the turn EMPTY —
+/// that reply was never rendered, so saving it would record what the operator
+/// never saw. A streamed reply was on screen and is kept. Usage stands.
+#[test]
+fn an_interrupted_unstreamed_reply_is_persisted_empty_with_its_usage() {
+    let usage = Some(newt_core::TokenUsage {
+        input_tokens: 10,
+        output_tokens: 3,
+    });
+    let unstreamed: anyhow::Result<_> = Ok(("never shown".to_string(), false, usage, 1));
+    assert_eq!(interrupted_turn_record(&unstreamed), ("", usage, 1));
+    let streamed: anyhow::Result<_> = Ok(("on screen".to_string(), true, usage, 0));
+    assert_eq!(interrupted_turn_record(&streamed), ("on screen", usage, 0));
+    let failed: anyhow::Result<(String, bool, Option<newt_core::TokenUsage>, u32)> =
+        Err(anyhow::anyhow!("boom"));
+    assert_eq!(interrupted_turn_record(&failed), ("", None, 0));
+}

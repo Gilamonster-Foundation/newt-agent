@@ -114,11 +114,7 @@ impl Respond for CaptureThenFinish {
             .lock()
             .expect("request capture lock")
             .push(body);
-        // Primary and final-display requests both use SSE. Each is
-        // captured like any other request — it goes to the same
-        // endpoint and carries the same wire controls, so the assertions about
-        // both apply to it too.
-        // Every generation reports 7 output tokens, so a contract that counts
+        // The primary request uses SSE. Every generation reports 7 output tokens, so a contract that counts
         // two generations for one answer reads 14 (#2372).
         if streaming {
             let frame = serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]});
@@ -762,6 +758,75 @@ async fn solve_scratchpad_state_reaches_wire_and_receipt() {
             .is_some_and(|s| s.starts_with('b')),
         "the seed is a content id: {scratchpad}"
     );
+}
+
+/// #2372: `newt solve` shows the model's final claim on stdout exactly once on
+/// every wire. Chat Completions returns its answer unprinted, so solve prints
+/// it; Anthropic streams it itself, so solve must not print it again. The
+/// claim is what a transcript tail and false-completion forensics read.
+#[tokio::test(flavor = "multi_thread")]
+async fn solve_prints_the_final_answer_exactly_once_on_every_wire() {
+    const CLAIM: &str = "FINAL-CLAIM-2372 every check passed";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if body["stream"].as_bool().unwrap_or(false) {
+                let frame = serde_json::json!({"choices": [{"delta": {"content": CLAIM}, "finish_reason": "stop"}]});
+                let sse = format!("data: {frame}\n\ndata: [DONE]\n\n");
+                return ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream");
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": CLAIM}, "finish_reason": "stop"}]
+            }))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(|_request: &Request| {
+            let frames = [
+                serde_json::json!({"type": "message_start", "message": {"model": "m", "usage": {"input_tokens": 5}}}),
+                serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+                serde_json::json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": CLAIM}}),
+                serde_json::json!({"type": "content_block_stop", "index": 0}),
+                serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 4}}),
+                serde_json::json!({"type": "message_stop"}),
+            ];
+            let body: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+            ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream")
+        })
+        .mount(&server)
+        .await;
+
+    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let instruction_path = fixture.path().join("instruction.md");
+    std::fs::write(&instruction_path, "Finish without calling a tool.\n")
+        .expect("write solve instruction");
+    for kind in ["openai", "anthropic"] {
+        let output = Command::cargo_bin("newt")
+            .expect("newt binary")
+            .env_remove("NEWT_TEAM")
+            .env_remove("NEWT_ANTHROPIC_STREAM")
+            .args(["--backend-endpoint", &server.uri()])
+            .args(["--backend-model", "m"])
+            .args(["--backend-kind", kind])
+            .args(["solve", "--cwd"])
+            .arg(fixture.path())
+            .arg("--instruction-file")
+            .arg(&instruction_path)
+            .args(["--max-rounds", "1"])
+            .output()
+            .expect("run newt solve");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{kind}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(stdout.matches(CLAIM).count(), 1, "{kind}: {stdout}");
+    }
 }
 
 /// An explicit config file selects the configuration source, but it must not

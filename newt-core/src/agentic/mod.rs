@@ -1937,9 +1937,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         operating_mode_control,
         plan_mode_control,
         steering,
-        // #2372: the final answer is the probe, split in batch by
-        // `split_reasoning`, which needs no streaming hint.
-        emits_leading_reasoning: _,
+        emits_leading_reasoning,
     } = ctx;
     // Any completed viewport this turn paints must not outlive the turn's
     // bookkeeping: on EVERY exit (return, `?`, cancel, panic) the guard
@@ -3339,12 +3337,21 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // #2372: the probe's content is the answer. It is never generated a
             // second time for display: the host renders the accepted reply, so
             // the operator sees, the caller returns and the ledger counts one
-            // generation. Reasoning is split out here, as the display stream's
-            // filter used to (#385, #528's lone leading closer), and folded.
-            let (probe_content, probe_reasoning) =
-                crate::reasoning::split_reasoning(&probe_content);
+            // generation. Reasoning is filtered with the display stream's own
+            // policy (#385; #528's leading shape only when declared), and folded.
+            let (probe_content, inline_reasoning) = crate::reasoning::ThinkFilter::filter_complete(
+                &probe_content,
+                emits_leading_reasoning,
+            );
+            // Ollama's native `thinking` channel wins over inline tags, as
+            // `reasoning_content` does on the OpenAI wire.
+            let native_thinking = json["message"]["thinking"]
+                .as_str()
+                .map(str::trim)
+                .filter(|thinking| !thinking.is_empty())
+                .map(str::to_string);
             commit_reasoning_fold(
-                probe_reasoning,
+                native_thinking.or(inline_reasoning),
                 probe_started.elapsed(),
                 completed_spill_renderer.as_deref(),
                 color,

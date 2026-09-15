@@ -818,6 +818,11 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
             writeln!(f, "{line}").context("writing events line")?;
         }
     }
+    // #2372: the Chat and Ollama loops return their answer unprinted, so show it
+    // here — the model's final claim is what a transcript tail must carry.
+    if let Some(o) = o_opt.filter(|o| !o.was_streamed && !o.reply.is_empty()) {
+        println!("▸  {}", o.reply);
+    }
     // Always echo the trace to stdout too, so a manual bootstrap run is legible.
     for line in &trace_lines {
         println!("{line}");

@@ -305,6 +305,9 @@ pub struct TurnOutcome {
     pub behavior_signals: Vec<crate::agentic::observability::BehaviorSignal>,
     /// The optional collaborators this turn's context actually carried.
     pub features: InstantiatedFeatures,
+    /// Whether the loop already printed `reply` as it arrived. A host that
+    /// shows answers must print an unstreamed reply itself (#2372).
+    pub was_streamed: bool,
     /// The output cap the turn's wire applied, and who enforced it (#2312).
     pub output_allowance: Option<crate::agentic::observability::OutputAllowance>,
 }
@@ -756,8 +759,9 @@ async fn run_one_turn(
     // infrastructure failure (e.g. a context-window 500) must not misreport the
     // agent as having done nothing.
     match dispatch {
-        Ok((reply, _, usage, hallucinations)) => Ok(TurnOutcome {
+        Ok((reply, was_streamed, usage, hallucinations)) => Ok(TurnOutcome {
             reply,
+            was_streamed,
             usage,
             hallucinations,
             tool_events,
@@ -772,6 +776,7 @@ async fn run_one_turn(
         }),
         Err(e) => Ok(TurnOutcome {
             reply: String::new(),
+            was_streamed: false,
             usage: None,
             hallucinations: 0,
             tool_events,

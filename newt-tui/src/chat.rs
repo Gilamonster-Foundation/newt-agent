@@ -7901,12 +7901,8 @@ fn session_body(
                         // branch used to discard `response` unread; read it
                         // defensively rather than assume Ok (a genuine `Err`
                         // racing the same instant has nothing recoverable).
-                        let (cancel_reply, cancel_usage, cancel_hallucinations) = match &response {
-                            Ok((reply, _was_streamed, usage, hallucinations)) => {
-                                (reply.as_str(), *usage, *hallucinations)
-                            }
-                            Err(_) => ("", None, 0),
-                        };
+                        let (cancel_reply, cancel_usage, cancel_hallucinations) =
+                            interrupted_turn_record(&response);
                         let pricing = cfg.pricing.clone().unwrap_or_default();
                         persist_incomplete_turn(
                             conversation_store.as_ref(),
@@ -8477,6 +8473,19 @@ fn session_body(
 #[cfg(test)]
 #[path = "chat_tests/prompt_ingress.rs"]
 mod prompt_ingress_tests;
+
+/// What an interrupted turn persists. A streamed reply was already on screen,
+/// so it is saved as shown; an unstreamed one was never rendered, so the turn
+/// is saved empty — Esc ends it empty (#2372). Usage stands either way (#1963).
+fn interrupted_turn_record(
+    response: &anyhow::Result<(String, bool, Option<newt_core::TokenUsage>, u32)>,
+) -> (&str, Option<newt_core::TokenUsage>, u32) {
+    match response {
+        Ok((reply, true, usage, hallucinations)) => (reply.as_str(), *usage, *hallucinations),
+        Ok((_, false, usage, hallucinations)) => ("", *usage, *hallucinations),
+        Err(_) => ("", None, 0),
+    }
+}
 
 /// #1963 regression: a turn that is cancelled or errors must still leave a
 /// `turns` row, a `turn_outcome` artifact, and (when recoverable) real

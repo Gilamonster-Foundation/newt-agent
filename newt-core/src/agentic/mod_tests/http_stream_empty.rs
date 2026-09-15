@@ -54,32 +54,103 @@ async fn ollama_returns_the_accepted_probe_answer_without_a_reissue() {
     assert_eq!(hallu, 0);
 }
 
-/// #2372: reasoning never reaches the accepted Ollama answer. The deleted
-/// display stream's filter used to strip it; the probe path must now, for an
-/// inline `<think>` block and #528's lone leading closer alike.
-#[tokio::test]
-async fn reasoning_does_not_leak_into_the_accepted_ollama_answer() {
-    for content in ["<think>x</think>Done.", "x</think>Done."] {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "message": {"content": content},
-                "prompt_eval_count": 5, "eval_count": 2,
-            })))
-            .mount(&server)
-            .await;
-
-        let messages = msgs();
-        let caveats = Caveats::top();
-        let (reply, _streamed, _usage, _hallu) =
-            chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
-                .await
-                .expect("dispatch");
-
-        assert_eq!(reply, "Done.", "{content:?}");
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+/// One Ollama answer with `content` (and optionally native `thinking`),
+/// returned through a real turn; `renderer` records the reasoning fold.
+async fn ollama_answer(
+    content: &str,
+    thinking: Option<&str>,
+    leading_reasoning: bool,
+    renderer: Option<Arc<FoldRecorder>>,
+) -> String {
+    let server = MockServer::start().await;
+    let mut message = serde_json::json!({"content": content});
+    if let Some(thinking) = thinking {
+        message["thinking"] = serde_json::json!(thinking);
     }
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": message, "prompt_eval_count": 5, "eval_count": 2,
+        })))
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.emits_leading_reasoning = leading_reasoning;
+    c.completed_spill_renderer = renderer.map(|r| r as Arc<dyn CompletedSpillRenderer>);
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    reply
+}
+
+/// #2372: the accepted Ollama answer follows the display stream's reasoning
+/// policy. An undeclared backend keeps a lone `</think>` as answer text; only a
+/// backend declaring the leading shape (#384, #528) has it stripped; an inline
+/// `<think>` block never reaches the answer either way.
+#[tokio::test]
+async fn the_ollama_answer_follows_the_declared_reasoning_policy() {
+    let undeclared = "End the block with `</think>` and then answer.";
+    assert_eq!(
+        ollama_answer(undeclared, None, false, None).await,
+        undeclared
+    );
+    assert_eq!(
+        ollama_answer("plan</think>Done.", None, true, None).await,
+        "Done."
+    );
+    let declared = ollama_answer("plan</think>Use the <think> tag", None, true, None).await;
+    assert!(
+        !declared.contains("plan") && !declared.contains("</think>"),
+        "{declared:?}"
+    );
+    for leading in [false, true] {
+        assert_eq!(
+            ollama_answer("<think>x</think>Done.", None, leading, None).await,
+            "Done."
+        );
+    }
+}
+
+/// Records what the reasoning fold retains.
+#[derive(Default)]
+struct FoldRecorder(std::sync::Mutex<Vec<String>>);
+impl CompletedSpillRenderer for FoldRecorder {
+    fn retain_completed(&self, output: &str) -> Option<u64> {
+        self.0.lock().unwrap().push(output.to_string());
+        Some(1)
+    }
+    fn render_completed(&self, _output: &str, _width: usize, _max_height: usize) -> usize {
+        0
+    }
+    fn is_active(&self) -> bool {
+        false
+    }
+    fn erase(&self) {}
+    fn discard(&self) {}
+}
+
+/// #2372: Ollama's native `thinking` channel is folded like the OpenAI wire's
+/// `reasoning_content` — it is the reasoning, not lost with the display stream.
+#[tokio::test]
+async fn ollama_native_thinking_is_folded_with_the_accepted_answer() {
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    crate::process_env::set_var("NEWT_THINKING", "fold");
+    let recorder = Arc::new(FoldRecorder::default());
+    let reply = ollama_answer(
+        "Done.",
+        Some("plan the change"),
+        false,
+        Some(recorder.clone()),
+    )
+    .await;
+    assert_eq!(reply, "Done.");
+    let retained = recorder.0.lock().unwrap();
+    assert!(
+        retained.iter().any(|body| body.contains("plan the change")),
+        "the native thinking was folded: {retained:?}"
+    );
 }
 
 struct EmptyStreamResponder;
