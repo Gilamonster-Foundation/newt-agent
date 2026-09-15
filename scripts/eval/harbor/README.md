@@ -134,6 +134,13 @@ declares the arms. Without it, every harness in `TB_HARNESSES` runs `none`.
 Treatments apply to newt only. The file's sha256 is recorded as the treatment's
 identity.
 
+*Required features.* A treatment may declare `requires = ["scratchpad", ...]`,
+using newt's receipt keys (`scratchpad`, `code_search`, `crew`). The adapter
+passes each one as `newt solve --require-feature`, so a feature the run cannot
+supply refuses before any inference. A cell whose trials all refuse is recorded
+as skipped with newt's refusal text. It is never graded, and no claim is counted
+for it. The baseline requires nothing.
+
 *Declared but not observed.* This column counts trials whose contract lacks a
 declared path. It reads `n/a` when a treatment declares nothing observable;
 today only `smart_harness` appears in the contract.

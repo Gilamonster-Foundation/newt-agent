@@ -307,3 +307,75 @@ fn stale_file_ground_truth_nudge_names_read_only_checks_and_revert_guard() {
         "{nudge}"
     );
 }
+
+/// #2315: on the Responses wire with SmartHarness, a turn whose check already
+/// ran must not be nudged to run it (#1961: the attempt satisfies the gate).
+/// `verify_answer` saw no command there, because requested calls ride as
+/// `function_call` items. Twin in the same test: the same wire with the check
+/// NOT run is still nudged, so a gate that never fires cannot pass this.
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(newt_self_verify_env)]
+async fn responses_smart_gate_sees_a_check_the_model_already_ran() {
+    use crate::agentic::smart_harness::{AdjudicationSettings, SmartHarness};
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("NEWT_SELF_VERIFY", v),
+                None => std::env::remove_var("NEWT_SELF_VERIFY"),
+            }
+        }
+    }
+    let _restore = Restore(std::env::var_os("NEWT_SELF_VERIFY"));
+    std::env::set_var("NEWT_SELF_VERIFY", "1");
+
+    const CHECK: &str = "sh -c true";
+    for ran_check in [true, false] {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .respond_with(move |_: &Request| {
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                ResponseTemplate::new(200).set_body_json(if first && ran_check {
+                    serde_json::json!({"id":"resp_1","status":"completed","output":[{
+                        "type":"function_call","id":"fc_1","call_id":"call_1","name":"run_command",
+                        "arguments":serde_json::json!({"command": CHECK}).to_string()}]})
+                } else {
+                    serde_json::json!({"id":"resp_1","status":"completed","model":"test-model",
+                        "output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed",
+                        "content":[{"type":"output_text","text":"done","annotations":[]}]}]})
+                })
+            })
+            .mount(&server)
+            .await;
+        let harness = SmartHarness::new(
+            agent_harness::Session::new(Default::default()).unwrap(),
+            Arc::new(|_| Box::pin(async { Ok(("\"answer\"".to_string(), None)) })),
+            AdjudicationSettings::default(),
+        )
+        .unwrap();
+        let ws = tempfile::TempDir::new().unwrap();
+        let workspace = ws.path().to_string_lossy().into_owned();
+        let task = format!("Fix the bug. You can run `{CHECK}` to verify.");
+        let (uri, messages, caveats) = (server.uri(), msgs(), Caveats::top());
+        let mut context = ctx(&uri, &messages, &caveats);
+        context.smart_harness = Some(&harness);
+        context.kind = BackendKind::Openai;
+        context.workspace = &workspace;
+        context.task = &task;
+        openai_responses_complete(context, &mut NoMcp)
+            .await
+            .expect("the turn completes");
+        let nudged = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| String::from_utf8_lossy(&r.body).contains("Before you finish"));
+        assert_eq!(
+            nudged, !ran_check,
+            "ran_check={ran_check}: the gate nudges exactly when the check was not attempted"
+        );
+    }
+}

@@ -91,7 +91,7 @@ use catalog::{
     levenshtein, nearest_tool_name, ALL_TOOL_NAMES, BASE_TOOL_NAMES, EXTENDED_TOOL_REGISTRY,
 };
 pub use exposure::ExposureSettings;
-pub(crate) use exposure::{select_exposed, select_openai_compatible_tools};
+pub(crate) use exposure::{select_exposed, select_openai_compatible_tools, HiddenTools};
 /// Build a shell prefix that exports venv/exec-path vars into the agent-bridle
 /// confined shell.
 ///
@@ -2458,10 +2458,19 @@ async fn execute_authorized_tool(
         plan_mode_control,
         spill_store,
         persona_tools,
+        hidden_tools,
         live_tool_output,
         completed_spill_renderer: _,
+        execution,
     } = collab;
     let smart_harness = invocation.map(|call| call.harness());
+    // #2315: hand the shell's execution class to the funnel, return the text.
+    let executed = |(text, outcome): (String, crate::ExecOutcome)| {
+        if let Some(slot) = execution {
+            let _ = slot.set(outcome);
+        }
+        text
+    };
     let host_return = |text: String| {
         if let Some(invocation) = invocation {
             invocation.host();
@@ -2566,6 +2575,13 @@ async fn execute_authorized_tool(
         if !persona_tool_allowed(canonical, allow) && !mcp.handles(name) {
             return host_return(persona_tool_denied_message(canonical));
         }
+    }
+
+    // #2331: an authorized tool whose schema the model was never sent. Every
+    // authority check above has already passed, so a refused tool never gets
+    // here; this call does not run, and the loop sends the schema next request.
+    if let Some(message) = hidden_tools.and_then(|hidden| hidden.promote(name).message(name)) {
+        return host_return(message);
     }
 
     // Remote MCP tools (namespaced `server__tool`) route to their server before
@@ -2964,7 +2980,12 @@ async fn execute_authorized_tool(
             );
             // #2332: disposition narrowing happens inside the search, which
             // names what it hides instead of dropping it.
-            super::tool_search::execute_tool_search_for_disposition(query, &catalog, disposition)
+            super::tool_search::execute_tool_search_for_disposition(
+                query,
+                &catalog,
+                disposition,
+                hidden_tools,
+            )
         }
 
         // Embedded git (PR4, #461): dispatch through the injected GitTool
@@ -3129,20 +3150,22 @@ async fn execute_authorized_tool(
                 workspace,
                 cd_path.as_deref().or_else(|| args["cwd"].as_str()),
             );
-            exec_confined_command(
-                cmd,
-                &run_cwd,
-                color,
-                tool_output_lines,
-                caveats,
-                exec_floor,
-                permission_gate,
-                tool_offload,
-                spill_store,
-                live_tool_output.clone(),
-                presentation,
+            executed(
+                exec_confined_command(
+                    cmd,
+                    &run_cwd,
+                    color,
+                    tool_output_lines,
+                    caveats,
+                    exec_floor,
+                    permission_gate,
+                    tool_offload,
+                    spill_store,
+                    live_tool_output.clone(),
+                    presentation,
+                )
+                .await,
             )
-            .await
         }
 
         // #891: the model-facing lifecycle surface over the #880 system. Resolve
@@ -3219,7 +3242,7 @@ async fn execute_authorized_tool(
             let joined = cmds.join(" && ");
             match action {
                 "list" => format!("lifecycle {} → {joined}", phase.as_str()),
-                "run" => {
+                "run" => executed(
                     exec_confined_command(
                         &joined,
                         &effective_dir,
@@ -3233,8 +3256,8 @@ async fn execute_authorized_tool(
                         live_tool_output.clone(),
                         presentation,
                     )
-                    .await
-                }
+                    .await,
+                ),
                 other => format!(
                     "error: unknown lifecycle action '{other}'. Use 'run' (default) or 'list'."
                 ),
@@ -4054,7 +4077,7 @@ mod exit_code_ok_tests;
 
 #[cfg(test)]
 #[path = "tools_tests/disable_ocap_tests.rs"]
-mod disable_ocap_tests;
+pub(crate) mod disable_ocap_tests;
 
 #[cfg(test)]
 #[path = "tools_tests/smart_frame_isolation.rs"]

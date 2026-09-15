@@ -10,9 +10,10 @@ import unittest
 from pathlib import Path
 
 from tb_campaign import (
-    PINNED, build_cell, codex_claim, deadline_cancels, fingerprint, is_trial_config, job_state, parse_schedule,
-    trial_plan, window_at, error_cause, harness_evidence, load_treatment, newcombe, newt_claim, observed,
-    pair, pair_report, pi_claim, pin_extend, pin_mismatch, render_profile, summarize, wilson,
+    PINNED, build_cell, codex_claim, deadline_cancels, error_cause, fingerprint, harness_evidence,
+    is_trial_config, job_state, load_treatment, newcombe, newt_claim, observed, pair, pair_report,
+    parse_schedule, pi_claim, pin_extend, pin_mismatch, refusal, render_profile, summarize, treatment_env,
+    trial_plan, wilson, window_at,
 )
 
 HARBOR = Path(__file__).resolve().parent.parent
@@ -154,6 +155,24 @@ class Treatments(unittest.TestCase):
     def test_env_outside_the_adapter_knobs_is_refused(self):
         with self.assertRaises(ValueError):
             load_treatment(HARBOR / "tests/fixtures/treatment-bad-env.toml")
+
+    def test_requires_reaches_the_adapter_and_none_requires_nothing(self):
+        t = load_treatment(HARBOR / "tests/fixtures/treatment-requires-scratchpad.toml")
+        self.assertEqual(treatment_env(t), {"NEWT_BENCH_REQUIRE_FEATURES": "scratchpad"})
+        self.assertEqual(treatment_env(load_treatment("none")), {})
+        with self.assertRaises(ValueError):  # names are the receipt keys: scratchpad, code_search, crew
+            load_treatment(HARBOR / "tests/fixtures/treatment-requires-unknown.toml")
+
+    def test_a_refused_requirement_is_read_from_the_exit_message(self):
+        message = ("Command failed (exit 1): newt solve ...\nstdout: None\n"
+                   "stderr: Error: required feature `scratchpad` is unavailable: no --scratchpad-state was supplied")
+        # Wording from Feature::absence in newt-cli/src/solve_contract.rs (#2356).
+        self.assertEqual(refusal(message),
+                         "required feature `scratchpad` is unavailable: no --scratchpad-state was supplied")
+        self.assertIsNone(refusal("Command failed (exit 1): streamed tool batch did not finish with tool_calls"))
+        refused = [row(state="refused", claimed_done=True), row(state="refused", claimed_done=None)]
+        s = summarize({"expected": 2, "model": "m"}, refused)  # never reached the model: no grade, no claim
+        self.assertEqual((s["graded"], s["claimed"], s["unrecoverable_claims"], s["rate_agent_fail"]), (0, 0, 0, (0, 0)))
 
     def test_observed_reads_dotted_contract_paths(self):
         expect = {"effective_config.smart_harness": "*", "effective_config.ocap": "off"}
