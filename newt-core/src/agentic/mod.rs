@@ -7192,7 +7192,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                             "inference endpoint",
                             smart_harness::decode_openai_response,
                         )
-                        .await?;
+                        .await
+                        .inspect_err(|error| {
+                            attempt_capture::failed(attempts, attempt.as_ref(), error);
+                        })?;
                         attempt_capture::complete(
                             attempts,
                             attempt.as_ref(),
@@ -11086,7 +11089,8 @@ where
                 http_error_prefix,
                 decode,
             )
-            .await?;
+            .await
+            .inspect_err(|error| attempt_capture::failed(attempts, attempt.as_ref(), error))?;
             Ok((json, attempt))
         },
         on_retry,
