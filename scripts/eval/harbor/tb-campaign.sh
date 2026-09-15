@@ -63,16 +63,17 @@ N_TASKS="$(py 'import json,sys; print(sum(len(d["task_names"]) for d in json.loa
 ENGINE="llama.cpp router $(curl -s -m 20 "$EP/props" | py 'import json,sys; print(json.load(sys.stdin).get("build_info"))')"
 
 # served <model> -> "<status> <ctx-size> <fingerprint json>", or "absent - null".
-# The fingerprint is the server's own model metadata plus the GGUF basename (the
-# full path carries a local username); the router exposes no weights digest.
+# The fingerprint (tb_campaign.fingerprint) is the server's model metadata, the
+# GGUF basename and the preset's chat-template kwargs; the router exposes no
+# weights digest.
 served() {
   curl -s -m 20 "$EP/v1/models" | py '
-import json,os,sys
+import json,sys
+from tb_campaign import fingerprint
 for m in json.load(sys.stdin)["data"]:
     if m["id"]==sys.argv[1]:
         st=m.get("status") or {}; a=st.get("args") or []
-        fp=dict(m.get("meta") or {}, gguf=os.path.basename(a[a.index("--model")+1]) if "--model" in a else None)
-        print(st.get("value"), a[a.index("--ctx-size")+1] if "--ctx-size" in a else "-", json.dumps(fp, sort_keys=True)); break
+        print(st.get("value"), a[a.index("--ctx-size")+1] if "--ctx-size" in a else "-", json.dumps(fingerprint(m), sort_keys=True)); break
 else: print("absent - null")' "$1"
 }
 loaded() { curl -s -m 20 "$EP/v1/models" | py 'import json,sys; print(",".join(m["id"] for m in json.load(sys.stdin)["data"] if (m.get("status") or {}).get("value")=="loaded"))'; }

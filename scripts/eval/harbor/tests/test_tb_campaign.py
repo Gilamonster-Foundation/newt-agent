@@ -10,9 +10,9 @@ import unittest
 from pathlib import Path
 
 from tb_campaign import (
-    PINNED, build_cell, codex_claim, error_cause, harness_evidence, load_treatment, newcombe, newt_claim, observed,
-    pair, pair_report, pi_claim, pin_extend, pin_mismatch, refusal, render_profile, summarize, treatment_env,
-    wilson,
+    PINNED, build_cell, codex_claim, error_cause, fingerprint, harness_evidence, load_treatment, newcombe, newt_claim,
+    observed, pair, pair_report, pi_claim, pin_extend, pin_mismatch, refusal, render_profile, summarize,
+    treatment_env, wilson,
 )
 
 HARBOR = Path(__file__).resolve().parent.parent
@@ -202,9 +202,26 @@ class Pinning(unittest.TestCase):
         for k in PINNED:
             self.assertEqual(pin_mismatch(pin, {**self.CELL, k: "other"}), [k])
 
-    def test_a_changed_model_fingerprint_refuses(self):
+    def test_a_changed_model_fingerprint_refuses_naming_the_field(self):
         pin = pin_extend({}, dict(self.CELL))
-        self.assertEqual(pin_mismatch(pin, {**self.CELL, "model_fingerprint": {"size": 2, "ftype": "Q4_K"}}), ["model_fingerprint"])
+        self.assertEqual(pin_mismatch(pin, {**self.CELL, "model_fingerprint": {"size": 2, "ftype": "Q4_K"}}),
+                         ["model_fingerprint.size"])
+
+    def test_a_changed_router_preset_thinking_flag_refuses(self):
+        # The thinking switch lives in the router preset (identical for every harness);
+        # a preset edit between cells must not pool with the cells before it.
+        def served(kwargs):
+            preset = "[m]\njinja = 1\nctx-size = 131072\nmodel = /x/y/m.gguf\n" + (f"chat-template-kwargs = {kwargs}\n" if kwargs else "")
+            return {"id": "m", "meta": {"size": 1, "ftype": "Q8_0"},
+                    "status": {"value": "loaded", "args": ["--ctx-size", "131072"], "preset": preset}}
+
+        off = fingerprint(served('{"enable_thinking": false}'))
+        self.assertEqual(off["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertEqual(off["gguf"], "m.gguf")  # from the preset when the args carry no --model
+        self.assertIsNone(fingerprint(served(None))["chat_template_kwargs"])  # absent is recorded, not assumed
+        pin = pin_extend({}, {**self.CELL, "model_fingerprint": off})
+        on = {**self.CELL, "model_fingerprint": fingerprint(served('{"enable_thinking": true}'))}
+        self.assertEqual(pin_mismatch(pin, on), ["model_fingerprint.chat_template_kwargs"])
 
     def test_a_new_model_extends_the_pin_and_harness_versions_are_pinned_once_seen(self):
         pin = pin_extend({}, dict(self.CELL))
