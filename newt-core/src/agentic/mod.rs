@@ -246,7 +246,7 @@ pub use scheduled::{
 pub use scratchpad::{
     scratchpad_state_block, working_memory_head, ScratchpadStore, SessionScratchpadStore,
 };
-pub use self_verify::verification_receipt;
+pub use self_verify::{verification_gate_present, verification_receipt};
 pub use semantic::{
     chunk_source, code_search_tool_definition, cosine, format_index_status, format_search_hits,
     format_search_model, format_search_preview, format_search_rejects, gather_code_files,
@@ -2064,7 +2064,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut repeat_calls = RepeatCallGuard::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
-    let mut verification = self_verify::VerificationLedger::default();
+    let mut verification = self_verify::VerificationLedger::for_task(task);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -4215,6 +4215,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // Step 27.5: salvage the plan/state ledger + the failed-call count so the
     // summary reflects progress and the fallback advice is honest.
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    // #2374: a failed check at the round limit is a scored repair exhaustion.
+    let cap_reason = verification.cap_exit_reason(workspace);
     if let Some(harness) = smart_harness {
         harness.record_messages(&messages)?;
         let text = cap_exit_fallback(
@@ -4230,9 +4232,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             turn_start_head.as_deref(),
             disclosure,
         );
-        harness.outcome(crate::TurnEndReason::RoundCap, &text)?;
+        harness.outcome(cap_reason, &text)?;
         if let Some(slot) = &mut end_reason {
-            **slot = Some(crate::TurnEndReason::RoundCap);
+            **slot = Some(cap_reason);
         }
         return Ok((text, false, accumulated_usage, hallucination_count));
     }
@@ -4269,7 +4271,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         disclosure,
     );
     if let Some(slot) = &mut end_reason {
-        **slot = Some(crate::TurnEndReason::RoundCap);
+        **slot = Some(cap_reason);
     }
     Ok((text, streamed, usage, hallucination_count))
 }
@@ -4468,6 +4470,13 @@ impl RepeatCallGuard {
     /// steer can escalate; success-shaped memos are not counted because they are
     /// not hard failures.
     fn record(&mut self, name: &str, args: &serde_json::Value, ok: bool, result: &str) {
+        // #2374: a failure memo describes the tree it ran against. After a
+        // successful call that may have changed the tree, the identical call is a
+        // legitimate re-check (the repair a verification nudge asks for).
+        if ok && !is_read_only_call(name, args) {
+            self.repeat_memos
+                .retain(|_, memo| !matches!(memo, RepeatMemo::Failure { .. }));
+        }
         if name == "update_plan" && ok {
             self.repeat_memos.retain(|key, _| {
                 !key.starts_with("plan_get\u{1}") && !key.starts_with("update_plan\u{1}")
@@ -6655,7 +6664,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut repeat_calls = RepeatCallGuard::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
-    let mut verification = self_verify::VerificationLedger::default();
+    let mut verification = self_verify::VerificationLedger::for_task(task);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -8580,6 +8589,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let trimmed = trim_for_summary(&messages, protected_head, 6.max(replay_protected_tail_len));
     // Step 27.5: salvage progress + failed-call count (matches the Ollama path).
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    // #2374: a failed check at the round limit is a scored repair exhaustion.
+    let cap_reason = verification.cap_exit_reason(workspace);
     if let Some(harness) = smart_harness {
         harness.record_messages(&messages)?;
         let text = cap_exit_fallback(
@@ -8595,9 +8606,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             turn_start_head.as_deref(),
             disclosure,
         );
-        harness.outcome(crate::TurnEndReason::RoundCap, &text)?;
+        harness.outcome(cap_reason, &text)?;
         if let Some(slot) = &mut end_reason {
-            **slot = Some(crate::TurnEndReason::RoundCap);
+            **slot = Some(cap_reason);
         }
         return Ok((text, false, accumulated_usage, hallucination_count));
     }
@@ -8651,7 +8662,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         disclosure,
     );
     if let Some(slot) = &mut end_reason {
-        **slot = Some(crate::TurnEndReason::RoundCap);
+        **slot = Some(cap_reason);
     }
     Ok((text, streamed, usage, hallucination_count))
 }
@@ -9224,7 +9235,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut repeat_calls = RepeatCallGuard::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
-    let mut verification = self_verify::VerificationLedger::default();
+    let mut verification = self_verify::VerificationLedger::for_task(task);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -10813,6 +10824,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let trimmed = trim_for_summary(&messages, protected_head, 6.max(replay_protected_tail_len));
     // Step 27.5: salvage progress + failed-call count (mirrors the OpenAI path).
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    // #2374: a failed check at the round limit is a scored repair exhaustion.
+    let cap_reason = verification.cap_exit_reason(workspace);
     if let Some(harness) = smart_harness {
         harness.record_messages(&messages)?;
         let text = cap_exit_fallback(
@@ -10828,9 +10841,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
             turn_start_head.as_deref(),
             disclosure,
         );
-        harness.outcome(crate::TurnEndReason::RoundCap, &text)?;
+        harness.outcome(cap_reason, &text)?;
         if let Some(slot) = &mut end_reason {
-            **slot = Some(crate::TurnEndReason::RoundCap);
+            **slot = Some(cap_reason);
         }
         return Ok((text, false, accumulated_usage, hallucination_count));
     }
@@ -10876,7 +10889,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         disclosure,
     );
     if let Some(slot) = &mut end_reason {
-        **slot = Some(crate::TurnEndReason::RoundCap);
+        **slot = Some(cap_reason);
     }
     Ok((text, streamed, usage, hallucination_count))
 }
@@ -11394,7 +11407,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut repeat_calls = RepeatCallGuard::default();
     // #2315: what each check actually did, fed at the per-tool-result funnel.
-    let mut verification = self_verify::VerificationLedger::default();
+    let mut verification = self_verify::VerificationLedger::for_task(task);
     // #1948: DETECTION beside the guard — it notices a clean-then-build
     // loop and says so once; it never blocks or rewrites the call.
     let mut clean_build = crate::loop_watch::CleanBuildWatch::default();
@@ -12268,6 +12281,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // count does not include this extra tools-disabled completion.
     let cap_accumulated = accumulated_usage;
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
+    // #2374: a failed check at the round limit is a scored repair exhaustion.
+    let cap_reason = verification.cap_exit_reason(workspace);
     if let Some(harness) = smart_harness {
         harness.record_responses_messages(instructions.as_deref(), &input)?;
         let text = cap_exit_fallback(
@@ -12283,9 +12298,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
             turn_start_head.as_deref(),
             disclosure,
         );
-        harness.outcome(crate::TurnEndReason::RoundCap, &text)?;
+        harness.outcome(cap_reason, &text)?;
         if let Some(slot) = &mut end_reason {
-            **slot = Some(crate::TurnEndReason::RoundCap);
+            **slot = Some(cap_reason);
         }
         return Ok((text, false, accumulated_usage, hallucination_count));
     }
@@ -12386,7 +12401,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 disclosure,
             );
             if let Some(slot) = &mut end_reason {
-                **slot = Some(crate::TurnEndReason::RoundCap);
+                **slot = Some(cap_reason);
             }
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
@@ -12437,7 +12452,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 disclosure,
             );
             if let Some(slot) = &mut end_reason {
-                **slot = Some(crate::TurnEndReason::RoundCap);
+                **slot = Some(cap_reason);
             }
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
@@ -12465,7 +12480,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 disclosure,
             );
             if let Some(slot) = &mut end_reason {
-                **slot = Some(crate::TurnEndReason::RoundCap);
+                **slot = Some(cap_reason);
             }
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
@@ -12487,7 +12502,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 disclosure,
             );
             if let Some(slot) = &mut end_reason {
-                **slot = Some(crate::TurnEndReason::RoundCap);
+                **slot = Some(cap_reason);
             }
             return Ok((text, false, accumulated_usage, hallucination_count));
         }
@@ -12507,7 +12522,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         disclosure,
     );
     if let Some(slot) = &mut end_reason {
-        **slot = Some(crate::TurnEndReason::RoundCap);
+        **slot = Some(cap_reason);
     }
     Ok((text, false, accumulated_usage, hallucination_count))
 }

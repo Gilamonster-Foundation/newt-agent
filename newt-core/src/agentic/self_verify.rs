@@ -36,19 +36,198 @@ pub struct VerifyCheck {
     /// Lower-case substrings whose presence in a run_command marks this check as
     /// having been run this turn. Any match satisfies the check.
     pub run_markers: Vec<String>,
+    /// #2374: the lower-case forms that actually RUN the check when a command
+    /// segment starts with one. Result-aware mode takes pass evidence only from
+    /// these, never from a marker substring (`cat test_x.py` names a test file
+    /// and runs nothing).
+    pub runners: Vec<String>,
+    /// Arguments that turn a runner into a run that executes no check
+    /// (`cargo test --no-run`).
+    pub non_runs: Vec<String>,
 }
 
 impl VerifyCheck {
     fn new(label: impl Into<String>, markers: &[&str]) -> Self {
+        let run_markers: Vec<String> = markers.iter().map(|m| m.to_ascii_lowercase()).collect();
         Self {
             label: label.into(),
-            run_markers: markers.iter().map(|m| m.to_ascii_lowercase()).collect(),
+            runners: run_markers.clone(),
+            run_markers,
+            non_runs: Vec::new(),
         }
+    }
+
+    /// Replace the invocation forms (the markers stay the attempted-mode rule).
+    fn runs_as(mut self, runners: &[&str]) -> Self {
+        self.runners = runners.iter().map(|r| r.to_ascii_lowercase()).collect();
+        self
+    }
+
+    fn except(mut self, non_runs: &[&str]) -> Self {
+        self.non_runs = non_runs.iter().map(|r| r.to_string()).collect();
+        self
     }
 
     /// Was this check run by `command` (a single run_command invocation)?
     fn run_by(&self, command_lc: &str) -> bool {
         self.run_markers.iter().any(|m| command_lc.contains(m))
+    }
+
+    /// How `command` runs this check, when one of its segments starts with a
+    /// runner (after env assignments and `time` / `timeout <t>` / `env`).
+    fn invocation(&self, command: &str) -> Option<Invocation> {
+        let segments = split_command(command);
+        segments
+            .iter()
+            .enumerate()
+            .find_map(|(index, (segment, _))| {
+                let words = strip_transparent_prefix(segment);
+                let text = words.join(" ").to_ascii_lowercase();
+                let runner = self.runners.iter().find(|r| {
+                    text == **r
+                        || text.starts_with(&format!("{r} "))
+                        || (r.ends_with('_') && text.starts_with(r.as_str()))
+                })?;
+                let taken = runner.split_whitespace().count();
+                let args: Vec<String> = if runner.ends_with('_') {
+                    words[taken - 1..].to_vec()
+                } else {
+                    words[taken..].to_vec()
+                };
+                if args.iter().any(|a| self.non_runs.contains(a)) {
+                    return None;
+                }
+                let later = &segments[index..];
+                let masked = later.iter().enumerate().any(|(k, (_, sep))| {
+                    let followed = later.get(k + 1).is_some_and(|(next, _)| !next.is_empty());
+                    followed && (matches!(*sep, ";" | "&" | "\n" | "||") || (k == 0 && *sep == "|"))
+                });
+                let plain = segments.iter().enumerate().all(|(k, (seg, sep))| {
+                    if k == index {
+                        later.iter().skip(1).all(|(next, _)| next.is_empty())
+                            && !seg
+                                .replace("2>&1", "")
+                                .replace("1>&2", "")
+                                .replace(">&2", "")
+                                .contains('>')
+                    } else {
+                        k < index && *sep == "&&" && seg.split_whitespace().next() == Some("cd")
+                    }
+                });
+                Some(Invocation {
+                    args,
+                    masked,
+                    plain,
+                })
+            })
+    }
+}
+
+/// How one command runs a check.
+struct Invocation {
+    /// The runner's arguments: what the run was narrowed to.
+    args: Vec<String>,
+    /// A later pipe, `||`, `;`, `&` or newline decides the command's exit
+    /// status, so a pass says nothing about the check.
+    masked: bool,
+    /// Nothing but the run (after `cd dir &&`): no other command, no output
+    /// redirected to a file. Only such a run is not itself a mutation.
+    plain: bool,
+}
+
+/// Flags that change how a runner reports, not what it runs.
+const NON_NARROWING_FLAGS: &[&str] = &[
+    "-q",
+    "-qq",
+    "-v",
+    "-vv",
+    "--quiet",
+    "--verbose",
+    "--no-header",
+    "-rA",
+    "--color=never",
+];
+
+impl Invocation {
+    /// Whether this run covers at least what `failed` ran.
+    fn covers(&self, failed: &Self) -> bool {
+        self.args
+            .iter()
+            .filter(|a| !NON_NARROWING_FLAGS.contains(&a.as_str()))
+            .all(|a| failed.args.contains(a))
+    }
+}
+
+/// `command` split into `(segment, separator after it)` at `&&`, `||`, `|`,
+/// `;`, `&` and newlines, outside quotes. `2>&1`, `>&2` and `&>` are
+/// redirections, not separators.
+fn split_command(command: &str) -> Vec<(String, &'static str)> {
+    let chars: Vec<char> = command.trim().chars().collect();
+    let (mut out, mut cur, mut quote, mut i) = (Vec::new(), String::new(), None::<char>, 0);
+    while i < chars.len() {
+        let (c, next) = (chars[i], chars.get(i + 1).copied());
+        if let Some(q) = quote {
+            cur.push(c);
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        let sep = match (c, next) {
+            ('\'' | '"', _) => {
+                quote = Some(c);
+                None
+            }
+            ('\\', Some(n)) => {
+                cur.push(c);
+                cur.push(n);
+                i += 2;
+                continue;
+            }
+            ('&', Some('&')) => Some(("&&", 2)),
+            ('|', Some('|')) => Some(("||", 2)),
+            ('|', Some('&')) => Some(("|", 2)),
+            ('|', _) => Some(("|", 1)),
+            (';', _) => Some((";", 1)),
+            ('\n', _) => Some(("\n", 1)),
+            ('&', Some('>')) => None,
+            ('&', _) if cur.ends_with('>') => None,
+            ('&', _) => Some(("&", 1)),
+            _ => None,
+        };
+        match sep {
+            Some((sep, width)) => {
+                out.push((cur.trim().to_string(), sep));
+                cur.clear();
+                i += width;
+            }
+            None => {
+                cur.push(c);
+                i += 1;
+            }
+        }
+    }
+    out.push((cur.trim().to_string(), ""));
+    out
+}
+
+/// A segment's words after the prefixes that run what follows them unchanged.
+fn strip_transparent_prefix(segment: &str) -> Vec<String> {
+    let mut words: Vec<String> = segment.split_whitespace().map(str::to_string).collect();
+    loop {
+        match words.first().map(String::as_str) {
+            Some(w) if w.contains('=') && !w.starts_with('-') => {
+                words.remove(0);
+            }
+            Some("env" | "time" | "nice") => {
+                words.remove(0);
+            }
+            Some("timeout") if words.len() > 2 => {
+                words.drain(..2);
+            }
+            _ => return words,
+        }
     }
 }
 
@@ -74,17 +253,29 @@ pub fn detect_checks(entries: &[String], instruction: &str) -> Vec<VerifyCheck> 
             || el == "pytest.ini";
         if is_py_test && !seen_pytest {
             seen_pytest = true;
-            checks.push(VerifyCheck::new(
-                "the Python tests (`pytest` / running the test file)",
-                &[
+            checks.push(
+                VerifyCheck::new(
+                    "the Python tests (`pytest` / running the test file)",
+                    &[
+                        "pytest",
+                        "unittest",
+                        "py.test",
+                        "python -m test",
+                        "test_",
+                        "_test.py",
+                    ],
+                )
+                .runs_as(&[
                     "pytest",
-                    "unittest",
                     "py.test",
-                    "python -m test",
-                    "test_",
-                    "_test.py",
-                ],
-            ));
+                    "python -m pytest",
+                    "python3 -m pytest",
+                    "python -m unittest",
+                    "python3 -m unittest",
+                    "python test_",
+                    "python3 test_",
+                ]),
+            );
         }
         match el.as_str() {
             "makefile" => checks.push(VerifyCheck::new(
@@ -120,10 +311,10 @@ pub fn detect_checks(entries: &[String], instruction: &str) -> Vec<VerifyCheck> 
                 // beside it because it is a different binary running the same
                 // tests: a turn that ran it has verified exactly as much, and
                 // omitting it would nudge a workspace that had.
-                checks.push(VerifyCheck::new(
-                    "`cargo test`",
-                    &["cargo test", "cargo nextest"],
-                ));
+                checks.push(
+                    VerifyCheck::new("`cargo test`", &["cargo test", "cargo nextest"])
+                        .except(&["--no-run"]),
+                );
             }
             "go.mod" => checks.push(VerifyCheck::new("`go test ./...`", &["go test"])),
             _ => {}
@@ -407,13 +598,23 @@ pub fn result_aware() -> bool {
     enabled() && outcomes_enabled()
 }
 
-/// The receipt entry for this gate (#2314): the mode a turn with this
-/// `action_nudges` switch instantiates, read through the same predicates the
-/// loop reads, plus the repair allowance when it applies. Headless solve always
-/// passes `true` (the driver sets `action_nudges`); per-decision evidence rides
-/// the `verification` trace signals.
-pub fn verification_receipt(action_nudges: bool) -> serde_json::Value {
-    let mode = if !action_nudges || !enabled() {
+/// Whether a turn on `kind` has a self-verify gate at all (#2374): SmartHarness
+/// verifies on every wire; without it only the OpenAI Chat Completions and
+/// Anthropic loops carry the ordinary gate. Headless solve always arms action
+/// nudges, so this is the whole instantiation question there.
+pub fn verification_gate_present(kind: crate::BackendKind, smart_harness: bool) -> bool {
+    smart_harness
+        || kind == crate::BackendKind::Anthropic
+        || (kind == crate::BackendKind::Openai && !super::responses_api_selected())
+}
+
+/// The receipt entry for this gate (#2314): the mode a turn instantiates when
+/// `gate_present` ([`verification_gate_present`] with action nudges armed),
+/// read through the same predicates the loop reads, plus the repair allowance
+/// when it applies. Per-decision evidence rides the `verification` trace
+/// signals.
+pub fn verification_receipt(gate_present: bool) -> serde_json::Value {
+    let mode = if !gate_present || !enabled() {
         "off"
     } else if outcomes_enabled() {
         "result_aware"
@@ -460,9 +661,20 @@ enum Observed {
 #[derive(Debug, Default, Clone)]
 pub struct VerificationLedger {
     entries: Vec<Observed>,
+    /// The instruction checks are detected against, so only a check's own pass
+    /// pays for a tree hash.
+    task: String,
 }
 
 impl VerificationLedger {
+    /// A ledger for a turn whose instruction is `task`.
+    pub(crate) fn for_task(task: &str) -> Self {
+        Self {
+            entries: Vec::new(),
+            task: task.to_string(),
+        }
+    }
+
     /// Record a shell execution.
     pub fn record_exec(&mut self, command: &str, outcome: ExecOutcome, tree: Option<ContentId>) {
         self.entries.push(Observed::Exec {
@@ -472,7 +684,7 @@ impl VerificationLedger {
         });
     }
 
-    /// Record a successful workspace write.
+    /// Record a call that may have changed the workspace.
     pub fn record_write(&mut self) {
         self.entries.push(Observed::Write);
     }
@@ -490,20 +702,53 @@ impl VerificationLedger {
         if !result_aware() {
             return;
         }
+        let _ = ok;
         match execution {
             Some(outcome) => {
                 let command = match args["command"].as_str() {
                     Some(command) if name == "run_command" => command.to_string(),
                     _ => format!("{name} {args}"),
                 };
-                let tree = (outcome == ExecOutcome::Passed)
-                    .then(|| workspace_tree_state(std::path::Path::new(workspace)))
-                    .flatten();
+                // Hash only a pass of a detected check; any other command's
+                // tree is never read.
+                let root = std::path::Path::new(workspace);
+                let tree = (outcome == ExecOutcome::Passed
+                    && detect_checks(&workspace_entries(root), &self.task)
+                        .iter()
+                        .any(|check| check.invocation(&command).is_some()))
+                .then(|| workspace_tree_state(root))
+                .flatten();
                 self.record_exec(&command, outcome, tree);
             }
-            None if ok && super::is_workspace_write_call(name) => self.record_write(),
+            // Every call that is not read-only may have changed the tree, ok or
+            // not (a failed write can still leave partial bytes).
+            None if !super::is_read_only_call(name, args) => self.record_write(),
             None => {}
         }
+    }
+
+    /// The end reason of a round-cap exit in result-aware mode: a detected
+    /// check whose latest evidence is a failure makes it `RepairExhausted`
+    /// (a scored attempt), otherwise it stays `RoundCap`.
+    pub(crate) fn cap_exit_reason(&self, workspace: &str) -> crate::TurnEndReason {
+        if result_aware() {
+            let checks = detect_checks(
+                &workspace_entries(std::path::Path::new(workspace)),
+                &self.task,
+            );
+            let (decision, _) = conclude(&Conclusion {
+                checks: &checks,
+                requested: &[],
+                ledger: self,
+                tree_now: self.tree_now(workspace),
+                repairs_used: VERIFY_REPAIR_ALLOWANCE,
+                rounds_left: false,
+            });
+            if decision == Decision::Stop(crate::TurnEndReason::RepairExhausted) {
+                return crate::TurnEndReason::RepairExhausted;
+            }
+        }
+        crate::TurnEndReason::RoundCap
     }
 
     /// The current tree state, computed only when some recorded pass could
@@ -607,6 +852,8 @@ pub enum StateBasis {
 pub enum CheckStatus {
     Passed,
     Stale,
+    /// Passed, but a pipe or a later command decided the exit status.
+    Unverified,
     Failed,
     TimedOut,
     Denied,
@@ -644,19 +891,15 @@ struct Mutation<'a> {
 
 /// Decide what to do with a concluding answer. Pure.
 pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
-    let is_check = |command: &str| {
-        let lc = command.to_ascii_lowercase();
-        c.checks.iter().any(|check| check.run_by(&lc))
-    };
-    // The chain head before each entry, then after the last one. Rebuilt from
-    // the ordered observations with the checks detected NOW, so it is a pure
-    // function of what was observed. A mint failure poisons the chain, which
-    // makes every chain-basis pass stale: fail closed.
+    // The chain head before each entry, then after the last one, rebuilt from
+    // the ordered observations with the checks detected NOW. Only a plain run
+    // of a detected check is not a mutation; every other call is one. A mint
+    // failure poisons the chain, which makes every chain-basis pass stale.
     let mut journal = crate::event_journal::Journal::new();
     let mut chain_ok = true;
     let mut heads = Vec::with_capacity(c.ledger.entries.len() + 1);
+    heads.push(None);
     for entry in &c.ledger.entries {
-        heads.push(journal.head().map(ToString::to_string));
         let mutation = match entry {
             Observed::Write => Some(Mutation {
                 command: None,
@@ -664,7 +907,11 @@ pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
             }),
             Observed::Exec {
                 command, outcome, ..
-            } => (!is_check(command)).then_some(Mutation {
+            } => (!c
+                .checks
+                .iter()
+                .any(|check| check.invocation(command).is_some_and(|i| i.plain)))
+            .then_some(Mutation {
                 command: Some(command),
                 outcome: Some(*outcome),
             }),
@@ -672,28 +919,53 @@ pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
         if let Some(mutation) = mutation {
             chain_ok &= journal.append(mutation).is_ok();
         }
+        heads.push(journal.head().map(ToString::to_string));
     }
-    let chain_now = journal.head().map(ToString::to_string);
+    let chain_now = heads.last().cloned().flatten();
 
-    let last_run = |check: &VerifyCheck| {
-        c.ledger
-            .entries
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(i, e)| match e {
-                Observed::Exec {
-                    command,
-                    outcome,
-                    tree,
-                } if check.run_by(&command.to_ascii_lowercase()) => Some((i, *outcome, tree)),
-                _ => None,
-            })
+    // Each check's standing from its runs in order. A failure is cleared only
+    // by an unmasked pass that covers what failed; a masked pass never clears.
+    enum Standing<'a> {
+        None,
+        Pass(usize, &'a Option<ContentId>),
+        Masked(usize),
+        Fail(ExecOutcome, Invocation),
+        Blocked(ExecOutcome, usize),
+    }
+    let standing = |check: &VerifyCheck| {
+        let mut state = Standing::None;
+        for (i, entry) in c.ledger.entries.iter().enumerate() {
+            let Observed::Exec {
+                command,
+                outcome,
+                tree,
+            } = entry
+            else {
+                continue;
+            };
+            let Some(run) = check.invocation(command) else {
+                continue;
+            };
+            state = match (*outcome, state) {
+                (ExecOutcome::Passed, state @ Standing::Fail(..)) if run.masked => state,
+                (ExecOutcome::Passed, Standing::Fail(kind, failed)) if !run.covers(&failed) => {
+                    Standing::Fail(kind, failed)
+                }
+                (ExecOutcome::Passed, _) if run.masked => Standing::Masked(i),
+                (ExecOutcome::Passed, _) => Standing::Pass(i, tree),
+                (kind @ (ExecOutcome::Failed | ExecOutcome::TimedOut), _) => {
+                    Standing::Fail(kind, run)
+                }
+                (kind, _) => Standing::Blocked(kind, i),
+            };
+        }
+        state
     };
+    let standings: Vec<Standing> = c.checks.iter().map(standing).collect();
     let basis = if c.tree_now.is_some()
-        && c.checks
+        && standings
             .iter()
-            .all(|check| !matches!(last_run(check), Some((_, ExecOutcome::Passed, None))))
+            .all(|s| !matches!(s, Standing::Pass(_, None)))
     {
         StateBasis::Tree
     } else {
@@ -703,43 +975,52 @@ pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
         StateBasis::Tree => c.tree_now.map(|id| id.to_string()),
         StateBasis::MutationChain => chain_now.clone(),
     };
+    let chain_at = |i: usize| heads[i + 1].clone();
 
     let reports: Vec<CheckReport> = c
         .checks
         .iter()
-        .map(|check| {
-            let (status, state_at_run) = match last_run(check) {
-                None if c
-                    .requested
-                    .iter()
-                    .any(|r| check.run_by(&r.to_ascii_lowercase())) =>
-                {
+        .zip(&standings)
+        .map(|(check, standing)| {
+            let (status, state_at_run) = match standing {
+                Standing::None if c.requested.iter().any(|r| check.invocation(r).is_some()) => {
                     (CheckStatus::Unexecuted, None)
                 }
-                None => (CheckStatus::NeverRun, None),
-                Some((i, outcome, tree)) => {
+                Standing::None => (CheckStatus::NeverRun, None),
+                Standing::Masked(i) => (CheckStatus::Unverified, chain_at(*i)),
+                Standing::Fail(kind, _) => (
+                    if *kind == ExecOutcome::TimedOut {
+                        CheckStatus::TimedOut
+                    } else {
+                        CheckStatus::Failed
+                    },
+                    None,
+                ),
+                Standing::Blocked(kind, i) => (
+                    if *kind == ExecOutcome::Denied {
+                        CheckStatus::Denied
+                    } else {
+                        CheckStatus::Unavailable
+                    },
+                    chain_at(*i),
+                ),
+                Standing::Pass(i, tree) => {
                     let at_run = match basis {
                         StateBasis::Tree => tree.map(|id| id.to_string()),
-                        StateBasis::MutationChain => heads[i].clone(),
+                        StateBasis::MutationChain => chain_at(*i),
                     };
-                    let status = match outcome {
-                        ExecOutcome::Passed => {
-                            let fresh = match basis {
-                                StateBasis::Tree => at_run == state_now,
-                                StateBasis::MutationChain => chain_ok && at_run == chain_now,
-                            };
-                            if fresh {
-                                CheckStatus::Passed
-                            } else {
-                                CheckStatus::Stale
-                            }
-                        }
-                        ExecOutcome::Failed => CheckStatus::Failed,
-                        ExecOutcome::TimedOut => CheckStatus::TimedOut,
-                        ExecOutcome::Denied => CheckStatus::Denied,
-                        ExecOutcome::Unavailable => CheckStatus::Unavailable,
+                    let fresh = match basis {
+                        StateBasis::Tree => at_run == state_now,
+                        StateBasis::MutationChain => chain_ok && at_run == chain_now,
                     };
-                    (status, at_run)
+                    (
+                        if fresh {
+                            CheckStatus::Passed
+                        } else {
+                            CheckStatus::Stale
+                        },
+                        at_run,
+                    )
                 }
             };
             CheckReport {
@@ -770,7 +1051,11 @@ fn decide(c: &Conclusion<'_>, reports: &[CheckReport]) -> Decision {
             .collect::<Vec<_>>()
     };
     let broken = with(&[CheckStatus::Failed, CheckStatus::TimedOut]);
-    let unverified = with(&[CheckStatus::NeverRun, CheckStatus::Stale]);
+    let unverified = with(&[
+        CheckStatus::NeverRun,
+        CheckStatus::Stale,
+        CheckStatus::Unverified,
+    ]);
     if reports.iter().all(|r| r.status == CheckStatus::Passed) {
         return Decision::Accept;
     }
@@ -802,6 +1087,10 @@ fn decide(c: &Conclusion<'_>, reports: &[CheckReport]) -> Decision {
                     "{label} passed, but the workspace changed after it ran, so run it again on \
                      the current state"
                 ),
+                CheckStatus::Unverified => format!(
+                    "{label} was run with its exit status hidden by a pipe or a later command, \
+                     so run it again on its own without piping or masking its exit status"
+                ),
                 _ => format!("{label} has not been run"),
             })
             .collect::<Vec<_>>()
@@ -822,10 +1111,13 @@ fn decide(c: &Conclusion<'_>, reports: &[CheckReport]) -> Decision {
 /// path to [`RawContentId`] of the file's bytes, skipping
 /// [`crate::verify_gate::SKIP_DIRS`]. `None` when the tree exceeds
 /// `max_entries` or `max_bytes`, or a file cannot be read: the caller then
-/// falls back to the mutation chain. Pure over the injected `list` and `read`.
+/// falls back to the mutation chain. Pure over the injected `list`, `size` and
+/// `read`; `size` is consulted first, so no file past the remaining byte budget
+/// is ever read into memory.
 pub(crate) fn tree_state(
     root: &std::path::Path,
     list: &impl Fn(&std::path::Path) -> Vec<(String, bool)>,
+    size: &impl Fn(&std::path::Path) -> Option<u64>,
     read: &impl Fn(&std::path::Path) -> Option<Vec<u8>>,
     max_entries: usize,
     max_bytes: u64,
@@ -859,7 +1151,11 @@ pub(crate) fn tree_state(
                 }
                 continue;
             }
-            let content = read(&dir.join(&name))?;
+            let path = dir.join(&name);
+            if bytes.saturating_add(size(&path)?) > max_bytes {
+                return None;
+            }
+            let content = read(&path)?;
             bytes = bytes.saturating_add(content.len() as u64);
             if bytes > max_bytes {
                 return None;
@@ -889,6 +1185,10 @@ pub fn workspace_tree_state(root: &std::path::Path) -> Option<ContentId> {
                         .collect()
                 })
                 .unwrap_or_default()
+        },
+        &|path| {
+            let meta = std::fs::symlink_metadata(path).ok()?;
+            (meta.file_type().is_symlink() || meta.is_file()).then_some(meta.len())
         },
         &|path| {
             let meta = std::fs::symlink_metadata(path).ok()?;

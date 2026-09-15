@@ -65,11 +65,13 @@ struct Run {
     /// The turn's end reason, as it serializes on the trace line.
     reason: serde_json::Value,
     bodies: Vec<String>,
+    /// The behavior signals the turn recorded for the solve trace.
+    signals: Vec<observability::BehaviorSignal>,
 }
 
 /// The model runs `check` once, then answers `done` every time it is asked.
 async fn run(wire: &str, smart: bool, outcomes: bool, check: &'static str) -> Run {
-    run_script(wire, smart, outcomes, check, &[Step::Run(check)], None).await
+    run_script(wire, smart, outcomes, check, &[Step::Run(check)], None, 8).await
 }
 
 /// The model follows `script`, then answers `done` every time it is asked.
@@ -80,6 +82,7 @@ async fn run_script(
     check: &str,
     script: &[Step],
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    max_tool_rounds: usize,
 ) -> Run {
     let _lock = env_lock().await;
     let _self_verify = EnvVar::set("NEWT_SELF_VERIFY", "1");
@@ -115,7 +118,9 @@ async fn run_script(
     let mut context = ctx(&uri, &messages, &caveats);
     context.workspace = &workspace;
     context.task = &task;
-    context.max_tool_rounds = 8;
+    context.max_tool_rounds = max_tool_rounds;
+    let mut obs = observability::SolveObservation::default();
+    context.solve_obs = Some(&mut obs);
     context.smart_harness = smart.then_some(&harness);
     context.kind = match wire {
         "ollama" => BackendKind::Ollama,
@@ -141,6 +146,7 @@ async fn run_script(
     Run {
         reason: serde_json::to_value(reason).unwrap(),
         bodies,
+        signals: obs.behavior_signals,
     }
 }
 
@@ -183,6 +189,52 @@ async fn a_failing_check_is_repaired_to_the_allowance_then_exhausts() {
             repair_ordinals(&run),
             ["1/3", "2/3", "3/3"].map(String::from).into(),
             "{wire} smart={smart}: exactly the declared allowance"
+        );
+        // Finding 10: the trace signal bench analysis reads. One decision per
+        // concluding answer: three repair nudges, then the stop.
+        let decisions: Vec<_> = run
+            .signals
+            .iter()
+            .filter_map(|signal| match signal {
+                observability::BehaviorSignal::Verification {
+                    decision,
+                    repairs_used,
+                    allowance,
+                    report,
+                    ..
+                } => Some((decision.as_str(), *repairs_used, *allowance, report.basis)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            decisions,
+            [
+                (
+                    "nudge",
+                    0,
+                    3,
+                    crate::agentic::self_verify::StateBasis::MutationChain
+                ),
+                (
+                    "nudge",
+                    1,
+                    3,
+                    crate::agentic::self_verify::StateBasis::MutationChain
+                ),
+                (
+                    "nudge",
+                    2,
+                    3,
+                    crate::agentic::self_verify::StateBasis::MutationChain
+                ),
+                (
+                    "repair_exhausted",
+                    3,
+                    3,
+                    crate::agentic::self_verify::StateBasis::MutationChain
+                ),
+            ],
+            "{wire} smart={smart}"
         );
     }
 }
@@ -235,6 +287,7 @@ async fn a_pass_goes_stale_on_a_write_but_not_on_a_read_only_command() {
         PASSING_CHECK,
         &[Step::Run(PASSING_CHECK), Step::Run("ls")],
         None,
+        8,
     )
     .await;
     assert_eq!(read_only.reason, "completed");
@@ -253,6 +306,7 @@ async fn a_pass_goes_stale_on_a_write_but_not_on_a_read_only_command() {
             Step::Run("sh -c 'echo changed > notes.txt'"),
         ],
         None,
+        8,
     )
     .await;
     assert!(
@@ -280,7 +334,16 @@ async fn cancelling_a_running_check_ends_cancelled_without_a_pass() {
         setter.store(true, Ordering::SeqCst);
     });
     const SLOW: &str = "sh -c 'sleep 5'";
-    let run = run_script("openai", true, true, SLOW, &[Step::Run(SLOW)], Some(&flag)).await;
+    let run = run_script(
+        "openai",
+        true,
+        true,
+        SLOW,
+        &[Step::Run(SLOW)],
+        Some(&flag),
+        8,
+    )
+    .await;
     interrupt.await.unwrap();
     assert_eq!(run.reason, "cancelled");
     assert_eq!(
@@ -288,4 +351,65 @@ async fn cancelling_a_running_check_ends_cancelled_without_a_pass() {
         1,
         "no request after the interrupted check"
     );
+}
+
+/// Finding 3: the model fixes the code and re-runs the identical failing check.
+/// The repeat-call guard's failure memo described the tree before the fix, so
+/// it must not short-circuit the re-run: the turn completes on the new pass.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+async fn an_identical_rerun_after_a_fix_is_not_blocked_by_the_repeat_guard() {
+    const CHECK: &str = "sh -c 'test -f fixed'";
+    for (wire, smart) in [
+        ("openai", false),
+        ("anthropic", false),
+        ("ollama", true),
+        ("responses", true),
+    ] {
+        let run = run_script(
+            wire,
+            smart,
+            true,
+            CHECK,
+            &[Step::Run(CHECK), Step::Run("touch fixed"), Step::Run(CHECK)],
+            None,
+            8,
+        )
+        .await;
+        assert_eq!(run.reason, "completed", "{wire} smart={smart}");
+        assert!(
+            !run.bodies.iter().any(|b| b.contains("You already called")),
+            "{wire} smart={smart}: the guard short-circuited the re-run"
+        );
+    }
+}
+
+/// Finding 4: when the rounds run out before the allowance, a failed check
+/// still ends `repair_exhausted`, never a round-cap exit (which the contract
+/// files as `timeout`, dropping the run from scoring).
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env, newt_self_verify_env)]
+async fn a_failure_at_the_round_limit_ends_repair_exhausted_not_round_cap() {
+    for (wire, smart) in [("openai", false), ("anthropic", false), ("openai", true)] {
+        let run = run_script(
+            wire,
+            smart,
+            true,
+            FAILING_CHECK,
+            &[
+                Step::Run(FAILING_CHECK),
+                Step::Done,
+                Step::Run(FAILING_CHECK),
+            ],
+            None,
+            3,
+        )
+        .await;
+        assert_eq!(run.reason, "repair_exhausted", "{wire} smart={smart}");
+        assert_eq!(
+            repair_ordinals(&run),
+            ["1/3"].map(String::from).into(),
+            "{wire} smart={smart}"
+        );
+    }
 }

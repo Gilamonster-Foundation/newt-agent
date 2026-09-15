@@ -234,6 +234,7 @@ fn tree_state_follows_bytes_and_gives_up_past_its_bounds() {
         tree_state(
             Path::new("/ws"),
             &list,
+            &|path: &Path| files.get(path).map(|b| b.len() as u64),
             &|path: &Path| files.get(path).cloned(),
             max_entries,
             max_bytes,
@@ -321,5 +322,226 @@ fn the_outcomes_policy_is_opt_in() {
     match saved {
         Some(v) => std::env::set_var("NEWT_VERIFY_OUTCOMES", v),
         None => std::env::remove_var("NEWT_VERIFY_OUTCOMES"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #2374 review: what counts as pass evidence.
+// ---------------------------------------------------------------------------
+
+fn decide_with(
+    checks: &[VerifyCheck],
+    ledger: &VerificationLedger,
+    tree_now: Option<ContentId>,
+) -> Decision {
+    conclude(&Conclusion {
+        checks,
+        requested: &[],
+        ledger,
+        tree_now,
+        repairs_used: 0,
+        rounds_left: true,
+    })
+    .0
+}
+
+fn python_checks() -> Vec<VerifyCheck> {
+    detect_checks(&["test_x.py".to_string()], "")
+}
+
+fn cargo_checks() -> Vec<VerifyCheck> {
+    detect_checks(&["Cargo.toml".to_string()], "")
+}
+
+/// Finding 1: a command that merely mentions a check's file is not a run of
+/// the check. After a failing `pytest`, `cat test_x.py` (exit 0) must not read
+/// as a fresh pass.
+#[test]
+fn a_command_that_mentions_the_test_file_is_not_a_pass() {
+    let mut ledger = VerificationLedger::default();
+    ledger.record_exec("pytest test_x.py", Failed, None);
+    ledger.record_write();
+    ledger.record_exec("cat test_x.py", Passed, Some(id("tree-t")));
+    let decision = decide_with(&python_checks(), &ledger, Some(id("tree-t")));
+    assert_ne!(decision, Decision::Accept, "{decision:?}");
+}
+
+/// Finding 1: after a failure, a narrower passing run does not clear it, and a
+/// run that executes no tests is not a pass. Twins: the same command, a broader
+/// one, and a `cd dir && runner` form do clear it.
+#[test]
+fn a_narrower_or_non_running_pass_does_not_clear_a_failure() {
+    let t = || Some(id("tree-t"));
+    let mut narrowed = VerificationLedger::default();
+    narrowed.record_exec("pytest", Failed, None);
+    narrowed.record_exec("pytest test_a.py::test_one", Passed, t());
+    assert_ne!(
+        decide_with(&python_checks(), &narrowed, t()),
+        Decision::Accept
+    );
+
+    let mut no_run = VerificationLedger::default();
+    no_run.record_exec("cargo test --no-run", Passed, t());
+    assert_ne!(decide_with(&cargo_checks(), &no_run, t()), Decision::Accept);
+
+    for (failed, passed) in [
+        ("pytest", "pytest"),
+        ("pytest test_a.py", "pytest"),
+        ("pytest test_a.py", "pytest -q test_a.py"),
+    ] {
+        let mut ledger = VerificationLedger::default();
+        ledger.record_exec(failed, Failed, None);
+        ledger.record_exec(passed, Passed, t());
+        assert_eq!(
+            decide_with(&python_checks(), &ledger, t()),
+            Decision::Accept,
+            "{failed} then {passed}"
+        );
+    }
+    let mut cd = VerificationLedger::default();
+    cd.record_exec("cd backend && cargo test -p api", Passed, t());
+    assert_eq!(decide_with(&cargo_checks(), &cd, t()), Decision::Accept);
+}
+
+/// Finding 2: a pass whose exit status a later pipe, `||`, `;` or `&` hides is
+/// unverified, and the nudge says to run it unmasked. Twins: a redirect and an
+/// `&&` chain keep the check's own status.
+#[test]
+fn a_status_masked_pass_is_unverified() {
+    let t = || Some(id("tree-t"));
+    for masked in [
+        "cargo test 2>&1 | tail -30",
+        "cargo test || true",
+        "cargo test; echo done",
+        "cargo test & wait",
+    ] {
+        let mut ledger = VerificationLedger::default();
+        ledger.record_exec(masked, Passed, t());
+        let decision = decide_with(&cargo_checks(), &ledger, t());
+        match &decision {
+            Decision::Nudge(text) => assert!(text.contains("exit status"), "{masked}: {text}"),
+            other => panic!("{masked}: expected a nudge, got {other:?}"),
+        }
+    }
+    for honest in [
+        "cargo test 2>&1",
+        "cargo test && echo ok",
+        "cargo test > out.txt 2>&1",
+    ] {
+        let mut ledger = VerificationLedger::default();
+        ledger.record_exec(honest, Passed, t());
+        assert_eq!(
+            decide_with(&cargo_checks(), &ledger, t()),
+            Decision::Accept,
+            "{honest}"
+        );
+    }
+}
+
+/// Finding 5: every non-read-only call is a mutation for the fallback chain,
+/// and a check-matching command that is not a plain run of the check is not
+/// exempt from it.
+#[serial_test::serial(newt_self_verify_env)]
+#[test]
+fn the_mutation_chain_counts_every_non_read_only_call() {
+    let saved = [
+        std::env::var_os("NEWT_SELF_VERIFY"),
+        std::env::var_os("NEWT_VERIFY_OUTCOMES"),
+    ];
+    std::env::set_var("NEWT_SELF_VERIFY", "1");
+    std::env::set_var("NEWT_VERIFY_OUTCOMES", "1");
+    let ws = "newt-core-test-workspace-that-does-not-exist";
+    let run = |ledger: &mut VerificationLedger, command: &str| {
+        ledger.observe(
+            "run_command",
+            &serde_json::json!({ "command": command }),
+            true,
+            Some(Passed),
+            ws,
+        );
+    };
+    let mut deleted = VerificationLedger::default();
+    run(&mut deleted, "cargo test");
+    deleted.observe(
+        "delete_file",
+        &serde_json::json!({"path": "src/lib.rs"}),
+        true,
+        None,
+        ws,
+    );
+    let mut sed = VerificationLedger::default();
+    run(&mut sed, "pytest");
+    run(&mut sed, "sed -i s/a/b/ tests/test_util.py");
+    for key in ["NEWT_SELF_VERIFY", "NEWT_VERIFY_OUTCOMES"]
+        .iter()
+        .zip(saved)
+        .map(|(k, v)| (*k, v))
+        .collect::<Vec<_>>()
+    {
+        match key.1 {
+            Some(v) => std::env::set_var(key.0, v),
+            None => std::env::remove_var(key.0),
+        }
+    }
+    assert_ne!(
+        decide_with(&cargo_checks(), &deleted, None),
+        Decision::Accept,
+        "delete_file"
+    );
+    assert_ne!(
+        decide_with(&python_checks(), &sed, None),
+        Decision::Accept,
+        "sed -i"
+    );
+}
+
+/// Finding 6: the byte bound is checked against a file's size BEFORE it is
+/// read, so peak memory never follows the largest file in the workspace.
+#[test]
+fn tree_state_never_reads_a_file_past_the_byte_budget() {
+    use std::path::Path;
+    let state = tree_state(
+        Path::new("/ws"),
+        &|_: &Path| vec![("huge.bin".to_string(), false)],
+        &|_: &Path| Some(1 << 40),
+        &|path: &Path| panic!("read {} although it exceeds the budget", path.display()),
+        100,
+        1 << 20,
+    );
+    assert_eq!(state, None);
+}
+
+/// Finding 7: the receipt reports a mode only for a turn that has a gate to
+/// run it. Without SmartHarness the Ollama and Responses loops carry none, so
+/// an A/B split on the receipt must see them as `off`, not treated.
+#[serial_test::serial(newt_self_verify_env)]
+#[test]
+fn the_receipt_says_off_where_the_loop_has_no_gate() {
+    use crate::BackendKind::{Anthropic, Ollama, Openai};
+    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
+    let saved = [
+        std::env::var_os("NEWT_SELF_VERIFY"),
+        std::env::var_os("NEWT_VERIFY_OUTCOMES"),
+    ];
+    std::env::set_var("NEWT_SELF_VERIFY", "1");
+    std::env::set_var("NEWT_VERIFY_OUTCOMES", "1");
+    std::env::remove_var("NEWT_OPENAI_API");
+    let mode =
+        |kind, smart| verification_receipt(verification_gate_present(kind, smart))["mode"].clone();
+    assert_eq!(mode(Ollama, false), "off");
+    assert_eq!(mode(Ollama, true), "result_aware");
+    assert_eq!(mode(Openai, false), "result_aware");
+    assert_eq!(mode(Anthropic, false), "result_aware");
+    std::env::set_var("NEWT_OPENAI_API", "responses");
+    assert_eq!(mode(Openai, false), "off", "Responses has no ordinary gate");
+    assert_eq!(mode(Openai, true), "result_aware");
+    for (key, value) in ["NEWT_SELF_VERIFY", "NEWT_VERIFY_OUTCOMES"]
+        .iter()
+        .zip(saved)
+    {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 }
