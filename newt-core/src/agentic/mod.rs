@@ -6313,6 +6313,7 @@ fn enforce_counted_budget(
 ///
 /// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
 /// `accumulated` carries usage from the preceding tool-call rounds.
+#[allow(clippy::too_many_arguments)]
 async fn final_summary_openai(
     clients: (&reqwest::Client, &reqwest::Client),
     chat_url: &str,
@@ -6321,6 +6322,7 @@ async fn final_summary_openai(
     mut messages: Vec<serde_json::Value>,
     generation_policy: generation_policy::GenerationPolicy,
     cap: &CapExit,
+    attempts: Option<attempt_capture::AttemptScope<'_>>,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
     let (count_client, stream_client) = clients;
     cap.push_nudge(&mut messages);
@@ -6338,7 +6340,7 @@ async fn final_summary_openai(
     generation_policy.apply_to_chat_completions_body(&mut body);
     cap.finish_with_decoder(
         chat_url,
-        None,
+        attempts,
         || async {
             let count =
                 count_openai_request(count_client, chat_url, api_key, &body, cap.request_budget)
@@ -6447,7 +6449,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         // into a local generation policy.
         cognition,
         output_allowance,
-        attempt_ledger: _,
+        attempt_ledger,
         chat_completions_capability,
         reasoning_replay_scope,
         max_tool_rounds,
@@ -6603,6 +6605,16 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
     prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
+    // #2313: one ledger attempt per primary request, keyed at the send.
+    let attempt_turn = turn_prompt_context
+        .map(|turn| turn.active_operator_prompt().id().to_string())
+        .unwrap_or_default();
+    let attempts = attempt_ledger.map(|ledger| attempt_capture::AttemptScope {
+        ledger,
+        turn: &attempt_turn,
+        model,
+        backend: url,
+    });
 
     // In-band memory nudge (Step 19.3) — mirrors the Ollama path.
     if note_sink.is_some() {
@@ -7140,19 +7152,22 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         // W0 (#1511): classify while the error is TYPED — the
                         // DispatchError keeps the historical message text and carries
                         // the structural class to the driver boundary.
-                        let resp = req.send().await.map_err(|e| {
-                            anyhow::Error::new(observability::DispatchError::from_reqwest(
-                                "request failed",
-                                e,
-                            ))
-                        })?;
-                        smart_harness::response_with_decoder(
+                        let (resp, attempt) =
+                            attempt_capture::send(attempts, "primary", req, "request failed")
+                                .await?;
+                        let json = smart_harness::response_with_decoder(
                             resp,
                             smart_harness,
                             "inference endpoint",
                             smart_harness::decode_openai_response,
                         )
-                        .await
+                        .await?;
+                        attempt_capture::complete(
+                            attempts,
+                            attempt.as_ref(),
+                            openai_usage(&json["usage"]),
+                        );
+                        Ok(json)
                     }
                 },
                 |attempt, delay, error| {
@@ -8045,6 +8060,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     }
                     openai_stream_final_answer(
                         stream_req,
+                        attempts,
                         io::stdout(),
                         color,
                         markdown,
@@ -8541,6 +8557,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         trimmed,
         generation_policy,
         &cap,
+        attempts,
     );
     let Some(result) = cancellable(cancel, summary).await else {
         cap.learn_measurement(compress_state)?;
@@ -12710,6 +12727,7 @@ enum StreamOutcome {
 /// still green.
 async fn openai_stream_final_answer<W: std::io::Write>(
     req: reqwest::RequestBuilder,
+    attempts: Option<attempt_capture::AttemptScope<'_>>,
     out: W,
     color: bool,
     markdown: bool,
@@ -12721,14 +12739,21 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     // an already-cancelled turn never fires it (and never pays for it), and Esc
     // during a slow prefill is felt at once instead of after the server
     // answers.
-    let sent = match cancellable(cancel, req.send()).await {
+    let sent = match cancellable(
+        cancel,
+        attempt_capture::send(attempts, "primary", req, "stream request failed"),
+    )
+    .await
+    {
         Some(sent) => sent,
         // Nothing was sent, so nothing was spent — `None` is the honest figure.
         None => return StreamOutcome::Cancelled(None),
     };
-    let resp = match sent {
-        Ok(r) if r.status().is_success() => r,
-        Ok(response) => {
+    // Only a printed answer completes the attempt; every other outcome stays
+    // recorded failed until failure and cancellation carry their own usage.
+    let (resp, attempt) = match sent {
+        Ok((r, attempt)) if r.status().is_success() => (r, attempt),
+        Ok((response, _)) => {
             let status = response.status();
             let Some((bytes, _read_error)) =
                 cancellable(cancel, crate::retry::read_response_bytes(response)).await
@@ -12869,6 +12894,7 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     // ended before [DONE]" blames the wire for the operator's own decision.
     if interrupted {
         display::write_harness_notice(&mut out, "interrupted — keeping the partial answer", color);
+        attempt_capture::complete(attempts, attempt.as_ref(), round.usage);
         return StreamOutcome::Printed(text, round.usage);
     }
     // A stream that never reached `[DONE]` was CUT: the fragment on screen
@@ -12905,6 +12931,7 @@ async fn openai_stream_final_answer<W: std::io::Write>(
         );
         return StreamOutcome::UseProbe(round.usage);
     }
+    attempt_capture::complete(attempts, attempt.as_ref(), round.usage);
     StreamOutcome::Printed(text, round.usage)
 }
 

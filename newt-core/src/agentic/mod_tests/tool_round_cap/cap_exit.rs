@@ -494,6 +494,7 @@ async fn openai_cap_exit_preserves_progress_as_a_paused_handoff() {
             ollama_num_ctx: None,
             prompt_measurement: Default::default(),
         },
+        None,
     )
     .await
     .expect("OpenAI cap summary should become a paused handoff");
@@ -629,6 +630,7 @@ async fn openai_cap_exit_refuses_giant_fresh_result_before_dispatch() {
             ollama_num_ctx: None,
             prompt_measurement: Default::default(),
         },
+        None,
     )
     .await
     .expect("oversized cap exit returns deterministic fallback");
