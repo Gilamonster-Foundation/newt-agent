@@ -295,6 +295,8 @@ async fn ollama_loop_honors_configured_cap_and_returns_real_final_answer() {
     let mut end_reason: Option<crate::TurnEndReason> = None;
     let (reply, streamed, _usage, _hallu) = chat_complete(
         ChatCtx {
+            verify_outcomes: false,
+            round_cap_hit: None,
             smart_harness: None,
             url: &server.uri(),
             model: "test-model",
@@ -693,6 +695,8 @@ async fn uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit() {
     let cap = 3;
     let (reply, _streamed, _usage, hallu) = chat_complete(
         ChatCtx {
+            verify_outcomes: false,
+            round_cap_hit: None,
             smart_harness: None,
             url: &server.uri(),
             model: "test-model",
@@ -845,6 +849,8 @@ async fn openai_loop_honors_configured_cap_and_returns_real_final_answer() {
     let mut end_reason: Option<crate::TurnEndReason> = None;
     let (reply, streamed, _usage, _hallu) = openai_chat_complete(
         ChatCtx {
+            verify_outcomes: false,
+            round_cap_hit: None,
             smart_harness: None,
             url: &server.uri(),
             model: "test-model",
@@ -974,6 +980,8 @@ async fn cap_exit_fallback_when_final_summary_errors() {
     let caveats = Caveats::top();
     let (reply, _streamed, _usage, _hallu) = chat_complete(
         ChatCtx {
+            verify_outcomes: false,
+            round_cap_hit: None,
             smart_harness: None,
             url: &server.uri(),
             model: "test-model",
@@ -1105,6 +1113,8 @@ async fn accumulated_usage_survives_summary_failure() {
     let cap = 2;
     let (reply, _streamed, usage, hallu) = chat_complete(
         ChatCtx {
+            verify_outcomes: false,
+            round_cap_hit: None,
             smart_harness: None,
             url: &server.uri(),
             model: "test-model",

@@ -31,6 +31,8 @@ const NO_CHECKS_WORKSPACE: &str = "newt-core-test-workspace-that-does-not-exist"
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        verify_outcomes: false,
+        round_cap_hit: None,
         smart_harness: None,
         rewrites_history: true,
         url: server_uri,
@@ -400,6 +402,12 @@ mod plan_handoff;
 #[cfg(test)]
 #[path = "http_verification.rs"]
 mod verification;
+
+// Every test here runs the real shell and is Unix-gated, so its helpers are
+// dead on Windows; gate the module, not each helper.
+#[cfg(all(test, unix))]
+#[path = "http_verification_outcomes.rs"]
+mod verification_outcomes;
 
 #[cfg(test)]
 #[path = "http_spill_retrieval.rs"]

@@ -1252,3 +1252,56 @@ kind = "openai"
          `status` and `end_reason`'s to report: {contract}"
     );
 }
+
+/// #2374: the receipt's verification mode comes from the loop the run actually
+/// has. With both switches on, the Chat Completions loop runs the result-aware
+/// gate, and the Responses loop without SmartHarness has no gate, so it reports
+/// `off`. Reverting solve to an unconditional receipt fails the second case.
+#[tokio::test(flavor = "multi_thread")]
+async fn solve_reports_verification_off_where_the_loop_has_no_gate() {
+    for (api, expected) in [("chat", "result_aware"), ("responses", "off")] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(CaptureThenFinish {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_1", "status": "completed", "model": NEMOTRON_MODEL,
+                "output": [{"type": "message", "id": "msg_1", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "done", "annotations": []}]}]
+            })))
+            .mount(&server)
+            .await;
+        let fixture = tempfile::tempdir().expect("temporary solve fixture");
+        let instruction_path = fixture.path().join("instruction.md");
+        let events_path = fixture.path().join("events.jsonl");
+        std::fs::write(&instruction_path, "Finish without calling a tool.\n")
+            .expect("write solve instruction");
+        Command::cargo_bin("newt")
+            .expect("newt binary")
+            .env_remove("NEWT_TEAM")
+            .env("NEWT_SELF_VERIFY", "1")
+            .env("NEWT_VERIFY_OUTCOMES", "1")
+            .args(["--backend-endpoint", &server.uri()])
+            .args(["--backend-model", NEMOTRON_MODEL])
+            .args(["--backend-kind", "openai"])
+            .args(["--backend-api", api])
+            .args(["solve", "--cwd"])
+            .arg(fixture.path())
+            .arg("--instruction-file")
+            .arg(&instruction_path)
+            .arg("--events")
+            .arg(&events_path)
+            .args(["--max-rounds", "1"])
+            .assert()
+            .success();
+        let verification = &contract_from(&events_path)["receipt"]["verification"];
+        assert_eq!(verification["mode"], expected, "{api}: {verification}");
+    }
+}

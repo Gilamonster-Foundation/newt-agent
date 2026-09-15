@@ -67,8 +67,10 @@ EP="$(sed -n 's/^endpoint *= *"\(.*\)"/\1/p' "$NEWT_BENCH_PROFILE_TEMPLATE" | he
 [ -n "$EP" ] || { echo "no endpoint in $NEWT_BENCH_PROFILE_TEMPLATE" >&2; exit 2; }
 export TB_LOCAL_BASE_URL="$EP/v1" TB_LOCAL_CONTEXT_WINDOW="$TB_CTX_SIZE"
 # Stock Codex copies OPENAI_API_KEY into the container and appends OPENAI_BASE_URL
-# to its config; NEWT_BENCH_SMART would change newt's arm.
-unset OPENAI_API_KEY OPENAI_BASE_URL NEWT_BENCH_SMART
+# to its config. Every treatment knob the runner does not export below is unset:
+# an exported one would silently change newt's arm in every baseline cell
+# (a treatment sets them per cell). Kept in step with TREATMENT_ENV by test.
+unset OPENAI_API_KEY OPENAI_BASE_URL NEWT_BENCH_SMART NEWT_BENCH_SELF_VERIFY NEWT_BENCH_MAX_ROUNDS NEWT_BENCH_TENACITY NEWT_BENCH_VERIFY_OUTCOMES
 export NEWT_BENCH_BIN NEWT_BENCH_CONTEXT_WINDOW="$TB_CTX_SIZE" NEWT_BENCH_OCAP=off
 
 py() { python3 -c "$@"; }

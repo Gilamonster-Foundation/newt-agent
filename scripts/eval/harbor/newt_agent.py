@@ -97,6 +97,11 @@ _HTTP_RETRIES = os.environ.get("NEWT_BENCH_HTTP_RETRIES", "10")
 # workspace's own checks before declaring done. Opt-in per run — set
 # NEWT_BENCH_SELF_VERIFY=1 to inject NEWT_SELF_VERIFY=1 into the container.
 _SELF_VERIFY = os.environ.get("NEWT_BENCH_SELF_VERIFY", "")
+# Result-aware verification (#2315): set NEWT_BENCH_VERIFY_OUTCOMES=1 to inject
+# NEWT_VERIFY_OUTCOMES=1, so the gate repairs a check that ran and FAILED instead
+# of accepting any attempt. It is a mode of the self-verify gate; newt reports the
+# mode it ran in the contract record's receipt.verification.
+_VERIFY_OUTCOMES = os.environ.get("NEWT_BENCH_VERIFY_OUTCOMES", "")
 # Smart-harness arm (#2260/#2263): set NEWT_BENCH_SMART=1 to run `newt solve
 # --smart-harness`. The frame lives under /logs/agent so it is outside every
 # workspace tool grant AND survives the container for the cross-tab. The
@@ -125,6 +130,8 @@ def _container_env_prefix() -> str:
         parts.append("NEWT_HTTP_BACKOFF_MAX_MS=30000")
     if _SELF_VERIFY.strip().lower() in ("1", "true", "on", "yes"):
         parts.append("NEWT_SELF_VERIFY=1")
+    if _VERIFY_OUTCOMES.strip().lower() in ("1", "true", "on", "yes"):
+        parts.append("NEWT_VERIFY_OUTCOMES=1")
     if _MODEL_DIGEST.strip():
         parts.append(f"NEWT_MODEL_DIGEST={shlex.quote(_MODEL_DIGEST.strip())}")
     return (" ".join(parts) + " ") if parts else ""

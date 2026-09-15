@@ -622,6 +622,8 @@ async fn run_one_turn(
             }
         };
     let ctx = ChatCtx {
+        verify_outcomes: crate::agentic::self_verify::outcomes_enabled(),
+        round_cap_hit: None,
         smart_harness: config.smart_harness.as_deref(),
         rewrites_history: config.context_manager.rewrites_history(),
         url: &config.url,

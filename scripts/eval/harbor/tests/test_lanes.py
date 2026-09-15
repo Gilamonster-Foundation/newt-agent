@@ -55,5 +55,20 @@ class RequiredFeatures(unittest.TestCase):
             newt_agent._REQUIRE_FEATURES = ""
 
 
+class VerifyOutcomes(unittest.TestCase):
+    """#2315: the result-aware verification treatment reaches the container, and
+    stays absent when the operator did not ask for it (a switch nothing sets is
+    the #1943 defect)."""
+
+    def test_opt_in_is_injected_and_absent_is_absent(self):
+        try:
+            newt_agent._VERIFY_OUTCOMES = "1"
+            self.assertIn("NEWT_VERIFY_OUTCOMES=1 ", newt_agent._container_env_prefix())
+            newt_agent._VERIFY_OUTCOMES = ""
+            self.assertNotIn("NEWT_VERIFY_OUTCOMES", newt_agent._container_env_prefix())
+        finally:
+            newt_agent._VERIFY_OUTCOMES = ""
+
+
 if __name__ == "__main__":
     unittest.main()
