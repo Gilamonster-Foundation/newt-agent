@@ -299,11 +299,11 @@ async fn suspicious_empty_generated_output_retries_with_nudge() {
     assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert_eq!(probes.load(Ordering::SeqCst), 2);
     assert!(saw_nudge.load(Ordering::SeqCst));
-    assert!(
+    assert_eq!(
         usage
             .expect("usage survives suspicious retry")
-            .output_tokens
-            >= 2566,
+            .output_tokens,
+        2_559 + 3,
         "usage from the suspicious empty round must be preserved"
     );
 }

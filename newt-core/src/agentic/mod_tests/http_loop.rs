@@ -178,26 +178,14 @@ impl Respond for CaptureOpenAiRequestResponder {
 
 // -- Narrate-then-stop rescue: bounded no-tool-call auto-continue ---------
 
-/// OpenAI responder that serves one scripted message per logical round.
-/// Primary calls stream too, so only an identical request immediately after a
-/// no-tool response can consume its one pending display replay. A changed
-/// request advances the script; out-of-range rounds repeat its last entry.
+/// OpenAI responder that serves one scripted message per request. Each request
+/// advances the script; out-of-range requests repeat its last entry.
 struct ScriptedOpenAi {
     round: Arc<AtomicUsize>,
     script: Vec<serde_json::Value>,
-    /// Exact request bytes and message eligible for one display reissue.
-    pending_replay: Mutex<Option<(Vec<u8>, serde_json::Value)>>,
 }
 impl Respond for ScriptedOpenAi {
     fn respond(&self, req: &Request) -> ResponseTemplate {
-        // Consume or invalidate the pending replay before deciding the round.
-        // Keeping it after replay would swallow a later identical turn.
-        let mut pending = self.pending_replay.lock().unwrap();
-        if let Some((body, message)) = pending.take() {
-            if is_stream(req) && body == req.body {
-                return scripted_openai_response(req, message);
-            }
-        }
         let i = self.round.fetch_add(1, Ordering::SeqCst);
         let msg = self
             .script
@@ -205,12 +193,6 @@ impl Respond for ScriptedOpenAi {
             .or_else(|| self.script.last())
             .cloned()
             .unwrap_or_else(|| serde_json::json!({ "content": "final." }));
-        if msg["tool_calls"]
-            .as_array()
-            .is_none_or(|calls| calls.is_empty())
-        {
-            *pending = Some((req.body.clone(), msg.clone()));
-        }
         scripted_openai_response(req, msg)
     }
 }
@@ -251,7 +233,6 @@ async fn run_openai_script_with_ledger(
         .respond_with(ScriptedOpenAi {
             round: round.clone(),
             script,
-            pending_replay: Default::default(),
         })
         .mount(&server)
         .await;
@@ -315,7 +296,6 @@ async fn scripted_openai_identical_next_turn_consumes_the_next_answer() {
                 serde_json::json!({"content":"First answer."}),
                 serde_json::json!({"content":"Second answer."}),
             ],
-            pending_replay: Default::default(),
         })
         .mount(&server)
         .await;

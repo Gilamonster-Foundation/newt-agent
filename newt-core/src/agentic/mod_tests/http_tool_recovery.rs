@@ -200,7 +200,7 @@ async fn ollama_tool_xml_error_recovers_with_tools_still_available() {
     );
     assert_eq!(
         rejections.load(Ordering::SeqCst),
-        3,
-        "the XML error probe, retry probe, and streaming re-issue all keep tools advertised"
+        2,
+        "the XML error probe and the retry probe both keep tools advertised"
     );
 }

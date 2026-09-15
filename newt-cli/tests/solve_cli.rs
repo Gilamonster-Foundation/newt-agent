@@ -118,9 +118,12 @@ impl Respond for CaptureThenFinish {
         // captured like any other request — it goes to the same
         // endpoint and carries the same wire controls, so the assertions about
         // both apply to it too.
+        // Every generation reports 7 output tokens, so a contract that counts
+        // two generations for one answer reads 14 (#2372).
         if streaming {
             let frame = serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]});
-            let sse = format!("data: {frame}\n\ndata: [DONE]\n\n");
+            let usage = serde_json::json!({"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 7}});
+            let sse = format!("data: {frame}\n\ndata: {usage}\n\ndata: [DONE]\n\n");
             return ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream");
         }
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -128,7 +131,8 @@ impl Respond for CaptureThenFinish {
             "choices": [{
                 "message": {"role": "assistant", "content": "done"},
                 "finish_reason": "stop"
-            }]
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 7}
         }))
     }
 }
@@ -826,9 +830,9 @@ kind = "openai"
         .success();
 
     let requests = requests.lock().expect("request capture lock");
-    // The probe round plus its #123 streaming re-issue — both to the CLI
-    // endpoint, both naming the CLI-overridden model.
-    assert_eq!(requests.len(), 2, "the CLI endpoint served the turn");
+    // #2372: one generation for the one answer, to the CLI endpoint, naming
+    // the CLI-overridden model.
+    assert_eq!(requests.len(), 1, "the CLI endpoint served the turn");
     for request in requests.iter() {
         assert_eq!(request["model"], "operator-model");
     }
@@ -844,6 +848,8 @@ kind = "openai"
     let contract = contract_from(&events_path);
     assert_eq!(contract["requested_model"], "operator-model");
     assert_eq!(contract["backend"]["name"], "cli");
+    // #2372: the answer was generated once, so it is counted once.
+    assert_eq!(contract["timing"]["gen_tokens"], 7, "{contract}");
 }
 
 /// A cognition dial is an intent, not evidence that a backend received the
@@ -901,10 +907,9 @@ api = "chat_completions"
         .success();
 
     let requests = requests.lock().expect("request capture lock");
-    // The probe round plus its #123 streaming re-issue. Neither may carry
-    // cognition controls: a dial is an intent, not evidence the endpoint
-    // supports the wire fields, and the streamed round is the same wire.
-    assert_eq!(requests.len(), 2);
+    // #2372: one generation. It may not carry cognition controls: a dial is an
+    // intent, not evidence the endpoint supports the wire fields.
+    assert_eq!(requests.len(), 1);
     for request in requests.iter() {
         assert!(request.get("max_tokens").is_none());
         assert!(request.get("chat_template_kwargs").is_none());
