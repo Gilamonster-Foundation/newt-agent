@@ -36,6 +36,14 @@ async fn assert_pending_summary_is_cancelled(
     let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, kind);
     ctx.safe_context = Some(12_000);
     ctx.num_ctx = Some(12_000);
+    if kind == BackendKind::Anthropic {
+        // #2341: Anthropic reserves the `max_tokens` it always sends from the
+        // declared window. Its 8,192 default would leave 3,808 of these 12,000
+        // tokens and refuse before compaction could start; an explicit 2,000
+        // keeps the budget at the 9,600 percentage ceiling, as on the other
+        // wires, so this still measures cancelling a pending summary.
+        ctx.output_allowance = Some(2_000);
+    }
     ctx.max_ok_input = None;
     ctx.mid_loop_trim_threshold = 8;
     ctx.max_tool_rounds = usize::from(!final_summary);
