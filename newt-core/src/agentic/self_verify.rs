@@ -597,21 +597,29 @@ pub fn outcomes_enabled() -> bool {
 /// verifies on every wire; without it only the OpenAI Chat Completions and
 /// Anthropic loops carry the ordinary gate. Headless solve always arms action
 /// nudges, so this is the whole instantiation question there.
-pub fn verification_gate_present(kind: crate::BackendKind, smart_harness: bool) -> bool {
+pub fn verification_gate_present(
+    kind: crate::BackendKind,
+    api: crate::OpenAiApi,
+    smart_harness: bool,
+) -> bool {
     smart_harness
         || kind == crate::BackendKind::Anthropic
-        || (kind == crate::BackendKind::Openai && !super::responses_api_selected())
+        || (kind == crate::BackendKind::Openai && api == crate::OpenAiApi::ChatCompletions)
 }
 
-/// The receipt entry for this gate (#2314): the mode a turn instantiates when
-/// `gate_present` ([`verification_gate_present`] with action nudges armed),
-/// read through the same predicates the loop reads, plus the repair allowance
-/// when it applies. Per-decision evidence rides the `verification` trace
-/// signals.
-pub fn verification_receipt(gate_present: bool) -> serde_json::Value {
-    let mode = if !gate_present || !enabled() {
+/// The receipt entry for this gate (#2314): the mode a turn instantiates, from
+/// whether it has a gate ([`verification_gate_present`], action nudges armed)
+/// and the two switches the host read, plus the repair allowance when it
+/// applies. Pure: the host passes the switches. Per-decision evidence rides the
+/// `verification` trace signals.
+pub fn verification_receipt(
+    gate_present: bool,
+    self_verify: bool,
+    outcomes: bool,
+) -> serde_json::Value {
+    let mode = if !gate_present || !self_verify {
         "off"
-    } else if outcomes_enabled() {
+    } else if outcomes {
         "result_aware"
     } else {
         "attempted"

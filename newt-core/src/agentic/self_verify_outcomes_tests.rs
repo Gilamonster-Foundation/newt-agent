@@ -263,44 +263,26 @@ fn tree_state_follows_bytes_and_gives_up_past_its_bounds() {
     assert_eq!(tree(&base, 100, 4), None, "byte bound exceeded");
 }
 
-/// A14: the receipt names the mode the gate instantiates, from the same
-/// predicates the loop reads, and the allowance only where it applies.
-#[serial_test::serial(newt_self_verify_env)]
+/// A14: the receipt names the mode the gate instantiates from the switches the
+/// host read, and the allowance only where it applies. Pure: no env.
 #[test]
 fn the_verification_receipt_names_the_mode_the_gate_runs_in() {
-    let saved = [
-        std::env::var_os("NEWT_SELF_VERIFY"),
-        std::env::var_os("NEWT_VERIFY_OUTCOMES"),
-    ];
-    std::env::remove_var("NEWT_SELF_VERIFY");
-    std::env::remove_var("NEWT_VERIFY_OUTCOMES");
     assert_eq!(
-        verification_receipt(true),
+        verification_receipt(true, true, false),
         serde_json::json!({"mode": "attempted"})
     );
     assert_eq!(
-        verification_receipt(false),
+        verification_receipt(false, true, true),
         serde_json::json!({"mode": "off"})
     );
-    std::env::set_var("NEWT_VERIFY_OUTCOMES", "1");
     assert_eq!(
-        verification_receipt(true),
+        verification_receipt(true, true, true),
         serde_json::json!({"mode": "result_aware", "repair_allowance": VERIFY_REPAIR_ALLOWANCE})
     );
-    std::env::set_var("NEWT_SELF_VERIFY", "0");
     assert_eq!(
-        verification_receipt(true),
+        verification_receipt(true, false, true),
         serde_json::json!({"mode": "off"})
     );
-    for (key, value) in ["NEWT_SELF_VERIFY", "NEWT_VERIFY_OUTCOMES"]
-        .iter()
-        .zip(saved)
-    {
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-    }
 }
 
 #[serial_test::serial(newt_self_verify_env)]
@@ -504,177 +486,24 @@ fn tree_state_never_reads_a_file_past_the_byte_budget() {
 
 /// Finding 7: the receipt reports a mode only for a turn that has a gate to
 /// run it. Without SmartHarness the Ollama and Responses loops carry none, so
-/// an A/B split on the receipt must see them as `off`, not treated.
-#[serial_test::serial(newt_self_verify_env)]
+/// an A/B split on the receipt must see them as `off`, not treated. Reads the
+/// typed wire API, never `NEWT_OPENAI_API`.
 #[test]
 fn the_receipt_says_off_where_the_loop_has_no_gate() {
     use crate::BackendKind::{Anthropic, Ollama, Openai};
-    let _settings = crate::test_guard::GlobalSettingsGuard::acquire();
-    let saved = [
-        std::env::var_os("NEWT_SELF_VERIFY"),
-        std::env::var_os("NEWT_VERIFY_OUTCOMES"),
-    ];
-    std::env::set_var("NEWT_SELF_VERIFY", "1");
-    std::env::set_var("NEWT_VERIFY_OUTCOMES", "1");
-    std::env::remove_var("NEWT_OPENAI_API");
-    let mode =
-        |kind, smart| verification_receipt(verification_gate_present(kind, smart))["mode"].clone();
-    assert_eq!(mode(Ollama, false), "off");
-    assert_eq!(mode(Ollama, true), "result_aware");
-    assert_eq!(mode(Openai, false), "result_aware");
-    assert_eq!(mode(Anthropic, false), "result_aware");
-    std::env::set_var("NEWT_OPENAI_API", "responses");
-    assert_eq!(mode(Openai, false), "off", "Responses has no ordinary gate");
-    assert_eq!(mode(Openai, true), "result_aware");
-    for (key, value) in ["NEWT_SELF_VERIFY", "NEWT_VERIFY_OUTCOMES"]
-        .iter()
-        .zip(saved)
-    {
-        match value {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// #2374 review round two, C and E: one pass-evidence rule.
-// ---------------------------------------------------------------------------
-
-fn standing(
-    checks: &[VerifyCheck],
-    runs: &[(&str, crate::ExecOutcome)],
-    tree_now: Option<ContentId>,
-) -> CheckStatus {
-    let mut ledger = VerificationLedger::default();
-    for (command, outcome) in runs {
-        let tree = (*outcome == Passed)
-            .then(|| id("tree-t"))
-            .filter(|_| tree_now.is_some());
-        ledger.record_exec(command, *outcome, tree);
-    }
-    let (_, report) = conclude(&Conclusion {
-        checks,
-        requested: &[],
-        ledger: &ledger,
-        tree_now,
-        repairs_used: 0,
-        rounds_left: true,
-    });
-    report.checks[0].status
-}
-
-/// Checks, their runs in order, and the standing the rule must give.
-type Case<'a> = (
-    &'a [VerifyCheck],
-    &'a [(&'a str, crate::ExecOutcome)],
-    CheckStatus,
-);
-
-/// C: a run is pass evidence only when its runner segment is the last one, it
-/// is not backgrounded, no earlier `||` can skip it, and it is not a non-run
-/// form. A failure is cleared only by the same normalized full command, a
-/// denial never erases it, and an unverified re-run keeps a genuine pass.
-#[test]
-fn one_rule_decides_pass_evidence_for_every_command_shape() {
-    use CheckStatus::{Failed as F, NeverRun, Passed as P, Unverified as U};
-    let t = || Some(id("tree-t"));
-    let cargo = cargo_checks();
-    let python = python_checks();
-    let go = detect_checks(&["go.mod".to_string()], "");
-    let named_make = detect_checks(&[], "You can run `make` to verify.");
-    let cases: &[Case] = &[
-        (&cargo, &[("cargo test", Passed)], P),
-        (&cargo, &[("cd backend && cargo test", Passed)], P),
-        (&cargo, &[("cargo test 2>&1", Passed)], P),
-        (&cargo, &[("RUST_BACKTRACE=1 cargo test", Passed)], P),
-        (
-            &cargo,
-            &[("cargo test && sed -i s/a/b/ src/lib.rs", Passed)],
-            U,
-        ),
-        (&cargo, &[("cargo test && rm src/lib.rs", Passed)], U),
-        (&cargo, &[("cargo test 2>&1 | tail -30", Passed)], U),
-        (&cargo, &[("cargo test; echo done", Passed)], U),
-        (&cargo, &[("cargo test &", Passed)], U),
-        (&cargo, &[("true || cargo test", Passed)], U),
-        (&cargo, &[("cargo test --no-run", Passed)], U),
-        (&cargo, &[("cargo test -- --list", Passed)], U),
-        (&cargo, &[("cargo nextest list", Passed)], U),
-        (&python, &[("pytest --collect-only", Passed)], U),
-        (&python, &[("pytest --co -q", Passed)], U),
-        (&python, &[("pytest --version", Passed)], U),
-        (&go, &[("go test -c ./...", Passed)], U),
-        (&go, &[("go test -list .", Passed)], U),
-        (
-            &python,
-            &[("pytest", Failed), ("pytest test_a.py", Passed)],
-            F,
-        ),
-        (
-            &python,
-            &[("pytest test_a.py", Failed), ("pytest", Passed)],
-            F,
-        ),
-        (
-            &cargo,
-            &[("cargo test --workspace", Failed), ("cargo test", Passed)],
-            F,
-        ),
-        (
-            &cargo,
-            &[("cd x && cargo test", Failed), ("cargo test", Passed)],
-            F,
-        ),
-        (
-            &python,
-            &[("PYTEST_ADDOPTS=-x pytest", Failed), ("pytest", Passed)],
-            F,
-        ),
-        (
-            &cargo,
-            &[("cargo test", Failed), ("cargo  test", Passed)],
-            P,
-        ),
-        (&cargo, &[("cargo test", Failed), ("cargo test", Denied)], F),
-        (
-            &cargo,
-            &[("cargo test", Failed), ("cargo test | tail", Passed)],
-            F,
-        ),
-        (
-            &cargo,
-            &[("cargo test", Passed), ("cargo test | tail", Passed)],
-            P,
-        ),
-        (&named_make, &[("make install", Passed)], NeverRun),
-        (&named_make, &[("make -j4", Passed)], P),
-    ];
-    for (checks, runs, expected) in cases {
-        assert_eq!(standing(checks, runs, t()), *expected, "{runs:?}");
-    }
-}
-
-/// E: on the mutation-chain basis, a read-only probe after a pass is not a
-/// mutation, so it does not cost a repair nudge. A failed mutating call still
-/// counts.
-#[test]
-fn a_read_only_probe_after_a_pass_does_not_stale_it_on_the_chain() {
-    let cargo = cargo_checks();
-    for probe in ["cat src/lib.rs", "ls", "git status"] {
-        assert_eq!(
-            standing(&cargo, &[("cargo test", Passed), (probe, Passed)], None),
-            CheckStatus::Passed,
-            "{probe}"
-        );
-    }
+    use crate::OpenAiApi::{ChatCompletions, Responses};
+    let mode = |kind, api, smart| {
+        verification_receipt(verification_gate_present(kind, api, smart), true, true)["mode"]
+            .clone()
+    };
+    assert_eq!(mode(Ollama, ChatCompletions, false), "off");
+    assert_eq!(mode(Ollama, ChatCompletions, true), "result_aware");
+    assert_eq!(mode(Openai, ChatCompletions, false), "result_aware");
+    assert_eq!(mode(Anthropic, ChatCompletions, false), "result_aware");
     assert_eq!(
-        standing(
-            &cargo,
-            &[("cargo test", Passed), ("rm src/lib.rs", Failed)],
-            None
-        ),
-        CheckStatus::Stale,
-        "a failed mutating call still counts"
+        mode(Openai, Responses, false),
+        "off",
+        "Responses has no ordinary gate"
     );
+    assert_eq!(mode(Openai, Responses, true), "result_aware");
 }

@@ -247,7 +247,8 @@ pub use scratchpad::{
     scratchpad_state_block, working_memory_head, ScratchpadStore, SessionScratchpadStore,
 };
 pub use self_verify::{
-    outcomes_enabled as verify_outcomes_requested, verification_gate_present, verification_receipt,
+    enabled as self_verify_enabled, outcomes_enabled as verify_outcomes_requested,
+    verification_gate_present, verification_receipt,
 };
 pub use semantic::{
     chunk_source, code_search_tool_definition, cosine, format_index_status, format_search_hits,

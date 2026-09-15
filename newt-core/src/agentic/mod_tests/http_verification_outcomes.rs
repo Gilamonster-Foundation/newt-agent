@@ -263,6 +263,23 @@ async fn a_fresh_passing_check_completes_without_a_nudge() {
                 .any(|body| body.contains("[loop-guidance] Before you finish")),
             "{wire} smart={smart}"
         );
+        // Review F: the pass recorded a tree state and the conclusion decided on
+        // it (basis `tree`), not on the mutation-chain fallback.
+        let bases: Vec<_> = run
+            .signals
+            .iter()
+            .filter_map(|signal| match signal {
+                observability::BehaviorSignal::Verification {
+                    decision, report, ..
+                } => Some((decision.as_str(), report.basis)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bases,
+            [("accept", crate::agentic::self_verify::StateBasis::Tree)],
+            "{wire} smart={smart}"
+        );
     }
 }
 
