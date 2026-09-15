@@ -94,6 +94,22 @@ def error_cause(exception, exit_code, harness_error, pi_failure, responses, wait
     return "unknown"
 
 
+# Rows and cells reach commits, report tables and cards, so the ingest writes no
+# address: newt's solve_result records its endpoint, and a failed request's error
+# text names the request URL. Applied to what is written, after classification.
+ADDRESS = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'()<>]+|\b\d{1,3}(?:\.\d{1,3}){3}\b|/(?:home|Users)/[^/\s\"']+")
+
+
+def redact(value):
+    if isinstance(value, str):
+        return ADDRESS.sub("<redacted>", value)
+    if isinstance(value, dict):
+        return {k: redact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(v) for v in value]
+    return value
+
+
 def pi_session_lines(agent_dir: Path):
     """pi's own session JSONL (--session-dir /logs/agent/pi/sessions), newest last."""
     files = sorted((agent_dir / "pi" / "sessions").rglob("*.jsonl")) if (agent_dir / "pi").is_dir() else []
@@ -445,7 +461,7 @@ def trial_row(harness, trial: Path, expect=None):
             harness_config = o.get("effective_config") or harness_config
             contract = o if "outcome" in o else contract
         tokens_out = timing.get("gen_tokens")
-    return {
+    return redact({
         "trial": rec["trial"],
         "task": rec["task"],
         "task_checksum": r.get("task_checksum"),
@@ -475,7 +491,7 @@ def trial_row(harness, trial: Path, expect=None):
         "tokens_source": source,
         "max_request_output_tokens": max_request_output(harness, trial / "agent"),
         "agent_s": _seconds(r.get("agent_execution")),
-    }
+    })
 
 
 # ── one Harbor job per trial ─────────────────────────────────────────────────
@@ -624,7 +640,7 @@ def ingest(job_dir: Path, cell_json: Path, out: Path):
     with open(out / "trials.jsonl", "a") as f:
         f.writelines(json.dumps(row) + "\n" for row in rows)
     with open(out / "cells.jsonl", "a") as f:
-        f.write(json.dumps({**cell, "observed": len(rows)}) + "\n")
+        f.write(json.dumps(redact({**cell, "observed": len(rows)})) + "\n")
 
 
 def wilson(k, n, z=1.96):

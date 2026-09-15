@@ -5,6 +5,7 @@ Run: PYTHONPATH=scripts/eval/harbor python -m unittest discover scripts/eval/har
 """
 
 import json
+import re
 import tomllib
 import unittest
 from pathlib import Path
@@ -15,7 +16,7 @@ from tb_campaign import (
     PINNED, awaiting, build_cell, ceiling_reached, codex_claim, deadline_cancels, error_cause, fingerprint,
     harness_evidence, is_trial_config, job_state, ledger_entry, ledger_total_s, load_treatment, newcombe,
     newt_claim, observed, pair, pair_report, parse_schedule, pi_claim, pin_extend, pin_mismatch, refusal,
-    render_profile, summarize, treatment_env, trial_plan, wilson, window_at,
+    render_profile, summarize, treatment_env, trial_plan, trial_row, wilson, window_at,
 )
 
 HARBOR = Path(__file__).resolve().parent.parent
@@ -418,6 +419,19 @@ class PiSessionLog(unittest.TestCase):
         self.assertEqual(awaiting("codex", jl({"type": "turn.started"}, {"type": "item.started"}), []), "tool")
         self.assertEqual(awaiting("codex", jl({"type": "item.completed", "item": {"type": "command_execution"}}), []), "model")
         self.assertIsNone(awaiting("newt", jl({"kind": "chat_completion_finish"}), []))
+
+
+class Redaction(unittest.TestCase):
+    """Rows reach commits, report tables and cards. newt's solve_result records its
+    endpoint, and a failed request's error text names the request URL (a real
+    unreachable-endpoint trial, address swapped for a documentation one)."""
+
+    def test_an_ingested_row_carries_no_url_or_ip(self):
+        r = trial_row("newt", HARBOR / "tests/fixtures/trial-newt-unreachable")
+        leak = re.compile(r"://|\b\d{1,3}(?:\.\d{1,3}){3}\b|/home/|/Users/")
+        self.assertIsNone(leak.search(json.dumps(r)), json.dumps(r))
+        self.assertEqual(r["error_cause"], "infra")  # classified from the raw text, before redaction
+        self.assertIn("error sending request", r["harness_error"])
 
 
 if __name__ == "__main__":
