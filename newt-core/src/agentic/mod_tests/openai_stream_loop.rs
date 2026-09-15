@@ -53,7 +53,8 @@
 //! silently, in the text that is printed, returned, persisted and re-sent.
 //! Where the boundary falls is exactly what machine load moves. Every body in
 //! this file was ASCII, which is why nothing here could ever see it. Fixed by
-//! `decode_chunk` and covered below; the Ollama wire still has the twin.
+//! `decode_chunk` and covered below. The Anthropic reader now uses the same
+//! helper, and the Ollama reader buffers bytes per line (#2313 review).
 
 use super::*;
 use crate::agentic::http_loop_tests::DisplayReplay;
@@ -521,16 +522,21 @@ async fn interrupt_once_the_client_is_reading(
     let req = reqwest::Client::new()
         .post(format!("http://{addr}/v1/chat/completions"))
         .json(&serde_json::json!({"stream": true}));
-    let out = openai_stream_final_answer(
-        req,
-        Some(scope),
-        buf.clone(),
-        false,
-        false,
-        false,
-        Some(cancel.as_ref()),
+    // Bounded: with the interrupt arm broken, this connection never closes.
+    let out = tokio::time::timeout(
+        super::http_loop_tests::RAW_STREAM_TEST_BOUND,
+        openai_stream_final_answer(
+            req,
+            Some(scope),
+            buf.clone(),
+            false,
+            false,
+            false,
+            Some(cancel.as_ref()),
+        ),
     )
-    .await;
+    .await
+    .expect("the interrupt ends the read");
     server.abort();
     let record = ledger.lock().unwrap().records().next().cloned();
     (out, buf.text(), record.expect("the reissue was sent"))

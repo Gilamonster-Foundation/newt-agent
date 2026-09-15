@@ -930,6 +930,186 @@ async fn an_ollama_cap_exit_summary_is_one_ledger_attempt() {
         .all(|r| r.state == crate::attempts::AttemptState::Ok && r.usage.is_some()));
 }
 
+/// Read one Ollama stream reissue body served in `parts` (see
+/// `serve_stream_parts`), returning `stream_response`'s (text, usage, complete).
+async fn ollama_stream_parts(
+    parts: &[&[u8]],
+    interrupt: bool,
+) -> (String, Option<crate::TokenUsage>, bool) {
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (url, server) =
+        super::http_loop_tests::serve_stream_parts(parts, interrupt.then(|| flag.clone())).await;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/api/chat"))
+        .send()
+        .await
+        .expect("the stream connects");
+    let read = tokio::time::timeout(
+        super::http_loop_tests::RAW_STREAM_TEST_BOUND,
+        stream_response(response, false, false, false, Some(&flag), false, None),
+    )
+    .await
+    .expect("the read ends: at done, at EOF, or at the interrupt")
+    .expect("the body reads");
+    server.abort();
+    read
+}
+
+const OLLAMA_DELTA: &str = "{\"message\":{\"content\":\"the answer\"}}\n";
+const OLLAMA_DONE: &str =
+    "{\"message\":{\"content\":\"\"},\"done\":true,\"prompt_eval_count\":40,\"eval_count\":6}\n";
+
+fn ollama_done_usage() -> Option<crate::TokenUsage> {
+    Some(crate::TokenUsage {
+        input_tokens: 40,
+        output_tokens: 6,
+    })
+}
+
+/// Review round 2, item 3: a stream that reached `done: true` is finished. An
+/// Esc that lands after it, while the connection is still open, must not turn
+/// it into an interrupted one, so the reader stops at `done` instead of polling
+/// the socket again.
+#[tokio::test]
+async fn an_ollama_stream_is_complete_once_done_even_if_esc_follows() {
+    let (text, usage, complete) =
+        ollama_stream_parts(&[OLLAMA_DELTA.as_bytes(), OLLAMA_DONE.as_bytes()], true).await;
+    assert_eq!(text, "the answer");
+    assert_eq!(usage, ollama_done_usage());
+    assert!(complete, "done: true arrived before the interrupt");
+}
+
+/// Review round 2, item 3: NDJSON lines straddle chunk boundaries. A `done`
+/// line split in two is still the end of the stream, with its usage.
+#[tokio::test]
+async fn an_ollama_done_line_split_across_chunks_still_completes_the_stream() {
+    let cut = OLLAMA_DONE.len() / 2;
+    let (text, usage, complete) = ollama_stream_parts(
+        &[
+            OLLAMA_DELTA.as_bytes(),
+            &OLLAMA_DONE.as_bytes()[..cut],
+            &OLLAMA_DONE.as_bytes()[cut..],
+        ],
+        false,
+    )
+    .await;
+    assert_eq!(text, "the answer");
+    assert_eq!(usage, ollama_done_usage());
+    assert!(complete, "the split done line was read");
+}
+
+/// Review round 3, item b: a character split across two chunks is still that
+/// character. Decoding each chunk on its own turns both halves into U+FFFD.
+#[tokio::test]
+async fn an_ollama_character_split_across_chunks_is_not_corrupted() {
+    let delta = "{\"message\":{\"content\":\"newt 🦎 蠑螈\"}}\n".as_bytes();
+    let cut = delta
+        .iter()
+        .position(|&b| b == 0xF0)
+        .expect("the emoji's lead byte")
+        + 2;
+    let (text, usage, complete) = ollama_stream_parts(
+        &[&delta[..cut], &delta[cut..], OLLAMA_DONE.as_bytes()],
+        false,
+    )
+    .await;
+    assert_eq!(text, "newt 🦎 蠑螈");
+    assert_eq!(usage, ollama_done_usage());
+    assert!(complete);
+}
+
+/// Review round 4, item b: the NDJSON line splitter without a socket. At every
+/// byte offset of a line holding multibyte characters, the line comes out whole
+/// and intact, and not before its newline arrives.
+#[test]
+fn an_ollama_line_split_at_every_byte_offset_is_not_corrupted() {
+    let line = "{\"message\":{\"content\":\"newt 🦎 蠑螈\"}}\n".as_bytes();
+    for cut in 0..line.len() {
+        let mut pending = line[..cut].to_vec();
+        assert_eq!(next_ndjson_line(&mut pending), None, "split at byte {cut}");
+        pending.extend_from_slice(&line[cut..]);
+        assert_eq!(
+            next_ndjson_line(&mut pending).as_deref(),
+            Some("{\"message\":{\"content\":\"newt 🦎 蠑螈\"}}"),
+            "split at byte {cut}"
+        );
+        assert!(pending.is_empty());
+    }
+}
+
+/// Review round 2, item 4: an Esc inside the read loop, after the first delta,
+/// keeps the partial text and is never complete. Deterministic: the flag is
+/// tripped only after the reader has drained megabytes of the body.
+#[tokio::test]
+async fn an_ollama_stream_interrupted_after_its_first_delta_is_not_complete() {
+    let (text, usage, complete) = ollama_stream_parts(&[OLLAMA_DELTA.as_bytes()], true).await;
+    assert_eq!(text, "the answer", "the partial is kept");
+    assert_eq!(usage, None, "usage only arrives on the done line");
+    assert!(!complete, "an interrupted stream is not complete");
+}
+
+/// A plain answer on the probe; a stream reissue cut before `done: true`.
+struct OllamaAnswerThenCutStream;
+impl Respond for OllamaAnswerThenCutStream {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        if is_stream(req) {
+            return ndjson(&[serde_json::json!({"message": {"content": "half an"}})]);
+        }
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {"content": "the whole answer"},
+            "prompt_eval_count": 40, "eval_count": 6,
+        }))
+    }
+}
+
+/// #2313 review (rule on the Ollama wire): a stream reissue that ends before
+/// `done: true` is a cut stream — a failed attempt, never ok.
+#[tokio::test]
+async fn a_cut_ollama_stream_reissue_is_a_failed_attempt() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(OllamaAnswerThenCutStream)
+        .mount(&server)
+        .await;
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("answer me"),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    let _ = chat_complete(c, &mut NoMcp).await;
+    let received = server.received_requests().await.expect("journal");
+    assert_eq!(received.len(), 2, "probe, stream reissue");
+    let ledger = ledger.lock().unwrap();
+    let mut records: Vec<_> = ledger.records().cloned().collect();
+    records.sort_by_key(|r| {
+        serde_json::from_slice::<serde_json::Value>(
+            &received
+                .iter()
+                .find(|q| content_addressable::RawContentId::from_content(&q.body) == r.key.request)
+                .expect("keyed by a received body")
+                .body,
+        )
+        .unwrap()["stream"]
+            .as_bool()
+    });
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records[0].state,
+        crate::attempts::AttemptState::Ok,
+        "the probe"
+    );
+    assert_eq!(
+        records[1].state,
+        crate::attempts::AttemptState::Failed,
+        "the cut stream"
+    );
+}
+
 /// B4 rule: a CONTENT-INVALID tool batch (RR1) — here a call with no name —
 /// is NOT usable output, so NO `Accepted` is emitted for that round; the
 /// loop echoes the rejection and re-dispatches, and only the following valid

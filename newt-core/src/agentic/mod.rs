@@ -3477,7 +3477,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // Step 25.4 (#568): `markdown` is now resolved by the caller
             // (`[tui].markdown` ∧ `/markdown` override ∧ color) and read off the
             // ctx above — no longer hardcoded to `color`.
-            let (streamed, stream_usage) = match stream_response(
+            let (streamed, stream_usage, stream_complete) = match stream_response(
                 sresp,
                 color,
                 show_thinking,
@@ -3535,11 +3535,19 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     return Ok((probe_content, false, accumulated_usage, hallucination_count));
                 }
             };
-            // An interrupted stream stays recorded failed (cancellation is not
-            // modelled here); a completed one reports the usage it streamed.
-            if !is_cancelled(cancel) {
-                attempt_capture::complete(attempts, stream_attempt.as_ref(), stream_usage);
-            }
+            // #2313: ok only for a stream that reached `done: true` without an
+            // interrupt; a cut stream or an interrupt is failed. Usage attaches
+            // either way.
+            attempt_capture::finish(
+                attempts,
+                stream_attempt.as_ref(),
+                if stream_complete {
+                    crate::attempts::AttemptState::Ok
+                } else {
+                    crate::attempts::AttemptState::Failed
+                },
+                stream_usage,
+            );
 
             if streamed.is_empty() {
                 // The streaming re-issue produced no tokens. Fall back to the
@@ -8949,6 +8957,7 @@ async fn anthropic_dispatch_round(
     messages: &[serde_json::Value],
     stream: bool,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    attempts: Option<attempt_capture::AttemptScope<'_>>,
 ) -> anyhow::Result<Option<(anthropic_wire::AnthropicRound, bool)>> {
     if !stream {
         let result = cancellable(
@@ -8965,13 +8974,11 @@ async fn anthropic_dispatch_round(
                     };
                     // W0 (#1511): classify while the error is TYPED — mirrors
                     // the OpenAI path's dispatch site.
-                    let resp = req.send().await.map_err(|e| {
-                        anyhow::Error::new(observability::DispatchError::from_reqwest(
-                            "request failed",
-                            e,
-                        ))
-                    })?;
-                    smart_harness::response(resp, d.smart_harness, "inference endpoint").await
+                    let (resp, attempt) =
+                        attempt_capture::send(attempts, "primary", req, "request failed").await?;
+                    let json = smart_harness::response(resp, d.smart_harness, "inference endpoint")
+                        .await?;
+                    Ok((json, attempt))
                 },
                 |attempt, delay, error| {
                     print_retry_indicator(attempt, d.retry.max_retries, delay, error, d.color);
@@ -8981,7 +8988,11 @@ async fn anthropic_dispatch_round(
         .await;
         return match result {
             None => Ok(None),
-            Some(Ok(json)) => Ok(Some((anthropic_wire::parse_messages_reply(&json), false))),
+            Some(Ok((json, attempt))) => {
+                let round = anthropic_wire::parse_messages_reply(&json);
+                attempt_capture::complete(attempts, attempt.as_ref(), round.usage);
+                Ok(Some((round, false)))
+            }
             Some(Err(e)) => Err(e),
         };
     }
@@ -8998,12 +9009,9 @@ async fn anthropic_dispatch_round(
                 || async {
                     let req = anthropic_headers(d.stream_client.post(d.messages_url), d.api_key)
                         .json(body);
-                    let resp = req.send().await.map_err(|e| {
-                        anyhow::Error::new(observability::DispatchError::from_reqwest(
-                            "stream request failed",
-                            e,
-                        ))
-                    })?;
+                    let (resp, attempt) =
+                        attempt_capture::send(attempts, "primary", req, "stream request failed")
+                            .await?;
                     if !resp.status().is_success() {
                         let status = resp.status();
                         let (bytes, read_error) = crate::retry::read_response_bytes(resp).await;
@@ -9016,7 +9024,7 @@ async fn anthropic_dispatch_round(
                         ))
                         .into());
                     }
-                    Ok(resp)
+                    Ok((resp, attempt))
                 },
                 |attempt, delay, error| {
                     print_retry_indicator(attempt, d.retry.max_retries, delay, error, d.color);
@@ -9028,6 +9036,7 @@ async fn anthropic_dispatch_round(
             None => return Ok(None),
             Some(r) => r?,
         };
+        let (resp, attempt) = resp;
 
         // The ONE spinner (`newt_core::tty`), gated exactly like
         // `stream_response`; the accumulated round text stays RAW (it is
@@ -9055,17 +9064,23 @@ async fn anthropic_dispatch_round(
         let mut anth_reason = ReasoningTrickle::default();
         let mut started = false;
         let mut transport_break: Option<String> = None;
+        let mut interrupted = false;
+        // The bytes of a character that has only half arrived. See `decode_chunk`.
+        let mut carry: Vec<u8> = Vec::new();
         let mut resp = resp;
         while !acc.is_done() {
             match cancellable(cancel, resp.chunk()).await {
                 // Interrupted: stop reading and keep what already streamed
                 // (mirrors `stream_response`'s interrupt contract).
-                None => break,
+                None => {
+                    interrupted = true;
+                    break;
+                }
                 Some(Ok(Some(chunk))) => {
-                    // Lossy UTF-8 into the accumulator's ROLLING line buffer —
-                    // an SSE `data:` line routinely splits across chunks, so a
-                    // per-chunk `lines()` split would drop events.
-                    for action in acc.feed(&String::from_utf8_lossy(&chunk)) {
+                    // Two rolling buffers: `decode_chunk` carries half a
+                    // CHARACTER to the next chunk, and the accumulator carries
+                    // half a `data:` LINE, since both straddle chunk boundaries.
+                    for action in acc.feed(&decode_chunk(&mut carry, &chunk)) {
                         match action {
                             anthropic_wire::StreamAction::TextDelta(t) => {
                                 if !started {
@@ -9123,6 +9138,7 @@ async fn anthropic_dispatch_round(
         if started && md.is_none() {
             println!();
         }
+        let done = acc.is_done();
         let round = acc.finish();
 
         // #640 mid-stream-break policy (mirrors the Ollama path): a stream
@@ -9130,6 +9146,19 @@ async fn anthropic_dispatch_round(
         // partial text with a notice; before any visible output it converts
         // to the retryable error shape and this round is re-issued.
         let break_error = round.error.clone().or(transport_break);
+        // #2313: ok only for a stream that reached `message_stop` with no error
+        // and no interrupt; a cut stream, an error event, or an interrupt is
+        // failed. Reported usage attaches either way.
+        attempt_capture::finish(
+            attempts,
+            attempt.as_ref(),
+            if done && break_error.is_none() && !interrupted {
+                crate::attempts::AttemptState::Ok
+            } else {
+                crate::attempts::AttemptState::Failed
+            },
+            round.usage,
+        );
         if let Some(err) = break_error {
             let shaped: anyhow::Error = observability::DispatchError::http_status(format!(
                 "inference endpoint 529: mid-stream error: {err}"
@@ -9166,6 +9195,7 @@ async fn anthropic_dispatch_round(
 /// `accumulated` carries usage from the preceding tool-call rounds. Mirrors
 /// [`final_summary_openai`]: cap-exit nudge appended, same preflight, and
 /// `stream:false` with NO tools advertised so the model cannot emit tool_use.
+#[allow(clippy::too_many_arguments)]
 async fn final_summary_anthropic(
     client: &reqwest::Client,
     messages_url: &str,
@@ -9174,6 +9204,7 @@ async fn final_summary_anthropic(
     mut messages: Vec<serde_json::Value>,
     generation_policy: generation_policy::GenerationPolicy,
     cap: &CapExit,
+    attempts: Option<attempt_capture::AttemptScope<'_>>,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
     cap.push_nudge(&mut messages);
     let (system, wire_messages) = anthropic_wire::anthropic_wire_messages(&messages)?;
@@ -9194,7 +9225,7 @@ async fn final_summary_anthropic(
     );
     cap.finish(
         messages_url,
-        None,
+        attempts,
         || async { Ok(anthropic_headers(client.post(messages_url), api_key).json(&body)) },
         "inference endpoint",
         estimate_value_tokens(&body, cap.estimation),
@@ -9247,7 +9278,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         // the output cap projects onto this wire today (see below).
         cognition,
         output_allowance,
-        attempt_ledger: _,
+        attempt_ledger,
         chat_completions_capability,
         reasoning_replay_scope,
         max_tool_rounds,
@@ -9431,6 +9462,16 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
     prompt_read::ensure_active_prompt_card(&mut messages, prompt_context, prompt_intake);
+    // #2313: one ledger attempt per primary request, keyed at the send.
+    let attempt_turn = turn_prompt_context
+        .map(|turn| turn.active_operator_prompt().id().to_string())
+        .unwrap_or_default();
+    let attempts = attempt_ledger.map(|ledger| attempt_capture::AttemptScope {
+        ledger,
+        turn: &attempt_turn,
+        model,
+        backend: url,
+    });
 
     // In-band memory nudge (Step 19.3) — mirrors the OpenAI path.
     if note_sink.is_some() {
@@ -9847,9 +9888,15 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 use_tools.then_some(tools_anthropic.as_slice()),
                 streaming_enabled,
             );
-            let dispatch =
-                anthropic_dispatch_round(&dispatcher, &body, &messages, streaming_enabled, cancel)
-                    .await;
+            let dispatch = anthropic_dispatch_round(
+                &dispatcher,
+                &body,
+                &messages,
+                streaming_enabled,
+                cancel,
+                attempts,
+            )
+            .await;
             match dispatch {
                 // Interrupted mid-dispatch: same contract as the round-
                 // boundary checkpoint (mirrors the Ollama raced probe).
@@ -11105,6 +11152,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         trimmed,
         generation_policy,
         &cap,
+        attempts,
     )
     .await;
     let (text, streamed, usage) = cap.recover_rejection(
@@ -13353,8 +13401,22 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     StreamOutcome::Printed(text, round.usage)
 }
 
+/// Take the next complete NDJSON line out of `pending`, decoded and without its
+/// line ending. The buffer holds bytes because a chunk boundary can fall inside
+/// a character; a line is decoded only once it is whole.
+fn next_ndjson_line(pending: &mut Vec<u8>) -> Option<String> {
+    let end = pending.iter().position(|&byte| byte == b'\n')?;
+    let line: Vec<u8> = pending.drain(..=end).collect();
+    Some(
+        String::from_utf8_lossy(&line)
+            .trim_end_matches(['\n', '\r'])
+            .to_string(),
+    )
+}
+
 /// Stream an Ollama NDJSON response, printing tokens as they arrive.
-/// Returns `(accumulated_text, token_usage)`.
+/// Returns `(accumulated_text, token_usage, complete)`, where `complete` means
+/// the stream reached `done: true` without an interrupt.
 /// Token usage is extracted from the final chunk (`done: true`).
 /// `show_thinking` opts into the cargo-style reasoning spinner (TTY only).
 /// `retain` is where a folded reasoning body is kept so its `/spill open <id>`
@@ -13369,7 +13431,7 @@ async fn stream_response(
     cancel: Option<&std::sync::atomic::AtomicBool>,
     markdown: bool,
     retain: Option<std::sync::Arc<dyn CompletedSpillRenderer>>,
-) -> anyhow::Result<(String, Option<crate::TokenUsage>)> {
+) -> anyhow::Result<(String, Option<crate::TokenUsage>, bool)> {
     // The ONE spinner (`newt_core::tty`). `legacy_caps` preserves today's
     // gating exactly; the shared 100ms OS-thread ticker replaces the old
     // advance-only-on-a-reasoning-chunk clock, so a model STALL now shows a
@@ -13408,18 +13470,33 @@ async fn stream_response(
     };
 
     let mut resp = resp;
+    let mut done = false;
+    let mut interrupted = false;
+    // The tail of an NDJSON line that arrived without its newline: a line
+    // straddles chunk boundaries, and the `done` line decides the attempt state.
+    // Bytes, not text: a chunk boundary can also fall inside a character.
+    let mut pending: Vec<u8> = Vec::new();
     // Race each chunk read against the interrupt flag so Esc stops the token
     // stream promptly; on interrupt, stop reading and return what we have.
-    while let Some(chunk) = match cancellable(cancel, resp.chunk()).await {
-        Some(c) => c?,
-        None => None,
-    } {
-        let text = String::from_utf8_lossy(&chunk);
-        for line in text.lines() {
+    'read: loop {
+        let chunk = match cancellable(cancel, resp.chunk()).await {
+            Some(c) => c?,
+            None => {
+                interrupted = true;
+                break;
+            }
+        };
+        let eof = chunk.is_none();
+        match chunk {
+            Some(chunk) => pending.extend_from_slice(&chunk),
+            // EOF terminates an unterminated final line.
+            None => pending.push(b'\n'),
+        }
+        while let Some(line) = next_ndjson_line(&mut pending) {
             if line.is_empty() {
                 continue;
             }
-            let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
             let raw = json["message"]["content"].as_str().unwrap_or("");
@@ -13477,6 +13554,7 @@ async fn stream_response(
                 full.push_str(token);
             }
             if json["done"].as_bool().unwrap_or(false) {
+                done = true;
                 // Extract token counts from the final Ollama chunk.
                 let input = json["prompt_eval_count"].as_u64().map(|n| n as u32);
                 let output = json["eval_count"].as_u64().map(|n| n as u32);
@@ -13484,8 +13562,12 @@ async fn stream_response(
                     input_tokens: i,
                     output_tokens: o,
                 });
-                break;
+                // Finished: never poll the socket (or the interrupt) again.
+                break 'read;
             }
+        }
+        if eof {
+            break;
         }
     }
     // #385: flush any clean tail the filter held back (a trailing run that turned out
@@ -13519,7 +13601,7 @@ async fn stream_response(
     if started && md.is_none() {
         println!();
     }
-    Ok((full, usage))
+    Ok((full, usage, done && !interrupted))
 }
 
 #[cfg(test)]
