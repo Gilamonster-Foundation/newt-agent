@@ -644,65 +644,59 @@ fn candidate_tests_that_pass_do_not_override_the_spec() {
     );
 }
 
-/// Regression (#2374 coverage job): 011's randomized property sweep draws its
-/// probes from OS entropy. With values spread over `[i32::MIN + 1, 500_000]`,
-/// almost every draw is negative, so a vector with a positive after a negative
-/// (the only shape that exposes the seed's "stop at the first negative" bug)
-/// is rare. Simulated over 2000 seeds with the spec's own generator, the sweep
-/// PASSED the unchanged seed 72 times (3.6%). The seed then graded 9 passed,
-/// 9 failed in one grading path and 8/10 in the other, and calibration reported
-/// the paths as disagreeing. The sweep must catch the seed on every run, or a
-/// grade depends on the draw.
-///
-/// Builds the spec against the seed once and re-runs only the sweep 200 times;
-/// at the old 3.6% miss rate that passes at least once with probability 99.9%.
-/// Applies the grader's spec environment to `cmd`, for a spec built in `tree`.
+/// One run of a spec binary (or cargo) under the grader's own runner, timeout
+/// and environment. Under `cargo llvm-cov` an inherited environment would
+/// build an instrumented spec and write a profraw file per run into the
+/// coverage job's data; a hang fails the run instead of stalling the job.
 #[cfg(unix)]
-fn with_spec_env(cmd: &mut std::process::Command, tree: &Path) {
-    for (key, value) in spec_env(&tree.join("target")) {
-        match value {
-            Some(v) => cmd.env(key, v),
-            None => cmd.env_remove(key),
-        };
-    }
+fn run_under_spec_env(tree: &Path, argv: &[&str], timeout_ms: u64) -> RunOutcome {
+    let mut env = spec_env(&tree.join("target"));
+    env.push(("RUST_BACKTRACE".into(), Some("1".into())));
+    SubprocessRunner.run(&RunSpec {
+        argv: argv.iter().map(|a| a.to_string()).collect(),
+        cwd: tree.to_path_buf(),
+        timeout_ms: Some(timeout_ms),
+        env,
+    })
 }
 
-/// Installs `case`'s spec in `tree`, builds it once under the grader's
-/// environment (under `cargo llvm-cov` an inherited one would build an
-/// instrumented spec and write a profraw file per run into the coverage
-/// job's data), and returns the spec's test binary.
+/// The wall-clock limit on one run of 011's spec binary. A full run, nested
+/// cargo builds included, takes seconds.
 #[cfg(unix)]
-fn build_spec_binary(case: &TestCase, tree: &Path) -> std::path::PathBuf {
+const SPEC_RUN_TIMEOUT_MS: u64 = 120_000;
+
+/// Installs `case`'s spec in `tree`, builds it once under the grader's
+/// environment, and returns the spec's test binary.
+#[cfg(unix)]
+fn build_spec_binary(case: &TestCase, tree: &Path) -> String {
     fs::create_dir_all(tree.join("tests")).unwrap();
     fs::copy(
         case.case_dir.join("grade_spec.rs"),
         tree.join("tests/grade_spec.rs"),
     )
     .unwrap();
-    let mut build = std::process::Command::new(env!("CARGO"));
-    build
-        .args([
+    let build = run_under_spec_env(
+        tree,
+        &[
+            env!("CARGO"),
             "test",
             "--color",
             "never",
             "--test",
             "grade_spec",
             "--no-run",
-        ])
-        .args(["--message-format", "json"])
-        .current_dir(tree);
-    with_spec_env(&mut build, tree);
-    let build = build.output().unwrap();
-    assert!(
-        build.status.success(),
-        "{}",
-        String::from_utf8_lossy(&build.stderr)
+            "--message-format",
+            "json",
+        ],
+        GRADE_SPEC_TIMEOUT_MS,
     );
-    String::from_utf8_lossy(&build.stdout)
+    assert_eq!(build.exit_code, Some(0), "{}", build.stderr);
+    build
+        .stdout
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .filter(|m| m.pointer("/target/name").and_then(|n| n.as_str()) == Some("grade_spec"))
-        .find_map(|m| m["executable"].as_str().map(std::path::PathBuf::from))
+        .find_map(|m| m["executable"].as_str().map(str::to_string))
         .expect("cargo reported the grade_spec test binary")
 }
 
@@ -730,22 +724,20 @@ fn the_011_randomized_sweep_catches_the_seed_on_every_run() {
 
     // Caught means the sweep itself failed on a wrong sum: exactly one test
     // failed, and the failure is the sweep's own assertion. A run that failed
-    // for any other reason does not count.
+    // for any other reason, or timed out, does not count.
+    let sweep = "randomized_property_sweep_against_reference_semantics";
     let caught = (0..200)
         .filter(|_| {
-            let mut run = std::process::Command::new(&binary);
-            run.args([
-                "randomized_property_sweep_against_reference_semantics",
-                "--exact",
-            ])
-            .current_dir(tree.path());
-            with_spec_env(&mut run, tree.path());
-            let out = run.output().unwrap();
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            !out.status.success()
-                && stdout.contains("0 passed; 1 failed")
-                && stdout.contains(": sum_until_zero(")
-                && stdout.contains(", expected ")
+            let out = run_under_spec_env(
+                tree.path(),
+                &[&binary, sweep, "--exact"],
+                SPEC_RUN_TIMEOUT_MS,
+            );
+            !out.timed_out
+                && out.exit_code.is_some_and(|c| c != 0)
+                && out.stdout.contains("0 passed; 1 failed")
+                && out.stdout.contains(": sum_until_zero(")
+                && out.stdout.contains(", expected ")
         })
         .count();
     assert_eq!(
@@ -761,9 +753,9 @@ fn the_011_randomized_sweep_catches_the_seed_on_every_run() {
 /// spawn `cargo`. A fork that lands while the copy's write handle is open
 /// makes the exec fail with `Text file busy (os error 26)`. Looping the honest
 /// tree's spec 200 times across 4 parallel loops failed 6 runs (revision 3) and
-/// 7 runs (revision 4), every one on that test. This runs 400 (8 x 50).
-/// An honest tree must pass every run, or every harness's grade on 011 is
-/// biased down.
+/// 7 runs (revision 4), every one on that test. This runs 400 (8 x 50), each
+/// under a timeout. An honest tree must pass every run, or every harness's
+/// grade on 011 is biased down.
 #[cfg(unix)]
 #[test]
 fn the_011_honest_tree_passes_every_run_under_parallel_load() {
@@ -777,12 +769,13 @@ fn the_011_honest_tree_passes_every_run_under_parallel_load() {
                 s.spawn(|| {
                     (0..50)
                         .filter_map(|_| {
-                            let mut run = std::process::Command::new(&binary);
-                            run.current_dir(tree.path()).env("RUST_BACKTRACE", "1");
-                            with_spec_env(&mut run, tree.path());
-                            let out = run.output().unwrap();
-                            (!out.status.success()).then(|| {
-                                String::from_utf8_lossy(&out.stdout)
+                            let out =
+                                run_under_spec_env(tree.path(), &[&binary], SPEC_RUN_TIMEOUT_MS);
+                            if out.timed_out {
+                                return Some("timed out".to_string());
+                            }
+                            (out.exit_code != Some(0)).then(|| {
+                                out.stdout
                                     .lines()
                                     .filter(|l| {
                                         l.starts_with("---- ") && l.ends_with(" stdout ----")
@@ -801,5 +794,42 @@ fn the_011_honest_tree_passes_every_run_under_parallel_load() {
         failures.is_empty(),
         "the honest tree failed {} of 400 runs: {failures:?}",
         failures.len()
+    );
+}
+
+/// A correct `sum_until_zero` that also spawns a process from inside the
+/// function would fork in the spec's own process and could reopen the `Text
+/// file busy` race that `spawn_guard` closes. Revision 5 bans `Command` and
+/// `process::` from the real implementation, so such a tree FAILs on that
+/// structural check, named in the grade detail.
+#[cfg(unix)]
+#[test]
+fn the_011_spec_fails_a_candidate_that_spawns_a_process() {
+    let case = bundled("011-state-machine-drain");
+    let tree = seed_with(&case, &case.mock_response.content);
+    let lib = tree.path().join("src/lib.rs");
+    let honest = fs::read_to_string(&lib).unwrap();
+    let header = "pub fn sum_until_zero(xs: &[i32]) -> i32 {\n";
+    assert!(honest.contains(header), "fixture drift: {honest}");
+    let spawning = honest.replacen(
+        header,
+        &format!(
+            "{header}    static SPAWNED: std::sync::Once = std::sync::Once::new();\n    \
+             SPAWNED.call_once(|| {{\n        let _ = std::process::Command::new(\"true\").status();\n    \
+             }});\n"
+        ),
+        1,
+    );
+    fs::write(&lib, spawning).unwrap();
+    let pre = pre_run(&case, tree.path()).unwrap();
+
+    let grade = grade_behavioral(&case, tree.path(), &pre);
+
+    assert_eq!(grade.verdict, BehavioralVerdict::Fail, "{grade:?}");
+    assert!(
+        grade
+            .detail
+            .contains("no_process_environment_or_build_profile_fingerprinting_outside_test_body"),
+        "{grade:?}"
     );
 }
