@@ -2043,6 +2043,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         turn: &attempt_turn,
         model,
         backend: url,
+        cancel,
     });
 
     // In-band memory nudge (Step 19.3): after `[memory] note_nudge_interval`
@@ -2628,13 +2629,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             let json = smart_harness::response(resp, smart_harness, "Ollama")
                                 .await
                                 .inspect_err(|error| {
-                                    attempt_capture::failed(attempts, attempt.as_ref(), error);
+                                    attempt_capture::failed(attempt.as_ref(), error);
                                 })?;
-                            attempt_capture::complete(
-                                attempts,
-                                attempt.as_ref(),
-                                ollama_usage(&json),
-                            );
+                            attempt_capture::complete(attempt.as_ref(), ollama_usage(&json));
                             Ok(json)
                         },
                         |attempt, delay, error| {
@@ -6084,7 +6081,7 @@ impl CapExit {
         };
         if let Ok((json, attempt)) = result {
             let (content, usage) = extract(json);
-            attempt_capture::complete(attempts, attempt.as_ref(), usage);
+            attempt_capture::complete(attempt.as_ref(), usage);
             let total = merge_round_usage(self.accumulated, usage);
             if !content.is_empty() {
                 return Ok((
@@ -6580,6 +6577,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         turn: &attempt_turn,
         model,
         backend: url,
+        cancel,
     });
 
     // In-band memory nudge (Step 19.3) — mirrors the Ollama path.
@@ -7134,13 +7132,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         )
                         .await
                         .inspect_err(|error| {
-                            attempt_capture::failed(attempts, attempt.as_ref(), error);
+                            attempt_capture::failed(attempt.as_ref(), error);
                         })?;
-                        attempt_capture::complete(
-                            attempts,
-                            attempt.as_ref(),
-                            openai_usage(&json["usage"]),
-                        );
+                        attempt_capture::complete(attempt.as_ref(), openai_usage(&json["usage"]));
                         Ok(json)
                     }
                 },
@@ -8610,7 +8604,7 @@ async fn anthropic_dispatch_round(
             None => Ok(None),
             Some(Ok((json, attempt))) => {
                 let round = anthropic_wire::parse_messages_reply(&json);
-                attempt_capture::complete(attempts, attempt.as_ref(), round.usage);
+                attempt_capture::complete(attempt.as_ref(), round.usage);
                 Ok(Some((round, false)))
             }
             Some(Err(e)) => Err(e),
@@ -8764,13 +8758,14 @@ async fn anthropic_dispatch_round(
         // partial text with a notice; before any visible output it converts
         // to the retryable error shape and this round is re-issued.
         let break_error = round.error.clone().or(transport_break);
-        // #2313: ok only for a stream that reached `message_stop` with no error
-        // and no interrupt; a cut stream, an error event, or an interrupt is
-        // failed. Reported usage attaches either way.
+        // #2313: an interrupt is cancelled; otherwise ok only for a stream that
+        // reached `message_stop` with no error, and a cut stream or an error
+        // event is failed. Reported usage attaches either way.
         attempt_capture::finish(
-            attempts,
             attempt.as_ref(),
-            if done && break_error.is_none() && !interrupted {
+            if interrupted {
+                crate::attempts::AttemptState::Cancelled
+            } else if done && break_error.is_none() {
                 crate::attempts::AttemptState::Ok
             } else {
                 crate::attempts::AttemptState::Failed
@@ -9089,6 +9084,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
         turn: &attempt_turn,
         model,
         backend: url,
+        cancel,
     });
 
     // In-band memory nudge (Step 19.3) — mirrors the OpenAI path.
@@ -10945,7 +10941,7 @@ pub async fn openai_responses_complete_with_prompt(
 /// constructor other than a successful [`validate_responses_request`] — so an
 /// unvalidated `serde_json::Value` body cannot compile its way to `POST /v1/responses`.
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_responses_json(
+async fn dispatch_responses_json<'a>(
     client: &reqwest::Client,
     url: &str,
     api_key: Option<&str>,
@@ -10953,8 +10949,8 @@ async fn dispatch_responses_json(
     retry: &RetryPolicy,
     color: bool,
     smart_harness: Option<&smart_harness::SmartHarness>,
-    attempts: Option<attempt_capture::AttemptScope<'_>>,
-) -> anyhow::Result<(serde_json::Value, Option<crate::attempts::AttemptKey>)> {
+    attempts: Option<attempt_capture::AttemptScope<'a>>,
+) -> anyhow::Result<(serde_json::Value, Option<attempt_capture::Attempt<'a>>)> {
     let body = validated.body();
     let body_bytes = smart_harness
         .map(|h| h.request(body, "responses"))
@@ -10989,15 +10985,15 @@ async fn dispatch_responses_json(
 /// Send with retries and decode. With an attempt scope, every try is one
 /// recorded attempt; the caller completes the returned attempt with the usage
 /// it extracts, because only it knows the wire's usage shape.
-async fn dispatch_with_decoder<Fut>(
+async fn dispatch_with_decoder<'a, Fut>(
     retry: &RetryPolicy,
-    attempts: Option<attempt_capture::AttemptScope<'_>>,
+    attempts: Option<attempt_capture::AttemptScope<'a>>,
     request: impl Fn() -> Fut,
     http_error_prefix: &str,
     on_retry: impl FnMut(u32, std::time::Duration, &anyhow::Error),
     smart_harness: Option<&smart_harness::SmartHarness>,
     decode: fn(&[u8]) -> anyhow::Result<serde_json::Value>,
-) -> anyhow::Result<(serde_json::Value, Option<crate::attempts::AttemptKey>)>
+) -> anyhow::Result<(serde_json::Value, Option<attempt_capture::Attempt<'a>>)>
 where
     Fut: std::future::Future<Output = anyhow::Result<reqwest::RequestBuilder>>,
 {
@@ -11015,7 +11011,7 @@ where
                 decode,
             )
             .await
-            .inspect_err(|error| attempt_capture::failed(attempts, attempt.as_ref(), error))?;
+            .inspect_err(|error| attempt_capture::failed(attempt.as_ref(), error))?;
             Ok((json, attempt))
         },
         on_retry,
@@ -11033,8 +11029,7 @@ where
 /// separate from the attempt state. The usage the body reported attaches either
 /// way.
 fn complete_responses_attempt(
-    attempts: Option<attempt_capture::AttemptScope<'_>>,
-    attempt: Option<&crate::attempts::AttemptKey>,
+    attempt: Option<&attempt_capture::Attempt<'_>>,
     json: &serde_json::Value,
     decoded: &Result<
         crate::responses_wire::DecodedResponse,
@@ -11055,7 +11050,6 @@ fn complete_responses_attempt(
         }
     };
     attempt_capture::finish(
-        attempts,
         attempt,
         state,
         crate::responses_wire::decode_usage(&json["usage"]),
@@ -11234,6 +11228,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         turn: &attempt_turn,
         model,
         backend: url,
+        cancel,
     });
     let exec_grounding_turn = action_nudges && prompt_disposition == PromptDisposition::Act;
     let (instructions, mut input) = crate::responses_wire::build_responses_input(&msgs_json);
@@ -11722,7 +11717,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // failed / incomplete / non-terminal status, malformed/empty body) is
         // surfaced — never mistaken for a benign empty reply.
         let decoded = crate::responses_wire::decode_response(&json);
-        complete_responses_attempt(attempts, attempt.as_ref(), &json, &decoded);
+        complete_responses_attempt(attempt.as_ref(), &json, &decoded);
         let decoded = match decoded {
             Ok(d) => d,
             Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage })
@@ -12417,7 +12412,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // handoff is still a successful paused turn so the interactive caller can
     // persist it and retain the continuation link.
     let decoded = crate::responses_wire::decode_response(&json);
-    complete_responses_attempt(attempts, attempt.as_ref(), &json, &decoded);
+    complete_responses_attempt(attempt.as_ref(), &json, &decoded);
     let decoded = match decoded {
         Ok(d) => d,
         Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage }) => {

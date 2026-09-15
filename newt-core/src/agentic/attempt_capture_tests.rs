@@ -8,6 +8,7 @@ fn scope(ledger: &Mutex<AttemptLedger>) -> AttemptScope<'_> {
         turn: "prompt:turn",
         model: "test-model",
         backend: "test-backend",
+        cancel: None,
     }
 }
 
@@ -70,11 +71,7 @@ async fn each_retry_of_a_failing_request_is_one_attempt() {
             .await?;
             let json =
                 super::super::smart_harness::response(response, None, "inference endpoint").await?;
-            complete(
-                Some(scope(&ledger)),
-                key.as_ref(),
-                super::super::trim::ollama_usage(&json),
-            );
+            complete(key.as_ref(), super::super::trim::ollama_usage(&json));
             Ok(json)
         },
         |_, _, _| {},
@@ -101,4 +98,67 @@ async fn each_retry_of_a_failing_request_is_one_attempt() {
             output_tokens: 2
         })
     );
+}
+
+/// #2313 (c): the attempt handle's drop. Unsettled under an interrupt it is
+/// cancelled with no usage; unsettled with the flag clear its send-time
+/// `failed` stands; settled first, a later interrupt changes nothing.
+#[tokio::test]
+async fn a_dropped_attempt_is_cancelled_only_when_unsettled_under_an_interrupt() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let url = format!("{}/api/chat", server.uri());
+    let used = Some(TokenUsage {
+        input_tokens: 9,
+        output_tokens: 1,
+    });
+    for (name, settle, interrupt, expected) in [
+        (
+            "unsettled, interrupted",
+            false,
+            true,
+            (AttemptState::Cancelled, None),
+        ),
+        (
+            "unsettled, not interrupted",
+            false,
+            false,
+            (AttemptState::Failed, None),
+        ),
+        (
+            "settled, then interrupted",
+            true,
+            true,
+            (AttemptState::Ok, used),
+        ),
+    ] {
+        let ledger = Mutex::new(AttemptLedger::default());
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let scope = AttemptScope {
+            cancel: Some(&flag),
+            ..scope(&ledger)
+        };
+        let body = serde_json::json!({"case": name});
+        let (_response, attempt) = send(
+            Some(scope),
+            "primary",
+            reqwest::Client::new().post(&url).json(&body),
+            "request failed",
+        )
+        .await
+        .expect("sent");
+        if settle {
+            complete(attempt.as_ref(), used);
+        }
+        flag.store(interrupt, std::sync::atomic::Ordering::Relaxed);
+        drop(attempt);
+        let ledger = ledger.lock().unwrap();
+        let records: Vec<_> = ledger.records().collect();
+        assert_eq!(records.len(), 1, "{name}");
+        assert_eq!((records[0].state, records[0].usage), expected, "{name}");
+    }
 }

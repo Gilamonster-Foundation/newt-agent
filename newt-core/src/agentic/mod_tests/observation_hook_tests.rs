@@ -1279,3 +1279,35 @@ async fn none_usage_round_emits_no_accepted() {
         "no usage → no invented measurement, hence no Accepted: {observations:?}"
     );
 }
+
+/// #2313 (c): Esc while the Ollama probe waits for its response drops the
+/// dispatch future, so nothing can settle the attempt; the handle's drop records
+/// it cancelled, with no usage.
+#[tokio::test]
+async fn an_interrupted_ollama_probe_is_a_cancelled_attempt() {
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (url, server) =
+        super::http_loop_tests::serve_until_interrupted("/api/chat", flag.clone()).await;
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("answer me"),
+    ];
+    let caveats = Caveats::top();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&url, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    c.cancel = Some(flag.as_ref());
+    let _ = tokio::time::timeout(
+        super::http_loop_tests::RAW_STREAM_TEST_BOUND,
+        chat_complete(c, &mut NoMcp),
+    )
+    .await
+    .expect("the interrupt ends the turn");
+    server.abort();
+    let records: Vec<_> = ledger.lock().unwrap().records().cloned().collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        (records[0].state, records[0].usage),
+        (crate::attempts::AttemptState::Cancelled, None)
+    );
+}
