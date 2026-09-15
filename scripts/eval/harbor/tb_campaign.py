@@ -131,20 +131,24 @@ def _addresses(host):
         pass
     try:
         return {host} | {info[4][0] for info in socket.getaddrinfo(host, None)}
-    except OSError:
+    except (OSError, UnicodeError):  # an empty or overlong label cannot be encoded
         return {host}
 
 
 def local_literals(base_url=None):
-    """(tokens, account, home): the endpoint host tb-campaign.sh exports in
-    TB_LOCAL_BASE_URL with its addresses, this machine's hostname, the account."""
+    """(tokens, words, home): the endpoint host tb-campaign.sh exports in
+    TB_LOCAL_BASE_URL with its addresses (plain substrings, so escaped and
+    %-encoded forms are caught), this machine's hostname and the account (whole
+    words only), and the home dir. Names too short to be distinctive are left out."""
     host = urlparse(base_url or os.environ.get("TB_LOCAL_BASE_URL", "")).hostname
-    tokens = (_addresses(host) if host else set()) | {socket.gethostname()}
-    return {t for t in tokens if t}, getpass.getuser(), str(Path.home())
+    tokens = {t for t in (_addresses(host) if host else set()) if len(t) >= 3}
+    hostname, account, home = socket.gethostname(), getpass.getuser(), str(Path.home())
+    words = {w for w in (hostname,) if len(w) >= 3} | ({account} if len(account) >= ACCOUNT_MIN else set())
+    return tokens, words, (home if len(home) >= ACCOUNT_MIN and home not in ("/", "~") else None)
 
 
 def scrub(value, literals=None):
-    """First line, with no address, account or home dir, then bounded."""
+    """First line, with no address, local name or home dir, then bounded."""
     literals = literals or local_literals()
     if isinstance(value, dict):
         return {k: scrub(v, literals) for k, v in value.items()}
@@ -152,12 +156,13 @@ def scrub(value, literals=None):
         return [scrub(v, literals) for v in value]
     if not isinstance(value, str):
         return value
-    tokens, account, home = literals
-    text = (value.strip().splitlines() or [""])[0].replace(home, "<redacted>")
-    for token in sorted(tokens, key=len, reverse=True):  # plain substrings: inside %-encoded or escaped URLs too
-        text = text.replace(token, "<redacted>") if len(token) >= 3 else text
-    if len(account) >= ACCOUNT_MIN:
-        text = re.sub(rf"(?<![\w-]){re.escape(account)}(?![\w-])", "<redacted>", text)
+    tokens, words, home = literals
+    text = (value.strip().splitlines() or [""])[0]
+    text = text.replace(home, "<redacted>") if home else text
+    for token in sorted(tokens, key=len, reverse=True):
+        text = text.replace(token, "<redacted>")
+    for word in sorted(words, key=len, reverse=True):
+        text = re.sub(rf"(?<![\w-]){re.escape(word)}(?![\w-])", "<redacted>", text)
     return ADDRESS.sub("<redacted>", text)[:FREE_TEXT_MAX]
 
 
@@ -235,6 +240,19 @@ def newt_status(lines):
     return status
 
 
+NOT_DONE_END = ("RepairExhausted", "VerificationIncomplete")
+
+
+def newt_end_reason(lines):
+    """newt's `solve_result.end_reason`, recorded as Rust Debug text: Some(X) is X."""
+    end = None
+    for o in _records(lines):
+        if o.get("kind") == "solve_result":
+            end = o.get("end_reason")
+    found = re.fullmatch(r"Some\((\w+)\)", end or "")
+    return found.group(1) if found else None
+
+
 def newt_claim(lines):
     """The contract's `outcome` says a terminal state was reached, not that the
     work is done: a run newt marks `status: incomplete` (#2315's RepairExhausted,
@@ -247,7 +265,7 @@ def newt_claim(lines):
     if outcome is None:
         return None
     status = newt_status(lines)
-    claimed = outcome == "completed" and status in ("completed", None)
+    claimed = outcome == "completed" and status in ("completed", None) and newt_end_reason(lines) not in NOT_DONE_END
     return claimed, f"contract outcome={outcome}, solve_result status={status}"
 
 
@@ -347,12 +365,15 @@ TREATMENT_ENV = {
     "NEWT_BENCH_TENACITY", "NEWT_BENCH_CONTEXT_WINDOW", "NEWT_BENCH_OCAP",
     "NEWT_BENCH_VERIFY_OUTCOMES",
 }
-NONE = {"name": "none", "sha256": None, "profile": "", "env": {}, "expect": {}, "requires": []}
+# none is newt's shipped defaults, whose self-verify gate is on (#1961): a newt
+# baseline receipt that says otherwise did not run the baseline.
+NONE = {"name": "none", "sha256": None, "profile": "", "env": {}, "expect": {"receipt.verification.mode": "attempted"},
+        "requires": []}
 
 
 def load_treatment(path):
     if str(path) in ("", "none"):
-        return dict(NONE)
+        return {**NONE, "expect": dict(NONE["expect"])}
     raw = Path(path).read_bytes()
     t = tomllib.loads(raw.decode())
     if set(t) - TREATMENT_KEYS or not t.get("description"):
@@ -535,6 +556,7 @@ def trial_row(harness, trial: Path, expect=None):
         "treatment_observed": observed(expect, contract),
         "harness_status": newt_status(lines) if harness == "newt" else None,
         "harness_outcome": (contract or {}).get("outcome"),
+        "harness_end_reason": newt_end_reason(lines) if harness == "newt" else None,
         "result": bool(r),
         "exception": exc,
         "reward": reward,
@@ -759,6 +781,7 @@ def summarize(cell, rows):
         ),
         "model_mismatches": sum(r["model_effective"] not in (None, cell["model"]) for r in rows),
         "not_observed": sum(r.get("treatment_observed") is False for r in rows),
+        "verification_ended": tuple(sum(r.get("harness_end_reason") == e for r in rows) for e in NOT_DONE_END),
         "terminal_not_done": sum(r.get("harness_outcome") == "completed"
                                  and r.get("harness_status") not in (None, "completed") for r in rows),
         "tokens_in": (sum(known_in), len(known_in)),
@@ -875,8 +898,8 @@ def table(out: Path, paired_report=False):
     trials = out / "trials.jsonl"
     rows = list(_records(trials.read_text().splitlines())) if trials.exists() else []
     lines = [
-        "| model | harness | expected / observed / graded / error | interrupted (archived, re-run) | resolved / n, rate [95% Wilson]: trials with any exception excluded | resolved / n, rate [95% Wilson]: agent-caused exceptions counted as failures (infra, unknown excluded) | claimed done | terminal but newt says not done | false completions | false incompletes | unrecoverable claims | exceptions: infra / agent / unknown | inference errors (ungraded) | agent timeouts | largest single-request output | ran another model | treatment declared but not observed | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| model | harness | expected / observed / graded / error | interrupted (archived, re-run) | resolved / n, rate [95% Wilson]: trials with any exception excluded | resolved / n, rate [95% Wilson]: agent-caused exceptions counted as failures (infra, unknown excluded) | claimed done | terminal but newt says not done | newt verification ended: repair exhausted / incomplete | false completions | false incompletes | unrecoverable claims | exceptions: infra / agent / unknown | inference errors (ungraded) | agent timeouts | largest single-request output | ran another model | treatment declared but not observed | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     # The last record per job wins: a cell skipped once and run later shows the run.
     cells = {c["job"]: c for c in _records((out / "cells.jsonl").read_text().splitlines())}
@@ -898,11 +921,11 @@ def table(out: Path, paired_report=False):
         fc = f"{s['false_completions']}/{s['claimed']}" if s["claimed"] else "0/0"
         big = f"{s['max_request_output']:,}" if s["max_request_output"] is not None else "not logged"
         treat = cell.get("treatment") or "none"
-        seen = "n/a" if treat == "none" or not cell.get("treatment_expect") else s["not_observed"]
+        seen = "n/a" if cell["harness"] != "newt" or not cell.get("treatment_expect") else s["not_observed"]
         tin, tout = (f"{t[0]:,} ({t[1]})" if t[1] else "— (0)" for t in (s["tokens_in"], s["tokens_out"]))
         lines.append(
             f"| {cell['model']} | {cell['harness']} {cell.get('harness_version') or ''} [{treat}] "
-            f"| {s['expected']} / {s['observed']} / {g} / {s['errors']} | {cell.get('interrupted') or 0} | {rate(s['rate_excl'])} | {rate(s['rate_agent_fail'])} | {s['claimed']} | {s['terminal_not_done']} | {fc} "
+            f"| {s['expected']} / {s['observed']} / {g} / {s['errors']} | {cell.get('interrupted') or 0} | {rate(s['rate_excl'])} | {rate(s['rate_agent_fail'])} | {s['claimed']} | {s['terminal_not_done']} | {'/'.join(map(str, s['verification_ended']))} | {fc} "
             f"| {s['false_incompletes']} | {s['unrecoverable_claims']} | {s['exceptions']}: {'/'.join(map(str, s['causes']))} | {s['inference_errors']} | {s['agent_timeouts']} | {big} | {s['model_mismatches']} | {seen} | {tin} "
             f"| {tout} | {med} / {s['agent_s_total']:.0f} | {tps} |"
         )

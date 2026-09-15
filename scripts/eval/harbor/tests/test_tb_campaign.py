@@ -21,7 +21,7 @@ from pi_log import pi_inference_failure, pi_session_claim
 from tb_campaign import (
     PINNED, TREATMENT_ENV, awaiting, build_cell, ceiling_reached, codex_claim, deadline_cancels, error_cause, fingerprint,
     harness_evidence, ingest, is_trial_config, job_state, ledger_entry, ledger_total_s, load_treatment, newcombe,
-    newt_claim, observed, pair, pair_report, parse_schedule, pi_claim, pin_extend, pin_mismatch, refusal,
+    newt_claim, newt_end_reason, observed, pair, pair_report, parse_schedule, pi_claim, pin_extend, pin_mismatch, refusal,
     redact, render_profile, scrub, summarize, table, treatment_env, trial_plan, wilson, window_at,
 )
 
@@ -53,6 +53,17 @@ class Claims(unittest.TestCase):
         incomplete = jl({"kind": "solve_result", "status": "incomplete"}, {"outcome": "completed"})
         self.assertEqual(newt_claim(incomplete)[0], False)
         done = jl({"kind": "solve_result", "status": "completed"}, {"outcome": "completed"})
+        self.assertEqual(newt_claim(done)[0], True)
+
+    def test_a_verification_end_reason_is_never_a_claim_with_or_without_a_status(self):
+        # #2374: RepairExhausted / VerificationIncomplete map to outcome completed.
+        for reason in ("RepairExhausted", "VerificationIncomplete"):
+            for status in ({"status": "incomplete"}, {}):
+                lines = jl({"kind": "solve_result", "end_reason": f"Some({reason})", **status}, {"outcome": "completed"})
+                self.assertEqual(newt_claim(lines)[0], False, (reason, status))
+                self.assertEqual(newt_end_reason(lines), reason)
+        self.assertIsNone(newt_end_reason(jl({"kind": "solve_result", "end_reason": "None"})))
+        done = jl({"kind": "solve_result", "end_reason": "Some(Completed)"}, {"outcome": "completed"})
         self.assertEqual(newt_claim(done)[0], True)
 
     def test_pi_claims_only_on_a_final_stop(self):
@@ -126,6 +137,9 @@ class Summary(unittest.TestCase):
         self.assertEqual(summarize({"expected": 1, "model": "m"}, [row(harness_outcome="completed", harness_status="incomplete",
                                                                        claimed_done=False)])["terminal_not_done"], 1)
         self.assertEqual((s["rate_excl"], s["rate_agent_fail"], s["causes"]), ((2, 5), (2, 6), (2, 1, 0)))
+        ended = [row(harness_end_reason="RepairExhausted"), row(harness_end_reason="VerificationIncomplete"),
+                 row(harness_end_reason="RepairExhausted"), row(harness_end_reason="Completed")]
+        self.assertEqual(summarize({"expected": 4, "model": "m"}, ended)["verification_ended"], (2, 1))
         self.assertEqual(s["tokens_in"], (0, 0))  # none known: count 0, not a zero cost
 
     def test_two_resolve_rates(self):
@@ -146,7 +160,8 @@ class Summary(unittest.TestCase):
 class Treatments(unittest.TestCase):
     def test_none_is_the_baseline(self):
         t = load_treatment("none")
-        self.assertEqual((t["name"], t["sha256"], t["env"], t["expect"]), ("none", None, {}, {}))
+        self.assertEqual((t["name"], t["sha256"], t["env"], t["expect"]),
+                         ("none", None, {}, {"receipt.verification.mode": "attempted"}))
         self.assertEqual(render_profile(t, "m", BASE), BASE.replace('model = "old"', 'model = "m"'))
 
     def test_committed_treatments_render_to_valid_profiles_without_placeholders(self):
@@ -182,13 +197,49 @@ class Treatments(unittest.TestCase):
         self.assertIs(observed(t["expect"], treated), True)
         self.assertIs(observed(t["expect"], {"receipt": {"verification": {"mode": "off"}}}), False)
 
+    def test_self_verify_off_is_an_ablation_confirmed_from_the_receipt(self):
+        t = load_treatment(HARBOR / "treatments/self-verify-off.toml")
+        self.assertEqual(treatment_env(t), {"NEWT_BENCH_SELF_VERIFY": "0"})
+        self.assertIs(observed(t["expect"], {"receipt": {"verification": {"mode": "off"}}}), True)
+        self.assertIs(observed(t["expect"], {"receipt": {"verification": {"mode": "attempted"}}}), False)
+
+    def test_the_baseline_expects_newts_shipped_attempted_gate(self):
+        # none is newt's shipped defaults: the self-verify gate is on (#1961), so a
+        # baseline cell whose receipt says otherwise did not run the baseline.
+        none = load_treatment("none")
+        self.assertIs(observed(none["expect"], {"receipt": {"verification": {"mode": "attempted"}}}), True)
+        self.assertIs(observed(none["expect"], {"receipt": {"verification": {"mode": "off"}}}), False)
+        self.assertIsNone(observed(none["expect"], None))  # pi and codex have no contract to read
+
+    def test_the_table_shows_the_baseline_receipt_check_and_verification_ends_for_newt_only(self):
+        cells = [{"campaign": "c", "model": "m", "harness": h, "job": f"m__{h}", "expected": 2, "treatment": "none",
+                  "treatment_expect": {"receipt.verification.mode": "attempted"}} for h in ("newt", "pi")]
+        rows = [{**row(treatment_observed=o, harness_end_reason=e, trial=f"t{i}__x"), "campaign": "c", "model": "m",
+                 "harness": h, "job": f"m__{h}"}
+                for h, pairs in (("newt", ((False, "RepairExhausted"), (True, "Completed"))), ("pi", ((None, None),) * 2))
+                for i, (o, e) in enumerate(pairs)]
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "cells.jsonl").write_text("".join(json.dumps(c) + "\n" for c in cells))
+            (Path(tmp) / "trials.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                table(Path(tmp))
+        header, _, *body = printed.getvalue().splitlines()
+        names = [c.strip() for c in header.split("|")]
+        col = {n: i for i, n in enumerate(names)}
+        by_harness = {r.split("|")[2].split()[0]: [c.strip() for c in r.split("|")] for r in body}
+        seen, ended = col["treatment declared but not observed"], col["newt verification ended: repair exhausted / incomplete"]
+        self.assertEqual((by_harness["newt"][seen], by_harness["newt"][ended]), ("1", "1/0"))
+        self.assertEqual(by_harness["pi"][seen], "n/a")
+
     def test_the_campaign_unsets_every_arm_changing_knob_it_does_not_set(self):
         # An operator's exported treatment knob must not silently change every
         # baseline cell: each TREATMENT_ENV key the runner does not export
         # itself is unset. Derived from TREATMENT_ENV, so a new knob fails here
         # until the script handles it.
         lines = (HARBOR / "tb-campaign.sh").read_text().splitlines()
-        words = lambda prefix: {w.split("=")[0] for l in lines if l.startswith(prefix) for w in l.split()[1:]}
+        def words(prefix):
+            return {w.split("=")[0] for line in lines if line.startswith(prefix) for w in line.split()[1:]}
         exported, unset = words("export "), words("unset ")
         missing = sorted(TREATMENT_ENV - exported - unset)
         self.assertEqual(missing, [], "treatment knobs the campaign neither sets nor unsets")
@@ -460,7 +511,7 @@ class Redaction(unittest.TestCase):
     pins install on them. build-cython-ext sorts first, so the cell takes its version."""
 
     FIXTURES = HARBOR / "tests/fixtures"
-    LITERALS = ({"gpu-box.invalid", "fd00::1"}, "fixture-user", "/home/fixture-user")
+    LITERALS = ({"gpu-box.invalid", "fd00::1"}, {"fixture-user"}, "/home/fixture-user")
     FORBIDDEN = ("203.0.113", "198.51.100", "gpu-box", "fd00::1", "fixture-user", "/home/", "req_fixture")
     CELL = {"campaign": "c", "model": "coder-1.2.3.4", "harness": "newt", "job": "coder-1.2.3.4__newt", "expected": 2}
 
@@ -511,17 +562,36 @@ class Redaction(unittest.TestCase):
         self.assertEqual(out, {**{k: "at <redacted>:8000" for k in free}, **{k: "coder-1.2.3.4" for k in identity}})
 
     def test_redaction_happens_before_the_cap(self):
-        for address, literals in (("gpu-box.invalid", self.LITERALS), ("198.51.100.4", (set(), "nobody", "/nonexistent"))):
+        for address, literals in (("gpu-box.invalid", self.LITERALS), ("198.51.100.4", (set(), set(), None))):
             # the address starts 10 chars before the cap: cutting first would leave "gpu-box.in" / "198.51.100"
             text = scrub("x" * (tb_campaign.FREE_TEXT_MAX - 11) + " " + address + " tail", literals)
             self.assertLessEqual(len(text), tb_campaign.FREE_TEXT_MAX)
             self.assert_clean(text)
 
     def test_generic_shapes_do_not_eat_evidence(self):
-        kept = "status:429 exit code:137 src/main.rs:42:5 error[E0308] PID:4242 /dev/null newt solve"
-        self.assertEqual(scrub(kept, (set(), "newt", "/home/newt")), kept)
-        self.assertEqual(scrub("at localhost:8080 and [fd00::2]:80", (set(), "nobody", "/nonexistent")),
-                         "at <redacted> and <redacted>")
+        kept = "status:429 exit code:137 error[E0308] PID:4242 /dev/null newt solve"
+        self.assertEqual(scrub(kept, (set(), set(), None)), kept)
+        self.assertEqual(scrub("at src/main.rs:42", (set(), set(), None)), "at src/main.rs:42")  # the lookbehind
+        self.assertEqual(scrub("at main.rs:42:5", (set(), set(), None)), "at main.rs:42:5")  # the port lookahead
+        self.assertEqual(scrub("at localhost:8080 and [fd00::2]:80", (set(), set(), None)), "at <redacted> and <redacted>")
+
+    def test_short_or_root_local_names_are_not_literals_and_the_hostname_is_a_whole_word(self):
+        with mock.patch.dict("os.environ", {"TB_LOCAL_BASE_URL": "http://203.0.113.7:8080/v1"}), \
+                mock.patch.object(tb_campaign.getpass, "getuser", return_value="newt"), \
+                mock.patch.object(tb_campaign.socket, "gethostname", return_value="gpubox1"), \
+                mock.patch.object(tb_campaign.Path, "home", return_value=Path("/")):
+            literals = tb_campaign.local_literals()
+        self.assertEqual(literals, ({"203.0.113.7"}, {"gpubox1"}, None))
+        self.assertEqual(scrub("newt solve on gpubox1, not gpubox10 or my-gpubox1, cwd /", literals),
+                         "newt solve on <redacted>, not gpubox10 or my-gpubox1, cwd /")
+
+    def test_an_unencodable_endpoint_host_is_kept_as_a_literal(self):
+        tb_campaign._addresses.cache_clear()
+        try:
+            with mock.patch.object(tb_campaign.socket, "getaddrinfo", side_effect=UnicodeError("label too long")):
+                self.assertEqual(tb_campaign._addresses("x" * 64 + ".invalid"), {"x" * 64 + ".invalid"})
+        finally:
+            tb_campaign._addresses.cache_clear()
 
     def test_the_cell_line_command_writes_a_skipped_cell_through_the_same_redaction(self):
         with tempfile.TemporaryDirectory() as tmp:
