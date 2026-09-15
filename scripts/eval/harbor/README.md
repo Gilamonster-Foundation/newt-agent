@@ -114,6 +114,15 @@ Before each trial the runner checks four things, in order:
   window. A second deadline cancel of the same attempt is final: the attempt is
   recorded as `DeadlineExhausted`, cause agent, and never re-run.
 
+**GPU-hour ledger.** Every trial run, cancelled ones included, appends one line
+to `<campaign>/ledger.jsonl`. Each line is `{cid, record}` and is addressed
+through `bench_scoreboard.trial_cid`, the same encoder as the trial store. A
+record holds the cell, task, attempt, window, state, agent seconds, the runner's
+wall seconds around Harbor, and the cumulative wall hours.
+
+With `TB_GPU_HOURS_CEILING` set, no trial starts once that total is reached. A
+line whose record no longer matches its cid refuses the run.
+
 [`systemd/`](systemd) holds a `systemd --user` service and timer template. The
 timer only wakes the runner every 15 minutes; the schedule decides whether
 trials run.

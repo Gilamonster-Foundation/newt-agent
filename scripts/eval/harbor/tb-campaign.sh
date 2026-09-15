@@ -33,6 +33,9 @@
 # 120). A cancelled attempt is archived as interrupted and re-run next window;
 # a second cancel of the same attempt is final (DeadlineExhausted, cause agent).
 # $OUT/campaign.stop (any content) stops the runner at the next trial boundary.
+# GPU-hours: every trial run appends one content-addressed line to
+# $OUT/ledger.jsonl (runner wall clock around Harbor); with TB_GPU_HOURS_CEILING
+# set, no trial starts once the total reaches it, and a tampered line refuses.
 # Optional: TB_TRIALS (3), TB_HARNESSES ("newt pi codex"), TB_MATRIX, TB_TIMEOUT_MULT (3),
 #   TB_JOBS_ROOT (/var/tmp/tbench-harbor), TB_MIN_FREE_GB (30), TB_INSTRUMENT_COMMIT
 #   (default: this checkout's HEAD; set it when running a frozen copy),
@@ -191,12 +194,17 @@ for MLINE in "${MODELS[@]}"; do
                  log "$NAME: archived an interrupted trial job ${TASK}__a$K" ;;
       esac
       boundary; router_clear
+      if [ -n "${TB_GPU_HOURS_CEILING:-}" ]; then
+        crc=0; used=$(tbc ledger-check "$OUT" "$TB_GPU_HOURS_CEILING") || crc=$?
+        [ "$crc" = 3 ] && { log "GPU-hour ceiling reached: ${used} h of ${TB_GPU_HOURS_CEILING} h; no new trial"; exit 0; }
+        [ "$crc" = 0 ] || { log "ledger refused: $used"; exit 2; }
+      fi
       wait_idle "$MODEL" || log "$NAME: slot still busy after 30 min"
       py 'import json,sys; a={"import_path":sys.argv[3],"model_name":sys.argv[4]}
 if sys.argv[5]: a["kwargs"]={"version":sys.argv[5]}
 json.dump({"jobs_dir":sys.argv[2],"datasets":[{"path":sys.argv[6],"task_names":[sys.argv[7]]}],"agents":[a]},open(sys.argv[1],"w"),indent=1)' \
         "$TJ.job.json" "$JOB" "$AGENT" "$LABEL" "$PV" "$DPATH" "$TASK"
-      rc=0; cancelled=""
+      rc=0; cancelled=""; t0=$(date +%s)
       env "${TENV[@]}" NEWT_BENCH_PROFILE="$PROFILE" NEWT_BENCH_MODEL_DIGEST="${DIGEST:-}" harbor run --config "$TJ.job.json" \
         --job-name "${TASK}__a$K" --n-attempts 1 --n-concurrent 1 --max-retries 0 --agent-timeout-multiplier "$MULT" \
         --no-delete -y > "$TJ.harbor.log" 2>&1 &
@@ -206,6 +214,10 @@ json.dump({"jobs_dir":sys.argv[2],"datasets":[{"path":sys.argv[6],"task_names":[
         sleep 10
       done
       wait "$hp" || rc=$?
+      if [ -n "$cancelled" ]; then run_state="cancelled-at-deadline"; else run_state=$(tbc job-state "$TJ"); fi
+      hours=$(tbc ledger-add "$OUT" "$TJ" campaign "$CAMPAIGN" model "$MODEL" cell "$NAME" task "$TASK" attempt "$K" \
+        window "${WINDOW:-}" state "$run_state" wall_s "$(( $(date +%s) - t0 ))")
+      log "$NAME ${TASK}__a$K ledger total ${hours} h"
       [ "$rc" = 0 ] || { failed=$((failed + 1)); log "$NAME ${TASK}__a$K harbor_exit=$rc"; }
       if [ -n "$cancelled" ] && [ "$(tbc job-state "$TJ")" != "done" ]; then
         if [ "$(tbc deadline-cancels "$JOB" "${TASK}__a$K")" -ge 1 ]; then
