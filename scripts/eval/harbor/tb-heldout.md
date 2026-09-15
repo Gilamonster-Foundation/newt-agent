@@ -62,4 +62,6 @@ Before this set is used, each candidate gets one calibration row. Calibration ru
 | ornith-1.5-35b | newt, treatment `none`, smart-ab-8, 1 trial per task, ctx 131072 | resolves; median agent seconds per trial; projected hours for 72 held-out trials |
 | the chosen small Nemotron 3 | the same | the same |
 
+**Thinking is off, and set at the server.** ornith-1.5-35b and Nemotron 3.5 Lightning run with `chat-template-kwargs = {"enable_thinking": false}` in their router presets. That switch is identical for every harness and leaves sampling alone. A calibration row runs only after `/v1/models` has been read back and shows the preset on that model, and the campaign pins the kwargs in the model fingerprint. Thinking-on may become a treatment arm later, if calibration shows its turn time is affordable. It is not part of the matrix now.
+
 Admitting easier tasks is not an option: every easy terminal-bench task is already exposed. A different suite would need its own declaration.
