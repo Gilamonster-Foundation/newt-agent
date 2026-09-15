@@ -643,3 +643,77 @@ fn candidate_tests_that_pass_do_not_override_the_spec() {
         grade.detail
     );
 }
+
+/// Regression (#2374 coverage job): 011's randomized property sweep draws its
+/// probes from OS entropy. With values spread over `[i32::MIN + 1, 500_000]`,
+/// almost every draw is negative, so a vector with a positive after a negative
+/// (the only shape that exposes the seed's "stop at the first negative" bug)
+/// is rare. Simulated over 2000 seeds with the spec's own generator, the sweep
+/// PASSED the unchanged seed 72 times (3.6%). The seed then graded 9 passed,
+/// 9 failed in one grading path and 8/10 in the other, and calibration reported
+/// the paths as disagreeing. The sweep must catch the seed on every run, or a
+/// grade depends on the draw.
+///
+/// Builds the spec against the seed once and re-runs only the sweep 200 times;
+/// at the old 3.6% miss rate that passes at least once with probability 99.9%.
+#[cfg(unix)]
+#[test]
+fn the_011_randomized_sweep_catches_the_seed_on_every_run() {
+    let case = bundled("011-state-machine-drain");
+    let tree = tempfile::tempdir().unwrap();
+    let mut opts = fs_extra::dir::CopyOptions::new();
+    opts.content_only = true;
+    fs_extra::dir::copy(case.workspace_fixture(), tree.path(), &opts).unwrap();
+    fs::create_dir_all(tree.path().join("tests")).unwrap();
+    fs::copy(
+        case.case_dir.join("grade_spec.rs"),
+        tree.path().join("tests/grade_spec.rs"),
+    )
+    .unwrap();
+    let target = tree.path().join("target");
+    let build = std::process::Command::new(env!("CARGO"))
+        .args([
+            "test",
+            "--color",
+            "never",
+            "--test",
+            "grade_spec",
+            "--no-run",
+        ])
+        .args(["--message-format", "json"])
+        .current_dir(tree.path())
+        .env("CARGO_TARGET_DIR", &target)
+        .env("RUSTC_WRAPPER", "")
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let binary = String::from_utf8_lossy(&build.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|m| m.pointer("/target/name").and_then(|n| n.as_str()) == Some("grade_spec"))
+        .find_map(|m| m["executable"].as_str().map(std::path::PathBuf::from))
+        .expect("cargo reported the grade_spec test binary");
+
+    let passes = (0..200)
+        .filter(|_| {
+            std::process::Command::new(&binary)
+                .args([
+                    "randomized_property_sweep_against_reference_semantics",
+                    "--exact",
+                ])
+                .current_dir(tree.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        })
+        .count();
+    assert_eq!(
+        passes, 0,
+        "the sweep passed the unchanged seed in {passes} of 200 runs"
+    );
+}

@@ -439,6 +439,15 @@ fn randomized_property_sweep_against_reference_semantics() {
     // negative range, so a magic-value gate anywhere in i32 has a
     // meaningfully higher chance of being hit by chance across trials —
     // defense-in-depth on top of the magnitude-agnostic structural ban.
+    //
+    // Revision 4 (#2317 calibration): the wide range alone is ~99.98%
+    // negative, so a positive after a negative (the shape that exposes
+    // "stop at the first negative") was rare, and this sweep passed the
+    // unchanged seed in 72 of 2000 simulated runs (3.6%). The same tree
+    // then graded differently run to run. Half the draws now come from a
+    // small band of either sign, so that shape appears within the first
+    // few trials of every run (0 misses in 20000 simulated seeds); the
+    // other half keep the wide range.
     let seed = runtime_entropy_seed();
     let mut rng = XorShift32::new(seed);
 
@@ -446,7 +455,11 @@ fn randomized_property_sweep_against_reference_semantics() {
         let len = rng.range(0, 16) as usize;
         let mut xs = Vec::with_capacity(len);
         for _ in 0..len {
-            let v = rng.range(i32::MIN + 1, 500_000);
+            let v = if rng.range(0, 1) == 0 {
+                rng.range(-1000, 1000)
+            } else {
+                rng.range(i32::MIN + 1, 500_000)
+            };
             xs.push(v);
         }
         let expected = reference_sum_until_zero(&xs);
