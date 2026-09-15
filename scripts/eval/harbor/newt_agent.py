@@ -110,6 +110,11 @@ _SMART = os.environ.get("NEWT_BENCH_SMART", "")
 # Operator-declared model digest (#2318): newt records NEWT_MODEL_DIGEST in its
 # contract's `model_digest`. Declared, not verified — the server exposes none.
 _MODEL_DIGEST = os.environ.get("NEWT_BENCH_MODEL_DIGEST", "")
+# Features a treatment requires (#2356): comma-separated receipt keys, each passed
+# as `--require-feature`, so a default-off feature the run cannot supply refuses
+# before inference instead of silently measuring the baseline. Set by
+# tb-campaign.sh from the treatment's `requires`; empty for the baseline.
+_REQUIRE_FEATURES = os.environ.get("NEWT_BENCH_REQUIRE_FEATURES", "")
 
 
 def _container_env_prefix() -> str:
@@ -130,6 +135,26 @@ def _container_env_prefix() -> str:
     if _MODEL_DIGEST.strip():
         parts.append(f"NEWT_MODEL_DIGEST={shlex.quote(_MODEL_DIGEST.strip())}")
     return (" ".join(parts) + " ") if parts else ""
+
+
+def _solve_command(workdir: str) -> str:
+    """The `newt solve` invocation for one trial, from this module's knobs."""
+    tenacity = f" --tenacity {shlex.quote(_TENACITY)}" if _TENACITY else ""
+    ctx = f" --context-window {shlex.quote(_CONTEXT_WINDOW)}" if _CONTEXT_WINDOW else ""
+    smart = " --smart-harness --frame-dir /logs/agent/frame" if _SMART.strip() in ("1", "on", "true") else ""
+    required = "".join(
+        f" --require-feature {shlex.quote(f.strip())}" for f in _REQUIRE_FEATURES.split(",") if f.strip()
+    )
+    # --non-interactive defaults true in `newt solve`, so it's omitted here
+    # (passing it bare requires a value under the current arg definition).
+    return (
+        f"mkdir -p /logs/agent {shlex.quote(workdir)}; "
+        f"{_container_env_prefix()}newt solve --cwd {shlex.quote(workdir)} "
+        "--instruction-file /tmp/newt-task.md "
+        "--config /etc/newt/bench.toml "
+        "--events /logs/agent/newt-events.jsonl "
+        f"--max-rounds {shlex.quote(_MAX_ROUNDS)}{tenacity}{ctx}{_lane_flag(_OCAP)}{smart}{required}"
+    )
 
 
 class NewtAgent(BaseInstalledAgent):
@@ -184,8 +209,6 @@ class NewtAgent(BaseInstalledAgent):
         finally:
             os.unlink(local_instr)
 
-        tenacity = f" --tenacity {shlex.quote(_TENACITY)}" if _TENACITY else ""
-        ctx = f" --context-window {shlex.quote(_CONTEXT_WINDOW)}" if _CONTEXT_WINDOW else ""
         # The task's working directory is NOT always /app: terminal-bench's
         # prove-plus-comm declares WORKDIR /workspace and copies its partial proof
         # there, and its verifier checks paths relative to that. Hardcoding /app
@@ -196,20 +219,4 @@ class NewtAgent(BaseInstalledAgent):
         if not workdir:
             probe = await self.exec_as_agent(environment, command="pwd")
             workdir = ((getattr(probe, "stdout", None) or "").strip().splitlines() or ["/app"])[0] or "/app"
-        confined = _lane_flag(_OCAP)
-        smart = (
-            " --smart-harness --frame-dir /logs/agent/frame"
-            if _SMART.strip() in ("1", "on", "true")
-            else ""
-        )
-        # --non-interactive defaults true in `newt solve`, so it's omitted here
-        # (passing it bare requires a value under the current arg definition).
-        command = (
-            f"mkdir -p /logs/agent {shlex.quote(workdir)}; "
-            f"{_container_env_prefix()}newt solve --cwd {shlex.quote(workdir)} "
-            "--instruction-file /tmp/newt-task.md "
-            "--config /etc/newt/bench.toml "
-            "--events /logs/agent/newt-events.jsonl "
-            f"--max-rounds {shlex.quote(_MAX_ROUNDS)}{tenacity}{ctx}{confined}{smart}"
-        )
-        await self.exec_as_agent(environment, command=command)
+        await self.exec_as_agent(environment, command=_solve_command(workdir))

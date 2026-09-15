@@ -49,6 +49,7 @@ fn ctx<'a>(
         cognition: None,
         chat_completions_capability: Default::default(),
         output_allowance: None,
+        attempt_ledger: None,
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
         emits_leading_reasoning: false,
         max_tool_rounds: 12,
@@ -511,11 +512,39 @@ async fn summarizer_500_degrades_to_static_marker_and_turn_completes() {
     );
     c.summarizer = Some(&*summarizer);
     c.compress_state = Some(&mut compress_state);
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    c.attempt_ledger = Some(&ledger);
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
         .await
         .expect("a summarizer failure must never abort the turn");
 
     assert_eq!(reply, "completed despite summarizer outage");
+    // #2313 (b1a): with compaction in the turn, the primary rounds are still
+    // exactly the attempts: attempts == requests on `/api/chat`, keyed by
+    // their bodies. b3's red: the summarizer's own `/summarize` request is not
+    // an attempt yet; once the producer wrapper lands, attempts must equal
+    // EVERY received request here.
+    let received = server.received_requests().await.expect("journal");
+    let mut wire: Vec<_> = received
+        .iter()
+        .filter(|r| r.url.path() == "/api/chat")
+        .map(|r| content_addressable::RawContentId::from_content(&r.body))
+        .collect();
+    assert!(
+        received
+            .iter()
+            .all(|r| matches!(r.url.path(), "/api/chat" | "/summarize")),
+        "no path beyond the rounds and the summarizer"
+    );
+    let mut recorded: Vec<_> = ledger
+        .lock()
+        .unwrap()
+        .records()
+        .map(|r| r.key.request)
+        .collect();
+    wire.sort();
+    recorded.sort();
+    assert_eq!(recorded, wire, "primary attempts == /api/chat requests");
     assert!(
         attempts.load(Ordering::SeqCst) >= 1,
         "the summarizer endpoint must have been attempted"
