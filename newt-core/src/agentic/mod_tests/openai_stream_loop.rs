@@ -750,6 +750,115 @@ async fn an_interrupt_mid_answer_is_not_reported_as_a_broken_stream() {
 }
 
 // -----------------------------------------------------------------------
+// #2313 review: the display reissue's attempt state and usage follow the rule
+// — a complete terminal response is ok; an interrupt, a cut stream or an error
+// event is failed; reported usage attaches either way.
+// -----------------------------------------------------------------------
+
+/// Run the display reissue once against `frames` with a real attempt ledger
+/// and return the single attempt it recorded.
+async fn reissue_attempt(
+    frames: &[&str],
+    interrupt_on_paint: bool,
+) -> (StreamOutcome, crate::attempts::AttemptRecord) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(frames))
+        .mount(&server)
+        .await;
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let scope = attempt_capture::AttemptScope {
+        ledger: &ledger,
+        turn: "prompt:turn",
+        model: "test-model",
+        backend: "test-backend",
+    };
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let buf = Buf::default();
+    let req = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", server.uri()))
+        .json(&serde_json::json!({"stream": true}));
+    let out = if interrupt_on_paint {
+        let sink = CancelOnWrite {
+            buf: buf.clone(),
+            flag: &cancel,
+        };
+        openai_stream_final_answer(req, Some(scope), sink, false, false, false, Some(&cancel)).await
+    } else {
+        openai_stream_final_answer(req, Some(scope), buf.clone(), false, false, false, None).await
+    };
+    let ledger = ledger.lock().unwrap();
+    let records: Vec<_> = ledger.records().cloned().collect();
+    assert_eq!(records.len(), 1, "one reissue, one attempt");
+    (out, records[0].clone())
+}
+
+const REISSUE_USAGE: &str = r#"{"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":5}}"#;
+
+fn reissue_usage() -> Option<crate::TokenUsage> {
+    Some(crate::TokenUsage {
+        input_tokens: 42,
+        output_tokens: 5,
+    })
+}
+
+/// Review finding 1: an interrupted reissue is a cancellation, which stays
+/// failed until cancellation is modelled — never ok — with the usage it
+/// reported attached.
+#[tokio::test]
+async fn an_interrupted_display_reissue_is_failed_with_its_reported_usage() {
+    let (out, record) = reissue_attempt(
+        &[
+            REISSUE_USAGE,
+            r#"{"choices":[{"delta":{"content":"the beginning of an"}}]}"#,
+        ],
+        true,
+    )
+    .await;
+    assert!(matches!(out, StreamOutcome::Printed(..)), "{out:?}");
+    assert_eq!(record.state, crate::attempts::AttemptState::Failed);
+    assert_eq!(record.usage, reissue_usage());
+}
+
+/// Review finding 2: a reissue that reaches `[DONE]` with no visible text (all
+/// reasoning) was a complete, billed response — ok with its usage, even though
+/// the caller falls back to the probe answer.
+#[tokio::test]
+async fn a_display_reissue_that_finishes_without_text_is_ok_with_its_usage() {
+    let (out, record) = reissue_attempt(
+        &[
+            r#"{"choices":[{"delta":{"content":"<think>only reasoning</think>"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            REISSUE_USAGE,
+            "[DONE]",
+        ],
+        false,
+    )
+    .await;
+    assert!(matches!(out, StreamOutcome::UseProbe(_)), "{out:?}");
+    assert_eq!(record.state, crate::attempts::AttemptState::Ok);
+    assert_eq!(record.usage, reissue_usage());
+}
+
+/// The rule's other half on this wire: a stream cut before `[DONE]` is failed,
+/// with whatever usage it reported.
+#[tokio::test]
+async fn a_cut_display_reissue_is_failed_with_its_reported_usage() {
+    let (out, record) = reissue_attempt(
+        &[
+            REISSUE_USAGE,
+            r#"{"choices":[{"delta":{"content":"half an answ"}}]}"#,
+        ],
+        false,
+    )
+    .await;
+    assert!(matches!(out, StreamOutcome::UseProbe(_)), "{out:?}");
+    assert_eq!(record.state, crate::attempts::AttemptState::Failed);
+    assert_eq!(record.usage, reissue_usage());
+}
+
+// -----------------------------------------------------------------------
 // The wiring: the accepted round is re-issued with stream:true
 // -----------------------------------------------------------------------
 
