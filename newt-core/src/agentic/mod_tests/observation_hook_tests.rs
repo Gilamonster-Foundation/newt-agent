@@ -35,6 +35,7 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         cognition: None,
         chat_completions_capability: Default::default(),
         output_allowance: None,
+        attempt_ledger: None,
         reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
         emits_leading_reasoning: false,
         max_tool_rounds: 8,
@@ -772,6 +773,159 @@ async fn validated_tool_calls_emit_one_accepted_and_survive_execution_failure() 
         vec![6_000, 5_200],
         "validated tool round + final text each emit exactly one Accepted: {observations:?}"
     );
+}
+
+/// #2313 (b1a): every primary Ollama request is exactly one ledger attempt,
+/// keyed by its exact wire bytes. The only direct proof against double
+/// counting and silent drops: attempts == the requests the server received on
+/// this wire's generation path (`/api/chat`), and each attempt's request id is
+/// the `RawContentId` of one received body. Nothing else may be hit, so the
+/// filter cannot hide an extra inference call.
+///
+/// Scope of the count: the Ollama primary loop's probe, stream reissue and
+/// cap-exit summary. Summarizer, auxiliary and other wires are not yet wired.
+#[tokio::test]
+async fn every_ollama_request_is_one_ledger_attempt_keyed_by_its_wire_bytes() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(OllamaValidToolThenText {
+            probes: Arc::new(AtomicUsize::new(0)),
+        })
+        .mount(&server)
+        .await;
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("do the thing"),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("the tool round then the final answer complete the turn");
+    assert_eq!(reply, "all done");
+
+    let received = server.received_requests().await.expect("journal");
+    let generation: Vec<_> = received
+        .iter()
+        .filter(|request| request.url.path() == "/api/chat")
+        .collect();
+    assert_eq!(
+        generation.len(),
+        received.len(),
+        "only the generation path may be hit: {:?}",
+        received.iter().map(|r| r.url.path()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        generation.len(),
+        3,
+        "tool probe, answer probe, stream reissue"
+    );
+
+    let ledger = ledger.lock().unwrap();
+    let records: Vec<_> = ledger.records().collect();
+    assert_eq!(records.len(), generation.len(), "attempts == wire requests");
+    let mut wire: Vec<_> = generation
+        .iter()
+        .map(|request| content_addressable::RawContentId::from_content(&request.body))
+        .collect();
+    let mut recorded: Vec<_> = records.iter().map(|record| record.key.request).collect();
+    wire.sort();
+    recorded.sort();
+    assert_eq!(recorded, wire, "each attempt is keyed by one received body");
+    let turn = &records[0].key.turn;
+    assert!(turn.starts_with("prompt:"), "{turn}");
+    for record in &records {
+        assert_eq!(&record.key.turn, turn);
+        assert_eq!(record.key.role, "primary");
+        assert_eq!(record.state, crate::attempts::AttemptState::Ok);
+    }
+    let totals = ledger.totals();
+    assert_eq!(
+        (totals.in_tokens, totals.out_tokens, totals.usage_complete),
+        (6_000 + 5_200 + 5_200, 5 + 3 + 3, true)
+    );
+}
+
+/// Tool call on every tools-bearing request; a plain answer (with usage) for
+/// the tools-disabled cap-exit summary.
+struct OllamaToolThenCapSummary;
+impl Respond for OllamaToolThenCapSummary {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        if body.get("tools").is_some() {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {"content": "", "tool_calls": [{
+                    "function": {"name": "definitely_not_a_real_tool", "arguments": {}}
+                }]},
+                "prompt_eval_count": 900, "eval_count": 4,
+            }))
+        } else {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {"content": "capped summary"},
+                "prompt_eval_count": 950, "eval_count": 6,
+            }))
+        }
+    }
+}
+
+/// #2313 (b1a): the Ollama cap-exit summary — sent through the shared
+/// `dispatch_with_decoder` — is one attempt too, so attempts still equal the
+/// requests on `/api/chat` when the round cap ends the turn.
+#[tokio::test]
+async fn an_ollama_cap_exit_summary_is_one_ledger_attempt() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(OllamaToolThenCapSummary)
+        .mount(&server)
+        .await;
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user("do the thing"),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.max_tool_rounds = 1;
+    c.attempt_ledger = Some(&ledger);
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("the round cap ends the turn with a summary");
+    assert!(reply.contains("capped summary"), "{reply}");
+
+    let received = server.received_requests().await.expect("journal");
+    assert!(
+        received.iter().all(|r| r.url.path() == "/api/chat"),
+        "only the generation path may be hit"
+    );
+    let summaries = received
+        .iter()
+        .filter(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .is_ok_and(|body| body.get("tools").is_none())
+        })
+        .count();
+    assert_eq!(summaries, 1, "exactly one tools-disabled cap-exit summary");
+    let ledger = ledger.lock().unwrap();
+    let mut wire: Vec<_> = received
+        .iter()
+        .map(|r| content_addressable::RawContentId::from_content(&r.body))
+        .collect();
+    let mut recorded: Vec<_> = ledger.records().map(|r| r.key.request).collect();
+    wire.sort();
+    recorded.sort();
+    assert_eq!(
+        recorded, wire,
+        "attempts == wire requests, keyed by their bodies"
+    );
+    assert!(ledger
+        .records()
+        .all(|r| r.state == crate::attempts::AttemptState::Ok && r.usage.is_some()));
 }
 
 /// B4 rule: a CONTENT-INVALID tool batch (RR1) — here a call with no name —

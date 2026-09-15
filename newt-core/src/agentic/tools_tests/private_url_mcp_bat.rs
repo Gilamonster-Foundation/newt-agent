@@ -194,6 +194,7 @@ async fn private_review_fetch_recovers_through_tool_search_and_mcp() {
             cognition: None,
             chat_completions_capability: Default::default(),
             output_allowance: None,
+            attempt_ledger: None,
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             emits_leading_reasoning: false,
             max_tool_rounds: 6,

@@ -407,6 +407,7 @@ async fn responses_durable_prompt_context_reaches_v1_responses_wire() {
             cognition: None,
             chat_completions_capability: Default::default(),
             output_allowance: None,
+            attempt_ledger: None,
             reasoning_replay_scope: crate::model_card::ReasoningReplayScope::Never,
             emits_leading_reasoning: false,
             max_tool_rounds: 5,
