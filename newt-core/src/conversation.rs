@@ -47,6 +47,30 @@ pub struct ToolEvent {
     /// the events array position.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// #2315: what a shell call (`run_command` / `lifecycle`) observably did,
+    /// classified where its envelope is produced. `None` for every other call
+    /// and for calls refused before reaching the shell. Additive: absent from
+    /// older rows and omitted when `None`, so those serialize as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecOutcome>,
+}
+
+/// #2315: the class of one shell execution, read from its envelope's facts
+/// (structured denial, timeout flag, exit status, program resolution) — never
+/// re-derived from the rendered result text, which [`ToolEvent::ok`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecOutcome {
+    /// Ran and exited 0.
+    Passed,
+    /// Ran and exited nonzero, including a program that exists but exits 127.
+    Failed,
+    /// A structured leash denial, or the kernel refusing the program.
+    Denied,
+    /// Killed at its wall-clock ceiling (the envelope's `timed_out` flag).
+    TimedOut,
+    /// Never ran: the program does not resolve, or the dispatch itself failed.
+    Unavailable,
 }
 
 impl ToolEvent {
@@ -79,6 +103,7 @@ impl ToolEvent {
             args_digest,
             ok,
             duration_ms,
+            execution: None,
         }
     }
 }
