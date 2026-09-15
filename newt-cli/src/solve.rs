@@ -432,6 +432,13 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         solve_contract::Feature::Crew => runtime.crew,
         solve_contract::Feature::CodeSearch => false,
     })?;
+    // #2312: the flag, else the model's `[[model_tuning]]` entry — the lookup
+    // the TUI uses — else the cognition table and wire defaults downstream. An
+    // unusable explicit value is refused here, like a required feature.
+    let output_allowance = args
+        .output_allowance
+        .or_else(|| cfg.find_model_tuning(&model)?.output_allowance);
+    newt_core::agentic::validate_output_allowance(output_allowance, args.context_window)?;
     let tenacity_level = runtime.tenacity.label();
     let cognition = projected_cognition(runtime.cognition, kind, api, chat_capability);
     // `None` means Newt projects no cognition controls. Call that `default`
@@ -472,11 +479,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // 5. Drive one full turn (== a complete multi-round agentic solve).
     let mut dc = TurnDriverConfig::new(&url, &model, kind, &workspace);
     apply_context_config(&mut dc, cfg.context.as_ref());
-    // #2312: the flag, else the model's `[[model_tuning]]` entry — the lookup
-    // the TUI uses — else the cognition table and wire defaults downstream.
-    dc.output_allowance = args
-        .output_allowance
-        .or_else(|| cfg.find_model_tuning(&model)?.output_allowance);
+    dc.output_allowance = output_allowance;
     dc.api_key = api_key;
     dc.chat_completions_capability = chat_capability;
     dc.reasoning_replay_scope = decision.reasoning_replay_scope();
@@ -804,6 +807,13 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
             smart_harness: smart_manifest.as_ref(),
             output_allowance: o_opt.and_then(|o| o.output_allowance),
             features: o_opt.map(|o| o.features),
+            // The headless driver always arms action nudges; whether the loop
+            // has a gate at all depends on the wire and SmartHarness.
+            verification: Some(newt_core::agentic::verification_receipt(
+                newt_core::agentic::verification_gate_present(kind, api, smart_manifest.is_some()),
+                newt_core::agentic::self_verify_enabled(),
+                newt_core::agentic::verify_outcomes_requested(),
+            )),
             scratchpad_seed: scratchpad.as_ref().map(|(_, seed)| seed.as_str()),
             required: &args.require_feature,
         },

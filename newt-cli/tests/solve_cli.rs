@@ -518,6 +518,55 @@ bounded_reasoning_continuation = true
     }
 }
 
+/// #2312: `newt solve` refuses an invalid output allowance at admission, like a
+/// required feature it cannot supply: no model request, no events file.
+#[tokio::test(flavor = "multi_thread")]
+async fn solve_refuses_an_invalid_output_allowance_before_inference() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(CaptureThenFinish {
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let instruction_path = fixture.path().join("instruction.md");
+    let events_path = fixture.path().join("events.jsonl");
+    std::fs::write(&instruction_path, "Finish without calling a tool.\n")
+        .expect("write solve instruction");
+    for (extra, expected) in [
+        (vec!["--output-allowance", "0"], "output_allowance 0 permits no output"),
+        (
+            vec!["--output-allowance", "40000", "--context-window", "32768"],
+            "output_allowance 40000 leaves no input room in the declared 32768-token context window",
+        ),
+    ] {
+        Command::cargo_bin("newt")
+            .expect("newt binary")
+            .env_remove("NEWT_TEAM")
+            .args(["--backend-endpoint", &server.uri()])
+            .args(["--backend-model", NEMOTRON_MODEL])
+            .args(["--backend-kind", "openai"])
+            .args(["solve", "--cwd"])
+            .arg(fixture.path())
+            .arg("--instruction-file")
+            .arg(&instruction_path)
+            .arg("--events")
+            .arg(&events_path)
+            .args(extra)
+            .assert()
+            .failure()
+            .stderr(predicates::str::contains(expected));
+    }
+    assert!(
+        requests.lock().expect("request capture lock").is_empty(),
+        "a refused allowance must not reach the model"
+    );
+    assert!(!events_path.exists(), "a refused run records no trace");
+}
+
 /// #2312: a headless run can set its output allowance, and the contract says
 /// whether the server was told (`max_tokens` on the wire) or newt only reserved
 /// it locally. Every contract read is paired with the captured bodies, so an
@@ -1202,4 +1251,131 @@ kind = "openai"
          AND that excludes it from capability scoring; which wall it hit is \
          `status` and `end_reason`'s to report: {contract}"
     );
+}
+
+/// #2318: a 2xx OpenAI stream that strict decoding rejects (a tool call without
+/// an id) is the model's answer, so the solve contract files it `model_error`.
+/// Its class used to be lost and the run filed as `harness_error`, which the
+/// bench excludes from capability scoring as the harness's fault.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_strictly_rejected_stream_files_as_model_error() {
+    let server = MockServer::start().await;
+    let stream = [
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "[DONE]",
+    ]
+    .iter()
+    .map(|frame| format!("data: {frame}\n\n"))
+    .collect::<String>();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let workspace = tempfile::tempdir().expect("temporary solve workspace");
+    let config_path = workspace.path().join("solve.toml");
+    let instruction_path = workspace.path().join("instruction.md");
+    let events_path = workspace.path().join("events.jsonl");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"default_backend = "strict"
+
+[[backends]]
+name = "strict"
+endpoint = "{}"
+model = "{NEMOTRON_MODEL}"
+kind = "openai"
+"#,
+            server.uri()
+        ),
+    )
+    .expect("write solve config");
+    std::fs::write(&instruction_path, "Read the seed file.\n").expect("write solve instruction");
+
+    let _ = Command::cargo_bin("newt")
+        .expect("newt binary")
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["solve", "--cwd"])
+        .arg(workspace.path())
+        .arg("--instruction-file")
+        .arg(&instruction_path)
+        .arg("--events")
+        .arg(&events_path)
+        .assert();
+
+    let posts: Vec<_> = server
+        .received_requests()
+        .await
+        .expect("journal")
+        .into_iter()
+        .filter(|request| request.method.as_str() == "POST")
+        .collect();
+    assert_eq!(
+        posts.len(),
+        1,
+        "exactly one POST: the rejection is not retried"
+    );
+    let result = solve_result_from(&events_path);
+    assert_eq!(result["tool_calls"], 0, "nothing ran: {result}");
+    assert_eq!(result["end_reason"], "None", "{result}");
+    let contract = contract_from(&events_path);
+    assert_eq!(contract["outcome"], "model_error", "{contract}");
+}
+
+/// #2374: the receipt's verification mode comes from the loop the run actually
+/// has. With both switches on, the Chat Completions loop runs the result-aware
+/// gate, and the Responses loop without SmartHarness has no gate, so it reports
+/// `off`. Reverting solve to an unconditional receipt fails the second case.
+#[tokio::test(flavor = "multi_thread")]
+async fn solve_reports_verification_off_where_the_loop_has_no_gate() {
+    for (api, expected) in [("chat", "result_aware"), ("responses", "off")] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(CaptureThenFinish {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_1", "status": "completed", "model": NEMOTRON_MODEL,
+                "output": [{"type": "message", "id": "msg_1", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "done", "annotations": []}]}]
+            })))
+            .mount(&server)
+            .await;
+        let fixture = tempfile::tempdir().expect("temporary solve fixture");
+        let instruction_path = fixture.path().join("instruction.md");
+        let events_path = fixture.path().join("events.jsonl");
+        std::fs::write(&instruction_path, "Finish without calling a tool.\n")
+            .expect("write solve instruction");
+        Command::cargo_bin("newt")
+            .expect("newt binary")
+            .env_remove("NEWT_TEAM")
+            .env("NEWT_SELF_VERIFY", "1")
+            .env("NEWT_VERIFY_OUTCOMES", "1")
+            .args(["--backend-endpoint", &server.uri()])
+            .args(["--backend-model", NEMOTRON_MODEL])
+            .args(["--backend-kind", "openai"])
+            .args(["--backend-api", api])
+            .args(["solve", "--cwd"])
+            .arg(fixture.path())
+            .arg("--instruction-file")
+            .arg(&instruction_path)
+            .arg("--events")
+            .arg(&events_path)
+            .args(["--max-rounds", "1"])
+            .assert()
+            .success();
+        let verification = &contract_from(&events_path)["receipt"]["verification"];
+        assert_eq!(verification["mode"], expected, "{api}: {verification}");
+    }
 }

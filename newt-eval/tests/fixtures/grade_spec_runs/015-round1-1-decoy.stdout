@@ -1,0 +1,12 @@
+
+running 7 tests
+test end_closes_once_then_exits ... ok
+test end_after_new_counts_both ... ok
+test end_on_empty_session_and_padded_input_still_closes_and_exits ... ok
+test plain_lines_and_unknown_commands ... ok
+test new_and_restart_close_and_continue ... ok
+test quit_and_exit_abandon_without_closing ... ok
+test repeated_end_closes_each_time ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,6 +1,6 @@
 export const meta = {
   name: 'crew-autopsy',
-  description: 'Classify failed and PASS?gameable crew runs against the 7-mechanism taxonomy of docs/design/improving-crew-results.md §3, with evidence quotes required and skeptical re-checks under a confidence floor. Deterministic aggregation names the biggest mover.',
+  description: 'Classify failed and ungradable (UNGRADABLE(..), legacy PASS?gameable) crew runs against the 7-mechanism taxonomy of docs/design/improving-crew-results.md §3, with evidence quotes required and skeptical re-checks under a confidence floor. Deterministic aggregation names the biggest mover.',
   phases: [
     { title: 'Inventory', detail: 'resolve TSV rows / run dirs into autopsy items' },
     { title: 'Classify', detail: 'one evidence-bound classifier per run' },
@@ -13,12 +13,13 @@ export const meta = {
 //         "dir|BEHAVIORAL" pairs e.g. "/tmp/a|FAIL,/tmp/b|PASS" when the caller already
 //         knows each dir's ground-truth outcome from its own sweep.tsv (required)',
 //         id: 'output name (required, e.g. 2026-07-02-baseline)',
-//         include?: 'failures'|'failures+gameable'|'all' (default failures+gameable),
+//         include?: 'failures'|'failures+ungradable'|'all' (default failures+ungradable;
+//                   the pre-#2317 spelling 'failures+gameable' still works),
 //         limit?: 24, floor?: 0.7, out_dir?: '<repo>/scripts/eval/results/autopsy' }
 // args may arrive as a JSON string depending on the invoker — normalize.
 const argv = typeof args === 'string' ? JSON.parse(args) : (args || {})
 if (!argv.source || !argv.id) throw new Error('missing required args: source, id')
-const INCLUDE = argv.include || 'failures+gameable'
+const INCLUDE = (argv.include === 'failures+gameable' ? 'failures+ungradable' : argv.include) || 'failures+ungradable'
 const LIMIT = argv.limit || 24
 const FLOOR = argv.floor ?? 0.7
 
@@ -31,7 +32,7 @@ const TAXONOMY = [
   { key: 'worker-ignores-scope', what: 'worker implemented the whole goal (or invented orphan/vacuum files) instead of its one leaf', signature: 'diff shows work far beyond the leaf instruction, or new files never wired in (orphans)' },
   { key: 'worker-spurious-edits', what: 'off-target edits (e.g. Cargo.toml on a pure-logic fix), retries exhausted, NEEDS-HUMAN-REVIEW', signature: 'diff touches unrelated files; NEEDS-HUMAN-REVIEW after retry attempts' },
   { key: 'planner-over-decomposition', what: 'non-actionable inspect/examine leaves or trailing validate/run-tests leaves padding the plan', signature: 'plan leaves named inspect/examine/validate/run-tests that produce no diff' },
-  { key: 'grading-integrity', what: 'seed test green without the goal genuinely met (gameable rung), or the crew edited its own test', signature: 'PASS?gameable grade, or edited_own_test=yes, or diff weakens/edits assertions' },
+  { key: 'grading-integrity', what: 'seed test green without the goal genuinely met (gameable rung), or the crew edited its own test', signature: 'a legacy PASS?gameable grade, a PASS row without grader=grade_spec, or edited_own_test=yes, or diff weakens/edits assertions' },
   { key: 'ops-noise', what: 'infrastructure, not the crew: endpoint down, model not pulled, timeout before inference', signature: 'connection errors / model-not-found / timeout with no inference in the log' },
   { key: 'other', what: 'a real mechanism not in the taxonomy', signature: 'quote the evidence; a verifier will re-read' },
 ]
@@ -64,9 +65,9 @@ const INVENTORY_SCHEMA = {
 const inv = await agent(`Build the autopsy inventory from this source: ${argv.source}
 - If it is a directory containing sweep.tsv: parse the RATCHET rows (tab-separated; cols 2-6 = task,mode,model,behavioral,details; dir=<path> inside details is the run dir).
 - If it is a .tsv file: same parsing.
-- If it is a comma-separated list of "dir|BEHAVIORAL" pairs (e.g. "/tmp/a|FAIL,/tmp/b|PASS?gameable"): the caller already knows each dir's ground-truth outcome from its own sweep.tsv. Use that BEHAVIORAL value VERBATIM — it is authoritative. Do NOT re-derive, re-run, or second-guess it by reading the run dir; that is the Classify phase's job, not Inventory's. infer task/mode/model from any .plan.log or leave "unknown".
+- If it is a comma-separated list of "dir|BEHAVIORAL" pairs (e.g. "/tmp/a|FAIL,/tmp/b|UNGRADABLE(no_tests_ran)"): the caller already knows each dir's ground-truth outcome from its own sweep.tsv. Use that BEHAVIORAL value VERBATIM — it is authoritative. Do NOT re-derive, re-run, or second-guess it by reading the run dir; that is the Classify phase's job, not Inventory's. infer task/mode/model from any .plan.log or leave "unknown".
 - If it is a bare comma-separated list of directories with no "|BEHAVIORAL" suffix: there is no ground truth available here — you must infer behavioral from the directory contents (this is inherently unreliable; prefer the "dir|BEHAVIORAL" form whenever the caller can supply it).
-Include ONLY rows/dirs matching include='${INCLUDE}' (failures = behavioral FAIL; +gameable adds PASS?gameable; all = everything). Drop items whose run dir no longer exists on disk (they were reaped) — note how many you dropped in a final check by listing them, but only return existing ones.`,
+Include ONLY rows/dirs matching include='${INCLUDE}' (failures = behavioral FAIL; +ungradable adds UNGRADABLE(..) and legacy PASS?gameable; all = everything). Drop items whose run dir no longer exists on disk (they were reaped) — note how many you dropped in a final check by listing them, but only return existing ones.`,
   { label: 'inventory', phase: 'Inventory', schema: INVENTORY_SCHEMA, effort: 'low' })
 if (!inv || !inv.items.length) return { id: argv.id, top_mechanism: null, note: 'no autopsy items (nothing failed, or run dirs were reaped)' }
 const items = inv.items.slice(0, LIMIT)
@@ -79,7 +80,7 @@ Investigate the run dir: read ${it.run_dir}/.plan.log; run (read-only) git -C ${
 Classify the PRIMARY mechanism from this taxonomy (secondary mechanisms allowed):
 ${taxText}
 RULES: every classification needs at least one VERBATIM quote from the run artifacts (schema requires it). If the evidence genuinely fits none, use 'other'. If the log shows the model was never exercised (connection/pull errors), use 'ops-noise'. Report confidence honestly — a verifier re-reads anything below ${FLOOR}.
-GROUND TRUTH CHECK (this item's own \`behavioral\` field above is authoritative — it is what the sweep actually recorded, not something to re-derive): 'grading-integrity' means the sweep recorded a PASS or PASS?gameable that should NOT have been one. If \`item.behavioral\` is FAIL, this item was NOT graded PASS — do not classify it as 'grading-integrity' on the theory that "the sweep should have recorded PASS but I think it's really broken" or similar; a FAIL item with genuinely bad code is a worker-quality mechanism (worker-ignores-scope, worker-spurious-edits, fail-stop, etc.), never grading-integrity. If you believe the recorded behavioral is itself wrong for some OTHER reason, that claim requires literally reproducing the grade yourself (checkout the final crew/* branch, drop the real grade_spec.rs into tests/, run \`cargo test --test grade_spec\`, and quote the actual exit result) — a diff read alone is not sufficient evidence for a grading-integrity claim, because a plausible-looking diff can still be one that correctly fails the real spec.`
+GROUND TRUTH CHECK (this item's own \`behavioral\` field above is authoritative — it is what the sweep actually recorded, not something to re-derive): 'grading-integrity' means the sweep recorded a PASS (or legacy PASS?gameable) that should NOT have been one. If \`item.behavioral\` is FAIL, this item was NOT graded PASS — do not classify it as 'grading-integrity' on the theory that "the sweep should have recorded PASS but I think it's really broken" or similar; a FAIL item with genuinely bad code is a worker-quality mechanism (worker-ignores-scope, worker-spurious-edits, fail-stop, etc.), never grading-integrity. If you believe the recorded behavioral is itself wrong for some OTHER reason, that claim requires literally reproducing the grade yourself (checkout the final crew/* branch, run the canonical grader \`newt-eval grade --case <task> --workspace <dir> --json\`, and quote its behavioral record) — a diff read alone is not sufficient evidence for a grading-integrity claim, because a plausible-looking diff can still be one that correctly fails the real spec.`
 const chunk = (arr, n) => arr.reduce((a, x, i) => ((i % n ? a[a.length - 1].push(x) : a.push([x])), a), [])
 let classified = []
 for (const batch of chunk(items, 8)) {

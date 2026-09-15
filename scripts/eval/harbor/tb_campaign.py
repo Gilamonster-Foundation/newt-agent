@@ -2,11 +2,18 @@
 """tb_campaign.py — trial records and the report table for tb-campaign.sh (#2318).
 
     tb_campaign.py ingest <job_dir> <cell.json> <out_dir>   # append trials.jsonl + cells.jsonl
+    tb_campaign.py cell-line <cell.json> <out_dir>          # append a skipped cell to cells.jsonl
     tb_campaign.py table <out_dir> [--pair]                # markdown matrix [+ treatment vs none]
     tb_campaign.py cell <cell.json> <treatment|none> key value ...   # write a cell binding
     tb_campaign.py profile <treatment|none> <model> <in> <out>       # newt profile + env lines
     tb_campaign.py pin-check <out_dir> <cell.json>         # exit 3 naming the fields that differ
     tb_campaign.py pinned-version <out_dir> <harness>      # the version pi/codex must install
+    tb_campaign.py plan <task-set.json> <trials>           # "<task> <attempt>" lines, in run order
+    tb_campaign.py job-state <trial_job_dir>               # absent / partial / done
+    tb_campaign.py window <schedule> [epoch]               # "<window id> <end epoch>", exit 1 outside
+    tb_campaign.py deadline-cancels <cell_dir> <trial_job> # prior deadline cancels of one attempt
+    tb_campaign.py ledger-add <out_dir> <trial_job_dir> key value ...  # append one trial's GPU-hour line
+    tb_campaign.py ledger-check <out_dir> <ceiling_h>      # exit 3 at the ceiling, 2 on a tampered line
 
 Every trial directory Harbor created becomes one row, graded or not. A cell's
 expected count comes from the task set, so a trial Harbor never produced is
@@ -22,22 +29,28 @@ attempt counts once; tasks carry equal attempts by design.
 
 from __future__ import annotations
 
+import functools
+import getpass
 import hashlib
+import ipaddress
 import json
 import math
+import os
 import random
 import re
+import socket
 import statistics
 import sys
 import tomllib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
-from pi_log import inference_failure
+from pi_log import pi_awaiting, pi_inference_failure, pi_session_claim, session_messages
 from pi_log import records as _records
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # scripts/eval: the shared trial reader
-from bench_scoreboard import trial_record, verdict  # noqa: E402
+from bench_scoreboard import trial_cid, trial_record, verdict  # noqa: E402
 
 SUITE = "terminal-bench"
 
@@ -68,24 +81,135 @@ INFRA_TEXT = re.compile(
 )
 
 
-def error_cause(exception, exit_code, harness_error, pi_failure, responses):
+def error_cause(exception, exit_code, harness_error, pi_failure, responses, waiting_on=None):
     """infra / agent / unknown for a trial that raised or failed inference; None otherwise.
     `harness_error` is the harness's own terminal error text (newt solve_result,
-    codex turn.failed), never Harbor's stdout tail, which carries model chatter."""
+    codex turn.failed), never Harbor's stdout tail, which carries model chatter.
+    `waiting_on` is what the harness's own log says it was waiting on at the end:
+    a timeout while waiting on the MODEL is unknown (a lost or stalled request is
+    not provably the agent's), while one blocked on its own tool stays agent."""
     if not exception and not pi_failure:
         return None
     if pi_failure or exception in INFRA_EXCEPTIONS or exit_code == 137 or INFRA_TEXT.search(harness_error or ""):
         return "infra"
     if exception in ("unreadable result.json", "malformed reward"):  # trial_record's own: not the agent's
         return "unknown"
+    if exception == TIMEOUT and waiting_on == "model":
+        return "unknown"
     if exception in AGENT_EXCEPTIONS or responses:
         return "agent"
     return "unknown"
 
 
-def harness_evidence(harness, lines):
+# Rows and cells reach commits, report tables and cards. Free text copied from a
+# harness or provider is scrubbed as it is written, after classification: newt's
+# failed request names the request URL, and a provider's error body can name an
+# account. Identity and join fields (campaign, model, harness, job, task,
+# harness_version) are never touched, so tables still join and pins still install.
+FREE_TEXT = ("harness_error", "harness_config", "inference_failure", "refusal", "claim_source", "skipped")
+FREE_TEXT_MAX = 300
+# Generic shapes, for addresses this machine does not know about. The operator's
+# own names are matched as literals (local_literals), which also catches them
+# unbracketed, portless, escaped or %-encoded.
+ADDRESS = re.compile(
+    r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'()<>]+"  # URL
+    r"|\[[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*\](?::\d+)?"  # bracketed IPv6 literal (not error[E0308])
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b"  # IPv4
+    # host:port with a dotted host or localhost (not status:429 or src/main.rs:42:5)
+    r"|(?<![\w./-])(?:localhost|[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)+):\d{2,5}(?![\d:])"
+    r"|/(?:home|Users)/[^/\s\"']+"  # home dir
+)
+ACCOUNT_MIN = 5  # ponytail: a shorter account (dev, app, newt) is only caught inside its home dir
+
+
+@functools.lru_cache(maxsize=None)
+def _addresses(host):
+    try:
+        ipaddress.ip_address(host)
+        return {host}
+    except ValueError:
+        pass
+    try:
+        return {host} | {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except (OSError, UnicodeError):  # an empty or overlong label cannot be encoded
+        return {host}
+
+
+def local_literals(base_url=None):
+    """(tokens, words, home): the endpoint host tb-campaign.sh exports in
+    TB_LOCAL_BASE_URL with its addresses (plain substrings, so escaped and
+    %-encoded forms are caught), this machine's hostname and the account (whole
+    words only), and the home dir. Names too short to be distinctive are left out."""
+    host = urlparse(base_url or os.environ.get("TB_LOCAL_BASE_URL", "")).hostname
+    tokens = {t for t in (_addresses(host) if host else set()) if len(t) >= 3}
+    hostname, account, home = socket.gethostname(), getpass.getuser(), str(Path.home())
+    words = {w for w in (hostname,) if len(w) >= 3} | ({account} if len(account) >= ACCOUNT_MIN else set())
+    return tokens, words, (home if len(home) >= ACCOUNT_MIN and home not in ("/", "~") else None)
+
+
+def scrub(value, literals=None):
+    """First line, with no address, local name or home dir, then bounded."""
+    literals = literals or local_literals()
+    if isinstance(value, dict):
+        return {k: scrub(v, literals) for k, v in value.items()}
+    if isinstance(value, list):
+        return [scrub(v, literals) for v in value]
+    if not isinstance(value, str):
+        return value
+    tokens, words, home = literals
+    text = (value.strip().splitlines() or [""])[0]
+    text = text.replace(home, "<redacted>") if home else text
+    for token in sorted(tokens, key=len, reverse=True):
+        text = text.replace(token, "<redacted>")
+    for word in sorted(words, key=len, reverse=True):
+        text = re.sub(rf"(?<![\w-]){re.escape(word)}(?![\w-])", "<redacted>", text)
+    return ADDRESS.sub("<redacted>", text)[:FREE_TEXT_MAX]
+
+
+def redact(record, literals=None):
+    literals = literals or local_literals()
+    return {k: scrub(v, literals) if k in FREE_TEXT else v for k, v in record.items()}
+
+
+def write_cell(out: Path, cell, observed):
+    """The one writer of cells.jsonl lines, for ingested and skipped cells alike."""
+    with open(out / "cells.jsonl", "a") as f:
+        f.write(json.dumps(redact({**cell, "observed": observed})) + "\n")
+
+
+def pi_session_lines(agent_dir: Path):
+    """pi's own session JSONL (--session-dir /logs/agent/pi/sessions), newest last."""
+    files = sorted((agent_dir / "pi" / "sessions").rglob("*.jsonl")) if (agent_dir / "pi").is_dir() else []
+    return files[-1].read_text(errors="replace").splitlines() if files else []
+
+
+def awaiting(harness, lines, session_lines):
+    """What the harness was waiting on when its log ends: `model`, `tool`, or None."""
+    if harness == "pi":
+        return pi_awaiting(lines, session_lines)
+    if harness == "codex":
+        events = [o for o in _records(lines) if o.get("type") in ("turn.started", "item.started", "item.completed")]
+        if not events:
+            return None
+        last = events[-1]
+        if last["type"] == "item.started":
+            return "tool"
+        if last["type"] == "turn.started" or (last.get("item") or {}).get("type") != "agent_message":
+            return "model"
+    # newt writes its whole events file only after the turn ends (solve.rs, the
+    # `--events` append after the contract record), so a newt run killed by the
+    # agent timeout leaves no log: there is nothing to read, and with no replies
+    # on record its timeout is unknown, the same as any harness with no log.
+    return None
+
+
+def harness_evidence(harness, lines, session_lines=()):
     """(model replies received, the harness's own terminal error text) from its log."""
     records = list(_records(lines))
+    if harness == "pi" and session_lines:
+        replies = sum(m.get("role") == "assistant" and m.get("stopReason") not in ("error", "aborted")
+                      for m in session_messages(session_lines))
+        return replies, None
     if harness == "newt":
         replies = sum(o.get("kind") == "chat_completion_finish" for o in records)
         errors = [o.get("error") for o in records if o.get("kind") == "solve_result"]
@@ -116,6 +240,19 @@ def newt_status(lines):
     return status
 
 
+NOT_DONE_END = ("RepairExhausted", "VerificationIncomplete")
+
+
+def newt_end_reason(lines):
+    """newt's `solve_result.end_reason`, recorded as Rust Debug text: Some(X) is X."""
+    end = None
+    for o in _records(lines):
+        if o.get("kind") == "solve_result":
+            end = o.get("end_reason")
+    found = re.fullmatch(r"Some\((\w+)\)", end or "")
+    return found.group(1) if found else None
+
+
 def newt_claim(lines):
     """The contract's `outcome` says a terminal state was reached, not that the
     work is done: a run newt marks `status: incomplete` (#2315's RepairExhausted,
@@ -128,7 +265,7 @@ def newt_claim(lines):
     if outcome is None:
         return None
     status = newt_status(lines)
-    claimed = outcome == "completed" and status in ("completed", None)
+    claimed = outcome == "completed" and status in ("completed", None) and newt_end_reason(lines) not in NOT_DONE_END
     return claimed, f"contract outcome={outcome}, solve_result status={status}"
 
 
@@ -163,7 +300,11 @@ CLAIM = {
 def claim(harness, agent_dir: Path, exception):
     parse, name = CLAIM[harness]
     log = agent_dir / name
-    found = parse(log.read_text(errors="replace").splitlines()) if log.exists() else None
+    session = pi_session_lines(agent_dir) if harness == "pi" else []
+    if session:  # pi.txt's tail is unreliable on a killed trial; the session is not
+        found = pi_session_claim(session)
+    else:
+        found = parse(log.read_text(errors="replace").splitlines()) if log.exists() else None
     if found:
         return found
     if exception == TIMEOUT:
@@ -175,7 +316,10 @@ def max_request_output(harness, agent_dir: Path):
     """Largest output a single model request produced, where the log shows it.
     pi logs usage per assistant message; codex logs last_token_usage per request
     in its session; newt's contract only totals, so newt is None (not logged)."""
-    if harness == "pi":
+    if harness == "pi" and pi_session_lines(agent_dir):
+        outs = [(m.get("usage") or {}).get("output")
+                for m in session_messages(pi_session_lines(agent_dir)) if m.get("role") == "assistant"]
+    elif harness == "pi":
         log = agent_dir / "pi.txt"
         lines = log.read_text(errors="replace").splitlines() if log.exists() else []
         outs = [
@@ -219,13 +363,17 @@ REFUSAL = re.compile(r"required feature `[a-z_]+` is [a-z_]+: [^\n]*")
 TREATMENT_ENV = {
     "NEWT_BENCH_SMART", "NEWT_BENCH_SELF_VERIFY", "NEWT_BENCH_MAX_ROUNDS",
     "NEWT_BENCH_TENACITY", "NEWT_BENCH_CONTEXT_WINDOW", "NEWT_BENCH_OCAP",
+    "NEWT_BENCH_VERIFY_OUTCOMES",
 }
-NONE = {"name": "none", "sha256": None, "profile": "", "env": {}, "expect": {}, "requires": []}
+# none is newt's shipped defaults, whose self-verify gate is on (#1961): a newt
+# baseline receipt that says otherwise did not run the baseline.
+NONE = {"name": "none", "sha256": None, "profile": "", "env": {}, "expect": {"receipt.verification.mode": "attempted"},
+        "requires": []}
 
 
 def load_treatment(path):
     if str(path) in ("", "none"):
-        return dict(NONE)
+        return {**NONE, "expect": dict(NONE["expect"])}
     raw = Path(path).read_bytes()
     t = tomllib.loads(raw.decode())
     if set(t) - TREATMENT_KEYS or not t.get("description"):
@@ -278,11 +426,33 @@ def observed(expect, record):
 PINNED = ("task_set_sha256", "engine", "ctx_served", "newt_binary_sha256", "instrument_commit")
 
 
+def fingerprint(model):
+    """One served model's identity from `/v1/models`: the server's own metadata,
+    the GGUF basename (the full path carries a local username), and the
+    chat-template kwargs its router preset or args set — where the thinking
+    switch lives for every harness alike. Absent kwargs are recorded as None."""
+    status = model.get("status") or {}
+    args = status.get("args") or []
+    preset = {}
+    for line in (status.get("preset") or "").splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            preset[key.strip()] = value.strip()
+    path = args[args.index("--model") + 1] if "--model" in args else preset.get("model")
+    kwargs = args[args.index("--chat-template-kwargs") + 1] if "--chat-template-kwargs" in args \
+        else preset.get("chat-template-kwargs")
+    try:
+        kwargs = json.loads(kwargs) if kwargs is not None else None
+    except ValueError:
+        pass  # an unparseable value is still compared as served
+    return dict(model.get("meta") or {}, gguf=Path(path).name if path else None, chat_template_kwargs=kwargs)
+
+
 def pin_mismatch(pin, cell):
     bad = [k for k in PINNED if pin.get(k) != cell.get(k)]
-    fp = (pin.get("models") or {}).get(cell["model"])
-    if fp is not None and fp != cell.get("model_fingerprint"):
-        bad.append("model_fingerprint")
+    fp, now = (pin.get("models") or {}).get(cell["model"]), cell.get("model_fingerprint") or {}
+    if fp is not None and fp != now:
+        bad += [f"model_fingerprint.{k}" for k in sorted(set(fp) | set(now)) if fp.get(k) != now.get(k)]
     version = (pin.get("harness_versions") or {}).get(cell["harness"])
     if version and cell.get("harness_version") and version != cell["harness_version"]:
         bad.append("harness_version")
@@ -347,11 +517,14 @@ def trial_row(harness, trial: Path, expect=None):
     # untouched workspace. That is an apparatus error, not a model result.
     log = trial / "agent" / CLAIM[harness][1]
     lines = log.read_text(errors="replace").splitlines() if log.exists() else []
-    infra = inference_failure(lines) if harness == "pi" else None
-    replies, harness_error = harness_evidence(harness, lines)
+    session = pi_session_lines(trial / "agent") if harness == "pi" else []
+    infra = pi_inference_failure(lines, session) if harness == "pi" else None
+    replies, harness_error = harness_evidence(harness, lines, session)
+    waiting_on = awaiting(harness, lines, session)
     exit_code = re.search(r"exit (\d+)", (r.get("exception_info") or {}).get("exception_message") or "")
     refused = refusal((r.get("exception_info") or {}).get("exception_message")) if harness == "newt" else None
-    cause = None if refused else error_cause(exc, exit_code and int(exit_code.group(1)), harness_error, infra, replies)
+    cause = None if refused else error_cause(exc, exit_code and int(exit_code.group(1)), harness_error, infra, replies,
+                                             waiting_on)
     # A refused requirement never ran the model: not graded, not an error to classify.
     state = "refused" if refused else "error" if infra else rec["state"]
     claimed, claim_source = claim(harness, trial / "agent", exc)
@@ -372,7 +545,7 @@ def trial_row(harness, trial: Path, expect=None):
             harness_config = o.get("effective_config") or harness_config
             contract = o if "outcome" in o else contract
         tokens_out = timing.get("gen_tokens")
-    return {
+    return redact({
         "trial": rec["trial"],
         "task": rec["task"],
         "task_checksum": r.get("task_checksum"),
@@ -383,6 +556,7 @@ def trial_row(harness, trial: Path, expect=None):
         "treatment_observed": observed(expect, contract),
         "harness_status": newt_status(lines) if harness == "newt" else None,
         "harness_outcome": (contract or {}).get("outcome"),
+        "harness_end_reason": newt_end_reason(lines) if harness == "newt" else None,
         "result": bool(r),
         "exception": exc,
         "reward": reward,
@@ -391,6 +565,7 @@ def trial_row(harness, trial: Path, expect=None):
         "inference_failure": infra,
         "refusal": refused,
         "error_cause": cause,
+        "waiting_on": waiting_on,
         "model_replies": replies,
         "harness_error": harness_error,
         "resolved": verdict(reward, rec["source"] or SUITE) == "resolved",
@@ -401,7 +576,126 @@ def trial_row(harness, trial: Path, expect=None):
         "tokens_source": source,
         "max_request_output_tokens": max_request_output(harness, trial / "agent"),
         "agent_s": _seconds(r.get("agent_execution")),
-    }
+    })
+
+
+# ── one Harbor job per trial ─────────────────────────────────────────────────
+# Harbor 0.20 has no stop-after-this-trial: resuming a job deletes any trial dir
+# without result.json (job.py), and SIGTERM cancels the in-flight trial
+# (cli/jobs.py). So each trial is its own Harbor job, <cell>/<task>__a<attempt>,
+# and the process boundary is the trial boundary.
+INTERRUPTED = "interrupted"
+
+
+def trial_plan(tasks, trials):
+    """Run order: every task's first attempt before any task's second."""
+    return [(task, k) for k in range(1, trials + 1) for task in tasks]
+
+
+def job_state(results, exhausted=False):
+    """A trial job from its trial dirs' parsed result.json (None when absent):
+    `done` once a non-cancelled result exists (an errored trial is a recorded
+    attempt, never re-run) or its attempt is deadline-exhausted, `partial` when a
+    dir holds no usable result, else `absent`."""
+    if exhausted or any(r is not None and ((r.get("exception_info") or {}).get("exception_type") != "CancelledError")
+           for r in results):
+        return "done"
+    return "partial" if results else "absent"
+
+
+# ── windows and the hard deadline ────────────────────────────────────────────
+# The inference box is the maintainer's outside declared windows. ONE schedule file is the
+# only source: "<days> <HH:MM start> <HH:MM end>" per line, days from
+# mon..sun, an end at or before the start running past midnight. A timer only
+# wakes the runner; the runner decides.
+DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+EXHAUSTED = ".deadline-exhausted"
+
+
+def parse_schedule(text):
+    windows = []
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        try:
+            days, start, end = line.split()
+            day_ids = {DAYS.index(d) for d in days.split(",")}
+            start_m, end_m = (int(h) * 60 + int(m) for h, m in (t.split(":") for t in (start, end)))
+            if not (0 <= start_m < 1440 and 0 < end_m <= 1440):
+                raise ValueError("time out of range")
+        except ValueError as e:
+            raise ValueError(f"schedule line {n}: {raw!r}") from e
+        windows.append((day_ids, start_m, end_m))
+    return windows
+
+
+def window_at(schedule, now):
+    """(window id, window end) for the window containing `now`, else None."""
+    for day_ids, start_m, end_m in schedule:
+        for back in (0, 1):  # a window that opened yesterday may still be open
+            day = datetime.combine(now.date() - timedelta(days=back), datetime.min.time())
+            if day.weekday() not in day_ids:
+                continue
+            start = day + timedelta(minutes=start_m)
+            end = day + timedelta(minutes=end_m if end_m > start_m else end_m + 1440)
+            if start <= now < end:
+                return f"{start:%Y-%m-%dT%H:%M}", end
+    return None
+
+
+def deadline_cancels(archived_names, trial_job):
+    """How many times this attempt was already cancelled at a hard deadline."""
+    return sum(n.startswith(trial_job + ".") and n.endswith(".deadline") for n in archived_names)
+
+
+# ── GPU-hour ledger ──────────────────────────────────────────────────────────
+# One append-only {cid, record} line per trial run, addressed through the same
+# encoder as bench_scoreboard's trial store (newt_conformance: CIDv1 / dag-cbor /
+# BLAKE3). A GPU-hour is a wall hour of the serial inference box, so wall_s is
+# the runner's own clock around the Harbor process, setup and verifier included.
+LEDGER = "ledger.jsonl"
+
+
+def ledger_entry(record):
+    return {"cid": trial_cid(record), "record": record}
+
+
+def ledger_total_s(entries):
+    """Total wall seconds; a line whose record no longer matches its cid refuses."""
+    total = 0.0
+    for n, entry in enumerate(entries, 1):
+        if trial_cid(entry["record"]) != entry["cid"]:
+            raise ValueError(f"ledger line {n}: record does not match its cid {entry['cid']}")
+        total += float(entry["record"].get("wall_s") or 0)
+    return total
+
+
+def ceiling_reached(total_s, ceiling_h):
+    return ceiling_h is not None and total_s >= float(ceiling_h) * 3600
+
+
+def _json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def is_trial_config(config):
+    return isinstance(config, dict) and "task" in config
+
+
+def trial_dirs(root: Path):
+    """Every Harbor trial dir under a cell: directly inside it (one job per cell)
+    or one level down (one job per trial). Archived interruptions are not rows."""
+    found = []
+    for d in sorted(p for p in root.iterdir() if p.is_dir() and p.name != INTERRUPTED):
+        if is_trial_config(_json(d / "config.json")) or not (d / "config.json").exists() and (d / "agent").is_dir():
+            found.append(d)
+        else:
+            found += [t for t in sorted(p for p in d.iterdir() if p.is_dir())]
+    return found
 
 
 def ingest(job_dir: Path, cell_json: Path, out: Path):
@@ -409,8 +703,15 @@ def ingest(job_dir: Path, cell_json: Path, out: Path):
     rows = [
         {**{k: cell.get(k) for k in ("campaign", "model", "harness", "job")},
          **trial_row(cell["harness"], t, cell.get("treatment_expect"))}
-        for t in sorted(p for p in job_dir.iterdir() if p.is_dir())
+        for t in trial_dirs(job_dir)
     ]
+    for row, t in zip(rows, trial_dirs(job_dir)):
+        # The attempt was cancelled at a hard deadline twice: final, and the
+        # agent's (a runaway), never a silent infra retry.
+        if Path(str(t.parent) + EXHAUSTED).exists():
+            row.update(state="error", error_cause="agent", exception="DeadlineExhausted", resolved=False)
+    archived = job_dir / INTERRUPTED
+    cell["interrupted"] = len([p for p in archived.iterdir() if p.is_dir()]) if archived.is_dir() else 0
     if not cell.get("harness_version") and rows:
         cell["harness_version"] = rows[0]["harness_version"]
     if rows and all(r["state"] == "refused" for r in rows):  # admission is per run, so it refuses every trial
@@ -423,8 +724,7 @@ def ingest(job_dir: Path, cell_json: Path, out: Path):
             pin_path.write_text(json.dumps(pin_extend(pin, cell), indent=1, sort_keys=True))
     with open(out / "trials.jsonl", "a") as f:
         f.writelines(json.dumps(row) + "\n" for row in rows)
-    with open(out / "cells.jsonl", "a") as f:
-        f.write(json.dumps({**cell, "observed": len(rows)}) + "\n")
+    write_cell(out, cell, len(rows))
 
 
 def wilson(k, n, z=1.96):
@@ -481,6 +781,7 @@ def summarize(cell, rows):
         ),
         "model_mismatches": sum(r["model_effective"] not in (None, cell["model"]) for r in rows),
         "not_observed": sum(r.get("treatment_observed") is False for r in rows),
+        "verification_ended": tuple(sum(r.get("harness_end_reason") == e for r in rows) for e in NOT_DONE_END),
         "terminal_not_done": sum(r.get("harness_outcome") == "completed"
                                  and r.get("harness_status") not in (None, "completed") for r in rows),
         "tokens_in": (sum(known_in), len(known_in)),
@@ -597,8 +898,8 @@ def table(out: Path, paired_report=False):
     trials = out / "trials.jsonl"
     rows = list(_records(trials.read_text().splitlines())) if trials.exists() else []
     lines = [
-        "| model | harness | expected / observed / graded / error | resolved / n, rate [95% Wilson]: trials with any exception excluded | resolved / n, rate [95% Wilson]: agent-caused exceptions counted as failures (infra, unknown excluded) | claimed done | terminal but newt says not done | false completions | false incompletes | unrecoverable claims | exceptions: infra / agent / unknown | inference errors (ungraded) | agent timeouts | largest single-request output | ran another model | treatment declared but not observed | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| model | harness | expected / observed / graded / error | interrupted (archived, re-run) | resolved / n, rate [95% Wilson]: trials with any exception excluded | resolved / n, rate [95% Wilson]: agent-caused exceptions counted as failures (infra, unknown excluded) | claimed done | terminal but newt says not done | newt verification ended: repair exhausted / incomplete | false completions | false incompletes | unrecoverable claims | exceptions: infra / agent / unknown | inference errors (ungraded) | agent timeouts | largest single-request output | ran another model | treatment declared but not observed | tokens in (n known) | tokens out (n known) | agent s median / total | out tok per agent-s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     # The last record per job wins: a cell skipped once and run later shows the run.
     cells = {c["job"]: c for c in _records((out / "cells.jsonl").read_text().splitlines())}
@@ -620,11 +921,11 @@ def table(out: Path, paired_report=False):
         fc = f"{s['false_completions']}/{s['claimed']}" if s["claimed"] else "0/0"
         big = f"{s['max_request_output']:,}" if s["max_request_output"] is not None else "not logged"
         treat = cell.get("treatment") or "none"
-        seen = "n/a" if treat == "none" or not cell.get("treatment_expect") else s["not_observed"]
+        seen = "n/a" if cell["harness"] != "newt" or not cell.get("treatment_expect") else s["not_observed"]
         tin, tout = (f"{t[0]:,} ({t[1]})" if t[1] else "— (0)" for t in (s["tokens_in"], s["tokens_out"]))
         lines.append(
             f"| {cell['model']} | {cell['harness']} {cell.get('harness_version') or ''} [{treat}] "
-            f"| {s['expected']} / {s['observed']} / {g} / {s['errors']} | {rate(s['rate_excl'])} | {rate(s['rate_agent_fail'])} | {s['claimed']} | {s['terminal_not_done']} | {fc} "
+            f"| {s['expected']} / {s['observed']} / {g} / {s['errors']} | {cell.get('interrupted') or 0} | {rate(s['rate_excl'])} | {rate(s['rate_agent_fail'])} | {s['claimed']} | {s['terminal_not_done']} | {'/'.join(map(str, s['verification_ended']))} | {fc} "
             f"| {s['false_incompletes']} | {s['unrecoverable_claims']} | {s['exceptions']}: {'/'.join(map(str, s['causes']))} | {s['inference_errors']} | {s['agent_timeouts']} | {big} | {s['model_mismatches']} | {seen} | {tin} "
             f"| {tout} | {med} / {s['agent_s_total']:.0f} | {tps} |"
         )
@@ -637,6 +938,8 @@ if __name__ == "__main__":
     cmd, *args = sys.argv[1:]
     if cmd == "ingest":
         ingest(Path(args[0]), Path(args[1]), Path(args[2]))
+    elif cmd == "cell-line":  # a skipped cell, through the same redaction as an ingested one
+        write_cell(Path(args[1]), json.loads(Path(args[0]).read_text()), 0)
     elif cmd == "table":
         table(Path(args[0]), "--pair" in args[1:])
     elif cmd == "cell":
@@ -647,6 +950,46 @@ if __name__ == "__main__":
         print("\n".join(f"{k}={v}" for k, v in sorted(treatment_env(t).items())))
     elif cmd == "pin-check":
         sys.exit(pin_check(Path(args[0]), Path(args[1])))
+    elif cmd == "plan":  # "<task> <attempt> <dataset path>"
+        paths = {t: d["path"] for d in json.loads(Path(args[0]).read_text())["datasets"] for t in d["task_names"]}
+        print("\n".join(f"{task} {k} {paths[task]}" for task, k in trial_plan(list(paths), int(args[1]))))
+    elif cmd == "job-state":
+        job = Path(args[0])
+        dirs = [d for d in job.iterdir() if d.is_dir()] if job.is_dir() else []
+        print(job_state([_json(d / "result.json") for d in dirs], exhausted=Path(str(job) + EXHAUSTED).exists()))
+    elif cmd == "window":
+        now = datetime.fromtimestamp(float(args[1])) if len(args) > 1 else datetime.now()
+        found = window_at(parse_schedule(Path(args[0]).read_text()), now)
+        if not found:
+            sys.exit(1)
+        print(found[0], int(found[1].timestamp()))
+    elif cmd == "ledger-add":
+        out, job = Path(args[0]), Path(args[1])
+        path = out / LEDGER
+        entries = [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
+        prior = ledger_total_s(entries)
+        record = dict(zip(args[2::2], args[3::2]))
+        results = [_json(d / "result.json") for d in job.iterdir() if d.is_dir()] if job.is_dir() else []
+        spans = [_seconds((r or {}).get("agent_execution")) for r in results]
+        record.update(attempt=int(record["attempt"]), wall_s=float(record["wall_s"]),
+                      agent_s=next((x for x in spans if x is not None), None),
+                      cumulative_wall_h=round((prior + float(record["wall_s"])) / 3600, 4))
+        with open(path, "a") as f:
+            f.write(json.dumps(ledger_entry(record), sort_keys=True) + "\n")
+        print(record["cumulative_wall_h"])
+    elif cmd == "ledger-check":
+        path = Path(args[0]) / LEDGER
+        entries = [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
+        try:
+            total = ledger_total_s(entries)
+        except ValueError as e:
+            print(e)
+            sys.exit(2)
+        print(round(total / 3600, 4))
+        sys.exit(3 if ceiling_reached(total, args[1]) else 0)
+    elif cmd == "deadline-cancels":
+        archived = Path(args[0]) / INTERRUPTED
+        print(deadline_cancels([p.name for p in archived.iterdir()] if archived.is_dir() else [], args[1]))
     elif cmd == "pinned-version":
         path = Path(args[0]) / "campaign.pin.json"
         print(((json.loads(path.read_text()) if path.exists() else {}).get("harness_versions") or {}).get(args[1], ""))

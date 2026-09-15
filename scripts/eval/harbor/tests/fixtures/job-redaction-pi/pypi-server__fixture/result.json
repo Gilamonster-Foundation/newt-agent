@@ -1,0 +1,1 @@
+{"trial_name": "pypi-server__fixture", "task_name": "pypi-server", "agent_info": {"name": "pi", "version": "0.85.1", "model_info": {"name": "coder-1.2.3.4"}}, "verifier_result": {"rewards": {"reward": 0.0}}}
