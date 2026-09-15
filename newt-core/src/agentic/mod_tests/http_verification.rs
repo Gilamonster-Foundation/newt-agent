@@ -92,10 +92,10 @@ async fn run_openai_script_in(script: Vec<serde_json::Value>, workspace: &str) -
 #[tokio::test]
 #[serial_test::serial(newt_self_verify_env)]
 async fn an_armed_self_verify_gate_adds_a_round_when_the_workspace_ships_a_check() {
-    // #2374: this pins the DEFAULT (attempted) mode. Serial with every writer of
-    // the two switches, and both pinned, so a sibling test holding the
-    // result-aware switch cannot turn this into a 4-request run.
-    struct Restore([(&'static str, Option<std::ffi::OsString>); 2]);
+    // #2374: this pins the DEFAULT (attempted) mode, which `ctx` builds with
+    // `verify_outcomes: false`; no loop reads NEWT_VERIFY_OUTCOMES. Serial with
+    // the other writers of NEWT_SELF_VERIFY.
+    struct Restore([(&'static str, Option<std::ffi::OsString>); 1]);
     impl Drop for Restore {
         fn drop(&mut self) {
             for (key, value) in &self.0 {
@@ -106,10 +106,8 @@ async fn an_armed_self_verify_gate_adds_a_round_when_the_workspace_ships_a_check
             }
         }
     }
-    let _restore =
-        Restore(["NEWT_SELF_VERIFY", "NEWT_VERIFY_OUTCOMES"].map(|k| (k, std::env::var_os(k))));
+    let _restore = Restore(["NEWT_SELF_VERIFY"].map(|k| (k, std::env::var_os(k))));
     std::env::set_var("NEWT_SELF_VERIFY", "1");
-    std::env::remove_var("NEWT_VERIFY_OUTCOMES");
     // The model answers without ever running a command, three times running.
     // Armed, the gate hands it another round each time — and then STOPS at
     // `SELF_VERIFY_CAP` (2), so a model that will not verify still ends its

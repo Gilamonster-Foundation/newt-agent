@@ -645,11 +645,17 @@ pub fn workspace_entries(dir: &std::path::Path) -> Vec<String> {
 use crate::ExecOutcome;
 use content_addressable::{ContentAddressable, ContentId, RawContentId};
 
-/// Is the result-aware mode requested? **OFF by default**: only `1`, `on` and
-/// `true` enable it. It is a mode of the gate, so it also needs [`enabled`].
+/// Is the result-aware mode requested (`NEWT_VERIFY_OUTCOMES`)? Hosts read it
+/// once per turn into `ChatCtx`. It is a mode of the gate, so it also needs
+/// [`enabled`].
 pub fn outcomes_enabled() -> bool {
-    std::env::var("NEWT_VERIFY_OUTCOMES")
-        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
+    outcomes_switch(std::env::var("NEWT_VERIFY_OUTCOMES").ok().as_deref())
+}
+
+/// How a `NEWT_VERIFY_OUTCOMES` value reads. **OFF by default**: only `1`,
+/// `on` and `true` enable it.
+fn outcomes_switch(value: Option<&str>) -> bool {
+    value.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
 }
 
 /// Whether a turn on `kind` has a self-verify gate at all (#2374): SmartHarness

@@ -285,25 +285,19 @@ fn the_verification_receipt_names_the_mode_the_gate_runs_in() {
     );
 }
 
-#[serial_test::serial(newt_self_verify_env)]
+/// The switch is opt-in. Pure: no test writes the process env, so the hosts
+/// that read it each turn never race one.
 #[test]
 fn the_outcomes_policy_is_opt_in() {
-    let saved = std::env::var_os("NEWT_VERIFY_OUTCOMES");
-    std::env::remove_var("NEWT_VERIFY_OUTCOMES");
-    assert!(!outcomes_enabled(), "unset is off");
+    assert!(!outcomes_switch(None), "unset is off");
     for (value, on) in [
         ("1", true),
-        ("on", true),
+        (" ON ", true),
         ("true", true),
         ("0", false),
         ("banana", false),
     ] {
-        std::env::set_var("NEWT_VERIFY_OUTCOMES", value);
-        assert_eq!(outcomes_enabled(), on, "{value:?}");
-    }
-    match saved {
-        Some(v) => std::env::set_var("NEWT_VERIFY_OUTCOMES", v),
-        None => std::env::remove_var("NEWT_VERIFY_OUTCOMES"),
+        assert_eq!(outcomes_switch(Some(value)), on, "{value:?}");
     }
 }
 
