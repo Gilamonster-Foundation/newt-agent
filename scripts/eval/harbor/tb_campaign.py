@@ -39,7 +39,7 @@ import tomllib
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from pi_log import inference_failure
+from pi_log import pi_awaiting, pi_inference_failure, pi_session_claim, session_messages
 from pi_log import records as _records
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # scripts/eval: the shared trial reader
@@ -74,24 +74,55 @@ INFRA_TEXT = re.compile(
 )
 
 
-def error_cause(exception, exit_code, harness_error, pi_failure, responses):
+def error_cause(exception, exit_code, harness_error, pi_failure, responses, waiting_on=None):
     """infra / agent / unknown for a trial that raised or failed inference; None otherwise.
     `harness_error` is the harness's own terminal error text (newt solve_result,
-    codex turn.failed), never Harbor's stdout tail, which carries model chatter."""
+    codex turn.failed), never Harbor's stdout tail, which carries model chatter.
+    `waiting_on` is what the harness's own log says it was waiting on at the end:
+    a timeout while waiting on the MODEL is unknown (a lost or stalled request is
+    not provably the agent's), while one blocked on its own tool stays agent."""
     if not exception and not pi_failure:
         return None
     if pi_failure or exception in INFRA_EXCEPTIONS or exit_code == 137 or INFRA_TEXT.search(harness_error or ""):
         return "infra"
     if exception in ("unreadable result.json", "malformed reward"):  # trial_record's own: not the agent's
         return "unknown"
+    if exception == TIMEOUT and waiting_on == "model":
+        return "unknown"
     if exception in AGENT_EXCEPTIONS or responses:
         return "agent"
     return "unknown"
 
 
-def harness_evidence(harness, lines):
+def pi_session_lines(agent_dir: Path):
+    """pi's own session JSONL (--session-dir /logs/agent/pi/sessions), newest last."""
+    files = sorted((agent_dir / "pi" / "sessions").rglob("*.jsonl")) if (agent_dir / "pi").is_dir() else []
+    return files[-1].read_text(errors="replace").splitlines() if files else []
+
+
+def awaiting(harness, lines, session_lines):
+    """What the harness was waiting on when its log ends: `model`, `tool`, or None."""
+    if harness == "pi":
+        return pi_awaiting(lines, session_lines)
+    if harness == "codex":
+        events = [o for o in _records(lines) if o.get("type") in ("turn.started", "item.started", "item.completed")]
+        if not events:
+            return None
+        last = events[-1]
+        if last["type"] == "item.started":
+            return "tool"
+        if last["type"] == "turn.started" or (last.get("item") or {}).get("type") != "agent_message":
+            return "model"
+    return None
+
+
+def harness_evidence(harness, lines, session_lines=()):
     """(model replies received, the harness's own terminal error text) from its log."""
     records = list(_records(lines))
+    if harness == "pi" and session_lines:
+        replies = sum(m.get("role") == "assistant" and m.get("stopReason") not in ("error", "aborted")
+                      for m in session_messages(session_lines))
+        return replies, None
     if harness == "newt":
         replies = sum(o.get("kind") == "chat_completion_finish" for o in records)
         errors = [o.get("error") for o in records if o.get("kind") == "solve_result"]
@@ -169,7 +200,11 @@ CLAIM = {
 def claim(harness, agent_dir: Path, exception):
     parse, name = CLAIM[harness]
     log = agent_dir / name
-    found = parse(log.read_text(errors="replace").splitlines()) if log.exists() else None
+    session = pi_session_lines(agent_dir) if harness == "pi" else []
+    if session:  # pi.txt's tail is unreliable on a killed trial; the session is not
+        found = pi_session_claim(session)
+    else:
+        found = parse(log.read_text(errors="replace").splitlines()) if log.exists() else None
     if found:
         return found
     if exception == TIMEOUT:
@@ -181,7 +216,10 @@ def max_request_output(harness, agent_dir: Path):
     """Largest output a single model request produced, where the log shows it.
     pi logs usage per assistant message; codex logs last_token_usage per request
     in its session; newt's contract only totals, so newt is None (not logged)."""
-    if harness == "pi":
+    if harness == "pi" and pi_session_lines(agent_dir):
+        outs = [(m.get("usage") or {}).get("output")
+                for m in session_messages(pi_session_lines(agent_dir)) if m.get("role") == "assistant"]
+    elif harness == "pi":
         log = agent_dir / "pi.txt"
         lines = log.read_text(errors="replace").splitlines() if log.exists() else []
         outs = [
@@ -356,10 +394,12 @@ def trial_row(harness, trial: Path, expect=None):
     # untouched workspace. That is an apparatus error, not a model result.
     log = trial / "agent" / CLAIM[harness][1]
     lines = log.read_text(errors="replace").splitlines() if log.exists() else []
-    infra = inference_failure(lines) if harness == "pi" else None
-    replies, harness_error = harness_evidence(harness, lines)
+    session = pi_session_lines(trial / "agent") if harness == "pi" else []
+    infra = pi_inference_failure(lines, session) if harness == "pi" else None
+    replies, harness_error = harness_evidence(harness, lines, session)
+    waiting_on = awaiting(harness, lines, session)
     exit_code = re.search(r"exit (\d+)", (r.get("exception_info") or {}).get("exception_message") or "")
-    cause = error_cause(exc, exit_code and int(exit_code.group(1)), harness_error, infra, replies)
+    cause = error_cause(exc, exit_code and int(exit_code.group(1)), harness_error, infra, replies, waiting_on)
     state = "error" if infra else rec["state"]
     claimed, claim_source = claim(harness, trial / "agent", exc)
     agent = r.get("agent_result") or {}
@@ -397,6 +437,7 @@ def trial_row(harness, trial: Path, expect=None):
         "state": state,
         "inference_failure": infra,
         "error_cause": cause,
+        "waiting_on": waiting_on,
         "model_replies": replies,
         "harness_error": harness_error,
         "resolved": verdict(reward, rec["source"] or SUITE) == "resolved",

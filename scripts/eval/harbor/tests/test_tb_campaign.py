@@ -9,8 +9,10 @@ import tomllib
 import unittest
 from pathlib import Path
 
+from pi_log import pi_inference_failure, pi_session_claim
+
 from tb_campaign import (
-    PINNED, build_cell, ceiling_reached, codex_claim, deadline_cancels, ledger_entry, ledger_total_s, fingerprint, is_trial_config, job_state, parse_schedule,
+    PINNED, awaiting, build_cell, ceiling_reached, codex_claim, deadline_cancels, ledger_entry, ledger_total_s, fingerprint, is_trial_config, job_state, parse_schedule,
     trial_plan, window_at, error_cause, harness_evidence, load_treatment, newcombe, newt_claim, observed,
     pair, pair_report, pi_claim, pin_extend, pin_mismatch, render_profile, summarize, wilson,
 )
@@ -351,6 +353,42 @@ class GpuHourLedger(unittest.TestCase):
         self.assertFalse(ceiling_reached(167.9 * 3600, 168))
         self.assertTrue(ceiling_reached(168 * 3600, 168))
         self.assertFalse(ceiling_reached(10**9, None))  # no ceiling declared
+
+
+class PiSessionLog(unittest.TestCase):
+    """Harbor pipes pi through a block-buffered grep (stdbuf applies only to tee),
+    so a KILLED pi trial's pi.txt loses up to 4 KiB of final events. pi's own
+    session JSONL is unbuffered: it decides pi's last events. Fixtures are the real
+    tails of pypi-server__N4dSxtG (2026-09-14 baseline), whose last act was a
+    foreground `python -m http.server` that never returned."""
+
+    FIX = HARBOR / "tests" / "fixtures"
+
+    def setUp(self):
+        self.session = (self.FIX / "pi-session-blocked-on-tool.jsonl").read_text().splitlines()
+        self.txt = (self.FIX / "pi-txt-truncated-tail.jsonl").read_text().splitlines()
+
+    def test_blocked_on_its_own_tool_is_agent(self):
+        self.assertEqual(awaiting("pi", self.txt, self.session), "tool")
+        self.assertEqual(error_cause("AgentTimeoutError", None, None, None, 14, "tool"), "agent")
+
+    def test_a_request_that_never_got_a_reply_is_unknown_on_timeout(self):
+        waiting_on_model = self.session[:-1]  # ends at a toolResult: the next reply never came
+        self.assertEqual(awaiting("pi", [], waiting_on_model), "model")
+        self.assertEqual(error_cause("AgentTimeoutError", None, None, None, 13, "model"), "unknown")
+        self.assertEqual(error_cause("NonZeroAgentExitCodeError", None, None, None, 13, "model"), "agent")  # timeouts only
+
+    def test_the_session_log_wins_over_a_truncated_pi_txt(self):
+        self.assertEqual(awaiting("pi", self.txt, []), "model")            # what the cut pi.txt alone says
+        self.assertEqual(awaiting("pi", self.txt, self.session), "tool")  # what happened
+        self.assertEqual(pi_inference_failure(self.txt, []), "no assistant message")  # the cut file misleads
+        self.assertIsNone(pi_inference_failure(self.txt, self.session))
+        self.assertEqual(pi_session_claim(self.session), (False, "session last assistant stopReason=toolUse"))
+
+    def test_codex_last_event_says_what_it_waits_on(self):
+        self.assertEqual(awaiting("codex", jl({"type": "turn.started"}, {"type": "item.started"}), []), "tool")
+        self.assertEqual(awaiting("codex", jl({"type": "item.completed", "item": {"type": "command_execution"}}), []), "model")
+        self.assertIsNone(awaiting("newt", jl({"kind": "chat_completion_finish"}), []))
 
 
 if __name__ == "__main__":
