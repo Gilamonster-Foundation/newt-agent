@@ -1,0 +1,40 @@
+{
+  "jobs_dir": "/var/tmp/tbench-harbor",
+  "datasets": [
+    {
+      "path": "/var/tmp/tbench-tasks/terminal-bench",
+      "task_names": [
+        "adaptive-rejection-sampler",
+        "chess-best-move",
+        "cobol-modernization",
+        "code-from-image",
+        "constraints-scheduling",
+        "count-dataset-tokens",
+        "crack-7z-hash",
+        "dna-insert",
+        "fix-git",
+        "overfull-hbox",
+        "prove-plus-comm",
+        "regex-log",
+        "break-filter-js-from-html",
+        "build-cython-ext",
+        "cancel-async-tasks",
+        "configure-git-webserver",
+        "db-wal-recovery",
+        "extract-elf",
+        "feal-differential-cryptanalysis",
+        "git-leak-recovery",
+        "kv-store-grpc",
+        "log-summary-date-ranges",
+        "nginx-request-logging",
+        "openssl-selfsigned-cert",
+        "password-recovery",
+        "path-tracing",
+        "pypi-server",
+        "regex-chess",
+        "sqlite-db-truncate",
+        "train-fasttext"
+      ]
+    }
+  ]
+}

@@ -518,6 +518,101 @@ bounded_reasoning_continuation = true
     }
 }
 
+/// #2312: a headless run can set its output allowance, and the contract says
+/// whether the server was told (`max_tokens` on the wire) or newt only reserved
+/// it locally. Every contract read is paired with the captured bodies, so an
+/// `enforced` predicted from configuration rather than the request cannot pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn solve_output_allowance_reports_server_or_local_enforcement_from_the_wire() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(CaptureThenFinish {
+            requests: requests.clone(),
+        })
+        .mount(&server)
+        .await;
+    let fixture = tempfile::tempdir().expect("temporary solve fixture");
+    let instruction_path = fixture.path().join("instruction.md");
+    std::fs::write(&instruction_path, "Finish without calling a tool.\n")
+        .expect("write solve instruction");
+
+    // A cognition-projecting endpoint takes the cap from the CLI flag; an
+    // unknown compatible endpoint takes it from `[[model_tuning]]`.
+    let projecting = format!(
+        r#"default_backend = "nemotron"
+
+[[backends]]
+name = "nemotron"
+endpoint = "{}"
+model = "{NEMOTRON_MODEL}"
+kind = "openai"
+api = "chat_completions"
+
+[backends.capability.chat_completions]
+cognition = true
+"#,
+        server.uri()
+    );
+    let unknown = format!(
+        r#"default_backend = "plain"
+
+[[backends]]
+name = "plain"
+endpoint = "{}"
+model = "plain-model"
+kind = "openai"
+api = "chat_completions"
+
+[[model_tuning]]
+model = "plain-model"
+output_allowance = 12000
+"#,
+        server.uri()
+    );
+    for (name, config, flag, enforced) in [
+        ("projecting", projecting, true, "server"),
+        ("unknown", unknown, false, "local"),
+    ] {
+        let config_path = fixture.path().join(format!("{name}.toml"));
+        let events_path = fixture.path().join(format!("events-{name}.jsonl"));
+        std::fs::write(&config_path, config).expect("write solve config");
+        let mut command = Command::cargo_bin("newt").expect("newt binary");
+        command
+            .env_remove("NEWT_TEAM")
+            .arg("--config")
+            .arg(&config_path)
+            .args(["solve", "--cwd"])
+            .arg(fixture.path())
+            .arg("--instruction-file")
+            .arg(&instruction_path)
+            .arg("--events")
+            .arg(&events_path)
+            .args(["--max-rounds", "1"]);
+        if flag {
+            command.args(["--output-allowance", "12000"]);
+        }
+        command.assert().success();
+
+        let bodies = std::mem::take(&mut *requests.lock().expect("request capture lock"));
+        assert!(!bodies.is_empty(), "{name}: the run reached the model");
+        for body in &bodies {
+            let sent = body.get("max_tokens");
+            if enforced == "server" {
+                assert_eq!(sent, Some(&serde_json::json!(12000)), "{name}: {body}");
+            } else {
+                assert_eq!(sent, None, "{name}: no cap may be sent: {body}");
+            }
+        }
+        assert_eq!(
+            contract_from(&events_path)["effective_config"]["output_allowance"],
+            serde_json::json!({"tokens": 12000, "enforced": enforced}),
+            "{name}"
+        );
+    }
+}
+
 /// #2314: a required feature this run cannot supply stops the solve before any
 /// model request, naming the feature and why. `.failure()` alone would also
 /// pass for an unknown flag, so each refusal asserts its stderr text; the twin

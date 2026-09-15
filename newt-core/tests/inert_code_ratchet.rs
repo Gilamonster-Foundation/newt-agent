@@ -47,7 +47,7 @@ use common::{for_each_production_line, production_roots, workspace_root};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-const KNOWN_INERT_UNITS: usize = 34;
+const KNOWN_INERT_UNITS: usize = 33;
 const KNOWN_SANCTIONS: usize = 16;
 const KNOWN_SCRIPT_PARSE_FAILURES: usize = 1;
 const WORKFLOW_COMPILER: &str = r#"
@@ -539,25 +539,6 @@ const DEBT: &[Unit] = &[
             site(
                 "newt-core/src/backend_probe.rs",
                 "pub pin_conflict: Option<String>"
-            ),
-        ]
-    ),
-    unit!(
-        "F12",
-        Wire,
-        "exposure planning computes hidden and token-budget telemetry that production drops.",
-        [
-            site(
-                "newt-core/src/agentic/tools/exposure.rs",
-                "pub hidden: Vec<String>"
-            ),
-            site(
-                "newt-core/src/agentic/tools/exposure.rs",
-                "pub exposed_tokens: usize"
-            ),
-            site(
-                "newt-core/src/agentic/tools/exposure.rs",
-                "pub budget_tokens: Option<usize>"
             ),
         ]
     ),
@@ -1340,7 +1321,7 @@ fn the_named_inventory_only_decreases() {
                 .filter(|unit| unit.resolution == Resolution::Document)
                 .count(),
         ),
-        (24, 8, 2),
+        (23, 8, 2),
         "the accepted WIRE/DELETE/DOCUMENT classification changed"
     );
     assert!(

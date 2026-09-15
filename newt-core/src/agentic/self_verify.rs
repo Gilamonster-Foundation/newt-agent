@@ -204,36 +204,38 @@ pub fn verify_gate_nudge(checks: &[VerifyCheck], commands: &[String]) -> Option<
 }
 
 /// The `run_command` command strings the model issued this turn, read straight
-/// from the assistant `tool_calls` in `messages` (the raw args, before the trace
+/// from the requested calls in `messages` (the raw args, before the trace
 /// digests them) — so the loop needs no separate accumulator. Pure over the JSON.
+///
+/// Both call shapes count: an assistant message's `tool_calls` (the Chat wires,
+/// arguments a JSON string or an object) and a top-level Responses
+/// `function_call` item (#2315). Reading only the first made every run on the
+/// Responses wire look unattempted.
 pub fn commands_from_messages(messages: &[serde_json::Value]) -> Vec<String> {
-    let mut out = Vec::new();
-    for m in messages {
-        let Some(calls) = m.get("tool_calls").and_then(|c| c.as_array()) else {
-            continue;
-        };
-        for call in calls {
-            let f = &call["function"];
-            if f["name"].as_str() != Some("run_command") {
-                continue;
-            }
-            // arguments is a JSON *string* (OpenAI wire) or an object.
+    let calls = messages.iter().flat_map(|m| {
+        let chat = m
+            .get("tool_calls")
+            .and_then(|c| c.as_array())
+            .into_iter()
+            .flatten()
+            .map(|call| &call["function"]);
+        let responses = (m["type"] == "function_call").then_some(m);
+        chat.chain(responses)
+    });
+    calls
+        .filter(|f| f["name"].as_str() == Some("run_command"))
+        .filter_map(|f| {
             let args = &f["arguments"];
-            let cmd = if let Some(s) = args.as_str() {
-                serde_json::from_str::<serde_json::Value>(s)
-                    .ok()
-                    .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(String::from))
-            } else {
-                args.get("command")
-                    .and_then(|c| c.as_str())
-                    .map(String::from)
-            };
-            if let Some(c) = cmd {
-                out.push(c);
+            match args.as_str() {
+                Some(s) => serde_json::from_str::<serde_json::Value>(s)
+                    .ok()?
+                    .get("command")?
+                    .as_str()
+                    .map(String::from),
+                None => args.get("command")?.as_str().map(String::from),
             }
-        }
-    }
-    out
+        })
+        .collect()
 }
 
 /// Is the self-verify gate enabled? **ON by default** (#1943), turned off with
@@ -826,6 +828,26 @@ mod tests {
         ];
         let cmds = commands_from_messages(&messages);
         assert_eq!(cmds, vec!["pytest -q".to_string(), "make test".to_string()]);
+    }
+
+    /// #2315: the Responses wire carries a requested call as a top-level
+    /// `function_call` item, not an assistant `tool_calls` entry. Reading only
+    /// `tool_calls` made every run on that wire look unattempted, so the gate
+    /// nudged a turn whose check had already run.
+    #[test]
+    fn commands_from_messages_reads_responses_function_call_items() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "fix it"}),
+            serde_json::json!({"type": "function_call", "call_id": "c1", "name": "run_command",
+                "arguments": "{\"command\": \"pytest -q\"}"}),
+            serde_json::json!({"type": "function_call", "call_id": "c2", "name": "read_file",
+                "arguments": "{\"path\": \"x\"}"}),
+            serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
+        ];
+        assert_eq!(
+            commands_from_messages(&messages),
+            vec!["pytest -q".to_string()]
+        );
     }
 
     #[test]
