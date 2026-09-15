@@ -67,7 +67,9 @@ if __name__ == "__main__":
     elif cmd == "draw":
         tasks = json.loads(Path(args[0]).read_text())
         dropped = oracle_failures(args[3]) if len(args) > 3 else set()
-        drawn = stratified_draw([t for t in tasks if t["task"] not in dropped], int(args[1]), int(args[2]))
+        valid = [t for t in tasks if t["task"] not in dropped]
+        # Declared size, or every oracle-valid task when fewer pass (tb-heldout.md).
+        drawn = stratified_draw(valid, min(int(args[1]), len(valid)), int(args[2]))
         print(json.dumps({"jobs_dir": "/var/tmp/tbench-harbor", "datasets": [
             {"path": "/var/tmp/tbench-tasks/terminal-bench", "task_names": [t["task"] for t in drawn]}]}, indent=2))
     else:

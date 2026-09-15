@@ -29,10 +29,10 @@ class HeldOut(unittest.TestCase):
             self.assertFalse(committed & set(task_names(HARBOR / exposed)), exposed)
 
     def test_draw_is_seeded_and_stratified_by_largest_remainder(self):
-        drawn = stratified_draw(tasks(33, 19), 24, 2318)
-        self.assertEqual(Counter(t["difficulty"] for t in drawn), {"medium": 15, "hard": 9})
-        self.assertEqual(drawn, stratified_draw(tasks(33, 19), 24, 2318))
-        self.assertNotEqual(drawn, stratified_draw(tasks(33, 19), 24, 1))
+        drawn = stratified_draw(tasks(33, 19), 40, 2318)
+        self.assertEqual(Counter(t["difficulty"] for t in drawn), {"medium": 25, "hard": 15})
+        self.assertEqual(drawn, stratified_draw(tasks(33, 19), 40, 2318))
+        self.assertNotEqual(drawn, stratified_draw(tasks(33, 19), 40, 1))
 
     def test_cannot_draw_more_than_the_pool(self):
         with self.assertRaises(ValueError):

@@ -18,7 +18,7 @@ Treatments may be developed, debugged and compared on these sets. **A result on 
 3. **Draw.** Run `tb_heldout.py draw tb-heldout-pool.json <size> <seed> <oracle job dir>`. It makes a seeded draw from the validated pool, stratified by each task's declared `[metadata] difficulty`, with largest-remainder allocation. The output is `tb-heldout.json`, whose sha256 becomes the campaign's `task_set_sha256`.
 4. **Freeze.** The set is never resampled. Backfill happens only by oracle-validating a replacement, and the replacement is recorded here.
 
-**Declared before any model runs on these tasks:** size **24**, seed **2318**.
+**Declared before any model runs on these tasks:** size **40**, or every oracle-valid task if fewer than 40 pass; seed **2318**. The size follows the 168-GPU-hour test-run budget. More tasks beat more trials, because trials cluster by task.
 
 ## Exposure check (measured 2026-09-14)
 
@@ -38,7 +38,7 @@ Treatments may be developed, debugged and compared on these sets. **A result on 
 | medium | 55 | 22 | 33 |
 | hard | 30 | 11 | 19 |
 
-**The pool has no easy tasks**, because all four are in development sets. A 24-task draw from the full pool allocates 15 medium and 9 hard; the oracle step can change the allocation.
+**The pool has no easy tasks**, because all four are in development sets. A 40-task draw from the full pool allocates 25 medium and 15 hard; the oracle step can change the allocation.
 
 ## Expected floor (development-set evidence only)
 
@@ -49,7 +49,7 @@ Nothing below uses a result on a held-out task.
   - Medium + hard: **3/26 and 4/26 (12–15%)**.
 - **smart-ab-8, the 2026-09-14 baseline, newt on qwen3-coder_30b, as of 18:08 EDT:**
   - 16 of 24 trials finished, **0 resolved**: easy 0/4, medium 0/6, hard 0/4 graded, and 2 more hard trials that ended in agent-caused errors (reward 0).
-- **Derived.** On a medium/hard held-out set, newt on this model should resolve somewhere between **about 0% and 15%** of trials at baseline. On 72 trials (24 tasks × 3) that is roughly 0–11 resolved. A floor that low leaves little room to detect a modest uplift, and a baseline at 0 cannot show one at all (the paired report flags that case as a floor).
+- **Derived.** On a medium/hard held-out set, newt on this model should resolve somewhere between **about 0% and 15%** of trials at baseline. On 80 trials (40 tasks × 2) that is roughly 0–12 resolved. A floor that low leaves little room to detect a modest uplift, and a baseline at 0 cannot show one at all (the paired report flags that case as a floor).
 
 ## Model choice (before GPU-days are spent)
 
@@ -59,7 +59,7 @@ Before this set is used, each candidate gets one calibration row. Calibration ru
 
 | candidate | calibration run | recorded |
 |---|---|---|
-| ornith-1.5-35b | newt, treatment `none`, smart-ab-8, 1 trial per task, ctx 131072 | resolves; median agent seconds per trial; projected hours for 72 held-out trials |
+| ornith-1.5-35b | newt, treatment `none`, smart-ab-8, 1 trial per task, ctx 131072 | resolves; median agent seconds per trial; projected hours for the confirmation run |
 | the chosen small Nemotron 3 | the same | the same |
 
 **Thinking is off, and set at the server.** ornith-1.5-35b and Nemotron 3.5 Lightning run with `chat-template-kwargs = {"enable_thinking": false}` in their router presets. That switch is identical for every harness and leaves sampling alone. A calibration row runs only after `/v1/models` has been read back and shows the preset on that model, and the campaign pins the kwargs in the model fingerprint. Thinking-on may become a treatment arm later, if calibration shows its turn time is affordable. It is not part of the matrix now.
