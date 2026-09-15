@@ -887,7 +887,10 @@ async fn final_summary_provider_contracts() {
                 }
             };
             let (reply, streamed, usage) = result.expect("summary failures become fallbacks");
-            let retried = case == "retry" && provider != "ollama";
+            // Every provider retries a transient 503 once. Until #2313's
+            // classifier fix this pinned Ollama's non-retry as a contract: its
+            // `Ollama 503 ...` text carried no status the classifier recognised.
+            let retried = case == "retry";
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 1 + usize::from(retried),
