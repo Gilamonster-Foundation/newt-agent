@@ -9,9 +9,6 @@ use crate::role_profile::Cognition;
 /// endpoint declared cognition projection; the Responses loop RESERVES it as
 /// local headroom (that wire sends no `max_output_tokens`). The explicit value
 /// never changes cognition, thinking or sampling.
-// TODO(#2312): report the resolved allowance in the solve contract's
-// `effective_config` via `solve_contract::conditional_stanza` (#2328), with
-// `enforced=server|local`, once that helper merges.
 pub(crate) fn resolve_output_allowance(
     explicit: Option<u32>,
     cognition: Option<Cognition>,

@@ -87,6 +87,7 @@ fn a_tool_event() -> newt_core::ToolEvent {
         args_digest: "keys=path;abc123".to_string(),
         ok: true,
         duration_ms: Some(42),
+        execution: None,
     }
 }
 

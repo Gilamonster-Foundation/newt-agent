@@ -332,8 +332,10 @@ async fn explicit_output_allowance_outranks_the_anthropic_env_default() {
         let messages = msgs();
         let caveats = Caveats::top();
         let uri = server.uri();
+        let mut obs = crate::agentic::SolveObservation::default();
         let mut c = ctx(&uri, &messages, &caveats);
         c.output_allowance = output_allowance;
+        c.solve_obs = Some(&mut obs);
         chat_complete(c, &mut NoMcp).await.expect("dispatch");
         let requests = server.received_requests().await.expect("recorded");
         assert_eq!(requests.len(), 1);
@@ -341,6 +343,15 @@ async fn explicit_output_allowance_outranks_the_anthropic_env_default() {
             body_json(&requests[0])["max_tokens"],
             sent,
             "{output_allowance:?}"
+        );
+        // #2312: this wire always sends the cap, so it is server-enforced —
+        // the env default included.
+        assert_eq!(
+            obs.output_allowance,
+            Some(crate::agentic::OutputAllowance {
+                tokens: sent,
+                enforced: crate::agentic::Enforcement::Server,
+            })
         );
     }
 }
@@ -1406,4 +1417,61 @@ async fn advertised_tools_carry_input_schema_and_object_tool_choice() {
         .await
         .expect("well-shaped tools should be accepted");
     assert_eq!(reply, "tools shape ok");
+}
+
+/// #2315: the Anthropic funnel records the structured execution class of a
+/// real shell call, like the other three loops (`tool_round_cap::tool_events`).
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn anthropic_funnel_records_the_execution_class() {
+    use crate::agentic::tools::disable_ocap_tests::{env_lock, EnvVar};
+    let _env = test_env(false);
+    let _lock = env_lock().await;
+    let _confined = EnvVar::unset("NEWT_DISABLE_OCAP");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(|req: &Request| {
+            if String::from_utf8_lossy(&req.body).contains("tool_result") {
+                json_reply(
+                    "end_turn",
+                    serde_json::json!([{"type": "text", "text": "done"}]),
+                    10,
+                    2,
+                )
+            } else {
+                json_reply(
+                    "tool_use",
+                    serde_json::json!([{"type": "tool_use", "id": "toolu_1",
+                        "name": "run_command",
+                        "input": {"command": "sh -c 'echo diag; exit 101'"}}]),
+                    10,
+                    2,
+                )
+            }
+        })
+        .mount(&server)
+        .await;
+    let ws = tempfile::TempDir::new().unwrap();
+    let workspace = ws.path().to_string_lossy().into_owned();
+    let (messages, caveats) = (msgs(), Caveats::top());
+    let mut events: Vec<crate::ToolEvent> = Vec::new();
+    let uri = server.uri();
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.workspace = &workspace;
+    context.action_nudges = false;
+    // The shared ctx allow-lists one MCP tool; this test needs the built-in shell.
+    context.persona_tools = None;
+    context.tool_events = Some(&mut events);
+    chat_complete(context, &mut NoMcp)
+        .await
+        .expect("the turn completes");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(!events[0].ok, "{events:?}");
+    assert_eq!(
+        serde_json::to_value(&events[0]).unwrap()["execution"],
+        "failed",
+        "{events:?}"
+    );
 }
