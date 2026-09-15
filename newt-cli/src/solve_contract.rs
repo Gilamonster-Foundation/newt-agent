@@ -62,6 +62,8 @@ pub struct ContractInputs<'a> {
     pub gen_tokens: Option<u64>,
     /// Accounted session, chosen auxiliary, and independent budgets when enabled.
     pub smart_harness: Option<&'a serde_json::Value>,
+    /// The output cap the turn's wire applied, and who enforced it (#2312).
+    pub output_allowance: Option<newt_core::agentic::OutputAllowance>,
     /// What the turn's constructed context carried; `None` when no turn
     /// outcome exists to read it from (the `receipt` stanza is then omitted).
     pub features: Option<InstantiatedFeatures>,
@@ -377,6 +379,10 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
         "max_rounds": i.max_rounds,
     });
     conditional_stanza(&mut effective_config, "context_window", i.context_window);
+    let output_allowance = i
+        .output_allowance
+        .map(|a| serde_json::to_value(a).expect("OutputAllowance serializes infallibly"));
+    conditional_stanza(&mut effective_config, "output_allowance", output_allowance);
     conditional_stanza(
         &mut effective_config,
         "smart_harness",
@@ -734,6 +740,7 @@ mod tests {
             wall_ms: 10_000,
             gen_tokens: Some(500),
             smart_harness: None,
+            output_allowance: None,
             features: Some(InstantiatedFeatures {
                 crew: true,
                 ..InstantiatedFeatures::default()
