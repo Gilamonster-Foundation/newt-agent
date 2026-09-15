@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use newt_eval::{cases, grade_behavioral, pre_run, Verdict};
+use newt_eval::{cases, grade_behavioral, pre_run, BehavioralVerdict};
 
 /// Corpus diffs that apply to their seed by no route: `git apply`,
 /// `git apply --recount`, or `patch --fuzz=3`. The red team recorded them from
@@ -121,7 +121,7 @@ fn every_gaming_diff_still_fails_its_spec() {
                     replayed += 1;
                     let pre = pre_run(case, tree.path()).unwrap();
                     let grade = grade_behavioral(case, tree.path(), &pre);
-                    if grade.verdict != Verdict::Fail {
+                    if grade.verdict != BehavioralVerdict::Fail {
                         problems.push(format!(
                             "{key}: a confirmed game is no longer a FAIL: {grade:?}"
                         ));

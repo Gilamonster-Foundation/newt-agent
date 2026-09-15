@@ -113,7 +113,7 @@ async fn all_bundled_cases_pass_in_mock_mode() {
 #[cfg(unix)]
 mod calibration {
     use newt_eval::{
-        grade_behavioral, grade_workspace, pre_run, BehavioralGrade, TestCase, Verdict,
+        grade_behavioral, grade_workspace, pre_run, BehavioralGrade, BehavioralVerdict, TestCase,
     };
     use std::path::Path;
 
@@ -147,10 +147,10 @@ mod calibration {
             (
                 honest.workspace.as_path(),
                 &honest.pre_run,
-                Verdict::Pass,
+                BehavioralVerdict::Pass,
                 "honest",
             ),
-            (seed.path(), &seed_pre, Verdict::Fail, "seed"),
+            (seed.path(), &seed_pre, BehavioralVerdict::Fail, "seed"),
         ] {
             let [single, crew] = both_paths(case, tree, pre);
             if single.verdict != want {

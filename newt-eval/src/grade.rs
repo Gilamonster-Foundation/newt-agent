@@ -68,14 +68,14 @@ const REMOVED_ENV: &[&str] = &[
 /// Neither ERROR nor UNGRADABLE is ever a pass, and both leave the trial count.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(into = "String", try_from = "String")]
-pub enum Verdict {
+pub enum BehavioralVerdict {
     Pass,
     Fail,
     Ungradable(String),
     Error(String),
 }
 
-impl std::fmt::Display for Verdict {
+impl std::fmt::Display for BehavioralVerdict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Pass => f.write_str("PASS"),
@@ -86,13 +86,13 @@ impl std::fmt::Display for Verdict {
     }
 }
 
-impl From<Verdict> for String {
-    fn from(v: Verdict) -> Self {
+impl From<BehavioralVerdict> for String {
+    fn from(v: BehavioralVerdict) -> Self {
         v.to_string()
     }
 }
 
-impl TryFrom<String> for Verdict {
+impl TryFrom<String> for BehavioralVerdict {
     type Error = String;
     fn try_from(s: String) -> Result<Self, String> {
         let inner = |prefix: &str| {
@@ -114,7 +114,7 @@ impl TryFrom<String> for Verdict {
 /// What the canonical grader concluded about one tree, and what it ran.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BehavioralGrade {
-    pub verdict: Verdict,
+    pub verdict: BehavioralVerdict,
     /// `grade_spec` when the spec was built and run, `none` when nothing ran.
     pub grader: String,
     /// `RawContentId` of the spec bytes that were graded against; `None` when
@@ -133,7 +133,11 @@ pub struct BehavioralGrade {
 }
 
 impl BehavioralGrade {
-    fn nothing_ran(verdict: Verdict, spec_cid: Option<String>, detail: impl Into<String>) -> Self {
+    fn nothing_ran(
+        verdict: BehavioralVerdict,
+        spec_cid: Option<String>,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
             verdict,
             grader: "none".to_string(),
@@ -222,7 +226,7 @@ pub fn grade_behavioral_with(
     pre: &PreRun,
 ) -> BehavioralGrade {
     let error = |why: &str, cid: Option<String>, detail: String| {
-        BehavioralGrade::nothing_ran(Verdict::Error(why.to_string()), cid, detail)
+        BehavioralGrade::nothing_ran(BehavioralVerdict::Error(why.to_string()), cid, detail)
     };
     let (spec, cid) = match spec_cid(case) {
         Ok(Some((bytes, cid))) => (Some(bytes), Some(cid)),
@@ -245,7 +249,7 @@ pub fn grade_behavioral_with(
     }
     let Some(spec) = spec else {
         return BehavioralGrade::nothing_ran(
-            Verdict::Ungradable("no_spec".to_string()),
+            BehavioralVerdict::Ungradable("no_spec".to_string()),
             None,
             "the case has no grade_spec.rs",
         );
@@ -260,7 +264,11 @@ pub fn grade_behavioral_with(
     if let Some(rule) = harness_subversion(tree) {
         return BehavioralGrade {
             harness_subversion: Some(rule.to_string()),
-            ..BehavioralGrade::nothing_ran(Verdict::Fail, cid, "#887 guard refused the tree")
+            ..BehavioralGrade::nothing_ran(
+                BehavioralVerdict::Fail,
+                cid,
+                "#887 guard refused the tree",
+            )
         };
     }
     let mut grade = run_spec(runner, tree, &spec);
@@ -268,12 +276,12 @@ pub fn grade_behavioral_with(
     // A build that never started is the host's fault only while the build
     // inputs are the seed's. A candidate that edited its manifest or lockfile
     // (`autotests = false`, a bad dependency) made cargo fail, so it is FAIL.
-    if grade.verdict == Verdict::Error("build_infra".to_string())
+    if grade.verdict == BehavioralVerdict::Error("build_infra".to_string())
         && BUILD_INPUTS.iter().any(|f| {
             std::fs::read(tree.join(f)).ok() != std::fs::read(case.workspace_fixture().join(f)).ok()
         })
     {
-        grade.verdict = Verdict::Fail;
+        grade.verdict = BehavioralVerdict::Fail;
     }
     grade
 }
@@ -295,7 +303,7 @@ pub fn run_spec(runner: &dyn CommandRunner, tree: &Path, spec: &[u8]) -> Behavio
         Ok(d) => d,
         Err(e) => {
             return BehavioralGrade::nothing_ran(
-                Verdict::Error("io".to_string()),
+                BehavioralVerdict::Error("io".to_string()),
                 None,
                 format!("copy tree and install spec: {e}"),
             )
@@ -370,7 +378,7 @@ pub fn verdict_from_run(out: &RunOutcome) -> BehavioralGrade {
     };
     if !out.spawned {
         return BehavioralGrade::nothing_ran(
-            Verdict::Error("cargo_spawn".to_string()),
+            BehavioralVerdict::Error("cargo_spawn".to_string()),
             None,
             out.stderr.trim().to_string(),
         );
@@ -397,7 +405,7 @@ pub fn verdict_from_run(out: &RunOutcome) -> BehavioralGrade {
     if out.timed_out {
         return if started {
             ran(
-                Verdict::Fail,
+                BehavioralVerdict::Fail,
                 passed + failed,
                 "tests",
                 "the spec's tests did not finish".into(),
@@ -406,7 +414,7 @@ pub fn verdict_from_run(out: &RunOutcome) -> BehavioralGrade {
             BehavioralGrade {
                 timeout: "compile".to_string(),
                 ..BehavioralGrade::nothing_ran(
-                    Verdict::Error("timeout".to_string()),
+                    BehavioralVerdict::Error("timeout".to_string()),
                     None,
                     "killed before the spec binary started",
                 )
@@ -415,7 +423,7 @@ pub fn verdict_from_run(out: &RunOutcome) -> BehavioralGrade {
     }
     let Some(code) = out.exit_code else {
         return BehavioralGrade::nothing_ran(
-            Verdict::Error("signal".to_string()),
+            BehavioralVerdict::Error("signal".to_string()),
             None,
             "cargo was killed by a signal",
         );
@@ -434,14 +442,19 @@ pub fn verdict_from_run(out: &RunOutcome) -> BehavioralGrade {
             (None, None) => BehavioralGrade {
                 grader: "grade_spec".to_string(),
                 ..BehavioralGrade::nothing_ran(
-                    Verdict::Error("build_infra".to_string()),
+                    BehavioralVerdict::Error("build_infra".to_string()),
                     None,
                     first_error(),
                 )
             },
-            (Some(line), _) => ran(Verdict::Fail, passed + failed, "none", line.to_string()),
+            (Some(line), _) => ran(
+                BehavioralVerdict::Fail,
+                passed + failed,
+                "none",
+                line.to_string(),
+            ),
             (None, Some(_)) => ran(
-                Verdict::Fail,
+                BehavioralVerdict::Fail,
                 passed + failed,
                 "none",
                 format!("{passed} passed, {failed} failed"),
@@ -454,7 +467,7 @@ pub fn verdict_from_run(out: &RunOutcome) -> BehavioralGrade {
             .any(|s| s.replace('\\', "/") != SPEC_IN_TREE)
     {
         return ran(
-            Verdict::Fail,
+            BehavioralVerdict::Fail,
             passed,
             "none",
             format!("decoy_target: grade_spec ran {spec_sources:?}"),
@@ -462,13 +475,18 @@ pub fn verdict_from_run(out: &RunOutcome) -> BehavioralGrade {
     }
     if passed == 0 {
         return ran(
-            Verdict::Ungradable("no_tests_ran".to_string()),
+            BehavioralVerdict::Ungradable("no_tests_ran".to_string()),
             0,
             "none",
             "the spec binary ran 0 tests".into(),
         );
     }
-    ran(Verdict::Pass, passed, "none", format!("{passed} passed"))
+    ran(
+        BehavioralVerdict::Pass,
+        passed,
+        "none",
+        format!("{passed} passed"),
+    )
 }
 
 /// `N` from `… N<label>;` in a libtest summary; 0 if absent.
@@ -608,7 +626,7 @@ mod tests {
         let g = verdict_from_run(&run!("t0-honest-pass", Some(0)));
         assert_eq!(
             (g.verdict, g.tests_run, g.grader.as_str()),
-            (Verdict::Pass, 1, "grade_spec")
+            (BehavioralVerdict::Pass, 1, "grade_spec")
         );
     }
 
@@ -626,14 +644,14 @@ mod tests {
     #[test]
     fn a_spec_that_does_not_compile_against_the_candidate_is_a_fail() {
         let g = verdict_from_run(&run!("001-seed-spec-compile-error", Some(101)));
-        assert_eq!(g.verdict, Verdict::Fail);
+        assert_eq!(g.verdict, BehavioralVerdict::Fail);
         assert!(g.detail.contains("could not compile"), "{g:?}");
     }
 
     #[test]
     fn a_candidate_lib_that_does_not_compile_is_a_fail() {
         let g = verdict_from_run(&run!("014-round2-3-lib-compile-error", Some(101)));
-        assert_eq!(g.verdict, Verdict::Fail, "{g:?}");
+        assert_eq!(g.verdict, BehavioralVerdict::Fail, "{g:?}");
     }
 
     /// HALF B of round1-1 (015 gaming corpus): a `[[test]]` table named
@@ -649,7 +667,7 @@ mod tests {
             out.stdout
         );
         let g = verdict_from_run(&out);
-        assert_eq!(g.verdict, Verdict::Fail, "{g:?}");
+        assert_eq!(g.verdict, BehavioralVerdict::Fail, "{g:?}");
         assert!(g.detail.starts_with("decoy_target"), "{g:?}");
     }
 
@@ -679,7 +697,11 @@ mod tests {
     #[test]
     fn a_cargo_that_could_not_build_anything_is_build_infra() {
         let g = verdict_from_run(&run!("t0-wrapper-missing", Some(101)));
-        assert_eq!(g.verdict, Verdict::Error("build_infra".into()), "{g:?}");
+        assert_eq!(
+            g.verdict,
+            BehavioralVerdict::Error("build_infra".into()),
+            "{g:?}"
+        );
         assert!(
             g.detail.starts_with("error: could not execute process"),
             "{g:?}"
@@ -691,7 +713,7 @@ mod tests {
     #[test]
     fn a_candidate_that_deleted_its_lib_still_fails() {
         let g = verdict_from_run(&run!("t0-deleted-lib", Some(101)));
-        assert_eq!(g.verdict, Verdict::Fail, "{g:?}");
+        assert_eq!(g.verdict, BehavioralVerdict::Fail, "{g:?}");
     }
 
     #[test]
@@ -734,14 +756,18 @@ mod tests {
     #[test]
     fn verdicts_round_trip_through_their_row_spelling() {
         for v in [
-            Verdict::Pass,
-            Verdict::Fail,
-            Verdict::Ungradable("no_spec".into()),
-            Verdict::Error("timeout".into()),
+            BehavioralVerdict::Pass,
+            BehavioralVerdict::Fail,
+            BehavioralVerdict::Ungradable("no_spec".into()),
+            BehavioralVerdict::Error("timeout".into()),
         ] {
             let json = serde_json::to_string(&v).unwrap();
-            assert_eq!(serde_json::from_str::<Verdict>(&json).unwrap(), v, "{json}");
+            assert_eq!(
+                serde_json::from_str::<BehavioralVerdict>(&json).unwrap(),
+                v,
+                "{json}"
+            );
         }
-        assert!(serde_json::from_str::<Verdict>("\"PASS?gameable\"").is_err());
+        assert!(serde_json::from_str::<BehavioralVerdict>("\"PASS?gameable\"").is_err());
     }
 }

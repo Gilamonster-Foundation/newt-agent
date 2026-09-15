@@ -12,8 +12,8 @@ use std::sync::Mutex;
 
 use newt_eval::evaluators::{CommandRunner, RunOutcome, RunSpec, SubprocessRunner};
 use newt_eval::{
-    grade_behavioral, grade_behavioral_with, grade_workspace, pre_run, run_spec, CaseScorecard,
-    EvalResult, MockResponse, PreRun, TestCase, Verdict, GRADE_SPEC_TIMEOUT_MS,
+    grade_behavioral, grade_behavioral_with, grade_workspace, pre_run, run_spec, BehavioralVerdict,
+    CaseScorecard, EvalResult, MockResponse, PreRun, TestCase, GRADE_SPEC_TIMEOUT_MS,
 };
 
 /// These fixture cases carry no withheld spec.
@@ -147,7 +147,10 @@ fn a_case_without_a_spec_is_ungradable_and_runs_nothing() {
         .unwrap()
         .behavioral
         .expect("grade_workspace always grades behaviorally");
-    assert_eq!(grade.verdict, Verdict::Ungradable("no_spec".into()));
+    assert_eq!(
+        grade.verdict,
+        BehavioralVerdict::Ungradable("no_spec".into())
+    );
     assert_eq!((grade.grader.as_str(), grade.tests_run), ("none", 0));
 }
 
@@ -210,7 +213,10 @@ fn the_spec_runs_in_a_copy_with_one_invocation_and_limit() {
 
     let grade = grade_behavioral_with(&runner, &case, tree.path(), &pre);
 
-    assert_eq!((&grade.verdict, grade.tests_run), (&Verdict::Pass, 2));
+    assert_eq!(
+        (&grade.verdict, grade.tests_run),
+        (&BehavioralVerdict::Pass, 2)
+    );
     assert_eq!(grade.spec_cid, pre.spec_cid);
     assert!(
         grade
@@ -266,7 +272,10 @@ fn a_spec_that_changed_during_the_run_is_an_error() {
 
     let grade = grade_behavioral_with(&runner, &case, tree.path(), &pre);
 
-    assert_eq!(grade.verdict, Verdict::Error("spec_changed".into()));
+    assert_eq!(
+        grade.verdict,
+        BehavioralVerdict::Error("spec_changed".into())
+    );
     assert_eq!(runner.calls(), 0);
 }
 
@@ -284,14 +293,20 @@ fn the_spec_visible_to_the_candidate_is_a_leak_but_a_same_named_file_is_not() {
     assert!(before.spec_visible);
     let runner = Recorder::new(passing_run());
     let leaked_before = grade_behavioral_with(&runner, &case, tree.path(), &before);
-    assert_eq!(leaked_before.verdict, Verdict::Error("spec_leak".into()));
+    assert_eq!(
+        leaked_before.verdict,
+        BehavioralVerdict::Error("spec_leak".into())
+    );
 
     let clean = PreRun {
         spec_visible: false,
         ..before
     };
     let leaked_after = grade_behavioral_with(&runner, &case, tree.path(), &clean);
-    assert_eq!(leaked_after.verdict, Verdict::Error("spec_leak".into()));
+    assert_eq!(
+        leaked_after.verdict,
+        BehavioralVerdict::Error("spec_leak".into())
+    );
     assert_eq!(runner.calls(), 0);
 
     fs::write(
@@ -300,7 +315,7 @@ fn the_spec_visible_to_the_candidate_is_a_leak_but_a_same_named_file_is_not() {
     )
     .unwrap();
     let own_file = grade_behavioral_with(&runner, &case, tree.path(), &clean);
-    assert_eq!(own_file.verdict, Verdict::Pass);
+    assert_eq!(own_file.verdict, BehavioralVerdict::Pass);
     assert_eq!(runner.calls(), 1);
 }
 
@@ -367,7 +382,7 @@ fn every_887_harness_override_fails_before_the_spec_runs() {
 
         let grade = grade_behavioral_with(&runner, &case, tree.path(), &pre);
 
-        assert_eq!(grade.verdict, Verdict::Fail, "{rule}: {grade:?}");
+        assert_eq!(grade.verdict, BehavioralVerdict::Fail, "{rule}: {grade:?}");
         assert_eq!(
             grade.harness_subversion.as_deref(),
             Some(rule),
@@ -388,7 +403,10 @@ fn a_grader_that_could_not_run_the_checks_is_an_error() {
         ..RunOutcome::default()
     });
     let grade = grade_behavioral_with(&no_cargo, &case, tree.path(), &pre);
-    assert_eq!(grade.verdict, Verdict::Error("cargo_spawn".into()));
+    assert_eq!(
+        grade.verdict,
+        BehavioralVerdict::Error("cargo_spawn".into())
+    );
 
     let slow_build = Recorder::new(RunOutcome {
         stderr: "   Compiling t-grade v0.1.0\n".into(),
@@ -399,7 +417,7 @@ fn a_grader_that_could_not_run_the_checks_is_an_error() {
     let grade = grade_behavioral_with(&slow_build, &case, tree.path(), &pre);
     assert_eq!(
         (grade.verdict, grade.timeout.as_str()),
-        (Verdict::Error("timeout".into()), "compile")
+        (BehavioralVerdict::Error("timeout".into()), "compile")
     );
 
     let unreadable = tempfile::tempdir().unwrap();
@@ -407,7 +425,7 @@ fn a_grader_that_could_not_run_the_checks_is_an_error() {
     broken.case_dir = unreadable.path().to_path_buf();
     fs::create_dir_all(unreadable.path().join("grade_spec.rs")).unwrap();
     let grade = grade_behavioral_with(&no_cargo, &broken, tree.path(), &pre);
-    assert_eq!(grade.verdict, Verdict::Error("io".into()));
+    assert_eq!(grade.verdict, BehavioralVerdict::Error("io".into()));
 }
 
 /// A build that produced no test summary and no `could not compile` is
@@ -443,7 +461,7 @@ fn a_build_failure_is_infra_only_when_the_build_inputs_are_the_seeds() {
     let grade = grade_behavioral_with(&Recorder::new(no_target()), &case, untouched.path(), &pre);
     assert_eq!(
         grade.verdict,
-        Verdict::Error("build_infra".into()),
+        BehavioralVerdict::Error("build_infra".into()),
         "{grade:?}"
     );
 
@@ -454,7 +472,7 @@ fn a_build_failure_is_infra_only_when_the_build_inputs_are_the_seeds() {
     )
     .unwrap();
     let grade = grade_behavioral_with(&Recorder::new(no_target()), &case, edited.path(), &pre);
-    assert_eq!(grade.verdict, Verdict::Fail, "{grade:?}");
+    assert_eq!(grade.verdict, BehavioralVerdict::Fail, "{grade:?}");
     assert!(grade.detail.contains("no test target named"), "{grade:?}");
 }
 
@@ -518,7 +536,7 @@ fn round1_1_is_refused_by_the_887_guard() {
 
     let grade = grade_behavioral(&case, tree.path(), &pre);
 
-    assert_eq!(grade.verdict, Verdict::Fail, "{grade:?}");
+    assert_eq!(grade.verdict, BehavioralVerdict::Fail, "{grade:?}");
     assert_eq!(
         grade.harness_subversion.as_deref(),
         Some("test-table"),
@@ -538,7 +556,7 @@ fn round1_1_below_the_guard_fails_as_a_decoy_target() {
 
     let grade = run_spec(&SubprocessRunner, tree.path(), &spec);
 
-    assert_eq!(grade.verdict, Verdict::Fail, "{grade:?}");
+    assert_eq!(grade.verdict, BehavioralVerdict::Fail, "{grade:?}");
     assert!(grade.detail.starts_with("decoy_target"), "{grade:?}");
     assert_eq!(
         grade.tests_run, 7,
@@ -575,7 +593,7 @@ fn candidate_tests_that_pass_do_not_override_the_spec() {
     let grade = card.behavioral.unwrap();
     assert_eq!(
         (grade.verdict, grade.tests_run),
-        (Verdict::Fail, 1),
+        (BehavioralVerdict::Fail, 1),
         "{}",
         grade.detail
     );

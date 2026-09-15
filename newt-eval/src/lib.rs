@@ -51,7 +51,7 @@ pub use evaluators::{
 };
 pub use grade::{
     grade_behavioral, grade_behavioral_with, grade_workspace, harness_subversion, pre_run,
-    run_spec, verdict_from_run, BehavioralGrade, PreRun, Verdict, GRADE_SPEC_TIMEOUT_MS,
+    run_spec, verdict_from_run, BehavioralGrade, BehavioralVerdict, PreRun, GRADE_SPEC_TIMEOUT_MS,
 };
 pub use lint::{lint_case_prompts, lint_prompt, LintError};
 pub use runner::{run_case, RunOutcome, RunnerConfig};
