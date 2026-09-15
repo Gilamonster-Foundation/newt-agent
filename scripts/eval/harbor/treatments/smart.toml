@@ -14,3 +14,4 @@ NEWT_BENCH_SMART = "1"
 
 [expect]
 "effective_config.smart_harness" = "*"
+"receipt.verification.mode" = "attempted"

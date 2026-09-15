@@ -6,3 +6,7 @@ profile = '''
 model = "{{MODEL}}"
 output_allowance = 16384
 '''
+
+# The self-verify gate stays in its shipped state, so this arm compares against none.
+[expect]
+"receipt.verification.mode" = "attempted"
