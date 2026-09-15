@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 from tb_campaign import (
-    PINNED, build_cell, codex_claim, deadline_cancels, fingerprint, is_trial_config, job_state, parse_schedule,
+    PINNED, build_cell, ceiling_reached, codex_claim, deadline_cancels, ledger_entry, ledger_total_s, fingerprint, is_trial_config, job_state, parse_schedule,
     trial_plan, window_at, error_cause, harness_evidence, load_treatment, newcombe, newt_claim, observed,
     pair, pair_report, pi_claim, pin_extend, pin_mismatch, render_profile, summarize, wilson,
 )
@@ -325,6 +325,32 @@ class Windows(unittest.TestCase):
         self.assertEqual(deadline_cancels(archived, "task-a__a1"), 1)
         self.assertEqual(deadline_cancels(archived, "task-a__a2"), 0)  # a crash archive is not a deadline cancel
         self.assertEqual(job_state([], exhausted=True), "done")
+
+
+class GpuHourLedger(unittest.TestCase):
+    """One content-addressed line per trial; the running wall total is checked
+    against the model's GPU-hour ceiling before each new trial."""
+
+    RECORD = dict(campaign="c", model="m", cell="m__newt", task="task-a", attempt=1, window="2026-09-19T00:00",
+                  state="done", agent_s=240.0, wall_s=300.0)
+
+    def test_an_entry_is_addressed_by_its_record(self):
+        entry = ledger_entry(dict(self.RECORD))
+        self.assertTrue(entry["cid"].startswith("b"))  # CIDv1 base32, via bench_scoreboard.trial_cid
+        self.assertEqual(entry["cid"], ledger_entry(dict(self.RECORD))["cid"])
+        self.assertNotEqual(entry["cid"], ledger_entry({**self.RECORD, "wall_s": 301.0})["cid"])
+
+    def test_the_total_counts_wall_seconds_and_refuses_a_tampered_line(self):
+        entries = [ledger_entry(dict(self.RECORD)), ledger_entry({**self.RECORD, "attempt": 2, "wall_s": 3300.0})]
+        self.assertEqual(ledger_total_s(entries), 3600.0)
+        tampered = [{**entries[0], "record": {**entries[0]["record"], "wall_s": 1.0}}]
+        with self.assertRaises(ValueError):
+            ledger_total_s(tampered)
+
+    def test_no_new_trial_once_the_ceiling_is_reached(self):
+        self.assertFalse(ceiling_reached(167.9 * 3600, 168))
+        self.assertTrue(ceiling_reached(168 * 3600, 168))
+        self.assertFalse(ceiling_reached(10**9, None))  # no ceiling declared
 
 
 if __name__ == "__main__":

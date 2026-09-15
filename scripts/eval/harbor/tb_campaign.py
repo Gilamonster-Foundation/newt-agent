@@ -11,6 +11,8 @@
     tb_campaign.py job-state <trial_job_dir>               # absent / partial / done
     tb_campaign.py window <schedule> [epoch]               # "<window id> <end epoch>", exit 1 outside
     tb_campaign.py deadline-cancels <cell_dir> <trial_job> # prior deadline cancels of one attempt
+    tb_campaign.py ledger-add <out_dir> <trial_job_dir> key value ...  # append one trial's GPU-hour line
+    tb_campaign.py ledger-check <out_dir> <ceiling_h>      # exit 3 at the ceiling, 2 on a tampered line
 
 Every trial directory Harbor created becomes one row, graded or not. A cell's
 expected count comes from the task set, so a trial Harbor never produced is
@@ -41,7 +43,7 @@ from pi_log import inference_failure
 from pi_log import records as _records
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # scripts/eval: the shared trial reader
-from bench_scoreboard import trial_record, verdict  # noqa: E402
+from bench_scoreboard import trial_cid, trial_record, verdict  # noqa: E402
 
 SUITE = "terminal-bench"
 
@@ -478,6 +480,32 @@ def deadline_cancels(archived_names, trial_job):
     return sum(n.startswith(trial_job + ".") and n.endswith(".deadline") for n in archived_names)
 
 
+# ── GPU-hour ledger ──────────────────────────────────────────────────────────
+# One append-only {cid, record} line per trial run, addressed through the same
+# encoder as bench_scoreboard's trial store (newt_conformance: CIDv1 / dag-cbor /
+# BLAKE3). A GPU-hour is a wall hour of the serial inference box, so wall_s is
+# the runner's own clock around the Harbor process, setup and verifier included.
+LEDGER = "ledger.jsonl"
+
+
+def ledger_entry(record):
+    return {"cid": trial_cid(record), "record": record}
+
+
+def ledger_total_s(entries):
+    """Total wall seconds; a line whose record no longer matches its cid refuses."""
+    total = 0.0
+    for n, entry in enumerate(entries, 1):
+        if trial_cid(entry["record"]) != entry["cid"]:
+            raise ValueError(f"ledger line {n}: record does not match its cid {entry['cid']}")
+        total += float(entry["record"].get("wall_s") or 0)
+    return total
+
+
+def ceiling_reached(total_s, ceiling_h):
+    return ceiling_h is not None and total_s >= float(ceiling_h) * 3600
+
+
 def _json(path: Path):
     try:
         return json.loads(path.read_text())
@@ -762,6 +790,30 @@ if __name__ == "__main__":
         if not found:
             sys.exit(1)
         print(found[0], int(found[1].timestamp()))
+    elif cmd == "ledger-add":
+        out, job = Path(args[0]), Path(args[1])
+        path = out / LEDGER
+        entries = [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
+        prior = ledger_total_s(entries)
+        record = dict(zip(args[2::2], args[3::2]))
+        results = [_json(d / "result.json") for d in job.iterdir() if d.is_dir()] if job.is_dir() else []
+        spans = [_seconds((r or {}).get("agent_execution")) for r in results]
+        record.update(attempt=int(record["attempt"]), wall_s=float(record["wall_s"]),
+                      agent_s=next((x for x in spans if x is not None), None),
+                      cumulative_wall_h=round((prior + float(record["wall_s"])) / 3600, 4))
+        with open(path, "a") as f:
+            f.write(json.dumps(ledger_entry(record), sort_keys=True) + "\n")
+        print(record["cumulative_wall_h"])
+    elif cmd == "ledger-check":
+        path = Path(args[0]) / LEDGER
+        entries = [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
+        try:
+            total = ledger_total_s(entries)
+        except ValueError as e:
+            print(e)
+            sys.exit(2)
+        print(round(total / 3600, 4))
+        sys.exit(3 if ceiling_reached(total, args[1]) else 0)
     elif cmd == "deadline-cancels":
         archived = Path(args[0]) / INTERRUPTED
         print(deadline_cancels([p.name for p in archived.iterdir()] if archived.is_dir() else [], args[1]))
