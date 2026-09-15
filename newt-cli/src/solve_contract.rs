@@ -67,7 +67,9 @@ pub struct ContractInputs<'a> {
     /// What the turn's constructed context carried; `None` when no turn
     /// outcome exists to read it from (the `receipt` stanza is then omitted).
     pub features: Option<InstantiatedFeatures>,
-    /// The self-verify gate's receipt entry (#2315); `None` omits it.
+    /// The self-verify gate's receipt entry (#2315); `None` omits it, and so
+    /// does a record with no turn outcome (`features` is `None`), whose gate
+    /// never ran.
     pub verification: Option<serde_json::Value>,
     /// Content id of the explicit scratchpad seed, when the run supplied one.
     pub scratchpad_seed: Option<&'a str>,
@@ -412,7 +414,7 @@ pub fn contract_record(i: &ContractInputs<'_>) -> serde_json::Value {
     });
     conditional_stanza(&mut record, "model_digest", i.model_digest);
     let mut receipt = feature_receipt(i.features, i.required, i.scratchpad_seed);
-    if let Some(verification) = &i.verification {
+    if let (Some(verification), Some(_)) = (&i.verification, &i.features) {
         receipt.get_or_insert_with(|| serde_json::json!({}))["verification"] = verification.clone();
     }
     conditional_stanza(&mut record, "receipt", receipt);
@@ -710,17 +712,30 @@ mod tests {
     /// #2315 (A14): the verification receipt entry rides the contract record
     /// when solve supplies it, even with no features section, and is absent
     /// otherwise (never invented).
+    ///
+    /// #2374 round three, item 8: a record with no turn outcome (`features` is
+    /// `None`: the turn task failed to start, panicked or was cancelled) ran no
+    /// gate, so it claims no mode even when solve supplied one.
     #[test]
     fn the_verification_receipt_is_carried_only_when_supplied() {
         let entry = serde_json::json!({"mode": "result_aware", "repair_allowance": 3});
         let mut with = inputs();
-        with.features = None;
         with.verification = Some(entry.clone());
         assert_eq!(contract_record(&with)["receipt"]["verification"], entry);
         let without = inputs();
         assert!(contract_record(&without)["receipt"]
             .get("verification")
             .is_none());
+        let mut no_outcome = inputs();
+        no_outcome.features = None;
+        no_outcome.verification = Some(entry);
+        assert!(
+            contract_record(&no_outcome)["receipt"]
+                .get("verification")
+                .is_none(),
+            "{}",
+            contract_record(&no_outcome)
+        );
     }
 
     /// #2315 (A10/A13): an unconfirmed-verification ending is a scored attempt
