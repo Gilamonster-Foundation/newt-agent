@@ -83,29 +83,47 @@ fn is_retryable_status(code: u16) -> bool {
     code == 408 || code == 429 || (500..600).contains(&code)
 }
 
-/// Pull the first status code out of an error message.
+/// Pull the HTTP status out of an error message a backend formatted.
 ///
-/// Recognises two formats produced by the backends in this workspace:
-/// - `"<backend> returned <code> …"` — local backends (Ollama, vLLM)
-/// - `"inference endpoint <code> …"` — hosted OpenAI-compatible endpoints
-///   (NVIDIA inference API, LiteLLM proxies, etc.)
+/// Recognised shapes, each with the status IMMEDIATELY after its marker:
+/// - `"<backend> returned <status> …"`: local backends (vLLM, Ollama native)
+///   and the probes;
+/// - `"inference endpoint <status> …"`: hosted OpenAI-compatible endpoints
+///   (NVIDIA inference API, LiteLLM proxies, etc.);
+/// - `"Ollama <status> …"` at the START of the message: the Ollama loop's
+///   probe, final summary, and warm-up (#2313).
 ///
-/// The code is the leading run of ASCII digits after the matched prefix
-/// (e.g. `StatusCode` Display is `"503 Service Unavailable"`, digits first).
+/// A status is three digits followed by `:`, the end of the message, or that
+/// code's canonical reason phrase (`StatusCode` displays `"503 Service
+/// Unavailable"`), so a count in prose (`returned 500 bytes`, `context 500
+/// tokens`) is never read as a status.
 fn status_code_in(msg: &str) -> Option<u16> {
-    const PREFIXES: &[&str] = &["returned ", "inference endpoint "];
-    for prefix in PREFIXES {
-        if let Some(after) = msg.split_once(prefix).map(|(_, r)| r) {
-            if let Some(code) = after
-                .split(|c: char| !c.is_ascii_digit())
-                .find(|s: &&str| !s.is_empty())
-                .and_then(|s| s.parse().ok())
-            {
-                return Some(code);
-            }
-        }
-    }
-    None
+    const MARKERS: &[&str] = &["returned ", "inference endpoint "];
+    const LEADING: &[&str] = &["Ollama "];
+    MARKERS
+        .iter()
+        .flat_map(|marker| {
+            msg.match_indices(marker)
+                .map(move |(at, _)| &msg[at + marker.len()..])
+        })
+        .chain(LEADING.iter().filter_map(|prefix| msg.strip_prefix(prefix)))
+        .find_map(status_at)
+}
+
+/// The status at the very start of `text`, per [`status_code_in`]'s rule.
+fn status_at(text: &str) -> Option<u16> {
+    let digits = text
+        .get(..3)
+        .filter(|d| d.bytes().all(|b| b.is_ascii_digit()))?;
+    let status = reqwest::StatusCode::from_bytes(digits.as_bytes()).ok()?;
+    let rest = &text[3..];
+    let named = match status.canonical_reason() {
+        Some(reason) => rest
+            .strip_prefix(' ')
+            .is_some_and(|r| r.starts_with(reason)),
+        None => rest.starts_with(' '),
+    };
+    (rest.is_empty() || rest.starts_with(':') || named).then_some(status.as_u16())
 }
 
 /// Read an HTTP body while retaining bytes observed before any read failure.
@@ -463,6 +481,36 @@ mod tests {
         assert_eq!(status_code_in("no status here"), None);
     }
 
+    /// #2313: the Ollama loop's probe and warm-up format a failed status as
+    /// `Ollama <status>` (no `returned`), so a 5xx from Ollama was Fatal and
+    /// never retried. Twins: its 4xx stays Fatal, and a number in prose is not a
+    /// status, in any recognised shape.
+    #[test]
+    fn classify_recognises_the_ollama_status_form_and_not_numbers_in_prose() {
+        assert_eq!(
+            classify(&err(
+                "Ollama 500 Internal Server Error: model runner crashed"
+            )),
+            Retryability::Retry
+        );
+        assert_eq!(
+            classify(&err("Ollama 503 Service Unavailable")),
+            Retryability::Retry
+        );
+        assert_eq!(
+            classify(&err("Ollama 400 Bad Request: invalid options")),
+            Retryability::Fatal
+        );
+        for prose in [
+            "context 500 tokens exceeded the budget",
+            "the tool returned 500 bytes",
+            "Ollama response error: 500 layers failed to load",
+        ] {
+            assert_eq!(status_code_in(prose), None, "{prose}");
+            assert_eq!(classify(&err(prose)), Retryability::Fatal, "{prose}");
+        }
+    }
+
     #[test]
     fn classify_inference_endpoint_5xx_is_retry() {
         // Regression: hosted endpoints format errors as "inference endpoint <code> …"
@@ -636,7 +684,7 @@ mod tests {
                 calls.set(n);
                 async move {
                     if n == 1 {
-                        Err(err("vLLM returned 503 sentinel"))
+                        Err(err("vLLM returned 503 Service Unavailable: sentinel"))
                     } else {
                         Ok("ok")
                     }
