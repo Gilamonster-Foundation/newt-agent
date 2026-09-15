@@ -41,9 +41,13 @@ pub struct VerifyCheck {
     /// these, never from a marker substring (`cat test_x.py` names a test file
     /// and runs nothing).
     pub runners: Vec<String>,
-    /// Arguments that turn a runner into a run that executes no check
-    /// (`cargo test --no-run`).
+    /// Forms that run no check: a flag anywhere in the runner's arguments
+    /// (`--no-run`, `--collect-only`), or a runner-relative prefix
+    /// (`cargo nextest list`).
     pub non_runs: Vec<String>,
+    /// The check the task names in backticks matches only that command plus
+    /// flags: backticked `make` is not `make install`.
+    pub flags_only: bool,
 }
 
 impl VerifyCheck {
@@ -54,6 +58,7 @@ impl VerifyCheck {
             runners: run_markers.clone(),
             run_markers,
             non_runs: Vec::new(),
+            flags_only: false,
         }
     }
 
@@ -77,85 +82,73 @@ impl VerifyCheck {
     /// runner (after env assignments and `time` / `timeout <t>` / `env`).
     fn invocation(&self, command: &str) -> Option<Invocation> {
         let segments = split_command(command);
-        segments
-            .iter()
-            .enumerate()
-            .find_map(|(index, (segment, _))| {
-                let words = strip_transparent_prefix(segment);
-                let text = words.join(" ").to_ascii_lowercase();
-                let runner = self.runners.iter().find(|r| {
-                    text == **r
-                        || text.starts_with(&format!("{r} "))
-                        || (r.ends_with('_') && text.starts_with(r.as_str()))
+        let (index, words, runner) =
+            segments
+                .iter()
+                .enumerate()
+                .find_map(|(index, (segment, _))| {
+                    let words = strip_transparent_prefix(segment);
+                    let text = words.join(" ").to_ascii_lowercase();
+                    let runner = self.runners.iter().find(|r| {
+                        text == **r
+                            || text.starts_with(&format!("{r} "))
+                            || (r.ends_with('_') && text.starts_with(r.as_str()))
+                    })?;
+                    Some((index, words, runner.clone()))
                 })?;
-                let taken = runner.split_whitespace().count();
-                let args: Vec<String> = if runner.ends_with('_') {
-                    words[taken - 1..].to_vec()
-                } else {
-                    words[taken..].to_vec()
-                };
-                if args.iter().any(|a| self.non_runs.contains(a)) {
-                    return None;
-                }
-                let later = &segments[index..];
-                let masked = later.iter().enumerate().any(|(k, (_, sep))| {
-                    let followed = later.get(k + 1).is_some_and(|(next, _)| !next.is_empty());
-                    followed && (matches!(*sep, ";" | "&" | "\n" | "||") || (k == 0 && *sep == "|"))
-                });
-                let plain = segments.iter().enumerate().all(|(k, (seg, sep))| {
-                    if k == index {
-                        later.iter().skip(1).all(|(next, _)| next.is_empty())
-                            && !seg
-                                .replace("2>&1", "")
-                                .replace("1>&2", "")
-                                .replace(">&2", "")
-                                .contains('>')
-                    } else {
-                        k < index && *sep == "&&" && seg.split_whitespace().next() == Some("cd")
-                    }
-                });
-                Some(Invocation {
-                    args,
-                    masked,
-                    plain,
-                })
-            })
+        let taken = runner.split_whitespace().count();
+        let args = if runner.ends_with('_') {
+            &words[taken - 1..]
+        } else {
+            &words[taken..]
+        };
+        if self.flags_only && args.iter().any(|a| !a.starts_with('-')) {
+            return None;
+        }
+        let text = words.join(" ").to_ascii_lowercase();
+        let non_run = self.non_runs.iter().any(|form| {
+            if form.starts_with('-') {
+                args.iter().any(|a| a.eq_ignore_ascii_case(form))
+            } else {
+                text == *form || text.starts_with(&format!("{form} "))
+            }
+        });
+        let last = segments[index + 1..]
+            .iter()
+            .all(|(next, _)| next.is_empty());
+        let backgrounded = segments[index].1 == "&";
+        let skippable = segments[..index].iter().any(|(_, sep)| *sep == "||");
+        let evidence = last && !backgrounded && !skippable && !non_run;
+        let plain = evidence
+            && segments[..index]
+                .iter()
+                .all(|(seg, sep)| *sep == "&&" && seg.split_whitespace().next() == Some("cd"))
+            && !segments[index]
+                .0
+                .replace("2>&1", "")
+                .replace("1>&2", "")
+                .replace(">&2", "")
+                .contains('>');
+        Some(Invocation {
+            evidence,
+            plain,
+            normalized: command.split_whitespace().collect::<Vec<_>>().join(" "),
+        })
     }
 }
 
 /// How one command runs a check.
 struct Invocation {
-    /// The runner's arguments: what the run was narrowed to.
-    args: Vec<String>,
-    /// A later pipe, `||`, `;`, `&` or newline decides the command's exit
-    /// status, so a pass says nothing about the check.
-    masked: bool,
-    /// Nothing but the run (after `cd dir &&`): no other command, no output
-    /// redirected to a file. Only such a run is not itself a mutation.
+    /// The run's exit status is the check's: the runner is the last segment,
+    /// not backgrounded, not skippable by an earlier `||`, and not a non-run
+    /// form. Anything else that matches a runner proves nothing.
+    evidence: bool,
+    /// Evidence with nothing else in the command (after `cd dir &&`) and no
+    /// output redirected to a file: the only run that is not itself a mutation.
     plain: bool,
-}
-
-/// Flags that change how a runner reports, not what it runs.
-const NON_NARROWING_FLAGS: &[&str] = &[
-    "-q",
-    "-qq",
-    "-v",
-    "-vv",
-    "--quiet",
-    "--verbose",
-    "--no-header",
-    "-rA",
-    "--color=never",
-];
-
-impl Invocation {
-    /// Whether this run covers at least what `failed` ran.
-    fn covers(&self, failed: &Self) -> bool {
-        self.args
-            .iter()
-            .filter(|a| !NON_NARROWING_FLAGS.contains(&a.as_str()))
-            .all(|a| failed.args.contains(a))
-    }
+    /// The whole command, whitespace-normalized: only this exact command
+    /// clears a failure it produced.
+    normalized: String,
 }
 
 /// `command` split into `(segment, separator after it)` at `&&`, `||`, `|`,
@@ -274,7 +267,8 @@ pub fn detect_checks(entries: &[String], instruction: &str) -> Vec<VerifyCheck> 
                     "python3 -m unittest",
                     "python test_",
                     "python3 test_",
-                ]),
+                ])
+                .except(&["--collect-only", "--co", "--version", "--help"]),
             );
         }
         match el.as_str() {
@@ -312,21 +306,27 @@ pub fn detect_checks(entries: &[String], instruction: &str) -> Vec<VerifyCheck> 
                 // tests: a turn that ran it has verified exactly as much, and
                 // omitting it would nudge a workspace that had.
                 checks.push(
-                    VerifyCheck::new("`cargo test`", &["cargo test", "cargo nextest"])
-                        .except(&["--no-run"]),
+                    VerifyCheck::new("`cargo test`", &["cargo test", "cargo nextest"]).except(&[
+                        "--no-run",
+                        "--list",
+                        "cargo nextest list",
+                    ]),
                 );
             }
-            "go.mod" => checks.push(VerifyCheck::new("`go test ./...`", &["go test"])),
+            "go.mod" => checks
+                .push(VerifyCheck::new("`go test ./...`", &["go test"]).except(&["-c", "-list"])),
             _ => {}
         }
     }
 
     if let Some(cmd) = instruction_verify_command(instruction) {
         let marker = cmd.to_ascii_lowercase();
-        checks.push(VerifyCheck::new(
+        let mut named = VerifyCheck::new(
             format!("the command the task says to run: `{cmd}`"),
             &[marker.as_str()],
-        ));
+        );
+        named.flags_only = true;
+        checks.push(named);
     }
     checks
 }
@@ -722,7 +722,7 @@ impl VerificationLedger {
                 let tree = (outcome == ExecOutcome::Passed
                     && detect_checks(&workspace_entries(root), &self.task)
                         .iter()
-                        .any(|check| check.invocation(&command).is_some()))
+                        .any(|check| check.invocation(&command).is_some_and(|i| i.evidence)))
                 .then(|| workspace_tree_state(root))
                 .flatten();
                 self.record_exec(&command, outcome, tree);
@@ -918,9 +918,10 @@ struct Mutation<'a> {
 /// Decide what to do with a concluding answer. Pure.
 pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
     // The chain head before each entry, then after the last one, rebuilt from
-    // the ordered observations with the checks detected NOW. Only a plain run
-    // of a detected check is not a mutation; every other call is one. A mint
-    // failure poisons the chain, which makes every chain-basis pass stale.
+    // the ordered observations with the checks detected NOW. A plain run of a
+    // detected check and a read-only command are not mutations; every other
+    // call is one, whether it succeeded or not. A mint failure poisons the
+    // chain, which makes every chain-basis pass stale.
     let mut journal = crate::event_journal::Journal::new();
     let mut chain_ok = true;
     let mut heads = Vec::with_capacity(c.ledger.entries.len() + 1);
@@ -933,10 +934,11 @@ pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
             }),
             Observed::Exec {
                 command, outcome, ..
-            } => (!c
-                .checks
-                .iter()
-                .any(|check| check.invocation(command).is_some_and(|i| i.plain)))
+            } => (!super::is_verification_read_command(command)
+                && !c
+                    .checks
+                    .iter()
+                    .any(|check| check.invocation(command).is_some_and(|i| i.plain)))
             .then_some(Mutation {
                 command: Some(command),
                 outcome: Some(*outcome),
@@ -949,13 +951,15 @@ pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
     }
     let chain_now = heads.last().cloned().flatten();
 
-    // Each check's standing from its runs in order. A failure is cleared only
-    // by an unmasked pass that covers what failed; a masked pass never clears.
+    // Each check's standing from its runs in order, by one rule: only pass
+    // evidence moves it to Pass; a failure is cleared only by the same
+    // normalized command; a denial or a non-evidence run never erases a Pass or
+    // a Fail.
     enum Standing<'a> {
         None,
         Pass(usize, &'a Option<ContentId>),
-        Masked(usize),
-        Fail(ExecOutcome, Invocation),
+        Unverified(usize),
+        Fail(ExecOutcome, String),
         Blocked(ExecOutcome, usize),
     }
     let standing = |check: &VerifyCheck| {
@@ -972,17 +976,20 @@ pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
             let Some(run) = check.invocation(command) else {
                 continue;
             };
-            state = match (*outcome, state) {
-                (ExecOutcome::Passed, state @ Standing::Fail(..)) if run.masked => state,
-                (ExecOutcome::Passed, Standing::Fail(kind, failed)) if !run.covers(&failed) => {
+            state = match (run.evidence, *outcome, state) {
+                (false, _, kept @ (Standing::Pass(..) | Standing::Fail(..))) => kept,
+                (false, _, _) => Standing::Unverified(i),
+                (true, ExecOutcome::Passed, Standing::Fail(kind, failed))
+                    if failed != run.normalized =>
+                {
                     Standing::Fail(kind, failed)
                 }
-                (ExecOutcome::Passed, _) if run.masked => Standing::Masked(i),
-                (ExecOutcome::Passed, _) => Standing::Pass(i, tree),
-                (kind @ (ExecOutcome::Failed | ExecOutcome::TimedOut), _) => {
-                    Standing::Fail(kind, run)
+                (true, ExecOutcome::Passed, _) => Standing::Pass(i, tree),
+                (true, kind @ (ExecOutcome::Failed | ExecOutcome::TimedOut), _) => {
+                    Standing::Fail(kind, run.normalized)
                 }
-                (kind, _) => Standing::Blocked(kind, i),
+                (true, _, kept @ Standing::Fail(..)) => kept,
+                (true, kind, _) => Standing::Blocked(kind, i),
             };
         }
         state
@@ -1013,7 +1020,7 @@ pub fn conclude(c: &Conclusion<'_>) -> (Decision, VerificationReport) {
                     (CheckStatus::Unexecuted, None)
                 }
                 Standing::None => (CheckStatus::NeverRun, None),
-                Standing::Masked(i) => (CheckStatus::Unverified, chain_at(*i)),
+                Standing::Unverified(i) => (CheckStatus::Unverified, chain_at(*i)),
                 Standing::Fail(kind, _) => (
                     if *kind == ExecOutcome::TimedOut {
                         CheckStatus::TimedOut

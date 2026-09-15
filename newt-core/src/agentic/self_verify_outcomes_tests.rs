@@ -191,7 +191,7 @@ fn a8_the_mutation_chain_decides_when_the_tree_is_unavailable() {
 
     for mutate in [
         |l: &mut VerificationLedger| l.record_write(),
-        |l: &mut VerificationLedger| l.record_exec(OTHER, Passed, None),
+        |l: &mut VerificationLedger| l.record_exec("touch notes.txt", Passed, None),
     ] {
         let mut stale = VerificationLedger::default();
         stale.record_exec(CHECK, Passed, None);
@@ -366,9 +366,9 @@ fn a_command_that_mentions_the_test_file_is_not_a_pass() {
     assert_ne!(decision, Decision::Accept, "{decision:?}");
 }
 
-/// Finding 1: after a failure, a narrower passing run does not clear it, and a
-/// run that executes no tests is not a pass. Twins: the same command, a broader
-/// one, and a `cd dir && runner` form do clear it.
+/// Finding 1: after a failure, a different passing run does not clear it, and
+/// a run that executes no tests is not a pass. Twins: the same command (modulo
+/// whitespace) clears it, and a `cd dir && runner` form is a pass.
 #[test]
 fn a_narrower_or_non_running_pass_does_not_clear_a_failure() {
     let t = || Some(id("tree-t"));
@@ -386,8 +386,7 @@ fn a_narrower_or_non_running_pass_does_not_clear_a_failure() {
 
     for (failed, passed) in [
         ("pytest", "pytest"),
-        ("pytest test_a.py", "pytest"),
-        ("pytest test_a.py", "pytest -q test_a.py"),
+        ("pytest  test_a.py", "pytest test_a.py"),
     ] {
         let mut ledger = VerificationLedger::default();
         ledger.record_exec(failed, Failed, None);
@@ -404,8 +403,8 @@ fn a_narrower_or_non_running_pass_does_not_clear_a_failure() {
 }
 
 /// Finding 2: a pass whose exit status a later pipe, `||`, `;` or `&` hides is
-/// unverified, and the nudge says to run it unmasked. Twins: a redirect and an
-/// `&&` chain keep the check's own status.
+/// unverified, and the nudge says to run it unmasked. Twins: redirects and a
+/// leading `cd dir &&` keep the check as the command's last word.
 #[test]
 fn a_status_masked_pass_is_unverified() {
     let t = || Some(id("tree-t"));
@@ -425,7 +424,7 @@ fn a_status_masked_pass_is_unverified() {
     }
     for honest in [
         "cargo test 2>&1",
-        "cargo test && echo ok",
+        "cd api && cargo test",
         "cargo test > out.txt 2>&1",
     ] {
         let mut ledger = VerificationLedger::default();
@@ -526,4 +525,146 @@ fn the_receipt_says_off_where_the_loop_has_no_gate() {
             None => std::env::remove_var(key),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// #2374 review round two, C and E: one pass-evidence rule.
+// ---------------------------------------------------------------------------
+
+fn standing(
+    checks: &[VerifyCheck],
+    runs: &[(&str, crate::ExecOutcome)],
+    tree_now: Option<ContentId>,
+) -> CheckStatus {
+    let mut ledger = VerificationLedger::default();
+    for (command, outcome) in runs {
+        let tree = (*outcome == Passed)
+            .then(|| id("tree-t"))
+            .filter(|_| tree_now.is_some());
+        ledger.record_exec(command, *outcome, tree);
+    }
+    let (_, report) = conclude(&Conclusion {
+        checks,
+        requested: &[],
+        ledger: &ledger,
+        tree_now,
+        repairs_used: 0,
+        rounds_left: true,
+    });
+    report.checks[0].status
+}
+
+/// Checks, their runs in order, and the standing the rule must give.
+type Case<'a> = (
+    &'a [VerifyCheck],
+    &'a [(&'a str, crate::ExecOutcome)],
+    CheckStatus,
+);
+
+/// C: a run is pass evidence only when its runner segment is the last one, it
+/// is not backgrounded, no earlier `||` can skip it, and it is not a non-run
+/// form. A failure is cleared only by the same normalized full command, a
+/// denial never erases it, and an unverified re-run keeps a genuine pass.
+#[test]
+fn one_rule_decides_pass_evidence_for_every_command_shape() {
+    use CheckStatus::{Failed as F, NeverRun, Passed as P, Unverified as U};
+    let t = || Some(id("tree-t"));
+    let cargo = cargo_checks();
+    let python = python_checks();
+    let go = detect_checks(&["go.mod".to_string()], "");
+    let named_make = detect_checks(&[], "You can run `make` to verify.");
+    let cases: &[Case] = &[
+        (&cargo, &[("cargo test", Passed)], P),
+        (&cargo, &[("cd backend && cargo test", Passed)], P),
+        (&cargo, &[("cargo test 2>&1", Passed)], P),
+        (&cargo, &[("RUST_BACKTRACE=1 cargo test", Passed)], P),
+        (
+            &cargo,
+            &[("cargo test && sed -i s/a/b/ src/lib.rs", Passed)],
+            U,
+        ),
+        (&cargo, &[("cargo test && rm src/lib.rs", Passed)], U),
+        (&cargo, &[("cargo test 2>&1 | tail -30", Passed)], U),
+        (&cargo, &[("cargo test; echo done", Passed)], U),
+        (&cargo, &[("cargo test &", Passed)], U),
+        (&cargo, &[("true || cargo test", Passed)], U),
+        (&cargo, &[("cargo test --no-run", Passed)], U),
+        (&cargo, &[("cargo test -- --list", Passed)], U),
+        (&cargo, &[("cargo nextest list", Passed)], U),
+        (&python, &[("pytest --collect-only", Passed)], U),
+        (&python, &[("pytest --co -q", Passed)], U),
+        (&python, &[("pytest --version", Passed)], U),
+        (&go, &[("go test -c ./...", Passed)], U),
+        (&go, &[("go test -list .", Passed)], U),
+        (
+            &python,
+            &[("pytest", Failed), ("pytest test_a.py", Passed)],
+            F,
+        ),
+        (
+            &python,
+            &[("pytest test_a.py", Failed), ("pytest", Passed)],
+            F,
+        ),
+        (
+            &cargo,
+            &[("cargo test --workspace", Failed), ("cargo test", Passed)],
+            F,
+        ),
+        (
+            &cargo,
+            &[("cd x && cargo test", Failed), ("cargo test", Passed)],
+            F,
+        ),
+        (
+            &python,
+            &[("PYTEST_ADDOPTS=-x pytest", Failed), ("pytest", Passed)],
+            F,
+        ),
+        (
+            &cargo,
+            &[("cargo test", Failed), ("cargo  test", Passed)],
+            P,
+        ),
+        (&cargo, &[("cargo test", Failed), ("cargo test", Denied)], F),
+        (
+            &cargo,
+            &[("cargo test", Failed), ("cargo test | tail", Passed)],
+            F,
+        ),
+        (
+            &cargo,
+            &[("cargo test", Passed), ("cargo test | tail", Passed)],
+            P,
+        ),
+        (&named_make, &[("make install", Passed)], NeverRun),
+        (&named_make, &[("make -j4", Passed)], P),
+    ];
+    for (checks, runs, expected) in cases {
+        assert_eq!(standing(checks, runs, t()), *expected, "{runs:?}");
+    }
+}
+
+/// E: on the mutation-chain basis, a read-only probe after a pass is not a
+/// mutation, so it does not cost a repair nudge. A failed mutating call still
+/// counts.
+#[test]
+fn a_read_only_probe_after_a_pass_does_not_stale_it_on_the_chain() {
+    let cargo = cargo_checks();
+    for probe in ["cat src/lib.rs", "ls", "git status"] {
+        assert_eq!(
+            standing(&cargo, &[("cargo test", Passed), (probe, Passed)], None),
+            CheckStatus::Passed,
+            "{probe}"
+        );
+    }
+    assert_eq!(
+        standing(
+            &cargo,
+            &[("cargo test", Passed), ("rm src/lib.rs", Failed)],
+            None
+        ),
+        CheckStatus::Stale,
+        "a failed mutating call still counts"
+    );
 }
