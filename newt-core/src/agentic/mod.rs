@@ -8812,6 +8812,8 @@ async fn anthropic_dispatch_round(
         let mut started = false;
         let mut transport_break: Option<String> = None;
         let mut interrupted = false;
+        // The bytes of a character that has only half arrived. See `decode_chunk`.
+        let mut carry: Vec<u8> = Vec::new();
         let mut resp = resp;
         while !acc.is_done() {
             match cancellable(cancel, resp.chunk()).await {
@@ -8822,10 +8824,10 @@ async fn anthropic_dispatch_round(
                     break;
                 }
                 Some(Ok(Some(chunk))) => {
-                    // Lossy UTF-8 into the accumulator's ROLLING line buffer —
-                    // an SSE `data:` line routinely splits across chunks, so a
-                    // per-chunk `lines()` split would drop events.
-                    for action in acc.feed(&String::from_utf8_lossy(&chunk)) {
+                    // Two rolling buffers: `decode_chunk` carries half a
+                    // CHARACTER to the next chunk, and the accumulator carries
+                    // half a `data:` LINE, since both straddle chunk boundaries.
+                    for action in acc.feed(&decode_chunk(&mut carry, &chunk)) {
                         match action {
                             anthropic_wire::StreamAction::TextDelta(t) => {
                                 if !started {
@@ -13051,6 +13053,19 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     StreamOutcome::Printed(text, round.usage)
 }
 
+/// Take the next complete NDJSON line out of `pending`, decoded and without its
+/// line ending. The buffer holds bytes because a chunk boundary can fall inside
+/// a character; a line is decoded only once it is whole.
+fn next_ndjson_line(pending: &mut Vec<u8>) -> Option<String> {
+    let end = pending.iter().position(|&byte| byte == b'\n')?;
+    let line: Vec<u8> = pending.drain(..=end).collect();
+    Some(
+        String::from_utf8_lossy(&line)
+            .trim_end_matches(['\n', '\r'])
+            .to_string(),
+    )
+}
+
 /// Stream an Ollama NDJSON response, printing tokens as they arrive.
 /// Returns `(accumulated_text, token_usage, complete)`, where `complete` means
 /// the stream reached `done: true` without an interrupt.
@@ -13129,14 +13144,11 @@ async fn stream_response(
             // EOF terminates an unterminated final line.
             None => pending.push(b'\n'),
         }
-        while let Some(end) = pending.iter().position(|&byte| byte == b'\n') {
-            let bytes: Vec<u8> = pending.drain(..=end).collect();
-            let line = String::from_utf8_lossy(&bytes);
-            let line = line.trim_end_matches(['\n', '\r']);
+        while let Some(line) = next_ndjson_line(&mut pending) {
             if line.is_empty() {
                 continue;
             }
-            let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
             let raw = json["message"]["content"].as_str().unwrap_or("");
