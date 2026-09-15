@@ -115,11 +115,13 @@ slug() { printf '%s' "$1" | tr ':/ .' '____'; }
 # (kept dependency-free and argument-driven so --self-test can exercise them)
 
 # Rows already completed for one cell in a sweep.tsv. Torn/short rows (a
-# crash mid-append) and rows without a PASS/FAIL grade never count.
+# crash mid-append) never count. A PASS/FAIL (or legacy PASS?gameable) grade
+# is a completed trial, and so is UNGRADABLE(..): re-running it cannot make it
+# gradable. ERROR(..) rows are infra and never reach the tsv.
 count_done() { # tsv task mode model
   [ -f "$1" ] || { echo 0; return; }
   awk -F'\t' -v t="$2" -v mo="$3" -v m="$4" \
-    'NF>=6 && $1=="RATCHET" && $2==t && $3==mo && $4==m && $5 ~ /^(PASS|FAIL)/ {n++} END {print n+0}' "$1"
+    'NF>=6 && $1=="RATCHET" && $2==t && $3==mo && $4==m && $5 ~ /^(PASS|FAIL|UNGRADABLE\()/ {n++} END {print n+0}' "$1"
 }
 
 # Structural row check: RATCHET-prefixed, model column matches the label we
@@ -131,16 +133,19 @@ validate_row() { # row model
   [ "$(printf '%s' "$1" | awk -F'\t' '{print $4}')" = "$2" ]
 }
 
-# Infra classification: a row whose FAIL is really "the model was never
-# exercised". crew: ratchet's no_crew_branch_infra marker (or the legacy
-# bare no_crew_branch, kept conservative); no_crew_branch_exercised means
-# real inference happened and the crew landed nothing — a LEGITIMATE
-# behavioral FAIL that counts toward n (#820). single: the evaluator
-# emitted no tests_pass value at all.
+# Infra classification: a row that graded nothing because the run or the
+# grader could not execute. ERROR(..) in either mode (#2317: a dead worker, a
+# crew that never reached a model, a grader that could not run the spec).
+# Legacy rows: crew's no_crew_branch_infra marker (or the bare no_crew_branch,
+# kept conservative), and a single row with no tests_pass value at all.
+# no_crew_branch_exercised means real inference happened and the crew landed
+# nothing — a LEGITIMATE behavioral FAIL that counts toward n (#820).
 row_is_infra() { # row
-  local mode details tp
+  local mode behavioral details tp
   mode="$(printf '%s' "$1" | awk -F'\t' '{print $3}')"
+  behavioral="$(printf '%s' "$1" | awk -F'\t' '{print $5}')"
   details="$(printf '%s' "$1" | awk -F'\t' '{print $6}')"
+  case "$behavioral" in ERROR\(*) return 0;; esac
   case "$mode" in
     crew)
       case "$details" in
@@ -248,6 +253,12 @@ self_test() {
   t "count_done counts PASS and FAIL rows"   '[ "$(count_done "$tsv" T2 crew m1)" = 2 ]'
   t "count_done is cell-scoped"              '[ "$(count_done "$tsv" T2 crew m2)" = 0 ]'
   t "count_done tolerates a missing tsv"     '[ "$(count_done "$sb/none.tsv" T2 crew m1)" = 0 ]'
+  {
+    printf 'RATCHET\tT3\tcrew\tm1\tUNGRADABLE(no_spec)\tgrader=none\tts\t1\n'
+    printf 'RATCHET\tT3\tcrew\tm1\tPASS?gameable\tleaves=1\tts\t1\n'
+    printf 'RATCHET\tT3\tcrew\tm1\tERROR(timeout)\tgrader=none\tts\t1\n'
+  } >> "$tsv"
+  t "count_done counts UNGRADABLE and legacy rows, not ERROR" '[ "$(count_done "$tsv" T3 crew m1)" = 2 ]'
 
   printf 'RATCHET\tT2\tcrew\tm1' >> "$tsv"        # torn row, no newline
   t "torn row does not count"                '[ "$(count_done "$tsv" T2 crew m1)" = 2 ]'
@@ -277,6 +288,13 @@ self_test() {
   t "row_is_infra: single empty tests_pass"  'row_is_infra "$infra_single"'
   t "row_is_infra: real single FAIL counts"  '! row_is_infra "$beh_single"'
   t "row_is_infra: real crew FAIL counts"    '! row_is_infra "$beh_crew"'
+  local err_single err_crew ungradable
+  err_single="$(printf 'RATCHET\tT2\tsingle\tm1\tERROR(timeout)\tgrader=none tests_pass=ok')"
+  err_crew="$(printf 'RATCHET\tT2\tcrew\tm1\tERROR(infra)\tplan_rc=1 dir=/x')"
+  ungradable="$(printf 'RATCHET\tT2\tcrew\tm1\tUNGRADABLE(no_tests_ran)\tgrader=grade_spec dir=/x')"
+  t "row_is_infra: single ERROR is infra even with a tests_pass value" 'row_is_infra "$err_single"'
+  t "row_is_infra: crew ERROR is infra"      'row_is_infra "$err_crew"'
+  t "row_is_infra: UNGRADABLE is a completed trial, not infra" '! row_is_infra "$ungradable"'
 
   t "grid_complete false while trials missing" '! grid_complete "$grid" "$tsv"'
   for _ in 1 2; do printf 'RATCHET\tT2\tcrew\tm1\tFAIL\tx\tts\t1\n' >> "$tsv"; done
@@ -427,8 +445,8 @@ run_sweep() {
             if [ -n "$dir" ]; then
               case "$KEEP" in
                 none) reap_dir "$dir" || true;;
-                # PASS?gameable trees are kept: they are exactly the
-                # possibly-gamed evidence autopsy needs.
+                # Only PASS trees are reaped: FAIL and UNGRADABLE trees (and
+                # legacy PASS?gameable ones) are the evidence autopsy needs.
                 fail) [ "$behavioral" = "PASS" ] && { reap_dir "$dir" || true; };;
               esac
             fi

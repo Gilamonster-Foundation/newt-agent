@@ -85,7 +85,11 @@ impl EvalResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CaseScorecard {
     pub case_name: String,
+    /// Structural evaluators: diagnostics, never the behavioral grade.
     pub results: Vec<EvalResult>,
+    /// The canonical behavioral grade (#2317); `None` when no tree was produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavioral: Option<crate::grade::BehavioralGrade>,
 }
 
 impl CaseScorecard {
@@ -212,18 +216,21 @@ mod tests {
         let empty = CaseScorecard {
             case_name: "x".into(),
             results: vec![],
+            behavioral: None,
         };
         assert!(!empty.all_passed());
 
         let mixed = CaseScorecard {
             case_name: "x".into(),
             results: vec![EvalResult::pass("a", ""), EvalResult::fail("b", "")],
+            behavioral: None,
         };
         assert!(!mixed.all_passed());
 
         let all_pass = CaseScorecard {
             case_name: "x".into(),
             results: vec![EvalResult::pass("a", ""), EvalResult::pass("b", "")],
+            behavioral: None,
         };
         assert!(all_pass.all_passed());
     }
@@ -248,6 +255,7 @@ mod tests {
                     skipped: false,
                 },
             ],
+            behavioral: None,
         };
         assert!((case.mean_score() - 0.75).abs() < 1e-9);
     }
@@ -257,6 +265,7 @@ mod tests {
         let case = CaseScorecard {
             case_name: "x".into(),
             results: vec![],
+            behavioral: None,
         };
         assert_eq!(case.mean_score(), 0.0);
     }
@@ -273,11 +282,13 @@ mod tests {
         s.push(CaseScorecard {
             case_name: "a".into(),
             results: vec![EvalResult::pass("ev", "")],
+            behavioral: None,
         });
         assert!(s.all_passed());
         s.push(CaseScorecard {
             case_name: "b".into(),
             results: vec![EvalResult::fail("ev", "")],
+            behavioral: None,
         });
         assert!(!s.all_passed());
     }
@@ -291,10 +302,12 @@ mod tests {
         s.push(CaseScorecard {
             case_name: "001-foo".into(),
             results: vec![EvalResult::pass("diff_nonempty", "all good")],
+            behavioral: None,
         });
         s.push(CaseScorecard {
             case_name: "002-bar".into(),
             results: vec![EvalResult::fail("diff_nonempty", "boom")],
+            behavioral: None,
         });
         assert_eq!(
             s.to_string(),
@@ -318,6 +331,7 @@ mod tests {
         s.push(CaseScorecard {
             case_name: "c".into(),
             results: vec![EvalResult::fail("ev", "ran `grep x | wc -l`")],
+            behavioral: None,
         });
         let table = s.to_string();
         assert!(
@@ -347,6 +361,7 @@ mod tests {
         s.push(CaseScorecard {
             case_name: "001-foo".into(),
             results: vec![EvalResult::pass("diff_nonempty", "all good")],
+            behavioral: None,
         });
         let table = s.to_string();
         assert!(table.contains("case "));
@@ -373,6 +388,7 @@ mod tests {
                 "ev",
                 "an em dash — appears here, then a lot more text to force truncation",
             )],
+            behavioral: None,
         });
         // Must not panic.
         let _ = s.to_string();
@@ -384,6 +400,7 @@ mod tests {
         s.push(CaseScorecard {
             case_name: "x".repeat(50),
             results: vec![EvalResult::pass("evaluator", "details")],
+            behavioral: None,
         });
         let table = s.to_string();
         // The first column is capped at 28 chars + ellipsis.

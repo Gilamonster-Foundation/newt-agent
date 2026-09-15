@@ -541,8 +541,8 @@ fn collect_py_into(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
 
 // ── output_matches (result oracle, #957) ────────────────────────────
 
-/// A command to run for the `output_matches` oracle.
-#[derive(Debug, Clone, PartialEq)]
+/// A command to run for the `output_matches` oracle and the canonical grader.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RunSpec {
     /// argv to execute; `argv[0]` is the program.
     pub argv: Vec<String>,
@@ -550,10 +550,13 @@ pub struct RunSpec {
     pub cwd: PathBuf,
     /// Optional wall-clock timeout in milliseconds.
     pub timeout_ms: Option<u64>,
+    /// Environment overrides on top of the inherited environment:
+    /// `Some(value)` sets the variable, `None` removes it.
+    pub env: Vec<(String, Option<String>)>,
 }
 
 /// What a [`CommandRunner`] captured from one run.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RunOutcome {
     pub stdout: String,
     pub stderr: String,
@@ -561,6 +564,8 @@ pub struct RunOutcome {
     pub exit_code: Option<i32>,
     /// True if the runner killed it for exceeding `timeout_ms`.
     pub timed_out: bool,
+    /// False when the program never started (missing binary, empty argv).
+    pub spawned: bool,
 }
 
 /// The injected seam for running the graded program (#957). Mocked in unit
@@ -569,6 +574,11 @@ pub struct RunOutcome {
 pub trait CommandRunner: Send + Sync {
     fn run(&self, spec: &RunSpec) -> RunOutcome;
 }
+
+/// How long the drain waits for a pipe after the child is gone. A grandchild
+/// that left the process group can hold a pipe open forever; its output past
+/// this point is dropped rather than hanging the grader (#2317).
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The real `CommandRunner` (#960): actually executes `spec.argv` in the graded
 /// worktree, captures stdout/stderr, and enforces a hard wall-clock timeout.
@@ -580,68 +590,77 @@ pub trait CommandRunner: Send + Sync {
 /// surface tracked in #887). Only run `output_matches` cases you trust, and only
 /// in the weekly/release tiers. A `NEWT_EVAL_SANDBOX=1` marker is set in the
 /// child env as an advisory signal, not an enforced boundary.
+///
+/// On unix the child leads its own process group, and the group is killed at
+/// the deadline and swept after exit, so a `cargo test` grandchild cannot
+/// outlive the run holding the pipes (#2317).
 pub struct SubprocessRunner;
 
 impl CommandRunner for SubprocessRunner {
     fn run(&self, spec: &RunSpec) -> RunOutcome {
         use std::io::Read;
         use std::process::Stdio;
+        use std::sync::{mpsc, Arc, Mutex};
         use std::time::{Duration, Instant};
 
         let Some((program, rest)) = spec.argv.split_first() else {
             return RunOutcome {
-                stdout: String::new(),
                 stderr: "output_matches: [output_match].run is empty".to_string(),
-                exit_code: None,
-                timed_out: false,
+                ..RunOutcome::default()
             };
         };
 
-        let mut child = match Command::new(program)
-            .args(rest)
+        let mut cmd = Command::new(program);
+        cmd.args(rest)
             .current_dir(&spec.cwd)
             // Advisory marker (see the trust-boundary note above); not enforced.
             .env("NEWT_EVAL_SANDBOX", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+            .stderr(Stdio::piped());
+        for (key, value) in &spec.env {
+            match value {
+                Some(v) => cmd.env(key, v),
+                None => cmd.env_remove(key),
+            };
+        }
+        #[cfg(unix)]
+        std::os::unix::prelude::CommandExt::process_group(&mut cmd, 0);
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             // Missing interpreter/binary is the common misconfiguration — report
             // it honestly and never auto-download.
             Err(e) => {
                 return RunOutcome {
-                    stdout: String::new(),
                     stderr: format!("runtime not found: {program} ({e})"),
-                    exit_code: None,
-                    timed_out: false,
+                    ..RunOutcome::default()
                 };
             }
         };
 
         // Drain both pipes on threads so the child can't deadlock on a full pipe
-        // while we poll for exit.
-        let read_pipe = |pipe: Option<std::process::ChildStdout>| {
+        // while we poll for exit. Each thread appends to a shared buffer and
+        // signals at EOF, so the wait below can give up on a pipe that never
+        // closes and still keep what was read.
+        let drain = |pipe: Option<Box<dyn Read + Send>>| {
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let (done, eof) = mpsc::channel::<()>();
+            let sink = Arc::clone(&buf);
             std::thread::spawn(move || {
-                let mut buf = Vec::new();
                 if let Some(mut p) = pipe {
-                    let _ = p.read_to_end(&mut buf);
+                    let mut chunk = [0u8; 8192];
+                    while let Ok(n @ 1..) = p.read(&mut chunk) {
+                        sink.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .extend_from_slice(&chunk[..n]);
+                    }
                 }
-                buf
-            })
+                let _ = done.send(());
+            });
+            (buf, eof)
         };
-        let read_err = |pipe: Option<std::process::ChildStderr>| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(mut p) = pipe {
-                    let _ = p.read_to_end(&mut buf);
-                }
-                buf
-            })
-        };
-        let out_handle = read_pipe(child.stdout.take());
-        let err_handle = read_err(child.stderr.take());
+        let (out_buf, out_eof) = drain(child.stdout.take().map(|p| Box::new(p) as _));
+        let (err_buf, err_eof) = drain(child.stderr.take().map(|p| Box::new(p) as _));
 
         // Poll for exit up to the deadline; kill on expiry. `None` timeout means
         // "no wall-clock budget" — wait indefinitely.
@@ -653,27 +672,35 @@ impl CommandRunner for SubprocessRunner {
             match child.try_wait() {
                 Ok(Some(status)) => break Some(status),
                 Ok(None) => {
-                    if let Some(dl) = deadline {
-                        if Instant::now() >= dl {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            timed_out = true;
-                            break None;
-                        }
+                    if deadline.is_some_and(|dl| Instant::now() >= dl) {
+                        #[cfg(unix)]
+                        newt_core::confined_exec::kill_process_group(child.id());
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        timed_out = true;
+                        break None;
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(_) => break None,
             }
         };
+        // Sweep grandchildren left in the group after a normal exit too.
+        #[cfg(unix)]
+        newt_core::confined_exec::kill_process_group(child.id());
 
-        let stdout = String::from_utf8_lossy(&out_handle.join().unwrap_or_default()).into_owned();
-        let stderr = String::from_utf8_lossy(&err_handle.join().unwrap_or_default()).into_owned();
+        let grace = Instant::now() + DRAIN_GRACE;
+        let take = |buf: &Arc<Mutex<Vec<u8>>>, eof: &mpsc::Receiver<()>| {
+            let _ = eof.recv_timeout(grace.saturating_duration_since(Instant::now()));
+            let bytes = buf.lock().unwrap_or_else(|e| e.into_inner());
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
         RunOutcome {
-            stdout,
-            stderr,
+            stdout: take(&out_buf, &out_eof),
+            stderr: take(&err_buf, &err_eof),
             exit_code: status.and_then(|s| s.code()),
             timed_out,
+            spawned: true,
         }
     }
 }
@@ -712,6 +739,7 @@ impl<R: CommandRunner> Evaluator for OutputMatchesEvaluator<R> {
             argv: om.run.clone(),
             cwd: ctx.workspace.clone(),
             timeout_ms: om.timeout_ms,
+            ..RunSpec::default()
         };
         let outcome = self.runner.run(&spec);
         if outcome.timed_out {
@@ -903,6 +931,7 @@ mod tests {
             stderr: String::new(),
             exit_code: exit,
             timed_out,
+            spawned: true,
         }
     }
     fn oracle_ctx(expected: Option<&str>, run: &[&str]) -> EvalContext {
@@ -988,6 +1017,7 @@ mod tests {
             argv: vec!["newt-eval-no-such-binary-xyzzy".to_string()],
             cwd: std::env::temp_dir(),
             timeout_ms: Some(1000),
+            ..RunSpec::default()
         };
         let out = SubprocessRunner.run(&spec);
         assert_eq!(out.exit_code, None);
@@ -1005,10 +1035,56 @@ mod tests {
             argv: vec![],
             cwd: std::env::temp_dir(),
             timeout_ms: None,
+            ..RunSpec::default()
         };
         let out = SubprocessRunner.run(&spec);
         assert_eq!(out.exit_code, None);
         assert!(out.stderr.contains("empty"), "stderr: {}", out.stderr);
+    }
+
+    /// #2317: the timeout must reap the whole process group. `sh` backgrounds a
+    /// `sleep` that inherits the stdout pipe. Killing only `sh` left the sleep
+    /// holding the pipe, so draining it blocked until the sleep ended: the
+    /// `cargo test` → test-binary shape the canonical grader runs.
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_runner_timeout_reaps_a_grandchild_holding_the_pipes() {
+        let spec = RunSpec {
+            argv: ["sh", "-c", "sleep 30 & sleep 30"]
+                .map(String::from)
+                .to_vec(),
+            cwd: std::env::temp_dir(),
+            timeout_ms: Some(200),
+            ..RunSpec::default()
+        };
+        let t0 = std::time::Instant::now();
+        let out = SubprocessRunner.run(&spec);
+        assert!(out.timed_out, "{out:?}");
+        assert!(t0.elapsed().as_secs() < 10, "hung for {:?}", t0.elapsed());
+    }
+
+    /// Twin: a clean exit that leaves a grandchild behind must not hang the
+    /// drain either. Covers both a grandchild still in the group and one that
+    /// left it (`setsid`), which no group kill can reach.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn subprocess_runner_returns_when_a_grandchild_outlives_the_child() {
+        for script in ["echo hi; sleep 30 &", "echo hi; setsid sleep 30 &"] {
+            let spec = RunSpec {
+                argv: ["sh", "-c", script].map(String::from).to_vec(),
+                cwd: std::env::temp_dir(),
+                timeout_ms: Some(60_000),
+                ..RunSpec::default()
+            };
+            let t0 = std::time::Instant::now();
+            let out = SubprocessRunner.run(&spec);
+            assert_eq!((out.exit_code, out.stdout.as_str()), (Some(0), "hi\n"));
+            assert!(
+                t0.elapsed().as_secs() < 10,
+                "{script}: hung for {:?}",
+                t0.elapsed()
+            );
+        }
     }
 
     #[test]

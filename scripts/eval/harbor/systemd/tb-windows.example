@@ -1,0 +1,5 @@
+# <days> <start HH:MM> <end HH:MM>; days from mon..sun; an end at or before the
+# start runs past midnight. Outside these windows the inference box is the
+# maintainer's. Example: weekday nights plus the whole weekend (108 h a week).
+mon,tue,wed,thu,fri 20:00 08:00
+sat,sun 00:00 24:00

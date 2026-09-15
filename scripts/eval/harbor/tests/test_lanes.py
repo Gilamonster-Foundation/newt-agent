@@ -55,5 +55,36 @@ class RequiredFeatures(unittest.TestCase):
             newt_agent._REQUIRE_FEATURES = ""
 
 
+class VerifyOutcomes(unittest.TestCase):
+    """#2315: the result-aware verification treatment reaches the container, and
+    stays absent when the operator did not ask for it (a switch nothing sets is
+    the #1943 defect)."""
+
+    def test_opt_in_is_injected_and_absent_is_absent(self):
+        try:
+            newt_agent._VERIFY_OUTCOMES = "1"
+            self.assertIn("NEWT_VERIFY_OUTCOMES=1 ", newt_agent._container_env_prefix())
+            newt_agent._VERIFY_OUTCOMES = ""
+            self.assertNotIn("NEWT_VERIFY_OUTCOMES", newt_agent._container_env_prefix())
+        finally:
+            newt_agent._VERIFY_OUTCOMES = ""
+
+
+class SelfVerifyAblation(unittest.TestCase):
+    """newt's self-verify gate is ON by default (#1961), so the baseline already runs
+    it and =1 changes nothing. The ablation is =0, which must reach the container."""
+
+    def test_off_is_injected_as_zero_and_absent_is_absent(self):
+        try:
+            for value, injected in (("0", "NEWT_SELF_VERIFY=0 "), ("off", "NEWT_SELF_VERIFY=0 "),
+                                    ("false", "NEWT_SELF_VERIFY=0 "), ("1", "NEWT_SELF_VERIFY=1 ")):
+                newt_agent._SELF_VERIFY = value
+                self.assertIn(injected, newt_agent._container_env_prefix(), value)
+            newt_agent._SELF_VERIFY = ""
+            self.assertNotIn("NEWT_SELF_VERIFY", newt_agent._container_env_prefix())
+        finally:
+            newt_agent._SELF_VERIFY = ""
+
+
 if __name__ == "__main__":
     unittest.main()

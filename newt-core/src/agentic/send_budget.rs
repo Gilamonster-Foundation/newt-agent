@@ -313,7 +313,8 @@ pub(super) fn resolve_responses_budget(
 /// projected value is the state's soft send budget — cached caps composed with
 /// the reserved hard ceiling — exactly what this seam has always returned.
 /// Explicitly capable **Chat Completions** endpoints receive Newt's local
-/// generation policy (its output reserve). **Ollama and embedded** backends keep
+/// generation policy (its output reserve). **Anthropic** reserves the
+/// `max_tokens` it always sends (#2341). **Ollama and embedded** backends keep
 /// the percentage-only local ceiling. Ceiling-from-an-unsent-value is deliberate
 /// for Responses — the alternative is an over-window request that only a reactive
 /// 400 (or a silent truncation) can catch.
@@ -348,18 +349,25 @@ pub fn initial_context_input_budget(
         .soft_send_budget()
         .map(|budget| u32::try_from(budget).expect("input budgets originate as u32 values"));
     }
-    let output_allowance =
-        if kind == crate::BackendKind::Openai && api == crate::OpenAiApi::ChatCompletions {
-            super::generation_policy::GenerationPolicy::resolve(
-                cognition,
-                output_allowance,
-                chat_capability,
-                reasoning_replay_scope,
-            )
-            .output_allowance
-        } else {
-            output_allowance
-        };
+    let policy_allowance = || {
+        super::generation_policy::GenerationPolicy::resolve(
+            cognition,
+            output_allowance,
+            chat_capability,
+            reasoning_replay_scope,
+        )
+        .output_allowance
+    };
+    let output_allowance = match kind {
+        crate::BackendKind::Openai if api == crate::OpenAiApi::ChatCompletions => {
+            policy_allowance()
+        }
+        // #2341: Anthropic always sends `max_tokens`, so it reserves exactly that.
+        crate::BackendKind::Anthropic => {
+            Some(policy_allowance().unwrap_or_else(super::anthropic_wire::default_max_tokens))
+        }
+        _ => output_allowance,
+    };
     // Chat Completions applies the resolved generation output allowance above;
     // Ollama and embedded backends reserve only an explicit allowance (no
     // cognition table). The declared window still bounds the input ceiling so

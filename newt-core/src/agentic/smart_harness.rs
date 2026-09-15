@@ -115,6 +115,8 @@ struct State {
     calls: usize,
     nudges: usize,
     verified: bool,
+    /// #2315: result-aware verification nudges spent this turn.
+    verify_repairs: usize,
     auxiliary_elapsed: Duration,
     initial: Option<Vec<Value>>,
     deferred_failure: Option<String>,
@@ -203,6 +205,7 @@ impl SmartHarness {
                 calls: 0,
                 nudges: 0,
                 verified: false,
+                verify_repairs: 0,
                 auxiliary_elapsed: Duration::ZERO,
                 initial,
                 deferred_failure: None,
@@ -255,6 +258,7 @@ impl SmartHarness {
         s.calls = 0;
         s.nudges = 0;
         s.verified = false;
+        s.verify_repairs = 0;
         s.auxiliary_elapsed = Duration::ZERO;
         s.antecedent = None;
         s.request = None;
@@ -803,19 +807,37 @@ impl SmartHarness {
     }
 
     /// The auxiliary classification never replaces workspace verification.
-    pub(crate) fn verify_answer(
+    /// `gate_on` is the turn's action-nudge and disposition switch; the
+    /// attempted-check path also needs a round left, the result-aware path
+    /// (#2315) decides what to do without one.
+    pub(crate) async fn verify_answer(
         &self,
         control: Control,
-        messages: &[Value],
-        workspace: &str,
-        task: &str,
-        can_verify: bool,
+        turn: super::self_verify::Concluding<'_>,
+        gate_on: bool,
+        answer: &str,
     ) -> anyhow::Result<Control> {
-        if matches!(control, Control::Answer)
-            && can_verify
-            && super::self_verify::enabled()
-            && !self.state()?.verified
-        {
+        if !matches!(control, Control::Answer) || !gate_on {
+            return Ok(control);
+        }
+        if turn.ledger.result_aware() {
+            let used = self.state()?.verify_repairs;
+            return Ok(match super::self_verify::conclude_turn(turn, used).await {
+                super::self_verify::Decision::Accept => control,
+                super::self_verify::Decision::Nudge(text) => {
+                    let text = format!("{} {text}", super::compress::LOOP_GUIDANCE_PREFIX);
+                    self.intervention(&text)?;
+                    self.state()?.verify_repairs += 1;
+                    Control::Continue(text)
+                }
+                super::self_verify::Decision::Stop(reason) => Control::Finish {
+                    text: answer.to_string(),
+                    reason,
+                },
+            });
+        }
+        if turn.rounds_left && super::self_verify::enabled() && !self.state()?.verified {
+            let (messages, workspace, task) = (turn.messages, turn.workspace, turn.task);
             let entries = super::self_verify::workspace_entries(std::path::Path::new(workspace));
             let checks = super::self_verify::detect_checks(&entries, task);
             let commands = super::self_verify::commands_from_messages(messages);
@@ -949,10 +971,15 @@ pub(crate) async fn response(
 /// OpenAI interpretation errors are model/wire evidence, with their original
 /// error chain retained. JSON-only consumers retain their existing decoder.
 pub(crate) fn decode_openai_response(bytes: &[u8]) -> anyhow::Result<Value> {
+    use super::observability::DispatchError;
     let mut usage = None;
     super::openai_sse::decode_response_reporting_usage(bytes, &mut usage).map_err(|error| {
-        let classified = super::observability::DispatchError::http_status(format!("{error:#}"))
-            .with_usage(usage);
+        let message = format!("{error:#}");
+        let classified = match super::openai_sse::rejection_class(&error) {
+            Some(class) => DispatchError::new(class, message),
+            None => DispatchError::http_status(message),
+        }
+        .with_usage(usage);
         error.context(classified)
     })
 }

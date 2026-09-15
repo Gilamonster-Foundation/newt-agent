@@ -1,0 +1,4 @@
+   Compiling state-machine-drain v0.0.0 (<tree>)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.49s
+     Running tests/grade_spec.rs (target/debug/deps/grade_spec-99ac63d78d0632da)
+error: test failed, to rerun pass `--test grade_spec`

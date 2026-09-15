@@ -1,0 +1,1 @@
+{"trial_name": "chess-best-move__fixture", "task_name": "chess-best-move", "agent_info": {"name": "newt", "version": "0.8.0", "model_info": {"name": "qwen3.8-flash-next"}}, "exception_info": {"exception_type": "NetworkConnectionError", "exception_message": "Command failed (exit 1): newt solve ...\nstdout: {\"endpoint\":\"http://203.0.113.7:8080\"}\n\nstderr: None"}}
