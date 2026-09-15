@@ -490,7 +490,9 @@ async fn responses_durable_prompt_context_reaches_v1_responses_wire() {
 async fn responses_output_allowance_never_changes_the_request_body() {
     let address = regex::Regex::new(r"prompt:[0-9a-f-]{36}").expect("regex");
     let mut bodies = Vec::new();
-    for output_allowance in [None, Some(2_000), Some(20_000)] {
+    for (output_allowance, reserved) in
+        [(None, 16_000), (Some(2_000), 2_000), (Some(20_000), 20_000)]
+    {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
@@ -508,11 +510,13 @@ async fn responses_output_allowance_never_changes_the_request_body() {
         let messages = giant_prompt_messages(task);
         let caveats = Caveats::top();
         let uri = server.uri();
+        let mut obs = crate::agentic::SolveObservation::default();
         let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
         ctx.safe_context = None;
         ctx.max_ok_input = None;
         ctx.cognition = Some(crate::role_profile::Cognition::Contemplating);
         ctx.output_allowance = output_allowance;
+        ctx.solve_obs = Some(&mut obs);
         openai_responses_complete(ctx, &mut NoMcp)
             .await
             .expect("the request should dispatch");
@@ -525,6 +529,16 @@ async fn responses_output_allowance_never_changes_the_request_body() {
             serde_json::from_str(&address.replace_all(&body, "prompt:ID")).unwrap();
         assert!(
             body.get("max_output_tokens").is_none(),
+            "{output_allowance:?}"
+        );
+        // #2312: no cap on the wire, so the reserve is local — the cognition
+        // table's 16,000 when nothing explicit was set.
+        assert_eq!(
+            obs.output_allowance,
+            Some(crate::agentic::OutputAllowance {
+                tokens: reserved,
+                enforced: crate::agentic::Enforcement::Local,
+            }),
             "{output_allowance:?}"
         );
         assert_eq!(body["reasoning"]["effort"], "high");

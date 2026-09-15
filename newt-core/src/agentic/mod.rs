@@ -223,8 +223,8 @@ pub use mcp::{
     NoMcp,
 };
 pub use observability::{
-    classify_reqwest, error_class, round_parse_signal, BehaviorSignal, DispatchError, ErrorClass,
-    ParseSignal, SolveObservation, ToolCallDialect,
+    classify_reqwest, error_class, round_parse_signal, BehaviorSignal, DispatchError, Enforcement,
+    ErrorClass, OutputAllowance, ParseSignal, SolveObservation, ToolCallDialect,
 };
 pub use plan_exec::{run_plan, run_plan_with_reground, NoReground, PlanRun, Reground};
 pub use prompt_intake::{
@@ -2068,6 +2068,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // #2312: no cognition table on this wire — only an explicit allowance reserves.
     let mut effective_input_ceiling =
         num_ctx_input_ceiling(num_ctx, input_ceiling_pct, output_allowance);
+    observability::observe_output_allowance(&mut solve_obs, output_allowance, false);
     let mut send_budget: Option<usize> =
         initial_send_budget(max_ok_input, safe_context, effective_input_ceiling);
     // Step 20.3: is the send budget backed by an authoritative ceiling, or
@@ -6515,6 +6516,13 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         chat_completions_capability,
         reasoning_replay_scope,
     );
+    // Every body this loop sends applies `generation_policy`, so the cap is
+    // server-enforced exactly when the policy projects `max_tokens`.
+    observability::observe_output_allowance(
+        &mut solve_obs,
+        generation_policy.output_allowance,
+        generation_policy.max_output_tokens.is_some(),
+    );
     let reasoning_replay_scope = generation_policy.reasoning_replay_scope;
     // Headless callers may pass no session state (mirrors the Ollama path).
     let mut local_compress_state = CompressState::new();
@@ -9035,6 +9043,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     let max_tokens = generation_policy
         .output_allowance
         .unwrap_or_else(anthropic_wire::default_max_tokens);
+    observability::observe_output_allowance(&mut solve_obs, Some(max_tokens), true);
     // Streaming valve: default ON; `NEWT_ANTHROPIC_STREAM=off` disables SSE.
     // Read once per loop invocation so a mid-turn flip cannot tear a round.
     let streaming_enabled = smart_harness.is_none()
@@ -11202,6 +11211,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         cognition,
         output_allowance,
     );
+    observability::observe_output_allowance(&mut solve_obs, budget_state.output_reserve(), false);
     let (tools_chat, hidden_tools) = crate::agentic::tools::select_exposed(
         tools_chat,
         &exposure,

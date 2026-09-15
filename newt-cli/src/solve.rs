@@ -101,6 +101,8 @@ pub struct SolveArgs {
     pub scratchpad_state: Option<PathBuf>,
     /// `--require-feature`: features the run must be able to supply (#2314).
     pub require_feature: Vec<solve_contract::Feature>,
+    /// `--output-allowance`: explicit output-token allowance (#2312).
+    pub output_allowance: Option<u32>,
 }
 
 /// Seed a fresh scratchpad from `--scratchpad-state` JSON, returning the store
@@ -470,6 +472,11 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
     // 5. Drive one full turn (== a complete multi-round agentic solve).
     let mut dc = TurnDriverConfig::new(&url, &model, kind, &workspace);
     apply_context_config(&mut dc, cfg.context.as_ref());
+    // #2312: the flag, else the model's `[[model_tuning]]` entry — the lookup
+    // the TUI uses — else the cognition table and wire defaults downstream.
+    dc.output_allowance = args
+        .output_allowance
+        .or_else(|| cfg.find_model_tuning(&model)?.output_allowance);
     dc.api_key = api_key;
     dc.chat_completions_capability = chat_capability;
     dc.reasoning_replay_scope = decision.reasoning_replay_scope();
@@ -795,6 +802,7 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
                 .and_then(|o| o.usage.as_ref())
                 .map(|u| u64::from(u.output_tokens)),
             smart_harness: smart_manifest.as_ref(),
+            output_allowance: o_opt.and_then(|o| o.output_allowance),
             features: o_opt.map(|o| o.features),
             scratchpad_seed: scratchpad.as_ref().map(|(_, seed)| seed.as_str()),
             required: &args.require_feature,

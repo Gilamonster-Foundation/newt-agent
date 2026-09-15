@@ -331,8 +331,10 @@ async fn explicit_output_allowance_outranks_the_anthropic_env_default() {
         let messages = msgs();
         let caveats = Caveats::top();
         let uri = server.uri();
+        let mut obs = crate::agentic::SolveObservation::default();
         let mut c = ctx(&uri, &messages, &caveats);
         c.output_allowance = output_allowance;
+        c.solve_obs = Some(&mut obs);
         chat_complete(c, &mut NoMcp).await.expect("dispatch");
         let requests = server.received_requests().await.expect("recorded");
         assert_eq!(requests.len(), 1);
@@ -340,6 +342,15 @@ async fn explicit_output_allowance_outranks_the_anthropic_env_default() {
             body_json(&requests[0])["max_tokens"],
             sent,
             "{output_allowance:?}"
+        );
+        // #2312: this wire always sends the cap, so it is server-enforced —
+        // the env default included.
+        assert_eq!(
+            obs.output_allowance,
+            Some(crate::agentic::OutputAllowance {
+                tokens: sent,
+                enforced: crate::agentic::Enforcement::Server,
+            })
         );
     }
 }

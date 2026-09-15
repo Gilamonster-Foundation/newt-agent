@@ -155,6 +155,45 @@ pub struct SolveObservation {
     pub parse_signals: Vec<ParseSignal>,
     /// Output-behavior signals, in detection order.
     pub behavior_signals: Vec<BehaviorSignal>,
+    /// The output cap the turn's wire applied (#2312), when it applied one.
+    pub output_allowance: Option<OutputAllowance>,
+}
+
+/// An output cap as a turn applied it (#2312): the tokens, and whether the
+/// request carried the cap to the server or newt only reserved it locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct OutputAllowance {
+    pub tokens: u32,
+    pub enforced: Enforcement,
+}
+
+/// Who enforces an [`OutputAllowance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Enforcement {
+    /// The request sent the cap (`max_tokens`).
+    Server,
+    /// The request sent no cap; newt reserved the tokens from its input budget.
+    Local,
+}
+
+/// Record the cap a wire applied, at the one point it decides the request:
+/// `sent` only when that request carries the cap.
+pub(crate) fn observe_output_allowance(
+    obs: &mut Option<&mut SolveObservation>,
+    tokens: Option<u32>,
+    sent: bool,
+) {
+    if let Some(obs) = obs.as_deref_mut() {
+        obs.output_allowance = tokens.map(|tokens| OutputAllowance {
+            tokens,
+            enforced: if sent {
+                Enforcement::Server
+            } else {
+                Enforcement::Local
+            },
+        });
+    }
 }
 
 /// Structural classification of a failed turn — the contract `outcome`
