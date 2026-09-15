@@ -737,6 +737,7 @@ fn persist_incomplete_turn(
     turn_tool_events: &[newt_core::ToolEvent],
     turn_phantom_reaches: &[newt_core::PhantomReach],
     usage: Option<newt_core::TokenUsage>,
+    attempts: newt_core::attempts::UsageTotals,
     hallucinations: u32,
     end_reason: newt_core::TurnEndReason,
     elapsed: std::time::Duration,
@@ -762,13 +763,14 @@ fn persist_incomplete_turn(
     let metrics = newt_core::TurnMetrics {
         elapsed_ms: elapsed.as_millis() as u64,
         usage,
-        cost_usd: pricing.estimate_cost(
+        attempts: Some(attempts),
+        cost_usd: pricing.estimate_attempts_cost(
             inf_model,
             newt_core::owned_hosts::inference_is_local(
                 inf_kind == newt_core::BackendKind::Embedded,
                 Some(inf_url),
             ),
-            usage.as_ref(),
+            &attempts,
         ),
         model_id: inf_model.to_string(),
         endpoint: inf_url.to_string(),
@@ -7577,6 +7579,9 @@ fn session_body(
                     } else {
                         None
                     };
+                    // #2313: one attempt ledger per turn; its totals price the turn.
+                    let turn_attempts =
+                        std::sync::Mutex::new(newt_core::attempts::AttemptLedger::default());
                     let response = with_live_spill_watch(
                         interruptible,
                         &turn_cancel,
@@ -7667,7 +7672,7 @@ fn session_body(
                                             .capability_decision().chat_completions(),
                                         output_allowance: model_tune
                                             .and_then(|t| t.output_allowance),
-                                        attempt_ledger: None,
+                                        attempt_ledger: Some(&turn_attempts),
                                         reasoning_replay_scope: choice
                                             .capability_decision()
                                             .reasoning_replay_scope(),
@@ -7828,6 +7833,10 @@ fn session_body(
                     surface.turn_ended();
 
                     let elapsed = t0.elapsed();
+                    let turn_attempt_totals = turn_attempts
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .totals();
                     erase_line();
                     // Snapshot again regardless of the response shape. A tool
                     // may have committed before cancellation or a later model
@@ -7932,6 +7941,7 @@ fn session_body(
                             &turn_tool_events,
                             &turn_phantom_reaches,
                             cancel_usage,
+                            turn_attempt_totals,
                             cancel_hallucinations,
                             newt_core::TurnEndReason::Cancelled,
                             elapsed,
@@ -8101,13 +8111,14 @@ fn session_body(
                                 let metrics = newt_core::TurnMetrics {
                                     elapsed_ms: elapsed.as_millis() as u64,
                                     usage,
-                                    cost_usd: pricing.estimate_cost(
+                                    attempts: Some(turn_attempt_totals),
+                                    cost_usd: pricing.estimate_attempts_cost(
                                         &inf_model,
                                         newt_core::owned_hosts::inference_is_local(
                                             inf_kind == newt_core::BackendKind::Embedded,
                                             Some(&inf_url),
                                         ),
-                                        usage.as_ref(),
+                                        &turn_attempt_totals,
                                     ),
                                     model_id: inf_model.clone(),
                                     endpoint: inf_url.clone(),
@@ -8390,6 +8401,7 @@ fn session_body(
                                     &turn_tool_events,
                                     &turn_phantom_reaches,
                                     None,
+                                    turn_attempt_totals,
                                     0,
                                     newt_core::TurnEndReason::Failed,
                                     elapsed,

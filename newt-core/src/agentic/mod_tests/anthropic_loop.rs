@@ -1454,6 +1454,66 @@ async fn an_anthropic_cap_exit_summary_is_one_ledger_attempt() {
         .all(|r| r.state == crate::attempts::AttemptState::Ok));
 }
 
+/// A `pause_turn` reply (with usage), then the final answer.
+struct PauseThenAnswer {
+    calls: Arc<AtomicUsize>,
+}
+impl Respond for PauseThenAnswer {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            json_reply(
+                "pause_turn",
+                serde_json::json!([{"type": "text", "text": "thinking so far"}]),
+                100,
+                8,
+            )
+        } else {
+            json_reply(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text": "resumed answer"}]),
+                110,
+                6,
+            )
+        }
+    }
+}
+
+/// #2313 (b2): a `pause_turn` reply generated tokens the operator pays for,
+/// so its usage joins the turn instead of being dropped by the re-dispatch.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn a_paused_turn_keeps_the_paused_replys_usage() {
+    let _env = test_env(false);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(PauseThenAnswer {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    let (reply, _, usage, _) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+    assert_eq!(reply, "resumed answer");
+    assert_eq!(
+        usage,
+        Some(crate::TokenUsage {
+            input_tokens: 110,
+            output_tokens: 14
+        }),
+        "the paused reply's 8 generated tokens join the turn"
+    );
+    let records = assert_anthropic_attempts_equal_wire_requests(&server, &ledger).await;
+    assert_eq!(records.len(), 2);
+    let totals = ledger.lock().unwrap().totals();
+    assert_eq!((totals.in_tokens, totals.out_tokens), (210, 14));
+}
+
 // -----------------------------------------------------------------------
 // #2313 review: streamed Anthropic attempts follow the state rule — a stream
 // that reached `message_stop` is ok; a cut stream, an error event, or an

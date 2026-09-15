@@ -3202,6 +3202,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 )
                             }));
                             unverified_exec_blocker_nudges += 1;
+                            // #2313: the rejected reply was still generated.
+                            accumulated_usage = merge_round_usage(accumulated_usage, $usage);
                             continue 'round_loop;
                         }
                         if action_nudges && round + 1 < current_tool_round_limit {
@@ -9914,6 +9916,8 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                     // pauses cannot spin the loop.
                     if reply.stop_reason.as_deref() == Some("pause_turn") && !pause_turn_retried {
                         pause_turn_retried = true;
+                        // #2313: the paused reply generated tokens the turn pays for.
+                        accumulated_usage = merge_round_usage(accumulated_usage, reply.usage);
                         if debug {
                             print_debug("pause_turn — re-dispatching the same history once", color);
                         }

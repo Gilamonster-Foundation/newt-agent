@@ -86,9 +86,17 @@ pub struct TurnMetrics {
     /// response byte), in milliseconds.
     pub elapsed_ms: u64,
 
-    /// Token usage, if reported by the backend.
+    /// Token usage, if reported by the backend: the turn's CONTEXT merge —
+    /// its largest prompt and the tokens it generated. Never a billing or
+    /// completeness signal; those are [`Self::attempts`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
+
+    /// What the turn actually sent and generated, summed per inference attempt,
+    /// with how many attempts reported no usage (#2313). `None` when no attempt
+    /// ledger observed the turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<crate::attempts::UsageTotals>,
 
     /// Estimated monetary cost in USD. `Some(0.0)` is a confirmed free (local)
     /// rate; `None` is UNKNOWN — no rate, or no usage — never zero (#2313).
@@ -132,13 +140,25 @@ impl TurnMetrics {
             format!("{}ms", self.elapsed_ms)
         };
 
-        let token_part = match self.usage {
-            Some(u) => format!(
-                "{} in / {} out",
-                fmt_count(u.input_tokens),
-                fmt_count(u.output_tokens)
+        // Whenever attempts were recorded and any lacks usage, say so — also
+        // when none was measured and the numbers below are the context merge's.
+        let unmeasured = self
+            .attempts
+            .filter(|t| t.attempts > 0 && !t.usage_complete)
+            .map(|t| format!(" ({} of {} calls unmeasured)", t.usage_missing, t.attempts))
+            .unwrap_or_default();
+        let token_part = match (self.attempts, self.usage) {
+            (Some(t), _) if t.attempts > t.usage_missing => format!(
+                "{} in / {} out{unmeasured}",
+                fmt_count(t.in_tokens),
+                fmt_count(t.out_tokens)
             ),
-            None => "(tokens unavailable)".into(),
+            (_, Some(u)) => format!(
+                "{} in / {} out{unmeasured}",
+                fmt_count(u64::from(u.input_tokens)),
+                fmt_count(u64::from(u.output_tokens))
+            ),
+            _ => format!("(tokens unavailable){unmeasured}"),
         };
 
         let cost_part = match self.cost_usd {
@@ -211,7 +231,7 @@ impl TurnMetrics {
     }
 }
 
-fn fmt_count(n: u32) -> String {
+fn fmt_count(n: u64) -> String {
     // Insert thousands separators for readability.
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
@@ -337,6 +357,56 @@ mod tests {
         let free = metrics(3200, 847, 312, Some(0.0));
         assert!(free.display_line().contains("free (local)"));
         assert_eq!(serde_json::to_value(&free).unwrap()["cost_usd"], 0.0);
+    }
+
+    /// #2313 (b2): with attempt totals the line shows what was sent, and an
+    /// incomplete turn names its unmeasured calls and never prints a cost.
+    #[test]
+    fn display_uses_attempt_totals_and_names_unmeasured_calls() {
+        let mut billed = metrics(1000, 120, 15, Some(0.000885));
+        billed.attempts = Some(crate::attempts::UsageTotals {
+            attempts: 2,
+            usage_missing: 0,
+            in_tokens: 220,
+            out_tokens: 15,
+            usage_complete: true,
+        });
+        let line = billed.display_line();
+        assert!(line.contains("220 in / 15 out"), "{line}");
+        assert!(!line.contains("120 in"), "{line}");
+
+        let mut partial = metrics(1000, 100, 10, None);
+        partial.attempts = Some(crate::attempts::UsageTotals {
+            attempts: 2,
+            usage_missing: 1,
+            in_tokens: 100,
+            out_tokens: 10,
+            usage_complete: false,
+        });
+        let line = partial.display_line();
+        assert!(
+            line.contains("100 in / 10 out (1 of 2 calls unmeasured) · cost unknown"),
+            "{line}"
+        );
+        assert!(!line.contains('$') && !line.contains("free"), "{line}");
+    }
+
+    /// #2313 review finding 8: when EVERY attempt is unmeasured the line still
+    /// says so, instead of falling through to the context merge's numbers
+    /// looking measured.
+    #[test]
+    fn display_names_unmeasured_calls_even_when_none_were_measured() {
+        let mut blind = metrics(1000, 120, 15, None);
+        blind.attempts = Some(crate::attempts::UsageTotals {
+            attempts: 2,
+            usage_missing: 2,
+            in_tokens: 0,
+            out_tokens: 0,
+            usage_complete: false,
+        });
+        let line = blind.display_line();
+        assert!(line.contains("(2 of 2 calls unmeasured)"), "{line}");
+        assert!(line.contains("cost unknown"), "{line}");
     }
 
     #[test]
