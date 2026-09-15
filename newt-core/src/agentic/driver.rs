@@ -680,6 +680,7 @@ async fn run_one_turn(
         cognition: runtime.cognition,
         chat_completions_capability: config.chat_completions_capability,
         output_allowance: config.output_allowance,
+        attempt_ledger: None,
         reasoning_replay_scope: config.reasoning_replay_scope,
         emits_leading_reasoning: config.emits_leading_reasoning,
         max_tool_rounds: config.max_tool_rounds,

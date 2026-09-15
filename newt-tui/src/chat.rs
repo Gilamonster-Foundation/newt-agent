@@ -7652,6 +7652,7 @@ fn session_body(
                                             .capability_decision().chat_completions(),
                                         output_allowance: model_tune
                                             .and_then(|t| t.output_allowance),
+                                        attempt_ledger: None,
                                         reasoning_replay_scope: choice
                                             .capability_decision()
                                             .reasoning_replay_scope(),
