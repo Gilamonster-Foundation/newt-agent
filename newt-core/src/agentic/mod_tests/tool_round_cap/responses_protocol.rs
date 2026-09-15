@@ -649,3 +649,99 @@ async fn a_responses_cap_exit_summary_is_one_ledger_attempt() {
         "tool round, tools-disabled summary"
     );
 }
+
+/// #2313 review findings 6 and 7: every 2xx Responses body records its attempt
+/// by the state rule, with the usage the body reported attached whatever the
+/// state. A complete terminal response is ok — an answer, a refusal, or a
+/// truncation (`incomplete`); a failed, provider-error, mixed, non-terminal or
+/// malformed body is failed.
+#[tokio::test]
+async fn every_responses_body_records_its_attempt_state_and_usage() {
+    use crate::attempts::AttemptState::{Failed, Ok};
+    let usage = serde_json::json!({"input_tokens": 30, "output_tokens": 4});
+    let message = serde_json::json!([{"type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": "an answer"}]}]);
+    let cases = [
+        (
+            "completed",
+            serde_json::json!({"status": "completed", "output": message, "usage": usage}),
+            Ok,
+        ),
+        (
+            "refused",
+            serde_json::json!({"status": "completed", "usage": usage, "output": [{"type": "message",
+            "role": "assistant", "content": [{"type": "refusal", "refusal": "no"}]}]}),
+            Ok,
+        ),
+        (
+            "incomplete",
+            serde_json::json!({"status": "incomplete", "usage": usage, "output": message,
+            "incomplete_details": {"reason": "max_output_tokens"}}),
+            Ok,
+        ),
+        (
+            "failed",
+            serde_json::json!({"status": "failed", "usage": usage, "output": []}),
+            Failed,
+        ),
+        (
+            "provider error",
+            serde_json::json!({"error": {"message": "boom"}, "usage": usage}),
+            Failed,
+        ),
+        (
+            "non-terminal",
+            serde_json::json!({"status": "in_progress", "usage": usage, "output": []}),
+            Failed,
+        ),
+        (
+            "malformed",
+            serde_json::json!({"status": "completed", "usage": usage, "output": []}),
+            Failed,
+        ),
+        (
+            "mixed",
+            serde_json::json!({"status": "completed", "usage": usage, "output": [
+                {"type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": "no"}]},
+                {"type": "function_call", "call_id": "c", "name": "definitely_not_a_real_tool", "arguments": "{}"}
+            ]}),
+            Failed,
+        ),
+    ];
+    for (name, body, state) in cases {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let task = "record this body";
+        let messages = giant_prompt_messages(task);
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+        let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, BackendKind::Openai);
+        ctx.safe_context = None;
+        ctx.max_ok_input = None;
+        ctx.max_tool_rounds = 5;
+        ctx.attempt_ledger = Some(&ledger);
+        let _ = openai_responses_complete(ctx, &mut NoMcp).await;
+
+        let received = server.received_requests().await.expect("journal");
+        let first = content_addressable::RawContentId::from_content(&received[0].body);
+        let ledger = ledger.lock().unwrap();
+        let record = ledger
+            .records()
+            .find(|r| r.key.request == first && r.key.ordinal == 0)
+            .unwrap_or_else(|| panic!("{name}: the first request is an attempt"));
+        assert_eq!(record.state, state, "{name}");
+        assert_eq!(
+            record.usage,
+            Some(crate::TokenUsage {
+                input_tokens: 30,
+                output_tokens: 4
+            }),
+            "{name}: reported usage attaches whatever the state"
+        );
+    }
+}

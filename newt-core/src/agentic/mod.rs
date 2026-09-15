@@ -3451,7 +3451,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             // Step 25.4 (#568): `markdown` is now resolved by the caller
             // (`[tui].markdown` ∧ `/markdown` override ∧ color) and read off the
             // ctx above — no longer hardcoded to `color`.
-            let (streamed, stream_usage) = match stream_response(
+            let (streamed, stream_usage, stream_complete) = match stream_response(
                 sresp,
                 color,
                 show_thinking,
@@ -3509,11 +3509,19 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     return Ok((probe_content, false, accumulated_usage, hallucination_count));
                 }
             };
-            // An interrupted stream stays recorded failed (cancellation is not
-            // modelled here); a completed one reports the usage it streamed.
-            if !is_cancelled(cancel) {
-                attempt_capture::complete(attempts, stream_attempt.as_ref(), stream_usage);
-            }
+            // #2313: ok only for a stream that reached `done: true` without an
+            // interrupt; a cut stream or an interrupt is failed. Usage attaches
+            // either way.
+            attempt_capture::finish(
+                attempts,
+                stream_attempt.as_ref(),
+                if stream_complete {
+                    crate::attempts::AttemptState::Ok
+                } else {
+                    crate::attempts::AttemptState::Failed
+                },
+                stream_usage,
+            );
 
             if streamed.is_empty() {
                 // The streaming re-issue produced no tokens. Fall back to the
@@ -8799,12 +8807,16 @@ async fn anthropic_dispatch_round(
         let mut anth_reason = ReasoningTrickle::default();
         let mut started = false;
         let mut transport_break: Option<String> = None;
+        let mut interrupted = false;
         let mut resp = resp;
         while !acc.is_done() {
             match cancellable(cancel, resp.chunk()).await {
                 // Interrupted: stop reading and keep what already streamed
                 // (mirrors `stream_response`'s interrupt contract).
-                None => break,
+                None => {
+                    interrupted = true;
+                    break;
+                }
                 Some(Ok(Some(chunk))) => {
                     // Lossy UTF-8 into the accumulator's ROLLING line buffer —
                     // an SSE `data:` line routinely splits across chunks, so a
@@ -8867,6 +8879,7 @@ async fn anthropic_dispatch_round(
         if started && md.is_none() {
             println!();
         }
+        let done = acc.is_done();
         let round = acc.finish();
 
         // #640 mid-stream-break policy (mirrors the Ollama path): a stream
@@ -8874,6 +8887,19 @@ async fn anthropic_dispatch_round(
         // partial text with a notice; before any visible output it converts
         // to the retryable error shape and this round is re-issued.
         let break_error = round.error.clone().or(transport_break);
+        // #2313: ok only for a stream that reached `message_stop` with no error
+        // and no interrupt; a cut stream, an error event, or an interrupt is
+        // failed. Reported usage attaches either way.
+        attempt_capture::finish(
+            attempts,
+            attempt.as_ref(),
+            if done && break_error.is_none() && !interrupted {
+                crate::attempts::AttemptState::Ok
+            } else {
+                crate::attempts::AttemptState::Failed
+            },
+            round.usage,
+        );
         if let Some(err) = break_error {
             let shaped: anyhow::Error = observability::DispatchError::http_status(format!(
                 "inference endpoint 529: mid-stream error: {err}"
@@ -8899,10 +8925,6 @@ async fn anthropic_dispatch_round(
                 d.color,
             );
             return Ok(Some((round, true)));
-        }
-        // A broken stream above stays recorded failed; so does an interrupt.
-        if !is_cancelled(cancel) {
-            attempt_capture::complete(attempts, attempt.as_ref(), round.usage);
         }
         return Ok(Some((round, started)));
     }
@@ -11055,22 +11077,30 @@ where
     .await
 }
 
-/// A Responses reply completed its attempt when it decoded to an answer or a
-/// refusal (the model's final word); failed, incomplete and malformed replies
-/// leave the attempt recorded failed.
+/// Record a decoded 2xx Responses reply's attempt by the #2313 state rule: a
+/// complete terminal response — an answer, a refusal, or a truncation
+/// (`incomplete`) — is ok; a failed, provider-error, mixed, non-terminal or
+/// malformed body is failed. The usage the body reported attaches either way.
 fn complete_responses_attempt(
     attempts: Option<attempt_capture::AttemptScope<'_>>,
     attempt: Option<&crate::attempts::AttemptKey>,
+    json: &serde_json::Value,
     decoded: &Result<
         crate::responses_wire::DecodedResponse,
         crate::responses_wire::ResponseDecodeError,
     >,
 ) {
-    if let Ok(crate::responses_wire::DecodedResponse { usage, .. })
-    | Err(crate::responses_wire::ResponseDecodeError::Refused { usage, .. }) = decoded
-    {
-        attempt_capture::complete(attempts, attempt, *usage);
-    }
+    use crate::responses_wire::ResponseDecodeError::{Incomplete, Refused};
+    let state = match decoded {
+        Ok(_) | Err(Refused { .. } | Incomplete { .. }) => crate::attempts::AttemptState::Ok,
+        Err(_) => crate::attempts::AttemptState::Failed,
+    };
+    attempt_capture::finish(
+        attempts,
+        attempt,
+        state,
+        crate::responses_wire::decode_usage(&json["usage"]),
+    );
 }
 
 async fn openai_responses_complete_with_prompt_and_artifacts(
@@ -11727,7 +11757,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         // failed / incomplete / non-terminal status, malformed/empty body) is
         // surfaced — never mistaken for a benign empty reply.
         let decoded = crate::responses_wire::decode_response(&json);
-        complete_responses_attempt(attempts, attempt.as_ref(), &decoded);
+        complete_responses_attempt(attempts, attempt.as_ref(), &json, &decoded);
         let decoded = match decoded {
             Ok(d) => d,
             Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage })
@@ -12398,7 +12428,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // handoff is still a successful paused turn so the interactive caller can
     // persist it and retain the continuation link.
     let decoded = crate::responses_wire::decode_response(&json);
-    complete_responses_attempt(attempts, attempt.as_ref(), &decoded);
+    complete_responses_attempt(attempts, attempt.as_ref(), &json, &decoded);
     let decoded = match decoded {
         Ok(d) => d,
         Err(crate::responses_wire::ResponseDecodeError::Refused { message, usage }) => {
@@ -12951,6 +12981,19 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     drop(spinner.take());
     let mut out = sink.end(started);
     let (round, provider_error) = acc.finish_with_error();
+    // #2313: one decision for the attempt, whatever the caller does with the
+    // text. Ok only for a stream that reached `[DONE]` with no error event and
+    // no interrupt; failed otherwise. Reported usage attaches either way.
+    attempt_capture::finish(
+        attempts,
+        attempt.as_ref(),
+        if round.done && provider_error.is_none() && !interrupted {
+            crate::attempts::AttemptState::Ok
+        } else {
+            crate::attempts::AttemptState::Failed
+        },
+        round.usage,
+    );
     if !interrupted {
         if let Some(error) = provider_error {
             if started {
@@ -12987,7 +13030,6 @@ async fn openai_stream_final_answer<W: std::io::Write>(
     // ended before [DONE]" blames the wire for the operator's own decision.
     if interrupted {
         display::write_harness_notice(&mut out, "interrupted — keeping the partial answer", color);
-        attempt_capture::complete(attempts, attempt.as_ref(), round.usage);
         return StreamOutcome::Printed(text, round.usage);
     }
     // A stream that never reached `[DONE]` was CUT: the fragment on screen
@@ -13024,12 +13066,12 @@ async fn openai_stream_final_answer<W: std::io::Write>(
         );
         return StreamOutcome::UseProbe(round.usage);
     }
-    attempt_capture::complete(attempts, attempt.as_ref(), round.usage);
     StreamOutcome::Printed(text, round.usage)
 }
 
 /// Stream an Ollama NDJSON response, printing tokens as they arrive.
-/// Returns `(accumulated_text, token_usage)`.
+/// Returns `(accumulated_text, token_usage, complete)`, where `complete` means
+/// the stream reached `done: true` without an interrupt.
 /// Token usage is extracted from the final chunk (`done: true`).
 /// `show_thinking` opts into the cargo-style reasoning spinner (TTY only).
 /// `retain` is where a folded reasoning body is kept so its `/spill open <id>`
@@ -13044,7 +13086,7 @@ async fn stream_response(
     cancel: Option<&std::sync::atomic::AtomicBool>,
     markdown: bool,
     retain: Option<std::sync::Arc<dyn CompletedSpillRenderer>>,
-) -> anyhow::Result<(String, Option<crate::TokenUsage>)> {
+) -> anyhow::Result<(String, Option<crate::TokenUsage>, bool)> {
     // The ONE spinner (`newt_core::tty`). `legacy_caps` preserves today's
     // gating exactly; the shared 100ms OS-thread ticker replaces the old
     // advance-only-on-a-reasoning-chunk clock, so a model STALL now shows a
@@ -13083,11 +13125,16 @@ async fn stream_response(
     };
 
     let mut resp = resp;
+    let mut done = false;
+    let mut interrupted = false;
     // Race each chunk read against the interrupt flag so Esc stops the token
     // stream promptly; on interrupt, stop reading and return what we have.
     while let Some(chunk) = match cancellable(cancel, resp.chunk()).await {
         Some(c) => c?,
-        None => None,
+        None => {
+            interrupted = true;
+            None
+        }
     } {
         let text = String::from_utf8_lossy(&chunk);
         for line in text.lines() {
@@ -13152,6 +13199,7 @@ async fn stream_response(
                 full.push_str(token);
             }
             if json["done"].as_bool().unwrap_or(false) {
+                done = true;
                 // Extract token counts from the final Ollama chunk.
                 let input = json["prompt_eval_count"].as_u64().map(|n| n as u32);
                 let output = json["eval_count"].as_u64().map(|n| n as u32);
@@ -13194,7 +13242,7 @@ async fn stream_response(
     if started && md.is_none() {
         println!();
     }
-    Ok((full, usage))
+    Ok((full, usage, done && !interrupted))
 }
 
 #[cfg(test)]
