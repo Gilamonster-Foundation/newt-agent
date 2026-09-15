@@ -2,6 +2,7 @@
 """tb_campaign.py — trial records and the report table for tb-campaign.sh (#2318).
 
     tb_campaign.py ingest <job_dir> <cell.json> <out_dir>   # append trials.jsonl + cells.jsonl
+    tb_campaign.py cell-line <cell.json> <out_dir>          # append a skipped cell to cells.jsonl
     tb_campaign.py table <out_dir> [--pair]                # markdown matrix [+ treatment vs none]
     tb_campaign.py cell <cell.json> <treatment|none> key value ...   # write a cell binding
     tb_campaign.py profile <treatment|none> <model> <in> <out>       # newt profile + env lines
@@ -28,16 +29,22 @@ attempt counts once; tasks carry equal attempts by design.
 
 from __future__ import annotations
 
+import functools
+import getpass
 import hashlib
+import ipaddress
 import json
 import math
+import os
 import random
 import re
+import socket
 import statistics
 import sys
 import tomllib
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pi_log import pi_awaiting, pi_inference_failure, pi_session_claim, session_messages
 from pi_log import records as _records
@@ -92,6 +99,77 @@ def error_cause(exception, exit_code, harness_error, pi_failure, responses, wait
     if exception in AGENT_EXCEPTIONS or responses:
         return "agent"
     return "unknown"
+
+
+# Rows and cells reach commits, report tables and cards. Free text copied from a
+# harness or provider is scrubbed as it is written, after classification: newt's
+# failed request names the request URL, and a provider's error body can name an
+# account. Identity and join fields (campaign, model, harness, job, task,
+# harness_version) are never touched, so tables still join and pins still install.
+FREE_TEXT = ("harness_error", "harness_config", "inference_failure", "refusal", "claim_source", "skipped")
+FREE_TEXT_MAX = 300
+# Generic shapes, for addresses this machine does not know about. The operator's
+# own names are matched as literals (local_literals), which also catches them
+# unbracketed, portless, escaped or %-encoded.
+ADDRESS = re.compile(
+    r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'()<>]+"  # URL
+    r"|\[[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*\](?::\d+)?"  # bracketed IPv6 literal (not error[E0308])
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b"  # IPv4
+    # host:port with a dotted host or localhost (not status:429 or src/main.rs:42:5)
+    r"|(?<![\w./-])(?:localhost|[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)+):\d{2,5}(?![\d:])"
+    r"|/(?:home|Users)/[^/\s\"']+"  # home dir
+)
+ACCOUNT_MIN = 5  # ponytail: a shorter account (dev, app, newt) is only caught inside its home dir
+
+
+@functools.lru_cache(maxsize=None)
+def _addresses(host):
+    try:
+        ipaddress.ip_address(host)
+        return {host}
+    except ValueError:
+        pass
+    try:
+        return {host} | {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except OSError:
+        return {host}
+
+
+def local_literals(base_url=None):
+    """(tokens, account, home): the endpoint host tb-campaign.sh exports in
+    TB_LOCAL_BASE_URL with its addresses, this machine's hostname, the account."""
+    host = urlparse(base_url or os.environ.get("TB_LOCAL_BASE_URL", "")).hostname
+    tokens = (_addresses(host) if host else set()) | {socket.gethostname()}
+    return {t for t in tokens if t}, getpass.getuser(), str(Path.home())
+
+
+def scrub(value, literals=None):
+    """First line, with no address, account or home dir, then bounded."""
+    literals = literals or local_literals()
+    if isinstance(value, dict):
+        return {k: scrub(v, literals) for k, v in value.items()}
+    if isinstance(value, list):
+        return [scrub(v, literals) for v in value]
+    if not isinstance(value, str):
+        return value
+    tokens, account, home = literals
+    text = (value.strip().splitlines() or [""])[0].replace(home, "<redacted>")
+    for token in sorted(tokens, key=len, reverse=True):  # plain substrings: inside %-encoded or escaped URLs too
+        text = text.replace(token, "<redacted>") if len(token) >= 3 else text
+    if len(account) >= ACCOUNT_MIN:
+        text = re.sub(rf"(?<![\w-]){re.escape(account)}(?![\w-])", "<redacted>", text)
+    return ADDRESS.sub("<redacted>", text)[:FREE_TEXT_MAX]
+
+
+def redact(record, literals=None):
+    literals = literals or local_literals()
+    return {k: scrub(v, literals) if k in FREE_TEXT else v for k, v in record.items()}
+
+
+def write_cell(out: Path, cell, observed):
+    """The one writer of cells.jsonl lines, for ingested and skipped cells alike."""
+    with open(out / "cells.jsonl", "a") as f:
+        f.write(json.dumps(redact({**cell, "observed": observed})) + "\n")
 
 
 def pi_session_lines(agent_dir: Path):
@@ -445,7 +523,7 @@ def trial_row(harness, trial: Path, expect=None):
             harness_config = o.get("effective_config") or harness_config
             contract = o if "outcome" in o else contract
         tokens_out = timing.get("gen_tokens")
-    return {
+    return redact({
         "trial": rec["trial"],
         "task": rec["task"],
         "task_checksum": r.get("task_checksum"),
@@ -475,7 +553,7 @@ def trial_row(harness, trial: Path, expect=None):
         "tokens_source": source,
         "max_request_output_tokens": max_request_output(harness, trial / "agent"),
         "agent_s": _seconds(r.get("agent_execution")),
-    }
+    })
 
 
 # ── one Harbor job per trial ─────────────────────────────────────────────────
@@ -623,8 +701,7 @@ def ingest(job_dir: Path, cell_json: Path, out: Path):
             pin_path.write_text(json.dumps(pin_extend(pin, cell), indent=1, sort_keys=True))
     with open(out / "trials.jsonl", "a") as f:
         f.writelines(json.dumps(row) + "\n" for row in rows)
-    with open(out / "cells.jsonl", "a") as f:
-        f.write(json.dumps({**cell, "observed": len(rows)}) + "\n")
+    write_cell(out, cell, len(rows))
 
 
 def wilson(k, n, z=1.96):
@@ -837,6 +914,8 @@ if __name__ == "__main__":
     cmd, *args = sys.argv[1:]
     if cmd == "ingest":
         ingest(Path(args[0]), Path(args[1]), Path(args[2]))
+    elif cmd == "cell-line":  # a skipped cell, through the same redaction as an ingested one
+        write_cell(Path(args[1]), json.loads(Path(args[0]).read_text()), 0)
     elif cmd == "table":
         table(Path(args[0]), "--pair" in args[1:])
     elif cmd == "cell":

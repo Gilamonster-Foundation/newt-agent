@@ -132,7 +132,7 @@ router_clear() {
 }
 record() { # record <cell.json> [job dir]: bind the cell and ingest its trials
   if [ -n "${2:-}" ]; then python3 "$HERE/tb_campaign.py" ingest "$2" "$1" "$OUT"
-  else py 'import json,sys; c=json.load(open(sys.argv[1])); open(sys.argv[2],"a").write(json.dumps({**c,"observed":0})+"\n")' "$1" "$OUT/cells.jsonl"; fi
+  else python3 "$HERE/tb_campaign.py" cell-line "$1" "$OUT"; fi
 }
 
 if [ -n "${TB_MATRIX:-}" ]; then mapfile -t ARMS < <(grep -vE '^\s*(#|$)' "$TB_MATRIX")
