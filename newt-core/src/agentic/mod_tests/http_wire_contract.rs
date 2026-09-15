@@ -89,11 +89,11 @@ async fn multi_turn_wire_keeps_live_operator_task_newest_after_protected_copy() 
         .expect("ordinary multi-turn request should complete");
 
     assert_eq!(reply, "wire order preserved");
-    assert!(streamed);
+    assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert_eq!(
         requests.load(Ordering::SeqCst),
-        2,
-        "both the probe and streaming reissue reached the wire"
+        1,
+        "one generation; no display reissue (#2372)"
     );
     assert!(
         order_valid.load(Ordering::SeqCst),

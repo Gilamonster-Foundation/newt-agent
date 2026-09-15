@@ -104,9 +104,7 @@ async fn cap_exit_hallucinated_path_gets_claim_check_refutation() {
 /// returned straight through, unannotated even when it hallucinated the
 /// same file path the cap-exit summary would have been checked for. Same
 /// content as [`HallucinatingFinalSummary`] above, served on the FIRST
-/// round with no cap in play, on both the non-streamed probe and the
-/// streaming re-issue (the wire always re-issues once the probe returns no
-/// tool calls).
+/// round with no cap in play.
 struct HallucinatingFirstAnswer;
 impl Respond for HallucinatingFirstAnswer {
     fn respond(&self, req: &Request) -> ResponseTemplate {

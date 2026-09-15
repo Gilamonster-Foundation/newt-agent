@@ -237,7 +237,8 @@ async fn ollama_advertises_artifact_read_and_records_plan_provenance() {
     .expect("Ollama plan loop succeeds");
 
     assert_eq!(reply, "plan provenance captured");
-    assert_eq!(requests.load(Ordering::SeqCst), 3);
+    // #2372: the accepted answer is not generated again for display.
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
     assert!(
         artifact_read_seen.load(Ordering::SeqCst),
         "artifact_read must ride every Ollama inference request"

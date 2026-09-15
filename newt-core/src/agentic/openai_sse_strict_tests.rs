@@ -90,23 +90,18 @@ fn stream_accepts_omitted_and_blank_zero_argument_tool_calls() {
 }
 
 #[test]
-fn stream_refuses_cut_or_malformed_tool_arguments() {
-    for (arguments, done) in [
-        ("{\"command\":\"echo fixture\"}", false),
-        ("{\"command\":", true),
-    ] {
-        let bytes = sse(
-            &[
-                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","type":"function","function":{"name":"run_command","arguments":arguments}}]}}]}),
-                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
-            ],
-            done,
-        );
-        assert!(
-            decode_response(&bytes).is_err(),
-            "an incomplete tool batch cannot authorize execution"
-        );
-    }
+fn stream_refuses_a_cut_tool_batch() {
+    let bytes = sse(
+        &[
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","type":"function","function":{"name":"run_command","arguments":"{\"command\":\"echo fixture\"}"}}]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ],
+        false,
+    );
+    assert!(
+        decode_response(&bytes).is_err(),
+        "an incomplete tool batch cannot authorize execution"
+    );
 }
 
 #[test]
@@ -185,15 +180,7 @@ fn stream_refuses_unfinished_text_and_incomplete_tool_identity() {
         ],
         vec![
             json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"one","function":{
-            "arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
-        ],
-        vec![
-            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"one","function":{
-            "name":"read_file","arguments":"{}"}}]},"finish_reason":"length"}]}),
-        ],
-        vec![
-            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"one","function":{
-            "name":"read_file","arguments":"[]"}}]},"finish_reason":"tool_calls"}]}),
+            "name":"read_file","arguments":"{}"}}]},"finish_reason":"stop"}]}),
         ],
     ] {
         assert!(decode_response(&sse(&frames, true)).is_err());
@@ -451,14 +438,6 @@ fn strict_rejections_classify_by_cause() {
             ErrorClass::Model,
         ),
         (
-            "invalid tool arguments",
-            call(
-                json!({"index":0,"id":"a","function":{"name":"run_command","arguments":"{\"command\":"}}),
-                "tool_calls",
-            ),
-            ErrorClass::Model,
-        ),
-        (
             "tool call index gap",
             call(
                 json!({"index":1,"id":"a","function":{"name":"read_file","arguments":"{}"}}),
@@ -467,10 +446,10 @@ fn strict_rejections_classify_by_cause() {
             ErrorClass::Model,
         ),
         (
-            "batch not ending tool_calls",
+            "batch ending neither tool_calls nor length",
             call(
                 json!({"index":0,"id":"a","function":{"name":"read_file","arguments":"{}"}}),
-                "length",
+                "stop",
             ),
             ErrorClass::Model,
         ),
@@ -555,5 +534,69 @@ fn strict_rejections_classify_by_cause() {
     for (name, bytes, class) in cases {
         let error = crate::agentic::smart_harness::decode_openai_response(&bytes).expect_err(name);
         assert_eq!(error_class(&error), Some(class), "{name}: {error:#}");
+    }
+}
+
+/// #2385: argument and name validity is the loop's to judge
+/// (`validate_tool_call_batch`), as on every other wire. A complete stream
+/// whose call has cut or non-object arguments, or no name, decodes with that
+/// call's raw fields, and so does a batch cut at the output limit
+/// (`finish_reason: length`); the loop then rejects the batch per call and
+/// retries. A valid call is still normalized here exactly as the loop would.
+#[test]
+fn stream_leaves_invalid_tool_calls_to_the_batch_validator() {
+    let call = |function: Value, finish: &str| {
+        sse(
+            &[json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"one","type":"function","function":function}]},
+                "finish_reason":finish}]})],
+            true,
+        )
+    };
+    for (function, finish) in [
+        (
+            json!({"name":"run_command","arguments":"{\"command\":"}),
+            "tool_calls",
+        ),
+        (
+            json!({"name":"run_command","arguments":"{\"command\":"}),
+            "length",
+        ),
+        (json!({"name":"read_file","arguments":"[]"}), "tool_calls"),
+        (json!({"arguments":"{}"}), "tool_calls"),
+        (json!({"name":"read_file","arguments":"{}"}), "length"),
+    ] {
+        let label = format!("{function} finish={finish}");
+        let response = decode_response(&call(function.clone(), finish))
+            .unwrap_or_else(|error| panic!("{label}: decodes: {error:#}"));
+        let decoded = &response["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(response["choices"][0]["finish_reason"], finish, "{label}");
+        assert_eq!(decoded["id"], "one", "{label}");
+        let name = decoded["function"]["name"].as_str();
+        let arguments = &decoded["function"]["arguments"];
+        let batch = crate::agentic::tools::validate_tool_call_batch(
+            &[(Some("one"), name, arguments)],
+            true,
+        );
+        match crate::agentic::tools::validate_tool_call(
+            function["name"].as_str(),
+            &function["arguments"],
+        ) {
+            Ok((name, args)) => {
+                assert_eq!(
+                    decoded["function"],
+                    json!({"name": name, "arguments": args.to_string()}),
+                    "{label}"
+                );
+                assert!(batch.is_ok(), "{label}");
+            }
+            Err(_) => assert!(
+                matches!(
+                    batch,
+                    Err(crate::agentic::tools::BatchRejection::ContentInvalid(_))
+                ),
+                "{label}: the loop rejects it per call"
+            ),
+        }
     }
 }

@@ -87,7 +87,7 @@ async fn context_overflow_trims_and_retries_then_recovers() {
         "overflow must trigger exactly one trim-and-retry probe"
     );
     assert_eq!(reply, "recovered after trim");
-    assert!(streamed);
+    assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert_eq!(
         usage
             .expect("accumulated usage survives the retry")

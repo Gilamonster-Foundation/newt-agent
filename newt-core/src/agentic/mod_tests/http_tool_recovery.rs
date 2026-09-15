@@ -54,17 +54,10 @@ impl Respond for NoToolsResponder {
             );
         }
         self.served_without_tools.store(true, Ordering::SeqCst);
-        if is_stream(req) {
-            ndjson(&[serde_json::json!({
-                "message": {"content": "hello there"}, "done": true,
-                "prompt_eval_count": 4, "eval_count": 2
-            })])
-        } else {
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "message": {"content": "probe answer"},
-                "prompt_eval_count": 4, "eval_count": 2,
-            }))
-        }
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {"content": "hello there"},
+            "prompt_eval_count": 4, "eval_count": 2,
+        }))
     }
 }
 
@@ -90,7 +83,7 @@ async fn no_tools_model_recovers_by_dropping_tools() {
             .expect("a no-tools model still answers a bare prompt");
 
     assert_eq!(reply, "hello there", "the tools-absent retry answered");
-    assert!(streamed);
+    assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert!(
         served_without_tools.load(Ordering::SeqCst),
         "a request without the tools field was eventually served"
@@ -121,16 +114,8 @@ impl Respond for MalformedToolXmlResponder {
             }
             self.served_with_tools_after_error
                 .store(true, Ordering::SeqCst);
-            if is_stream(req) {
-                return ndjson(&[serde_json::json!({
-                    "message": {"content": "recovered with tools still available"},
-                    "done": true,
-                    "prompt_eval_count": 4,
-                    "eval_count": 3
-                })]);
-            }
             return ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "message": {"content": "probe answer with tools still available"},
+                "message": {"content": "recovered with tools still available"},
                 "prompt_eval_count": 4,
                 "eval_count": 3,
             }));
@@ -204,7 +189,7 @@ async fn ollama_tool_xml_error_recovers_with_tools_still_available() {
             .expect("malformed XML tool-call parser errors should retry with tools");
 
     assert_eq!(reply, "recovered with tools still available");
-    assert!(streamed);
+    assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert!(
         served_with_tools_after_error.load(Ordering::SeqCst),
         "a tools-bearing request was served after the XML parser failure"
@@ -215,7 +200,7 @@ async fn ollama_tool_xml_error_recovers_with_tools_still_available() {
     );
     assert_eq!(
         rejections.load(Ordering::SeqCst),
-        3,
-        "the XML error probe, retry probe, and streaming re-issue all keep tools advertised"
+        2,
+        "the XML error probe and the retry probe both keep tools advertised"
     );
 }

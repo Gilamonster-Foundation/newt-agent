@@ -11,7 +11,6 @@ async fn openai_unverified_run_command_blocker_gets_ground_truth_retry() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ScriptedOpenAi {
-            pending_replay: Default::default(),
             round: round.clone(),
             script: vec![
                 serde_json::json!({
@@ -62,7 +61,6 @@ async fn run_openai_script_in(script: Vec<serde_json::Value>, workspace: &str) -
         .respond_with(ScriptedOpenAi {
             round: round.clone(),
             script,
-            pending_replay: Default::default(),
         })
         .mount(&server)
         .await;
@@ -148,7 +146,6 @@ async fn explain_turn_request_user_input_dispatches_and_completes() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ScriptedOpenAi {
-            pending_replay: Default::default(),
             round: round.clone(),
             script: vec![
                 serde_json::json!({
@@ -223,7 +220,6 @@ async fn question_turns_are_never_nudged() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ScriptedOpenAi {
-            pending_replay: Default::default(),
             round: round.clone(),
             // Phrasing the classifier reads as pending-action ("Let me…").
             script: vec![

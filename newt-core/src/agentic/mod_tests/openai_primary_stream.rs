@@ -39,6 +39,12 @@ fn wire(frames: &[Value], done: bool) -> ResponseTemplate {
 }
 
 fn streamed_batch(done: bool, valid_arguments: bool) -> ResponseTemplate {
+    streamed_batch_finishing(done, valid_arguments, "tool_calls")
+}
+
+/// The two-call batch, ending with `finish`. With `valid_arguments` false, the
+/// second call's arguments are cut mid-string.
+fn streamed_batch_finishing(done: bool, valid_arguments: bool, finish: &str) -> ResponseTemplate {
     wire(
         &[
             json!({"model":"served-model","choices":[{"delta":{"reasoning_content":"fixture reasoning",
@@ -49,7 +55,7 @@ fn streamed_batch(done: bool, valid_arguments: bool) -> ResponseTemplate {
             json!({"choices":[{"delta":{"tool_calls":[
             {"index":0,"function":{"arguments":"\"a\"}"}},
             {"index":1,"function":{"arguments":if valid_arguments { "\"b\"}" } else { "\"b" }}}
-        ]},"finish_reason":"tool_calls"}]}),
+        ]},"finish_reason":finish}]}),
             json!({"choices":[],"usage":{"prompt_tokens":2000,"completion_tokens":4}}),
         ],
         done,
@@ -76,6 +82,54 @@ fn complete_single_tool_frame() -> Value {
 
 fn complete_single_tool_prefix() -> String {
     format!("data: {}\n\n", complete_single_tool_frame())
+}
+
+/// #2372: an accepted final answer is generated ONCE and returned exactly as
+/// the gates accepted it. The mock would answer any second request with
+/// DIFFERENT text, so a display reissue shows up twice: as an extra request,
+/// and as `REISSUED` in the returned reply.
+#[tokio::test]
+async fn an_accepted_final_answer_is_generated_once_and_returned_as_accepted() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_request: &Request| {
+            let text = if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                "ACCEPTED answer."
+            } else {
+                "REISSUED answer."
+            };
+            wire(
+                &[
+                    json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}]}),
+                    json!({"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":3}}),
+                ],
+                true,
+            )
+        })
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.action_nudges = false;
+    let (text, streamed, usage, _) = chat_complete(context, &mut NoMcp)
+        .await
+        .expect("a plain answer completes the turn");
+    assert_eq!(
+        text, "ACCEPTED answer.",
+        "the gated answer, never a second generation"
+    );
+    assert!(!streamed, "nothing was streamed to a display");
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "one generation request"
+    );
+    assert_eq!(usage.unwrap().output_tokens, 3, "one generation's tokens");
 }
 
 #[tokio::test]
@@ -114,14 +168,11 @@ async fn primary_stream_assembles_a_tool_batch_once_and_preserves_call_ids() {
         .expect("a complete streamed tool batch must reach execution");
     assert_eq!(tools.0, ["a", "b"]);
     assert_eq!(text, "Fixture response.");
-    assert!(
-        streamed,
-        "the accepted final answer retains its display reissue"
-    );
+    assert!(!streamed, "the host renders the accepted answer (#2372)");
     assert_eq!(hallucinations, 0);
-    assert_eq!(usage.unwrap().output_tokens, 8);
+    assert_eq!(usage.unwrap().output_tokens, 6, "tool batch 4 + answer 2");
     let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 3, "tool batch, final answer, display reissue");
+    assert_eq!(seen.len(), 2, "tool batch, final answer");
     for request in seen.iter() {
         assert_eq!(request["stream"], true);
         assert_eq!(request["stream_options"]["include_usage"], true);
@@ -140,12 +191,81 @@ async fn primary_stream_assembles_a_tool_batch_once_and_preserves_call_ids() {
 }
 
 #[tokio::test]
-async fn primary_stream_rejects_a_cut_or_malformed_batch_before_any_tool_runs() {
-    for (done, valid_arguments) in [(false, true), (true, false)] {
+async fn primary_stream_rejects_a_cut_batch_before_any_tool_runs() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(streamed_batch(false, true))
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let mut context = ctx(&uri, &messages, &caveats);
+    context.action_nudges = false;
+    let allowed = [TOOL.to_owned()];
+    context.persona_tools = Some(&allowed);
+    let mut tools = FixtureTools::default();
+    assert!(chat_complete(context, &mut tools).await.is_err());
+    assert!(tools.0.is_empty(), "no partial batch may authorize a tool");
+    let requests = server.received_requests().await.unwrap();
+    let generation = requests
+        .iter()
+        .filter(|request| request.url.path() == "/v1/chat/completions")
+        .collect::<Vec<_>>();
+    assert_eq!(generation.len(), 1);
+    assert_eq!(body_json(generation[0])["stream"], true);
+}
+
+/// The same two-call batch as a complete JSON reply, which the strict decoder
+/// passes through as-is: the non-streamed Chat twin of [`streamed_batch_finishing`].
+fn json_batch(finish: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({"model":"served-model",
+        "choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[
+            {"id":"call-a","type":"function","function":{"name":TOOL,"arguments":"{\"stage\":\"a\"}"}},
+            {"id":"call-b","type":"function","function":{"name":TOOL,"arguments":"{\"stage\":\"b"}}
+        ]},"finish_reason":finish}],
+        "usage":{"prompt_tokens":2000,"completion_tokens":4}}))
+}
+
+/// #2385: a complete stream whose tool call carries invalid arguments, including
+/// a call cut at the output limit (`finish_reason: length`), is the model's to
+/// retry. The loop echoes a keyed rejection per call and asks again, as the
+/// non-streamed Chat wire does; before, the strict decoder failed the turn. No
+/// call of the rejected batch runs, the retry's batch runs once, and both wires
+/// send the model the same rejection.
+#[tokio::test]
+async fn invalid_streamed_arguments_are_rejected_per_call_and_retried() {
+    let mut rejections = Vec::new();
+    for (streamed, finish) in [
+        (true, "tool_calls"),
+        (true, "length"),
+        (false, "tool_calls"),
+        (false, "length"),
+    ] {
+        let label = format!("streamed={streamed} finish={finish}");
         let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let requests = seen.clone();
+        let finish_owned = finish.to_owned();
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(streamed_batch(done, valid_arguments))
+            .respond_with(move |request: &Request| {
+                let body = body_json(request);
+                let tool_messages = body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|message| message["role"] == "tool")
+                    .count();
+                requests.lock().unwrap().push(body);
+                match tool_messages {
+                    0 if streamed => streamed_batch_finishing(true, false, &finish_owned),
+                    0 => json_batch(&finish_owned),
+                    2 => streamed_batch(true, true),
+                    _ => streamed_answer(),
+                }
+            })
             .mount(&server)
             .await;
         let uri = server.uri();
@@ -156,16 +276,46 @@ async fn primary_stream_rejects_a_cut_or_malformed_batch_before_any_tool_runs() 
         let allowed = [TOOL.to_owned()];
         context.persona_tools = Some(&allowed);
         let mut tools = FixtureTools::default();
-        assert!(chat_complete(context, &mut tools).await.is_err());
-        assert!(tools.0.is_empty(), "no partial batch may authorize a tool");
-        let requests = server.received_requests().await.unwrap();
-        let generation = requests
+        let (text, _, _, _) = chat_complete(context, &mut tools)
+            .await
+            .unwrap_or_else(|error| panic!("{label}: the turn continues: {error:#}"));
+        assert_eq!(text, "Fixture response.", "{label}");
+        assert_eq!(tools.0, ["a", "b"], "{label}: only the retried batch runs");
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            3,
+            "{label}: rejected batch, retried batch, answer (#2388 removed the display reissue)"
+        );
+        let echoed: Vec<_> = seen[1]["messages"]
+            .as_array()
+            .unwrap()
             .iter()
-            .filter(|request| request.url.path() == "/v1/chat/completions")
-            .collect::<Vec<_>>();
-        assert_eq!(generation.len(), 1);
-        assert_eq!(body_json(generation[0])["stream"], true);
+            .filter(|message| message["role"] == "tool")
+            .map(|message| {
+                (
+                    message["tool_call_id"].clone(),
+                    message["content"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            echoed.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            [json!("call-a"), json!("call-b")],
+            "{label}: one keyed rejection per call"
+        );
+        assert!(
+            echoed.iter().all(
+                |(_, content)| content.starts_with("tool-call batch rejected before execution")
+            ),
+            "{label}: {echoed:?}"
+        );
+        rejections.push(echoed);
     }
+    assert!(
+        rejections.windows(2).all(|pair| pair[0] == pair[1]),
+        "every wire and finish sends the same rejection: {rejections:#?}"
+    );
 }
 
 #[tokio::test]
@@ -353,28 +503,6 @@ async fn progressing_core_stream_resets_its_idle_timeout(cap_summary: bool) {
             written_tx.send(()).unwrap();
         }
         socket.shutdown().await.unwrap();
-
-        if !cap_summary {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let (path, display) = read_request(&mut socket).await;
-            assert_eq!(path, "/v1/chat/completions");
-            assert_eq!(display["stream"], true);
-            let body = concat!(
-                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"display answer\"},\"finish_reason\":\"stop\"}]}\n\n",
-                "data: [DONE]\n\n",
-            );
-            socket
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-            socket.shutdown().await.unwrap();
-        }
         request
     });
 
@@ -419,13 +547,10 @@ async fn progressing_core_stream_resets_its_idle_timeout(cap_summary: bool) {
         .expect("the progressing generation must finish")
         .expect("progress must reset the idle timeout");
     server.await.unwrap();
-    if cap_summary {
-        assert_eq!(text, "progressing answer");
-        assert!(!streamed);
-    } else {
-        assert_eq!(text, "display answer");
-        assert!(streamed);
-    }
+    // #2372: both the primary answer and the cap summary are returned as
+    // generated; nothing is sent again for display.
+    assert_eq!(text, "progressing answer");
+    assert!(!streamed);
 }
 
 #[tokio::test]
@@ -1037,11 +1162,7 @@ async fn a_mixed_response_after_a_dispatched_tool_retries_the_round_without_repl
     assert_eq!(text, "Fixture response.");
     assert_eq!(tools.0, ["a"], "a dispatched tool is never replayed");
     let seen = seen.lock().unwrap();
-    assert_eq!(
-        seen.len(),
-        4,
-        "tool round, mixed answer, one retry, display reissue"
-    );
+    assert_eq!(seen.len(), 3, "tool round, mixed answer, one retry");
 }
 
 /// #2334: when the one fresh attempt is also mixed, the turn fails explicitly

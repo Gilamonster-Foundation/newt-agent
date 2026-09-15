@@ -689,9 +689,8 @@ async fn every_verification_case_ends_within_its_allowance() {
             })
             .await;
             assert_eq!(run.reason, case.reason, "{label}");
-            // Primary rounds only. The ordinary loop re-issues an accepted
-            // answer for display, replaying the same history, so a request
-            // whose messages equal the previous request's is not a round.
+            // Primary rounds only: a request whose messages equal the previous
+            // request's replays that round rather than starting a new one.
             let histories: Vec<serde_json::Value> = run
                 .bodies
                 .iter()

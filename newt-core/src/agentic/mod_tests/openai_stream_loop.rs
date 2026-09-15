@@ -1,63 +1,15 @@
-//! #123 — the OpenAI-compatible streaming re-issue, tested at the WIRING.
+//! The OpenAI-compatible final answer, tested at the WIRING (#123, #2372).
 //!
-//! `openai_sse` already proves the parser with no HTTP in it. What is
-//! unproved by those tests is everything this file covers: that the loop
-//! issues a second `stream: true` display request AFTER the primary is accepted
-//! (never reissuing a tool round or preceding the nudge cascade), that the streamed
-//! answer is what comes back with `was_streamed = true`, and that every way
-//! the second call can fail lands on the probe answer instead of on silence.
-//!
-//! Two tiers, because the end-to-end tier is blind to the terminal. A turn
-//! can only be observed through the returned string and the `was_streamed`
-//! flag — and that flag is what tells the CALLER not to print, so a suite
-//! asserting only the flag stays green while every print site is deleted and
-//! the operator gets a blank turn. The first section below therefore drives
-//! `openai_stream_final_answer` onto a buffer and asserts the BYTES; the
-//! sections after it drive whole turns through `chat_complete`.
+//! `openai_sse` proves the parser with no HTTP in it. This file drives whole
+//! turns through `chat_complete`. Since #2372 an accepted final answer is
+//! generated ONCE: the loop returns the gated reply with `was_streamed = false`
+//! and the host renders it, so these tests pin the request counts and the text
+//! that comes back rather than a display stream.
 //!
 //! These tests touch no process-global state (no env, no filesystem), so
-//! unlike `anthropic_loop.rs` they need neither a serial lane nor an env
-//! guard: the streaming re-issue has no valve to set.
-//!
-//! # They are not load-flaky, and this is why — do not "fix" them with a lane
-//!
-//! Reported as failing under machine load and hunted for deliberately: 6 500+
-//! runs of this file at 32× process oversubscription with every core pinned,
-//! plus 84 whole-`newt-core` runs at up to 256 test threads. **Zero failures
-//! here** — while the SAME runs reproduced load failures in `retry::tests`
-//! (env-global), `tool_spinner_pty_test` (real PTY) and
-//! `execute_tool_branch_tests`, so the harness demonstrably catches this class
-//! on this box. Each suspect is closed by construction, not by luck:
-//!
-//! * **The `Buf` sink.** `flush` is a no-op and every write lands in the shared
-//!   `Vec` synchronously, so there is nothing to lose to a missed flush; and
-//!   `stream_onto` awaits the helper to COMPLETION before reading it, so the
-//!   markdown writer's `finish()` has already run.
-//! * **wiremock.** One server per test, one mock, one request, no `expect()`
-//!   counts — there is no port or expectation shared with anything.
-//! * **The tty/spinner global.** These call with `color = false`, so
-//!   `legacy_caps` yields `LineCaps::None`, `Terminal::lease_with_caps` refuses
-//!   on `!caps.can_own()` BEFORE touching the arbiter mutex, and the spinner is
-//!   `None`. Zero bytes on stdout, zero contention on the lease.
-//! * **The interrupt flag.** `cancelled()` reads the flag on its FIRST poll and
-//!   `select!` is `biased`, so an already-set flag wins without a timer and a
-//!   flag set from the sink is observed on the very next loop iteration. No
-//!   window either way.
-//! * **Chunk boundaries** (what load actually moves): `SseAccumulator` holds a
-//!   rolling line buffer and `MarkdownStreamWriter` holds a line buffer, so
-//!   arrival splits are normalised before anything is asserted.
-//!
-//! The hunt did turn up one REAL load-sensitivity here, and it was not any of
-//! the above: the loop decoded each chunk with its own `from_utf8_lossy`, so a
-//! multi-byte character split across two `chunk()` boundaries became U+FFFD —
-//! silently, in the text that is printed, returned, persisted and re-sent.
-//! Where the boundary falls is exactly what machine load moves. Every body in
-//! this file was ASCII, which is why nothing here could ever see it. Fixed by
-//! `decode_chunk` and covered below. The Anthropic reader now uses the same
-//! helper, and the Ollama reader buffers bytes per line (#2313 review).
+//! unlike `anthropic_loop.rs` they need neither a serial lane nor an env guard.
 
 use super::*;
-use crate::agentic::http_loop_tests::DisplayReplay;
 use crate::caveats::Caveats;
 use crate::{BackendKind, MemMessage};
 use std::sync::{Arc, Mutex};
@@ -193,430 +145,15 @@ fn sse_text(parts: &[&str], input: u64, output: u64) -> ResponseTemplate {
     sse(&frames.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
-/// Records every request body so a test can assert on the SEQUENCE of
-/// requests, then injects the display response only after an accepted primary.
-struct Recorder<F: Fn(&serde_json::Value) -> ResponseTemplate> {
-    seen: Arc<Mutex<Vec<serde_json::Value>>>,
-    reply: F,
-    replay: DisplayReplay,
-}
-impl<F: Fn(&serde_json::Value) -> ResponseTemplate + Send + Sync + 'static> Respond
-    for Recorder<F>
-{
-    fn respond(&self, req: &Request) -> ResponseTemplate {
-        let body = body_json(req);
-        self.seen.lock().unwrap().push(body.clone());
-        if self.replay.take(req) {
-            return (self.reply)(&body);
-        }
-        self.replay.arm(req);
-        if body["messages"]
-            .as_array()
-            .map(|m| m.iter().any(|x| x["role"] == "tool"))
-            .unwrap_or(false)
-        {
-            probe_reply("the tool round finished")
-        } else {
-            probe_reply("the probe already answered")
-        }
-    }
-}
+const STREAM_USAGE: &str = r#"{"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":5}}"#;
 
-async fn mount<F>(server: &MockServer, reply: F) -> Arc<Mutex<Vec<serde_json::Value>>>
-where
-    F: Fn(&serde_json::Value) -> ResponseTemplate + Send + Sync + 'static,
-{
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(Recorder {
-            seen: seen.clone(),
-            reply,
-            replay: Default::default(),
-        })
-        .mount(server)
-        .await;
-    seen
-}
-
-#[tokio::test]
-async fn readonly_completion_streamed_promise_cannot_replace_the_accepted_probe() {
-    let server = MockServer::start().await;
-    let seen = mount(&server, |_| {
-        sse_text(
-            &["Let me check the current implementation and identify any gaps."],
-            101,
-            11,
-        )
+fn stream_usage() -> Option<crate::TokenUsage> {
+    Some(crate::TokenUsage {
+        input_tokens: 42,
+        output_tokens: 5,
     })
-    .await;
-    let messages = msgs();
-    let caveats = Caveats::top();
-    let uri = server.uri();
-    let mut c = ctx(&uri, &messages, &caveats);
-    c.prompt_disposition = PromptDisposition::Explain;
-    let (reply, streamed, usage, _) = chat_complete(c, &mut NoMcp).await.unwrap();
-    assert_eq!(reply, "the probe already answered");
-    assert!(
-        !streamed,
-        "the caller must render the accepted answer after the replay promise"
-    );
-    assert_eq!(
-        seen.lock().unwrap().len(),
-        2,
-        "reuse the accepted probe without another inference"
-    );
-    assert_eq!(
-        usage.unwrap().output_tokens,
-        18,
-        "both requests remain accounted for"
-    );
 }
 
-// -----------------------------------------------------------------------
-// The BYTES: `openai_stream_final_answer` drives its output sink directly,
-// so these assert what actually reached the terminal.
-//
-// The end-to-end tests below can only see the returned string and the
-// `was_streamed` flag — and that flag is a literal on the success arm,
-// decoupled from any write. Deleting the prefix, the per-delta write, the
-// markdown push or the trailing newline leaves every one of them green while
-// the operator gets a blank turn (the flag tells the CALLER not to print).
-// The sink is the seam that makes those deletions fail.
-// -----------------------------------------------------------------------
-
-/// A sink the test can read back — the shape `display.rs`'s renderer tests
-/// already use (`Arc<Mutex<Vec<u8>>>` behind a `Clone` handle), so the helper
-/// keeps ownership of one writer while the test still holds a view of it.
-#[derive(Clone, Default)]
-struct Buf(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for Buf {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Buf {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
-}
-
-/// Drive the streaming helper alone against a mock SSE body, onto a buffer.
-/// Returns what it gave the caller AND what it painted.
-async fn stream_onto(body: ResponseTemplate, markdown: bool) -> (StreamOutcome, String) {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(body)
-        .mount(&server)
-        .await;
-    let buf = Buf::default();
-    let req = reqwest::Client::new()
-        .post(format!("{}/v1/chat/completions", server.uri()))
-        .json(&serde_json::json!({"stream": true}));
-    let out =
-        openai_stream_final_answer(req, None, buf.clone(), false, markdown, false, None).await;
-    (out, buf.text())
-}
-
-/// The answer a `Printed` outcome carries; any other outcome is the test's
-/// own setup being wrong about what the stream did.
-fn printed(out: StreamOutcome) -> String {
-    match out {
-        StreamOutcome::Printed(text, _) => text,
-        other => panic!("expected a streamed answer, got {other:?}"),
-    }
-}
-
-/// The `▸  ` prefix, then every delta in arrival order, then the closing
-/// newline — on the sink, not merely "a flag says so".
-#[tokio::test]
-async fn the_prefix_and_every_delta_reach_the_sink_in_order() {
-    let (out, painted) = stream_onto(sse_text(&["Hel", "lo ", "world"], 100, 9), false).await;
-
-    assert_eq!(printed(out), "Hello world");
-    assert_eq!(
-        painted, "▸  Hello world\n",
-        "prefix + deltas in order + the closing newline all reach the terminal"
-    );
-}
-
-/// The `<think>` half of the leak test its doc comment always claimed: the
-/// filtered text is what the operator SEES, not just what is returned.
-#[tokio::test]
-async fn the_think_block_reaches_neither_the_answer_nor_the_terminal() {
-    let (out, painted) = stream_onto(
-        sse_text(&["<thi", "nk>secr", "et</think>", "the ", "answer"], 100, 9),
-        false,
-    )
-    .await;
-
-    assert_eq!(printed(out), "the answer");
-    assert_eq!(
-        painted, "▸  the answer\n",
-        "the raw <think> block must never be painted: {painted:?}"
-    );
-}
-
-/// The cut-stream notice is a print site like any other — assert the operator
-/// can actually see that the fragment above it was not the answer.
-#[tokio::test]
-async fn a_cut_stream_says_so_on_the_terminal() {
-    let (out, painted) = stream_onto(
-        sse(&[r#"{"choices":[{"delta":{"content":"the beginning of an"}}]}"#]),
-        false,
-    )
-    .await;
-
-    assert!(
-        matches!(out, StreamOutcome::UseProbe(_)),
-        "a cut stream hands the caller the complete probe answer, got {out:?}"
-    );
-    assert!(
-        painted.starts_with("▸  the beginning of an"),
-        "the fragment stays on screen: {painted:?}"
-    );
-    assert!(
-        painted.contains("⚠  newt: stream cut mid-answer"),
-        "an unannounced fragment reads as the answer: {painted:?}"
-    );
-}
-
-/// `markdown` is bound from the `ChatCtx` rather than discarded, and the two
-/// settings do different things: on, the block writer renders; off, the deltas
-/// are verbatim. The RETURNED text is raw either way — it is persisted and
-/// re-sent, so no styling may enter it.
-#[tokio::test]
-async fn markdown_on_renders_the_answer_and_markdown_off_does_not() {
-    let (off, painted_off) = stream_onto(sse_text(&["**bo", "ld**"], 100, 9), false).await;
-    let (on, painted_on) = stream_onto(sse_text(&["**bo", "ld**"], 100, 9), true).await;
-
-    assert_eq!(printed(off), "**bold**");
-    assert_eq!(printed(on), "**bold**");
-    assert!(
-        painted_off.contains("**bold**"),
-        "markdown off is a verbatim passthrough: {painted_off:?}"
-    );
-    #[cfg(feature = "markdown")]
-    assert!(
-        painted_on.contains("bold") && !painted_on.contains("**"),
-        "markdown on renders the emphasis instead of printing its markers: {painted_on:?}"
-    );
-    // The headless strip compiles a passthrough shim in place of the renderer,
-    // so there the two settings paint the same bytes and only the wiring is
-    // assertable.
-    #[cfg(not(feature = "markdown"))]
-    assert!(painted_on.contains("**bold**"), "{painted_on:?}");
-}
-
-// -----------------------------------------------------------------------
-// Interrupts: Esc is the operator's, not the wire's.
-// -----------------------------------------------------------------------
-
-/// The re-issue is a WHOLE SECOND inference call. Racing the send against the
-/// interrupt flag is what keeps an already-cancelled turn from paying for it —
-/// and from leaving Esc unresponsive until the server finally answers.
-#[tokio::test]
-async fn an_interrupt_before_the_send_never_fires_the_second_call() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(sse_text(&["never asked for"], 100, 9))
-        .mount(&server)
-        .await;
-    let cancel = std::sync::atomic::AtomicBool::new(true);
-    let buf = Buf::default();
-    let req = reqwest::Client::new()
-        .post(format!("{}/v1/chat/completions", server.uri()))
-        .json(&serde_json::json!({"stream": true}));
-
-    let out =
-        openai_stream_final_answer(req, None, buf.clone(), false, false, false, Some(&cancel))
-            .await;
-
-    assert_eq!(
-        server.received_requests().await.unwrap().len(),
-        0,
-        "a cancelled turn must not pay for a second full inference call"
-    );
-    assert_eq!(buf.text(), "", "nothing streamed, so nothing is painted");
-    assert!(
-        matches!(out, StreamOutcome::Cancelled(None)),
-        "an interrupt ends the turn; it is not a wire failure to fall back from — \
-         and with no call fired there is no usage to report, which is `None` and \
-         never a zero: {out:?}"
-    );
-}
-
-/// Serve one SSE response over a socket the test owns, and interrupt only once
-/// the client is demonstrably reading it.
-///
-/// `wiremock` cannot express this case. The third outcome arm needs the
-/// interrupt to land AFTER the send resolved and BEFORE any text is painted,
-/// and nothing wiremock exposes says when the client began reading — a flag
-/// tripped from a `Respond` races the send's own completion, which would make
-/// the test either flaky or (worse) silently cover the pre-send arm instead.
-///
-/// TCP backpressure is the signal that removes the race. The padding is far
-/// larger than the socket buffers, so `write_all` returns only after the client
-/// has drained megabytes: by then the send has long resolved and the chunk loop
-/// is running, so the pre-send check cannot be what fires. The padding is SSE
-/// COMMENT lines (`:…`), which `apply_line` drops before `serde_json` is ever
-/// reached, so this costs bytes and not parsing.
-async fn interrupt_once_the_client_is_reading(
-    frames: &str,
-) -> (StreamOutcome, String, crate::attempts::AttemptRecord) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag = cancel.clone();
-    let head = frames.to_string();
-
-    let server = tokio::spawn(async move {
-        let (mut sock, _) = listener.accept().await.unwrap();
-        let mut scratch = [0u8; 8192];
-        // The head's CONTENT does not matter; that it arrived does — the
-        // response must not start before the client has actually asked.
-        let asked = sock.read(&mut scratch).await.unwrap();
-        assert!(asked > 0, "the client sent its request");
-        // Neither `Content-Length` nor chunked framing, deliberately: an
-        // HTTP/1.1 response body then runs to connection close, and this
-        // connection never closes. The client therefore BLOCKS in `chunk()`
-        // rather than seeing an EOF — an EOF here would be a cut stream, which
-        // is a different arm entirely.
-        sock.write_all(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                 Connection: close\r\n\r\n{head}"
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-        let pad = format!(":{}\n", "x".repeat(64 * 1024 - 2));
-        for _ in 0..256 {
-            sock.write_all(pad.as_bytes()).await.unwrap();
-        }
-        // 16 MiB have gone out and been drained, so the answer stream is well
-        // under way. NOW the operator presses Esc.
-        flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        std::future::pending::<()>().await;
-    });
-
-    let buf = Buf::default();
-    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
-    let scope = attempt_capture::AttemptScope {
-        ledger: &ledger,
-        turn: "prompt:turn",
-        model: "test-model",
-        backend: "test-backend",
-        cancel: Some(cancel.as_ref()),
-    };
-    let req = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/chat/completions"))
-        .json(&serde_json::json!({"stream": true}));
-    // Bounded: with the interrupt arm broken, this connection never closes.
-    let out = tokio::time::timeout(
-        super::http_loop_tests::RAW_STREAM_TEST_BOUND,
-        openai_stream_final_answer(
-            req,
-            Some(scope),
-            buf.clone(),
-            false,
-            false,
-            false,
-            Some(cancel.as_ref()),
-        ),
-    )
-    .await
-    .expect("the interrupt ends the read");
-    server.abort();
-    let record = ledger.lock().unwrap().records().next().cloned();
-    (out, buf.text(), record.expect("the reissue was sent"))
-}
-
-/// Serve an SSE body whose bytes are cut at a chosen offset, with a real gap
-/// between the two writes — the split `reqwest` would otherwise only produce
-/// when the machine is busy, made to happen on demand.
-async fn stream_split_at(body: &str, cut: usize) -> (StreamOutcome, String) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let bytes = body.as_bytes().to_vec();
-    let server = tokio::spawn(async move {
-        let (mut sock, _) = listener.accept().await.unwrap();
-        sock.set_nodelay(true).unwrap();
-        let mut scratch = [0u8; 8192];
-        // The head's CONTENT does not matter; that it arrived does — the
-        // response must not start before the client has actually asked.
-        let asked = sock.read(&mut scratch).await.unwrap();
-        assert!(asked > 0, "the client sent its request");
-        sock.write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-              Connection: close\r\n\r\n",
-        )
-        .await
-        .unwrap();
-        sock.write_all(&bytes[..cut]).await.unwrap();
-        sock.flush().await.unwrap();
-        // Let the reader drain the first half before the rest is written, so
-        // the two halves land in two different `chunk()` calls.
-        for _ in 0..200 {
-            tokio::task::yield_now().await;
-        }
-        sock.write_all(&bytes[cut..]).await.unwrap();
-        sock.shutdown().await.unwrap();
-    });
-
-    let buf = Buf::default();
-    let req = reqwest::Client::new()
-        .post(format!("http://{addr}/v1/chat/completions"))
-        .json(&serde_json::json!({"stream": true}));
-    let out = openai_stream_final_answer(req, None, buf.clone(), false, false, false, None).await;
-    server.abort();
-    (out, buf.text())
-}
-
-/// A character split across two chunks is still that character.
-///
-/// `reqwest` splits where the socket did, not where the protocol did — the
-/// same fact `SseAccumulator`'s line buffer exists for — and a chunk boundary
-/// lands wherever machine load puts it. Decoding each chunk on its own turns
-/// the half that arrived into U+FFFD, and that corruption is silent and
-/// permanent: the mangled text is what gets printed, returned, persisted, and
-/// re-sent to the model. It is also invisible to every other test in this
-/// file, because every other body here is ASCII.
-#[tokio::test]
-async fn a_character_split_across_two_chunks_is_not_corrupted() {
-    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"café\"}}]}\n\ndata: [DONE]\n\n";
-    // Between the two bytes of `é` (0xC3 0xA9) — the boundary a busy box picks
-    // by accident.
-    let cut = body.find('é').unwrap() + 1;
-
-    let (out, painted) = stream_split_at(body, cut).await;
-
-    assert_eq!(
-        printed(out),
-        "café",
-        "the returned answer is what gets re-sent"
-    );
-    assert_eq!(
-        painted, "▸  café\n",
-        "and the operator sees the same: {painted:?}"
-    );
-}
-
-/// The adversarial form of the test above, and the one that cannot go vacuous.
-///
 /// The socket test can only split where the kernel agrees to split, so on some
 /// run it may deliver both halves together and pass without proving anything.
 /// This splits at EVERY byte offset — including inside all of a 2-, 3- and
@@ -664,162 +201,41 @@ fn decode_chunk_spends_invalid_bytes_instead_of_stalling_on_them() {
     );
 }
 
-/// The third outcome arm, which no test reached: the operator interrupts after
-/// the stream is under way but before one character of the answer has been
-/// painted. That is neither a cut wire nor a fallback — the turn ends empty,
-/// because printing the complete probe answer over an interrupt is the exact
-/// opposite of what Esc asked for.
-///
-/// The usage rides along for the same reason `UseProbe`'s does, and the reason
-/// was never "the answer arrived": the second call reported tokens and they
-/// were spent. Dropping them here while merging them one arm up would make the
-/// turn's billed cost depend on WHICH way the second call failed.
+/// #2372 (moved onto the primary path from the deleted display reissue): a
+/// primary stream cut before `[DONE]` after its usage chunk was generated and
+/// billed, so every attempt is failed WITH that usage.
 #[tokio::test]
-async fn an_interrupt_before_any_text_ends_the_turn_and_still_bills_the_call() {
-    // Usage FIRST, so it is parsed well before the interrupt can land; then a
-    // role-only delta, which paints nothing. No text delta anywhere, and no
-    // `[DONE]` — this stream is stopped, not finished.
-    let (out, painted, record) = interrupt_once_the_client_is_reading(
-        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":5}}\n\n\
-         data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
-    )
-    .await;
-
-    assert_eq!(
-        painted, "",
-        "nothing reached the terminal — that is what makes this arm this arm"
-    );
-    match out {
-        StreamOutcome::Cancelled(usage) => {
-            // `expect` and not a silent skip: reaching the PRE-SEND `Cancelled`
-            // instead would look identical without it, and a test that cannot
-            // tell which arm it covered is not covering either.
-            let u = usage.expect("the second call reported usage before the interrupt");
-            assert_eq!(
-                (u.input_tokens, u.output_tokens),
-                (42, 5),
-                "an interrupted call is still a call the operator paid for: {u:?}"
-            );
-        }
-        other => panic!("an interrupt with nothing on screen ends the turn, got {other:?}"),
-    }
-    // #2313: the interrupted attempt is failed (cancellation is not modelled
-    // yet), never ok, and keeps the usage it reported.
-    assert_eq!(record.state, crate::attempts::AttemptState::Failed);
-    assert_eq!(
-        record.usage.map(|u| (u.input_tokens, u.output_tokens)),
-        Some((42, 5))
-    );
-}
-
-/// A sink that trips the interrupt flag the moment the answer starts
-/// painting — the deterministic stand-in for Esc mid-stream (no sleeps, no
-/// racing the mock server).
-struct CancelOnWrite<'a> {
-    buf: Buf,
-    flag: &'a std::sync::atomic::AtomicBool,
-}
-
-impl std::io::Write for CancelOnWrite<'_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        std::io::Write::write(&mut self.buf, bytes)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// An interrupt mid-answer and a broken socket both stop the loop with no
-/// `[DONE]` — but they are not the same event, and reporting the operator's
-/// own keypress as "the stream ended before [DONE]" blames the wire for it.
-/// The partial stays (it is on screen and the operator asked to stop, so the
-/// complete answer is NOT reprinted over it).
-#[tokio::test]
-async fn an_interrupt_mid_answer_is_not_reported_as_a_broken_stream() {
+async fn a_primary_stream_cut_after_its_usage_chunk_is_failed_with_that_usage() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(sse(&[
-            r#"{"choices":[{"delta":{"content":"the beginning of an"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"half an answ"}}]}"#,
+            STREAM_USAGE,
         ]))
         .mount(&server)
         .await;
-    let cancel = std::sync::atomic::AtomicBool::new(false);
-    let buf = Buf::default();
-    let sink = CancelOnWrite {
-        buf: buf.clone(),
-        flag: &cancel,
-    };
-    let req = reqwest::Client::new()
-        .post(format!("{}/v1/chat/completions", server.uri()))
-        .json(&serde_json::json!({"stream": true}));
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    let error = chat_complete(c, &mut NoMcp)
+        .await
+        .expect_err("a stream that never reaches [DONE] is not an answer");
+    assert!(format!("{error:#}").contains("[DONE]"), "{error:#}");
 
-    let out = openai_stream_final_answer(req, None, sink, false, false, false, Some(&cancel)).await;
-
-    let painted = buf.text();
-    assert!(
-        painted.contains("⚠  newt: interrupted"),
-        "the operator's own keypress must not be reported as a wire failure: {painted:?}"
-    );
-    assert!(
-        !painted.contains("[DONE]"),
-        "nothing here is the stream's fault: {painted:?}"
-    );
-    match out {
-        StreamOutcome::Printed(text, _) => assert!(
-            painted.starts_with(&format!("▸  {text}")),
-            "the partial already on screen is what comes back: {text:?} vs {painted:?}"
-        ),
-        other => panic!("an interrupt after visible text keeps the partial, got {other:?}"),
+    let received = server.received_requests().await.expect("journal").len();
+    let ledger = ledger.lock().unwrap();
+    let records: Vec<_> = ledger.records().collect();
+    assert_eq!(records.len(), received, "attempts == wire requests");
+    for record in records {
+        assert_eq!(record.state, crate::attempts::AttemptState::Failed);
+        assert_eq!(record.usage, stream_usage());
     }
 }
 
-// -----------------------------------------------------------------------
-// #2313 review: the display reissue's attempt state and usage follow the rule
-// — a complete terminal response is ok; an interrupt, a cut stream or an error
-// event is failed; reported usage attaches either way.
-// -----------------------------------------------------------------------
-
-/// Run the display reissue once against `frames` with a real attempt ledger
-/// and return the single attempt it recorded.
-async fn reissue_attempt(
-    frames: &[&str],
-    interrupt_on_paint: bool,
-) -> (StreamOutcome, crate::attempts::AttemptRecord) {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(sse(frames))
-        .mount(&server)
-        .await;
-    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
-    let scope = attempt_capture::AttemptScope {
-        ledger: &ledger,
-        turn: "prompt:turn",
-        model: "test-model",
-        backend: "test-backend",
-        cancel: None,
-    };
-    let cancel = std::sync::atomic::AtomicBool::new(false);
-    let buf = Buf::default();
-    let req = reqwest::Client::new()
-        .post(format!("{}/v1/chat/completions", server.uri()))
-        .json(&serde_json::json!({"stream": true}));
-    let out = if interrupt_on_paint {
-        let sink = CancelOnWrite {
-            buf: buf.clone(),
-            flag: &cancel,
-        };
-        openai_stream_final_answer(req, Some(scope), sink, false, false, false, Some(&cancel)).await
-    } else {
-        openai_stream_final_answer(req, Some(scope), buf.clone(), false, false, false, None).await
-    };
-    let ledger = ledger.lock().unwrap();
-    let records: Vec<_> = ledger.records().cloned().collect();
-    assert_eq!(records.len(), 1, "one reissue, one attempt");
-    (out, records[0].clone())
-}
 
 const REISSUE_USAGE: &str = r#"{"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":5}}"#;
 
@@ -830,89 +246,56 @@ fn reissue_usage() -> Option<crate::TokenUsage> {
     })
 }
 
-/// Review finding 1: an interrupted reissue is a cancellation, which stays
-/// failed until cancellation is modelled — never ok — with the usage it
-/// reported attached.
+/// #2372 (moved onto the primary path): an error event after a usage frame
+/// fails the attempt with that usage even when `[DONE]` follows, and a context
+/// rejection is classified `ContextExceeded` while any other error is not.
 #[tokio::test]
-async fn an_interrupted_display_reissue_is_failed_with_its_reported_usage() {
-    let (out, record) = reissue_attempt(
-        &[
-            REISSUE_USAGE,
-            r#"{"choices":[{"delta":{"content":"the beginning of an"}}]}"#,
-        ],
-        true,
-    )
-    .await;
-    assert!(matches!(out, StreamOutcome::Printed(..)), "{out:?}");
-    assert_eq!(record.state, crate::attempts::AttemptState::Failed);
-    assert_eq!(record.usage, reissue_usage());
-}
-
-/// Review finding 2: a reissue that reaches `[DONE]` with no visible text (all
-/// reasoning) was a complete, billed response — ok with its usage, even though
-/// the caller falls back to the probe answer.
-#[tokio::test]
-async fn a_display_reissue_that_finishes_without_text_is_ok_with_its_usage() {
-    let (out, record) = reissue_attempt(
-        &[
-            r#"{"choices":[{"delta":{"content":"<think>only reasoning</think>"}}]}"#,
-            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
-            REISSUE_USAGE,
-            "[DONE]",
-        ],
-        false,
-    )
-    .await;
-    assert!(matches!(out, StreamOutcome::UseProbe(_)), "{out:?}");
-    assert_eq!(record.state, crate::attempts::AttemptState::Ok);
-    assert_eq!(record.usage, reissue_usage());
-}
-
-/// The rule's other half on this wire: a stream cut before `[DONE]` is failed,
-/// with whatever usage it reported.
-#[tokio::test]
-async fn a_cut_display_reissue_is_failed_with_its_reported_usage() {
-    let (out, record) = reissue_attempt(
-        &[
-            REISSUE_USAGE,
-            r#"{"choices":[{"delta":{"content":"half an answ"}}]}"#,
-        ],
-        false,
-    )
-    .await;
-    assert!(matches!(out, StreamOutcome::UseProbe(_)), "{out:?}");
-    assert_eq!(record.state, crate::attempts::AttemptState::Failed);
-    assert_eq!(record.usage, reissue_usage());
-}
-
-/// Review round 2, item 2: an error event after a usage frame is failed with
-/// that usage even when `[DONE]` follows it, and the caller's outcome carries the same usage — whether the
-/// error is a context rejection or any other provider error.
-#[tokio::test]
-async fn a_display_reissue_rejected_by_an_error_event_is_failed_with_its_reported_usage() {
-    for (error, context_exceeded) in [
+async fn a_primary_stream_error_event_after_usage_is_failed_with_that_usage() {
+    for (error_frame, context_exceeded) in [
         (
             r#"{"error":{"message":"Context size has been exceeded."}}"#,
             true,
         ),
         (r#"{"error":{"message":"busy","code":503}}"#, false),
     ] {
-        let (out, record) = reissue_attempt(&[REISSUE_USAGE, error, "[DONE]"], false).await;
-        match out {
-            StreamOutcome::ContextExceeded(usage) if context_exceeded => {
-                assert_eq!(usage, reissue_usage());
-            }
-            StreamOutcome::UseProbe(usage) if !context_exceeded => {
-                assert_eq!(usage, reissue_usage());
-            }
-            other => panic!("{error}: {other:?}"),
-        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(sse(&[STREAM_USAGE, error_frame, "[DONE]"]))
+            .mount(&server)
+            .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.attempt_ledger = Some(&ledger);
+        let error = chat_complete(c, &mut NoMcp)
+            .await
+            .expect_err("an error event is not an answer");
         assert_eq!(
-            record.state,
-            crate::attempts::AttemptState::Failed,
-            "{error}"
+            crate::agentic::observability::error_class(&error)
+                == Some(crate::agentic::observability::ErrorClass::ContextExceeded),
+            context_exceeded,
+            "{error_frame}: {error:#}"
         );
-        assert_eq!(record.usage, reissue_usage(), "{error}");
+
+        let received = server.received_requests().await.expect("journal").len();
+        let ledger = ledger.lock().unwrap();
+        let records: Vec<_> = ledger.records().collect();
+        assert_eq!(
+            records.len(),
+            received,
+            "{error_frame}: attempts == wire requests"
+        );
+        for record in records {
+            assert_eq!(
+                record.state,
+                crate::attempts::AttemptState::Failed,
+                "{error_frame}"
+            );
+            assert_eq!(record.usage, stream_usage(), "{error_frame}");
+        }
     }
 }
 
@@ -927,7 +310,7 @@ async fn a_primary_stream_rejected_by_strict_decoding_is_failed_with_its_reporte
         .respond_with(sse(&[
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
             r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
-            REISSUE_USAGE,
+            STREAM_USAGE,
             "[DONE]",
         ]))
         .mount(&server)
@@ -949,7 +332,7 @@ async fn a_primary_stream_rejected_by_strict_decoding_is_failed_with_its_reporte
     assert_eq!(records.len(), received, "attempts == wire requests");
     for record in records {
         assert_eq!(record.state, crate::attempts::AttemptState::Failed);
-        assert_eq!(record.usage, reissue_usage());
+        assert_eq!(record.usage, stream_usage());
     }
 }
 
@@ -1004,7 +387,7 @@ async fn dispatch_with_decoder_keeps_a_strictly_rejected_responses_usage() {
         .and(path("/v1/chat/completions"))
         .respond_with(sse(&[
             r#"{"choices":[{"delta":{"content":"a summary"}}]}"#,
-            REISSUE_USAGE,
+            STREAM_USAGE,
             "[DONE]",
         ]))
         .mount(&server)
@@ -1017,7 +400,7 @@ async fn dispatch_with_decoder_keeps_a_strictly_rejected_responses_usage() {
         "{error:#}"
     );
     assert_eq!(record.state, crate::attempts::AttemptState::Failed);
-    assert_eq!(record.usage, reissue_usage());
+    assert_eq!(record.usage, stream_usage());
 }
 
 /// Serve `body` under a `Content-Length` it never meets, so the client's body
@@ -1067,12 +450,12 @@ async fn a_body_read_failure_keeps_the_usage_its_bytes_reported() {
     let cases = [
         (
             "stream cut mid-answer",
-            format!("data: {answer}\n\ndata: {REISSUE_USAGE}\n\n"),
+            format!("data: {answer}\n\ndata: {STREAM_USAGE}\n\n"),
             smart_harness::decode_openai_response as fn(&[u8]) -> _,
         ),
         (
             "whole [DONE] stream",
-            format!("data: {answer}\n\ndata: {REISSUE_USAGE}\n\ndata: [DONE]\n\n"),
+            format!("data: {answer}\n\ndata: {STREAM_USAGE}\n\ndata: [DONE]\n\n"),
             smart_harness::decode_openai_response,
         ),
         (
@@ -1089,67 +472,15 @@ async fn a_body_read_failure_keeps_the_usage_its_bytes_reported() {
             crate::attempts::AttemptState::Failed,
             "{name}"
         );
-        assert_eq!(record.usage, reissue_usage(), "{name}");
+        assert_eq!(record.usage, stream_usage(), "{name}");
     }
 }
 
-// -----------------------------------------------------------------------
-// The wiring: the accepted round is re-issued with stream:true
-// -----------------------------------------------------------------------
-
-/// The point of #123: the final answer arrives token by token, and the
-/// caller is told it was already printed so it does not print it twice.
-#[tokio::test]
-async fn the_final_round_is_re_issued_as_a_stream() {
-    let server = MockServer::start().await;
-    let seen = mount(&server, |_| sse_text(&["Hello ", "world"], 101, 9)).await;
-
-    let messages = msgs();
-    let caveats = Caveats::top();
-    let (reply, streamed, usage, hallu) =
-        chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
-            .await
-            .expect("openai streaming re-issue should succeed");
-
-    assert_eq!(reply, "Hello world", "the STREAMED answer is what returns");
-    assert!(
-        streamed,
-        "was_streamed must be true or the caller prints the answer a second time"
-    );
-    let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 2, "one probe, one streaming re-issue: {seen:?}");
-    assert_eq!(seen[0]["stream"], serde_json::json!(true));
-    assert_eq!(seen[1]["stream"], serde_json::json!(true));
-    assert_eq!(
-        seen[1]["stream_options"]["include_usage"],
-        serde_json::json!(true),
-        "without include_usage the streamed round reports no tokens at all"
-    );
-    // Exact, because the interesting failure is REPLACING rather than merging
-    // and a `>=` threshold passes either way: the probe reported 7 output
-    // tokens and the stream 9, so a replacement scores 9 and still clears
-    // `>= 9`. Input is the max of (100, 101) and output is the sum 7 + 9 —
-    // `merge_round_usage`'s contract, not a coincidence of these numbers.
-    let u = usage.expect("usage survives the streaming round");
-    assert_eq!(
-        u.input_tokens, 101,
-        "input is the largest single round: {u:?}"
-    );
-    assert_eq!(
-        u.output_tokens, 16,
-        "both rounds were billed, so both are counted: 7 (probe) + 9 (stream): {u:?}"
-    );
-    assert_eq!(hallu, 0);
-}
-
-/// End to end: an interrupt that lands after the probe answered ends the turn
-/// with an empty reply — the loop's own round-boundary contract — and the
-/// second inference call never leaves the harness.
+/// End to end: an interrupt that lands after the answer arrived ends the turn
+/// with an empty reply — the loop's own round-boundary contract.
 ///
-/// An empty REPLY is not an empty BILL. The probe round was paid for before
-/// the operator pressed anything, so its usage has to survive the cancelled
-/// arm; a turn that reports no tokens because it ended early would understate
-/// what the session actually cost.
+/// An empty REPLY is not an empty BILL. The round was paid for before the
+/// operator pressed anything, so its usage has to survive the cancelled arm.
 #[tokio::test]
 async fn an_interrupt_after_the_probe_ends_the_turn_with_no_second_call() {
     let server = MockServer::start().await;
@@ -1173,12 +504,8 @@ async fn an_interrupt_after_the_probe_ends_the_turn_with_no_second_call() {
 
     assert_eq!(reply, "", "an interrupted turn ends with an empty reply");
     assert!(!streamed);
-    assert_eq!(
-        server.received_requests().await.unwrap().len(),
-        1,
-        "only the probe — the operator cancelled before the re-issue"
-    );
-    let u = usage.expect("the probe round was billed before the interrupt landed");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let u = usage.expect("the round was billed before the interrupt landed");
     assert_eq!(
         (u.input_tokens, u.output_tokens),
         (100, 7),
@@ -1187,7 +514,7 @@ async fn an_interrupt_after_the_probe_ends_the_turn_with_no_second_call() {
 }
 
 /// Answers the probe and trips the interrupt flag while doing it: by the time
-/// the loop reaches the streaming re-issue, the operator has hit Esc.
+/// the loop would accept the answer, the operator has hit Esc.
 struct CancelOnProbe {
     flag: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1198,14 +525,16 @@ impl Respond for CancelOnProbe {
     }
 }
 
-/// The `markdown` field is bound from the `ChatCtx` (it used to be discarded),
-/// so a markdown turn streams like any other — and the RETURNED answer stays
-/// raw, because it is persisted and re-sent and no styling may enter it. The
-/// rendering half is asserted on the sink above, where bytes are observable.
+/// A markdown turn returns the RAW answer — it is persisted and re-sent, so no
+/// styling may enter it — and leaves rendering to the host.
 #[tokio::test]
-async fn a_markdown_turn_streams_and_returns_the_raw_answer() {
+async fn a_markdown_turn_returns_the_raw_answer_for_the_host_to_render() {
     let server = MockServer::start().await;
-    let seen = mount(&server, |_| sse_text(&["**bo", "ld**"], 101, 9)).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(probe_reply("**bold**"))
+        .mount(&server)
+        .await;
 
     let messages = msgs();
     let caveats = Caveats::top();
@@ -1214,26 +543,22 @@ async fn a_markdown_turn_streams_and_returns_the_raw_answer() {
     ctx.markdown = true;
     let (reply, streamed, _usage, _hallu) = chat_complete(ctx, &mut NoMcp)
         .await
-        .expect("a markdown turn streams too");
+        .expect("a markdown turn completes");
 
     assert_eq!(reply, "**bold**", "the transcript keeps the raw source");
-    assert!(streamed);
-    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert!(!streamed, "the host renders it");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
-/// Tool rounds stream on the transport once. Only the accepted final answer
-/// receives an optional display reissue; no tool batch is generated twice.
+/// A tool round and its answer are exactly two generations: nothing is
+/// generated a second time for display.
 #[tokio::test]
-async fn a_tool_round_streams_once_before_the_final_display() {
+async fn a_tool_round_and_its_answer_are_two_generations() {
     let server = MockServer::start().await;
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let recorded = seen.clone();
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ToolThenAnswer {
-            seen: recorded,
-            replay: Default::default(),
-        })
+        .respond_with(ToolThenAnswer { seen: seen.clone() })
         .mount(&server)
         .await;
 
@@ -1242,20 +567,11 @@ async fn a_tool_round_streams_once_before_the_final_display() {
     let (reply, streamed, _usage, _hallu) =
         chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
             .await
-            .expect("tool round then streamed answer");
+            .expect("tool round then answer");
 
     assert_eq!(reply, "answered after the tool");
-    assert!(streamed);
-    let seen = seen.lock().unwrap();
-    let streams: Vec<bool> = seen
-        .iter()
-        .map(|b| b["stream"].as_bool().unwrap_or(false))
-        .collect();
-    assert_eq!(
-        streams,
-        vec![true, true, true],
-        "one tool batch, one accepted answer, then exactly one display reissue: {seen:?}"
-    );
+    assert!(!streamed);
+    assert_eq!(seen.lock().unwrap().len(), 2, "one tool batch, one answer");
 }
 
 /// Assert the #2313 invariant for one OpenAI Chat turn: every received request
@@ -1298,11 +614,10 @@ async fn assert_chat_attempts_equal_wire_requests(
     wire.len()
 }
 
-/// #2313 (b1b): every primary OpenAI Chat request — the tool round, the
-/// accepted answer, and its display reissue — is exactly one ledger attempt.
+/// #2313 (b1b): every primary OpenAI Chat request — the tool round and the
+/// accepted answer — is exactly one ledger attempt.
 ///
-/// Scope of the count: the Chat primary loop's rounds, display reissue and
-/// cap-exit summary.
+/// Scope of the count: the Chat primary loop's rounds and cap-exit summary.
 #[tokio::test]
 async fn every_openai_chat_request_is_one_ledger_attempt_keyed_by_its_wire_bytes() {
     let server = MockServer::start().await;
@@ -1310,7 +625,6 @@ async fn every_openai_chat_request_is_one_ledger_attempt_keyed_by_its_wire_bytes
         .and(path("/v1/chat/completions"))
         .respond_with(ToolThenAnswer {
             seen: Arc::new(Mutex::new(Vec::new())),
-            replay: Default::default(),
         })
         .mount(&server)
         .await;
@@ -1322,19 +636,19 @@ async fn every_openai_chat_request_is_one_ledger_attempt_keyed_by_its_wire_bytes
     c.attempt_ledger = Some(&ledger);
     let (reply, streamed, _usage, _hallu) = chat_complete(c, &mut NoMcp)
         .await
-        .expect("tool round then streamed answer");
+        .expect("tool round then answer");
     assert_eq!(reply, "answered after the tool");
-    assert!(streamed);
+    assert!(!streamed, "the host renders the accepted answer (#2372)");
 
     assert_eq!(
         assert_chat_attempts_equal_wire_requests(&server, &ledger).await,
-        3,
-        "tool round, accepted answer, display reissue"
+        2,
+        "tool round, accepted answer; no display reissue (#2372)"
     );
     let totals = ledger.lock().unwrap().totals();
     assert_eq!(
         (totals.in_tokens, totals.out_tokens, totals.usage_complete),
-        (100 + 100 + 100, 4 + 7 + 5, true)
+        (100 + 100, 4 + 7, true)
     );
 }
 
@@ -1396,22 +710,16 @@ async fn an_openai_chat_cap_exit_summary_is_one_ledger_attempt() {
 
 struct ToolThenAnswer {
     seen: Arc<Mutex<Vec<serde_json::Value>>>,
-    replay: DisplayReplay,
 }
 impl Respond for ToolThenAnswer {
     fn respond(&self, req: &Request) -> ResponseTemplate {
         let body = body_json(req);
-        let display = self.replay.take(req);
         let had_tool_result = body["messages"]
             .as_array()
             .map(|m| m.iter().any(|x| x["role"] == "tool"))
             .unwrap_or(false);
         self.seen.lock().unwrap().push(body);
-        if display {
-            return sse_text(&["answered ", "after the tool"], 100, 5);
-        }
         if had_tool_result {
-            self.replay.arm(req);
             return probe_reply("answered after the tool");
         }
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1428,117 +736,37 @@ impl Respond for ToolThenAnswer {
     }
 }
 
-// -----------------------------------------------------------------------
-// Fallback: the probe already holds a good answer, so a failed re-issue
-// must never return silence.
-// -----------------------------------------------------------------------
-
-/// A non-2xx on the streaming request falls back to the probe answer, and
-/// says so by returning `was_streamed = false` — nothing was printed, so the
-/// caller still has to print it.
+/// #2372: the accepted Chat answer — the string that is returned, persisted
+/// and re-sent — follows the reasoning policy the display stream's filter had.
+/// An inline `<think>` block never reaches it; a lone `</think>` is answer text
+/// unless the backend declares the #528 leading shape.
 #[tokio::test]
-async fn a_non_2xx_stream_falls_back_to_the_probe_content() {
-    let server = MockServer::start().await;
-    let seen = mount(&server, |_| ResponseTemplate::new(503)).await;
+async fn the_chat_answer_follows_the_declared_reasoning_policy() {
+    let undeclared = "End the block with `</think>` and then answer.";
+    for (content, leading, expected) in [
+        ("<think>x</think>Done.", false, "Done."),
+        ("<think>x</think>Done.", true, "Done."),
+        (undeclared, false, undeclared),
+        ("x</think>Done.", true, "Done."),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(probe_reply(content))
+            .mount(&server)
+            .await;
 
-    let messages = msgs();
-    let caveats = Caveats::top();
-    let (reply, streamed, _usage, _hallu) =
-        chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
-            .await
-            .expect("a failed stream is recoverable, not fatal");
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.emits_leading_reasoning = leading;
+        let (reply, _streamed, _usage, _hallu) =
+            chat_complete(c, &mut NoMcp).await.expect("dispatch");
 
-    assert_eq!(reply, "the probe already answered");
-    assert!(
-        !streamed,
-        "nothing was printed, so the caller must be told to print it"
-    );
-    assert_eq!(seen.lock().unwrap().len(), 2);
-}
-
-/// A 200 stream that produces no text (cut before `[DONE]`, or a model that
-/// simply said nothing on the second call) is the same failure: keep the
-/// probe answer rather than returning a blank turn.
-#[tokio::test]
-async fn an_empty_stream_falls_back_to_the_probe_content() {
-    let server = MockServer::start().await;
-    let seen = mount(&server, |_| {
-        // A role-only opening delta and then the socket ends: 200, valid
-        // frames, no text, no `[DONE]`.
-        sse(&[r#"{"choices":[{"delta":{"role":"assistant"}}]}"#])
-    })
-    .await;
-
-    let messages = msgs();
-    let caveats = Caveats::top();
-    let (reply, streamed, _usage, _hallu) =
-        chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
-            .await
-            .expect("an empty stream is recoverable");
-
-    assert_eq!(reply, "the probe already answered");
-    assert!(!streamed);
-    assert_eq!(seen.lock().unwrap().len(), 2);
-}
-
-/// A stream CUT mid-answer is not an answer. The fragment already on screen
-/// stops at whatever byte the socket died on; the probe answer the loop is
-/// still holding is complete, vetted, and the thing that gets persisted and
-/// re-sent. Returning the fragment silently truncates the turn's record — so
-/// the complete answer comes back instead, with `was_streamed = false` so the
-/// caller prints it under the notice.
-#[tokio::test]
-async fn a_cut_stream_returns_the_complete_probe_answer_not_the_fragment() {
-    let server = MockServer::start().await;
-    let seen = mount(&server, |_| {
-        // Text, then the socket ends: no usage chunk, no `[DONE]`.
-        sse(&[r#"{"choices":[{"delta":{"content":"the beginning of an"}}]}"#])
-    })
-    .await;
-
-    let messages = msgs();
-    let caveats = Caveats::top();
-    let (reply, streamed, _usage, _hallu) =
-        chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
-            .await
-            .expect("a cut stream is recoverable, not fatal");
-
-    assert_eq!(
-        reply, "the probe already answered",
-        "a truncated fragment must never become the turn's answer"
-    );
-    assert!(
-        !streamed,
-        "the fragment on screen is not the answer, so the caller must print the complete one"
-    );
-    assert_eq!(seen.lock().unwrap().len(), 2);
-}
-
-/// The non-streaming arm of this loop runs every reply through
-/// `split_reasoning`, so an inline `<think>` block never reaches the answer.
-/// Turning streaming on must not start leaking it — into the terminal, into
-/// the returned string, or into the transcript that gets re-sent. The tags are
-/// split across deltas because that is how a real stream delivers them, and a
-/// per-delta check could not see them.
-#[tokio::test]
-async fn inline_think_blocks_do_not_leak_into_the_streamed_answer() {
-    let server = MockServer::start().await;
-    let seen = mount(&server, |_| {
-        sse_text(&["<thi", "nk>secr", "et</think>", "the ", "answer"], 100, 9)
-    })
-    .await;
-
-    let messages = msgs();
-    let caveats = Caveats::top();
-    let (reply, streamed, _usage, _hallu) =
-        chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
-            .await
-            .expect("streamed dispatch");
-
-    assert!(streamed, "text was printed live");
-    assert_eq!(reply, "the answer");
-    assert!(!reply.contains("secret"), "reasoning leaked: {reply:?}");
-    assert_eq!(seen.lock().unwrap().len(), 2);
+        assert_eq!(reply, expected, "{content:?} declared={leading}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -1622,18 +850,14 @@ async fn a_chat_retry_storm_is_one_attempt_per_try() {
         assert_eq!(result.is_ok(), recovers, "recovers={recovers}");
 
         let records = chat_attempts_by_ordinal(&server, &ledger).await;
-        // A recovered answer is followed by its display reissue (#2372), which
-        // is one more attempt on the same bytes; the storm is the first three.
+        // #2388 removed the display reissue: a recovered answer is the third
+        // and last try, with no further attempt on the same bytes.
         let expected = if recovers {
             [Failed, Failed, Ok]
         } else {
             [Failed; 3]
         };
-        assert_eq!(
-            records.len(),
-            if recovers { 4 } else { 3 },
-            "recovers={recovers}"
-        );
+        assert_eq!(records.len(), 3, "recovers={recovers}");
         for (ordinal, (record, state)) in records.iter().zip(expected).enumerate() {
             assert_eq!(record.key.ordinal as usize, ordinal, "recovers={recovers}");
             assert_eq!(record.key.request, records[0].key.request, "the same bytes");

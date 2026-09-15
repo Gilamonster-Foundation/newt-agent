@@ -221,7 +221,7 @@ async fn inferred_overflows_cannot_permanently_refuse_the_next_small_driver_prom
     );
     assert_eq!(result.reply, "Hello.");
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 2, "one primary and its optional display");
+    assert_eq!(requests.len(), 1, "one primary; no display reissue (#2372)");
     for request in requests.iter() {
         assert!(request["messages"]
             .as_array()
