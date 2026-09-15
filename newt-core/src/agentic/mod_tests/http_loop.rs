@@ -369,7 +369,9 @@ mod plan_handoff;
 #[path = "http_verification.rs"]
 mod verification;
 
-#[cfg(test)]
+// Every test here runs the real shell and is Unix-gated, so its helpers are
+// dead on Windows; gate the module, not each helper.
+#[cfg(all(test, unix))]
 #[path = "http_verification_outcomes.rs"]
 mod verification_outcomes;
 
