@@ -26,7 +26,7 @@ pub(super) struct EnvGuard {
     prev: Option<String>,
 }
 impl EnvGuard {
-    fn set(key: &'static str, value: &str) -> Self {
+    pub(super) fn set(key: &'static str, value: &str) -> Self {
         let prev = std::env::var(key).ok();
         std::env::set_var(key, value);
         Self { key, prev }
@@ -1686,6 +1686,7 @@ async fn raw_anthropic_round(
         turn: "prompt:turn",
         model: "claude-test",
         backend: "test-backend",
+        cancel: Some(flag.as_ref()),
     };
     let (round, started) = tokio::time::timeout(
         super::http_loop_tests::RAW_STREAM_TEST_BOUND,
@@ -1711,13 +1712,13 @@ fn anthropic_sse_body(frames: &[serde_json::Value]) -> String {
     frames.iter().map(|f| format!("data: {f}\n\n")).collect()
 }
 
-/// Review round 2, item 4: an Esc inside the stream's read loop, after the first
-/// text delta, is a failed attempt. Deterministic: the flag is tripped only
+/// Review round 2, item 4, and #2313 (c): an Esc inside the stream's read loop,
+/// after the first text delta, is a cancelled attempt. Deterministic: the flag is tripped only
 /// after the reader has drained megabytes of the body, so the send-time cancel
 /// cannot be what fires. Only `message_start` usage arrived, which is no usage
 /// (a known limit: `TokenUsage` cannot say "output unknown").
 #[tokio::test]
-async fn an_anthropic_stream_interrupted_after_its_first_delta_is_a_failed_attempt() {
+async fn an_anthropic_stream_interrupted_after_its_first_delta_is_a_cancelled_attempt() {
     let mut frames = anthropic_stream_head(6);
     frames.push(
         serde_json::json!({"type": "content_block_delta", "index": 0,
@@ -1728,7 +1729,7 @@ async fn an_anthropic_stream_interrupted_after_its_first_delta_is_a_failed_attem
     assert!(started, "the first delta was shown");
     assert_eq!(round.text, "the beginning");
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].state, crate::attempts::AttemptState::Failed);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Cancelled);
     assert_eq!(records[0].usage, None);
 }
 
@@ -1801,7 +1802,7 @@ impl Respond for CancelWhileServing {
 /// Review finding 5: a cancel while the request is in flight is never an ok
 /// attempt. The flag is set before the headers return, so this covers the
 /// send-time cancel; the stream's own interrupt arm is pinned by
-/// `an_anthropic_stream_interrupted_after_its_first_delta_is_a_failed_attempt`.
+/// `an_anthropic_stream_interrupted_after_its_first_delta_is_a_cancelled_attempt`.
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn an_anthropic_stream_cancelled_mid_flight_is_never_ok() {
@@ -2105,5 +2106,61 @@ async fn a_declared_window_reserves_the_max_tokens_anthropic_sends() {
             Some(budget),
             "{env_max_tokens:?}: the reporting seam agrees with what admission enforces"
         );
+    }
+}
+
+/// #2313 (c): Esc while a `/v1/messages` send waits for its response drops the
+/// dispatch future, so nothing can settle the attempt; the handle's drop records
+/// it cancelled, with no usage. Both the streamed and the non-streamed send.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn an_interrupted_anthropic_send_is_a_cancelled_attempt() {
+    for stream in [true, false] {
+        let _env = test_env(stream);
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (url, server) =
+            super::http_loop_tests::serve_until_interrupted("/v1/messages", flag.clone()).await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+        let mut c = ctx(&url, &messages, &caveats);
+        c.attempt_ledger = Some(&ledger);
+        c.cancel = Some(flag.as_ref());
+        let _ = tokio::time::timeout(
+            super::http_loop_tests::RAW_STREAM_TEST_BOUND,
+            chat_complete(c, &mut NoMcp),
+        )
+        .await
+        .expect("the interrupt ends the turn");
+        server.abort();
+        let records: Vec<_> = ledger.lock().unwrap().records().cloned().collect();
+        assert_eq!(records.len(), 1, "stream={stream}");
+        assert_eq!(
+            (records[0].state, records[0].usage),
+            (crate::attempts::AttemptState::Cancelled, None),
+            "stream={stream}"
+        );
+    }
+}
+
+/// #2313 (c): a retry storm on the streamed no-output re-issue. Every stream
+/// fails before any text, so the loop re-issues the same bytes until the retry
+/// budget is spent: `NEWT_HTTP_MAX_RETRIES` + 1 attempts, ordinals 0.., all
+/// failed, and not one more.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn an_anthropic_no_output_reissue_storm_is_one_attempt_per_try() {
+    let _env = test_env(true);
+    let _retries = EnvGuard::set("NEWT_HTTP_MAX_RETRIES", "2");
+    let mut frames = anthropic_stream_head(6);
+    frames.push(serde_json::json!({"type": "error",
+        "error": {"type": "overloaded_error", "message": "Overloaded"}}));
+    let mut records = streamed_anthropic_turn(sse(&frames), None).await;
+    records.sort_by_key(|r| r.key.ordinal);
+    assert_eq!(records.len(), 3, "the first try and two re-issues");
+    for (ordinal, record) in records.iter().enumerate() {
+        assert_eq!(record.key.ordinal as usize, ordinal);
+        assert_eq!(record.key.request, records[0].key.request, "the same bytes");
+        assert_eq!(record.state, crate::attempts::AttemptState::Failed);
     }
 }

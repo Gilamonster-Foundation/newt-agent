@@ -193,6 +193,37 @@ pub(super) async fn serve_stream_parts(
     (url, server)
 }
 
+/// A raw HTTP/1.1 server that never answers a `POST` to `path`: once it has read
+/// that request (so the attempt is sent and recorded), it trips `flag` and holds
+/// the connection with no headers, as a slow prefill does. Any other request is
+/// answered 404. The loop's `cancellable` race then drops the in-flight dispatch.
+pub(super) async fn serve_until_interrupted(
+    path: &'static str,
+    flag: Arc<AtomicBool>,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 64 * 1024];
+            let read = sock.read(&mut request).await.unwrap();
+            if request[..read].starts_with(format!("POST {path} ").as_bytes()) {
+                flag.store(true, Ordering::SeqCst);
+                held.push(sock);
+            } else {
+                let _ = sock
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        }
+    });
+    (url, server)
+}
+
 /// One terminal response authorizes one matching display reissue. A changed
 /// request invalidates the pending replay; every later logical turn advances.
 #[derive(Default)]

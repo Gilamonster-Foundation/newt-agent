@@ -518,6 +518,7 @@ async fn interrupt_once_the_client_is_reading(
         turn: "prompt:turn",
         model: "test-model",
         backend: "test-backend",
+        cancel: Some(cancel.as_ref()),
     };
     let req = reqwest::Client::new()
         .post(format!("http://{addr}/v1/chat/completions"))
@@ -798,6 +799,7 @@ async fn reissue_attempt(
         turn: "prompt:turn",
         model: "test-model",
         backend: "test-backend",
+        cancel: None,
     };
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let buf = Buf::default();
@@ -964,6 +966,7 @@ async fn failed_dispatch_attempt(
         turn: "prompt:turn",
         model: "test-model",
         backend: "test-backend",
+        cancel: None,
     };
     let policy = RetryPolicy {
         max_retries: 0,
@@ -1541,3 +1544,145 @@ async fn inline_think_blocks_do_not_leak_into_the_streamed_answer() {
 #[cfg(test)]
 #[path = "openai_primary_stream.rs"]
 mod primary_stream;
+
+/// #2313 (c): Esc while a Chat round waits for its response drops the dispatch
+/// future, so nothing can settle the attempt; the handle's drop records it
+/// cancelled, with no usage.
+#[tokio::test]
+async fn an_interrupted_openai_chat_round_is_a_cancelled_attempt() {
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (url, server) =
+        super::http_loop_tests::serve_until_interrupted("/v1/chat/completions", flag.clone()).await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&url, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    c.cancel = Some(flag.as_ref());
+    let _ = tokio::time::timeout(
+        super::http_loop_tests::RAW_STREAM_TEST_BOUND,
+        chat_complete(c, &mut NoMcp),
+    )
+    .await
+    .expect("the interrupt ends the turn");
+    server.abort();
+    let records: Vec<_> = ledger.lock().unwrap().records().cloned().collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        (records[0].state, records[0].usage),
+        (crate::attempts::AttemptState::Cancelled, None)
+    );
+}
+
+/// The primary rounds' attempts, by ordinal, after asserting they equal the
+/// wire requests. Ordinal order is try order.
+async fn chat_attempts_by_ordinal(
+    server: &MockServer,
+    ledger: &std::sync::Mutex<crate::attempts::AttemptLedger>,
+) -> Vec<crate::attempts::AttemptRecord> {
+    let received = server.received_requests().await.expect("journal");
+    let mut records: Vec<_> = ledger.lock().unwrap().records().cloned().collect();
+    assert_eq!(records.len(), received.len(), "attempts == wire requests");
+    records.sort_by_key(|r| r.key.ordinal);
+    records
+}
+
+/// #2313 (c): a retry storm on a Chat round. Every try is one attempt on the
+/// same request bytes, ordinals 0, 1, 2: a 503 until the budget
+/// (`NEWT_HTTP_MAX_RETRIES` = 2) is spent leaves three failed attempts and no
+/// more; a 503 run that recovers on the last try ends ok with its usage.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn a_chat_retry_storm_is_one_attempt_per_try() {
+    use crate::attempts::AttemptState::{Failed, Ok};
+    let _env = super::anthropic_loop_tests::test_env(false);
+    let _retries = super::anthropic_loop_tests::EnvGuard::set("NEWT_HTTP_MAX_RETRIES", "2");
+    for recovers in [false, true] {
+        let server = MockServer::start().await;
+        let unavailable = Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("busy"));
+        if recovers {
+            unavailable.up_to_n_times(2).mount(&server).await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(sse_text(&["recovered"], 100, 7))
+                .mount(&server)
+                .await;
+        } else {
+            unavailable.mount(&server).await;
+        }
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.attempt_ledger = Some(&ledger);
+        let result = chat_complete(c, &mut NoMcp).await;
+        assert_eq!(result.is_ok(), recovers, "recovers={recovers}");
+
+        let records = chat_attempts_by_ordinal(&server, &ledger).await;
+        // A recovered answer is followed by its display reissue (#2372), which
+        // is one more attempt on the same bytes; the storm is the first three.
+        let expected = if recovers {
+            [Failed, Failed, Ok]
+        } else {
+            [Failed; 3]
+        };
+        assert_eq!(
+            records.len(),
+            if recovers { 4 } else { 3 },
+            "recovers={recovers}"
+        );
+        for (ordinal, (record, state)) in records.iter().zip(expected).enumerate() {
+            assert_eq!(record.key.ordinal as usize, ordinal, "recovers={recovers}");
+            assert_eq!(record.key.request, records[0].key.request, "the same bytes");
+            assert_eq!(record.state, state, "recovers={recovers}, try {ordinal}");
+            let usage = (state == Ok).then_some(crate::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 7,
+            });
+            assert_eq!(record.usage, usage, "recovers={recovers}, try {ordinal}");
+        }
+    }
+}
+
+/// #2313 (c): a response whose identity changes mid-stream (#2334) earns one
+/// fresh try, whatever the retry budget: exactly two attempts on the same bytes,
+/// both failed with the usage each stream reported.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn a_changed_response_identity_retries_once_as_one_more_attempt() {
+    let _env = super::anthropic_loop_tests::test_env(false);
+    let _retries = super::anthropic_loop_tests::EnvGuard::set("NEWT_HTTP_MAX_RETRIES", "4");
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(sse(&[
+            r#"{"id":"resp-one","choices":[{"delta":{"content":"a"}}]}"#,
+            r#"{"id":"resp-two","choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            REISSUE_USAGE,
+            "[DONE]",
+        ]))
+        .mount(&server)
+        .await;
+    let messages = msgs();
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.attempt_ledger = Some(&ledger);
+    let error = chat_complete(c, &mut NoMcp)
+        .await
+        .expect_err("a mixed response stays rejected after its one retry");
+    assert!(format!("{error:#}").contains("stream changed"), "{error:#}");
+
+    let records = chat_attempts_by_ordinal(&server, &ledger).await;
+    assert_eq!(records.len(), 2, "one try and one fresh retry");
+    for (ordinal, record) in records.iter().enumerate() {
+        assert_eq!(record.key.ordinal as usize, ordinal);
+        assert_eq!(record.key.request, records[0].key.request, "the same bytes");
+        assert_eq!(record.state, crate::attempts::AttemptState::Failed);
+        assert_eq!(record.usage, reissue_usage());
+    }
+}
