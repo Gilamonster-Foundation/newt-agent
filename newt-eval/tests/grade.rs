@@ -227,7 +227,10 @@ fn the_spec_runs_in_a_copy_with_one_invocation_and_limit() {
     );
     let seen = runner.seen.lock().unwrap();
     let (spec, installed) = &seen[0];
-    assert_eq!(spec.argv, ["cargo", "test", "--test", "grade_spec"]);
+    assert_eq!(
+        spec.argv,
+        ["cargo", "test", "--color", "never", "--test", "grade_spec"]
+    );
     assert_eq!(spec.timeout_ms, Some(GRADE_SPEC_TIMEOUT_MS));
     assert_ne!(spec.cwd, tree.path(), "the spec must run in a copy");
     assert_eq!(installed.as_deref(), Some(SPEC));
@@ -554,13 +557,50 @@ fn round1_1_below_the_guard_fails_as_a_decoy_target() {
     let tree = seed_with(&case, &round1_1());
     let spec = fs::read(case.case_dir.join("grade_spec.rs")).unwrap();
 
-    let grade = run_spec(&SubprocessRunner, tree.path(), &spec);
+    let grade = run_spec(&ColorForcing, tree.path(), &spec);
 
     assert_eq!(grade.verdict, BehavioralVerdict::Fail, "{grade:?}");
-    assert!(grade.detail.starts_with("decoy_target"), "{grade:?}");
+    assert!(
+        grade.detail.starts_with("decoy_target") && grade.detail.contains("tests/smoke.rs"),
+        "the Running line must be read, and name the decoy: {grade:?}"
+    );
     assert_eq!(
         grade.tests_run, 7,
         "the decoy's own tests did run: {grade:?}"
+    );
+}
+
+/// Forces cargo's color on every run, as CI's workflow-wide
+/// `CARGO_TERM_COLOR: always` does, and otherwise runs for real.
+struct ColorForcing;
+
+impl CommandRunner for ColorForcing {
+    fn run(&self, spec: &RunSpec) -> RunOutcome {
+        let mut spec = spec.clone();
+        spec.env
+            .push(("CARGO_TERM_COLOR".into(), Some("always".into())));
+        SubprocessRunner.run(&spec)
+    }
+}
+
+/// Regression (#2358 on CI): with `CARGO_TERM_COLOR=always` in the caller's
+/// environment, cargo wrapped `Running` in ANSI codes, the grader never saw
+/// the spec binary start, and an honest tree graded FAIL as a decoy
+/// (`tests_run=1 tests_pass=ok`). The grade must not depend on how the
+/// caller's terminal is configured.
+#[cfg(unix)]
+#[test]
+fn an_honest_tree_passes_when_the_caller_forces_cargo_color() {
+    let case = bundled("T0-fix-add");
+    let tree = seed_with(&case, &case.mock_response.content);
+    let pre = pre_run(&case, tree.path()).unwrap();
+
+    let grade = grade_behavioral_with(&ColorForcing, &case, tree.path(), &pre);
+
+    assert_eq!(
+        (&grade.verdict, grade.tests_run),
+        (&BehavioralVerdict::Pass, 1),
+        "{grade:?}"
     );
 }
 

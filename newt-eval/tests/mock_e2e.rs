@@ -269,7 +269,9 @@ diff --git a/Cargo.toml b/Cargo.toml
         cmd.arg(repo_path("../scripts/eval/ratchet.sh"))
             .args(["--task", "T0-fix-add"])
             .args(args)
-            .env("NEWT_EVAL_BIN", env!("CARGO_BIN_EXE_newt-eval"));
+            .env("NEWT_EVAL_BIN", env!("CARGO_BIN_EXE_newt-eval"))
+            // CI sets this workflow-wide; pin it so every host grades under it.
+            .env("CARGO_TERM_COLOR", "always");
         for (key, value) in env {
             cmd.env(key, value);
         }

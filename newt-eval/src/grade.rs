@@ -320,7 +320,10 @@ pub fn run_spec(runner: &dyn CommandRunner, tree: &Path, spec: &[u8]) -> Behavio
     env.extend(REMOVED_ENV.iter().map(|k| (k.to_string(), None)));
     verdict_from_run(
         &runner.run(&RunSpec {
-            argv: ["cargo", "test", "--test", "grade_spec"]
+            // `--color never` pins the output this parses: a caller's
+            // CARGO_TERM_COLOR=always (CI sets it) or a cargo config wraps
+            // `Running` in ANSI codes, and an honest tree graded FAIL as a decoy.
+            argv: ["cargo", "test", "--color", "never", "--test", "grade_spec"]
                 .map(String::from)
                 .to_vec(),
             cwd: copy.path().to_path_buf(),
