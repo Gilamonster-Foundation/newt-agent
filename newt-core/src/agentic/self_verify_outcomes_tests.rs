@@ -440,30 +440,40 @@ fn a_status_masked_pass_is_unverified() {
 /// Finding 5: every call that may change the workspace is a mutation for the
 /// fallback chain, and a check-matching command that is not a plain run of the
 /// check is not exempt from it.
-#[test]
-fn the_mutation_chain_counts_every_workspace_changing_call() {
+#[tokio::test]
+async fn the_mutation_chain_counts_every_workspace_changing_call() {
     let ws = "newt-core-test-workspace-that-does-not-exist";
-    let run = |ledger: &mut VerificationLedger, command: &str| {
-        ledger.observe(
+    let run_json = |command: &str| serde_json::json!({ "command": command });
+    let mut deleted = VerificationLedger::for_turn("", true);
+    deleted
+        .observe(
             "run_command",
-            &serde_json::json!({ "command": command }),
+            &run_json("cargo test"),
             true,
             Some(Passed),
             ws,
-        );
-    };
-    let mut deleted = VerificationLedger::for_turn("", true);
-    run(&mut deleted, "cargo test");
-    deleted.observe(
-        "delete_file",
-        &serde_json::json!({"path": "src/lib.rs"}),
-        true,
-        None,
-        ws,
-    );
+        )
+        .await;
+    deleted
+        .observe(
+            "delete_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+            true,
+            None,
+            ws,
+        )
+        .await;
     let mut sed = VerificationLedger::for_turn("", true);
-    run(&mut sed, "pytest");
-    run(&mut sed, "sed -i s/a/b/ tests/test_util.py");
+    sed.observe("run_command", &run_json("pytest"), true, Some(Passed), ws)
+        .await;
+    sed.observe(
+        "run_command",
+        &run_json("sed -i s/a/b/ tests/test_util.py"),
+        true,
+        Some(Passed),
+        ws,
+    )
+    .await;
     assert_ne!(
         decide_with(&cargo_checks(), &deleted, None),
         Decision::Accept,

@@ -3066,6 +3066,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         rounds_left: more,
                         round,
                         ledger: &verification,
+                        tree_now: verification.tree_now(workspace).await,
                         solve_obs: solve_obs.as_deref_mut(),
                     },
                     smart_verify,
@@ -4169,7 +4170,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
-            verification.observe(name, &args, ok, execution.get().copied(), workspace);
+            verification
+                .observe(name, &args, ok, execution.get().copied(), workspace)
+                .await;
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,
@@ -4226,12 +4229,14 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // summary reflects progress and the fallback advice is honest.
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
     // #2374: a failed check at the round limit is a scored repair exhaustion.
-    let cap_reason = verification.cap_exit_reason(
-        workspace,
-        smart_harness.is_some() && smart_verify,
-        max_tool_rounds,
-        solve_obs.as_deref_mut(),
-    );
+    let cap_reason = verification
+        .cap_exit_reason(
+            workspace,
+            smart_harness.is_some() && smart_verify,
+            max_tool_rounds,
+            solve_obs.as_deref_mut(),
+        )
+        .await;
     if let Some(harness) = smart_harness {
         harness.record_messages(&messages)?;
         let text = cap_exit_fallback(
@@ -7837,6 +7842,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         rounds_left: more,
                         round,
                         ledger: &verification,
+                        tree_now: verification.tree_now(workspace).await,
                         solve_obs: solve_obs.as_deref_mut(),
                     },
                     smart_verify,
@@ -8089,6 +8095,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         rounds_left: round + 1 < current_tool_round_limit,
                         round,
                         ledger: &verification,
+                        tree_now: verification.tree_now(workspace).await,
                         solve_obs: solve_obs.as_deref_mut(),
                     },
                     verification_nudges,
@@ -8649,7 +8656,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
-            verification.observe(name, &args, ok, execution.get().copied(), workspace);
+            verification
+                .observe(name, &args, ok, execution.get().copied(), workspace)
+                .await;
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,
@@ -8698,16 +8707,18 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // Step 27.5: salvage progress + failed-call count (matches the Ollama path).
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
     // #2374: a failed check at the round limit is a scored repair exhaustion.
-    let cap_reason = verification.cap_exit_reason(
-        workspace,
-        if smart_harness.is_some() {
-            smart_verify
-        } else {
-            action_nudges
-        },
-        max_tool_rounds,
-        solve_obs.as_deref_mut(),
-    );
+    let cap_reason = verification
+        .cap_exit_reason(
+            workspace,
+            if smart_harness.is_some() {
+                smart_verify
+            } else {
+                action_nudges
+            },
+            max_tool_rounds,
+            solve_obs.as_deref_mut(),
+        )
+        .await;
     if let Some(harness) = smart_harness {
         harness.record_messages(&messages)?;
         let text = cap_exit_fallback(
@@ -10256,6 +10267,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         rounds_left: more,
                         round,
                         ledger: &verification,
+                        tree_now: verification.tree_now(workspace).await,
                         solve_obs: solve_obs.as_deref_mut(),
                     },
                     smart_verify,
@@ -10494,6 +10506,7 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                         rounds_left: round + 1 < current_tool_round_limit,
                         round,
                         ledger: &verification,
+                        tree_now: verification.tree_now(workspace).await,
                         solve_obs: solve_obs.as_deref_mut(),
                     },
                     verification_nudges,
@@ -10893,7 +10906,9 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
-            verification.observe(name, &args, ok, execution.get().copied(), workspace);
+            verification
+                .observe(name, &args, ok, execution.get().copied(), workspace)
+                .await;
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,
@@ -10945,16 +10960,18 @@ async fn anthropic_chat_complete_with_prompt_and_artifacts(
     // Step 27.5: salvage progress + failed-call count (mirrors the OpenAI path).
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
     // #2374: a failed check at the round limit is a scored repair exhaustion.
-    let cap_reason = verification.cap_exit_reason(
-        workspace,
-        if smart_harness.is_some() {
-            smart_verify
-        } else {
-            action_nudges
-        },
-        max_tool_rounds,
-        solve_obs.as_deref_mut(),
-    );
+    let cap_reason = verification
+        .cap_exit_reason(
+            workspace,
+            if smart_harness.is_some() {
+                smart_verify
+            } else {
+                action_nudges
+            },
+            max_tool_rounds,
+            solve_obs.as_deref_mut(),
+        )
+        .await;
     if let Some(harness) = smart_harness {
         harness.record_messages(&messages)?;
         let text = cap_exit_fallback(
@@ -11991,6 +12008,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                         rounds_left: more,
                         round,
                         ledger: &verification,
+                        tree_now: verification.tree_now(workspace).await,
                         solve_obs: solve_obs.as_deref_mut(),
                     },
                     smart_verify,
@@ -12372,7 +12390,9 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                 execution.get().copied(),
                 tool_t0,
             );
-            verification.observe(name, &args, ok, execution.get().copied(), workspace);
+            verification
+                .observe(name, &args, ok, execution.get().copied(), workspace)
+                .await;
             record_phantom_reach(
                 &mut phantom_reaches,
                 name,
@@ -12414,12 +12434,14 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     let cap_accumulated = accumulated_usage;
     let progress = cap_exit_progress(step_ledger, scratchpad_store);
     // #2374: a failed check at the round limit is a scored repair exhaustion.
-    let cap_reason = verification.cap_exit_reason(
-        workspace,
-        smart_harness.is_some() && smart_verify,
-        max_tool_rounds,
-        solve_obs.as_deref_mut(),
-    );
+    let cap_reason = verification
+        .cap_exit_reason(
+            workspace,
+            smart_harness.is_some() && smart_verify,
+            max_tool_rounds,
+            solve_obs.as_deref_mut(),
+        )
+        .await;
     if let Some(harness) = smart_harness {
         harness.record_responses_messages(instructions.as_deref(), &input)?;
         let text = cap_exit_fallback(

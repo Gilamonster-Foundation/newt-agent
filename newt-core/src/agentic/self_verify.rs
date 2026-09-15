@@ -664,6 +664,9 @@ pub struct VerificationLedger {
     ///
     /// [`ChatCtx::verify_outcomes`]: super::ChatCtx::verify_outcomes
     result_aware: bool,
+    /// The workspace's detected checks, scanned once per turn (off the async
+    /// worker) the first time a pass needs them.
+    checks: Option<Vec<VerifyCheck>>,
 }
 
 impl VerificationLedger {
@@ -674,7 +677,23 @@ impl VerificationLedger {
             entries: Vec::new(),
             task: task.to_string(),
             result_aware,
+            checks: None,
         }
+    }
+
+    /// This turn's detected checks: one bounded directory scan per turn, run on
+    /// the blocking pool.
+    async fn checks(&mut self, workspace: &str) -> &[VerifyCheck] {
+        if self.checks.is_none() {
+            let (root, task) = (std::path::PathBuf::from(workspace), self.task.clone());
+            let scanned = tokio::task::spawn_blocking(move || {
+                detect_checks(&workspace_entries(&root), &task)
+            })
+            .await
+            .unwrap_or_default();
+            self.checks = Some(scanned);
+        }
+        self.checks.as_deref().unwrap_or_default()
     }
 
     /// Whether this turn runs the result-aware gate.
@@ -698,7 +717,7 @@ impl VerificationLedger {
 
     /// The funnel's single call. A no-op unless result-aware mode is on, so the
     /// default path does no extra work and no workspace scan.
-    pub(crate) fn observe(
+    pub(crate) async fn observe(
         &mut self,
         name: &str,
         args: &serde_json::Value,
@@ -716,15 +735,19 @@ impl VerificationLedger {
                     Some(command) if name == "run_command" => command.to_string(),
                     _ => format!("{name} {args}"),
                 };
-                // Hash only a pass of a detected check; any other command's
-                // tree is never read.
-                let root = std::path::Path::new(workspace);
-                let tree = (outcome == ExecOutcome::Passed
-                    && detect_checks(&workspace_entries(root), &self.task)
+                // Hash only pass evidence for a detected check; any other
+                // command's tree is never read.
+                let evidence = outcome == ExecOutcome::Passed
+                    && self
+                        .checks(workspace)
+                        .await
                         .iter()
-                        .any(|check| check.invocation(&command).is_some_and(|i| i.evidence)))
-                .then(|| workspace_tree_state(root))
-                .flatten();
+                        .any(|check| check.invocation(&command).is_some_and(|i| i.evidence));
+                let tree = if evidence {
+                    tree_state_off_worker(workspace).await
+                } else {
+                    None
+                };
                 self.record_exec(&command, outcome, tree);
             }
             // Every call that is not read-only may have changed the tree, ok or
@@ -739,8 +762,8 @@ impl VerificationLedger {
     /// and a detected check's latest evidence is a failure, the exit is a scored
     /// `RepairExhausted` and the reclassification is traced. Otherwise, and on
     /// any loop without a gate, it stays `RoundCap`.
-    pub(crate) fn cap_exit_reason(
-        &self,
+    pub(crate) async fn cap_exit_reason(
+        &mut self,
         workspace: &str,
         gate_on: bool,
         round: usize,
@@ -749,15 +772,13 @@ impl VerificationLedger {
         if !(self.result_aware && gate_on) {
             return crate::TurnEndReason::RoundCap;
         }
-        let checks = detect_checks(
-            &workspace_entries(std::path::Path::new(workspace)),
-            &self.task,
-        );
+        let tree_now = self.tree_now(workspace).await;
+        let checks = self.checks(workspace).await.to_vec();
         let (decision, report) = conclude(&Conclusion {
             checks: &checks,
             requested: &[],
             ledger: self,
-            tree_now: self.tree_now(workspace),
+            tree_now,
             repairs_used: VERIFY_REPAIR_ALLOWANCE,
             rounds_left: false,
         });
@@ -777,15 +798,29 @@ impl VerificationLedger {
         crate::TurnEndReason::RepairExhausted
     }
 
-    /// The current tree state, computed only when some recorded pass could
-    /// need it.
-    pub(crate) fn tree_now(&self, workspace: &str) -> Option<ContentId> {
-        self.entries
+    /// The current tree state, computed (off the async worker) only when some
+    /// recorded pass could need it.
+    pub(crate) async fn tree_now(&self, workspace: &str) -> Option<ContentId> {
+        let needed = self
+            .entries
             .iter()
-            .any(|e| matches!(e, Observed::Exec { tree: Some(_), .. }))
-            .then(|| workspace_tree_state(std::path::Path::new(workspace)))
-            .flatten()
+            .any(|e| matches!(e, Observed::Exec { tree: Some(_), .. }));
+        if needed {
+            tree_state_off_worker(workspace).await
+        } else {
+            None
+        }
     }
+}
+
+/// [`workspace_tree_state`] on the blocking pool: it reads and hashes up to
+/// the byte bound, which must not stall an async worker.
+async fn tree_state_off_worker(workspace: &str) -> Option<ContentId> {
+    let root = std::path::PathBuf::from(workspace);
+    tokio::task::spawn_blocking(move || workspace_tree_state(&root))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// A concluding answer as a loop sees it: what [`conclude_turn`] needs to
@@ -798,6 +833,8 @@ pub(crate) struct Concluding<'a> {
     pub rounds_left: bool,
     pub round: usize,
     pub ledger: &'a VerificationLedger,
+    /// The tree state now, computed by the caller off the async worker.
+    pub tree_now: Option<ContentId>,
     pub solve_obs: Option<&'a mut super::observability::SolveObservation>,
 }
 
@@ -812,7 +849,7 @@ pub(crate) fn conclude_turn(turn: Concluding<'_>, repairs_used: usize) -> Decisi
         checks: &checks,
         requested: &requested,
         ledger: turn.ledger,
-        tree_now: turn.ledger.tree_now(turn.workspace),
+        tree_now: turn.tree_now,
         repairs_used,
         rounds_left: turn.rounds_left,
     });
