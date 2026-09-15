@@ -949,8 +949,10 @@ pub(crate) async fn response(
 /// OpenAI interpretation errors are model/wire evidence, with their original
 /// error chain retained. JSON-only consumers retain their existing decoder.
 pub(crate) fn decode_openai_response(bytes: &[u8]) -> anyhow::Result<Value> {
-    super::openai_sse::decode_response(bytes).map_err(|error| {
-        let classified = super::observability::DispatchError::http_status(format!("{error:#}"));
+    let mut usage = None;
+    super::openai_sse::decode_response_reporting_usage(bytes, &mut usage).map_err(|error| {
+        let classified = super::observability::DispatchError::http_status(format!("{error:#}"))
+            .with_usage(usage);
         error.context(classified)
     })
 }

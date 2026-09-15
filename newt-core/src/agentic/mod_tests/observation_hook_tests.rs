@@ -928,6 +928,76 @@ async fn an_ollama_cap_exit_summary_is_one_ledger_attempt() {
         .all(|r| r.state == crate::attempts::AttemptState::Ok && r.usage.is_some()));
 }
 
+/// Read one Ollama stream reissue body served in `parts` (see
+/// `serve_stream_parts`), returning `stream_response`'s (text, usage, complete).
+async fn ollama_stream_parts(
+    parts: &[&str],
+    interrupt: bool,
+) -> (String, Option<crate::TokenUsage>, bool) {
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (url, server) =
+        super::http_loop_tests::serve_stream_parts(parts, interrupt.then(|| flag.clone())).await;
+    let response = reqwest::Client::new()
+        .post(format!("{url}/api/chat"))
+        .send()
+        .await
+        .expect("the stream connects");
+    let read = stream_response(response, false, false, false, Some(&flag), false, None)
+        .await
+        .expect("the body reads");
+    server.abort();
+    read
+}
+
+const OLLAMA_DELTA: &str = "{\"message\":{\"content\":\"the answer\"}}\n";
+const OLLAMA_DONE: &str =
+    "{\"message\":{\"content\":\"\"},\"done\":true,\"prompt_eval_count\":40,\"eval_count\":6}\n";
+
+fn ollama_done_usage() -> Option<crate::TokenUsage> {
+    Some(crate::TokenUsage {
+        input_tokens: 40,
+        output_tokens: 6,
+    })
+}
+
+/// Review round 2, item 3: a stream that reached `done: true` is finished. An
+/// Esc that lands after it, while the connection is still open, must not turn
+/// it into an interrupted one, so the reader stops at `done` instead of polling
+/// the socket again.
+#[tokio::test]
+async fn an_ollama_stream_is_complete_once_done_even_if_esc_follows() {
+    let (text, usage, complete) = ollama_stream_parts(&[OLLAMA_DELTA, OLLAMA_DONE], true).await;
+    assert_eq!(text, "the answer");
+    assert_eq!(usage, ollama_done_usage());
+    assert!(complete, "done: true arrived before the interrupt");
+}
+
+/// Review round 2, item 3: NDJSON lines straddle chunk boundaries. A `done`
+/// line split in two is still the end of the stream, with its usage.
+#[tokio::test]
+async fn an_ollama_done_line_split_across_chunks_still_completes_the_stream() {
+    let cut = OLLAMA_DONE.len() / 2;
+    let (text, usage, complete) = ollama_stream_parts(
+        &[OLLAMA_DELTA, &OLLAMA_DONE[..cut], &OLLAMA_DONE[cut..]],
+        false,
+    )
+    .await;
+    assert_eq!(text, "the answer");
+    assert_eq!(usage, ollama_done_usage());
+    assert!(complete, "the split done line was read");
+}
+
+/// Review round 2, item 4: an Esc inside the read loop, after the first delta,
+/// keeps the partial text and is never complete. Deterministic: the flag is
+/// tripped only after the reader has drained megabytes of the body.
+#[tokio::test]
+async fn an_ollama_stream_interrupted_after_its_first_delta_is_not_complete() {
+    let (text, usage, complete) = ollama_stream_parts(&[OLLAMA_DELTA], true).await;
+    assert_eq!(text, "the answer", "the partial is kept");
+    assert_eq!(usage, None, "usage only arrives on the done line");
+    assert!(!complete, "an interrupted stream is not complete");
+}
+
 /// A plain answer on the probe; a stream reissue cut before `done: true`.
 struct OllamaAnswerThenCutStream;
 impl Respond for OllamaAnswerThenCutStream {

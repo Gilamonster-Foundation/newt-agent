@@ -1555,6 +1555,96 @@ async fn an_anthropic_error_event_after_partial_text_is_a_failed_attempt() {
     assert_eq!(records[0].state, crate::attempts::AttemptState::Failed);
 }
 
+/// Review round 2, item 4: a failure after `message_delta` has complete usage,
+/// and the failed attempt keeps it.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn an_anthropic_error_event_after_message_delta_keeps_the_complete_usage() {
+    let _env = test_env(true);
+    let mut frames = anthropic_stream_head(6);
+    frames.push(
+        serde_json::json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": "a whole answer"}}),
+    );
+    frames.push(serde_json::json!({"type": "message_delta",
+        "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}}));
+    frames.push(serde_json::json!({"type": "error",
+        "error": {"type": "overloaded_error", "message": "Overloaded"}}));
+    let records = streamed_anthropic_turn(sse(&frames), None).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Failed);
+    assert_eq!(
+        records[0].usage,
+        Some(crate::TokenUsage {
+            input_tokens: 6,
+            output_tokens: 3
+        })
+    );
+}
+
+/// Review round 2, item 4: an Esc inside the stream's read loop, after the first
+/// text delta, is a failed attempt. Deterministic: the flag is tripped only
+/// after the reader has drained megabytes of the body, so the send-time cancel
+/// cannot be what fires. Only `message_start` usage arrived, which is no usage
+/// (a known limit: `TokenUsage` cannot say "output unknown").
+#[tokio::test]
+async fn an_anthropic_stream_interrupted_after_its_first_delta_is_a_failed_attempt() {
+    let mut frames = anthropic_stream_head(6);
+    frames.push(
+        serde_json::json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": "the beginning"}}),
+    );
+    let head: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (url, server) =
+        super::http_loop_tests::serve_stream_parts(&[&head], Some(flag.clone())).await;
+    let messages_url = format!("{url}/v1/messages");
+    let client = reqwest::Client::new();
+    let retry = RetryPolicy {
+        max_retries: 0,
+        base: std::time::Duration::ZERO,
+        max: std::time::Duration::ZERO,
+        jitter: false,
+    };
+    let dispatch = AnthropicDispatch {
+        smart_harness: None,
+        client: &client,
+        stream_client: &client,
+        messages_url: &messages_url,
+        api_key: None,
+        retry: &retry,
+        color: false,
+        markdown: false,
+        retain: None,
+    };
+    let ledger = std::sync::Mutex::new(crate::attempts::AttemptLedger::default());
+    let scope = attempt_capture::AttemptScope {
+        ledger: &ledger,
+        turn: "prompt:turn",
+        model: "claude-test",
+        backend: "test-backend",
+    };
+    let (round, started) = anthropic_dispatch_round(
+        &dispatch,
+        &serde_json::json!({"stream": true}),
+        &[],
+        true,
+        Some(flag.as_ref()),
+        Some(scope),
+    )
+    .await
+    .expect("an interrupt is not an error")
+    .expect("the stream was read, so this is not the send-time cancel");
+    server.abort();
+    assert!(started, "the first delta was shown");
+    assert_eq!(round.text, "the beginning");
+    let ledger = ledger.lock().unwrap();
+    let records: Vec<_> = ledger.records().collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, crate::attempts::AttemptState::Failed);
+    assert_eq!(records[0].usage, None);
+}
+
 /// Trips the interrupt flag as the response is served.
 struct CancelWhileServing {
     flag: Arc<std::sync::atomic::AtomicBool>,
@@ -1566,7 +1656,10 @@ impl Respond for CancelWhileServing {
     }
 }
 
-/// Review finding 5: a cancel mid-stream is never an ok attempt.
+/// Review finding 5: a cancel while the request is in flight is never an ok
+/// attempt. The flag is set before the headers return, so this covers the
+/// send-time cancel; the stream's own interrupt arm is pinned by
+/// `an_anthropic_stream_interrupted_after_its_first_delta_is_a_failed_attempt`.
 #[tokio::test]
 #[serial_test::serial(anthropic_loop_env)]
 async fn an_anthropic_stream_cancelled_mid_flight_is_never_ok() {
