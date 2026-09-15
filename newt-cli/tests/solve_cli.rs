@@ -1525,3 +1525,169 @@ async fn solve_reports_verification_off_where_the_loop_has_no_gate() {
         assert_eq!(verification["mode"], expected, "{api}: {verification}");
     }
 }
+
+/// A plain streamed answer, with a usage chunk (32 in, 12 out) when `measured`.
+fn usage_sse_reply(measured: bool) -> ResponseTemplate {
+    let mut frames = vec![serde_json::json!({
+        "model": NEMOTRON_MODEL,
+        "choices": [{"delta": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}]
+    })
+    .to_string()];
+    if measured {
+        frames.push(
+            serde_json::json!({"choices": [], "usage": {"prompt_tokens": 32, "completion_tokens": 12}})
+                .to_string(),
+        );
+    }
+    frames.push("[DONE]".to_string());
+    let body: String = frames
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect();
+    ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
+}
+
+/// Run one `newt solve` against `server`, with `--events` into `workspace` when
+/// asked, and return the process's stdout.
+fn run_usage_solve(
+    server: &MockServer,
+    workspace: &std::path::Path,
+    pricing: bool,
+    events: bool,
+) -> String {
+    let config_path = workspace.join("solve.toml");
+    let instruction_path = workspace.join("instruction.md");
+    let mut config = format!(
+        r#"default_backend = "usage"
+
+[[backends]]
+name = "usage"
+endpoint = "{}"
+model = "{NEMOTRON_MODEL}"
+kind = "openai"
+"#,
+        server.uri()
+    );
+    if pricing {
+        config.push_str(&format!(
+            "\n[pricing.overrides.\"{NEMOTRON_MODEL}\"]\ninput_usd_per_1k = 1.0\noutput_usd_per_1k = 1.0\n"
+        ));
+    }
+    std::fs::write(&config_path, config).expect("write solve config");
+    std::fs::write(&instruction_path, "Say done.\n").expect("write solve instruction");
+    let mut command = Command::cargo_bin("newt").expect("newt binary");
+    command
+        .env_remove("NEWT_TEAM")
+        .arg("--config")
+        .arg(&config_path)
+        .args(["solve", "--cwd"])
+        .arg(workspace)
+        .arg("--instruction-file")
+        .arg(&instruction_path);
+    if events {
+        command.arg("--events").arg(workspace.join("events.jsonl"));
+    }
+    let output = command.output().expect("newt solve runs");
+    String::from_utf8(output.stdout).expect("stdout is UTF-8")
+}
+
+/// #2313 (d): the `solve_result` line carries a `usage` stanza summed per
+/// inference attempt, and `--events` carries the attempt ledger's chain, which
+/// verifies against the stanza's `ledger_head`.
+///
+/// - Measured and priced: `in_tokens`/`out_tokens` are per-attempt sums,
+///   `usage_complete` is true and `cost_usd` is priced from them.
+/// - Unmeasured (no `usage` in the reply): every attempt is `usage_missing`,
+///   usage is incomplete, and there is no `cost_usd` — unknown is not zero.
+/// - Without `--events` there are no ledger lines, so no `ledger_head`: a head
+///   with no lines to walk is unverifiable.
+///
+/// Counts are relative to the POSTs the server received, so the display
+/// reissue (#2372) changes nothing here.
+#[tokio::test(flavor = "multi_thread")]
+async fn solve_reports_per_attempt_usage_and_a_verifiable_attempt_ledger() {
+    use newt_core::attempts::AttemptRecord;
+    use newt_core::event_journal::{verify_chain, JournalLine};
+
+    for measured in [true, false] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(usage_sse_reply(measured))
+            .mount(&server)
+            .await;
+        let workspace = tempfile::tempdir().expect("temporary solve workspace");
+        run_usage_solve(&server, workspace.path(), measured, true);
+
+        let posts = server.received_requests().await.expect("journal").len() as u64;
+        assert!(posts > 0, "measured={measured}: the run reached the model");
+        let events_path = workspace.path().join("events.jsonl");
+        let result = solve_result_from(&events_path);
+        let usage = &result["usage"];
+        assert_eq!(usage["attempts"], posts, "measured={measured}: {usage}");
+        if measured {
+            assert_eq!(usage["in_tokens"], 32 * posts, "{usage}");
+            assert_eq!(usage["out_tokens"], 12 * posts, "{usage}");
+            assert_eq!(usage["usage_missing"], 0, "{usage}");
+            assert_eq!(usage["usage_complete"], true, "{usage}");
+            let cost = usage["cost_usd"]
+                .as_f64()
+                .expect("a complete, priced run has a cost");
+            assert!((cost - 0.044 * posts as f64).abs() < 1e-9, "{usage}");
+        } else {
+            assert_eq!(usage["in_tokens"], 0, "{usage}");
+            assert_eq!(usage["usage_missing"], posts, "{usage}");
+            assert_eq!(usage["usage_complete"], false, "{usage}");
+            assert!(
+                usage.get("cost_usd").is_none(),
+                "unknown is not zero: {usage}"
+            );
+        }
+
+        let lines: Vec<JournalLine<AttemptRecord>> = std::fs::read_to_string(&events_path)
+            .expect("read solve events")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).expect("event line is JSON")
+            })
+            .filter(|record| record["kind"] == "attempt")
+            .map(|record| {
+                serde_json::from_value(record).expect("an attempt line is a journal line")
+            })
+            .collect();
+        let head = usage["ledger_head"]
+            .as_str()
+            .expect("--events carries the head");
+        assert_eq!(
+            verify_chain(&lines, Some(head)),
+            vec![],
+            "measured={measured}"
+        );
+        let attempts: std::collections::BTreeSet<_> =
+            lines.iter().map(|line| line.node.payload().id).collect();
+        assert_eq!(attempts.len() as u64, posts, "one attempt id per POST");
+    }
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(usage_sse_reply(true))
+        .mount(&server)
+        .await;
+    let workspace = tempfile::tempdir().expect("temporary solve workspace");
+    let stdout = run_usage_solve(&server, workspace.path(), false, false);
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert!(
+        records.iter().all(|record| record["kind"] != "attempt"),
+        "no --events, no lines"
+    );
+    let result = records
+        .iter()
+        .find(|record| record["kind"] == "solve_result")
+        .expect("a solve_result line on stdout");
+    assert!(result["usage"]["attempts"].as_u64() > Some(0), "{result}");
+    assert!(result["usage"].get("ledger_head").is_none(), "{result}");
+}

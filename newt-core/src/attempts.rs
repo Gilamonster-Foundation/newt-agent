@@ -98,12 +98,14 @@ pub struct UsageTotals {
 
 /// Per-attempt usage ledger (#2313), chained on [`crate::event_journal`].
 ///
-/// Holds the chain head plus the latest observation per attempt id: the fold
-/// the totals are computed from, not a copy of the emitted lines. Those lines
-/// go to a trace (`--events`), where `verify_chain` is the check on the head.
+/// Holds the chain, its lines in observation order, and the latest observation
+/// per attempt id (the fold the totals are computed from). The lines go to a
+/// trace (`newt solve --events`), where `verify_chain` against the head is the
+/// check; one attempt observed twice (sent, then settled) is two lines.
 #[derive(Debug, Default)]
 pub struct AttemptLedger {
     journal: crate::event_journal::Journal,
+    lines: Vec<crate::event_journal::JournalLine<AttemptRecord>>,
     ordinals: std::collections::BTreeMap<(String, String, content_addressable::RawContentId), u32>,
     observed: std::collections::BTreeMap<content_addressable::ContentId, AttemptRecord>,
 }
@@ -140,6 +142,7 @@ impl AttemptLedger {
     ) -> Result<crate::event_journal::JournalLine<AttemptRecord>, content_addressable::ContentError>
     {
         let line = self.journal.append(record.clone())?;
+        self.lines.push(line.clone());
         self.observed.insert(record.id, record);
         Ok(line)
     }
@@ -163,6 +166,12 @@ impl AttemptLedger {
     /// The latest observation of every distinct attempt.
     pub fn records(&self) -> impl Iterator<Item = &AttemptRecord> {
         self.observed.values()
+    }
+
+    /// Every chain line, in observation order.
+    #[must_use]
+    pub fn lines(&self) -> &[crate::event_journal::JournalLine<AttemptRecord>] {
+        &self.lines
     }
 
     /// The chain head, reported only when the lines were emitted.
@@ -326,6 +335,30 @@ mod tests {
         let mut tampered = decoded.clone();
         tampered.key.ordinal += 1;
         assert_ne!(tampered.id, tampered.key.content_id().unwrap());
+    }
+
+    /// #2313 (d): the ledger keeps every chain line it appended, so a trace can
+    /// be written after the turn. An attempt observed at its send and again
+    /// when settled is two lines and one attempt, and the lines reach the head.
+    #[test]
+    fn the_ledger_keeps_its_chain_lines_for_a_trace() {
+        use crate::event_journal::verify_chain;
+        let mut ledger = AttemptLedger::default();
+        let key = ledger.dispatch("turn-1", "primary", b"round 0");
+        let sent = ledger
+            .observe(record(&key, None, AttemptState::Failed))
+            .unwrap();
+        let settled = ledger
+            .observe(record(&key, used(32, 12), AttemptState::Ok))
+            .unwrap();
+        assert_eq!(ledger.lines(), [sent, settled].as_slice());
+        let head = ledger.head().expect("a head").to_string();
+        assert_eq!(
+            ledger.lines().last().map(|l| l.id.as_str()),
+            Some(head.as_str())
+        );
+        assert_eq!(verify_chain(ledger.lines(), Some(&head)), vec![]);
+        assert_eq!(ledger.totals().attempts, 1);
     }
 
     /// #2313: the lines an `--events` trace carries are the evidence for

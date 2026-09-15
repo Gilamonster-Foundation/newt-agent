@@ -755,11 +755,36 @@ pub async fn run(args: SolveArgs) -> Result<i32> {
         "error": error,
     });
     solve_contract::conditional_stanza(&mut record, "smart_harness", smart_manifest.clone());
+    // #2313: per-attempt usage, and the attempt ledger's chain lines ahead of
+    // this line, but only into a trace that is kept (`--events`); the head is
+    // reported only alongside them.
+    let attempt_lines = match (o_opt, &args.events) {
+        (Some(o), Some(_)) => &o.attempt_lines[..],
+        _ => &[],
+    };
+    let usage_stanza = o_opt.and_then(|o| o.attempts).map(|totals| {
+        let local = newt_core::owned_hosts::inference_is_local(
+            kind == newt_core::BackendKind::Embedded,
+            Some(&url),
+        );
+        let cost = cfg
+            .pricing
+            .clone()
+            .unwrap_or_default()
+            .estimate_attempts_cost(&model, local, &totals);
+        let head = attempt_lines.last().map(|line| line.id.as_str());
+        solve_contract::usage_stanza(&totals, cost, head)
+    });
+    solve_contract::conditional_stanza(&mut record, "usage", usage_stanza);
     // 7. W0 (#1511): the per-round parse-signal trace events plus EXACTLY ONE
     //    contract record (the `contract_version` key marks it — the external
     //    evaluator rejects a trace with zero or several), appended alongside
     //    the solve_result line above, never replacing it.
-    let mut trace_lines: Vec<serde_json::Value> = vec![record];
+    let mut trace_lines: Vec<serde_json::Value> = attempt_lines
+        .iter()
+        .map(solve_contract::attempt_line)
+        .collect();
+    trace_lines.push(record);
     if let Some(o) = o_opt {
         trace_lines.extend(
             o.parse_signals

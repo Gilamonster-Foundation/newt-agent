@@ -316,6 +316,10 @@ pub struct TurnOutcome {
     /// how many attempts reported no usage (#2313). `usage` above stays the
     /// context merge (largest prompt, generated tokens).
     pub attempts: Option<crate::attempts::UsageTotals>,
+    /// The attempt ledger's chain lines, in observation order, for a trace
+    /// (`newt solve --events`). The last line's id is the chain head. A boxed
+    /// slice, not a `Vec`: the lines are final, and `TurnStatus` stays small.
+    pub attempt_lines: Box<[crate::event_journal::JournalLine<crate::attempts::AttemptRecord>]>,
 }
 
 /// Non-blocking snapshot of the driver's state, returned by
@@ -763,12 +767,12 @@ async fn run_one_turn(
     // responses check — which is exactly why a responses-only model like
     // gpt-5.6-sol was mis-routed to /v1/chat/completions.)
     let dispatch = chat_complete(ctx, &mut mcp).await;
-    let attempts = Some(
-        attempt_ledger
+    let (attempts, attempt_lines) = {
+        let ledger = attempt_ledger
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .totals(),
-    );
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (Some(ledger.totals()), ledger.lines().into())
+    };
     // Both arms move `tool_events`/`end_reason` out (only one arm runs). On a
     // failed turn we still return `Ok` carrying the PARTIAL trajectory + the
     // error, rather than `Err` that discards what the agent already did — an
@@ -791,6 +795,7 @@ async fn run_one_turn(
             output_allowance: solve_obs.output_allowance,
             harness_reply: solve_obs.harness_reply,
             attempts,
+            attempt_lines,
         }),
         Err(e) => Ok(TurnOutcome {
             reply: String::new(),
@@ -814,6 +819,7 @@ async fn run_one_turn(
             output_allowance: solve_obs.output_allowance,
             harness_reply: solve_obs.harness_reply,
             attempts,
+            attempt_lines,
         }),
     }
 }
