@@ -2619,8 +2619,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 "request failed",
                             )
                             .await?;
-                            let json =
-                                smart_harness::response(resp, smart_harness, "Ollama").await?;
+                            let json = smart_harness::response(resp, smart_harness, "Ollama")
+                                .await
+                                .inspect_err(|error| {
+                                    attempt_capture::failed(attempts, attempt.as_ref(), error);
+                                })?;
                             attempt_capture::complete(
                                 attempts,
                                 attempt.as_ref(),
