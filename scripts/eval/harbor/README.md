@@ -155,7 +155,16 @@ declared path, and reads `n/a` for pi and Codex. The baseline is newt's shipped
 defaults, which arm the self-verify gate (#1961), so `none` itself expects
 `receipt.verification.mode = attempted`. `verify-outcomes` expects
 `result_aware`, and the `self-verify-off` ablation (`NEWT_BENCH_SELF_VERIFY=0`)
-expects `off`; `NEWT_BENCH_SELF_VERIFY=1` changes nothing.
+expects `off`; `NEWT_BENCH_SELF_VERIFY=1` changes nothing. Two assumptions hold
+these expects:
+- **Binary floor.** Only newt built from `58ae8a96` (#2374) or later writes
+  `receipt.verification`. On an older binary every newt cell reads not observed.
+- **Wire.** `attempted` is the mode on the Chat Completions or Anthropic wire,
+  or with the smart harness on. On the Responses wire without it newt has no
+  gate and reports `off`.
+
+A turn that never ran (outcome `harness_error` with no verification receipt, as
+a spawn or thread failure writes) is not counted as not observed.
 
 *Verification ends.* `RepairExhausted` and `VerificationIncomplete` still deliver
 an answer, so newt's contract says `outcome: completed` while `solve_result`

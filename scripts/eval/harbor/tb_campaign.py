@@ -249,7 +249,7 @@ def newt_end_reason(lines):
     for o in _records(lines):
         if o.get("kind") == "solve_result":
             end = o.get("end_reason")
-    found = re.fullmatch(r"Some\((\w+)\)", end or "")
+    found = re.fullmatch(r"Some\((\w+)\)", end) if isinstance(end, str) else None
     return found.group(1) if found else None
 
 
@@ -418,6 +418,15 @@ def observed(expect, record):
     return all(at(p) is not None if v == "*" else at(p) == v for p, v in expect.items())
 
 
+def observed_in(expect, contract):
+    """`observed` for a trial, except a turn that never ran: a spawn or thread
+    failure writes outcome harness_error with no features, so its receipt carries
+    no verification entry and nothing was there to observe."""
+    if contract and contract.get("outcome") == "harness_error" and not (contract.get("receipt") or {}).get("verification"):
+        return None
+    return observed(expect, contract)
+
+
 # ── pinning ─────────────────────────────────────────────────────────────────
 # Cells pool or pair only under one pin. The first cell writes it; a later cell
 # that differs is refused. The model fingerprint is the server's own metadata
@@ -553,7 +562,7 @@ def trial_row(harness, trial: Path, expect=None):
         "model_label": label,
         "model_effective": effective,
         "harness_config": harness_config,
-        "treatment_observed": observed(expect, contract),
+        "treatment_observed": observed_in(expect, contract),
         "harness_status": newt_status(lines) if harness == "newt" else None,
         "harness_outcome": (contract or {}).get("outcome"),
         "harness_end_reason": newt_end_reason(lines) if harness == "newt" else None,
@@ -922,10 +931,11 @@ def table(out: Path, paired_report=False):
         big = f"{s['max_request_output']:,}" if s["max_request_output"] is not None else "not logged"
         treat = cell.get("treatment") or "none"
         seen = "n/a" if cell["harness"] != "newt" or not cell.get("treatment_expect") else s["not_observed"]
+        ended = "/".join(map(str, s["verification_ended"])) if cell["harness"] == "newt" else "n/a"
         tin, tout = (f"{t[0]:,} ({t[1]})" if t[1] else "— (0)" for t in (s["tokens_in"], s["tokens_out"]))
         lines.append(
             f"| {cell['model']} | {cell['harness']} {cell.get('harness_version') or ''} [{treat}] "
-            f"| {s['expected']} / {s['observed']} / {g} / {s['errors']} | {cell.get('interrupted') or 0} | {rate(s['rate_excl'])} | {rate(s['rate_agent_fail'])} | {s['claimed']} | {s['terminal_not_done']} | {'/'.join(map(str, s['verification_ended']))} | {fc} "
+            f"| {s['expected']} / {s['observed']} / {g} / {s['errors']} | {cell.get('interrupted') or 0} | {rate(s['rate_excl'])} | {rate(s['rate_agent_fail'])} | {s['claimed']} | {s['terminal_not_done']} | {ended} | {fc} "
             f"| {s['false_incompletes']} | {s['unrecoverable_claims']} | {s['exceptions']}: {'/'.join(map(str, s['causes']))} | {s['inference_errors']} | {s['agent_timeouts']} | {big} | {s['model_mismatches']} | {seen} | {tin} "
             f"| {tout} | {med} / {s['agent_s_total']:.0f} | {tps} |"
         )

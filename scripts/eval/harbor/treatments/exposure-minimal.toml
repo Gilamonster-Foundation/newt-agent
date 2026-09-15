@@ -4,3 +4,7 @@ profile = '''
 [tool_exposure]
 profile = "minimal"
 '''
+
+# The self-verify gate stays in its shipped state, so this arm compares against none.
+[expect]
+"receipt.verification.mode" = "attempted"

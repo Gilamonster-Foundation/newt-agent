@@ -21,8 +21,8 @@ from pi_log import pi_inference_failure, pi_session_claim
 from tb_campaign import (
     PINNED, TREATMENT_ENV, awaiting, build_cell, ceiling_reached, codex_claim, deadline_cancels, error_cause, fingerprint,
     harness_evidence, ingest, is_trial_config, job_state, ledger_entry, ledger_total_s, load_treatment, newcombe,
-    newt_claim, newt_end_reason, observed, pair, pair_report, parse_schedule, pi_claim, pin_extend, pin_mismatch, refusal,
-    redact, render_profile, scrub, summarize, table, treatment_env, trial_plan, wilson, window_at,
+    newt_claim, newt_end_reason, observed, observed_in, pair, pair_report, parse_schedule, pi_claim, pin_extend, pin_mismatch, refusal,
+    redact, render_profile, scrub, summarize, table, treatment_env, trial_plan, trial_row, wilson, window_at,
 )
 
 HARBOR = Path(__file__).resolve().parent.parent
@@ -63,6 +63,8 @@ class Claims(unittest.TestCase):
                 self.assertEqual(newt_claim(lines)[0], False, (reason, status))
                 self.assertEqual(newt_end_reason(lines), reason)
         self.assertIsNone(newt_end_reason(jl({"kind": "solve_result", "end_reason": "None"})))
+        for odd in ({"reason": "RepairExhausted"}, 7, None):  # a future serde shape must not abort the ingest
+            self.assertIsNone(newt_end_reason(jl({"kind": "solve_result", "end_reason": odd})))
         done = jl({"kind": "solve_result", "end_reason": "Some(Completed)"}, {"outcome": "completed"})
         self.assertEqual(newt_claim(done)[0], True)
 
@@ -211,6 +213,25 @@ class Treatments(unittest.TestCase):
         self.assertIs(observed(none["expect"], {"receipt": {"verification": {"mode": "off"}}}), False)
         self.assertIsNone(observed(none["expect"], None))  # pi and codex have no contract to read
 
+    def test_every_arm_confirms_the_gate_state_it_compares_against(self):
+        modes = {Path(f).stem: load_treatment(f)["expect"].get("receipt.verification.mode")
+                 for f in sorted((HARBOR / "treatments").glob("*.toml"))}
+        self.assertEqual(modes, {"allowance-16k": "attempted", "exposure-minimal": "attempted", "smart": "attempted",
+                                 "self-verify-off": "off", "verify-outcomes": "result_aware"})
+
+    def test_a_turn_that_never_ran_is_not_counted_as_not_observed(self):
+        # A spawn or thread failure writes outcome harness_error with no features,
+        # so the receipt carries no verification entry: nothing was there to observe.
+        expect = load_treatment("none")["expect"]
+        self.assertIsNone(observed_in(expect, {"outcome": "harness_error"}))
+        self.assertIsNone(observed_in(expect, {"outcome": "harness_error", "receipt": {"features": {}}}))
+        self.assertIs(observed_in(expect, {"outcome": "harness_error",
+                                            "receipt": {"verification": {"mode": "off"}}}), False)
+        self.assertIs(observed_in(expect, {"outcome": "completed"}), False)  # a turn ran on an older binary
+        job = HARBOR / "tests/fixtures/job-redaction"  # outcome harness_error, and timeout, both without a receipt
+        self.assertIsNone(trial_row("newt", job / "build-cython-ext__fixture", expect)["treatment_observed"])
+        self.assertIs(trial_row("newt", job / "chess-best-move__fixture", expect)["treatment_observed"], False)
+
     def test_the_table_shows_the_baseline_receipt_check_and_verification_ends_for_newt_only(self):
         cells = [{"campaign": "c", "model": "m", "harness": h, "job": f"m__{h}", "expected": 2, "treatment": "none",
                   "treatment_expect": {"receipt.verification.mode": "attempted"}} for h in ("newt", "pi")]
@@ -230,7 +251,7 @@ class Treatments(unittest.TestCase):
         by_harness = {r.split("|")[2].split()[0]: [c.strip() for c in r.split("|")] for r in body}
         seen, ended = col["treatment declared but not observed"], col["newt verification ended: repair exhausted / incomplete"]
         self.assertEqual((by_harness["newt"][seen], by_harness["newt"][ended]), ("1", "1/0"))
-        self.assertEqual(by_harness["pi"][seen], "n/a")
+        self.assertEqual((by_harness["pi"][seen], by_harness["pi"][ended]), ("n/a", "n/a"))
 
     def test_the_campaign_unsets_every_arm_changing_knob_it_does_not_set(self):
         # An operator's exported treatment knob must not silently change every
