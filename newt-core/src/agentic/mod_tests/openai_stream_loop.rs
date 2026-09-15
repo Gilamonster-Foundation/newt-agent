@@ -236,7 +236,6 @@ async fn a_primary_stream_cut_after_its_usage_chunk_is_failed_with_that_usage() 
     }
 }
 
-
 const REISSUE_USAGE: &str = r#"{"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":5}}"#;
 
 fn reissue_usage() -> Option<crate::TokenUsage> {
