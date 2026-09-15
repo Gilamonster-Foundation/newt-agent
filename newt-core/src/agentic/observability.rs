@@ -103,8 +103,9 @@ pub fn reasoning_overflow_signature(
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BehaviorSignal {
     /// #2315: one result-aware verification decision at a concluding answer:
-    /// `accept`, `nudge`, or the stop reason; the per-check status; and which
-    /// state evidence (`tree` or `mutation_chain`) decided freshness.
+    /// `accept`, `nudge`, the stop reason, `no_checks` (nothing to verify) or
+    /// `check_scan_failed`; the per-check status; and which state evidence
+    /// (`tree` or `mutation_chain`) decided freshness.
     Verification {
         round: usize,
         decision: String,

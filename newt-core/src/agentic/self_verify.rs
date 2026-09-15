@@ -904,6 +904,10 @@ impl VerificationLedger {
 /// with no checks.
 const SCAN_FAILED: &str = "check_scan_failed";
 
+/// The trace decision for a conclusion with nothing to verify: the workspace
+/// and the task afford no check, so the answer is accepted unverified.
+const NO_CHECKS: &str = "no_checks";
+
 /// [`detect_checks`] over a fresh [`workspace_entries`] scan, on the blocking
 /// pool. `None` when the scan task failed.
 async fn detect_off_worker(workspace: &str, task: &str) -> Option<Vec<VerifyCheck>> {
@@ -937,8 +941,9 @@ pub(crate) struct Concluding<'a> {
 }
 
 /// The one result-aware decision every caller uses (the two ordinary gates and
-/// SmartHarness), with its evidence recorded as a solve trace signal whenever
-/// the workspace affords a check or the scan failed. The scan and the tree
+/// SmartHarness), with its evidence recorded as a solve trace signal. A turn
+/// with no check to run records `no_checks`, so it is told apart from a turn
+/// whose gate was never reached. The scan and the tree
 /// state run here, off the async worker, so only a real conclusion pays for
 /// them.
 pub(crate) async fn conclude_turn(turn: Concluding<'_>, repairs_used: usize) -> Decision {
@@ -953,15 +958,13 @@ pub(crate) async fn conclude_turn(turn: Concluding<'_>, repairs_used: usize) -> 
         repairs_used,
         rounds_left: turn.rounds_left,
     });
-    if let Some(obs) = turn
-        .solve_obs
-        .filter(|_| !checks.is_empty() || scanned.is_none())
-    {
+    if let Some(obs) = turn.solve_obs {
         obs.behavior_signals
             .push(super::observability::BehaviorSignal::Verification {
                 round: turn.round,
                 decision: match &decision {
                     _ if scanned.is_none() => SCAN_FAILED.to_string(),
+                    _ if checks.is_empty() => NO_CHECKS.to_string(),
                     Decision::Accept => "accept".to_string(),
                     Decision::Nudge(_) => "nudge".to_string(),
                     Decision::Stop(reason) => serde_json::to_value(reason)
