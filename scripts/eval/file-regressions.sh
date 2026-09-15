@@ -15,9 +15,9 @@
 #     RATCHET<TAB>task<TAB>mode<TAB>model<TAB>behavioral<TAB>details
 #
 # A "rung" is keyed by task/mode (model is a CONTROL, per RATCHET.md — the
-# single-vs-crew staircase is what we watch). A trial "passes" when its
-# behavioral column matches ^PASS (covers PASS and legacy PASS?gameable); an
-# UNGRADABLE(..) or ERROR(..) row graded nothing and is not a trial at all. A rung
+# single-vs-crew staircase is what we watch). A trial "passes" only when its
+# behavioral column is exactly PASS. An UNGRADABLE(..), ERROR(..) or legacy
+# PASS?gameable row graded nothing canonically and is not a trial at all. A rung
 # REGRESSED when its current pass-rate (pass/total across the run's trials) is
 # strictly lower than the same rung's pass-rate in the baseline.
 #
@@ -59,10 +59,10 @@ done
 # Emit "<task>/<mode>\t<pass>\t<total>" for each rung in a RATCHET tsv file.
 aggregate() {
   awk -F'\t' '
-    $1=="RATCHET" && $5 !~ /^(UNGRADABLE|ERROR)\(/ {
+    $1=="RATCHET" && $5 !~ /^(UNGRADABLE\(|ERROR\(|PASS\?gameable$)/ {
       key=$2"/"$3
       total[key]++
-      if ($5 ~ /^PASS/) pass[key]++
+      if ($5 == "PASS") pass[key]++
     }
     END { for (k in total) printf "%s\t%d\t%d\n", k, (pass[k]+0), total[k] }
   ' "$1" | sort
@@ -221,6 +221,12 @@ self_test() {
     printf 'RATCHET\tT2-humanize-duration\tsingle\tqwen2.5-coder:7b\tFAIL\ttests_pass=fail\n'
     printf 'RATCHET\tT2-humanize-duration\tsingle\tqwen2.5-coder:7b\tFAIL\ttests_pass=fail\n'
     printf 'RATCHET\tT2-humanize-duration\tsingle\tqwen2.5-coder:7b\tFAIL\ttests_pass=fail\n'
+    # T4/crew: legacy PASS?gameable rows are ungraded. Counted as passes, the
+    # baseline would read 3/4 and the unchanged 1/2 below a false regression.
+    printf 'RATCHET\tT4-legacy\tcrew\tqwen2.5-coder:7b\tPASS?gameable\tleaves=1\n'
+    printf 'RATCHET\tT4-legacy\tcrew\tqwen2.5-coder:7b\tPASS?gameable\tleaves=1\n'
+    printf 'RATCHET\tT4-legacy\tcrew\tqwen2.5-coder:7b\tPASS\tleaves=1\n'
+    printf 'RATCHET\tT4-legacy\tcrew\tqwen2.5-coder:7b\tFAIL\tleaves=1\n'
   } > "$base"
 
   # current: T0/single regresses to 1/3; T1/crew holds 3/3; T2/single stays 0/3;
@@ -239,6 +245,8 @@ self_test() {
     printf 'RATCHET\tT2-humanize-duration\tsingle\tqwen2.5-coder:7b\tFAIL\ttests_pass=fail\n'
     printf 'RATCHET\tT2-humanize-duration\tsingle\tqwen2.5-coder:7b\tFAIL\ttests_pass=fail\n'
     printf 'RATCHET\tT3-format-temperature\tsingle\tqwen2.5-coder:7b\tPASS\ttests_pass=ok\n'
+    printf 'RATCHET\tT4-legacy\tcrew\tqwen2.5-coder:7b\tPASS\tleaves=1\n'
+    printf 'RATCHET\tT4-legacy\tcrew\tqwen2.5-coder:7b\tFAIL\tleaves=1\n'
   } > "$cur"
 
   local fails=0
@@ -251,6 +259,7 @@ self_test() {
   grep -q "OK (no regression): T1-parse-port/crew" <<<"$outA" || { echo "  !! expected OK for T1-parse-port/crew"; fails=$((fails+1)); }
   grep -q "OK (no regression): T2-humanize-duration/single" <<<"$outA" || { echo "  !! expected OK (still-failing) for T2-humanize-duration/single"; fails=$((fails+1)); }
   grep -q "NEW RUNG (no baseline): T3-format-temperature/single" <<<"$outA" || { echo "  !! expected NEW RUNG for T3-format-temperature/single"; fails=$((fails+1)); }
+  grep -q "OK (no regression): T4-legacy/crew" <<<"$outA" || { echo "  !! expected legacy PASS?gameable rows left out of T4-legacy/crew"; fails=$((fails+1)); }
   grep -q "filed 1 new issue" <<<"$outA" || { echo "  !! expected 1 filed"; fails=$((fails+1)); }
 
   echo

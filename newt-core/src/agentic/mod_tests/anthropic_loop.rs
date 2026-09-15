@@ -99,6 +99,8 @@ const NO_CHECKS_WORKSPACE: &str = "newt-core-test-workspace-that-does-not-exist"
 
 fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats) -> ChatCtx<'a> {
     ChatCtx {
+        verify_outcomes: false,
+        round_cap_hit: None,
         smart_harness: None,
         rewrites_history: true,
         url: server_uri,
@@ -859,7 +861,7 @@ async fn final_summary_provider_contracts() {
                 request_budget: None,
                 calibration: 1.0,
                 estimation: crate::tokens::TokenEstimation::default(),
-                ollama_num_ctx: None,
+                ollama_options: None,
                 prompt_measurement: Default::default(),
             };
             let client = reqwest::Client::new();
@@ -897,7 +899,10 @@ async fn final_summary_provider_contracts() {
                 }
             };
             let (reply, streamed, usage) = result.expect("summary failures become fallbacks");
-            let retried = case == "retry" && provider != "ollama";
+            // Every provider retries a transient 503 once. Until #2313's
+            // classifier fix this pinned Ollama's non-retry as a contract: its
+            // `Ollama 503 ...` text carried no status the classifier recognised.
+            let retried = case == "retry";
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 1 + usize::from(retried),
@@ -2033,4 +2038,72 @@ async fn anthropic_funnel_records_the_execution_class() {
         "failed",
         "{events:?}"
     );
+}
+
+// -----------------------------------------------------------------------
+// #2341: admission reserves the max_tokens this wire sends
+// -----------------------------------------------------------------------
+
+/// A prompt too large for any budget, so the refusal names the budget the loop
+/// enforced.
+fn oversized_task() -> String {
+    format!("OUTPUT-RESERVE {}", "x".repeat(200_000))
+}
+
+/// #2341: with a declared 32,768-token window and no explicit allowance the
+/// loop sends `max_tokens` (8,192, or `NEWT_ANTHROPIC_MAX_TOKENS`), so admission
+/// must leave exactly those tokens free — 24,576 input for the default, not the
+/// 26,214 percentage ceiling alone — and the reporting seam must agree.
+#[tokio::test]
+#[serial_test::serial(anthropic_loop_env)]
+async fn a_declared_window_reserves_the_max_tokens_anthropic_sends() {
+    for (env_max_tokens, budget) in [(None, 24_576), (Some("12000"), 20_768)] {
+        let mut env = test_env(false);
+        env.push(match env_max_tokens {
+            Some(value) => EnvGuard::set("NEWT_ANTHROPIC_MAX_TOKENS", value),
+            None => EnvGuard::unset("NEWT_ANTHROPIC_MAX_TOKENS"),
+        });
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let task = oversized_task();
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user(&task),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.task = &task;
+        c.num_ctx = Some(32_768);
+        let error = chat_complete(c, &mut NoMcp)
+            .await
+            .expect_err("the prompt cannot fit")
+            .to_string();
+        assert!(
+            error.contains(&format!("authoritative {budget}-token input budget")),
+            "{env_max_tokens:?}: {error}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            initial_context_input_budget(
+                BackendKind::Anthropic,
+                crate::OpenAiApi::ChatCompletions,
+                Some(32_768),
+                80,
+                None,
+                None,
+                Default::default(),
+                crate::model_card::ReasoningReplayScope::Never,
+                None,
+                None,
+            ),
+            Some(budget),
+            "{env_max_tokens:?}: the reporting seam agrees with what admission enforces"
+        );
+    }
 }

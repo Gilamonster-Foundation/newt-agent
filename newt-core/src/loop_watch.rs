@@ -419,16 +419,20 @@ mod loop_watch_tests {
         // Positive read assertion FIRST: an absence-check that silently read
         // nothing would otherwise pass forever.
         assert!(
-            src.contains("RepeatCallGuard::default()"),
+            src.contains("RepeatCallGuard::for_verification("),
             "the scan read nothing, so the counts below prove nothing"
         );
-        let guards = src.matches("RepeatCallGuard::default()").count();
+        let guards = src.matches("RepeatCallGuard::for_verification(").count();
         let watches = src.matches("CleanBuildWatch::default()").count();
         assert_eq!(
             watches, guards,
             "{guards} loops construct RepeatCallGuard but {watches} construct CleanBuildWatch"
         );
-        for (index, tail) in src.split("RepeatCallGuard::default()").skip(1).enumerate() {
+        for (index, tail) in src
+            .split("RepeatCallGuard::for_verification(")
+            .skip(1)
+            .enumerate()
+        {
             let (loop_tail, _) = tail.split_once("\n}").expect("guarded loop has no end");
             assert_eq!(
                 loop_tail.matches("append_clean_build_warning(").count(),

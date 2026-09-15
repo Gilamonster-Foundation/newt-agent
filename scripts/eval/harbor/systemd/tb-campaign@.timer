@@ -1,0 +1,12 @@
+# Wakes campaign %i every 15 minutes. Waking is cheap: outside a declared window,
+# with a stop file, or with nothing left to run, the runner exits at once. The
+# schedule file, not this timer, decides when trials run.
+[Unit]
+Description=Wake Terminal-Bench campaign %i (#2318)
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=false
+
+[Install]
+WantedBy=timers.target

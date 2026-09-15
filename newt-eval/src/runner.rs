@@ -40,6 +40,8 @@ pub struct RunOutcome {
     pub reply: TaskReply,
     pub workspace: PathBuf,
     pub baseline: PathBuf,
+    /// The spec's content id and visibility, recorded before the worker ran.
+    pub pre_run: crate::grade::PreRun,
     /// Kept alive so the temp dirs aren't pruned out from under the
     /// evaluators. Dropped when the outcome is dropped.
     pub _workspace_guard: tempfile::TempDir,
@@ -113,6 +115,7 @@ pub async fn run_case(case: &TestCase, config: &RunnerConfig) -> anyhow::Result<
     copy_fixture(&case.workspace_fixture(), &workspace)?;
     copy_fixture(&case.workspace_fixture(), &baseline)?;
     init_baseline_git(&workspace)?;
+    let pre_run = crate::grade::pre_run(case, &workspace)?;
 
     // `_home_guard` isolates the worker's `HOME`; it must outlive the child.
     let (mut child, _home_guard) = spawn_worker(config)?;
@@ -145,6 +148,7 @@ pub async fn run_case(case: &TestCase, config: &RunnerConfig) -> anyhow::Result<
         reply,
         workspace,
         baseline,
+        pre_run,
         _workspace_guard: workspace_guard,
         _baseline_guard: baseline_guard,
     })

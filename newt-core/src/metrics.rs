@@ -68,6 +68,15 @@ pub enum TurnEndReason {
     /// carried here (it is already printed to the session); this exists so
     /// the turn is still findable and distinguishable from `Completed`.
     Failed,
+    /// #2315 (opt-in `NEWT_VERIFY_OUTCOMES`): a detected check still failed
+    /// or timed out when the repair allowance or the rounds ran out. The
+    /// answer is delivered; passing an external grader is a separate question.
+    RepairExhausted,
+    /// #2315: the turn concluded without an observed pass on the current
+    /// workspace state, and no repair could change that: a check was denied,
+    /// unavailable, requested but never executed, or left stale or unrun with
+    /// no allowance or round left.
+    VerificationIncomplete,
 }
 
 /// Full telemetry record for one inference turn.
@@ -189,6 +198,12 @@ impl TurnMetrics {
             Some(TurnEndReason::Empty) => format!("{base} · ⚠ empty response"),
             Some(TurnEndReason::Cancelled) => format!("{base} · ⊘ interrupted"),
             Some(TurnEndReason::Failed) => format!("{base} · ✗ failed"),
+            Some(TurnEndReason::RepairExhausted) => {
+                format!("{base} · ✗ verification failed after repair")
+            }
+            Some(TurnEndReason::VerificationIncomplete) => {
+                format!("{base} · ⚠ verification incomplete")
+            }
             Some(TurnEndReason::Completed) | None => base,
         }
     }

@@ -1,0 +1,13 @@
+# Terminal-Bench campaign %i (#2318). The runner starts trials only inside the
+# windows its TB_SCHEDULE declares, stops at trial boundaries, and never touches
+# the inference router. Stop it by writing <TB_JOBS_ROOT>/%i/campaign.stop, not
+# with `systemctl stop` (that cancels the trial in flight).
+# Install: copy to ~/.config/systemd/user/, fill ~/.config/tb-campaign/%i.env
+# from tb-campaign.env.example, then `systemctl --user enable --now tb-campaign@%i.timer`.
+[Unit]
+Description=Terminal-Bench campaign %i (#2318)
+
+[Service]
+Type=exec
+EnvironmentFile=%h/.config/tb-campaign/%i.env
+ExecStart=/bin/bash ${TB_INSTRUMENT}/tb-campaign.sh ${TB_ROSTER} ${TB_TASKS} %i

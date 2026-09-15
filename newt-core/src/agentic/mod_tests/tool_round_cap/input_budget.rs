@@ -570,10 +570,9 @@ async fn refused_budget_message(path_str: &str, output_allowance: Option<u32>) -
 /// The `None` row is the twin: without an override every surface falls back
 /// to the Contemplating table's 16,000 (16,768 input).
 ///
-/// EXCLUDED surface, a known discrepancy: the Anthropic loop. With no
-/// allowance it reserves nothing locally while sending the 8,192 wire default
-/// as `max_tokens`; this PR keeps that default unchanged and tracks the fix
-/// separately. With an explicit allowance it reserves and sends the same value.
+/// The Anthropic loop reserves the `max_tokens` it sends, default included; its
+/// surfaces are pinned by `a_declared_window_reserves_the_max_tokens_anthropic_sends`
+/// in `anthropic_loop.rs` (#2341).
 #[tokio::test]
 async fn output_allowance_resolves_once_across_every_budget_surface() {
     use crate::agentic::generation_policy::GenerationPolicy;
@@ -647,5 +646,48 @@ async fn output_allowance_resolves_once_across_every_budget_surface() {
             ollama.contains(&names(ollama_budget)),
             "{explicit:?}: {ollama}"
         );
+    }
+}
+
+/// #2312: an explicit output allowance of 0, or one that leaves no input room
+/// in the declared window, is refused at the dispatch entry before any request
+/// on every wire, naming the allowance and the window. Without a declared
+/// window only the 0 check can apply.
+#[tokio::test]
+async fn an_invalid_output_allowance_is_refused_before_any_request() {
+    for (kind, path_str) in [
+        (BackendKind::Openai, "/v1/chat/completions"),
+        (BackendKind::Ollama, "/api/chat"),
+    ] {
+        for (allowance, num_ctx, expected) in [
+            (0, None, "output_allowance 0 permits no output"),
+            (
+                32_768,
+                Some(32_768),
+                "output_allowance 32768 leaves no input room in the declared 32768-token context window",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(path_str))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let task = "invalid allowance";
+            let messages = giant_prompt_messages(task);
+            let caveats = Caveats::top();
+            let uri = server.uri();
+            let mut ctx = hard_budget_ctx(&uri, &messages, &caveats, task, kind);
+            ctx.safe_context = None;
+            ctx.max_ok_input = None;
+            ctx.num_ctx = num_ctx;
+            ctx.output_allowance = Some(allowance);
+            let error = chat_complete(ctx, &mut NoMcp)
+                .await
+                .expect_err("an invalid allowance must not dispatch")
+                .to_string();
+            assert!(error.contains(expected), "{kind:?}: {error}");
+            assert_no_requests(&server).await;
+        }
     }
 }

@@ -22,6 +22,17 @@ name: Output-oracle real tier (#960)
 # doc comment and the harness-attack surface tracked in #887. Only trusted
 # fixtures live in output_matches_real.rs; do not point this tier at arbitrary
 # graded workspaces until the OCAP-shell confinement story lands.
+#
+# The one deliberate exception is the gaming-corpus replay (#2317,
+# newt-eval/tests/gaming_corpus.rs): committed, reviewed red-team diffs under
+# scripts/eval/results/gaming-corpus/, graded by the canonical grader. The #887
+# guard refuses build scripts, cargo configs, toolchain files and test-target
+# redirects before any cargo runs. The remaining games' test code runs as
+# unconfined as the output_matches fixtures do, which this job bounds four ways:
+# an ephemeral GitHub-hosted runner (ubuntu-latest, not a self-hosted one), a
+# read-only token (permissions: contents: read), no secrets, and no persisted
+# credentials (checkout persist-credentials: false, so the token is not left
+# in .git/config for replayed code to read).
 
 on:
   schedule:
@@ -49,6 +60,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -66,4 +79,12 @@ jobs:
       - name: Run output_matches real-resource tests
         run: |
           cargo test -p newt-eval --test output_matches_real \
+            -- --ignored --test-threads=1
+
+      # #2317: every confirmed game in the gaming corpus must still FAIL its
+      # withheld spec. Spec strength changes rarely, so this is weekly; the
+      # per-PR calibration in mock_e2e.rs is what stops a broken spec landing.
+      - name: Replay the gaming corpus against the withheld specs
+        run: |
+          cargo test -p newt-eval --test gaming_corpus \
             -- --ignored --test-threads=1

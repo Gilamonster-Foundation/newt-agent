@@ -2,12 +2,14 @@
 # ratchet.sh — run one newt-eval task through an execution MODE and behaviorally
 # grade the result. The matrix driver for the capability ratchet (see RATCHET.md).
 #
-#   single   — one agent, one turn         → `newt-eval run` (it grades structurally)
-#   crew     — autonomous plan + crew       → `newt plan --one-shot` → cargo test (behavioral)
+#   single   — one agent, one turn         → `newt-eval run --json`
+#   crew     — autonomous plan + crew       → `newt plan --one-shot` → `newt-eval grade --json`
 #
-# Behavioral grade = does the feature WORK when you run it (#672's North-Star),
-# i.e. `cargo test` in the produced tree. Tasks whose seed test FAILS until the
-# feature is implemented (e.g. T0) make this an honest pass/fail.
+# Behavioral grade = does the feature WORK (#672's North-Star), judged by ONE
+# canonical grader for both modes (#2317): the case's withheld grade_spec.rs,
+# run by newt-eval against a copy of the produced tree (newt-eval/src/grade.rs).
+# The row's behavioral column is PASS | FAIL | UNGRADABLE(reason) | ERROR(reason);
+# the candidate's own tests and the structural evaluators are diagnostics only.
 #
 # SECURITY: no home-network specifics live here. Models are NAMES (--model);
 # crew rosters/endpoints come from the operator's local ~/.newt config. Nothing
@@ -51,38 +53,40 @@ emit() { # task mode model behavioral details...
   printf 'RATCHET\t%s\t%s\t%s\t%s\t%s\n' "$TASK" "$MODE" "${MODEL:-config-crew}" "$1" "$2"
 }
 
+# newt-eval's scorecard JSON (stdin) → "<verdict>\t<details>", read by KEY for
+# both arms. Never parse the human table: its reshaping (#1883) silently
+# emptied the single arm. No behavioral grade at all means no tree was graded.
+row_from_scorecard() { # task
+  python3 -c '
+import json, sys
+try:
+    cases = [c for c in json.load(sys.stdin)["cases"] if c["case_name"] == sys.argv[1]]
+except (ValueError, KeyError, TypeError):
+    cases = []
+rows = [r for c in cases for r in c["results"]]
+grade = next((c["behavioral"] for c in cases if c.get("behavioral")), None)
+if grade is None:
+    runner = any(r["evaluator"] == "runner" and not r["passed"] for r in rows)
+    grade = {"verdict": "ERROR(runner)" if runner else "ERROR(no_scorecard)",
+             "grader": "none", "spec_cid": None, "tests_run": 0, "timeout": "none"}
+tp = next((r for r in rows if r["evaluator"] == "tests_pass"), None)
+tp = "" if tp is None else "skipped" if tp.get("skipped") else "ok" if tp["passed"] else "fail"
+allok = "yes" if rows and all(r["passed"] for r in rows) else "no"
+details = "grader=%s spec_cid=%s tests_run=%s timeout=%s tests_pass=%s all_evaluators_ok=%s" % (
+    grade["grader"], grade["spec_cid"] or "none", grade["tests_run"], grade["timeout"], tp, allok)
+if grade.get("harness_subversion"):
+    details += " harness_subversion=" + grade["harness_subversion"]
+print(grade["verdict"] + "\t" + details)
+' "$1"
+}
+
 case "$MODE" in
   single)
     [ -n "$MODEL" ] || { echo "ratchet: --mode single needs --model" >&2; exit 2; }
     out="$("$NEWT_EVAL" run --json --case "$TASK" --model "$MODEL" $CODER \
             --worker-timeout-ms "$WORKER_TIMEOUT_MS" 2>/dev/null)"
     echo "$out" >&2
-    # Behavioral truth = the tests_pass result, read by KEY from the scorecard
-    # JSON — never by column from the human table, whose reshaping (#1883)
-    # emptied tests_pass= on every row here until #2317. ok → PASS, fail →
-    # FAIL, skipped (ran no test) → UNGRADABLE, no grade produced → ERROR.
-    IFS=$'\t' read -r behavioral details < <(python3 -c '
-import json, sys
-try:
-    rows = [r for c in json.load(sys.stdin)["cases"] if c["case_name"] == sys.argv[1] for r in c["results"]]
-except (ValueError, KeyError, TypeError):
-    rows = []
-tp = next((r for r in rows if r["evaluator"] == "tests_pass"), None)
-if tp is None:
-    if any(r["evaluator"] == "runner" and not r["passed"] for r in rows):
-        verdict = "ERROR(runner)"
-    else:
-        verdict = "UNGRADABLE(no_grader)" if rows else "ERROR(no_scorecard)"
-    status, ran = "", "0"
-elif tp.get("skipped"):
-    verdict, status, ran = "UNGRADABLE(no_tests)", "skipped", "0"
-elif tp["passed"]:
-    verdict, status, ran = "PASS", "ok", "unknown"
-else:
-    verdict, status, ran = "FAIL", "fail", "unknown"
-allok = "yes" if rows and all(r["passed"] for r in rows) else "no"
-print(f"{verdict}\tgrader=tests_pass spec_cid=none tests_run={ran} tests_pass={status} all_evaluators_ok={allok}")
-' "$TASK" <<<"$out")
+    IFS=$'\t' read -r behavioral details < <(row_from_scorecard "$TASK" <<<"$out")
     emit "$behavioral" "$details"
     ;;
   crew)
@@ -104,6 +108,21 @@ print(f"{verdict}\tgrader=tests_pass spec_cid=none tests_run={ran} tests_pass={s
     ( cd "$throw" && git init -q -b main && git add -A \
         && git -c user.email=r@r -c user.name=r commit -qm baseline )
     base="$(cd "$throw" && git rev-parse HEAD)"
+    # What the grader must see again after the run: the spec's content id, and
+    # that the spec is not already in the tree the crew is about to work in.
+    pre="$("$NEWT_EVAL" grade --pre-run --case "$TASK" --workspace "$throw" 2>/dev/null)"
+    read -r cid_before visible_before < <(python3 -c '
+import json, sys
+try:
+    p = json.load(sys.stdin)
+    print(p["spec_cid"] or "none", "yes" if p["spec_visible"] else "no")
+except (ValueError, KeyError, TypeError):
+    pass
+' <<<"$pre")
+    if [ -z "${cid_before:-}" ]; then
+      emit "ERROR(pre_run)" "grader=none spec_cid=none tests_run=0 timeout=none dir=$throw"
+      exit 0
+    fi
     echo "ratchet: crew run on $TASK in $throw (max-leaves $MAX_LEAVES, timeout ${TIMEOUT}s)" >&2
     # The autonomous loop. --one-shot is the headless approval. Crew roster from ~/.newt.
     # -k 60: timeout setpgid()s newt into its own process group, which escapes an
@@ -116,7 +135,7 @@ print(f"{verdict}\tgrader=tests_pass spec_cid=none tests_run={ran} tests_pass={s
     if [ -z "$final" ]; then
       # No branch landed. Discriminate WHY (#820) — a dead endpoint and a
       # model that ran but landed nothing are different results:
-      #   no_crew_branch_infra      — the model was never exercised
+      #   ERROR(infra)              — the model was never exercised
       #                               (connection/availability errors, or an
       #                               empty log). Drivers exclude from n.
       #   no_crew_branch_exercised  — real inference happened but the crew
@@ -127,9 +146,9 @@ print(f"{verdict}\tgrader=tests_pass spec_cid=none tests_run={ran} tests_pass={s
       if [ ! -s "$throw/.plan.log" ] || grep -qiE \
           'connection refused|error sending request|tcp connect|connection reset|no such host|dns error|not found, try pulling|timed out waiting for' \
           "$throw/.plan.log"; then
-        emit FAIL "plan_rc=$plan_rc no_crew_branch_infra (see $throw/.plan.log)"
+        emit "ERROR(infra)" "grader=none spec_cid=$cid_before tests_run=0 timeout=none plan_rc=$plan_rc no_crew_branch_infra (see $throw/.plan.log)"
       else
-        emit FAIL "plan_rc=$plan_rc no_crew_branch_exercised dir=$throw"
+        emit FAIL "grader=none spec_cid=$cid_before tests_run=0 timeout=none plan_rc=$plan_rc no_crew_branch_exercised dir=$throw"
       fi
       exit 0
     fi
@@ -139,54 +158,14 @@ print(f"{verdict}\tgrader=tests_pass spec_cid=none tests_run={ran} tests_pass={s
     touched_seam=$(cd "$throw" && git diff "$base..$final" -- src/lib.rs | grep -qE '^[-+]' && echo yes || echo no)
     # Diagnostic: did the crew edit its OWN test assertion (the #672 gaming move)?
     edited_test=$(cd "$throw" && git diff "$base..$final" -- src/lib.rs | grep -qE '^[-+].*assert' && echo yes || echo no)
-    # #887: harness-trust-boundary guard. The grading step below drops the
-    # hidden spec into $throw and runs `cargo test` against the produced
-    # tree's OWN Cargo.toml / build config — a crew that adds a build.rs, a
-    # .cargo/config.toml (any override — rustc-wrapper, a [build] section's
-    # rustc/rustdoc keys, dotted-key form, whatever shape it takes), or a
-    # Cargo.toml [[test]] table can subvert the grade before any real check
-    # even compiles. Found via /grade-spec-author red-team rounds on
-    # 012/013/014 (3-for-3): build.rs pre-compile overwrite of
-    # tests/grade_spec.rs, a rustc-wrapper source swap of grade_spec.rs's own
-    # compilation, and a [[test]] name/path redirect + autotests=false that
-    # points the test runner at a decoy file entirely. None of the case
-    # prompts legitimately need a build.rs, a custom cargo config, or a
-    # declared [[test]] target, so their mere PRESENCE in the produced tree
-    # is grounds for an honest FAIL — checked BEFORE the spec is even dropped
-    # in. Banning the whole file (not pattern-matching its content) avoids
-    # chasing every TOML syntax variant of the same override.
-    subversion=""
-    if [ -f "$throw/build.rs" ] || grep -qE '^[[:space:]]*build[[:space:]]*=' "$throw/Cargo.toml" 2>/dev/null; then
-      subversion="build.rs (or Cargo.toml build= key) present"
-    elif [ -f "$throw/.cargo/config.toml" ]; then
-      subversion=".cargo/config.toml present (build-toolchain override risk)"
-    elif grep -qE '^\[\[test\]\]' "$throw/Cargo.toml" 2>/dev/null; then
-      subversion="Cargo.toml declares a [[test]] table (test-target redirect risk)"
-    fi
-    if [ -n "$subversion" ]; then
-      emit FAIL "leaves=$leaves touched_src_lib=$touched_seam edited_own_test=$edited_test files=[$files] plan_rc=$plan_rc dir=$throw harness_subversion=$subversion"
-      exit 0
-    fi
-    # UNGAMEABLE behavioral grade — structurally-enforced TDD, measurement side.
-    # Drop the case's HIDDEN canonical spec (which the agent never saw, so it
-    # could not edit it) into the produced tree and run ONLY that. A crew that
-    # "passed" by rewriting its own assertion still FAILS here unless the code is
-    # actually correct.
-    spec="$CASE_DIR/grade_spec.rs"
-    if [ -f "$spec" ]; then
-      mkdir -p "$throw/tests"; cp "$spec" "$throw/tests/grade_spec.rs"
-      if ( cd "$throw" && CARGO_TARGET_DIR="$TARGET" cargo test --test grade_spec -q >/dev/null 2>&1 ); then
-        behavioral=PASS
-      else
-        behavioral=FAIL
-      fi
-    else
-      # No hidden spec → fall back to the seed's own tests (only honest for
-      # fail-until-fixed seeds; gameable by a test-editing agent — flagged).
-      ( cd "$throw" && CARGO_TARGET_DIR="$TARGET" cargo test -q >/dev/null 2>&1 ) \
-        && behavioral="PASS?gameable" || behavioral="FAIL"
-    fi
-    emit "$behavioral" "leaves=$leaves touched_src_lib=$touched_seam edited_own_test=$edited_test files=[$files] plan_rc=$plan_rc dir=$throw"
+    # The canonical grade, the same call single mode makes: the #887 guard,
+    # then the hidden spec in a copy of the tree (newt-eval/src/grade.rs).
+    visible_flag=()
+    [ "$visible_before" = yes ] && visible_flag=(--spec-visible-before)
+    out="$("$NEWT_EVAL" grade --json --case "$TASK" --workspace "$throw" \
+            --spec-cid-before "$cid_before" "${visible_flag[@]}" 2>/dev/null)"
+    IFS=$'\t' read -r behavioral details < <(row_from_scorecard "$TASK" <<<"$out")
+    emit "$behavioral" "$details leaves=$leaves touched_src_lib=$touched_seam edited_own_test=$edited_test files=[$files] plan_rc=$plan_rc dir=$throw"
     ;;
   *) echo "ratchet: --mode must be single|crew" >&2; exit 2;;
 esac

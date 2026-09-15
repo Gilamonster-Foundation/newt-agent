@@ -249,6 +249,7 @@ impl PyCaseScorecard {
             inner: CaseScorecard {
                 case_name,
                 results: results.into_iter().map(|r| r.inner.clone()).collect(),
+                behavioral: None,
             },
         }
     }
@@ -297,6 +298,7 @@ impl PyScorecard {
         self.inner.push(CaseScorecard {
             case_name,
             results: results.into_iter().map(|r| r.inner.clone()).collect(),
+            behavioral: None,
         });
     }
 
